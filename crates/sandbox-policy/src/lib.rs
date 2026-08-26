@@ -1484,6 +1484,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn target_paths_are_strict() {
         assert_eq!(
             normalize_target_path("/work/src").expect("path"),
@@ -1495,6 +1496,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
+    fn target_paths_are_strict() {
+        assert_eq!(
+            normalize_target_path(r"C:\work\src").expect("path"),
+            r"C:\work\src"
+        );
+        assert!(normalize_target_path(r"work\src").is_err());
+        assert!(normalize_target_path(r"C:\work\..\secret").is_err());
+        assert!(normalize_target_path(r"\\.\PhysicalDrive0").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn runtime_owned_grant_targets_are_reserved() {
         for path in [
             "/",
@@ -1511,6 +1525,20 @@ mod tests {
         for path in ["/workspace", "/home/other", "/etc-custom", "/devtools"] {
             assert!(!reserved_target_conflict(path), "{path} must remain usable");
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn only_the_target_root_is_generically_reserved() {
+        assert!(reserved_target_conflict("/"));
+        assert!(!reserved_target_conflict("/workspace"));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn only_a_target_volume_root_is_generically_reserved() {
+        assert!(reserved_target_conflict(r"C:\"));
+        assert!(!reserved_target_conflict(r"C:\workspace"));
     }
 
     #[test]
