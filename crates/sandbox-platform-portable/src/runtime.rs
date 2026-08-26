@@ -36,6 +36,16 @@ const CONFORMANCE_ID: &str = "windows-appcontainer-v1-conformance-1";
 #[cfg(target_os = "macos")]
 const CONFORMANCE_ID: &str = "darwin-seatbelt-v1-conformance-1";
 
+#[cfg(target_os = "windows")]
+const HOST_PLATFORM: &str = "win32";
+#[cfg(target_os = "macos")]
+const HOST_PLATFORM: &str = "darwin";
+
+#[cfg(target_os = "windows")]
+const TARGET_OPERATING_SYSTEM: &str = "windows";
+#[cfg(target_os = "macos")]
+const TARGET_OPERATING_SYSTEM: &str = "macos";
+
 #[derive(Clone)]
 struct ProtocolWriter {
     output: Arc<Mutex<io::Stdout>>,
@@ -371,21 +381,24 @@ fn handle_frame(
             let id = request_id_value(&value)?;
             unique_request(request_ids, &id)?;
             let capability = functional_probe();
-            writer.control(MessageType::ProbeResult, &json!({
-                "requestId": id,
-                "support": {
-                    "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
-                    "packageVersion": BACKEND_VERSION,
-                    "host": {"platform": std::env::consts::OS, "architecture": std::env::consts::ARCH},
-                    "backends": [{
-                        "id": BACKEND_ID,
-                        "isolation": "process",
-                        "stability": "experimental",
-                        "available": capability.available,
-                        "capabilities": capability,
-                    }],
-                }
-            }))?;
+            writer.control(
+                MessageType::ProbeResult,
+                &json!({
+                    "requestId": id,
+                    "support": {
+                        "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
+                        "packageVersion": BACKEND_VERSION,
+                        "host": {"platform": HOST_PLATFORM, "architecture": std::env::consts::ARCH},
+                        "backends": [{
+                            "id": BACKEND_ID,
+                            "isolation": "process",
+                            "stability": "experimental",
+                            "available": capability.available,
+                            "capabilities": capability,
+                        }],
+                    }
+                }),
+            )?;
         }
         MessageType::PrepareRun => {
             ensure_empty(state)?;
@@ -862,7 +875,7 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
         "digestFormat": 1,
         "protocolMajor": PROTOCOL_MAJOR,
         "backend": {"id": BACKEND_ID, "version": BACKEND_VERSION, "stability": "experimental"},
-        "targetOperatingSystem": std::env::consts::OS,
+        "targetOperatingSystem": TARGET_OPERATING_SYSTEM,
         "policy": normalized,
         "runtimeManifestDigest": manifest_digest,
         "grants": grants,
@@ -1045,7 +1058,7 @@ fn enforcement_report(
             mechanism: mechanisms(),
         },
         host: EnforcementHost {
-            platform: std::env::consts::OS.into(),
+            platform: HOST_PLATFORM.into(),
             architecture: std::env::consts::ARCH.into(),
             path_style: if cfg!(target_os = "windows") {
                 "windows"
@@ -1055,7 +1068,7 @@ fn enforcement_report(
             .into(),
         },
         target: EnforcementTarget {
-            operating_system: std::env::consts::OS.into(),
+            operating_system: TARGET_OPERATING_SYSTEM.into(),
             path_style: if cfg!(target_os = "windows") {
                 "windows"
             } else {
@@ -2009,7 +2022,7 @@ fn start_process(
                     "phase": "execute",
                     "targetExecuted": true,
                     "backend": BACKEND_ID,
-                    "platform": std::env::consts::OS,
+                    "platform": HOST_PLATFORM,
                 }
             }),
         };
@@ -2822,4 +2835,23 @@ fn bounded(value: &str) -> String {
         .take(1024)
         .filter(|character| !character.is_control() || *character == ' ')
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HOST_PLATFORM, TARGET_OPERATING_SYSTEM};
+
+    #[test]
+    fn platform_names_match_the_public_node_contract() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(HOST_PLATFORM, "win32");
+            assert_eq!(TARGET_OPERATING_SYSTEM, "windows");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(HOST_PLATFORM, "darwin");
+            assert_eq!(TARGET_OPERATING_SYSTEM, "macos");
+        }
+    }
 }
