@@ -1036,47 +1036,76 @@ mod windows {
                 .grant(&workspace, GrantAccess::ReadWrite)
                 .expect("grant working directory");
 
-            let (stdin_read, stdin_write) = pipe().expect("stdin pipe");
-            let (stdout_read, stdout_write) = pipe().expect("stdout pipe");
-            let (stderr_read, stderr_write) = pipe().expect("stderr pipe");
             let args = vec![
                 "--exact".to_owned(),
                 "windows::tests::appcontainer_process_smoke".to_owned(),
             ];
-            let mut environment = std::env::vars()
+            let parent_environment = std::env::vars()
                 .filter(|(name, _)| !name.contains('='))
                 .collect::<Vec<_>>();
-            environment.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
-            let launch = session.launch_suspended(&LaunchSpec {
-                executable: &executable,
-                args: &args,
-                cwd: &workspace,
-                environment: &environment,
-                inherited_handles: &[stdin_read.0, stdout_write.0, stderr_write.0],
-                limits: JobLimits {
-                    memory_bytes: None,
-                    max_processes: Some(1),
-                },
-            });
-            drop(stdin_read);
-            drop(stdout_write);
-            drop(stderr_write);
-            drop(stdin_write);
-            let mut process = match launch {
-                Ok(process) => process,
-                Err(error) => {
-                    let report = session.cleanup();
-                    let _ = fs::remove_dir_all(&parent);
-                    let _ = fs::remove_dir_all(&workspace);
-                    panic!(
-                        "launch AppContainer test child: {error}; cleanup failures: {:?}",
-                        report.failures
-                    );
-                }
-            };
-            assert_eq!(process.wait().expect("wait for test child"), 0);
-            drop(stdout_read);
-            drop(stderr_read);
+            let variants = [
+                ("sentinel-only", &[][..]),
+                ("system-root", &["SystemRoot"][..]),
+                (
+                    "loader",
+                    &[
+                        "ComSpec",
+                        "OS",
+                        "Path",
+                        "PATHEXT",
+                        "SystemDrive",
+                        "SystemRoot",
+                        "windir",
+                    ][..],
+                ),
+                (
+                    "program-files",
+                    &[
+                        "ALLUSERSPROFILE",
+                        "CommonProgramFiles",
+                        "CommonProgramFiles(x86)",
+                        "CommonProgramW6432",
+                        "ComSpec",
+                        "OS",
+                        "Path",
+                        "PATHEXT",
+                        "ProgramData",
+                        "ProgramFiles",
+                        "ProgramFiles(x86)",
+                        "ProgramW6432",
+                        "SystemDrive",
+                        "SystemRoot",
+                        "windir",
+                    ][..],
+                ),
+                (
+                    "profile",
+                    &[
+                        "APPDATA",
+                        "HOMEDRIVE",
+                        "HOMEPATH",
+                        "LOCALAPPDATA",
+                        "SystemDrive",
+                        "SystemRoot",
+                        "USERPROFILE",
+                        "windir",
+                    ][..],
+                ),
+            ];
+            let mut outcomes = Vec::new();
+            for (label, names) in variants {
+                let environment = selected_environment(&parent_environment, names);
+                outcomes.push((
+                    label,
+                    launch_test_child(&session, &executable, &args, &workspace, &environment),
+                ));
+            }
+            let mut full_environment = parent_environment;
+            full_environment.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
+            outcomes.push((
+                "full",
+                launch_test_child(&session, &executable, &args, &workspace, &full_environment),
+            ));
 
             let report = session.cleanup();
             assert!(
@@ -1086,6 +1115,7 @@ mod windows {
             );
             let _ = fs::remove_dir_all(&parent);
             let _ = fs::remove_dir_all(&workspace);
+            panic!("AppContainer environment outcomes: {outcomes:?}");
         }
 
         #[test]
@@ -1186,6 +1216,55 @@ mod windows {
                 return Err(last_error("CreatePipe(test)"));
             }
             Ok((TestHandle(read), TestHandle(write)))
+        }
+
+        fn selected_environment(
+            parent: &[(String, String)],
+            names: &[&str],
+        ) -> Vec<(String, String)> {
+            let mut selected = parent
+                .iter()
+                .filter(|(name, _)| {
+                    names
+                        .iter()
+                        .any(|expected| name.eq_ignore_ascii_case(expected))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            selected.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
+            selected
+        }
+
+        fn launch_test_child(
+            session: &AppContainerSession,
+            executable: &Path,
+            args: &[String],
+            cwd: &Path,
+            environment: &[(String, String)],
+        ) -> io::Result<u32> {
+            let (stdin_read, stdin_write) = pipe()?;
+            let (stdout_read, stdout_write) = pipe()?;
+            let (stderr_read, stderr_write) = pipe()?;
+            let launch = session.launch_suspended(&LaunchSpec {
+                executable,
+                args,
+                cwd,
+                environment,
+                inherited_handles: &[stdin_read.0, stdout_write.0, stderr_write.0],
+                limits: JobLimits {
+                    memory_bytes: None,
+                    max_processes: Some(1),
+                },
+            });
+            drop(stdin_read);
+            drop(stdout_write);
+            drop(stderr_write);
+            drop(stdin_write);
+            let mut process = launch?;
+            let status = process.wait();
+            drop(stdout_read);
+            drop(stderr_read);
+            status
         }
 
         fn derive_sid(moniker: &str) -> io::Result<OwnedSid> {
