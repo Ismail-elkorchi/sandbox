@@ -45,7 +45,7 @@ environment: {
 }
 ```
 
-The target never receives the entire Node environment by default. `minimal` creates the documented baseline; `empty` starts with no entries. Only valid portable variable names are accepted. Sensitive values contribute to the execution digest but do not appear in prepared summaries, enforcement reports, or normal error messages.
+The target never receives the entire Node environment by default. `minimal` creates the documented baseline; `empty` starts with no caller-controlled entries. Backends still set private home and temporary-directory variables. Windows also supplies the operating system's `SystemRoot`, which common Windows executables require during startup; it does not inherit the caller's profile path. Runtime-managed names cannot be overridden through the process environment. Only valid portable variable names are accepted. Sensitive values contribute to the execution digest but do not appear in prepared summaries, enforcement reports, or normal error messages.
 
 The trusted native runtime itself is launched with a fixed minimal environment, not the caller's ambient secrets.
 

@@ -2170,18 +2170,32 @@ fn verify_execution(execution: &PreparedExecution) -> Result<(), ErrorData> {
 fn target_environment(
     policy: &PreparedPolicy,
     execution: &PreparedExecution,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, ErrorData> {
     let mut values = execution
         .normalized
         .environment
         .iter()
         .map(|(name, value)| (name.clone(), value.value.clone()))
         .collect::<Vec<_>>();
+    #[cfg(not(target_os = "windows"))]
     values.retain(|(name, _)| {
         !matches!(
             name.as_str(),
             "HOME" | "TMPDIR" | "TEMP" | "TMP" | "LOCALAPPDATA"
         )
+    });
+    #[cfg(target_os = "windows")]
+    values.retain(|(name, _)| {
+        ![
+            "HOME",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "LOCALAPPDATA",
+            "SYSTEMROOT",
+        ]
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
     });
     values.push((
         "HOME".into(),
@@ -2203,13 +2217,43 @@ fn target_environment(
             "TMP".into(),
             policy.temporary.to_string_lossy().into_owned(),
         ));
+        values.push(("SystemRoot".into(), windows_directory()?));
     }
     #[cfg(target_os = "macos")]
     values.push((
         "TMPDIR".into(),
         policy.temporary.to_string_lossy().into_owned(),
     ));
-    values
+    Ok(values)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_directory() -> Result<String, ErrorData> {
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        // SAFETY: `buffer` is writable for its declared length and remains live for the call.
+        let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(os_error(
+                "spawn.system_root",
+                &io::Error::last_os_error(),
+                "spawn",
+            ));
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            return String::from_utf16(&buffer[..length]).map_err(|_| {
+                ErrorData::new(
+                    "spawn.system_root",
+                    "Windows returned an invalid system directory",
+                    "spawn",
+                )
+            });
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2272,7 +2316,7 @@ fn platform_spawn(
             ));
         }
     }
-    let environment = target_environment(policy, execution);
+    let environment = target_environment(policy, execution)?;
     let launch_result = {
         let authority = policy.authority.lock().map_err(|_| lock_error())?;
         let session = authority.session.as_ref().ok_or_else(|| {
@@ -2389,7 +2433,7 @@ fn platform_spawn(
         },
     )
     .map_err(|error| os_error("spawn.seatbelt_profile", &error, "spawn"))?;
-    let environment = target_environment(policy, execution);
+    let environment = target_environment(policy, execution)?;
     let launch =
         sandbox_launcher_macos::Process::spawn(&sandbox_launcher_macos::ProcessLaunchSpec {
             launcher_executable: &std::env::current_exe()

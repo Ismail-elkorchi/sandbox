@@ -37,7 +37,7 @@ test("Windows preview assigns an exact-handle AppContainer process to a Job befo
       );
       const observed = JSON.parse(await readFile(join(workspace, "result.json"), "utf8"));
       assert.deepEqual(observed.args, ["one two", "$(not-a-shell)"]);
-      assert.deepEqual(observed.env, ["HOME", "LOCALAPPDATA", "TEMP", "TMP"]);
+      assert.deepEqual(observed.env, ["HOME", "LOCALAPPDATA", "SystemRoot", "TEMP", "TMP"]);
       assert.equal(result.cleanup.completed, true);
     } finally {
       await sandbox.dispose();
@@ -61,7 +61,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
     try {
       const result = await sandbox.run(options(executable, workspace, [
         "-e",
-        "const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>{const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)']);require('fs').writeFileSync(process.argv[2],String(p.pid));setInterval(()=>{},1000)})",
+        "const n=require('net');const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)']);require('fs').writeFileSync(process.argv[2],String(p.pid));const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>setInterval(()=>{},1000))",
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 800, terminationGraceMs: 100 }));
@@ -195,7 +195,7 @@ function options(executable, workspace, args, resources = {}) {
       executable,
       args,
       cwd: workspace,
-      environment: { base: "empty", set: { SystemRoot: process.env.SystemRoot } },
+      environment: { base: "empty" },
     },
   };
 }
