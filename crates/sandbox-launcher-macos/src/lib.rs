@@ -209,7 +209,6 @@ mod macos {
             error_buffer: *mut *mut c_char,
         ) -> libc::c_int;
         fn sandbox_free_error(error_buffer: *mut c_char);
-        fn closefrom(low_fd: libc::c_int) -> libc::c_int;
     }
 
     pub struct LaunchSpec<'a> {
@@ -678,9 +677,19 @@ mod macos {
         if unsafe { libc::fcntl(status_fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             fail_child(status_fd, errno());
         }
-        // SAFETY: target gets only descriptors 0-2. Descriptor 3 reports setup and closes on exec;
-        // guardian lifeline and lifecycle descriptors start at 5 and are not inherited.
-        unsafe { closefrom(4) };
+        // `closefrom` is unavailable at the deployment target used by the ARM64 release build.
+        // The dedicated launcher has no other threads, and `getdtablesize` bounds every possible
+        // inherited descriptor without depending on that newer symbol.
+        // SAFETY: this fresh child owns its descriptor table and keeps only 0-3. Descriptor 3
+        // reports setup and closes on exec; close errors for absent descriptors are harmless.
+        let descriptor_limit = unsafe { libc::getdtablesize() };
+        if descriptor_limit < 0 {
+            fail_child(status_fd, errno());
+        }
+        for descriptor in 4..descriptor_limit {
+            // SAFETY: each integer is within the child's descriptor table; EBADF is ignored.
+            unsafe { libc::close(descriptor) };
+        }
         if unsafe { libc::setpgid(0, 0) } != 0 {
             fail_child(status_fd, errno());
         }

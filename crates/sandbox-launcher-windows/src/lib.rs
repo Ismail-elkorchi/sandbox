@@ -1115,21 +1115,36 @@ mod windows {
                 unsafe { LocalFree(descriptor) };
                 return Err(win32_error("GetExplicitEntriesFromAclW(test)", status));
             }
-            // SAFETY: the API returned `count` initialized entries in a LocalAlloc buffer.
-            let entries_slice = unsafe { std::slice::from_raw_parts(entries, count as usize) };
-            let matches = entries_slice
-                .iter()
-                .filter(|entry| {
-                    entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
-                        // SAFETY: SID-form trustees expose a valid SID pointer for this buffer.
-                        && unsafe {
-                            windows_sys::Win32::Security::EqualSid(
-                                entry.Trustee.ptstrName.cast(),
-                                sid,
-                            )
-                        } != 0
-                })
-                .count();
+            let matches = if count == 0 {
+                0
+            } else {
+                if entries.is_null() {
+                    // SAFETY: descriptor is LocalAlloc-owned and entries has no allocation.
+                    unsafe { LocalFree(descriptor) };
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ACL enumeration returned a positive count without entries",
+                    ));
+                }
+                // SAFETY: a positive count and successful API result establish a non-null buffer
+                // containing exactly `count` initialized entries.
+                let entries_slice = unsafe {
+                    std::slice::from_raw_parts(entries, usize::try_from(count).expect("u32 fits"))
+                };
+                entries_slice
+                    .iter()
+                    .filter(|entry| {
+                        entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
+                            // SAFETY: SID-form trustees expose a valid SID pointer for this buffer.
+                            && unsafe {
+                                windows_sys::Win32::Security::EqualSid(
+                                    entry.Trustee.ptstrName.cast(),
+                                    sid,
+                                )
+                            } != 0
+                    })
+                    .count()
+            };
             // SAFETY: both allocations were produced by Windows ACL APIs and are no longer used.
             unsafe {
                 LocalFree(entries.cast());
