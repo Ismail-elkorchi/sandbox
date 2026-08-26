@@ -191,7 +191,12 @@ function options(executable, workspace, args, resources = {}) {
       ],
     },
     resources,
-    process: { executable, args, cwd: workspace, environment: { base: "empty" } },
+    process: {
+      executable,
+      args,
+      cwd: workspace,
+      environment: { base: "empty", set: { SystemRoot: process.env.SystemRoot } },
+    },
   };
 }
 
