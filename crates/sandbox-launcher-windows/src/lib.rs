@@ -1020,6 +1020,72 @@ mod windows {
         use super::*;
 
         #[test]
+        fn appcontainer_process_smoke() {
+            if std::env::var_os("SANDBOX_APPCONTAINER_TEST_CHILD").is_some() {
+                return;
+            }
+
+            let (parent, workspace) = test_directories("process-smoke");
+            let executable = std::env::current_exe().expect("current test executable");
+            let executable_parent = executable.parent().expect("test executable parent");
+            let mut session = AppContainerSession::create(&parent).expect("create AppContainer");
+            session
+                .grant(executable_parent, GrantAccess::ReadExecute)
+                .expect("grant test executable tree");
+            session
+                .grant(&workspace, GrantAccess::ReadWrite)
+                .expect("grant working directory");
+
+            let (stdin_read, stdin_write) = pipe().expect("stdin pipe");
+            let (stdout_read, stdout_write) = pipe().expect("stdout pipe");
+            let (stderr_read, stderr_write) = pipe().expect("stderr pipe");
+            let args = vec![
+                "--exact".to_owned(),
+                "windows::tests::appcontainer_process_smoke".to_owned(),
+            ];
+            let environment = vec![("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned())];
+            let launch = session.launch_suspended(&LaunchSpec {
+                executable: &executable,
+                args: &args,
+                cwd: &workspace,
+                environment: &environment,
+                inherited_handles: &[stdin_read.0, stdout_write.0, stderr_write.0],
+                limits: JobLimits {
+                    memory_bytes: None,
+                    max_processes: Some(1),
+                },
+            });
+            drop(stdin_read);
+            drop(stdout_write);
+            drop(stderr_write);
+            drop(stdin_write);
+            let mut process = match launch {
+                Ok(process) => process,
+                Err(error) => {
+                    let report = session.cleanup();
+                    let _ = fs::remove_dir_all(&parent);
+                    let _ = fs::remove_dir_all(&workspace);
+                    panic!(
+                        "launch AppContainer test child: {error}; cleanup failures: {:?}",
+                        report.failures
+                    );
+                }
+            };
+            assert_eq!(process.wait().expect("wait for test child"), 0);
+            drop(stdout_read);
+            drop(stderr_read);
+
+            let report = session.cleanup();
+            assert!(
+                report.completed(),
+                "cleanup failures: {:?}",
+                report.failures
+            );
+            let _ = fs::remove_dir_all(&parent);
+            let _ = fs::remove_dir_all(&workspace);
+        }
+
+        #[test]
         fn cleanup_revokes_only_the_ephemeral_appcontainer_sid() {
             let (parent, workspace) = test_directories("exact-ace");
             let mut session = AppContainerSession::create(&parent).expect("create AppContainer");
@@ -1088,6 +1154,35 @@ mod windows {
             fs::create_dir(&parent).expect("create state parent");
             fs::create_dir(&workspace).expect("create workspace");
             (parent, workspace)
+        }
+
+        struct TestHandle(HANDLE);
+
+        impl Drop for TestHandle {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: this test helper uniquely owns the pipe endpoint.
+                    unsafe { CloseHandle(self.0) };
+                }
+            }
+        }
+
+        fn pipe() -> io::Result<(TestHandle, TestHandle)> {
+            let mut read = null_mut();
+            let mut write = null_mut();
+            let security = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+                nLength: size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: null_mut(),
+                bInheritHandle: 1,
+            };
+            // SAFETY: both output slots and the initialized security attributes remain live.
+            if unsafe {
+                windows_sys::Win32::System::Pipes::CreatePipe(&mut read, &mut write, &security, 0)
+            } == 0
+            {
+                return Err(last_error("CreatePipe(test)"));
+            }
+            Ok((TestHandle(read), TestHandle(write)))
         }
 
         fn derive_sid(moniker: &str) -> io::Result<OwnedSid> {
