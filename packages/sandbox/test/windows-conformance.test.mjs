@@ -30,7 +30,11 @@ test("Windows preview assigns an exact-handle AppContainer process to a Job befo
         executionDigest: prepared.executionDigest,
       });
       const result = await process_.wait();
-      assert.deepEqual(result.termination, { reason: "exit", code: 0 });
+      assert.deepEqual(
+        result.termination,
+        { reason: "exit", code: 0 },
+        result.stderr?.toString("utf8"),
+      );
       const observed = JSON.parse(await readFile(join(workspace, "result.json"), "utf8"));
       assert.deepEqual(observed.args, ["one two", "$(not-a-shell)"]);
       assert.deepEqual(observed.env, ["HOME", "LOCALAPPDATA", "TEMP", "TMP"]);
@@ -61,7 +65,11 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 800, terminationGraceMs: 100 }));
-      assert.equal(result.termination.reason, "timeout");
+      assert.equal(
+        result.termination.reason,
+        "timeout",
+        result.stderr?.toString("utf8"),
+      );
       const pid = Number(await readFile(join(workspace, "pid"), "utf8"));
       await new Promise((resolve) => setTimeout(resolve, 150));
       assert.throws(() => process.kill(pid, 0));
