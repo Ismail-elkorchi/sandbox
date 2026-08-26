@@ -1045,56 +1045,50 @@ mod windows {
                 .collect::<Vec<_>>();
             let variants = [
                 ("sentinel-only", &[][..]),
-                ("system-root", &["SystemRoot"][..]),
-                (
-                    "loader",
-                    &[
-                        "ComSpec",
-                        "OS",
-                        "Path",
-                        "PATHEXT",
-                        "SystemDrive",
-                        "SystemRoot",
-                        "windir",
-                    ][..],
-                ),
-                (
-                    "program-files",
-                    &[
-                        "ALLUSERSPROFILE",
-                        "CommonProgramFiles",
-                        "CommonProgramFiles(x86)",
-                        "CommonProgramW6432",
-                        "ComSpec",
-                        "OS",
-                        "Path",
-                        "PATHEXT",
-                        "ProgramData",
-                        "ProgramFiles",
-                        "ProgramFiles(x86)",
-                        "ProgramW6432",
-                        "SystemDrive",
-                        "SystemRoot",
-                        "windir",
-                    ][..],
-                ),
-                (
-                    "profile",
-                    &[
-                        "APPDATA",
-                        "HOMEDRIVE",
-                        "HOMEPATH",
-                        "LOCALAPPDATA",
-                        "SystemDrive",
-                        "SystemRoot",
-                        "USERPROFILE",
-                        "windir",
-                    ][..],
-                ),
+                ("local-app-data", &["LOCALAPPDATA"][..]),
+                ("user-profile", &["USERPROFILE"][..]),
+                ("app-data", &["APPDATA"][..]),
+                ("home-drive-path", &["HOMEDRIVE", "HOMEPATH"][..]),
+                ("local-and-system", &["LOCALAPPDATA", "SystemRoot"][..]),
             ];
             let mut outcomes = Vec::new();
             for (label, names) in variants {
                 let environment = selected_environment(&parent_environment, names);
+                outcomes.push((
+                    label,
+                    launch_test_child(&session, &executable, &args, &workspace, &environment),
+                ));
+            }
+            for (label, environment) in [
+                (
+                    "local-workspace",
+                    vec![
+                        (
+                            "LOCALAPPDATA".to_owned(),
+                            workspace.to_string_lossy().into_owned(),
+                        ),
+                        ("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()),
+                    ],
+                ),
+                (
+                    "private-profile",
+                    vec![
+                        (
+                            "APPDATA".to_owned(),
+                            workspace.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "LOCALAPPDATA".to_owned(),
+                            workspace.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "USERPROFILE".to_owned(),
+                            workspace.to_string_lossy().into_owned(),
+                        ),
+                        ("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()),
+                    ],
+                ),
+            ] {
                 outcomes.push((
                     label,
                     launch_test_child(&session, &executable, &args, &workspace, &environment),
