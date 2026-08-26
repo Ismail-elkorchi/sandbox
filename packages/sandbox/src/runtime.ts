@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdtemp, open, readFile, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough, Writable } from "node:stream";
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -93,10 +93,10 @@ interface VerifiedRuntime {
 
 async function locateAndVerifyExplicitRuntime(path: string, expected: string): Promise<VerifiedRuntime> {
   const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o022) !== 0) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixMode(metadata.mode)) {
     throw new SandboxRuntimeIntegrityError({
       code: "runtime_integrity.extension_file",
-      message: "extension runtime is not an immutable regular file",
+      message: "extension runtime is not a non-symbolic regular file with safe host permissions",
       phase: "probe",
       targetExecuted: false,
     });
@@ -113,6 +113,9 @@ async function locateAndVerifyExplicitRuntime(path: string, expected: string): P
       phase: "probe",
       targetExecuted: false,
     });
+  }
+  if (process.platform === "win32" || process.platform === "darwin") {
+    return snapshotVerifiedRuntime(path, bytes, file, false);
   }
   return { path, file };
 }
@@ -149,10 +152,10 @@ async function locateAndVerifyRuntime(): Promise<VerifiedRuntime> {
       platform: process.platform,
     });
   }
-  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o022) !== 0) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixMode(metadata.mode)) {
     throw new SandboxRuntimeIntegrityError({
       code: "runtime_integrity.file_type",
-      message: "bundled runtime must be a non-symbolic, non-group-writable regular file",
+      message: "bundled runtime must be a non-symbolic regular file with safe host permissions",
       phase: "probe",
       targetExecuted: false,
       platform: process.platform,
@@ -222,25 +225,41 @@ async function locateAndVerifyRuntime(): Promise<VerifiedRuntime> {
       });
     }
   }
-  if (process.platform === "win32") {
-    const snapshotDirectory = await mkdtemp(join(tmpdir(), "sandbox-runtime-snapshot-"));
-    const snapshotPath = join(snapshotDirectory, binaryName);
-    try {
-      await writeFile(snapshotPath, bytes, { flag: "wx", mode: 0o700 });
-      const snapshot = await open(snapshotPath, constants.O_RDONLY);
-      await file.close();
-      return {
-        path: snapshotPath,
-        file: snapshot,
-        cleanup: () => rm(snapshotDirectory, { recursive: true, force: true }),
-      };
-    } catch (error) {
-      await file.close();
-      await rm(snapshotDirectory, { recursive: true, force: true });
-      throw error;
-    }
+  if (process.platform === "win32" || process.platform === "darwin") {
+    return snapshotVerifiedRuntime(binaryPath, bytes, file, process.platform === "darwin");
   }
   return { path: binaryPath, file };
+}
+
+function hasUnsafePosixMode(mode: number): boolean {
+  return process.platform !== "win32" && (mode & 0o022) !== 0;
+}
+
+async function snapshotVerifiedRuntime(
+  sourcePath: string,
+  bytes: Buffer,
+  source: FileHandle,
+  verifySignature: boolean,
+): Promise<VerifiedRuntime> {
+  const snapshotDirectory = await mkdtemp(join(tmpdir(), "sandbox-runtime-snapshot-"));
+  const snapshotPath = join(snapshotDirectory, basename(sourcePath));
+  let snapshot: FileHandle | undefined;
+  try {
+    await writeFile(snapshotPath, bytes, { flag: "wx", mode: 0o700 });
+    if (verifySignature) await verifyMacCodeSignature(snapshotPath);
+    snapshot = await open(snapshotPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    await source.close();
+    return {
+      path: snapshotPath,
+      file: snapshot,
+      cleanup: () => rm(snapshotDirectory, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await snapshot?.close().catch(() => undefined);
+    await source.close().catch(() => undefined);
+    await rm(snapshotDirectory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function verifyMacCodeSignature(path: string): Promise<void> {
@@ -313,15 +332,11 @@ export class RuntimeClient {
 
   static async launch(locator: RuntimeLocator): Promise<RuntimeClient> {
     const runtime = await locator.locate();
-    const descriptorExecutionPath = process.platform === "linux"
-      ? "/proc/self/fd/3"
-      : process.platform === "darwin"
-        ? "/dev/fd/3"
-        : runtime.path;
+    const descriptorExecutionPath = process.platform === "linux" ? "/proc/self/fd/3" : runtime.path;
     const child = spawn(descriptorExecutionPath, [], {
-      stdio: process.platform === "win32"
-        ? ["pipe", "pipe", "pipe"] as const
-        : ["pipe", "pipe", "pipe", runtime.file.fd] as const,
+      stdio: process.platform === "linux"
+        ? ["pipe", "pipe", "pipe", runtime.file.fd] as const
+        : ["pipe", "pipe", "pipe"] as const,
       windowsHide: true,
       env: { LANG: "C", LC_ALL: "C" },
     });

@@ -11,8 +11,8 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -39,39 +39,39 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
       - run: npm ci
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor --all-targets -- -D warnings
+      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
-      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable
+      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-test-runtime
       - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/macos-conformance.test.mjs
 
   windows:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
       - run: npm ci
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor --all-targets -- -D warnings
+      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
-      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable
+      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-test-runtime
       - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/windows-conformance.test.mjs
 
   fuzz:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install nightly --profile minimal
       - run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz every required trust-boundary parser

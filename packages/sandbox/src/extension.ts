@@ -86,8 +86,12 @@ async function verifyRegularFile(path: string, expectedDigest: string): Promise<
   const metadata = await lstat(path).catch(() => {
     throw integrity("extension runtime is missing");
   });
-  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o022) !== 0) {
-    throw integrity("extension runtime must be a non-symbolic, non-group-writable regular file");
+  if (
+    !metadata.isFile()
+    || metadata.isSymbolicLink()
+    || (process.platform !== "win32" && (metadata.mode & 0o022) !== 0)
+  ) {
+    throw integrity("extension runtime must be a non-symbolic regular file with safe host permissions");
   }
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {

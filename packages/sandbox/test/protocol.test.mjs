@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import {
   FrameDecodeError,
   FrameDecoder,
@@ -13,6 +16,10 @@ import {
   encodeControlFrame,
 } from "../dist/protocol.js";
 import { RuntimeClient, RuntimeLocator } from "../dist/runtime.js";
+
+const execFile = promisify(execFileCallback);
+const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+let windowsFixtureBuild;
 
 test("framed protocol accepts partial headers and payloads", () => {
   const bytes = encodeControlFrame(MessageType.Hello, { protocolMajor: 1 });
@@ -135,7 +142,22 @@ test("runtime shutdown fails an active process that never produced a final resul
 
 async function fakeRuntime(mode) {
   const directory = await mkdtemp(join(tmpdir(), "sandbox-fake-runtime-"));
-  const runtimePath = join(directory, "runtime");
+  const runtimePath = join(directory, process.platform === "win32" ? `${mode}.exe` : "runtime");
+  if (process.platform === "win32") {
+    windowsFixtureBuild ??= execFile(
+      "cargo",
+      ["build", "-p", "sandbox-test-runtime", "--bin", "sandbox-protocol-fixture"],
+      { cwd: repository },
+    );
+    await windowsFixtureBuild;
+    await copyFile(join(repository, "target", "debug", "sandbox-protocol-fixture.exe"), runtimePath);
+    const bytes = await readFile(runtimePath);
+    return {
+      runtimePath,
+      runtimeDigest: createHash("sha256").update(bytes).digest("hex"),
+      cleanup: () => rm(directory, { recursive: true, force: true }),
+    };
+  }
   const source = `#!${process.execPath}
 const mode=${JSON.stringify(mode)};
 let buffered=Buffer.alloc(0);

@@ -398,6 +398,7 @@ name = "sandbox-test-runtime"
 version = "0.1.0"
 dependencies = [
  "sandbox-protocol",
+ "serde_json",
 ]
 
 [[package]]
