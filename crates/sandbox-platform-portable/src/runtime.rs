@@ -2177,13 +2177,24 @@ fn target_environment(
         .iter()
         .map(|(name, value)| (name.clone(), value.value.clone()))
         .collect::<Vec<_>>();
-    values.retain(|(name, _)| !matches!(name.as_str(), "HOME" | "TMPDIR" | "TEMP" | "TMP"));
+    values.retain(|(name, _)| {
+        !matches!(
+            name.as_str(),
+            "HOME" | "TMPDIR" | "TEMP" | "TMP" | "LOCALAPPDATA"
+        )
+    });
     values.push((
         "HOME".into(),
         policy.private_home.to_string_lossy().into_owned(),
     ));
     #[cfg(target_os = "windows")]
     {
+        // CreateProcessW requires LOCALAPPDATA while constructing an AppContainer token. Bind it
+        // to sandbox-owned storage instead of inheriting the host user's profile location.
+        values.push((
+            "LOCALAPPDATA".into(),
+            policy.private_home.to_string_lossy().into_owned(),
+        ));
         values.push((
             "TEMP".into(),
             policy.temporary.to_string_lossy().into_owned(),

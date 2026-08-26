@@ -1040,66 +1040,18 @@ mod windows {
                 "--exact".to_owned(),
                 "windows::tests::appcontainer_process_smoke".to_owned(),
             ];
-            let parent_environment = std::env::vars()
-                .filter(|(name, _)| !name.contains('='))
-                .collect::<Vec<_>>();
-            let variants = [
-                ("sentinel-only", &[][..]),
-                ("local-app-data", &["LOCALAPPDATA"][..]),
-                ("user-profile", &["USERPROFILE"][..]),
-                ("app-data", &["APPDATA"][..]),
-                ("home-drive-path", &["HOMEDRIVE", "HOMEPATH"][..]),
-                ("local-and-system", &["LOCALAPPDATA", "SystemRoot"][..]),
+            let environment = vec![
+                (
+                    "LOCALAPPDATA".to_owned(),
+                    workspace.to_string_lossy().into_owned(),
+                ),
+                ("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()),
             ];
-            let mut outcomes = Vec::new();
-            for (label, names) in variants {
-                let environment = selected_environment(&parent_environment, names);
-                outcomes.push((
-                    label,
-                    launch_test_child(&session, &executable, &args, &workspace, &environment),
-                ));
-            }
-            for (label, environment) in [
-                (
-                    "local-workspace",
-                    vec![
-                        (
-                            "LOCALAPPDATA".to_owned(),
-                            workspace.to_string_lossy().into_owned(),
-                        ),
-                        ("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()),
-                    ],
-                ),
-                (
-                    "private-profile",
-                    vec![
-                        (
-                            "APPDATA".to_owned(),
-                            workspace.to_string_lossy().into_owned(),
-                        ),
-                        (
-                            "LOCALAPPDATA".to_owned(),
-                            workspace.to_string_lossy().into_owned(),
-                        ),
-                        (
-                            "USERPROFILE".to_owned(),
-                            workspace.to_string_lossy().into_owned(),
-                        ),
-                        ("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()),
-                    ],
-                ),
-            ] {
-                outcomes.push((
-                    label,
-                    launch_test_child(&session, &executable, &args, &workspace, &environment),
-                ));
-            }
-            let mut full_environment = parent_environment;
-            full_environment.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
-            outcomes.push((
-                "full",
-                launch_test_child(&session, &executable, &args, &workspace, &full_environment),
-            ));
+            assert_eq!(
+                launch_test_child(&session, &executable, &args, &workspace, &environment)
+                    .expect("launch AppContainer child with private profile storage"),
+                0
+            );
 
             let report = session.cleanup();
             assert!(
@@ -1109,7 +1061,6 @@ mod windows {
             );
             let _ = fs::remove_dir_all(&parent);
             let _ = fs::remove_dir_all(&workspace);
-            panic!("AppContainer environment outcomes: {outcomes:?}");
         }
 
         #[test]
@@ -1210,23 +1161,6 @@ mod windows {
                 return Err(last_error("CreatePipe(test)"));
             }
             Ok((TestHandle(read), TestHandle(write)))
-        }
-
-        fn selected_environment(
-            parent: &[(String, String)],
-            names: &[&str],
-        ) -> Vec<(String, String)> {
-            let mut selected = parent
-                .iter()
-                .filter(|(name, _)| {
-                    names
-                        .iter()
-                        .any(|expected| name.eq_ignore_ascii_case(expected))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            selected.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
-            selected
         }
 
         fn launch_test_child(

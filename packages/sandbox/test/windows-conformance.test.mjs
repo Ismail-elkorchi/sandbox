@@ -33,7 +33,7 @@ test("Windows preview assigns an exact-handle AppContainer process to a Job befo
       assert.deepEqual(result.termination, { reason: "exit", code: 0 });
       const observed = JSON.parse(await readFile(join(workspace, "result.json"), "utf8"));
       assert.deepEqual(observed.args, ["one two", "$(not-a-shell)"]);
-      assert.deepEqual(observed.env, ["HOME", "TEMP", "TMP"]);
+      assert.deepEqual(observed.env, ["HOME", "LOCALAPPDATA", "TEMP", "TMP"]);
       assert.equal(result.cleanup.completed, true);
     } finally {
       await sandbox.dispose();
