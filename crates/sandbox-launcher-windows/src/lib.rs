@@ -29,7 +29,14 @@ pub fn encode_windows_environment(values: &[(String, String)]) -> Result<Vec<u16
     sorted.sort_by_key(|left| left.0.to_uppercase());
     let mut block = Vec::new();
     for (name, value) in sorted {
-        if name.contains(['\0', '=']) || value.contains('\0') {
+        let drive_current_directory = name.len() == 3
+            && name.starts_with('=')
+            && name.ends_with(':')
+            && name.as_bytes()[1].is_ascii_alphabetic();
+        if name.contains('\0')
+            || (name.contains('=') && !drive_current_directory)
+            || value.contains('\0')
+        {
             return Err("invalid environment entry");
         }
         block.extend(format!("{name}={value}").encode_utf16());
@@ -377,7 +384,7 @@ mod windows {
             let executable = wide_os(spec.executable.as_os_str());
             let cwd = wide_os(spec.cwd.as_os_str());
             let mut command_line = wide(&windows_command_line(spec.executable, spec.args));
-            let environment = environment_block(spec.environment)?;
+            let environment = environment_block(spec.environment, spec.cwd)?;
             // SAFETY: PROCESS_INFORMATION is an output-only plain Win32 structure.
             let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
             // SAFETY: all pointers reference initialized, live buffers; inherited handles are
@@ -955,8 +962,26 @@ mod windows {
         result >= 0 || matches!(result as u32, 0x8007_0002 | 0x8007_0490)
     }
 
-    fn environment_block(values: &[(String, String)]) -> io::Result<Vec<u16>> {
-        encode_windows_environment(values)
+    pub(super) fn environment_block(
+        values: &[(String, String)],
+        cwd: &Path,
+    ) -> io::Result<Vec<u16>> {
+        use std::path::{Component, Prefix};
+
+        let mut values = values.to_vec();
+        if let Some(Component::Prefix(prefix)) = cwd.components().next()
+            && let Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) = prefix.kind()
+        {
+            // CreateProcessW does not add the hidden per-drive current-directory entry when a
+            // custom environment block is supplied. Keep it launch-internal: Windows consumes
+            // this `=C:`-style entry for drive-relative path resolution, while policy-visible
+            // environment names remain exactly those requested by the caller.
+            values.push((
+                format!("={}:", char::from(drive).to_ascii_uppercase()),
+                cwd.to_string_lossy().into_owned(),
+            ));
+        }
+        encode_windows_environment(&values)
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))
     }
 
@@ -1187,6 +1212,28 @@ mod tests {
         let expected: Vec<u16> = "A=1\0z=2\0\0".encode_utf16().collect();
         assert_eq!(block, expected);
         assert!(encode_windows_environment(&[("BAD=NAME".into(), "x".into())]).is_err());
+        let drive = encode_windows_environment(&[("=c:".into(), r"C:\workspace".into())])
+            .expect("drive current-directory entry");
+        assert_eq!(
+            drive,
+            "=c:=C:\\workspace\0\0".encode_utf16().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn launch_environment_adds_the_working_drive_without_exposing_parent_state() {
+        let block = windows::environment_block(
+            &[("HOME".into(), r"C:\private".into())],
+            std::path::Path::new(r"d:\work"),
+        )
+        .expect("environment block");
+        assert_eq!(
+            block,
+            "=D:=d:\\work\0HOME=C:\\private\0\0"
+                .encode_utf16()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[cfg(target_os = "windows")]
