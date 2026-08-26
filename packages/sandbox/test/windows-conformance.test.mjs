@@ -14,7 +14,7 @@ test("Windows preview assigns an exact-handle AppContainer process to a Job befo
   const before = new Set((await readdir(tmpdir())).filter((name) => name.startsWith("sandbox-appcontainer-")));
   try {
     const executable = await realpath(process.execPath);
-    const sandbox = await createSandbox();
+    const sandbox = await createSandbox({ allowExperimentalBackends: true });
     try {
       const prepared = await sandbox.prepareRun(options(executable, workspace, [
         "-e",
@@ -53,7 +53,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
     const address = server.address();
     assert.equal(typeof address, "object");
     const executable = await realpath(process.execPath);
-    const sandbox = await createSandbox();
+    const sandbox = await createSandbox({ allowExperimentalBackends: true });
     try {
       const result = await sandbox.run(options(executable, workspace, [
         "-e",
@@ -79,7 +79,7 @@ test("Windows preview rejects hard links, junctions, case collisions, and device
   const workspace = await mkdtemp(join(tmpdir(), "sandbox-windows-paths-"));
   const outside = await mkdtemp(join(tmpdir(), "sandbox-windows-outside-"));
   const executable = await realpath(process.execPath);
-  const sandbox = await createSandbox();
+  const sandbox = await createSandbox({ allowExperimentalBackends: true });
   try {
     await writeFile(join(outside, "secret"), "preserved");
     const junction = join(workspace, "junction");
@@ -134,7 +134,7 @@ test("Windows preparation cancellation proves the target never ran", { skip: !su
   try {
     const executable = await realpath(process.execPath);
     const sentinel = join(workspace, "sentinel");
-    const sandbox = await createSandbox();
+    const sandbox = await createSandbox({ allowExperimentalBackends: true });
     try {
       const prepared = await sandbox.prepareRun(options(executable, workspace, [
         "-e",
