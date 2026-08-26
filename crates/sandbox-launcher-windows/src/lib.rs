@@ -1043,7 +1043,10 @@ mod windows {
                 "--exact".to_owned(),
                 "windows::tests::appcontainer_process_smoke".to_owned(),
             ];
-            let environment = vec![("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned())];
+            let mut environment = std::env::vars()
+                .filter(|(name, _)| !name.contains('='))
+                .collect::<Vec<_>>();
+            environment.push(("SANDBOX_APPCONTAINER_TEST_CHILD".to_owned(), "1".to_owned()));
             let launch = session.launch_suspended(&LaunchSpec {
                 executable: &executable,
                 args: &args,
