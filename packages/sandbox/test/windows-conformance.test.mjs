@@ -10,7 +10,7 @@ import { createSandbox } from "../dist/index.js";
 const supported = process.platform === "win32" && await backendAvailable("windows-appcontainer-v1");
 
 test("Windows preview assigns an exact-handle AppContainer process to a Job before resume", { skip: !supported }, async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "sandbox-windows-"));
+  const workspace = await temporaryDirectory("sandbox-windows-");
   const before = new Set((await readdir(tmpdir())).filter((name) => name.startsWith("sandbox-appcontainer-")));
   try {
     const executable = await realpath(process.execPath);
@@ -46,7 +46,7 @@ test("Windows preview assigns an exact-handle AppContainer process to a Job befo
 });
 
 test("Windows preview denies loopback and Job close kills descendants", { skip: !supported }, async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "sandbox-windows-tree-"));
+  const workspace = await temporaryDirectory("sandbox-windows-tree-");
   const server = createServer(() => {});
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
   try {
@@ -76,8 +76,8 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
 });
 
 test("Windows preview rejects hard links, junctions, case collisions, and device-name ambiguity", { skip: !supported }, async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "sandbox-windows-paths-"));
-  const outside = await mkdtemp(join(tmpdir(), "sandbox-windows-outside-"));
+  const workspace = await temporaryDirectory("sandbox-windows-paths-");
+  const outside = await temporaryDirectory("sandbox-windows-outside-");
   const executable = await realpath(process.execPath);
   const sandbox = await createSandbox({ allowExperimentalBackends: true });
   try {
@@ -130,7 +130,7 @@ test("Windows preview rejects hard links, junctions, case collisions, and device
 });
 
 test("Windows preparation cancellation proves the target never ran", { skip: !supported }, async () => {
-  const workspace = await mkdtemp(join(tmpdir(), "sandbox-windows-cancel-"));
+  const workspace = await temporaryDirectory("sandbox-windows-cancel-");
   try {
     const executable = await realpath(process.execPath);
     const sentinel = join(workspace, "sentinel");
@@ -189,6 +189,10 @@ function options(executable, workspace, args, resources = {}) {
 
 function fact(prepared, id) {
   return prepared.enforcement.guarantees.find((value) => value.id === id)?.status;
+}
+
+async function temporaryDirectory(prefix) {
+  return realpath(await mkdtemp(join(tmpdir(), prefix)));
 }
 
 async function backendAvailable(id) {
