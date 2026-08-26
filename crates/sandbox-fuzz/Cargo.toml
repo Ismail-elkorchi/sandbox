@@ -1,0 +1,15 @@
+[package]
+name = "sandbox-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-fuzz-smoke"
+path = "src/main.rs"
+
+[dependencies]
+sandbox-policy = { path = "../sandbox-policy" }
+sandbox-protocol = { path = "../sandbox-protocol" }
+serde_json.workspace = true

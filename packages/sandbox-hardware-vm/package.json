@@ -1,0 +1,46 @@
+{
+  "name": "@ismail-elkorchi/sandbox-hardware-vm",
+  "version": "0.1.0",
+  "description": "Experimental Firecracker hardware-VM extension for @ismail-elkorchi/sandbox",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ismail-elkorchi/sandbox.git",
+    "directory": "packages/sandbox-hardware-vm"
+  },
+  "homepage": "https://github.com/Ismail-elkorchi/sandbox#readme",
+  "bugs": {
+    "url": "https://github.com/Ismail-elkorchi/sandbox/issues"
+  },
+  "keywords": [
+    "sandbox",
+    "firecracker",
+    "microvm",
+    "kvm",
+    "security"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "native",
+    "images",
+    "LICENSE",
+    "SBOM.cdx.json",
+    "THIRD-PARTY"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {}
+}

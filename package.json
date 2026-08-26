@@ -1,0 +1,40 @@
+{
+  "name": "verifiable-sandbox-runtime",
+  "private": true,
+  "description": "Fail-closed, policy-driven sandbox runtimes for Node.js",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ismail-elkorchi/sandbox.git"
+  },
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build:native && npm run build:ts",
+    "build:native": "node scripts/build-native.ts",
+    "build:ts": "tsc -b && tsc -p scripts/tsconfig.json",
+    "check": "tsc -b --pretty false && tsc -p scripts/tsconfig.json --pretty false && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "test": "npm run build && node --test packages/sandbox/test/*.test.mjs && cargo test --workspace",
+    "test:rust": "cargo test --workspace",
+    "test:ts": "node --test packages/sandbox/test/*.test.mjs",
+    "verify:native": "node scripts/verify-native.ts",
+    "fuzz:smoke": "cargo run -p sandbox-fuzz --release --bin sandbox-fuzz-smoke -- 25000",
+    "fetch:firecracker": "node scripts/fetch-firecracker.ts",
+    "build:guest-image": "node scripts/build-guest-image.ts",
+    "build:vm-native": "node scripts/build-vm-native.ts",
+    "package": "node scripts/package.ts",
+    "test:package": "node scripts/test-package.ts",
+    "audit:licenses": "node scripts/check-licenses.ts",
+    "audit:unsafe": "node scripts/check-unsafe.ts",
+    "supply-chain": "node scripts/generate-supply-chain.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

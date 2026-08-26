@@ -1,0 +1,11 @@
+{
+  "formatVersion": 1,
+  "buildId": "sandbox-hardware-vm-0.1.0",
+  "files": {
+    "linux-x64/extension.json": "d2fd4376bf616eff2863a847b61e8a189f0f77f2d234e45fa2eadc3d64386258",
+    "linux-x64/sandbox-vm-runtime-linux-x64": "0251c1f5919a3a7f38bad894c965c476649e442a520da18649711e7efd839299",
+    "linux-x64/firecracker-v1.16.1-x86_64": "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7",
+    "linux-x64/empty-workspace.ext4": "b8dfaaeb837dd7d51eee06ebbb953615cbb3ebdb7b5f5356843a77905f39c0ae",
+    "images/minimal-x64/manifest.json": "544ce1f52870f4e6bba95f918b68b60be853a97969a6f10ef0a6a85591d3762d"
+  }
+}

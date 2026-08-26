@@ -1,0 +1,90 @@
+name: release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: linux-x64
+          - runner: ubuntu-24.04-arm
+            artifact: linux-arm64
+          - runner: macos-13
+            artifact: macos-x64
+          - runner: macos-14
+            artifact: macos-arm64
+          - runner: windows-2025
+            artifact: windows-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: rustup toolchain install stable --profile minimal
+      - if: startsWith(matrix.artifact, 'linux-')
+        run: rustup target add ${{ matrix.artifact == 'linux-x64' && 'x86_64-unknown-linux-musl' || 'aarch64-unknown-linux-musl' }}
+      - run: npm run build:ts
+      - run: npm run build:native
+      - run: node --test packages/sandbox/test/protocol.test.mjs
+      - if: startsWith(matrix.artifact, 'macos-')
+        run: node --test packages/sandbox/test/macos-conformance.test.mjs
+      - if: startsWith(matrix.artifact, 'windows-')
+        run: node --test packages/sandbox/test/windows-conformance.test.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.artifact }}
+          path: packages/sandbox/native/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  assemble:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: staged-runtimes
+      - name: Assemble platform directories
+        shell: bash
+        run: |
+          for directory in staged-runtimes/runtime-*; do
+            platform="${directory##*/runtime-}"
+            mkdir -p "packages/sandbox/native/$platform"
+            cp -a "$directory/." "packages/sandbox/native/$platform/"
+          done
+      - run: node scripts/rebuild-native-manifest.ts
+      - run: npm run build:ts
+      - run: npm run verify:native
+      - run: npm run supply-chain
+      - run: npm run test:package
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs-and-supply-chain
+          path: |
+            release/*.tgz
+            packages/sandbox/SBOM.cdx.json
+            packages/sandbox/THIRD-PARTY
+            packages/sandbox-hardware-vm/SBOM.cdx.json
+            packages/sandbox-hardware-vm/THIRD-PARTY
+            Cargo.lock
+            package-lock.json
+          if-no-files-found: error

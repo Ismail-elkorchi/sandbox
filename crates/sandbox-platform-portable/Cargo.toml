@@ -1,0 +1,29 @@
+[package]
+name = "sandbox-platform-portable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sandbox-digest = { path = "../sandbox-digest" }
+sandbox-policy = { path = "../sandbox-policy" }
+sandbox-protocol = { path = "../sandbox-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sandbox-launcher-windows = { path = "../sandbox-launcher-windows" }
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+sandbox-launcher-macos = { path = "../sandbox-launcher-macos" }

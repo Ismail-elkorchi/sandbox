@@ -1,0 +1,28 @@
+{
+  "formatVersion": 1,
+  "id": "sandbox-minimal",
+  "version": "0.1.0",
+  "architecture": "x64",
+  "kernel": {
+    "path": "vmlinux-6.1.177",
+    "sha256": "18beee8e4b355140e637f5d2360cdf23b11a8979edbefacb3941b1ad28158f34"
+  },
+  "rootfs": {
+    "path": "minimal-rootfs.ext4",
+    "sha256": "783423a7b7da79d9da9eeee5c1df5f62583b7681c8f26c01b69ea944908b7d11",
+    "format": "ext4"
+  },
+  "guestAgent": {
+    "version": "0.1.0",
+    "protocolMajor": 1,
+    "protocolMinor": 6,
+    "sha256": "2b976f8beebfa465cbaa13d8ab21e13866f5a8928d96345c825ef024073b4a1d"
+  },
+  "capabilities": {
+    "overlayfs": false,
+    "vsock": true,
+    "seccomp": true,
+    "cgroupV2": true
+  },
+  "signature": "e89dc08853c6932e6c3f53374e7548aebe8b8d521b52e9b378c1684669c1d231cc892b7cf648eecdba01edf7f2476da5b263ec9c1ea7e6d94da3e1b6a973e209"
+}

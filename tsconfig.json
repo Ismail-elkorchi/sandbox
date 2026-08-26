@@ -1,0 +1,7 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/sandbox" },
+    { "path": "./packages/sandbox-hardware-vm" }
+  ]
+}

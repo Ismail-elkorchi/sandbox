@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+  "crates/sandbox-protocol",
+  "crates/sandbox-digest",
+  "crates/sandbox-policy",
+  "crates/sandbox-platform",
+  "crates/sandbox-launcher-linux",
+  "crates/sandbox-supervisor",
+  "crates/sandbox-test-runtime",
+  "crates/sandbox-network-broker",
+  "crates/sandbox-fuzz",
+  "crates/sandbox-launcher-windows",
+  "crates/sandbox-launcher-macos",
+  "crates/sandbox-platform-portable",
+  "crates/sandbox-image",
+  "crates/sandbox-vm",
+  "crates/sandbox-guest",
+  "crates/sandbox-vm-runtime",
+  "crates/sandbox-conformance-target",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+libc = "=0.2.177"
+serde = { version = "=1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.145", default-features = false, features = ["std"] }
+sha2 = { version = "=0.10.9", default-features = false, features = ["std"] }
+windows-sys = "=0.61.2"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+idna = { version = "=1.1.0", default-features = false, features = ["std", "compiled_data"] }
+
+[profile.release]
+panic = "abort"
+overflow-checks = true
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

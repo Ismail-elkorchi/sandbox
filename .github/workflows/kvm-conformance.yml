@@ -1,0 +1,30 @@
+name: KVM conformance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  firecracker:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: test -r /dev/kvm && test -w /dev/kvm
+      - run: npm run build:ts
+      - run: npm run verify:native
+      - run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release -p sandbox-conformance-target --target x86_64-unknown-linux-musl
+      - run: node --test packages/sandbox/test/hardware-vm-conformance.test.mjs
+        env:
+          SANDBOX_VM_CONFORMANCE_TARGET: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/sandbox-conformance-target

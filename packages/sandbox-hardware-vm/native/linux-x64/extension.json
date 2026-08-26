@@ -1,0 +1,34 @@
+{
+  "formatVersion": 1,
+  "kind": "hardware-vm",
+  "protocol": {
+    "minimumMajor": 1,
+    "maximumMajor": 1
+  },
+  "hosts": [
+    {
+      "platform": "linux",
+      "architecture": "x64"
+    }
+  ],
+  "runtime": {
+    "path": "sandbox-vm-runtime-linux-x64",
+    "sha256": "0251c1f5919a3a7f38bad894c965c476649e442a520da18649711e7efd839299"
+  },
+  "vmm": {
+    "name": "Firecracker",
+    "version": "v1.16.1",
+    "path": "firecracker-v1.16.1-x86_64",
+    "sha256": "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7"
+  },
+  "workspaceTemplate": {
+    "path": "empty-workspace.ext4",
+    "sha256": "b8dfaaeb837dd7d51eee06ebbb953615cbb3ebdb7b5f5356843a77905f39c0ae"
+  },
+  "imageTrust": {
+    "explicitLocal": true,
+    "bundledManifestDigests": [
+      "544ce1f52870f4e6bba95f918b68b60be853a97969a6f10ef0a6a85591d3762d"
+    ]
+  }
+}

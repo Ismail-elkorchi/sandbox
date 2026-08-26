@@ -1,0 +1,5 @@
+*.ext4 binary
+packages/**/vmlinux-* binary
+packages/**/sandbox-runtime-* binary
+packages/**/sandbox-vm-runtime-* binary
+packages/**/firecracker-* binary

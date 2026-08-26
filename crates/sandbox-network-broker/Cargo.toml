@@ -1,0 +1,9 @@
+[package]
+name = "sandbox-network-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sandbox-policy = { path = "../sandbox-policy" }

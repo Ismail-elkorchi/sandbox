@@ -1,0 +1,15 @@
+{
+  "id": "linux-namespace-v1-conformance-1",
+  "backend": "linux-namespace-v1",
+  "version": "0.1.0",
+  "boundary": "os-process",
+  "stable": true,
+  "suites": [
+    "preparation",
+    "filesystem",
+    "process-ipc",
+    "network-none",
+    "resources",
+    "cleanup"
+  ]
+}

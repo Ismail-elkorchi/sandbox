@@ -1,0 +1,134 @@
+[package]
+name = "sandbox-cargo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.145"
+sandbox-digest = { path = "../crates/sandbox-digest" }
+sandbox-guest = { path = "../crates/sandbox-guest" }
+sandbox-image = { path = "../crates/sandbox-image" }
+sandbox-launcher-windows = { path = "../crates/sandbox-launcher-windows" }
+sandbox-network-broker = { path = "../crates/sandbox-network-broker" }
+sandbox-platform = { path = "../crates/sandbox-platform" }
+sandbox-policy = { path = "../crates/sandbox-policy" }
+sandbox-protocol = { path = "../crates/sandbox-protocol" }
+sandbox-vm = { path = "../crates/sandbox-vm" }
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths"
+path = "fuzz_targets/paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "changesets"
+path = "fuzz_targets/changesets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_messages"
+path = "fuzz_targets/control_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_digest"
+path = "fuzz_targets/canonical_digest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_paths"
+path = "fuzz_targets/host_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "environment_block"
+path = "fuzz_targets/environment_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows_arguments"
+path = "fuzz_targets/windows_arguments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "network_rules"
+path = "fuzz_targets/network_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks5"
+path = "fuzz_targets/socks5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_connect"
+path = "fuzz_targets/http_connect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_manifest"
+path = "fuzz_targets/image_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guest_protocol"
+path = "fuzz_targets/guest_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "artifact_manifest"
+path = "fuzz_targets/artifact_manifest.rs"
+test = false
+doc = false
+bench = false

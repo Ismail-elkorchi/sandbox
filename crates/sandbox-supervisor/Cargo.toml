@@ -1,0 +1,23 @@
+[package]
+name = "sandbox-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-runtime"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
+sandbox-network-broker = { path = "../sandbox-network-broker" }
+sandbox-platform = { path = "../sandbox-platform" }
+sandbox-policy = { path = "../sandbox-policy" }
+sandbox-protocol = { path = "../sandbox-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+sandbox-platform-portable = { path = "../sandbox-platform-portable" }

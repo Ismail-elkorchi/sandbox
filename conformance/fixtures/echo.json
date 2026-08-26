@@ -1,0 +1,9 @@
+{
+  "name": "exact-arguments",
+  "process": {
+    "executable": "/bin/printf",
+    "args": ["%s|%s", "one two", "$(not-a-shell)"],
+    "cwd": "/"
+  },
+  "expectedStdoutUtf8": "one two|$(not-a-shell)"
+}

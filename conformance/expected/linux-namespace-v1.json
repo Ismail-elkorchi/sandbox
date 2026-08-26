@@ -1,0 +1,12 @@
+{
+  "backend": "linux-namespace-v1",
+  "requiredFacts": [
+    "runtime.setup-before-exec",
+    "runtime.executable-identity-bound",
+    "filesystem.grant-roots-identity-bound",
+    "filesystem.read-confined",
+    "process.complete-tree-termination",
+    "resource.wall-time-hard",
+    "resource.output-hard"
+  ]
+}

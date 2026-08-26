@@ -1,0 +1,23 @@
+[package]
+name = "sandbox-vm-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-vm-runtime"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+sandbox-digest = { path = "../sandbox-digest" }
+sandbox-guest = { path = "../sandbox-guest" }
+sandbox-image = { path = "../sandbox-image" }
+sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
+sandbox-policy = { path = "../sandbox-policy" }
+sandbox-protocol = { path = "../sandbox-protocol" }
+sandbox-vm = { path = "../sandbox-vm" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
