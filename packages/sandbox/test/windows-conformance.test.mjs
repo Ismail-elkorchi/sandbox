@@ -65,10 +65,10 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
-      assert.equal(
-        result.termination.reason,
-        "timeout",
-        result.stderr?.toString("utf8"),
+      assert.deepEqual(
+        result.termination,
+        { reason: "timeout" },
+        `${JSON.stringify(result.termination)}\n${result.stderr?.toString("utf8") ?? ""}`,
       );
       const descendant = await readFile(join(workspace, "pid"), "utf8");
       assert.match(descendant, /^\d+$/);
