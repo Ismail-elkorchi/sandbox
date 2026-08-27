@@ -61,7 +61,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
     try {
       const result = await sandbox.run(options(executable, workspace, [
         "-e",
-        "const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});require('fs').writeFileSync(process.argv[2],String(p.pid));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));setInterval(()=>{},1000)",
+        "const f=require('fs');const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});f.writeFileSync(process.argv[2],String(p.pid));p.once('error',e=>f.writeFileSync(process.argv[2],`error:${e.code}:${e.errno}`));p.once('exit',c=>f.writeFileSync(process.argv[2],`exit:${c}`));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));setInterval(()=>{},1000)",
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
@@ -71,7 +71,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         `${JSON.stringify(result.termination)}\n${result.stderr?.toString("utf8") ?? ""}`,
       );
       const descendant = await readFile(join(workspace, "pid"), "utf8");
-      assert.match(descendant, /^\d+$/);
+      assert.match(descendant, /^\d+$/, `descendant state: ${descendant}`);
       const pid = Number(descendant);
       await new Promise((resolve) => setTimeout(resolve, 150));
       assert.throws(() => process.kill(pid, 0));
