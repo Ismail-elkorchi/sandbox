@@ -64,7 +64,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         "const n=require('net');const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)']);require('fs').writeFileSync(process.argv[2],String(p.pid));const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>setInterval(()=>{},1000))",
         String(address.port),
         join(workspace, "pid"),
-      ], { wallTimeMs: 800, terminationGraceMs: 100 }));
+      ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
       assert.equal(
         result.termination.reason,
         "timeout",
