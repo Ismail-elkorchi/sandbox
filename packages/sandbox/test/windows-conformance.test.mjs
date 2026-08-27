@@ -65,12 +65,12 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
+      const descendant = await readFile(join(workspace, "pid"), "utf8");
       assert.deepEqual(
         result.termination,
         { reason: "timeout" },
-        `${JSON.stringify(result.termination)}\n${result.stderr?.toString("utf8") ?? ""}`,
+        `${JSON.stringify(result.termination)}; descendant state: ${descendant}\n${result.stderr?.toString("utf8") ?? ""}`,
       );
-      const descendant = await readFile(join(workspace, "pid"), "utf8");
       assert.match(descendant, /^\d+$/, `descendant state: ${descendant}`);
       const pid = Number(descendant);
       await new Promise((resolve) => setTimeout(resolve, 150));
