@@ -61,7 +61,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
     try {
       const result = await sandbox.run(options(executable, workspace, [
         "-e",
-        "const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)']);require('fs').writeFileSync(process.argv[2],String(p.pid));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>setInterval(()=>{},1000))",
+        "const f=require('fs');f.writeFileSync(process.argv[2],'started');const cp=require('child_process');f.writeFileSync(process.argv[2],'loaded');const p=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)']);f.writeFileSync(process.argv[2],String(p.pid));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>setInterval(()=>{},1000))",
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
@@ -70,7 +70,9 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
         "timeout",
         result.stderr?.toString("utf8"),
       );
-      const pid = Number(await readFile(join(workspace, "pid"), "utf8"));
+      const descendant = await readFile(join(workspace, "pid"), "utf8");
+      assert.match(descendant, /^\d+$/, `descendant startup stopped at: ${descendant}`);
+      const pid = Number(descendant);
       await new Promise((resolve) => setTimeout(resolve, 150));
       assert.throws(() => process.kill(pid, 0));
       assert.equal(result.cleanup.completed, true);
