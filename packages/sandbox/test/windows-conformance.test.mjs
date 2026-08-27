@@ -61,7 +61,7 @@ test("Windows preview denies loopback and Job close kills descendants", { skip: 
     try {
       const result = await sandbox.run(options(executable, workspace, [
         "-e",
-        "const f=require('fs');const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});f.writeFileSync(process.argv[2],String(p.pid));p.once('error',e=>f.writeFileSync(process.argv[2],`error:${e.code}:${e.errno}`));p.once('exit',c=>f.writeFileSync(process.argv[2],`exit:${c}`));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));setInterval(()=>{},1000)",
+        "const f=require('fs');const p=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});f.writeFileSync(process.argv[2],String(p.pid));p.once('error',e=>f.writeFileSync(process.argv[2],`error:${e.code}:${e.errno}`));p.once('exit',c=>f.writeFileSync(process.argv[2],`exit:${c}`));const n=require('net');const c=n.connect(+process.argv[1],'127.0.0.1');c.once('connect',()=>process.exit(91));c.once('error',()=>{});setInterval(()=>{},1000)",
         String(address.port),
         join(workspace, "pid"),
       ], { wallTimeMs: 3_000, terminationGraceMs: 100 }));
