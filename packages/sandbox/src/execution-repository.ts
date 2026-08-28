@@ -36,6 +36,9 @@ import type {
 const EMPTY_OUTPUT: SandboxExecutionOutput = Object.freeze({
   cursorStart: 0,
   cursorEnd: 0,
+  availableCursorEnd: 0,
+  stdoutBytes: 0,
+  stderrBytes: 0,
   cursorExpired: false,
   chunks: Object.freeze([]),
 });
@@ -62,7 +65,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     this.identity = repositoryIdentity(root);
   }
 
-  async admit(request: SandboxExecutionRequest, query: SandboxExecutionQuery = {}): Promise<SandboxExecutionObservation> {
+  async prepare(request: SandboxExecutionRequest, query: SandboxExecutionQuery = {}): Promise<SandboxExecutionObservation> {
     this.#ensureOpen();
     if (typeof request !== "object" || request === null) throw new TypeError("Sandbox execution request must be an object.");
     validateExecutionId(request.executionId);
@@ -82,7 +85,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     const createdAtMs = Date.now();
     await writeRecord(directory, {
       schemaVersion: 1,
-      phase: "starting",
+      phase: "preparing",
       executionId: request.executionId,
       requestDigest,
       createdAtMs,
@@ -104,7 +107,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     }
     await writeRecord(directory, {
       schemaVersion: 1,
-      phase: "starting",
+      phase: "preparing",
       executionId: request.executionId,
       requestDigest,
       createdAtMs,
@@ -181,13 +184,18 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
       }
       if (record.phase === "rejected") return Object.freeze({ kind: "rejected", executionId, requestDigest: record.requestDigest, error: record.error, output });
       if (record.phase === "unknown") return unknown(executionId, "execution-host-unreachable", record.diagnostic, record.requestDigest, output);
+      if (record.phase === "prepared") return Object.freeze({
+        kind: "prepared", executionId, requestDigest: record.requestDigest,
+        policyDigest: record.policyDigest, executionDigest: record.executionDigest,
+        summary: record.summary, enforcement: record.enforcement, expiresAtMs: record.expiresAtMs, output,
+      });
 
       const signature = `${record.phase}:${output.cursorEnd}`;
       if (initialSignature.length === 0) initialSignature = signature;
       else if (signature !== initialSignature) {
         return record.phase === "running"
           ? Object.freeze({ kind: "running", executionId, requestDigest: record.requestDigest, processId: record.processId, output })
-          : Object.freeze({ kind: "starting", executionId, requestDigest: record.requestDigest, output });
+          : Object.freeze({ kind: "preparing", executionId, requestDigest: record.requestDigest, output });
       }
       if (Date.now() >= deadline) {
         const reachable = record.endpoint !== undefined && await sendControl(record.endpoint, record.authToken, { kind: "ping" }).then(() => true, () => false);
@@ -196,10 +204,17 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
         }
         return record.phase === "running"
           ? Object.freeze({ kind: "running", executionId, requestDigest: record.requestDigest, processId: record.processId, output })
-          : Object.freeze({ kind: "starting", executionId, requestDigest: record.requestDigest, output });
+          : Object.freeze({ kind: "preparing", executionId, requestDigest: record.requestDigest, output });
       }
       await sleep(Math.min(25, Math.max(1, deadline - Date.now())));
     } while (true);
+  }
+
+  async activate(executionId: string, expected: { policyDigest: string; executionDigest: string }): Promise<void> {
+    if (typeof expected !== "object" || expected === null || typeof expected.policyDigest !== "string" || typeof expected.executionDigest !== "string") {
+      throw new TypeError("Sandbox activation requires the exact prepared policy and execution digests.");
+    }
+    await this.#control(executionId, { kind: "activate", policyDigest: expected.policyDigest, executionDigest: expected.executionDigest });
   }
 
   async writeInput(executionId: string, data: Uint8Array): Promise<void> {
@@ -240,7 +255,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     validateExecutionId(executionId);
     const directory = executionDirectory(this.root, executionId);
     const record = await readRecord(directory);
-    if (record.phase === "starting" || record.phase === "running") throw new Error("A live or uncertain execution cannot be forgotten.");
+    if (record.phase === "preparing" || record.phase === "prepared" || record.phase === "running") throw new Error("A live or uncertain execution cannot be forgotten.");
     await removeExecutionDirectory(directory);
   }
 
@@ -266,7 +281,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     this.#ensureOpen();
     validateExecutionId(executionId);
     const record = await readRecord(executionDirectory(this.root, executionId));
-    if ((record.phase !== "starting" && record.phase !== "running") || record.endpoint === undefined) {
+    if ((record.phase !== "preparing" && record.phase !== "prepared" && record.phase !== "running") || record.endpoint === undefined) {
       throw new Error(`Execution ${executionId} does not have a reachable live control endpoint.`);
     }
     await sendControl(record.endpoint, record.authToken, command);

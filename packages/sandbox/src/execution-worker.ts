@@ -9,7 +9,9 @@ import {
   writeReceipt,
   writeRecord,
 } from "./execution-record.js";
+import { SandboxPreparationExpiredError, SandboxPreparationError } from "./errors.js";
 import { createSandbox } from "./sandbox.js";
+import type { PreparedSandboxRun } from "./prepared-run.js";
 import type { SandboxProcess } from "./process.js";
 import type { SandboxRunResult } from "./result.js";
 
@@ -46,6 +48,7 @@ async function run(executionDirectory: string): Promise<void> {
   const { run: requestedRun, limits } = parseRunForHost(JSON.parse(input));
 
   let processHandle: SandboxProcess | undefined;
+  let preparedHandle: PreparedSandboxRun | undefined;
   let targetMayHaveExecuted = false;
   let endpoint = 0;
   let cursor = 0;
@@ -54,6 +57,38 @@ async function run(executionDirectory: string): Promise<void> {
   let outputWrites = Promise.resolve();
   const capturedStdout: Buffer[] = [];
   const capturedStderr: Buffer[] = [];
+  let activationExpected: { policyDigest: string; executionDigest: string } | undefined;
+  let resolveActivation: ((value: { policyDigest: string; executionDigest: string }) => void) | undefined;
+  let rejectActivation: ((error: Error) => void) | undefined;
+  const activation = new Promise<{ policyDigest: string; executionDigest: string }>((resolve, reject) => {
+    resolveActivation = resolve;
+    rejectActivation = reject;
+  });
+
+  const authority: ControlAuthority = {
+    process: () => processHandle,
+    prepared: () => preparedHandle,
+    activate(expected) {
+      if (activationExpected !== undefined) {
+        if (activationExpected.policyDigest !== expected.policyDigest || activationExpected.executionDigest !== expected.executionDigest) {
+          throw new Error("Prepared execution was already activated with different digests.");
+        }
+        return;
+      }
+      activationExpected = expected;
+      resolveActivation?.(expected);
+    },
+    async cancel() {
+      await preparedHandle?.cancel();
+      preparedHandle = undefined;
+      rejectActivation?.(new SandboxPreparationError({
+        code: "preparation.cancelled",
+        message: "Prepared execution was cancelled before activation.",
+        phase: "activate",
+        targetExecuted: false,
+      }));
+    },
+  };
 
   const server = net.createServer((socket) => {
     let request = "";
@@ -64,7 +99,7 @@ async function run(executionDirectory: string): Promise<void> {
       if (!handled && request.includes("\n")) {
         handled = true;
         socket.pause();
-      void handleControl(request, initial.authToken, () => processHandle).then(
+      void handleControl(request, initial.authToken, authority).then(
         () => socket.end(`${JSON.stringify({ accepted: true })}\n`),
         (error: unknown) => socket.end(`${JSON.stringify({ accepted: false, error: bounded(error) })}\n`),
       );
@@ -93,10 +128,25 @@ async function run(executionDirectory: string): Promise<void> {
       },
     };
     const prepared = await sandbox.prepareRun(run);
-    processHandle = await prepared.start({
+    preparedHandle = prepared;
+    await writeRecord(executionDirectory, {
+      schemaVersion: 1,
+      phase: "prepared",
+      executionId: initial.executionId,
+      requestDigest: initial.requestDigest,
+      createdAtMs: initial.createdAtMs,
+      workerPid: process.pid,
+      authToken: initial.authToken,
+      endpoint,
       policyDigest: prepared.policyDigest,
       executionDigest: prepared.executionDigest,
+      summary: prepared.summary,
+      enforcement: prepared.enforcement,
+      expiresAtMs: prepared.expiresAtMs,
     });
+    const expected = await waitForActivation(activation, prepared.expiresAtMs);
+    processHandle = await prepared.start(expected);
+    preparedHandle = undefined;
     targetMayHaveExecuted = true;
     await writeRecord(executionDirectory, {
       schemaVersion: 1,
@@ -198,14 +248,23 @@ async function run(executionDirectory: string): Promise<void> {
 async function handleControl(
   text: string,
   expectedToken: string,
-  processHandle: () => SandboxProcess | undefined,
+  authority: ControlAuthority,
 ): Promise<void> {
   const value: unknown = JSON.parse(text);
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Control request must be an object.");
   const request = value as Record<string, unknown>;
   if (request.token !== expectedToken) throw new Error("Execution control authentication failed.");
   if (request.kind === "ping") return;
-  const target = processHandle();
+  if (request.kind === "activate") {
+    if (typeof request.policyDigest !== "string" || typeof request.executionDigest !== "string") throw new TypeError("Activation digests are invalid.");
+    authority.activate({ policyDigest: request.policyDigest, executionDigest: request.executionDigest });
+    return;
+  }
+  if (request.kind === "terminate" && authority.process() === undefined && authority.prepared() !== undefined) {
+    await authority.cancel();
+    return;
+  }
+  const target = authority.process();
   if (target === undefined) throw new Error("Sandbox process is not running.");
   if (request.kind === "write") {
     if (typeof request.dataBase64 !== "string") throw new TypeError("Sandbox input is invalid.");
@@ -224,6 +283,29 @@ async function handleControl(
     return;
   }
   throw new TypeError("Unknown execution control request.");
+}
+
+interface ControlAuthority {
+  process(): SandboxProcess | undefined;
+  prepared(): PreparedSandboxRun | undefined;
+  activate(expected: { policyDigest: string; executionDigest: string }): void;
+  cancel(): Promise<void>;
+}
+
+async function waitForActivation(
+  activation: Promise<{ policyDigest: string; executionDigest: string }>,
+  expiresAtMs: number,
+): Promise<{ policyDigest: string; executionDigest: string }> {
+  const delay = Math.max(0, expiresAtMs - Date.now());
+  return Promise.race([
+    activation,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new SandboxPreparationExpiredError({
+      code: "preparation_expired.detached_execution",
+      message: "Prepared execution expired before activation.",
+      phase: "activate",
+      targetExecuted: false,
+    })), delay)),
+  ]);
 }
 
 async function waitForOwnedRecord(executionDirectory: string) {

@@ -15,7 +15,7 @@ const executions = await openSandboxExecutionRepository({
   maxRetainedOutputBytes: 8 * 1024 * 1024,
 });
 
-const observation = await executions.admit({
+const prepared = await executions.prepare({
   executionId: "effect_01J...",
   run: {
     isolation: { kind: "process" },
@@ -32,6 +32,11 @@ const observation = await executions.admit({
     },
   },
 }, { waitMs: 250 });
+
+if (prepared.kind !== "prepared") throw new Error(`Preparation is ${prepared.kind}`);
+// Present prepared.summary, prepared.enforcement, and both exact digests to the
+// application authorization layer before issuing one-shot effect authority.
+await executions.activate(prepared.executionId, prepared);
 ```
 
 Output is retained as a checksum-linked, bounded byte stream. `inspect()` accepts `afterCursor` and `maxBytes`; `writeInput()`, `closeInput()`, and `terminate()` authenticate to the live execution host. A terminal receipt contains the native sandbox result, including enforcement, resource usage, violations, and cleanup.

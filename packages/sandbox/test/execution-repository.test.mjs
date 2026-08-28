@@ -36,12 +36,12 @@ test("execution repository binds one identity to one exact request", async () =>
       run: detachedRun({ executable: "/bin/true", cwd: "/" }),
     };
     const [first, second] = await Promise.all([
-      repository.admit(request, { waitMs: 2_000 }),
-      repository.admit(request, { waitMs: 2_000 }),
+      repository.prepare(request, { waitMs: 2_000 }),
+      repository.prepare(request, { waitMs: 2_000 }),
     ]);
     assert.equal(first.requestDigest, second.requestDigest);
     await assert.rejects(
-      repository.admit({
+      repository.prepare({
         executionId: request.executionId,
         run: detachedRun({ executable: "/bin/false", cwd: "/" }),
       }),
@@ -58,14 +58,14 @@ test("execution repository fails closed for unsupported detached contracts", asy
   const repository = await openSandboxExecutionRepository({ directory });
   try {
     await assert.rejects(
-      repository.admit({
+      repository.prepare({
         executionId: "missing-output-bound",
         run: { ...baseOptions(), process: { executable: "/bin/true", cwd: "/" } },
       }),
       /maxOutputBytes/,
     );
     await assert.rejects(
-      repository.admit({
+      repository.prepare({
         executionId: "hardware-vm",
         run: {
           ...detachedRun({ executable: "/bin/true", cwd: "/" }),
@@ -76,7 +76,7 @@ test("execution repository fails closed for unsupported detached contracts", asy
     );
     const run = detachedRun({ executable: "/bin/true", cwd: "/" });
     Object.defineProperty(run, "unexpected", { enumerable: true, get: () => "side effect" });
-    await assert.rejects(repository.admit({ executionId: "accessor", run }), /must not contain accessors/);
+    await assert.rejects(repository.prepare({ executionId: "accessor", run }), /must not contain accessors/);
   } finally {
     await repository.close();
     await rm(directory, { recursive: true, force: true });
@@ -95,7 +95,7 @@ test("execution repository creates a private authority directory", async () => {
       executionId: "missing",
       reason: "not-found",
       diagnostic: "No execution record exists for this identity.",
-      output: { cursorStart: 0, cursorEnd: 0, cursorExpired: false, chunks: [] },
+      output: { cursorStart: 0, cursorEnd: 0, availableCursorEnd: 0, stdoutBytes: 0, stderrBytes: 0, cursorExpired: false, chunks: [] },
     });
   } finally {
     await repository.close();
@@ -157,8 +157,8 @@ test("two callers share one isolated execution and output cursors are exact", { 
       }),
     };
     const [first, second] = await Promise.all([
-      repositoryA.admit(request, { waitMs: 5_000, maxBytes: 4 }),
-      repositoryB.admit(request, { waitMs: 5_000, maxBytes: 4 }),
+      activate(repositoryA, request, { waitMs: 5_000, maxBytes: 4 }),
+      activate(repositoryB, request, { waitMs: 5_000, maxBytes: 4 }),
     ]);
     assert.equal(first.kind, "settled");
     assert.equal(second.kind, "settled");
@@ -180,7 +180,7 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
   const lateMarker = join(parent, "late");
   const repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 100 });
   try {
-    const observation = await repository.admit({
+    const request = {
       executionId: "host-loss",
       run: detachedRun({
         executable: "/bin/sh",
@@ -196,7 +196,11 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
           process: { hostProcesses: "deny", hostIpc: "deny" },
         },
       }),
-    }, { waitMs: 500 });
+    };
+    const prepared = await repository.prepare(request, { waitMs: 500 });
+    assert.equal(prepared.kind, "prepared");
+    await repository.activate(request.executionId, prepared);
+    const observation = await repository.inspect(request.executionId, { waitMs: 500 });
     assert.equal(observation.kind, "running");
     const statePath = await stateFile(directory, "host-loss");
     const envelope = JSON.parse(await readFile(statePath, "utf8"));
@@ -217,10 +221,11 @@ test("terminal execution receipts expire without becoming replayable", { skip: !
   const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-expiry-"));
   const repository = await openSandboxExecutionRepository({ directory, completedRetentionMs: 20, expiredIdentityRetentionMs: 50 });
   try {
-    const settled = await repository.admit({
+    const request = {
       executionId: "expires",
       run: detachedRun({ executable: "/bin/true", cwd: "/" }),
-    }, { waitMs: 5_000 });
+    };
+    const settled = await activate(repository, request, { waitMs: 5_000 });
     assert.equal(settled.kind, "settled");
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal((await repository.inspect("expires")).kind, "expired");
@@ -242,6 +247,13 @@ async function readOneLine(stream) {
     if (newline >= 0) return value.slice(0, newline);
   }
   throw new Error("Child exited before writing a line.");
+}
+
+async function activate(repository, request, query) {
+  const prepared = await repository.prepare(request, query);
+  if (prepared.kind !== "prepared") return prepared;
+  await repository.activate(request.executionId, prepared);
+  return repository.inspect(request.executionId, query);
 }
 
 async function stateFile(root, executionId) {

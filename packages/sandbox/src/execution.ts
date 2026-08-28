@@ -1,11 +1,13 @@
 import type { Buffer } from "node:buffer";
 import type { SandboxEnvironment } from "./environment.js";
 import type { SandboxErrorData } from "./errors.js";
+import type { EnforcementReport } from "./enforcement.js";
 import type { SandboxPolicy } from "./policy.js";
 import type { SandboxArtifactRequest, SandboxWorkspaceChangeRequest } from "./process-options.js";
 import type { EnforcementRequirements } from "./requirements.js";
 import type { ResourceLimits } from "./resources.js";
 import type { SandboxRunResult } from "./result.js";
+import type { PreparedRunSummary } from "./summary.js";
 
 export interface SandboxExecutionRepositoryOptions {
   /** Private host directory that owns execution identities and retained receipts. */
@@ -57,7 +59,12 @@ export interface SandboxExecutionOutputChunk {
 
 export interface SandboxExecutionOutput {
   cursorStart: number;
+  /** Cursor immediately after the bytes returned by this observation. */
   cursorEnd: number;
+  /** Cursor immediately after all output currently retained for the execution. */
+  availableCursorEnd: number;
+  stdoutBytes: number;
+  stderrBytes: number;
   cursorExpired: boolean;
   chunks: readonly SandboxExecutionOutputChunk[];
 }
@@ -69,8 +76,17 @@ interface SandboxExecutionBase {
 
 export type SandboxExecutionObservation =
   | (SandboxExecutionBase & {
-      kind: "starting";
+      kind: "preparing";
       requestDigest: string;
+    })
+  | (SandboxExecutionBase & {
+      kind: "prepared";
+      requestDigest: string;
+      policyDigest: string;
+      executionDigest: string;
+      summary: PreparedRunSummary;
+      enforcement: EnforcementReport;
+      expiresAtMs: number;
     })
   | (SandboxExecutionBase & {
       kind: "running";
@@ -119,7 +135,8 @@ export interface SandboxExecutionReconciliation {
 export interface SandboxExecutionRepository {
   readonly identity: string;
   readonly durability: "application-process";
-  admit(request: SandboxExecutionRequest, query?: SandboxExecutionQuery): Promise<SandboxExecutionObservation>;
+  prepare(request: SandboxExecutionRequest, query?: SandboxExecutionQuery): Promise<SandboxExecutionObservation>;
+  activate(executionId: string, expected: { policyDigest: string; executionDigest: string }): Promise<void>;
   inspect(executionId: string, query?: SandboxExecutionQuery): Promise<SandboxExecutionObservation>;
   writeInput(executionId: string, data: Uint8Array): Promise<void>;
   closeInput(executionId: string): Promise<void>;

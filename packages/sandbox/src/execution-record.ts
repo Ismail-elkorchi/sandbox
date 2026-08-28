@@ -4,9 +4,11 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { SandboxErrorData } from "./errors.js";
+import type { EnforcementReport } from "./enforcement.js";
 import type { SandboxDetachedRunOptions, SandboxExecutionOutputChunk } from "./execution.js";
 import type { SandboxRunResult } from "./result.js";
-import { parseCleanup, parseEnforcement, parseErrorData, parseViolation } from "./validation.js";
+import type { PreparedRunSummary } from "./summary.js";
+import { parseCleanup, parseEnforcement, parseErrorData, parseRunSummary, parseViolation } from "./validation.js";
 
 export const EXECUTION_SCHEMA_VERSION = 1;
 export const STATE_FILE = "state.json";
@@ -22,7 +24,8 @@ export interface ExecutionRepositoryLimits {
 }
 
 export type ExecutionRecord =
-  | ExecutionStartingRecord
+  | ExecutionPreparingRecord
+  | ExecutionPreparedRecord
   | ExecutionRunningRecord
   | ExecutionSettledRecord
   | ExecutionRejectedRecord
@@ -39,8 +42,18 @@ interface ExecutionRecordBase {
   endpoint?: number;
 }
 
-export interface ExecutionStartingRecord extends ExecutionRecordBase {
-  phase: "starting";
+export interface ExecutionPreparingRecord extends ExecutionRecordBase {
+  phase: "preparing";
+}
+
+export interface ExecutionPreparedRecord extends ExecutionRecordBase {
+  phase: "prepared";
+  endpoint: number;
+  policyDigest: string;
+  executionDigest: string;
+  summary: PreparedRunSummary;
+  enforcement: EnforcementReport;
+  expiresAtMs: number;
 }
 
 export interface ExecutionRunningRecord extends ExecutionRecordBase {
@@ -240,7 +253,7 @@ export async function readOutput(
   maxBytes: number,
   expectedEnd?: number,
   expectedHash?: string,
-): Promise<{ cursorStart: number; cursorEnd: number; cursorExpired: boolean; chunks: readonly SandboxExecutionOutputChunk[] }> {
+): Promise<{ cursorStart: number; cursorEnd: number; availableCursorEnd: number; stdoutBytes: number; stderrBytes: number; cursorExpired: boolean; chunks: readonly SandboxExecutionOutputChunk[] }> {
   let text = "";
   try {
     text = await readFile(join(directory, OUTPUT_FILE), "utf8");
@@ -251,6 +264,8 @@ export async function readOutput(
   const completeLines = lines.at(-1) === "" ? lines.slice(0, -1) : lines.slice(0, -1);
   let previousHash = "0".repeat(64);
   let cursorEnd = 0;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
   const stored: StoredOutputChunk[] = [];
   for (const [index, line] of completeLines.entries()) {
     if (line.length === 0) continue;
@@ -261,6 +276,8 @@ export async function readOutput(
     if (createHash("sha256").update(canonicalJson(unsigned)).digest("hex") !== chunk.hash) throw new Error("Execution output chunk checksum is invalid.");
     previousHash = chunk.hash;
     cursorEnd = chunk.cursorEnd;
+    if (chunk.stream === "stdout") stdoutBytes += chunk.cursorEnd - chunk.cursorStart;
+    else stderrBytes += chunk.cursorEnd - chunk.cursorStart;
     stored.push(chunk);
   }
   if (expectedEnd !== undefined && (cursorEnd !== expectedEnd || previousHash !== expectedHash)) {
@@ -282,7 +299,7 @@ export async function readOutput(
     remaining -= selected.byteLength;
   }
   const observedEnd = chunks.at(-1)?.cursorEnd ?? afterCursor;
-  return Object.freeze({ cursorStart, cursorEnd: observedEnd, cursorExpired: false, chunks: Object.freeze(chunks) });
+  return Object.freeze({ cursorStart, cursorEnd: observedEnd, availableCursorEnd: cursorEnd, stdoutBytes, stderrBytes, cursorExpired: false, chunks: Object.freeze(chunks) });
 }
 
 export async function expireRecord(directory: string, recordValue: ExecutionSettledRecord | ExecutionRejectedRecord): Promise<void> {
@@ -411,8 +428,16 @@ function parseRecord(value: unknown): ExecutionRecord {
     workerPid: requiredNumber(source.workerPid, "worker PID"),
     authToken: requiredString(source.authToken, "execution auth token"),
   };
-  if (phase === "starting") return { ...live, phase };
+  if (phase === "preparing") return { ...live, phase };
   const endpoint = requiredNumber(source.endpoint, "execution endpoint");
+  if (phase === "prepared") return {
+    ...live, phase, endpoint,
+    policyDigest: digestString(source.policyDigest, "policy digest"),
+    executionDigest: digestString(source.executionDigest, "execution digest"),
+    summary: parseRunSummary(source.summary),
+    enforcement: parseEnforcement(source.enforcement),
+    expiresAtMs: requiredNumber(source.expiresAtMs, "preparation expiration"),
+  };
   if (phase === "running") return { ...live, phase, endpoint, processId: requiredString(source.processId, "process ID") };
   if (phase === "settled") return {
     ...live, phase, endpoint, processId: requiredString(source.processId, "process ID"),
