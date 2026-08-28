@@ -9,6 +9,19 @@ export type {
   SandboxSupport,
 } from "./sandbox.js";
 export type { SandboxEnvironment, SandboxEnvironmentValue } from "./environment.js";
+export { openSandboxExecutionRepository } from "./execution-repository.js";
+export type {
+  SandboxDetachedProcessOptions,
+  SandboxDetachedRunOptions,
+  SandboxExecutionObservation,
+  SandboxExecutionOutput,
+  SandboxExecutionOutputChunk,
+  SandboxExecutionQuery,
+  SandboxExecutionReconciliation,
+  SandboxExecutionRepository,
+  SandboxExecutionRepositoryOptions,
+  SandboxExecutionRequest,
+} from "./execution.js";
 export type {
   EnforcementCaveat,
   EnforcementLayer,

@@ -108,6 +108,7 @@ Environment values marked `sensitive` affect execution identity but are omitted 
 
 - [Documentation index](docs/README.md)
 - [Getting started and lifecycle](docs/getting-started.md)
+- [Execution repository and caller-process recovery](docs/execution-repository.md)
 - [Policies and requirements](docs/policy.md)
 - [Backend support and caveats](docs/backends.md)
 - [Managed networking](docs/managed-networking.md)

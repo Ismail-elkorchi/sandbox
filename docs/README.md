@@ -5,6 +5,7 @@ Use this directory for operational and architectural details that would interrup
 ## Use the sandbox
 
 - [Getting started](getting-started.md): probing, prepared runs, sessions, cancellation, streams, and results.
+- [Execution repository](execution-repository.md): caller-process recovery, exact execution identity, retained output, and terminal receipts.
 - [Policies and requirements](policy.md): filesystem, environment, network, process, resources, and guarantee matching.
 - [Backend support](backends.md): platform matrix, stability, availability, and backend-specific limitations.
 - [Managed networking](managed-networking.md): supported proxy protocols, rule semantics, DNS, and limitations.
