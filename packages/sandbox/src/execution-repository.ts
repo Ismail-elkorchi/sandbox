@@ -163,15 +163,17 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
         }
         return Object.freeze({ kind: "expired", executionId, requestDigest: record.requestDigest, expiredAtMs: record.expiredAtMs, output: EMPTY_OUTPUT });
       }
-      let output;
+      let output: SandboxExecutionOutput;
+      let outputHash: string;
       try {
-        output = await readOutput(
+        const retained = await readOutput(
           directory,
           afterCursor,
           maxBytes,
           record.phase === "settled" ? record.cursorEnd : undefined,
           record.phase === "settled" ? record.outputHash : undefined,
         );
+        ({ outputHash, ...output } = retained);
       } catch (error) {
         return unknown(executionId, "corrupt-record", bounded(error), record.requestDigest);
       }
@@ -200,6 +202,10 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
       if (Date.now() >= deadline) {
         const reachable = record.endpoint !== undefined && await sendControl(record.endpoint, record.authToken, { kind: "ping" }).then(() => true, () => false);
         if (!reachable && Date.now() - record.createdAtMs >= this.limits.startupTimeoutMs) {
+          if (record.phase === "running") {
+            const recovered = await this.#recoverTerminalReceipt(directory, record, output, outputHash);
+            if (recovered !== undefined) return recovered;
+          }
           return unknown(executionId, "execution-host-unreachable", "The detached execution host cannot be authenticated; the external effect outcome is unknown.", record.requestDigest, output);
         }
         return record.phase === "running"
@@ -293,6 +299,35 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
       throw new Error(`Execution ${executionId} does not have a reachable live control endpoint.`);
     }
     await sendControl(record.endpoint, record.authToken, command);
+  }
+
+  async #recoverTerminalReceipt(
+    directory: string,
+    record: Extract<ExecutionRecord, { phase: "running" }>,
+    output: SandboxExecutionOutput,
+    outputHash: string,
+  ): Promise<SandboxExecutionObservation | undefined> {
+    let result;
+    try {
+      result = await readReceipt(directory);
+    } catch (error) {
+      if (nodeCode(error) === "ENOENT") return undefined;
+      return unknown(record.executionId, "corrupt-record", bounded(error), record.requestDigest, output);
+    }
+    const settledAtMs = Date.now();
+    try {
+      await writeRecord(directory, {
+        ...record,
+        phase: "settled",
+        settledAtMs,
+        expiresAtMs: settledAtMs + this.limits.completedRetentionMs,
+        cursorEnd: output.availableCursorEnd,
+        outputHash,
+      });
+    } catch (error) {
+      return unknown(record.executionId, "execution-host-unreachable", `A durable terminal receipt exists but settlement publication failed: ${bounded(error)}`, record.requestDigest, output);
+    }
+    return Object.freeze({ kind: "settled", executionId: record.executionId, requestDigest: record.requestDigest, result, output });
   }
 
   async #readKnownRecord(directory: string, executionId: string): Promise<ExecutionRecord | undefined> {

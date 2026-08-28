@@ -253,7 +253,7 @@ export async function readOutput(
   maxBytes: number,
   expectedEnd?: number,
   expectedHash?: string,
-): Promise<{ cursorStart: number; cursorEnd: number; availableCursorEnd: number; stdoutBytes: number; stderrBytes: number; cursorExpired: boolean; chunks: readonly SandboxExecutionOutputChunk[] }> {
+): Promise<{ cursorStart: number; cursorEnd: number; availableCursorEnd: number; stdoutBytes: number; stderrBytes: number; cursorExpired: boolean; chunks: readonly SandboxExecutionOutputChunk[]; outputHash: string }> {
   let text = "";
   try {
     text = await readFile(join(directory, OUTPUT_FILE), "utf8");
@@ -299,7 +299,7 @@ export async function readOutput(
     remaining -= selected.byteLength;
   }
   const observedEnd = chunks.at(-1)?.cursorEnd ?? afterCursor;
-  return Object.freeze({ cursorStart, cursorEnd: observedEnd, availableCursorEnd: cursorEnd, stdoutBytes, stderrBytes, cursorExpired: false, chunks: Object.freeze(chunks) });
+  return Object.freeze({ cursorStart, cursorEnd: observedEnd, availableCursorEnd: cursorEnd, stdoutBytes, stderrBytes, cursorExpired: false, chunks: Object.freeze(chunks), outputHash: previousHash });
 }
 
 export async function expireRecord(directory: string, recordValue: ExecutionSettledRecord | ExecutionRejectedRecord): Promise<void> {

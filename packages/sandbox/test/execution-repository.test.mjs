@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createSandbox, openSandboxExecutionRepository } from "../dist/index.js";
+import { executionDirectory, readRecord, writeRecord } from "../dist/execution-record.js";
 import { baseOptions } from "./helpers.mjs";
 
 const linux = process.platform === "linux" && await (async () => {
@@ -214,6 +215,44 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
   } finally {
     await repository.close();
     await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("a durable result and cleanup receipt settles after worker death before state publication", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-receipt-recovery-"));
+  let repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 10 });
+  try {
+    const request = {
+      executionId: "receipt-recovery",
+      run: detachedRun({ executable: "/bin/printf", args: ["receipt-survives"], cwd: "/", stdout: "pipe" }),
+    };
+    const settled = await activate(repository, request, { waitMs: 5_000 });
+    assert.equal(settled.kind, "settled");
+    assert.equal(settled.result.cleanup.completed, true);
+    const stateDirectory = executionDirectory(directory, request.executionId);
+    const state = await readRecord(stateDirectory);
+    assert.equal(state.phase, "settled");
+    await writeRecord(stateDirectory, {
+      schemaVersion: 1,
+      phase: "running",
+      executionId: state.executionId,
+      requestDigest: state.requestDigest,
+      createdAtMs: state.createdAtMs,
+      workerPid: state.workerPid,
+      authToken: state.authToken,
+      endpoint: state.endpoint,
+      processId: state.processId,
+    });
+    await repository.close();
+    repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 10 });
+    const recovered = await repository.inspect(request.executionId, { waitMs: 100 });
+    assert.equal(recovered.kind, "settled");
+    assert.equal(recovered.result.cleanup.completed, true);
+    assert.equal(recovered.output.chunks.map((chunk) => chunk.data.toString()).join(""), "receipt-survives");
+    assert.equal((await readRecord(stateDirectory)).phase, "settled");
+  } finally {
+    await repository.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
