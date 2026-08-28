@@ -142,6 +142,8 @@ export interface SandboxExecutionRepository {
   closeInput(executionId: string): Promise<void>;
   terminate(executionId: string): Promise<void>;
   reconcile(): Promise<SandboxExecutionReconciliation>;
+  /** Remove an explicitly accepted unknown outcome so it no longer blocks the owning application. */
+  acknowledgeUnknown(executionId: string): Promise<void>;
   forget(executionId: string): Promise<void>;
   close(): Promise<void>;
 }

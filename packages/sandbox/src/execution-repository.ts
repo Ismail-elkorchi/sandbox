@@ -259,6 +259,14 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     await removeExecutionDirectory(directory);
   }
 
+  async acknowledgeUnknown(executionId: string): Promise<void> {
+    this.#ensureOpen();
+    validateExecutionId(executionId);
+    const observation = await this.inspect(executionId);
+    if (observation.kind !== "unknown" || observation.reason === "not-found") throw new Error("Only a retained execution with an explicitly unknown outcome can be acknowledged as unresolved.");
+    await removeExecutionDirectory(executionDirectory(this.root, executionId));
+  }
+
   async close(): Promise<void> {
     this.#closed = true;
   }
