@@ -288,7 +288,7 @@ test("a durable result and cleanup receipt settles after worker death before sta
 
 test("terminal execution receipts expire without becoming replayable", { skip: !linux }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-expiry-"));
-  const repository = await openSandboxExecutionRepository({ directory, completedRetentionMs: 20, expiredIdentityRetentionMs: 50 });
+  const repository = await openSandboxExecutionRepository({ directory, expiredIdentityRetentionMs: 50 });
   try {
     const request = {
       executionId: "expires",
@@ -296,9 +296,14 @@ test("terminal execution receipts expire without becoming replayable", { skip: !
     };
     const settled = await activate(repository, request, { waitMs: 5_000 });
     assert.equal(settled.kind, "settled");
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    const stateDirectory = executionDirectory(directory, request.executionId);
+    const settledRecord = await readRecord(stateDirectory);
+    assert.equal(settledRecord.phase, "settled");
+    await writeRecord(stateDirectory, { ...settledRecord, expiresAtMs: Date.now() - 1 });
     assert.equal((await repository.inspect("expires")).kind, "expired");
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    const expiredRecord = await readRecord(stateDirectory);
+    assert.equal(expiredRecord.phase, "expired");
+    await writeRecord(stateDirectory, { ...expiredRecord, expiredAtMs: Date.now() - 51 });
     const removed = await repository.inspect("expires");
     assert.equal(removed.kind, "unknown");
     assert.equal(removed.reason, "not-found");
