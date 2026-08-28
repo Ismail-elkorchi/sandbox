@@ -58,6 +58,7 @@ async function run(executionDirectory: string): Promise<void> {
   const capturedStdout: Buffer[] = [];
   const capturedStderr: Buffer[] = [];
   let activationExpected: { policyDigest: string; executionDigest: string } | undefined;
+  let activationAcceptance: Promise<void> | undefined;
   let resolveActivation: ((value: { policyDigest: string; executionDigest: string }) => void) | undefined;
   let rejectActivation: ((error: Error) => void) | undefined;
   const activation = new Promise<{ policyDigest: string; executionDigest: string }>((resolve, reject) => {
@@ -68,15 +69,37 @@ async function run(executionDirectory: string): Promise<void> {
   const authority: ControlAuthority = {
     process: () => processHandle,
     prepared: () => preparedHandle,
-    activate(expected) {
+    async activate(expected) {
       if (activationExpected !== undefined) {
         if (activationExpected.policyDigest !== expected.policyDigest || activationExpected.executionDigest !== expected.executionDigest) {
           throw new Error("Prepared execution was already activated with different digests.");
         }
+        await activationAcceptance;
         return;
       }
+      if (preparedHandle === undefined) throw new Error("Sandbox execution is not prepared for activation.");
       activationExpected = expected;
-      resolveActivation?.(expected);
+      const acceptance = writeRecord(executionDirectory, {
+        schemaVersion: 1,
+        phase: "activating",
+        executionId: initial.executionId,
+        requestDigest: initial.requestDigest,
+        createdAtMs: initial.createdAtMs,
+        workerPid: process.pid,
+        authToken: initial.authToken,
+        endpoint,
+        policyDigest: expected.policyDigest,
+        executionDigest: expected.executionDigest,
+        activatedAtMs: Date.now(),
+      }).then(() => resolveActivation?.(expected));
+      activationAcceptance = acceptance;
+      try {
+        await acceptance;
+      } catch (error) {
+        activationExpected = undefined;
+        activationAcceptance = undefined;
+        throw error;
+      }
     },
     async cancel() {
       await preparedHandle?.cancel();
@@ -257,7 +280,7 @@ async function handleControl(
   if (request.kind === "ping") return;
   if (request.kind === "activate") {
     if (typeof request.policyDigest !== "string" || typeof request.executionDigest !== "string") throw new TypeError("Activation digests are invalid.");
-    authority.activate({ policyDigest: request.policyDigest, executionDigest: request.executionDigest });
+    await authority.activate({ policyDigest: request.policyDigest, executionDigest: request.executionDigest });
     return;
   }
   if (request.kind === "terminate" && authority.process() === undefined && authority.prepared() !== undefined) {
@@ -288,7 +311,7 @@ async function handleControl(
 interface ControlAuthority {
   process(): SandboxProcess | undefined;
   prepared(): PreparedSandboxRun | undefined;
-  activate(expected: { policyDigest: string; executionDigest: string }): void;
+  activate(expected: { policyDigest: string; executionDigest: string }): Promise<void>;
   cancel(): Promise<void>;
 }
 
@@ -297,15 +320,22 @@ async function waitForActivation(
   expiresAtMs: number,
 ): Promise<{ policyDigest: string; executionDigest: string }> {
   const delay = Math.max(0, expiresAtMs - Date.now());
-  return Promise.race([
-    activation,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new SandboxPreparationExpiredError({
-      code: "preparation_expired.detached_execution",
-      message: "Prepared execution expired before activation.",
-      phase: "activate",
-      targetExecuted: false,
-    })), delay)),
-  ]);
+  let expirationTimer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      activation,
+      new Promise<never>((_, reject) => {
+        expirationTimer = setTimeout(() => reject(new SandboxPreparationExpiredError({
+          code: "preparation_expired.detached_execution",
+          message: "Prepared execution expired before activation.",
+          phase: "activate",
+          targetExecuted: false,
+        })), delay);
+      }),
+    ]);
+  } finally {
+    if (expirationTimer !== undefined) clearTimeout(expirationTimer);
+  }
 }
 
 async function waitForOwnedRecord(executionDirectory: string) {

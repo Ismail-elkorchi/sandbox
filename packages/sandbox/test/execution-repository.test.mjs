@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -104,6 +104,35 @@ test("execution repository creates a private authority directory", async () => {
   }
 });
 
+test("accepted activation authority is never exposed as prepared", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-activating-"));
+  const repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 2_000 });
+  try {
+    const stateDirectory = executionDirectory(directory, "accepted-authority");
+    await mkdir(stateDirectory, { mode: 0o700 });
+    await writeRecord(stateDirectory, {
+      schemaVersion: 1,
+      phase: "activating",
+      executionId: "accepted-authority",
+      requestDigest: `sha256:${"1".repeat(64)}`,
+      createdAtMs: Date.now(),
+      workerPid: process.pid,
+      authToken: "private-test-authority",
+      endpoint: 1,
+      policyDigest: `sha256:${"2".repeat(64)}`,
+      executionDigest: `sha256:${"3".repeat(64)}`,
+      activatedAtMs: Date.now(),
+    });
+
+    const observation = await repository.inspect("accepted-authority");
+    assert.equal(observation.kind, "preparing");
+    assert.equal((await readRecord(stateDirectory)).phase, "activating");
+  } finally {
+    await repository.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("detached execution survives its admitting application process", { skip: !linux }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "sandbox-execution-caller-death-"));
   const repositoryDirectory = join(parent, "repository");
@@ -201,6 +230,7 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
     const prepared = await repository.prepare(request, { waitMs: 500 });
     assert.equal(prepared.kind, "prepared");
     await repository.activate(request.executionId, prepared);
+    assert.notEqual((await readRecord(executionDirectory(directory, request.executionId))).phase, "prepared");
     const observation = await repository.inspect(request.executionId, { waitMs: 500 });
     assert.equal(observation.kind, "running");
     const statePath = await stateFile(directory, "host-loss");
@@ -289,10 +319,15 @@ async function readOneLine(stream) {
 }
 
 async function activate(repository, request, query) {
-  const prepared = await repository.prepare(request, query);
-  if (prepared.kind !== "prepared") return prepared;
-  await repository.activate(request.executionId, prepared);
-  return repository.inspect(request.executionId, query);
+  const deadline = Date.now() + (query.waitMs ?? 0);
+  let observation = await repository.prepare(request, query);
+  while (observation.kind === "preparing" || observation.kind === "prepared" || observation.kind === "running") {
+    if (observation.kind === "prepared") await repository.activate(request.executionId, observation);
+    const waitMs = Math.max(0, deadline - Date.now());
+    observation = await repository.inspect(request.executionId, { ...query, waitMs });
+    if (waitMs === 0) return observation;
+  }
+  return observation;
 }
 
 async function stateFile(root, executionId) {

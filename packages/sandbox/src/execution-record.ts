@@ -26,6 +26,7 @@ export interface ExecutionRepositoryLimits {
 export type ExecutionRecord =
   | ExecutionPreparingRecord
   | ExecutionPreparedRecord
+  | ExecutionActivatingRecord
   | ExecutionRunningRecord
   | ExecutionSettledRecord
   | ExecutionRejectedRecord
@@ -54,6 +55,14 @@ export interface ExecutionPreparedRecord extends ExecutionRecordBase {
   summary: PreparedRunSummary;
   enforcement: EnforcementReport;
   expiresAtMs: number;
+}
+
+export interface ExecutionActivatingRecord extends ExecutionRecordBase {
+  phase: "activating";
+  endpoint: number;
+  policyDigest: string;
+  executionDigest: string;
+  activatedAtMs: number;
 }
 
 export interface ExecutionRunningRecord extends ExecutionRecordBase {
@@ -437,6 +446,12 @@ function parseRecord(value: unknown): ExecutionRecord {
     summary: parseRunSummary(source.summary),
     enforcement: parseEnforcement(source.enforcement),
     expiresAtMs: requiredNumber(source.expiresAtMs, "preparation expiration"),
+  };
+  if (phase === "activating") return {
+    ...live, phase, endpoint,
+    policyDigest: digestString(source.policyDigest, "policy digest"),
+    executionDigest: digestString(source.executionDigest, "execution digest"),
+    activatedAtMs: requiredNumber(source.activatedAtMs, "activation time"),
   };
   if (phase === "running") return { ...live, phase, endpoint, processId: requiredString(source.processId, "process ID") };
   if (phase === "settled") return {

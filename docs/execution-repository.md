@@ -39,6 +39,8 @@ if (prepared.kind !== "prepared") throw new Error(`Preparation is ${prepared.kin
 await executions.activate(prepared.executionId, prepared);
 ```
 
+`activate()` acknowledges only after the execution host has durably consumed the exact authority. From that point the observation is in flight and can never return to `prepared`, including if the execution host is lost before it publishes a process identifier. Callers should continue inspecting transitional `preparing` or `running` observations until a terminal receipt or an explicit unknown outcome is available.
+
 Output is retained as a checksum-linked, bounded byte stream. `inspect()` accepts `afterCursor` and `maxBytes`; `writeInput()`, `closeInput()`, and `terminate()` authenticate to the live execution host. A terminal receipt contains the native sandbox result, including enforcement, resource usage, violations, and cleanup.
 
 ## Durability boundary

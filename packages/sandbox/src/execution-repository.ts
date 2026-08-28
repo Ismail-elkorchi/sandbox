@@ -261,7 +261,9 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     validateExecutionId(executionId);
     const directory = executionDirectory(this.root, executionId);
     const record = await readRecord(directory);
-    if (record.phase === "preparing" || record.phase === "prepared" || record.phase === "running") throw new Error("A live or uncertain execution cannot be forgotten.");
+    if (record.phase === "preparing" || record.phase === "prepared" || record.phase === "activating" || record.phase === "running") {
+      throw new Error("A live or uncertain execution cannot be forgotten.");
+    }
     await removeExecutionDirectory(directory);
   }
 
@@ -295,7 +297,7 @@ class ExecutionRepositoryImplementation implements SandboxExecutionRepository {
     this.#ensureOpen();
     validateExecutionId(executionId);
     const record = await readRecord(executionDirectory(this.root, executionId));
-    if ((record.phase !== "preparing" && record.phase !== "prepared" && record.phase !== "running") || record.endpoint === undefined) {
+    if ((record.phase !== "prepared" && record.phase !== "activating" && record.phase !== "running") || record.endpoint === undefined) {
       throw new Error(`Execution ${executionId} does not have a reachable live control endpoint.`);
     }
     await sendControl(record.endpoint, record.authToken, command);
