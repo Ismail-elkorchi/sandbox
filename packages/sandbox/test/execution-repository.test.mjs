@@ -135,30 +135,34 @@ test("accepted activation authority is never exposed as prepared", async () => {
 
 test("detached execution survives its admitting application process", { skip: !linux }, async () => {
   const parent = await mkdtemp(join(tmpdir(), "sandbox-execution-caller-death-"));
-  const repositoryDirectory = join(parent, "repository");
-  const marker = join(parent, "completed");
   try {
-    const child = spawn(process.execPath, [
-      join(import.meta.dirname, "fixtures", "detached-execution-caller.mjs"),
-      repositoryDirectory,
-      parent,
-    ], { stdio: ["ignore", "pipe", "inherit"] });
-    const admitted = await readOneLine(child.stdout);
-    assert.equal(admitted, "admitted");
-    assert.equal(await new Promise((resolve) => child.once("exit", resolve)), 0);
+    for (let repetition = 0; repetition < 8; repetition += 1) {
+      const workspace = join(parent, `case-${repetition}`);
+      const repositoryDirectory = join(workspace, "repository");
+      const marker = join(workspace, "completed");
+      await mkdir(workspace);
+      const child = spawn(process.execPath, [
+        join(import.meta.dirname, "fixtures", "detached-execution-caller.mjs"),
+        repositoryDirectory,
+        workspace,
+      ], { stdio: ["ignore", "pipe", "inherit"] });
+      const admitted = await readOneLine(child.stdout);
+      assert.equal(admitted, "admitted");
+      assert.equal(await new Promise((resolve) => child.once("exit", resolve)), 0);
 
-    const repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });
-    try {
-      const observation = await inspectUntilTerminal(repository, "caller-loss", { waitMs: 5_000 });
-      assert.equal(
-        observation.kind,
-        "settled",
-        observation.kind === "rejected" ? JSON.stringify(observation.error) : `Unexpected ${observation.kind} observation.`,
-      );
-      assert.equal(observation.output.chunks.map((chunk) => chunk.data.toString()).join(""), "detached-output");
-      assert.equal(await readFile(marker, "utf8"), "completed");
-    } finally {
-      await repository.close();
+      const repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });
+      try {
+        const observation = await inspectUntilTerminal(repository, "caller-loss", { waitMs: 5_000 });
+        assert.equal(
+          observation.kind,
+          "settled",
+          observation.kind === "rejected" ? JSON.stringify(observation.error) : `Unexpected ${observation.kind} observation.`,
+        );
+        assert.equal(observation.output.chunks.map((chunk) => chunk.data.toString()).join(""), "detached-output");
+        assert.equal(await readFile(marker, "utf8"), "completed");
+      } finally {
+        await repository.close();
+      }
     }
   } finally {
     await rm(parent, { recursive: true, force: true });
