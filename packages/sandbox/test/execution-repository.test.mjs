@@ -150,7 +150,11 @@ test("detached execution survives its admitting application process", { skip: !l
     const repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });
     try {
       const observation = await inspectUntilTerminal(repository, "caller-loss", { waitMs: 5_000 });
-      assert.equal(observation.kind, "settled");
+      assert.equal(
+        observation.kind,
+        "settled",
+        observation.kind === "rejected" ? JSON.stringify(observation.error) : `Unexpected ${observation.kind} observation.`,
+      );
       assert.equal(observation.output.chunks.map((chunk) => chunk.data.toString()).join(""), "detached-output");
       assert.equal(await readFile(marker, "utf8"), "completed");
     } finally {
