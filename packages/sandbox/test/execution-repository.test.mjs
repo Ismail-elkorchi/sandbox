@@ -149,7 +149,7 @@ test("detached execution survives its admitting application process", { skip: !l
 
     const repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });
     try {
-      const observation = await repository.inspect("caller-loss", { waitMs: 5_000 });
+      const observation = await inspectUntilTerminal(repository, "caller-loss", { waitMs: 5_000 });
       assert.equal(observation.kind, "settled");
       assert.equal(observation.output.chunks.map((chunk) => chunk.data.toString()).join(""), "detached-output");
       assert.equal(await readFile(marker, "utf8"), "completed");
@@ -333,6 +333,19 @@ async function activate(repository, request, query) {
     if (waitMs === 0) return observation;
   }
   return observation;
+}
+
+async function inspectUntilTerminal(repository, executionId, query) {
+  const deadline = Date.now() + (query.waitMs ?? 0);
+  let observation;
+  do {
+    const waitMs = Math.max(0, deadline - Date.now());
+    observation = await repository.inspect(executionId, { ...query, waitMs });
+    if (observation.kind !== "preparing" && observation.kind !== "prepared" && observation.kind !== "running") {
+      return observation;
+    }
+    if (waitMs === 0) return observation;
+  } while (true);
 }
 
 async function stateFile(root, executionId) {
