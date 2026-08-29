@@ -873,15 +873,17 @@ test("normal exit cannot leave daemonized descendants", { skip: !linux }, async 
   }
 });
 
-test("sessions retain immutable authority and run sequential processes", { skip: !linux }, async () => {
+test("session process start precedes immediate output across sequential runs", { skip: !linux }, async () => {
   await withSandbox(async (sandbox) => {
     const prepared = await sandbox.prepareSession(baseOptions());
     const session = await prepared.activate({ policyDigest: prepared.policyDigest });
     try {
-      const first = await session.run({ executable: "/bin/printf", args: ["one"], cwd: "/" });
-      const second = await session.run({ executable: "/bin/printf", args: ["two"], cwd: "/" });
-      assert.equal(first.stdout?.toString(), "one");
-      assert.equal(second.stdout?.toString(), "two");
+      for (let index = 0; index < 32; index += 1) {
+        const expected = `immediate-${index}`;
+        const result = await session.run({ executable: "/bin/printf", args: [expected], cwd: "/" });
+        assert.deepEqual(result.termination, { reason: "exit", code: 0 });
+        assert.equal(result.stdout?.toString(), expected);
+      }
     } finally {
       await session.close();
       await session.close();

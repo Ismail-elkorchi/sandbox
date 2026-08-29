@@ -31,7 +31,7 @@ mod linux {
     use std::os::unix::net::UnixStream;
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,15 +70,23 @@ mod linux {
         output: Arc<Mutex<io::Stdout>>,
     }
 
+    struct ProtocolSequence<'a> {
+        output: MutexGuard<'a, io::Stdout>,
+    }
+
     impl ProtocolWriter {
+        fn sequence(&self) -> Result<ProtocolSequence<'_>, ProtocolError> {
+            Ok(ProtocolSequence {
+                output: self.output.lock().map_err(|_| poisoned())?,
+            })
+        }
+
         fn control<T: Serialize>(
             &self,
             message_type: MessageType,
             value: &T,
         ) -> Result<(), ProtocolError> {
-            let frame = Frame::control(message_type, value)?;
-            let mut output = self.output.lock().map_err(|_| poisoned())?;
-            write_frame(&mut *output, &frame)
+            self.sequence()?.control(message_type, value)
         }
 
         fn binary(&self, message_type: MessageType, value: Vec<u8>) -> Result<(), ProtocolError> {
@@ -92,6 +100,17 @@ mod linux {
                 MessageType::Error,
                 &json!({"requestId": request_id, "error": error}),
             );
+        }
+    }
+
+    impl ProtocolSequence<'_> {
+        fn control<T: Serialize>(
+            &mut self,
+            message_type: MessageType,
+            value: &T,
+        ) -> Result<(), ProtocolError> {
+            let frame = Frame::control(message_type, value)?;
+            write_frame(&mut *self.output, &frame)
         }
     }
 
@@ -431,6 +450,9 @@ mod linux {
                     }
                 };
                 validate_prepared_run(&prepared, &message)?;
+                // The target can emit output as soon as it is spawned. Keep every cloned
+                // publisher behind this writer lock until ProcessStarted is serialized.
+                let mut publication = writer.sequence().map_err(protocol_data)?;
                 let running = spawn_process(
                     &prepared.policy,
                     &prepared.execution,
@@ -446,12 +468,13 @@ mod linux {
                     prepared_process: None,
                     running: Some(Arc::clone(&running)),
                 });
-                writer
+                publication
                     .control(
                         MessageType::ProcessStarted,
                         &process_started(&message.request_id, &running),
                     )
                     .map_err(protocol_data)?;
+                drop(publication);
                 send_stdin_credit(writer)?;
                 if prepared.execution.normalized.stdin == "closed" {
                     close_target_stdin(&running)?;
@@ -619,6 +642,9 @@ mod linux {
                     )
                 })?;
                 validate_prepared_process(&session.policy, &prepared, &message)?;
+                // The target can emit output as soon as it is spawned. Keep every cloned
+                // publisher behind this writer lock until ProcessStarted is serialized.
+                let mut publication = writer.sequence().map_err(protocol_data)?;
                 let running = spawn_process(
                     &session.policy,
                     &prepared.execution,
@@ -627,12 +653,13 @@ mod linux {
                     None,
                 )?;
                 session.running = Some(Arc::clone(&running));
-                writer
+                publication
                     .control(
                         MessageType::ProcessStarted,
                         &process_started(&message.request_id, &running),
                     )
                     .map_err(protocol_data)?;
+                drop(publication);
                 send_stdin_credit(writer)?;
                 if prepared.execution.normalized.stdin == "closed" {
                     close_target_stdin(&running)?;

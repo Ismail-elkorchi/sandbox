@@ -18,7 +18,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,11 +51,19 @@ struct ProtocolWriter {
     output: Arc<Mutex<io::Stdout>>,
 }
 
+struct ProtocolSequence<'a> {
+    output: MutexGuard<'a, io::Stdout>,
+}
+
 impl ProtocolWriter {
+    fn sequence(&self) -> Result<ProtocolSequence<'_>, ErrorData> {
+        Ok(ProtocolSequence {
+            output: self.output.lock().map_err(|_| lock_error())?,
+        })
+    }
+
     fn control<T: Serialize>(&self, kind: MessageType, value: &T) -> Result<(), ErrorData> {
-        let frame = Frame::control(kind, value).map_err(protocol_error)?;
-        let mut output = self.output.lock().map_err(|_| lock_error())?;
-        write_frame(&mut *output, &frame).map_err(protocol_error)
+        self.sequence()?.control(kind, value)
     }
 
     fn binary(&self, kind: MessageType, bytes: Vec<u8>) -> Result<(), ErrorData> {
@@ -72,6 +80,13 @@ impl ProtocolWriter {
                 "error": error,
             }),
         );
+    }
+}
+
+impl ProtocolSequence<'_> {
+    fn control<T: Serialize>(&mut self, kind: MessageType, value: &T) -> Result<(), ErrorData> {
+        let frame = Frame::control(kind, value).map_err(protocol_error)?;
+        write_frame(&mut *self.output, &frame).map_err(protocol_error)
     }
 }
 
@@ -444,6 +459,9 @@ fn handle_frame(
                 }
             };
             validate_run(&prepared, &message)?;
+            // The target can emit output as soon as it is spawned. Keep every cloned publisher
+            // behind this writer lock until ProcessStarted is serialized.
+            let mut publication = writer.sequence()?;
             let running =
                 start_process(&prepared.policy, &prepared.execution, writer.clone(), true)?;
             *state = RuntimeState::Session(Session {
@@ -454,7 +472,8 @@ fn handle_frame(
                 prepared: None,
                 running: Some(Arc::clone(&running)),
             });
-            process_started(writer, &message.request_id, &running)?;
+            process_started(&mut publication, &message.request_id, &running)?;
+            drop(publication);
             send_stdin_credit(writer)?;
             if prepared.execution.normalized.stdin == "closed" {
                 close_stdin(&running)?;
@@ -607,10 +626,14 @@ fn handle_frame(
                 )
             })?;
             validate_process(&session.policy, &prepared, &message)?;
+            // The target can emit output as soon as it is spawned. Keep every cloned publisher
+            // behind this writer lock until ProcessStarted is serialized.
+            let mut publication = writer.sequence()?;
             let running =
                 start_process(&session.policy, &prepared.execution, writer.clone(), false)?;
             session.running = Some(Arc::clone(&running));
-            process_started(writer, &message.request_id, &running)?;
+            process_started(&mut publication, &message.request_id, &running)?;
+            drop(publication);
             send_stdin_credit(writer)?;
             if prepared.execution.normalized.stdin == "closed" {
                 close_stdin(&running)?;
@@ -1885,8 +1908,8 @@ fn start_process(
     let SpawnedProcess {
         mut process,
         mut stdin,
-        mut stdout,
-        mut stderr,
+        stdout,
+        stderr,
     } = platform_spawn(policy, execution)?;
     let (stdin_tx, stdin_rx) = mpsc::channel();
     let (control_tx, control_rx) = mpsc::channel();
@@ -1937,16 +1960,16 @@ fn start_process(
         "stdout",
         execution.normalized.stdout.clone(),
         execution.normalized.resources.max_output_bytes,
-        &mut stdout,
-    )?;
+        stdout,
+    );
     let stderr_thread = output_thread(
         Arc::clone(&running),
         writer.clone(),
         "stderr",
         execution.normalized.stderr.clone(),
         execution.normalized.resources.max_output_bytes,
-        &mut stderr,
-    )?;
+        stderr,
+    );
     let authority = Arc::clone(&policy.authority);
     let lifecycle_running = Arc::clone(&running);
     let wall_limit = Duration::from_millis(execution.normalized.resources.wall_time_ms);
@@ -2053,12 +2076,9 @@ fn output_thread(
     stream: &'static str,
     mode: String,
     maximum: u64,
-    file: &mut File,
-) -> Result<thread::JoinHandle<()>, ErrorData> {
-    let mut reader = file
-        .try_clone()
-        .map_err(|error| os_error("spawn.output_clone", &error, "spawn"))?;
-    Ok(thread::spawn(move || {
+    mut reader: File,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
         let counter = if stream == "stdout" {
             &running.stdout_bytes
         } else {
@@ -2109,7 +2129,7 @@ fn output_thread(
                 offset += allowed;
             }
         }
-    }))
+    })
 }
 
 fn verify_policy(policy: &PreparedPolicy) -> Result<(), ErrorData> {
@@ -2634,11 +2654,11 @@ fn validate_process(
 }
 
 fn process_started(
-    writer: &ProtocolWriter,
+    publication: &mut ProtocolSequence<'_>,
     request_id: &str,
     running: &Running,
 ) -> Result<(), ErrorData> {
-    writer.control(
+    publication.control(
         MessageType::ProcessStarted,
         &json!({
             "requestId": request_id,
