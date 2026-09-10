@@ -14,9 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-26.04
             artifact: linux-x64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-26.04-arm
             artifact: linux-arm64
           - runner: macos-13
             artifact: macos-x64
@@ -54,7 +54,7 @@ jobs:
 
   assemble:
     needs: native
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

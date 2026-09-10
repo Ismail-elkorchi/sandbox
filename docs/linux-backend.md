@@ -2,6 +2,8 @@
 
 `linux-namespace-v1` constructs an isolated filesystem and process context with the system bubblewrap executable at `/usr/bin/bwrap`. Bubblewrap must be installed and permitted by the host's security policy. The runtime verifies root ownership and write permissions, retains its executable descriptor, and binds its identity and content digest during preparation. It does not change host security settings.
 
+Linux CI uses Ubuntu 26.04 with its packaged Bubblewrap AppArmor profile. Ubuntu 24.04 does not ship that authorization profile in its standard AppArmor package; on a host enforcing unprivileged-user-namespace restrictions, installing Bubblewrap alone does not make namespace execution eligible. Host policy must authorize the launcher.
+
 Disposable probes exercise the namespace launcher, isolated networking, Landlock, seccomp, and delegated cgroup controllers independently. Eligibility depends on the requested guarantees. Missing memory or process-count delegation does not prevent execution when those limits were not requested.
 
 Preparation opens explicit resources, records their object identities, snapshots executable bytes, and binds policy and execution digests. Symbolic links are resolved through the admitted filesystem: a destination must belong to an admitted resource, respect masks, and permit execution where required. No toolchain, home, or cache directories are implicitly admitted.
