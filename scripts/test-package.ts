@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-package-test-"));
+const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
   const core = await pack("@ismail-elkorchi/sandbox");
   const vm = await pack("@ismail-elkorchi/sandbox-hardware-vm");
@@ -19,12 +20,16 @@ try {
   }
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);
+  if (originalUmask !== undefined) process.umask(0o002);
   await run("npm", ["init", "--yes"], consumer);
   await run("npm", ["install", "--ignore-scripts", core, vm], consumer);
   await run("node", ["--input-type=module", "--eval", "await import('@ismail-elkorchi/sandbox'); await import('@ismail-elkorchi/sandbox-hardware-vm')"], consumer);
+  await copyFile(resolve("scripts/package-consumer.mjs"), resolve(consumer, "package-consumer.mjs"));
+  await run("node", ["package-consumer.mjs"], consumer);
   const lock = await readFile(resolve(consumer, "package-lock.json"), "utf8");
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
 } finally {
+  if (originalUmask !== undefined) process.umask(originalUmask);
   await rm(temporary, { recursive: true, force: true });
 }
 
@@ -39,11 +44,13 @@ async function pack(workspace: string): Promise<string> {
 
 function run(command: string, arguments_: readonly string[], cwd = process.cwd()): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(command, arguments_, { cwd, stdio: "ignore" });
+    const errors: Buffer[] = [];
+    const child = spawn(command, arguments_, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
     child.once("error", rejectRun);
     child.once("exit", (code, signal) => {
       if (code === 0) resolveRun();
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`));
+      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
     });
   });
 }

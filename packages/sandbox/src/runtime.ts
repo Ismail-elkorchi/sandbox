@@ -41,6 +41,7 @@ import {
   parseRunResult,
   parseViolation,
   string,
+  stringArray,
   type JsonObject,
 } from "./validation.js";
 
@@ -51,6 +52,7 @@ interface PendingRequest {
 }
 
 interface ActiveProcessHooks {
+  readonly id: string;
   output(stream: "stdout" | "stderr", chunk: Buffer): void;
   artifact(chunk: Buffer): void;
   exit(value: unknown): void;
@@ -58,16 +60,35 @@ interface ActiveProcessHooks {
   fail(error: SandboxError): void;
 }
 
+export type ProbeState = "available" | "unavailable" | "error" | "not-run";
+
+export interface MechanismProbe {
+  state: ProbeState;
+  operation: string;
+  osError?: { code: number; name?: string };
+  detail?: string;
+}
+
 export interface RuntimeSupport {
   protocol: { major: number; minor: number };
   packageVersion: string;
   host: { platform: string; architecture: string };
-  backends: readonly {
-    id: string;
-    isolation: string;
+  implementations: readonly {
+    identity: {
+      id: string;
+      version: string;
+      buildId: string;
+      conformanceManifestId: string;
+    };
+    boundary: string;
+    filesystem: readonly ("host" | "isolated")[];
     stability: "stable" | "experimental";
-    available: boolean;
-    capabilities: Readonly<Record<string, unknown>>;
+    availability: "available" | "unavailable" | "error";
+    eligibility: {
+      state: "eligible" | "ineligible" | "not-evaluated";
+      unmet: readonly string[];
+    };
+    mechanisms: Readonly<Record<string, MechanismProbe>>;
   }[];
 }
 
@@ -152,7 +173,7 @@ async function locateAndVerifyRuntime(): Promise<VerifiedRuntime> {
       platform: process.platform,
     });
   }
-  if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixMode(metadata.mode)) {
+  if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafeBundledRuntimeMode(metadata.mode)) {
     throw new SandboxRuntimeIntegrityError({
       code: "runtime_integrity.file_type",
       message: "bundled runtime must be a non-symbolic regular file with safe host permissions",
@@ -225,14 +246,15 @@ async function locateAndVerifyRuntime(): Promise<VerifiedRuntime> {
       });
     }
   }
-  if (process.platform === "win32" || process.platform === "darwin") {
-    return snapshotVerifiedRuntime(binaryPath, bytes, file, process.platform === "darwin");
-  }
-  return { path: binaryPath, file };
+  return snapshotVerifiedRuntime(binaryPath, bytes, file, process.platform === "darwin");
 }
 
 function hasUnsafePosixMode(mode: number): boolean {
   return process.platform !== "win32" && (mode & 0o022) !== 0;
+}
+
+function hasUnsafeBundledRuntimeMode(mode: number): boolean {
+  return process.platform !== "win32" && (mode & 0o002) !== 0;
 }
 
 async function snapshotVerifiedRuntime(
@@ -426,10 +448,16 @@ export class RuntimeClient {
     if (this.#active === hooks) this.#active = undefined;
   }
 
-  async sendStdin(bytes: Buffer): Promise<void> {
+  async sendStdin(processId: string, bytes: Buffer): Promise<void> {
     let offset = 0;
     while (offset < bytes.byteLength) {
-      await this.#waitForStdinCredit();
+      if (this.#active?.id !== processId || this.#processLifecycle !== "running") {
+        throw new Error("Target stdin is closed.");
+      }
+      if (this.#stdinCredit === 0) {
+        await new Promise<void>((resolveCredit) => this.#stdinWaiters.push(resolveCredit));
+        continue;
+      }
       const count = Math.min(bytes.byteLength - offset, MAX_STREAM_PAYLOAD, this.#stdinCredit);
       this.#stdinCredit -= count;
       await this.#sendBinary(MessageType.Stdin, bytes.subarray(offset, offset + count));
@@ -437,8 +465,13 @@ export class RuntimeClient {
     }
   }
 
-  grantOutput(stream: "stdout" | "stderr", bytes: number): void {
-    if (bytes > 0) {
+  closeStdin(processId: string): Promise<void> {
+    if (this.#active?.id !== processId || this.#processLifecycle !== "running") return Promise.resolve();
+    return this.request(MessageType.CloseStdin, MessageType.Event, { id: processId }).then(() => undefined);
+  }
+
+  grantOutput(owner: ActiveProcessHooks, stream: "stdout" | "stderr", bytes: number): void {
+    if (bytes > 0 && this.#active === owner && this.#processLifecycle === "running") {
       void this.#sendControl(MessageType.StreamCredit, { stream, bytes }).catch((error: unknown) => {
         this.#crash(error instanceof Error ? error : new Error("credit write failed"));
       });
@@ -559,6 +592,7 @@ export class RuntimeClient {
     if (frame.messageType === MessageType.ProcessExit) {
       if (this.#processLifecycle !== "running") throw new FrameDecodeError("process exit is out of lifecycle order");
       this.#processLifecycle = "exited";
+      for (const waiter of this.#stdinWaiters.splice(0)) waiter();
       if (this.#active === undefined) this.#pendingExit = value;
       else this.#active.exit(value);
       return;
@@ -633,12 +667,6 @@ export class RuntimeClient {
     return write;
   }
 
-  #waitForStdinCredit(): Promise<void> {
-    if (this.#stdinCredit > 0) return Promise.resolve();
-    if (this.#closed) return Promise.reject(this.#crashedError("runtime closed while writing stdin"));
-    return new Promise((resolveCredit) => this.#stdinWaiters.push(resolveCredit));
-  }
-
   #receiveEmergency(chunk: Buffer): void {
     if (this.#stderrBytes >= this.#stderrLimit) return;
     const accepted = chunk.subarray(0, this.#stderrLimit - this.#stderrBytes);
@@ -693,16 +721,55 @@ function parseSupport(value: unknown): RuntimeSupport {
       platform: string(host.platform, "support.host.platform"),
       architecture: string(host.architecture, "support.host.architecture"),
     },
-    backends: array(source.backends, "support.backends").map((entry) => {
-      const backend = object(entry, "support backend");
-      const stability = string(backend.stability, "backend.stability");
-      if (stability !== "stable" && stability !== "experimental") throw new TypeError("invalid backend stability");
+    implementations: array(source.implementations, "support.implementations").map((entry) => {
+      const implementation = object(entry, "support implementation");
+      const identity = object(implementation.identity, "implementation.identity");
+      const stability = string(implementation.stability, "implementation.stability");
+      if (stability !== "stable" && stability !== "experimental") throw new TypeError("invalid implementation stability");
+      const availability = string(implementation.availability, "implementation.availability");
+      if (availability !== "available" && availability !== "unavailable" && availability !== "error") throw new TypeError("invalid implementation availability");
+      const eligibility = object(implementation.eligibility, "implementation.eligibility");
+      const eligibilityState = string(eligibility.state, "implementation.eligibility.state");
+      if (eligibilityState !== "eligible" && eligibilityState !== "ineligible" && eligibilityState !== "not-evaluated") throw new TypeError("invalid implementation eligibility");
+      const mechanisms: Record<string, MechanismProbe> = {};
+      for (const [name, value] of Object.entries(object(implementation.mechanisms, "implementation.mechanisms"))) {
+        const probe = object(value, `mechanism ${name}`);
+        const state = string(probe.state, `mechanism ${name}.state`);
+        if (state !== "available" && state !== "unavailable" && state !== "error" && state !== "not-run") throw new TypeError(`invalid mechanism ${name} state`);
+        const parsed: MechanismProbe = {
+          state,
+          operation: string(probe.operation, `mechanism ${name}.operation`),
+        };
+        if (probe.detail !== undefined) parsed.detail = string(probe.detail, `mechanism ${name}.detail`).slice(0, 4096);
+        if (probe.osError !== undefined) {
+          const osError = object(probe.osError, `mechanism ${name}.osError`);
+          parsed.osError = {
+            code: number(osError.code, `mechanism ${name}.osError.code`),
+            ...(osError.name === undefined ? {} : { name: string(osError.name, `mechanism ${name}.osError.name`) }),
+          };
+        }
+        mechanisms[name] = parsed;
+      }
       return {
-        id: string(backend.id, "backend.id"),
-        isolation: string(backend.isolation, "backend.isolation"),
+        identity: {
+          id: string(identity.id, "implementation.identity.id"),
+          version: string(identity.version, "implementation.identity.version"),
+          buildId: string(identity.buildId, "implementation.identity.buildId"),
+          conformanceManifestId: string(identity.conformanceManifestId, "implementation.identity.conformanceManifestId"),
+        },
+        boundary: string(implementation.boundary, "implementation.boundary"),
+        filesystem: array(implementation.filesystem, "implementation.filesystem").map((value) => {
+          const kind = string(value, "implementation filesystem kind");
+          if (kind !== "host" && kind !== "isolated") throw new TypeError("invalid implementation filesystem kind");
+          return kind;
+        }),
         stability,
-        available: boolean(backend.available, "backend.available"),
-        capabilities: object(backend.capabilities, "backend.capabilities"),
+        availability,
+        eligibility: {
+          state: eligibilityState,
+          unmet: stringArray(eligibility.unmet, "implementation.eligibility.unmet"),
+        },
+        mechanisms,
       };
     }),
   };
@@ -752,12 +819,12 @@ class RuntimeStdin extends Writable {
     callback: (error?: Error | null) => void,
   ): void {
     const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding) : Buffer.from(chunk);
-    void this.#client.sendStdin(bytes).then(() => callback(), callback);
+    void this.#client.sendStdin(this.#processId, bytes).then(() => callback(), callback);
   }
 
   override _final(callback: (error?: Error | null) => void): void {
     void this.#client
-      .request(MessageType.CloseStdin, MessageType.Event, { id: this.#processId })
+      .closeStdin(this.#processId)
       .then(() => callback(), callback);
   }
 }
@@ -836,16 +903,16 @@ export class RuntimeProcess implements SandboxProcess, ActiveProcessHooks {
     const mode = stream === "stdout" ? this.#options.stdoutMode : this.#options.stderrMode;
     if (mode === "capture") {
       (stream === "stdout" ? this.#stdoutCapture : this.#stderrCapture).push(Buffer.from(chunk));
-      this.#client.grantOutput(stream, chunk.byteLength);
+      this.#client.grantOutput(this, stream, chunk.byteLength);
       return;
     }
     const destination = stream === "stdout" ? this.stdout : this.stderr;
     if (destination === null) {
-      this.#client.grantOutput(stream, chunk.byteLength);
+      this.#client.grantOutput(this, stream, chunk.byteLength);
       return;
     }
     if (destination.write(chunk)) {
-      this.#client.grantOutput(stream, chunk.byteLength);
+      this.#client.grantOutput(this, stream, chunk.byteLength);
     } else {
       if (stream === "stdout") {
         this.#stdoutWithheldCredit += chunk.byteLength;
@@ -855,7 +922,7 @@ export class RuntimeProcess implements SandboxProcess, ActiveProcessHooks {
             const bytes = this.#stdoutWithheldCredit;
             this.#stdoutWithheldCredit = 0;
             this.#stdoutDrainPending = false;
-            this.#client.grantOutput("stdout", bytes);
+            this.#client.grantOutput(this, "stdout", bytes);
           });
         }
       } else {
@@ -866,7 +933,7 @@ export class RuntimeProcess implements SandboxProcess, ActiveProcessHooks {
             const bytes = this.#stderrWithheldCredit;
             this.#stderrWithheldCredit = 0;
             this.#stderrDrainPending = false;
-            this.#client.grantOutput("stderr", bytes);
+            this.#client.grantOutput(this, "stderr", bytes);
           });
         }
       }

@@ -1,9 +1,8 @@
 {
   "formatVersion": 1,
   "buildId": "sandbox-runtime-0.1.0",
-  "conformanceManifestId": "cross-platform-sandbox-conformance-1",
   "files": {
-    "linux-x64/sandbox-runtime-linux-x64": "576e17a382079f9352580038ce81b185dc16443bb623298e53575acc4d4137e8",
-    "linux-arm64/sandbox-runtime-linux-arm64": "ad1fdec54de08490408fb7428ed1d0401a730a0fa77157ed9cdfe9aa45788b6f"
+    "linux-x64/sandbox-runtime-linux-x64": "436ffc81e7639aa15a0b321385af2153a98ab689a24e162a3aa9675c1a6975f9",
+    "linux-arm64/sandbox-runtime-linux-arm64": "3dec8654f267e97857e7a72954598b96cbede9d4542965608944212437c62cec"
   }
 }

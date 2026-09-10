@@ -1,9 +1,10 @@
 {
   "id": "linux-namespace-v1-conformance-1",
-  "backend": "linux-namespace-v1",
+  "implementation": "linux-namespace-v1",
   "version": "0.1.0",
   "boundary": "os-process",
-  "stable": true,
+  "filesystem": "isolated",
+  "stability": "stable",
   "suites": [
     "preparation",
     "filesystem",

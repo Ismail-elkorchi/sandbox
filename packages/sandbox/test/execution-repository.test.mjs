@@ -4,28 +4,41 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createSandbox, openSandboxExecutionRepository } from "../dist/index.js";
+import { openSandboxExecutionRepository } from "../dist/index.js";
 import { executionDirectory, readRecord, writeRecord } from "../dist/execution-record.js";
-import { baseOptions } from "./helpers.mjs";
+import {
+  baseOptions,
+  isolatedPath,
+  isolatedPolicy,
+  isolatedResource,
+  linuxImplementationEligible,
+  readWriteAccess,
+  runtimeResources,
+} from "./helpers.mjs";
 
-const linux = process.platform === "linux" && await (async () => {
-  const sandbox = await createSandbox();
-  try {
-    const support = await sandbox.probe();
-    return support.backends.some((backend) => backend.id === "linux-namespace-v1" && backend.available);
-  } catch {
-    return false;
-  } finally {
-    await sandbox.dispose();
-  }
-})();
+const linux = await linuxImplementationEligible();
 
 function detachedRun(process, overrides = {}) {
+  const options = baseOptions(overrides);
   return {
-    ...baseOptions(overrides),
-    resources: { maxOutputBytes: 1024 * 1024 },
-    process,
+    ...options,
+    resources: {
+      ...options.resources,
+      output: { enforcement: "hard", scope: "process", value: 1024 * 1024 },
+    },
+    process: {
+      ...process,
+      executable: typeof process.executable === "string" ? isolatedPath(process.executable) : process.executable,
+      cwd: typeof process.cwd === "string" ? isolatedPath(process.cwd) : process.cwd,
+    },
   };
+}
+
+function workspacePolicy(path) {
+  return isolatedPolicy([
+    ...runtimeResources(),
+    isolatedResource("workspace", path, "/workspace", readWriteAccess(), ["data"]),
+  ]);
 }
 
 test("execution repository binds one identity to one exact request", async () => {
@@ -61,9 +74,9 @@ test("execution repository fails closed for unsupported detached contracts", asy
     await assert.rejects(
       repository.prepare({
         executionId: "missing-output-bound",
-        run: { ...baseOptions(), process: { executable: "/bin/true", cwd: "/" } },
+        run: { ...baseOptions(), process: { executable: isolatedPath("/bin/true"), cwd: isolatedPath("/") } },
       }),
-      /maxOutputBytes/,
+      /resources\.output/,
     );
     await assert.rejects(
       repository.prepare({
@@ -184,14 +197,7 @@ test("two callers share one isolated execution and output cursors are exact", { 
         cwd: "/workspace",
         stdout: "pipe",
       }, {
-        policy: {
-          filesystem: {
-            runtime: { kind: "system" },
-            grants: [{ hostPath: parent, targetPath: "/workspace", access: "read-write" }],
-          },
-          network: { mode: "none" },
-          process: { hostProcesses: "deny", hostIpc: "deny" },
-        },
+        policy: workspacePolicy(parent),
       }),
     };
     const [first, second] = await Promise.all([
@@ -225,14 +231,7 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
         args: ["-c", "sleep 1; printf late > /workspace/late"],
         cwd: "/workspace",
       }, {
-        policy: {
-          filesystem: {
-            runtime: { kind: "system" },
-            grants: [{ hostPath: parent, targetPath: "/workspace", access: "read-write" }],
-          },
-          network: { mode: "none" },
-          process: { hostProcesses: "deny", hostIpc: "deny" },
-        },
+        policy: workspacePolicy(parent),
       }),
     };
     const prepared = await repository.prepare(request, { waitMs: 500 });

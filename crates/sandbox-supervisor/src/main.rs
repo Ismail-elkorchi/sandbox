@@ -5,19 +5,21 @@
 mod linux {
 
     use sandbox_launcher_linux::{
-        KernelProbeResult, LauncherEvent, LauncherFinalStatus, LauncherStatus, probe_main,
-        read_launcher_event, read_launcher_status, receive_managed_listener_fds, send_launch_spec,
+        KernelProbeResult, LauncherEvent, LauncherFinalStatus, LauncherStatus, ProbeOutcome,
+        admit_target, probe_main, read_launcher_event, read_launcher_status,
+        receive_managed_listener_fds, receive_target_pid, send_launch_spec,
         send_launcher_close_stdin, send_launcher_stdin, send_launcher_terminate,
     };
     use sandbox_network_broker::{BrokerHandle, NetworkViolation};
     use sandbox_platform::{
-        Cgroup, PreparedLinuxExecution, PreparedLinuxPolicy, ProbeCapabilities, execution_summary,
-        host_physical_memory, prepare_execution, prepare_policy, probe_cgroup_delegation,
+        BUILD_ID, CONFORMANCE_MANIFEST_ID, Cgroup, IMPLEMENTATION_ID, IMPLEMENTATION_VERSION,
+        PreparedLinuxExecution, PreparedLinuxPolicy, ProbeCapabilities, execution_summary,
+        implementation_limitations, prepare_execution, prepare_policy, probe_cgroup_delegation,
     };
     use sandbox_policy::{
         ActivateSessionMessage, ErrorData, IdMessage, PrepareProcessMessage, PrepareRunMessage,
-        PrepareSessionMessage, StartProcessMessage, StartRunMessage, TerminateMessage,
-        normalize_process, normalize_run, normalize_session,
+        PrepareSessionMessage, SessionOptions, StartProcessMessage, StartRunMessage,
+        TerminateMessage, normalize_process, normalize_run, normalize_session,
     };
     use sandbox_protocol::{
         Frame, Hello, INITIAL_STREAM_CREDIT, MessageType, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -48,6 +50,12 @@ mod linux {
             .as_deref()
         {
             Some("--linux-launcher") => std::process::exit(sandbox_launcher_linux::launcher_main()),
+            Some("--linux-isolated") => {
+                std::process::exit(sandbox_launcher_linux::isolated_main(arguments.next()))
+            }
+            Some("--linux-namespace-probe") => {
+                std::process::exit(sandbox_launcher_linux::namespace_probe_main())
+            }
             Some("--linux-probe") => std::process::exit(probe_main()),
             Some(_) => {
                 eprintln!("invalid internal runtime mode");
@@ -143,7 +151,7 @@ mod linux {
         deadline: Option<Instant>,
         active: bool,
         prepared_process: Option<PreparedProcess>,
-        running: Option<Arc<RunningState>>,
+        running: Option<Arc<ProcessState>>,
     }
 
     enum RuntimeState {
@@ -205,7 +213,7 @@ mod linux {
             &self,
             stream: MessageType,
             maximum: usize,
-            alive: &AtomicBool,
+            cancelled: &AtomicBool,
         ) -> Option<usize> {
             let mut values = self.values.lock().ok()?;
             loop {
@@ -219,39 +227,31 @@ mod linux {
                     *available -= amount as u64;
                     return Some(amount);
                 }
-                if !alive.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) {
                     return None;
                 }
                 values = self.changed.wait(values).ok()?;
             }
         }
-
-        fn refund(&self, stream: MessageType, amount: usize) {
-            if amount == 0 {
-                return;
-            }
-            if let Ok(mut values) = self.values.lock() {
-                let value = if stream == MessageType::Stdout {
-                    &mut values.0
-                } else {
-                    &mut values.1
-                };
-                *value = value
-                    .saturating_add(amount as u64)
-                    .min(MAX_OUTSTANDING_CREDIT);
-                self.changed.notify_all();
-            }
-        }
     }
 
-    struct RunningState {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProcessPhase {
+        Executing,
+        Draining,
+        Finished,
+    }
+
+    struct ProcessState {
         id: String,
         policy_digest: String,
         execution_digest: String,
         enforcement: sandbox_policy::EnforcementReport,
         control: Mutex<UnixStream>,
-        launcher_pid: u32,
-        alive: AtomicBool,
+        launcher: std::fs::File,
+        phase: Mutex<ProcessPhase>,
+        phase_changed: Condvar,
+        output_cancelled: AtomicBool,
         stdin_credit: Mutex<u64>,
         credits: OutputCredits,
         termination_reason: Mutex<Option<String>>,
@@ -265,6 +265,34 @@ mod linux {
         hard_kill_armed: AtomicBool,
         termination_grace_ms: u64,
         violations: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl ProcessState {
+        fn is_alive(&self) -> bool {
+            *self.phase.lock().expect("process lifecycle lock") == ProcessPhase::Executing
+        }
+
+        fn is_finished(&self) -> bool {
+            *self.phase.lock().expect("process lifecycle lock") == ProcessPhase::Finished
+        }
+
+        fn set_phase(&self, phase: ProcessPhase) {
+            *self.phase.lock().expect("process lifecycle lock") = phase;
+            self.phase_changed.notify_all();
+        }
+
+        fn wait_while(
+            &self,
+            duration: Duration,
+            predicate: impl FnMut(&mut ProcessPhase) -> bool,
+        ) -> ProcessPhase {
+            let phase = self.phase.lock().expect("process lifecycle lock");
+            let (phase, _) = self
+                .phase_changed
+                .wait_timeout_while(phase, duration, predicate)
+                .expect("process lifecycle lock");
+            *phase
+        }
     }
 
     fn supervisor_main() -> Result<(), Box<dyn std::error::Error>> {
@@ -369,7 +397,7 @@ mod linux {
                         "protocolMajor": PROTOCOL_MAJOR,
                         "protocolMinor": PROTOCOL_MINOR,
                         "runtimeVersion": env!("CARGO_PKG_VERSION"),
-                        "backendVersions": {"linux-namespace-v1": env!("CARGO_PKG_VERSION")},
+                        "implementationVersions": {IMPLEMENTATION_ID: IMPLEMENTATION_VERSION},
                     }),
                 )
                 .map_err(protocol_data)?;
@@ -381,35 +409,23 @@ mod linux {
                 let value: Value = parse(&frame)?;
                 let request_id = request_id_from_value(&value)?;
                 unique_request(request_ids, &request_id)?;
+                let request = value.get("request").cloned().unwrap_or_else(|| json!({}));
                 writer
-                .control(
-                    MessageType::ProbeResult,
-                    &json!({
-                        "requestId": request_id,
-                        "support": {
-                            "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
-                            "packageVersion": env!("CARGO_PKG_VERSION"),
-                            "host": {"platform": "linux", "architecture": std::env::consts::ARCH},
-                            "backends": [{
-                                "id": "linux-namespace-v1",
-                                "isolation": "process",
-                                "stability": "stable",
-                                "available": capabilities.backend_available("none"),
-                                "capabilities": capabilities,
-                            }],
-                        }
-                    }),
-                )
-                .map_err(protocol_data)?;
+                    .control(
+                        MessageType::ProbeResult,
+                        &json!({
+                            "requestId": request_id,
+                            "support": probe_support(capabilities, &request)
+                        }),
+                    )
+                    .map_err(protocol_data)?;
             }
             MessageType::PrepareRun => {
                 ensure_empty(state)?;
-                let message: PrepareRunMessage = parse(&frame)?;
+                let message: PrepareRunMessage = parse_policy_message(&frame)?;
                 unique_request(request_ids, &message.request_id)?;
-                let memory = host_physical_memory()
-                    .map_err(|error| runtime_os("preparation.host_memory", &error, "prepare"))?;
                 let (normalized_policy, normalized_execution) =
-                    normalize_run(message.options, memory).map_err(|error| *error.0)?;
+                    normalize_run(message.options).map_err(|error| *error.0)?;
                 let policy = prepare_policy(normalized_policy, capabilities)?;
                 let execution = prepare_execution(&policy, normalized_execution)?;
                 let id = new_id("run");
@@ -456,10 +472,10 @@ mod linux {
                 let running = spawn_process(
                     &prepared.policy,
                     &prepared.execution,
-                    capabilities,
                     writer.clone(),
                     Some(prepared.policy.state_path()),
                 )?;
+                let wall_time_ms = prepared.policy.normalized.limits.wall_time.value;
                 *state = RuntimeState::Session(SessionState {
                     id: String::new(),
                     policy: prepared.policy,
@@ -479,10 +495,7 @@ mod linux {
                 if prepared.execution.normalized.stdin == "closed" {
                     close_target_stdin(&running)?;
                 }
-                set_watchdog_duration(
-                    &running,
-                    prepared.execution.normalized.resources.wall_time_ms,
-                );
+                set_watchdog_duration(&running, wall_time_ms);
             }
             MessageType::CancelPreparedRun => {
                 let message: IdMessage = parse(&frame)?;
@@ -495,12 +508,9 @@ mod linux {
             }
             MessageType::PrepareSession => {
                 ensure_empty(state)?;
-                let message: PrepareSessionMessage = parse(&frame)?;
+                let message: PrepareSessionMessage = parse_policy_message(&frame)?;
                 unique_request(request_ids, &message.request_id)?;
-                let memory = host_physical_memory()
-                    .map_err(|error| runtime_os("preparation.host_memory", &error, "prepare"))?;
-                let normalized =
-                    normalize_session(message.options, memory).map_err(|error| *error.0)?;
+                let normalized = normalize_session(message.options).map_err(|error| *error.0)?;
                 let policy = prepare_policy(normalized, capabilities)?;
                 let id = new_id("session");
                 let (deadline, expires_at_ms) = expiration(policy.normalized.prepared_ttl_ms);
@@ -578,7 +588,7 @@ mod linux {
                 writer.control(MessageType::Event, &json!({"requestId": message.request_id, "kind": "cancelled", "id": message.id})).map_err(protocol_data)?;
             }
             MessageType::PrepareProcess => {
-                let message: PrepareProcessMessage = parse(&frame)?;
+                let message: PrepareProcessMessage = parse_policy_message(&frame)?;
                 unique_request(request_ids, &message.request_id)?;
                 let session = active_session_mut(state, &message.session_id)?;
                 clear_finished_process(session);
@@ -589,9 +599,8 @@ mod linux {
                         "prepare",
                     ));
                 }
-                let normalized =
-                    normalize_process(message.process, &session.policy.normalized.resources)
-                        .map_err(|error| *error.0)?;
+                let normalized = normalize_process(message.process, &session.policy.normalized)
+                    .map_err(|error| *error.0)?;
                 let execution = prepare_execution(&session.policy, normalized)?;
                 let id = new_id("process");
                 let (deadline, expires_at_ms) =
@@ -645,13 +654,8 @@ mod linux {
                 // The target can emit output as soon as it is spawned. Keep every cloned
                 // publisher behind this writer lock until ProcessStarted is serialized.
                 let mut publication = writer.sequence().map_err(protocol_data)?;
-                let running = spawn_process(
-                    &session.policy,
-                    &prepared.execution,
-                    capabilities,
-                    writer.clone(),
-                    None,
-                )?;
+                let running =
+                    spawn_process(&session.policy, &prepared.execution, writer.clone(), None)?;
                 session.running = Some(Arc::clone(&running));
                 publication
                     .control(
@@ -664,10 +668,7 @@ mod linux {
                 if prepared.execution.normalized.stdin == "closed" {
                     close_target_stdin(&running)?;
                 }
-                set_watchdog_duration(
-                    &running,
-                    prepared.execution.normalized.resources.wall_time_ms,
-                );
+                set_watchdog_duration(&running, session.policy.normalized.limits.wall_time.value);
             }
             MessageType::CancelPreparedProcess => {
                 let message: IdMessage = parse(&frame)?;
@@ -683,7 +684,7 @@ mod linux {
                 writer.control(MessageType::Event, &json!({"requestId": message.request_id, "kind": "cancelled", "id": message.id})).map_err(protocol_data)?;
             }
             MessageType::Stdin => {
-                let running = running_state(state)?;
+                let running = process_state(state)?;
                 let length = u64::try_from(frame.payload.len()).map_err(|_| {
                     ErrorData::new("protocol.stdin", "stdin frame length overflow", "execute")
                 })?;
@@ -699,14 +700,15 @@ mod linux {
                     *credit -= length;
                 }
                 let mut control = running.control.lock().map_err(|_| lock_error())?;
-                send_launcher_stdin(&mut control, &frame.payload)
-                    .map_err(|error| runtime_os("runtime.stdin", &error, "execute"))?;
-                drop(control);
+                control_write(
+                    send_launcher_stdin(&mut control, &frame.payload),
+                    "runtime.stdin",
+                )?;
             }
             MessageType::CloseStdin => {
                 let message: IdMessage = parse(&frame)?;
                 unique_request(request_ids, &message.request_id)?;
-                let running = running_state(state)?;
+                let running = process_state(state)?;
                 if running.id != message.id {
                     return Err(ErrorData::new(
                         "protocol.process_id",
@@ -719,13 +721,13 @@ mod linux {
             }
             MessageType::StreamCredit => {
                 let message: StreamCreditMessage = parse(&frame)?;
-                let running = running_state(state)?;
+                let running = process_state(state)?;
                 running.credits.grant(&message.stream, message.bytes)?;
             }
             MessageType::Terminate => {
                 let message: TerminateMessage = parse(&frame)?;
                 unique_request(request_ids, &message.request_id)?;
-                let running = running_state(state)?;
+                let running = process_state(state)?;
                 if running.id != message.id {
                     return Err(ErrorData::new(
                         "protocol.process_id",
@@ -749,7 +751,7 @@ mod linux {
                         ));
                     }
                     if let Some(running) = &session.running
-                        && running.alive.load(Ordering::Acquire)
+                        && !running.is_finished()
                     {
                         if let Err(error) = request_termination(running, "caller-request") {
                             cleanup_failures.push(cleanup_failure(
@@ -766,7 +768,7 @@ mod linux {
                             }
                         }
                         wait_for_exit(running, Duration::from_secs(15));
-                        if running.alive.load(Ordering::Acquire) {
+                        if running.is_alive() {
                             cleanup_failures.push(cleanup_failure(
                                 "cleanup.tree_unconfirmed",
                                 "target-process-tree",
@@ -827,10 +829,9 @@ mod linux {
     fn spawn_process(
         policy: &PreparedLinuxPolicy,
         execution: &PreparedLinuxExecution,
-        capabilities: &ProbeCapabilities,
         writer: ProtocolWriter,
         cleanup_state_path: Option<std::path::PathBuf>,
-    ) -> Result<Arc<RunningState>, ErrorData> {
+    ) -> Result<Arc<ProcessState>, ErrorData> {
         let bundle = policy.launch_bundle(execution)?;
         let executable = std::env::current_exe()
             .map_err(|error| runtime_os("spawn.runtime_path", &error, "spawn"))?;
@@ -850,26 +851,9 @@ mod linux {
             .spawn()
             .map_err(|error| runtime_os("spawn.launcher", &error, "spawn"))?;
         let mut guard = LaunchGuard::new(child);
-        let launch_result = (|| -> Result<Arc<RunningState>, ErrorData> {
-            let cgroup = if capabilities.cgroup_memory || capabilities.cgroup_processes {
-                match Cgroup::create(
-                    guard.child_mut().id(),
-                    capabilities
-                        .cgroup_memory
-                        .then_some(execution.normalized.resources.memory_bytes),
-                    capabilities
-                        .cgroup_processes
-                        .then_some(execution.normalized.resources.max_processes),
-                ) {
-                    Ok(cgroup) => Some(cgroup),
-                    Err(error) => {
-                        return Err(runtime_os("setup.cgroup", &error, "spawn"));
-                    }
-                }
-            } else {
-                None
-            };
-            guard.set_cgroup(cgroup);
+        let launcher = sandbox_launcher_linux::open_pidfd(guard.child_mut().id())
+            .map_err(|error| runtime_os("spawn.pidfd", &error, "spawn"))?;
+        let launch_result = (|| -> Result<Arc<ProcessState>, ErrorData> {
             send_launch_spec(&mut supervisor_control, &bundle.spec, &bundle.files)
                 .map_err(|error| runtime_os("spawn.launch_request", &error, "spawn"))?;
             drop(bundle.files);
@@ -884,6 +868,40 @@ mod linux {
             } else {
                 None
             };
+            let cgroup = if policy.normalized.limits.memory.is_some()
+                || policy.normalized.limits.process_count.is_some()
+            {
+                match Cgroup::create(
+                    receive_target_pid(&supervisor_control)
+                        .map_err(|error| runtime_os("setup.target_identity", &error, "spawn"))?,
+                    policy
+                        .normalized
+                        .limits
+                        .memory
+                        .as_ref()
+                        .map(|limit| limit.value),
+                    policy
+                        .normalized
+                        .limits
+                        .process_count
+                        .as_ref()
+                        .map(|limit| limit.value),
+                ) {
+                    Ok(cgroup) => Some(cgroup),
+                    Err(error) => {
+                        return Err(runtime_os("setup.cgroup", &error, "spawn"));
+                    }
+                }
+            } else {
+                None
+            };
+            guard.set_cgroup(cgroup);
+            if policy.normalized.limits.memory.is_some()
+                || policy.normalized.limits.process_count.is_some()
+            {
+                admit_target(&mut supervisor_control)
+                    .map_err(|error| runtime_os("setup.target_admission", &error, "spawn"))?;
+            }
             let status = read_launcher_status(&mut supervisor_control)
                 .map_err(|error| runtime_os("setup.launcher_status", &error, "spawn"))?;
             supervisor_control
@@ -947,26 +965,28 @@ mod linux {
             } else {
                 None
             };
-            let running = Arc::new(RunningState {
+            let running = Arc::new(ProcessState {
                 id: process_id,
                 policy_digest: policy.policy_digest.clone(),
                 execution_digest: execution.execution_digest.clone(),
                 enforcement: policy.enforcement.clone(),
                 control: Mutex::new(supervisor_control),
-                launcher_pid: guard.child_mut().id(),
-                alive: AtomicBool::new(true),
+                launcher,
+                phase: Mutex::new(ProcessPhase::Executing),
+                phase_changed: Condvar::new(),
+                output_cancelled: AtomicBool::new(false),
                 stdin_credit: Mutex::new(INITIAL_STREAM_CREDIT),
                 credits: OutputCredits::new(),
                 termination_reason: Mutex::new(None),
                 stdout_bytes: AtomicU64::new(0),
                 stderr_bytes: AtomicU64::new(0),
                 total_output: AtomicU64::new(0),
-                output_limit: execution.normalized.resources.max_output_bytes,
+                output_limit: policy.normalized.limits.output.value,
                 started: Instant::now(),
                 final_status: Mutex::new(None),
                 launcher_event_error: Mutex::new(None),
                 hard_kill_armed: AtomicBool::new(false),
-                termination_grace_ms: execution.normalized.resources.termination_grace_ms,
+                termination_grace_ms: policy.normalized.process.termination.grace_ms,
                 violations,
             });
             let status_thread =
@@ -1088,7 +1108,7 @@ mod linux {
 
     fn spawn_launcher_event_reader(
         mut control: UnixStream,
-        running: Arc<RunningState>,
+        running: Arc<ProcessState>,
         writer: ProtocolWriter,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
@@ -1141,37 +1161,20 @@ mod linux {
         mut reader: impl Read + Send + 'static,
         stream: MessageType,
         mode: String,
-        running: Arc<RunningState>,
+        running: Arc<ProcessState>,
         writer: ProtocolWriter,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let mut buffer = vec![0_u8; sandbox_protocol::MAX_STREAM_PAYLOAD];
             loop {
-                let maximum = if mode == "discard" {
-                    buffer.len()
-                } else {
-                    match running
-                        .credits
-                        .reserve(stream, buffer.len(), &running.alive)
-                    {
-                        Some(value) => value,
-                        None => return,
-                    }
-                };
-                let count = match reader.read(&mut buffer[..maximum]) {
+                // Read EOF independently of credit. A normal child exit does not
+                // cancel delivery of bytes still buffered in its output pipes.
+                let count = match reader.read(&mut buffer) {
                     Ok(0) => return,
                     Ok(value) => value,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                        if mode != "discard" {
-                            running.credits.refund(stream, maximum);
-                        }
-                        continue;
-                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => return,
                 };
-                if mode != "discard" && count < maximum {
-                    running.credits.refund(stream, maximum - count);
-                }
                 let counter = if stream == MessageType::Stdout {
                     &running.stdout_bytes
                 } else {
@@ -1184,17 +1187,31 @@ mod linux {
                 let deliverable = usize::try_from(running.output_limit.saturating_sub(previous))
                     .unwrap_or(usize::MAX)
                     .min(count);
-                if mode != "discard"
-                    && deliverable > 0
-                    && writer
-                        .binary(stream, buffer[..deliverable].to_vec())
-                        .is_err()
-                {
-                    let _ = force_kill(&running);
-                    return;
-                }
-                if previous.saturating_add(count as u64) > running.output_limit {
+                let exceeded = previous.saturating_add(count as u64) > running.output_limit;
+                if exceeded {
                     let _ = request_termination(&running, "output-limit");
+                }
+                if mode != "discard" {
+                    let mut delivered = 0;
+                    while delivered < deliverable {
+                        let Some(credit) = running.credits.reserve(
+                            stream,
+                            deliverable - delivered,
+                            &running.output_cancelled,
+                        ) else {
+                            return;
+                        };
+                        if writer
+                            .binary(stream, buffer[delivered..delivered + credit].to_vec())
+                            .is_err()
+                        {
+                            let _ = force_kill(&running);
+                            return;
+                        }
+                        delivered += credit;
+                    }
+                }
+                if exceeded {
                     return;
                 }
             }
@@ -1212,7 +1229,7 @@ mod linux {
 
     fn spawn_exit_watcher(
         mut child: Child,
-        running: Arc<RunningState>,
+        running: Arc<ProcessState>,
         writer: ProtocolWriter,
         resources: ExitResources,
     ) {
@@ -1226,7 +1243,7 @@ mod linux {
                 broker,
             } = resources;
             let status = child.wait();
-            running.alive.store(false, Ordering::Release);
+            running.set_phase(ProcessPhase::Draining);
             running.credits.changed.notify_all();
             let mut cleanup_failures = Vec::new();
             if stdout_thread.join().is_err() {
@@ -1359,7 +1376,12 @@ mod linux {
                 },
                 "cleanup": {"completed": cleanup_completed, "failures": cleanup_failures},
             });
-            let _ = writer.control(MessageType::ProcessExit, &result);
+            // Publish completion before a following process can publish its start.
+            let publication = writer.sequence();
+            running.set_phase(ProcessPhase::Finished);
+            if let Ok(mut publication) = publication {
+                let _ = publication.control(MessageType::ProcessExit, &result);
+            }
         });
     }
 
@@ -1371,11 +1393,13 @@ mod linux {
         })
     }
 
-    fn set_watchdog_duration(running: &Arc<RunningState>, duration_ms: u64) {
+    fn set_watchdog_duration(running: &Arc<ProcessState>, duration_ms: u64) {
         let running = Arc::clone(running);
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(duration_ms));
-            if running.alive.load(Ordering::Acquire) {
+            if running.wait_while(Duration::from_millis(duration_ms), |phase| {
+                *phase == ProcessPhase::Executing
+            }) == ProcessPhase::Executing
+            {
                 let _ = request_termination(&running, "timeout");
             }
         });
@@ -1384,7 +1408,7 @@ mod linux {
     fn determine_termination(
         status: Option<&ExitStatus>,
         final_status: Option<&LauncherFinalStatus>,
-        running: &RunningState,
+        running: &ProcessState,
         cgroup: Option<&Cgroup>,
     ) -> Value {
         if cgroup
@@ -1453,10 +1477,9 @@ mod linux {
         })
     }
 
-    fn request_termination(running: &Arc<RunningState>, reason: &str) -> Result<(), ErrorData> {
-        if !running.alive.load(Ordering::Acquire) {
-            return Ok(());
-        }
+    fn request_termination(running: &Arc<ProcessState>, reason: &str) -> Result<(), ErrorData> {
+        running.output_cancelled.store(true, Ordering::Release);
+        running.credits.changed.notify_all();
         {
             let mut current = running
                 .termination_reason
@@ -1466,10 +1489,12 @@ mod linux {
                 *current = Some(reason.into());
             }
         }
+        if !running.is_alive() {
+            return Ok(());
+        }
         match running.control.try_lock() {
             Ok(mut control) => {
-                send_launcher_terminate(&mut control)
-                    .map_err(|error| runtime_os("termination.control", &error, "terminate"))?;
+                control_write(send_launcher_terminate(&mut control), "termination.control")?;
             }
             Err(std::sync::TryLockError::WouldBlock) => {}
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(lock_error()),
@@ -1478,41 +1503,75 @@ mod linux {
         Ok(())
     }
 
-    fn arm_hard_kill(running: &Arc<RunningState>) {
+    fn arm_hard_kill(running: &Arc<ProcessState>) {
         if running.hard_kill_armed.swap(true, Ordering::AcqRel) {
             return;
         }
         let running = Arc::clone(running);
         let delay = Duration::from_millis(running.termination_grace_ms.saturating_add(1_000));
         thread::spawn(move || {
-            thread::sleep(delay);
-            if running.alive.load(Ordering::Acquire) {
+            if running.wait_while(delay, |phase| *phase == ProcessPhase::Executing)
+                == ProcessPhase::Executing
+            {
                 let _ = force_kill(&running);
             }
         });
     }
 
-    fn force_kill(running: &RunningState) -> io::Result<()> {
-        // SAFETY: launcher_pid is the positive PID returned by Child::id; kill does not dereference memory.
-        let result = unsafe { libc::kill(running.launcher_pid as libc::pid_t, libc::SIGKILL) };
+    fn force_kill(running: &ProcessState) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the retained pidfd identifies only our launcher, including after
+        // exit; a recycled numeric PID can never receive this signal.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                running.launcher.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
         if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    fn close_target_stdin(running: &RunningState) -> Result<(), ErrorData> {
-        let mut control = running.control.lock().map_err(|_| lock_error())?;
-        send_launcher_close_stdin(&mut control)
-            .map_err(|error| runtime_os("runtime.stdin_close", &error, "execute"))
+    fn control_write(result: io::Result<()>, code: &str) -> Result<(), ErrorData> {
+        match result {
+            Ok(()) => Ok(()),
+            // Process completion and an in-flight control frame can cross. The
+            // exit watcher owns the result; a closed input stream cannot replace it.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                let mut failure = runtime_os(code, &error, "execute");
+                failure.target_executed = true;
+                Err(failure)
+            }
+        }
     }
 
-    fn wait_for_exit(running: &RunningState, maximum: Duration) {
-        let start = Instant::now();
-        while running.alive.load(Ordering::Acquire) && start.elapsed() < maximum {
-            thread::sleep(Duration::from_millis(5));
-        }
-        if running.alive.load(Ordering::Acquire) {
+    fn close_target_stdin(running: &ProcessState) -> Result<(), ErrorData> {
+        let mut control = running.control.lock().map_err(|_| lock_error())?;
+        control_write(
+            send_launcher_close_stdin(&mut control),
+            "runtime.stdin_close",
+        )
+    }
+
+    fn wait_for_exit(running: &ProcessState, maximum: Duration) {
+        if running.wait_while(maximum, |phase| *phase != ProcessPhase::Finished)
+            == ProcessPhase::Executing
+        {
             let _ = force_kill(running);
         }
     }
@@ -1520,14 +1579,16 @@ mod linux {
     fn cleanup_state(state: &RuntimeState) {
         if let RuntimeState::Session(session) = state
             && let Some(running) = &session.running
-            && running.alive.load(Ordering::Acquire)
+            && !running.is_finished()
         {
+            running.output_cancelled.store(true, Ordering::Release);
+            running.credits.changed.notify_all();
             let _ = force_kill(running);
             wait_for_exit(running, Duration::from_secs(5));
         }
     }
 
-    fn process_started(request_id: &str, running: &RunningState) -> Value {
+    fn process_started(request_id: &str, running: &ProcessState) -> Value {
         json!({
             "requestId": request_id,
             "id": &running.id,
@@ -1646,19 +1707,15 @@ mod linux {
         Ok(session)
     }
 
-    fn running_state(state: &RuntimeState) -> Result<&Arc<RunningState>, ErrorData> {
+    fn process_state(state: &RuntimeState) -> Result<&Arc<ProcessState>, ErrorData> {
         match state {
-            RuntimeState::Session(session) => session
-                .running
-                .as_ref()
-                .filter(|running| running.alive.load(Ordering::Acquire))
-                .ok_or_else(|| {
-                    ErrorData::new(
-                        "runtime.no_process",
-                        "no target process is running",
-                        "execute",
-                    )
-                }),
+            RuntimeState::Session(session) => session.running.as_ref().ok_or_else(|| {
+                ErrorData::new(
+                    "runtime.no_process",
+                    "no target process is running",
+                    "execute",
+                )
+            }),
             _ => Err(ErrorData::new(
                 "runtime.no_process",
                 "no target process is running",
@@ -1671,7 +1728,7 @@ mod linux {
         if session
             .running
             .as_ref()
-            .is_some_and(|running| !running.alive.load(Ordering::Acquire))
+            .is_some_and(|running| running.is_finished())
         {
             session.running = None;
         }
@@ -1732,7 +1789,6 @@ mod linux {
     }
 
     fn probe_capabilities() -> ProbeCapabilities {
-        let mut errors = Vec::new();
         let kernel = std::env::current_exe()
             .and_then(|executable| {
                 Command::new(executable)
@@ -1749,38 +1805,222 @@ mod linux {
                     Err(String::from_utf8_lossy(&output.stderr).into_owned())
                 }
             });
-        let kernel = match kernel {
-            Ok(kernel) => kernel,
-            Err(error) => {
-                errors.push(format!("kernel probe failed: {}", bounded(&error)));
-                KernelProbeResult {
-                    namespaces: false,
-                    network_namespace: false,
-                    mount_setattr: false,
-                    landlock_abi: 0,
-                    seccomp: false,
-                    execveat: false,
-                    errors: Vec::new(),
-                }
-            }
+        let kernel = kernel.unwrap_or_else(|error| KernelProbeResult {
+            mechanisms: [(
+                "kernel-probe".into(),
+                ProbeOutcome {
+                    state: "error".into(),
+                    operation: "execute disposable kernel probe".into(),
+                    os_error: None,
+                    detail: Some(bounded(&error)),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            landlock_abi: 0,
+        });
+        let available = |name: &str| {
+            kernel
+                .mechanisms
+                .get(name)
+                .is_some_and(|outcome| outcome.state == "available")
         };
-        errors.extend(kernel.errors.iter().map(|error| bounded(error)));
-        let (cgroup_memory, cgroup_processes) = probe_cgroup_delegation();
+        let namespaces = available("namespace-launcher");
+        let network_namespace = available("network-namespace");
+        let seccomp = available("seccomp");
+        let cgroup = probe_cgroup_delegation();
+        let cgroup_memory = cgroup.memory.state == "available";
+        let cgroup_processes = cgroup.processes.state == "available";
+        let mut mechanisms = kernel.mechanisms;
+        mechanisms.insert("cgroup-memory".into(), cgroup.memory);
+        mechanisms.insert("cgroup-processes".into(), cgroup.processes);
         ProbeCapabilities {
-            namespaces: kernel.namespaces,
-            network_namespace: kernel.network_namespace,
-            mount_setattr: kernel.mount_setattr,
+            namespaces,
+            network_namespace,
             landlock_abi: kernel.landlock_abi,
-            seccomp: kernel.seccomp,
-            execveat: kernel.execveat,
+            seccomp,
             cgroup_memory,
             cgroup_processes,
-            errors,
+            mechanisms,
+        }
+    }
+
+    fn probe_support(capabilities: &ProbeCapabilities, request: &Value) -> Value {
+        let core =
+            capabilities.namespaces && capabilities.landlock_abi >= 3 && capabilities.seccomp;
+        let availability = if core {
+            "available"
+        } else if capabilities
+            .mechanisms
+            .values()
+            .any(|outcome| outcome.state == "error")
+        {
+            "error"
+        } else {
+            "unavailable"
+        };
+        let request_object = request.as_object();
+        let evaluated = request_object.is_some_and(|object| !object.is_empty());
+        let filesystem = request
+            .get("filesystem")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                request
+                    .get("policy")
+                    .and_then(|policy| policy.get("filesystem"))
+                    .and_then(|filesystem| filesystem.get("kind"))
+                    .and_then(Value::as_str)
+            });
+        let network = request.get("network").and_then(Value::as_str).or_else(|| {
+            request
+                .get("policy")
+                .and_then(|policy| policy.get("network"))
+                .and_then(|network| network.get("mode"))
+                .and_then(Value::as_str)
+        });
+        let isolation = request.get("isolation").and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("kind").and_then(Value::as_str))
+        });
+        let mut unmet = Vec::new();
+        if !core {
+            unmet.push("implementation mechanisms".to_owned());
+        }
+        let exact_request = request.get("isolation").is_some() && request.get("policy").is_some();
+        if exact_request {
+            let options = json!({
+                "isolation": request.get("isolation"),
+                "policy": request.get("policy"),
+                "requirements": request.get("requirements").cloned().unwrap_or_else(|| json!({})),
+                "resources": request.get("resources").cloned().unwrap_or_else(|| json!({})),
+                "preparedTtlMs": null,
+            });
+            match serde_json::from_value::<SessionOptions>(options)
+                .map_err(|error| error.to_string())
+                .and_then(|options| {
+                    normalize_session(options).map_err(|error| error.0.message.clone())
+                }) {
+                Ok(policy) => {
+                    unmet.extend(implementation_limitations(&policy, capabilities));
+                    for guarantee in policy
+                        .obligations
+                        .iter()
+                        .chain(policy.requirements.additional.iter())
+                    {
+                        if !probe_guarantee(capabilities, guarantee, &policy.network) {
+                            unmet.push(guarantee.clone());
+                        }
+                    }
+                }
+                Err(error) => unmet.push(format!("invalid policy: {error}")),
+            }
+        } else {
+            if isolation.is_some_and(|kind| kind != "process") {
+                unmet.push("requested isolation boundary".into());
+            }
+            if filesystem.is_some_and(|kind| kind != "isolated") {
+                unmet.push("requested filesystem layout".into());
+            }
+            if network.is_some_and(|mode| mode != "unrestricted") && !capabilities.network_namespace
+            {
+                unmet.push("network namespace".into());
+            }
+        }
+        if let Some(additional) = request
+            .get("requirements")
+            .and_then(|requirements| requirements.get("additional"))
+            .and_then(Value::as_array)
+        {
+            for guarantee in additional.iter().filter_map(Value::as_str) {
+                if !probe_guarantee(capabilities, guarantee, network.unwrap_or("none")) {
+                    unmet.push(guarantee.to_owned());
+                }
+            }
+        }
+        unmet.sort();
+        unmet.dedup();
+        json!({
+            "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
+            "packageVersion": env!("CARGO_PKG_VERSION"),
+            "host": {"platform": "linux", "architecture": std::env::consts::ARCH},
+            "implementations": [{
+                "identity": {
+                    "id": IMPLEMENTATION_ID,
+                    "version": IMPLEMENTATION_VERSION,
+                    "buildId": BUILD_ID,
+                    "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+                },
+                "boundary": "os-process",
+                "filesystem": ["isolated"],
+                "stability": "stable",
+                "availability": availability,
+                "eligibility": {
+                    "state": if !evaluated { "not-evaluated" } else if unmet.is_empty() { "eligible" } else { "ineligible" },
+                    "unmet": unmet,
+                },
+                "mechanisms": &capabilities.mechanisms,
+            }],
+        })
+    }
+
+    fn probe_guarantee(capabilities: &ProbeCapabilities, guarantee: &str, network: &str) -> bool {
+        match guarantee {
+            "runtime.setup-before-exec"
+            | "runtime.no-ambient-environment"
+            | "runtime.no-ambient-handles"
+            | "runtime.executable-identity-bound"
+            | "filesystem.resource-identities-bound"
+            | "filesystem.content-read-confined"
+            | "filesystem.content-write-confined"
+            | "filesystem.directory-entry-mutation-confined"
+            | "filesystem.metadata-mutation-confined"
+            | "filesystem.execution-confined"
+            | "filesystem.name-visibility-confined"
+            | "filesystem.isolated-layout"
+            | "process.host-visibility-denied"
+            | "process.host-control-denied"
+            | "process.group-termination"
+            | "ipc.host-endpoints-hidden"
+            | "ipc.host-shared-memory-hidden"
+            | "resource.wall-time-hard"
+            | "resource.output-hard"
+            | "resource.open-files-hard"
+            | "resource.single-file-size-hard" => true,
+            "network.no-external-connect"
+            | "network.no-external-listen"
+            | "network.no-host-loopback" => {
+                network != "unrestricted" && capabilities.network_namespace
+            }
+            "network.egress-brokered" | "network.private-addresses-denied" => {
+                network == "managed" && capabilities.network_namespace
+            }
+            "resource.memory-hard" => capabilities.cgroup_memory,
+            "process.descendant-tree-termination" => capabilities.namespaces,
+            "resource.process-count-hard" => capabilities.cgroup_processes,
+            "resource.cpu-time-hard"
+            | "vm.boot-artifacts-verified"
+            | "vm.guest-control-authenticated"
+            | "vm.control-plane-hidden-from-target"
+            | "vm.host-filesystem-absent-outside-imports" => false,
+            _ => false,
         }
     }
 
     fn parse<T: for<'de> serde::Deserialize<'de>>(frame: &Frame) -> Result<T, ErrorData> {
         frame.parse_control().map_err(protocol_data)
+    }
+
+    fn parse_policy_message<T: for<'de> serde::Deserialize<'de>>(
+        frame: &Frame,
+    ) -> Result<T, ErrorData> {
+        frame.parse_control().map_err(|error| {
+            ErrorData::new(
+                "policy.invalid_contract",
+                bounded(&error.to_string()),
+                "validate",
+            )
+        })
     }
 
     fn request_id_from_value(value: &Value) -> Result<String, ErrorData> {

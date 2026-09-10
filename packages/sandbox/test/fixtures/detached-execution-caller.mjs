@@ -1,5 +1,12 @@
 import { openSandboxExecutionRepository } from "../../dist/index.js";
-import { baseOptions } from "../helpers.mjs";
+import {
+  baseOptions,
+  isolatedPath,
+  isolatedPolicy,
+  isolatedResource,
+  readWriteAccess,
+  runtimeResources,
+} from "../helpers.mjs";
 
 const [repositoryDirectory, workspace] = process.argv.slice(2);
 if (repositoryDirectory === undefined || workspace === undefined) process.exit(2);
@@ -10,19 +17,17 @@ const request = {
   run: {
     ...baseOptions({
       policy: {
-        filesystem: {
-          runtime: { kind: "system" },
-          grants: [{ hostPath: workspace, targetPath: "/workspace", access: "read-write" }],
-        },
-        network: { mode: "none" },
-        process: { hostProcesses: "deny", hostIpc: "deny" },
+        ...isolatedPolicy([
+          ...runtimeResources(),
+          isolatedResource("workspace", workspace, "/workspace", readWriteAccess(), ["data"]),
+        ]),
       },
     }),
-    resources: { maxOutputBytes: 1024 * 1024 },
+    resources: { output: { enforcement: "hard", scope: "process", value: 1024 * 1024 } },
     process: {
-      executable: "/bin/sh",
+      executable: isolatedPath("/bin/sh"),
       args: ["-c", "sleep 0.2; printf completed > /workspace/completed; printf detached-output"],
-      cwd: "/workspace",
+      cwd: isolatedPath("/workspace"),
       stdout: "pipe",
     },
   },

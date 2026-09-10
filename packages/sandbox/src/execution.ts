@@ -1,9 +1,9 @@
 import type { Buffer } from "node:buffer";
-import type { SandboxEnvironment } from "./environment.js";
 import type { SandboxErrorData } from "./errors.js";
 import type { EnforcementReport } from "./enforcement.js";
 import type { SandboxPolicy } from "./policy.js";
 import type { SandboxArtifactRequest, SandboxWorkspaceChangeRequest } from "./process-options.js";
+import type { SandboxPath } from "./policy.js";
 import type { EnforcementRequirements } from "./requirements.js";
 import type { ResourceLimits } from "./resources.js";
 import type { SandboxRunResult } from "./result.js";
@@ -32,22 +32,21 @@ export interface SandboxDetachedRunOptions {
   isolation: { kind: "process" };
   policy: SandboxPolicy;
   requirements: EnforcementRequirements;
-  resources?: Partial<ResourceLimits>;
+  resources?: ResourceLimits;
   preparedTtlMs?: number;
   process: SandboxDetachedProcessOptions;
 }
 
 export interface SandboxDetachedProcessOptions {
-  executable: string;
+  executable: SandboxPath;
   args?: readonly string[];
-  cwd: string;
-  environment?: SandboxEnvironment;
+  cwd: SandboxPath;
+  environment?: import("./environment.js").SandboxEnvironment;
   stdin?: "pipe" | "closed";
   stdout?: "pipe" | "capture" | "discard";
   stderr?: "pipe" | "capture" | "discard";
   artifacts?: SandboxArtifactRequest;
   changeSet?: SandboxWorkspaceChangeRequest;
-  resources?: Partial<ResourceLimits>;
 }
 
 export interface SandboxExecutionOutputChunk {

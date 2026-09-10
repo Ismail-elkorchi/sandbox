@@ -1,25 +1,25 @@
 import type { SandboxEnvironment } from "./environment.js";
-import type { ResourceLimits } from "./resources.js";
+import type { SandboxPath } from "./policy.js";
 
 export interface SandboxProcessOptions {
-  executable: string;
+  executable: SandboxPath;
   args?: readonly string[];
-  cwd: string;
+  cwd: SandboxPath;
   environment?: SandboxEnvironment;
   stdin?: "pipe" | "closed";
   stdout?: "pipe" | "capture" | "discard";
   stderr?: "pipe" | "capture" | "discard";
   artifacts?: SandboxArtifactRequest;
   changeSet?: SandboxWorkspaceChangeRequest;
-  resources?: Partial<ResourceLimits>;
   signal?: AbortSignal;
 }
 
 export interface SandboxWorkspaceChangeRequest {
+  root: SandboxPath;
   maxBytes: number;
 }
 
 export interface SandboxArtifactRequest {
-  paths: readonly string[];
+  paths: readonly SandboxPath[];
   maxBytes: number;
 }

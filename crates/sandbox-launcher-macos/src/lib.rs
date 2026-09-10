@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const BACKEND_ID: &str = "darwin-seatbelt-v1";
+pub const IMPLEMENTATION_ID: &str = "darwin-seatbelt-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]

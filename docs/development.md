@@ -6,7 +6,7 @@
 - Rust stable 1.88 or newer with `rustfmt` and `clippy`.
 - Nightly Rust and `cargo-fuzz` for libFuzzer targets.
 - `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets for Linux release runtimes.
-- Platform-native SDK/toolchains for Windows and macOS backends.
+- Platform-native SDK/toolchains for Windows and macOS implementations.
 - Writable `/dev/kvm` for real Firecracker conformance.
 
 Install JavaScript development dependencies with `npm ci` in a clean checkout.
@@ -34,7 +34,7 @@ cargo audit --deny warnings
 cargo audit --file fuzz/Cargo.lock --deny warnings
 ```
 
-Native tests probe required host functionality and report an explicit skip when the current machine cannot enforce a backend. A Linux machine without usable namespaces or Landlock is not treated as a backend test pass. Windows and macOS conformance must run on their native hosts.
+Native tests probe required host functionality and record exact unavailable or error outcomes when the current machine cannot enforce an implementation. A Linux machine without usable namespaces, Landlock, or delegated cgroups is not treated as functional conformance. Windows and macOS probe tests run on their native hosts and keep currently unsatisfied replacement obligations visible.
 
 ## Fuzzing
 
@@ -104,4 +104,4 @@ Release tarballs are written to `release/`, which is intentionally ignored by Gi
 - `release.yml` builds and executes native artifacts on Linux x64/ARM64, macOS x64/ARM64, and Windows x64 before assembling packages.
 - `kvm-conformance.yml` runs Firecracker tests on a dedicated self-hosted KVM runner.
 
-Do not mark a native backend available from compile success. Availability and release status require its functional probe and native conformance suite.
+Do not mark a native implementation available from compile success. Availability and release status require its functional probe and native conformance suite.

@@ -14,19 +14,28 @@ import {
 } from "@ismail-elkorchi/sandbox-hardware-vm";
 
 const sandbox = await createSandbox({
-  allowExperimentalBackends: true,
+  allowExperimentalImplementations: true,
   extensions: [hardwareVmExtension()],
 });
 
-const support = await sandbox.probe({ isolation: "hardware-vm" });
+const support = await sandbox.probe({
+  isolation: {
+    kind: "hardware-vm",
+    image: minimalHardwareVmImage(),
+    filesystemTransport: "import",
+  },
+  policy,
+  requirements: { allowExperimentalImplementations: true },
+  resources,
+});
 console.dir(support, { depth: null });
 
 const image = minimalHardwareVmImage();
 ```
 
-The backend requires Linux x64 and readable/writable `/dev/kvm`. Registering the extension does not silently select it; runs must request `hardware-vm`, opt into experimental enforcement requirements, and provide the selected image.
+The implementation requires Linux x64 and readable/writable `/dev/kvm`. Registering the extension does not silently select it; runs must request `hardware-vm`, opt into experimental implementation use, and provide the selected image.
 
-Host workspaces are copied into an ephemeral guest disk. Guest completion never synchronizes them automatically. Request explicit artifacts or a conflict-checked change set, then apply that change set through the exported host helper.
+Explicit resources are copied into guest-owned storage. Guest completion never synchronizes them automatically. Request coordinate-tagged artifacts or a conflict-checked change set, then apply that change set through the exported host helper.
 
 Operational guide: [Firecracker hardware VMs](https://github.com/Ismail-elkorchi/sandbox/blob/main/docs/hardware-vm.md)
 

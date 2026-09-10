@@ -38,7 +38,6 @@ pub enum GuestRequest {
         cwd: String,
         mounts: Vec<GuestMount>,
         masks: Vec<GuestMask>,
-        system_runtime: bool,
     },
     Run {
         executable: String,
@@ -53,7 +52,6 @@ pub enum GuestRequest {
         private_home: GuestPrivateDirectory,
         temporary: GuestPrivateDirectory,
         network_mode: String,
-        system_runtime: bool,
         limits: GuestLimits,
     },
     WriteStdin {

@@ -1,8 +1,9 @@
 import type { EnforcementReport } from "./enforcement.js";
 import type { SandboxErrorData } from "./errors.js";
+import type { SandboxPath } from "./policy.js";
 
 export interface SandboxArtifactEntry {
-  path: string;
+  path: SandboxPath;
   kind: "directory" | "regular-file" | "symbolic-link";
   mode: number;
   modifiedUnixMs: number;
@@ -33,7 +34,7 @@ export interface SandboxRunResult {
 }
 
 export interface SandboxWorkspaceChangeSet {
-  targetPath: string;
+  root: SandboxPath;
   bytes: number;
   changeSet: SandboxChangeSet;
 }
@@ -48,7 +49,7 @@ export interface SandboxChangeSet {
 
 export interface SandboxChangeBaseEntry {
   path: string;
-  kind: SandboxArtifactEntry["kind"];
+  kind: SandboxChangeArtifactEntry["kind"];
   sha256?: string;
   mode: number;
   modifiedUnixMs: number;
@@ -56,9 +57,19 @@ export interface SandboxChangeBaseEntry {
 }
 
 export type SandboxChangeOperation =
-  | { kind: "upsert"; entry: SandboxArtifactEntry }
+  | { kind: "upsert"; entry: SandboxChangeArtifactEntry }
   | { kind: "delete"; path: string }
   | { kind: "rename"; from: string; to: string };
+
+export interface SandboxChangeArtifactEntry {
+  path: string;
+  kind: "directory" | "regular-file" | "symbolic-link";
+  mode: number;
+  modifiedUnixMs: number;
+  contentHex?: string;
+  linkTarget?: string;
+  sha256?: string;
+}
 
 export type SandboxTermination =
   | { reason: "exit"; code: number }

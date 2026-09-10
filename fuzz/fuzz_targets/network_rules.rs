@@ -11,11 +11,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut options: SessionOptions = match serde_json::from_str(
-        r#"{"isolation":{"kind":"process"},"policy":{"filesystem":{"runtime":{"kind":"empty"},"grants":[]},"network":{"mode":"none"},"process":{"hostProcesses":"deny","hostIpc":"deny"}},"requirements":{"boundary":"os-process","required":[]}}"#,
+        r#"{"isolation":{"kind":"process"},"policy":{"filesystem":{"kind":"isolated","resources":[]},"network":{"mode":"none"},"process":{"visibility":"session","control":"session","termination":{"scope":"descendant-tree","graceMs":100}},"ipc":{"visibility":"session"}},"requirements":{}}"#,
     ) {
         Ok(value) => value,
         Err(_) => return,
     };
     options.policy.network = network;
-    let _ = normalize_session(options, 8 * 1024 * 1024 * 1024);
+    let _ = normalize_session(options);
 });

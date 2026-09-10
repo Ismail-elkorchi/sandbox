@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import type { SandboxErrorData } from "./errors.js";
 import type { EnforcementReport } from "./enforcement.js";
 import type { SandboxDetachedRunOptions, SandboxExecutionOutputChunk } from "./execution.js";
-import type { SandboxRunResult } from "./result.js";
+import type { SandboxChangeArtifactEntry, SandboxRunResult } from "./result.js";
 import type { PreparedRunSummary } from "./summary.js";
 import { parseCleanup, parseEnforcement, parseErrorData, parseRunSummary, parseViolation } from "./validation.js";
 
@@ -173,10 +173,10 @@ export function normalizeLimits(options: {
 export function validateDetachedRun(value: SandboxDetachedRunOptions, maxRetainedOutputBytes: number): void {
   if (typeof value !== "object" || value === null) throw new TypeError("Detached sandbox run must be an object.");
   if (value.isolation?.kind !== "process") throw new TypeError("Detached execution supports process isolation only.");
-  const limit = value.process?.resources?.maxOutputBytes ?? value.resources?.maxOutputBytes;
-  if (!Number.isSafeInteger(limit) || (limit ?? 0) < 1) throw new TypeError("Detached execution requires a positive maxOutputBytes resource limit.");
+  const limit = value.resources?.output?.value;
+  if (!Number.isSafeInteger(limit) || (limit ?? 0) < 1) throw new TypeError("Detached execution requires a positive process-scoped resources.output hard limit.");
   if ((limit as number) > maxRetainedOutputBytes) {
-    throw new RangeError("Sandbox maxOutputBytes exceeds the execution repository output retention bound.");
+    throw new RangeError("Sandbox resources.output exceeds the execution repository output retention bound.");
   }
   rejectSignal(value, "run");
   rejectSignal(value.process, "process");
@@ -577,7 +577,7 @@ function parseStoredArtifactEntry(value: unknown): NonNullable<SandboxRunResult[
   const kind = source.kind;
   if (kind !== "directory" && kind !== "regular-file" && kind !== "symbolic-link") throw new TypeError("Invalid artifact kind.");
   return {
-    path: requiredString(source.path, "artifact path"),
+    path: parseStoredPath(source.path, "artifact path"),
     kind,
     mode: requiredNumber(source.mode, "artifact mode"),
     modifiedUnixMs: requiredNumber(source.modifiedUnixMs, "artifact modified time"),
@@ -587,30 +587,51 @@ function parseStoredArtifactEntry(value: unknown): NonNullable<SandboxRunResult[
   };
 }
 
+function parseStoredChangeArtifactEntry(value: unknown): SandboxChangeArtifactEntry {
+  const source = record(value, "change-set entry");
+  const kind = source.kind;
+  if (kind !== "directory" && kind !== "regular-file" && kind !== "symbolic-link") {
+    throw new TypeError("Invalid change-set artifact kind.");
+  }
+  return {
+    path: requiredString(source.path, "change-set artifact path"),
+    kind,
+    mode: requiredNumber(source.mode, "change-set artifact mode"),
+    modifiedUnixMs: requiredNumber(source.modifiedUnixMs, "change-set artifact modified time"),
+    ...(source.contentHex === undefined ? {} : { contentHex: requiredString(source.contentHex, "change-set artifact content") }),
+    ...(source.linkTarget === undefined ? {} : { linkTarget: requiredString(source.linkTarget, "change-set artifact link target") }),
+    ...(source.sha256 === undefined ? {} : { sha256: digestString(source.sha256, "change-set artifact digest") }),
+  };
+}
+
 function parseStoredWorkspaceChangeSet(value: unknown): NonNullable<SandboxRunResult["changeSets"]>[number] {
   const source = record(value, "workspace change set");
   const change = record(source.changeSet, "change set");
   if (change.formatVersion !== 1) throw new TypeError("Unsupported change-set format version.");
   return {
-    targetPath: requiredString(source.targetPath, "change-set target path"),
+    root: parseStoredPath(source.root, "change-set root"),
     bytes: requiredNumber(source.bytes, "change-set bytes"),
     changeSet: {
       formatVersion: 1,
       baseManifestDigest: digestString(change.baseManifestDigest, "change-set base digest"),
       digest: digestString(change.digest, "change-set digest"),
-      base: array(change.base, "change-set base").map((entry) => {
-        const parsed = parseStoredArtifactEntry(entry);
-        return parsed;
-      }),
+      base: array(change.base, "change-set base").map(parseStoredChangeArtifactEntry),
       operations: array(change.operations, "change-set operations").map((operation) => {
         const item = record(operation, "change-set operation");
-        if (item.kind === "upsert") return { kind: "upsert" as const, entry: parseStoredArtifactEntry(item.entry) };
+        if (item.kind === "upsert") return { kind: "upsert" as const, entry: parseStoredChangeArtifactEntry(item.entry) };
         if (item.kind === "delete") return { kind: "delete" as const, path: requiredString(item.path, "deleted path") };
         if (item.kind === "rename") return { kind: "rename" as const, from: requiredString(item.from, "renamed source"), to: requiredString(item.to, "renamed target") };
         throw new TypeError("Invalid stored change-set operation.");
       }),
     },
   };
+}
+
+function parseStoredPath(value: unknown, label: string): import("./policy.js").SandboxPath {
+  const source = record(value, label);
+  const space = source.space;
+  if (space !== "host" && space !== "isolated") throw new TypeError(`${label} has an invalid coordinate space.`);
+  return { space, path: requiredString(source.path, `${label} path`) };
 }
 
 function optionalNumberField(source: Record<string, unknown>, key: string): Record<string, number> {

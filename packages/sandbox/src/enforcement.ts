@@ -25,14 +25,17 @@ export interface EnforcementCaveat {
   affectedGuarantees: readonly GuaranteeId[];
 }
 
+export interface ImplementationIdentity {
+  id: string;
+  version: string;
+  buildId: string;
+  conformanceManifestId: string;
+  stability: "stable" | "experimental";
+}
+
 export interface EnforcementReport {
-  boundary: {
-    kind: IsolationBoundary;
-    backendId: string;
-    backendVersion: string;
-    stability: "stable" | "experimental";
-    mechanism: readonly string[];
-  };
+  boundary: { kind: IsolationBoundary };
+  implementation: ImplementationIdentity & { mechanism: readonly string[] };
   host: {
     platform: NodeJS.Platform;
     architecture: string;
@@ -43,11 +46,10 @@ export interface EnforcementReport {
     pathStyle: "posix" | "windows";
   };
   guarantees: readonly GuaranteeFact[];
-  runtimeView: {
-    kind: "system" | "empty";
-    manifestDigest: string;
+  filesystem: {
+    kind: "host" | "isolated";
+    resourceManifestDigest: string;
     visibleRoots: readonly string[];
   };
   caveats: readonly EnforcementCaveat[];
-  conformance: { manifestId: string; buildId: string };
 }

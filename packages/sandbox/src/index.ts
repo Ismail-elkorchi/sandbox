@@ -28,6 +28,7 @@ export type {
   EnforcementReport,
   GuaranteeFact,
   GuaranteeStatus,
+  ImplementationIdentity,
 } from "./enforcement.js";
 export type { SandboxExtensionRegistration, SandboxImageReference } from "./extension.js";
 export {
@@ -50,17 +51,24 @@ export {
 } from "./errors.js";
 export type { SandboxErrorData } from "./errors.js";
 export type {
-  FilesystemGrant,
+  FilesystemAccess,
   FilesystemMask,
   FilesystemPolicy,
+  FilesystemResourcePurpose,
+  HostFilesystemPolicy,
+  HostFilesystemResource,
+  HostPath,
+  IpcPolicy,
+  IsolatedFilesystemPolicy,
+  IsolatedFilesystemResource,
+  IsolatedPath,
   ManagedNetworkPolicy,
   ManagedNetworkRule,
   NetworkPolicy,
-  PrivateDirectoryPolicy,
   ProcessPolicy,
-  RuntimeView,
+  SandboxPath,
   SandboxPolicy,
-  TemporaryDirectoryPolicy,
+  SyntheticDirectoryPolicy,
 } from "./policy.js";
 export type { PreparedSandboxRun } from "./prepared-run.js";
 export type { PreparedSandboxProcess, PreparedSandboxSession } from "./prepared-session.js";
@@ -70,12 +78,12 @@ export type {
   SandboxProcessOptions,
   SandboxWorkspaceChangeRequest,
 } from "./process-options.js";
-export { LINUX_PROCESS_BASELINE_REQUIREMENTS } from "./requirements.js";
 export type { EnforcementRequirements, GuaranteeId, IsolationBoundary } from "./requirements.js";
-export type { ResourceLimits } from "./resources.js";
+export type { HardLimit, ResolvedResourceLimits, ResourceLimitScope, ResourceLimits } from "./resources.js";
 export type {
   SandboxArtifactBundle,
   SandboxArtifactEntry,
+  SandboxChangeArtifactEntry,
   SandboxChangeBaseEntry,
   SandboxChangeOperation,
   SandboxChangeSet,
@@ -89,7 +97,7 @@ export type {
 } from "./result.js";
 export type { SandboxSession } from "./session.js";
 export type {
-  PreparedGrantSummary,
+  PreparedResourceSummary,
   PreparedNetworkSummary,
   PreparedProcessSummary,
   PreparedRunSummary,

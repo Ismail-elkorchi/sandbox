@@ -44,10 +44,10 @@ fn fuzz_policy(random: &mut XorShift64, index: usize) {
     let mut bytes = vec![0_u8; random.length(8192)];
     random.fill(&mut bytes);
     if index.is_multiple_of(4) {
-        bytes.splice(0..0, br#"{"isolation":{"kind":"process"},"policy":{"filesystem":{"runtime":{"kind":"system"},"grants":[]},"network":{"mode":"none"},"process":{"hostProcesses":"deny","hostIpc":"deny"}},"requirements":{"boundary":"os-process","required":[]}}"#.iter().copied());
+        bytes.splice(0..0, br#"{"isolation":{"kind":"process"},"policy":{"filesystem":{"kind":"isolated","resources":[]},"network":{"mode":"none"},"process":{"visibility":"session","control":"session","termination":{"scope":"descendant-tree","graceMs":100}},"ipc":{"visibility":"session"}},"requirements":{}}"#.iter().copied());
     }
     if let Ok(options) = serde_json::from_slice::<SessionOptions>(&bytes) {
-        let _ = normalize_session(options, 8 * 1024 * 1024 * 1024);
+        let _ = normalize_session(options);
     }
 }
 

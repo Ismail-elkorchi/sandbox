@@ -178,8 +178,7 @@ fn agent_main() -> io::Result<()> {
                 cwd,
                 mounts,
                 masks,
-                system_runtime,
-            } => match inspect_target(&executable, &cwd, &mounts, &masks, system_runtime) {
+            } => match inspect_target(&executable, &cwd, &mounts, &masks) {
                 Ok((executable_sha256, executable_identity_digest, cwd_identity_digest)) => {
                     GuestResponse::Inspected {
                         executable_sha256,
@@ -202,7 +201,6 @@ fn agent_main() -> io::Result<()> {
                 private_home,
                 temporary,
                 network_mode,
-                system_runtime,
                 limits,
             } => {
                 if active_run.is_some() {
@@ -227,7 +225,6 @@ fn agent_main() -> io::Result<()> {
                                 private_home,
                                 temporary,
                                 network_mode,
-                                system_runtime,
                                 limits,
                                 listener.as_raw_fd(),
                                 connection.as_raw_fd(),
@@ -453,7 +450,6 @@ fn start_active_run(
     private_home: GuestPrivateDirectory,
     temporary: GuestPrivateDirectory,
     network_mode: String,
-    system_runtime: bool,
     limits: GuestLimits,
     listener_fd: RawFd,
     connection_fd: RawFd,
@@ -485,7 +481,6 @@ fn start_active_run(
             &private_home,
             &temporary,
             &network_mode,
-            system_runtime,
             limits,
             &mut worker,
             &mut target_executed,
@@ -605,14 +600,13 @@ fn run_target(
     private_home: &GuestPrivateDirectory,
     temporary: &GuestPrivateDirectory,
     network_mode: &str,
-    system_runtime: bool,
     limits: GuestLimits,
     control: &mut UnixStream,
     target_executed: &mut bool,
 ) -> io::Result<()> {
     validate_target_request(executable, args, cwd, environment, mounts, &limits)?;
     let (executable_sha256, executable_identity_digest, cwd_identity_digest) =
-        inspect_target(executable, cwd, mounts, masks, system_runtime)?;
+        inspect_target(executable, cwd, mounts, masks)?;
     if executable_sha256 != expected_executable_sha256
         || executable_identity_digest != expected_executable_identity_digest
         || cwd_identity_digest != expected_cwd_identity_digest
@@ -656,7 +650,6 @@ fn run_target(
                 private_home,
                 temporary,
                 network_mode,
-                system_runtime,
                 &target_cgroup,
                 target_status_write.as_raw_fd(),
                 setup_error_write.as_raw_fd(),
@@ -930,7 +923,6 @@ unsafe fn target_exec(
     private_home: &GuestPrivateDirectory,
     temporary: &GuestPrivateDirectory,
     network_mode: &str,
-    system_runtime: bool,
     target_cgroup: &Path,
     target_status_fd: RawFd,
     setup_error_fd: RawFd,
@@ -998,15 +990,7 @@ unsafe fn target_exec(
             fail();
         }
     }
-    if construct_target_root(
-        mounts,
-        masks,
-        private_home,
-        temporary,
-        network_mode,
-        system_runtime,
-    )
-    .is_err()
+    if construct_target_root(mounts, masks, private_home, temporary, network_mode).is_err()
         || install_private_target_dev().is_err()
         || apply_limits(&limits).is_err()
     {
@@ -1188,7 +1172,6 @@ fn construct_target_root(
     private_home: &GuestPrivateDirectory,
     temporary: &GuestPrivateDirectory,
     network_mode: &str,
-    system_runtime: bool,
 ) -> io::Result<()> {
     mount(None, "/", None, libc::MS_REC | libc::MS_PRIVATE, None)?;
     let suffix = unique_staging_suffix()?;
@@ -1219,35 +1202,6 @@ fn construct_target_root(
     ] {
         fs::create_dir_all(Path::new(&root).join(directory))?;
     }
-    if system_runtime {
-        for source in ["/bin", "/sbin", "/usr", "/lib", "/lib64"] {
-            if Path::new(source).exists() {
-                let target = format!("{root}{source}");
-                bind_mount(source, &target, true, true)?;
-            }
-        }
-        for source in [
-            "/etc/ssl",
-            "/etc/hosts",
-            "/etc/resolv.conf",
-            "/etc/passwd",
-            "/etc/group",
-        ] {
-            if Path::new(source).exists() {
-                let target = Path::new(&root).join(source.trim_start_matches('/'));
-                create_mount_target(&target, Path::new(source).is_dir())?;
-                bind_mount(
-                    source,
-                    target
-                        .to_str()
-                        .ok_or_else(|| io::Error::other("non-UTF8 target"))?,
-                    true,
-                    false,
-                )?;
-            }
-        }
-    }
-    bind_mount("/workspace", &format!("{root}/workspace"), false, false)?;
     for specification in explicit_mounts {
         let source = Path::new(&specification.source);
         let target = Path::new(&root).join(specification.target.trim_start_matches('/'));
@@ -1261,13 +1215,15 @@ fn construct_target_root(
             specification.executable,
         )?;
     }
-    mount_private_directory(
-        &format!("{root}/tmp"),
-        temporary.size_bytes,
-        temporary.executable,
-        0o1777,
-        None,
-    )?;
+    if temporary.enabled {
+        mount_private_directory(
+            &format!("{root}/tmp"),
+            temporary.size_bytes,
+            temporary.executable,
+            0o1777,
+            None,
+        )?;
+    }
     mount(
         Some("tmpfs"),
         &format!("{root}/run"),
@@ -1736,7 +1692,6 @@ fn inspect_target(
     cwd: &str,
     mounts: &[GuestMount],
     masks: &[GuestMask],
-    system_runtime: bool,
 ) -> io::Result<(String, String, String)> {
     validate_target_request(
         executable,
@@ -1764,8 +1719,8 @@ fn inspect_target(
             "executable or working directory is hidden by a filesystem mask",
         ));
     }
-    let executable_path = resolve_target_source(executable, mounts, system_runtime)?;
-    let cwd_path = resolve_cwd_source(cwd, mounts, system_runtime)?;
+    let executable_path = resolve_target_source(executable, mounts)?;
+    let cwd_path = resolve_cwd_source(cwd, mounts)?;
     let executable_metadata = fs::metadata(&executable_path)?;
     let cwd_metadata = fs::metadata(&cwd_path)?;
     if !executable_metadata.is_file() || !cwd_metadata.is_dir() {
@@ -1804,11 +1759,7 @@ fn target_contains(parent: &str, child: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn resolve_target_source(
-    target: &str,
-    mounts: &[GuestMount],
-    system_runtime: bool,
-) -> io::Result<std::path::PathBuf> {
+fn resolve_target_source(target: &str, mounts: &[GuestMount]) -> io::Result<std::path::PathBuf> {
     let target_path = Path::new(target);
     let mapping = mounts
         .iter()
@@ -1828,23 +1779,10 @@ fn resolve_target_source(
             boundary.join(suffix)
         };
         (candidate, boundary)
-    } else if target_path.starts_with("/workspace") {
-        let boundary = fs::canonicalize("/workspace")?;
-        let suffix = target_path
-            .strip_prefix("/workspace")
-            .map_err(io::Error::other)?;
-        let candidate = if suffix.as_os_str().is_empty() {
-            boundary.clone()
-        } else {
-            boundary.join(suffix)
-        };
-        (candidate, boundary)
-    } else if system_runtime {
-        (target_path.to_path_buf(), Path::new("/").to_path_buf())
     } else {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "target path is outside the prepared runtime view",
+            "target path is outside the prepared resource set",
         ));
     };
     let resolved = fs::canonicalize(candidate)?;
@@ -1857,12 +1795,8 @@ fn resolve_target_source(
     Ok(resolved)
 }
 
-fn resolve_cwd_source(
-    target: &str,
-    mounts: &[GuestMount],
-    system_runtime: bool,
-) -> io::Result<std::path::PathBuf> {
-    match resolve_target_source(target, mounts, system_runtime) {
+fn resolve_cwd_source(target: &str, mounts: &[GuestMount]) -> io::Result<std::path::PathBuf> {
+    match resolve_target_source(target, mounts) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             let target_path = Path::new(target);

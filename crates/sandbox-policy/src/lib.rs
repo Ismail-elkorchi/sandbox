@@ -5,17 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path};
 
-#[cfg(target_os = "linux")]
-pub const BACKEND_ID: &str = "linux-namespace-v1";
-#[cfg(target_os = "windows")]
-pub const BACKEND_ID: &str = "windows-appcontainer-v1";
-#[cfg(target_os = "macos")]
-pub const BACKEND_ID: &str = "darwin-seatbelt-v1";
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-pub const BACKEND_ID: &str = "unsupported-process-v1";
-pub const BACKEND_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const CONFORMANCE_MANIFEST_ID: &str = "linux-namespace-v1-conformance-1";
-pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 pub const MAX_PREPARED_TTL_MS: u64 = 1_800_000;
 pub const DEFAULT_PREPARED_TTL_MS: u64 = 300_000;
 
@@ -24,22 +13,24 @@ pub const GUARANTEES: &[&str] = &[
     "runtime.no-ambient-environment",
     "runtime.no-ambient-handles",
     "runtime.executable-identity-bound",
-    "filesystem.grant-roots-identity-bound",
-    "filesystem.read-confined",
+    "filesystem.resource-identities-bound",
+    "filesystem.content-read-confined",
     "filesystem.content-write-confined",
-    "filesystem.namespace-mutation-confined",
+    "filesystem.directory-entry-mutation-confined",
     "filesystem.metadata-mutation-confined",
     "filesystem.execution-confined",
-    "filesystem.host-user-data-hidden",
+    "filesystem.name-visibility-confined",
+    "filesystem.isolated-layout",
     "network.no-external-connect",
     "network.no-external-listen",
     "network.no-host-loopback",
     "network.egress-brokered",
     "network.private-addresses-denied",
-    "process.host-enumeration-denied",
+    "process.host-visibility-denied",
     "process.host-control-denied",
-    "process.complete-tree-termination",
-    "ipc.host-endpoints-hidden-outside-grants",
+    "process.descendant-tree-termination",
+    "process.group-termination",
+    "ipc.host-endpoints-hidden",
     "ipc.host-shared-memory-hidden",
     "resource.wall-time-hard",
     "resource.output-hard",
@@ -165,66 +156,92 @@ pub struct Policy {
     pub filesystem: FilesystemPolicy,
     pub network: NetworkPolicy,
     pub process: ProcessPolicy,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FilesystemPolicy {
-    pub runtime: RuntimeView,
-    pub grants: Vec<FilesystemGrant>,
-    #[serde(default)]
-    pub masks: Vec<FilesystemMask>,
-    pub private_home: Option<PrivateDirectoryPolicy>,
-    pub temporary: Option<TemporaryDirectoryPolicy>,
+    pub ipc: IpcPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum RuntimeView {
-    System,
-    Empty,
-}
-
-impl RuntimeView {
-    #[must_use]
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Empty => "empty",
-        }
-    }
+pub enum FilesystemPolicy {
+    Host {
+        resources: Vec<HostFilesystemResource>,
+    },
+    Isolated {
+        resources: Vec<IsolatedFilesystemResource>,
+        #[serde(default)]
+        masks: Vec<FilesystemMask>,
+        #[serde(rename = "privateHome")]
+        private_home: Option<SyntheticDirectoryPolicy>,
+        temporary: Option<SyntheticDirectoryPolicy>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FilesystemGrant {
-    pub host_path: String,
-    pub target_path: String,
-    pub access: String,
-    pub execution: Option<String>,
+pub struct HostFilesystemResource {
+    pub id: String,
+    pub path: CoordinatePath,
+    pub access: FilesystemAccess,
+    pub purposes: Vec<String>,
     pub root_resolution: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IsolatedFilesystemResource {
+    pub id: String,
+    pub source: CoordinatePath,
+    pub target: CoordinatePath,
+    pub access: FilesystemAccess,
+    pub purposes: Vec<String>,
+    pub root_resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FilesystemAccess {
+    pub content: String,
+    pub directory_entries: String,
+    pub metadata: String,
+    pub execution: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FilesystemMask {
-    pub target_path: String,
+    pub path: CoordinatePath,
     pub replacement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PrivateDirectoryPolicy {
-    pub enabled: Option<bool>,
-    pub size_bytes: Option<u64>,
+pub struct SyntheticDirectoryPolicy {
+    pub path: CoordinatePath,
+    pub size_bytes: u64,
     pub executable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TemporaryDirectoryPolicy {
-    pub size_bytes: Option<u64>,
-    pub executable: Option<bool>,
+#[serde(tag = "space", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CoordinatePath {
+    Host { path: String },
+    Isolated { path: String },
+}
+
+impl CoordinatePath {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Host { path } | Self::Isolated { path } => path,
+        }
+    }
+
+    #[must_use]
+    pub const fn space(&self) -> &'static str {
+        match self {
+            Self::Host { .. } => "host",
+            Self::Isolated { .. } => "isolated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,82 +301,100 @@ impl NetworkPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessPolicy {
-    pub host_processes: String,
-    pub host_ipc: String,
+    pub visibility: String,
+    pub control: String,
+    pub termination: TerminationPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminationPolicy {
+    pub scope: String,
+    pub grace_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IpcPolicy {
+    pub visibility: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Requirements {
-    pub boundary: String,
-    pub required: Vec<String>,
     #[serde(default)]
-    pub allow_experimental_backend: bool,
+    pub additional: Vec<String>,
+    #[serde(default)]
+    pub allow_experimental_implementations: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PartialResourceLimits {
-    pub wall_time_ms: Option<u64>,
-    pub cpu_time_ms: Option<u64>,
-    pub memory_bytes: Option<u64>,
-    pub max_processes: Option<u64>,
-    pub max_open_files_per_process: Option<u64>,
-    pub max_single_file_bytes: Option<u64>,
-    pub max_output_bytes: Option<u64>,
-    pub termination_grace_ms: Option<u64>,
+    pub wall_time: Option<HardLimit>,
+    pub cpu_time: Option<HardLimit>,
+    pub memory: Option<HardLimit>,
+    pub process_count: Option<HardLimit>,
+    pub open_files: Option<HardLimit>,
+    pub single_file_size: Option<HardLimit>,
+    pub output: Option<HardLimit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceLimits {
-    pub wall_time_ms: u64,
+    pub wall_time: HardLimit,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_time_ms: Option<u64>,
-    pub memory_bytes: u64,
-    pub max_processes: u64,
+    pub cpu_time: Option<HardLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_open_files_per_process: Option<u64>,
+    pub memory: Option<HardLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_single_file_bytes: Option<u64>,
-    pub max_output_bytes: u64,
-    pub termination_grace_ms: u64,
+    pub process_count: Option<HardLimit>,
+    pub open_files: HardLimit,
+    pub single_file_size: HardLimit,
+    pub output: HardLimit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HardLimit {
+    pub enforcement: String,
+    pub scope: String,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessOptions {
-    pub executable: String,
+    pub executable: CoordinatePath,
     #[serde(default)]
     pub args: Vec<String>,
-    pub cwd: String,
+    pub cwd: CoordinatePath,
     pub environment: Option<Environment>,
     pub stdin: Option<String>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub artifacts: Option<ArtifactRequest>,
     pub change_set: Option<WorkspaceChangeRequest>,
-    #[serde(default)]
-    pub resources: PartialResourceLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactRequest {
-    pub paths: Vec<String>,
+    pub paths: Vec<CoordinatePath>,
     pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceChangeRequest {
+    pub root: CoordinatePath,
     pub max_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Environment {
-    pub base: Option<String>,
     #[serde(default)]
     pub inherit: Vec<String>,
     #[serde(default)]
@@ -379,27 +414,44 @@ pub enum EnvironmentValue {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NormalizedPolicy {
     pub isolation: Isolation,
-    pub runtime_view: String,
-    pub grants: Vec<NormalizedGrant>,
+    pub filesystem_kind: String,
+    pub resources: Vec<NormalizedResource>,
     pub masks: Vec<NormalizedMask>,
-    pub private_home: NormalizedPrivateDirectory,
-    pub temporary: NormalizedTemporaryDirectory,
+    pub private_home: Option<NormalizedSyntheticDirectory>,
+    pub temporary: Option<NormalizedSyntheticDirectory>,
     pub network: String,
     pub managed_network_rules: Vec<ManagedNetworkRule>,
     pub process: ProcessPolicy,
-    pub resources: ResourceLimits,
+    pub ipc: IpcPolicy,
+    pub limits: ResourceLimits,
     pub prepared_ttl_ms: u64,
+    pub obligations: Vec<String>,
     pub requirements: Requirements,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NormalizedGrant {
+pub struct NormalizedResource {
+    pub id: String,
     pub requested_host_path: String,
     pub target_path: String,
-    pub access: String,
-    pub execution: String,
+    pub access: FilesystemAccess,
+    pub purposes: Vec<String>,
     pub root_resolution: String,
+}
+
+impl NormalizedResource {
+    #[must_use]
+    pub fn read_only(&self) -> bool {
+        self.access.content == "read"
+            && self.access.directory_entries == "read"
+            && self.access.metadata == "read"
+    }
+
+    #[must_use]
+    pub fn executable(&self) -> bool {
+        self.access.execution == "allow"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,15 +463,8 @@ pub struct NormalizedMask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NormalizedPrivateDirectory {
-    pub enabled: bool,
-    pub size_bytes: u64,
-    pub executable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NormalizedTemporaryDirectory {
+pub struct NormalizedSyntheticDirectory {
+    pub target_path: String,
     pub size_bytes: u64,
     pub executable: bool,
 }
@@ -427,9 +472,9 @@ pub struct NormalizedTemporaryDirectory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NormalizedExecution {
-    pub executable: String,
+    pub executable: CoordinatePath,
     pub args: Vec<String>,
-    pub cwd: String,
+    pub cwd: CoordinatePath,
     pub environment: BTreeMap<String, CapturedEnvironmentValue>,
     pub stdin: String,
     pub stdout: String,
@@ -438,7 +483,6 @@ pub struct NormalizedExecution {
     pub artifacts: Option<ArtifactRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_set: Option<WorkspaceChangeRequest>,
-    pub resources: ResourceLimits,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,20 +519,27 @@ pub struct EnforcementCaveat {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnforcementReport {
     pub boundary: EnforcementBoundary,
+    pub implementation: EnforcementImplementation,
     pub host: EnforcementHost,
     pub target: EnforcementTarget,
     pub guarantees: Vec<GuaranteeFact>,
-    pub runtime_view: EnforcementRuntimeView,
+    pub filesystem: EnforcementFilesystem,
     pub caveats: Vec<EnforcementCaveat>,
-    pub conformance: EnforcementConformance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnforcementBoundary {
     pub kind: String,
-    pub backend_id: String,
-    pub backend_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnforcementImplementation {
+    pub id: String,
+    pub version: String,
+    pub build_id: String,
+    pub conformance_manifest_id: String,
     pub stability: String,
     pub mechanism: Vec<String>,
 }
@@ -510,17 +561,10 @@ pub struct EnforcementTarget {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnforcementRuntimeView {
+pub struct EnforcementFilesystem {
     pub kind: String,
-    pub manifest_digest: String,
+    pub resource_manifest_digest: String,
     pub visible_roots: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnforcementConformance {
-    pub manifest_id: String,
-    pub build_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,7 +575,7 @@ pub struct ErrorData {
     pub phase: String,
     pub target_executed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
+    pub implementation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,7 +592,7 @@ impl ErrorData {
             message: sanitize_message(&message.into()),
             phase: phase.into(),
             target_executed: false,
-            backend: Some(BACKEND_ID.into()),
+            implementation: None,
             platform: Some(std::env::consts::OS.into()),
             cause_code: None,
             enforcement: None,
@@ -567,20 +611,17 @@ impl Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-pub fn normalize_session(
-    options: SessionOptions,
-    host_physical_memory: u64,
-) -> Result<NormalizedPolicy, PolicyError> {
-    let expected_boundary = match &options.isolation {
+pub fn normalize_session(options: SessionOptions) -> Result<NormalizedPolicy, PolicyError> {
+    match &options.isolation {
         Isolation::Process => "os-process",
         Isolation::HardwareVm {
             image,
             filesystem_transport,
         } => {
-            if filesystem_transport != "ephemeral" && filesystem_transport != "import" {
+            if filesystem_transport != "import" {
                 return Err(policy_error(
                     "policy.vm_filesystem_transport",
-                    "hardware VM filesystem transport must be ephemeral or import",
+                    "hardware VM filesystem transport must be import",
                 ));
             }
             if image.manifest_path.is_empty()
@@ -601,21 +642,33 @@ pub fn normalize_session(
             "hardware-virtualized"
         }
     };
-    if options.requirements.boundary != expected_boundary {
-        return Err(policy_error(
-            "requirement.boundary",
-            format!("the requested boundary must be {expected_boundary}"),
-        ));
-    }
     validate_requirements(&options.requirements)?;
-    if options.policy.process.host_processes != "deny" || options.policy.process.host_ipc != "deny"
+    let Policy {
+        filesystem,
+        network,
+        process,
+        ipc,
+    } = options.policy;
+    if !matches!(process.visibility.as_str(), "session" | "host")
+        || !matches!(process.control.as_str(), "session" | "host")
+        || !matches!(
+            process.termination.scope.as_str(),
+            "descendant-tree" | "process-group"
+        )
+        || process.termination.grace_ms > 10_000
     {
         return Err(policy_error(
             "policy.process",
-            "host process and IPC policy must be deny",
+            "process visibility, control, or termination policy is invalid",
         ));
     }
-    let managed_network_rules = match &options.policy.network {
+    if !matches!(ipc.visibility.as_str(), "session" | "host") {
+        return Err(policy_error(
+            "policy.ipc",
+            "IPC visibility policy is invalid",
+        ));
+    }
+    let managed_network_rules = match &network {
         NetworkPolicy::None => Vec::new(),
         NetworkPolicy::Managed { allow } => normalize_managed_rules(allow)?,
         NetworkPolicy::Unrestricted { acknowledgement } => {
@@ -629,7 +682,7 @@ pub fn normalize_session(
         }
     };
 
-    let resources = resolve_resources(&options.resources, host_physical_memory)?;
+    let resolved_limits = resolve_resources(&options.resources)?;
     let prepared_ttl_ms = options.prepared_ttl_ms.unwrap_or(DEFAULT_PREPARED_TTL_MS);
     if prepared_ttl_ms == 0 || prepared_ttl_ms > MAX_PREPARED_TTL_MS {
         return Err(policy_error(
@@ -637,107 +690,172 @@ pub fn normalize_session(
             "preparedTtlMs must be between 1 and 1800000",
         ));
     }
-    let private = options
-        .policy
-        .filesystem
-        .private_home
-        .unwrap_or(PrivateDirectoryPolicy {
-            enabled: None,
-            size_bytes: None,
-            executable: None,
-        });
-    let private_home = NormalizedPrivateDirectory {
-        enabled: private.enabled.unwrap_or(true),
-        size_bytes: private.size_bytes.unwrap_or(268_435_456),
-        executable: private.executable.unwrap_or(false),
+    let (filesystem_kind, raw_resources, raw_masks, private_home, temporary) = match filesystem {
+        FilesystemPolicy::Host { resources } => {
+            if matches!(options.isolation, Isolation::HardwareVm { .. }) {
+                return Err(policy_error(
+                    "policy.filesystem_layout",
+                    "hardware VM isolation requires an isolated filesystem layout",
+                ));
+            }
+            let resources = resources
+                .into_iter()
+                .map(|resource| {
+                    let CoordinatePath::Host { path } = resource.path else {
+                        return Err(policy_error(
+                            "policy.path_space",
+                            "host-layout resources require host paths",
+                        ));
+                    };
+                    Ok((
+                        resource.id,
+                        path.clone(),
+                        path,
+                        resource.access,
+                        resource.purposes,
+                        resource.root_resolution,
+                    ))
+                })
+                .collect::<Result<Vec<_>, PolicyError>>()?;
+            ("host", resources, Vec::new(), None, None)
+        }
+        FilesystemPolicy::Isolated {
+            resources,
+            masks,
+            private_home,
+            temporary,
+        } => {
+            let resources = resources
+                .into_iter()
+                .map(|resource| {
+                    let CoordinatePath::Host { path: source } = resource.source else {
+                        return Err(policy_error(
+                            "policy.path_space",
+                            "isolated resource sources require host paths",
+                        ));
+                    };
+                    let CoordinatePath::Isolated { path: target } = resource.target else {
+                        return Err(policy_error(
+                            "policy.path_space",
+                            "isolated resource targets require isolated paths",
+                        ));
+                    };
+                    Ok((
+                        resource.id,
+                        source,
+                        target,
+                        resource.access,
+                        resource.purposes,
+                        resource.root_resolution,
+                    ))
+                })
+                .collect::<Result<Vec<_>, PolicyError>>()?;
+            (
+                "isolated",
+                resources,
+                masks,
+                normalize_synthetic_directory(private_home, "privateHome")?,
+                normalize_synthetic_directory(temporary, "temporary")?,
+            )
+        }
     };
-    let temporary = options
-        .policy
-        .filesystem
-        .temporary
-        .unwrap_or(TemporaryDirectoryPolicy {
-            size_bytes: None,
-            executable: None,
-        });
-    let temporary = NormalizedTemporaryDirectory {
-        size_bytes: temporary.size_bytes.unwrap_or(536_870_912),
-        executable: temporary.executable.unwrap_or(false),
-    };
-    if private_home.enabled && private_home.size_bytes == 0 || temporary.size_bytes == 0 {
-        return Err(policy_error(
-            "policy.private_directory",
-            "private directory sizes must be positive",
-        ));
-    }
 
-    let mut grants = Vec::with_capacity(options.policy.filesystem.grants.len());
+    let mut normalized_resources = Vec::with_capacity(raw_resources.len());
     let mut target_paths = BTreeSet::new();
-    for grant in options.policy.filesystem.grants {
-        validate_absolute_host_path(&grant.host_path)?;
-        let target_path = normalize_target_path(&grant.target_path)?;
-        if reserved_target_conflict(&target_path) {
+    let mut resource_ids = BTreeSet::new();
+    for (id, host_path, raw_target, access, purposes, root_resolution) in raw_resources {
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !resource_ids.insert(id.clone())
+        {
             return Err(policy_error(
-                "policy.grant_reserved_target",
-                format!("grant target {target_path} conflicts with a runtime-owned path"),
+                "policy.resource_id",
+                "filesystem resource IDs must be unique portable identifiers",
             ));
         }
+        validate_absolute_host_path(&host_path)?;
+        validate_filesystem_access(&access)?;
+        let purposes = normalize_resource_purposes(purposes)?;
+        let target_path = if filesystem_kind == "host" {
+            validate_absolute_host_path(&raw_target)?;
+            raw_target
+        } else {
+            normalize_target_path(&raw_target)?
+        };
         if !target_paths.insert(target_path.clone()) {
             return Err(policy_error(
-                "policy.grant_conflict",
-                "multiple grants map to the same target path",
+                "policy.resource_conflict",
+                "multiple resources map to the same target path",
             ));
         }
-        if grant.access != "read" && grant.access != "read-write" {
-            return Err(policy_error(
-                "policy.grant_access",
-                "grant access must be read or read-write",
-            ));
-        }
-        let execution = grant.execution.unwrap_or_else(|| "deny".into());
-        if execution != "deny" && execution != "allow" {
-            return Err(policy_error(
-                "policy.grant_execution",
-                "grant execution must be deny or allow",
-            ));
-        }
-        let root_resolution = grant
-            .root_resolution
-            .unwrap_or_else(|| "resolve-once".into());
+        let root_resolution = root_resolution.unwrap_or_else(|| "resolve-once".into());
         if root_resolution != "resolve-once" && root_resolution != "reject-if-link" {
             return Err(policy_error(
-                "policy.grant_resolution",
-                "unsupported grant root resolution",
+                "policy.resource_resolution",
+                "unsupported resource root resolution",
             ));
         }
-        grants.push(NormalizedGrant {
-            requested_host_path: grant.host_path,
+        normalized_resources.push(NormalizedResource {
+            id,
+            requested_host_path: host_path,
             target_path,
-            access: grant.access,
-            execution,
+            access,
+            purposes,
             root_resolution,
         });
     }
-    grants.sort_by(|left, right| {
+    normalized_resources.sort_by(|left, right| {
         left.target_path
             .as_bytes()
             .cmp(right.target_path.as_bytes())
     });
-    for (index, parent) in grants.iter().enumerate() {
-        if grants[index + 1..]
+    for (index, parent) in normalized_resources.iter().enumerate() {
+        if normalized_resources[index + 1..]
             .iter()
             .any(|child| paths_overlap(&parent.target_path, &child.target_path))
         {
             return Err(policy_error(
-                "policy.grant_overlap",
-                "grant targets must not contain one another",
+                "policy.resource_overlap",
+                "resource targets must not contain one another",
             ));
         }
     }
 
-    let mut masks = Vec::with_capacity(options.policy.filesystem.masks.len());
+    for directory in private_home.iter().chain(temporary.iter()) {
+        if normalized_resources
+            .iter()
+            .any(|resource| paths_overlap(&resource.target_path, &directory.target_path))
+        {
+            return Err(policy_error(
+                "policy.synthetic_directory_conflict",
+                "synthetic directory paths conflict with an owned or authorized resource",
+            ));
+        }
+    }
+    if private_home
+        .as_ref()
+        .zip(temporary.as_ref())
+        .is_some_and(|(left, right)| paths_overlap(&left.target_path, &right.target_path))
+    {
+        return Err(policy_error(
+            "policy.synthetic_directory_conflict",
+            "synthetic directory paths overlap",
+        ));
+    }
+
+    let mut masks = Vec::with_capacity(raw_masks.len());
     let mut mask_paths = BTreeSet::new();
-    for mask in options.policy.filesystem.masks {
-        let target_path = normalize_target_path(&mask.target_path)?;
+    for mask in raw_masks {
+        let CoordinatePath::Isolated { path } = mask.path else {
+            return Err(policy_error(
+                "policy.path_space",
+                "mask paths require isolated coordinates",
+            ));
+        };
+        let target_path = normalize_target_path(&path)?;
         if target_path == "/" || !mask_paths.insert(target_path.clone()) {
             return Err(policy_error(
                 "policy.mask_conflict",
@@ -765,20 +883,156 @@ pub fn normalize_session(
             .cmp(right.target_path.as_bytes())
     });
 
-    Ok(NormalizedPolicy {
+    let mut normalized = NormalizedPolicy {
         isolation: options.isolation,
-        runtime_view: options.policy.filesystem.runtime.name().into(),
-        grants,
+        filesystem_kind: filesystem_kind.into(),
+        resources: normalized_resources,
         masks,
         private_home,
         temporary,
-        network: options.policy.network.name().into(),
+        network: network.name().into(),
         managed_network_rules,
-        process: options.policy.process,
-        resources,
+        process,
+        ipc,
+        limits: resolved_limits,
         prepared_ttl_ms,
+        obligations: Vec::new(),
         requirements: options.requirements,
-    })
+    };
+    normalized.obligations = derive_obligations(&normalized);
+    Ok(normalized)
+}
+
+fn normalize_synthetic_directory(
+    directory: Option<SyntheticDirectoryPolicy>,
+    label: &str,
+) -> Result<Option<NormalizedSyntheticDirectory>, PolicyError> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let CoordinatePath::Isolated { path } = directory.path else {
+        return Err(policy_error(
+            "policy.path_space",
+            format!("{label} requires an isolated path"),
+        ));
+    };
+    if directory.size_bytes == 0 {
+        return Err(policy_error(
+            "policy.synthetic_directory_size",
+            format!("{label} size must be positive"),
+        ));
+    }
+    Ok(Some(NormalizedSyntheticDirectory {
+        target_path: normalize_target_path(&path)?,
+        size_bytes: directory.size_bytes,
+        executable: directory.executable.unwrap_or(false),
+    }))
+}
+
+fn validate_filesystem_access(access: &FilesystemAccess) -> Result<(), PolicyError> {
+    if !matches!(access.content.as_str(), "read" | "read-write")
+        || !matches!(access.directory_entries.as_str(), "read" | "read-write")
+        || !matches!(access.metadata.as_str(), "read" | "read-write")
+        || !matches!(access.execution.as_str(), "deny" | "allow")
+    {
+        return Err(policy_error(
+            "policy.resource_access",
+            "filesystem access dimensions are invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_resource_purposes(mut purposes: Vec<String>) -> Result<Vec<String>, PolicyError> {
+    purposes.sort();
+    purposes.dedup();
+    if purposes.is_empty()
+        || purposes.iter().any(|purpose| {
+            !matches!(
+                purpose.as_str(),
+                "executable" | "interpreter" | "loader" | "library" | "cache" | "data"
+            )
+        })
+    {
+        return Err(policy_error(
+            "policy.resource_purpose",
+            "filesystem resources require one or more known purposes",
+        ));
+    }
+    Ok(purposes)
+}
+
+fn derive_obligations(policy: &NormalizedPolicy) -> Vec<String> {
+    let mut obligations = BTreeSet::from([
+        "runtime.setup-before-exec".to_owned(),
+        "runtime.no-ambient-environment".to_owned(),
+        "runtime.no-ambient-handles".to_owned(),
+        "runtime.executable-identity-bound".to_owned(),
+        "filesystem.resource-identities-bound".to_owned(),
+        "filesystem.content-read-confined".to_owned(),
+        "filesystem.content-write-confined".to_owned(),
+        "filesystem.directory-entry-mutation-confined".to_owned(),
+        "filesystem.metadata-mutation-confined".to_owned(),
+        "filesystem.execution-confined".to_owned(),
+        "resource.wall-time-hard".to_owned(),
+        "resource.output-hard".to_owned(),
+        "resource.open-files-hard".to_owned(),
+        "resource.single-file-size-hard".to_owned(),
+    ]);
+    if policy.filesystem_kind == "isolated" {
+        obligations.insert("filesystem.name-visibility-confined".into());
+        obligations.insert("filesystem.isolated-layout".into());
+    }
+    match policy.network.as_str() {
+        "none" => {
+            obligations.insert("network.no-external-connect".into());
+            obligations.insert("network.no-external-listen".into());
+            obligations.insert("network.no-host-loopback".into());
+        }
+        "managed" => {
+            obligations.insert("network.egress-brokered".into());
+            obligations.insert("network.private-addresses-denied".into());
+            obligations.insert("network.no-external-listen".into());
+            obligations.insert("network.no-host-loopback".into());
+        }
+        _ => {}
+    }
+    if policy.process.visibility == "session" {
+        obligations.insert("process.host-visibility-denied".into());
+    }
+    if policy.process.control == "session" {
+        obligations.insert("process.host-control-denied".into());
+    }
+    obligations.insert(
+        if policy.process.termination.scope == "descendant-tree" {
+            "process.descendant-tree-termination"
+        } else {
+            "process.group-termination"
+        }
+        .into(),
+    );
+    if policy.ipc.visibility == "session" {
+        obligations.insert("ipc.host-endpoints-hidden".into());
+        obligations.insert("ipc.host-shared-memory-hidden".into());
+    }
+    if policy.limits.memory.is_some() {
+        obligations.insert("resource.memory-hard".into());
+    }
+    if policy.limits.process_count.is_some() {
+        obligations.insert("resource.process-count-hard".into());
+    }
+    if policy.limits.cpu_time.is_some() {
+        obligations.insert("resource.cpu-time-hard".into());
+    }
+    if matches!(policy.isolation, Isolation::HardwareVm { .. }) {
+        obligations.extend([
+            "vm.boot-artifacts-verified".into(),
+            "vm.guest-control-authenticated".into(),
+            "vm.control-plane-hidden-from-target".into(),
+            "vm.host-filesystem-absent-outside-imports".into(),
+        ]);
+    }
+    obligations.into_iter().collect()
 }
 
 fn normalize_managed_rules(
@@ -890,7 +1144,6 @@ pub fn normalize_dns_name(value: &str) -> Result<String, PolicyError> {
 
 pub fn normalize_run(
     options: RunOptions,
-    host_physical_memory: u64,
 ) -> Result<(NormalizedPolicy, NormalizedExecution), PolicyError> {
     let process = options.process;
     let session = SessionOptions {
@@ -900,26 +1153,26 @@ pub fn normalize_run(
         resources: options.resources,
         prepared_ttl_ms: options.prepared_ttl_ms,
     };
-    let policy = normalize_session(session, host_physical_memory)?;
-    let execution = normalize_process(process, &policy.resources)?;
+    let policy = normalize_session(session)?;
+    let execution = normalize_process(process, &policy)?;
     Ok((policy, execution))
 }
 
 pub fn normalize_process(
     process: ProcessOptions,
-    session_limits: &ResourceLimits,
+    policy: &NormalizedPolicy,
 ) -> Result<NormalizedExecution, PolicyError> {
-    let executable = normalize_target_path(&process.executable)?;
-    if executable == "/" {
+    let executable = normalize_execution_path(process.executable, &policy.filesystem_kind)?;
+    if executable.path() == "/" {
         return Err(policy_error(
             "policy.executable",
             "executable cannot be the target root",
         ));
     }
-    let cwd = normalize_target_path(&process.cwd)?;
-    for value in std::iter::once(&process.executable)
-        .chain(std::iter::once(&process.cwd))
-        .chain(process.args.iter())
+    let cwd = normalize_execution_path(process.cwd, &policy.filesystem_kind)?;
+    for value in std::iter::once(executable.path())
+        .chain(std::iter::once(cwd.path()))
+        .chain(process.args.iter().map(String::as_str))
     {
         if value.contains('\0') {
             return Err(policy_error(
@@ -928,7 +1181,6 @@ pub fn normalize_process(
             ));
         }
     }
-    let resources = narrow_resources(session_limits, &process.resources)?;
     let environment = capture_environment(process.environment)?;
     let stdin = validate_mode(
         process.stdin.as_deref().unwrap_or("closed"),
@@ -947,11 +1199,11 @@ pub fn normalize_process(
     )?;
     let artifacts = process
         .artifacts
-        .map(normalize_artifact_request)
+        .map(|request| normalize_artifact_request(request, &policy.filesystem_kind))
         .transpose()?;
     let change_set = process
         .change_set
-        .map(normalize_workspace_change_request)
+        .map(|request| normalize_workspace_change_request(request, &policy.filesystem_kind))
         .transpose()?;
     Ok(NormalizedExecution {
         executable,
@@ -963,12 +1215,12 @@ pub fn normalize_process(
         stderr,
         artifacts,
         change_set,
-        resources,
     })
 }
 
 fn normalize_workspace_change_request(
-    request: WorkspaceChangeRequest,
+    mut request: WorkspaceChangeRequest,
+    filesystem_kind: &str,
 ) -> Result<WorkspaceChangeRequest, PolicyError> {
     if request.max_bytes == 0 || request.max_bytes > 64 * 1024 * 1024 {
         return Err(policy_error(
@@ -976,10 +1228,14 @@ fn normalize_workspace_change_request(
             "workspace change-set export requires a byte limit no larger than 64 MiB",
         ));
     }
+    request.root = normalize_execution_path(request.root, filesystem_kind)?;
     Ok(request)
 }
 
-fn normalize_artifact_request(request: ArtifactRequest) -> Result<ArtifactRequest, PolicyError> {
+fn normalize_artifact_request(
+    request: ArtifactRequest,
+    filesystem_kind: &str,
+) -> Result<ArtifactRequest, PolicyError> {
     if request.paths.is_empty()
         || request.paths.len() > 65_536
         || request.max_bytes == 0
@@ -990,34 +1246,14 @@ fn normalize_artifact_request(request: ArtifactRequest) -> Result<ArtifactReques
             "artifact export requires one to 65536 paths and a byte limit no larger than 64 MiB",
         ));
     }
-    let mut paths = BTreeSet::new();
+    let mut paths = BTreeMap::new();
     for value in request.paths {
-        if value.contains('\0') {
-            return Err(policy_error(
-                "policy.artifact_path",
-                "artifact path contains NUL",
-            ));
-        }
-        let path = Path::new(&value);
-        let normalized = if path.is_absolute() {
-            normalize_target_path(&value)?
-                .strip_prefix('/')
-                .unwrap_or("")
-                .to_owned()
-        } else {
-            if value.is_empty()
-                || path
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(policy_error(
-                    "policy.artifact_path",
-                    "artifact paths must be normalized target paths",
-                ));
-            }
-            value
-        };
-        if normalized.is_empty() || !paths.insert(normalized) {
+        let normalized = normalize_execution_path(value, filesystem_kind)?;
+        if normalized.path() == "/"
+            || paths
+                .insert(normalized.path().to_owned(), normalized)
+                .is_some()
+        {
             return Err(policy_error(
                 "policy.artifact_path",
                 "artifact paths must be unique and non-root",
@@ -1025,9 +1261,34 @@ fn normalize_artifact_request(request: ArtifactRequest) -> Result<ArtifactReques
         }
     }
     Ok(ArtifactRequest {
-        paths: paths.into_iter().collect(),
+        paths: paths.into_values().collect(),
         max_bytes: request.max_bytes,
     })
+}
+
+fn normalize_execution_path(
+    path: CoordinatePath,
+    filesystem_kind: &str,
+) -> Result<CoordinatePath, PolicyError> {
+    match (filesystem_kind, path) {
+        ("host", CoordinatePath::Host { path }) => {
+            validate_absolute_host_path(&path)?;
+            Ok(CoordinatePath::Host { path })
+        }
+        ("isolated", CoordinatePath::Isolated { path }) => Ok(CoordinatePath::Isolated {
+            path: normalize_target_path(&path)?,
+        }),
+        ("host", CoordinatePath::Isolated { .. }) | ("isolated", CoordinatePath::Host { .. }) => {
+            Err(policy_error(
+                "policy.path_space",
+                "execution paths must use the filesystem layout coordinate space",
+            ))
+        }
+        _ => Err(policy_error(
+            "policy.filesystem_layout",
+            "unknown filesystem layout",
+        )),
+    }
 }
 
 fn validate_mode(value: &str, accepted: &[&str], name: &str) -> Result<String, PolicyError> {
@@ -1045,36 +1306,11 @@ fn capture_environment(
     environment: Option<Environment>,
 ) -> Result<BTreeMap<String, CapturedEnvironmentValue>, PolicyError> {
     let environment = environment.unwrap_or(Environment {
-        base: None,
         inherit: Vec::new(),
         set: BTreeMap::new(),
         unset: Vec::new(),
     });
-    let base = environment.base.as_deref().unwrap_or("minimal");
-    if base != "minimal" && base != "empty" {
-        return Err(policy_error(
-            "policy.environment_base",
-            "environment base must be minimal or empty",
-        ));
-    }
     let mut result = BTreeMap::new();
-    if base == "minimal" {
-        for (name, value) in [
-            ("HOME", "/home/sandbox"),
-            ("PATH", "/usr/bin:/bin"),
-            ("TMPDIR", "/tmp"),
-            ("TMP", "/tmp"),
-            ("TEMP", "/tmp"),
-        ] {
-            result.insert(
-                name.into(),
-                CapturedEnvironmentValue {
-                    value: value.into(),
-                    sensitive: false,
-                },
-            );
-        }
-    }
     let mut seen = BTreeSet::new();
     for name in environment.inherit {
         validate_environment_name(&name)?;
@@ -1145,7 +1381,7 @@ fn validate_environment_name(name: &str) -> Result<(), PolicyError> {
 
 fn validate_requirements(requirements: &Requirements) -> Result<(), PolicyError> {
     let mut seen = BTreeSet::new();
-    for guarantee in &requirements.required {
+    for guarantee in &requirements.additional {
         if !GUARANTEES.contains(&guarantee.as_str()) {
             return Err(policy_error(
                 "requirement.unknown",
@@ -1162,108 +1398,68 @@ fn validate_requirements(requirements: &Requirements) -> Result<(), PolicyError>
     Ok(())
 }
 
-pub fn resolve_resources(
-    partial: &PartialResourceLimits,
-    host_memory: u64,
-) -> Result<ResourceLimits, PolicyError> {
-    let calculated_memory = 4_294_967_296_u64.min(host_memory / 2);
-    let memory_bytes = match partial.memory_bytes {
-        Some(value) => value,
-        None if calculated_memory < 536_870_912 => {
-            return Err(policy_error(
-                "policy.memory_default",
-                "host memory is too low for the default envelope; provide memoryBytes explicitly",
-            ));
-        }
-        None => calculated_memory,
-    };
+pub fn resolve_resources(partial: &PartialResourceLimits) -> Result<ResourceLimits, PolicyError> {
     let limits = ResourceLimits {
-        wall_time_ms: partial.wall_time_ms.unwrap_or(600_000),
-        cpu_time_ms: partial.cpu_time_ms,
-        memory_bytes,
-        max_processes: partial.max_processes.unwrap_or(256),
-        max_open_files_per_process: Some(partial.max_open_files_per_process.unwrap_or(1024)),
-        max_single_file_bytes: Some(partial.max_single_file_bytes.unwrap_or(1_073_741_824)),
-        max_output_bytes: partial.max_output_bytes.unwrap_or(33_554_432),
-        termination_grace_ms: partial.termination_grace_ms.unwrap_or(2_000),
+        wall_time: partial
+            .wall_time
+            .clone()
+            .unwrap_or_else(|| hard_limit("process", 600_000)),
+        cpu_time: partial.cpu_time.clone(),
+        memory: partial.memory.clone(),
+        process_count: partial.process_count.clone(),
+        open_files: partial
+            .open_files
+            .clone()
+            .unwrap_or_else(|| hard_limit("process", 1024)),
+        single_file_size: partial
+            .single_file_size
+            .clone()
+            .unwrap_or_else(|| hard_limit("process", 1_073_741_824)),
+        output: partial
+            .output
+            .clone()
+            .unwrap_or_else(|| hard_limit("process", 33_554_432)),
     };
     validate_limits(&limits)?;
     Ok(limits)
 }
 
 fn validate_limits(limits: &ResourceLimits) -> Result<(), PolicyError> {
-    if limits.wall_time_ms == 0
-        || limits.memory_bytes == 0
-        || limits.max_processes == 0
-        || limits.max_output_bytes == 0
-        || limits.max_open_files_per_process == Some(0)
-        || limits.max_single_file_bytes == Some(0)
-        || limits.cpu_time_ms == Some(0)
-    {
+    let valid = validate_limit(&limits.wall_time, &["process", "session"])
+        && limits
+            .cpu_time
+            .as_ref()
+            .is_none_or(|limit| validate_limit(limit, &["descendant-tree", "session"]))
+        && limits
+            .memory
+            .as_ref()
+            .is_none_or(|limit| validate_limit(limit, &["descendant-tree", "session"]))
+        && limits
+            .process_count
+            .as_ref()
+            .is_none_or(|limit| validate_limit(limit, &["descendant-tree", "session"]))
+        && validate_limit(&limits.open_files, &["process"])
+        && validate_limit(&limits.single_file_size, &["process"])
+        && validate_limit(&limits.output, &["process", "session"]);
+    if !valid {
         return Err(policy_error(
             "policy.resource",
-            "resource limits must be positive",
-        ));
-    }
-    if limits.termination_grace_ms > 10_000 {
-        return Err(policy_error(
-            "policy.termination_grace",
-            "terminationGraceMs must be between 0 and 10000",
+            "resource limits must be positive hard limits with a valid scope",
         ));
     }
     Ok(())
 }
 
-fn narrow_resources(
-    session: &ResourceLimits,
-    partial: &PartialResourceLimits,
-) -> Result<ResourceLimits, PolicyError> {
-    let narrowed = ResourceLimits {
-        wall_time_ms: partial.wall_time_ms.unwrap_or(session.wall_time_ms),
-        cpu_time_ms: partial.cpu_time_ms.or(session.cpu_time_ms),
-        memory_bytes: partial.memory_bytes.unwrap_or(session.memory_bytes),
-        max_processes: partial.max_processes.unwrap_or(session.max_processes),
-        max_open_files_per_process: partial
-            .max_open_files_per_process
-            .or(session.max_open_files_per_process),
-        max_single_file_bytes: partial
-            .max_single_file_bytes
-            .or(session.max_single_file_bytes),
-        max_output_bytes: partial.max_output_bytes.unwrap_or(session.max_output_bytes),
-        termination_grace_ms: partial
-            .termination_grace_ms
-            .unwrap_or(session.termination_grace_ms),
-    };
-    validate_limits(&narrowed)?;
-    let widened = narrowed.wall_time_ms > session.wall_time_ms
-        || narrowed.memory_bytes > session.memory_bytes
-        || narrowed.max_processes > session.max_processes
-        || narrowed.max_output_bytes > session.max_output_bytes
-        || option_widens(narrowed.cpu_time_ms, session.cpu_time_ms)
-        || option_widens(
-            narrowed.max_open_files_per_process,
-            session.max_open_files_per_process,
-        )
-        || option_widens(
-            narrowed.max_single_file_bytes,
-            session.max_single_file_bytes,
-        )
-        || narrowed.termination_grace_ms > session.termination_grace_ms;
-    if widened {
-        return Err(policy_error(
-            "policy.resource_widening",
-            "process limits may not widen session limits",
-        ));
+fn hard_limit(scope: &str, value: u64) -> HardLimit {
+    HardLimit {
+        enforcement: "hard".into(),
+        scope: scope.into(),
+        value,
     }
-    Ok(narrowed)
 }
 
-const fn option_widens(child: Option<u64>, parent: Option<u64>) -> bool {
-    match (child, parent) {
-        (Some(child), Some(parent)) => child > parent,
-        (None, Some(_)) => true,
-        _ => false,
-    }
+fn validate_limit(limit: &HardLimit, scopes: &[&str]) -> bool {
+    limit.enforcement == "hard" && limit.value > 0 && scopes.contains(&limit.scope.as_str())
 }
 
 pub fn normalize_target_path(value: &str) -> Result<String, PolicyError> {
@@ -1393,35 +1589,6 @@ fn normalize_windows_target_path(value: &str) -> Result<String, PolicyError> {
     Ok(normalized)
 }
 
-#[cfg(target_os = "linux")]
-const RUNTIME_OWNED_TARGETS: &[&str] = &[
-    "/dev",
-    "/proc",
-    "/tmp",
-    "/home/sandbox",
-    "/etc/passwd",
-    "/etc/group",
-    "/etc/hosts",
-    "/etc/resolv.conf",
-];
-
-#[cfg(target_os = "linux")]
-fn reserved_target_conflict(target: &str) -> bool {
-    target == "/"
-        || target
-            .strip_prefix('/')
-            .and_then(|relative| relative.split('/').next())
-            .is_some_and(|component| component.starts_with(".sandbox-"))
-        || RUNTIME_OWNED_TARGETS
-            .iter()
-            .any(|reserved| paths_overlap(target, reserved))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn reserved_target_conflict(target: &str) -> bool {
-    Path::new(target).parent().is_none()
-}
-
 fn paths_overlap(left: &str, right: &str) -> bool {
     path_contains(left, right) || path_contains(right, left)
 }
@@ -1508,63 +1675,26 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn runtime_owned_grant_targets_are_reserved() {
-        for path in [
-            "/",
-            "/.sandbox-masks",
-            "/.sandbox-runtime/executable",
-            "/tmp/work",
-            "/home",
-            "/etc",
-            "/dev/null",
-            "/proc/self",
-        ] {
-            assert!(reserved_target_conflict(path), "{path} must be reserved");
-        }
-        for path in ["/workspace", "/home/other", "/etc-custom", "/devtools"] {
-            assert!(!reserved_target_conflict(path), "{path} must remain usable");
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn only_the_target_root_is_generically_reserved() {
-        assert!(reserved_target_conflict("/"));
-        assert!(!reserved_target_conflict("/workspace"));
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn only_a_target_volume_root_is_generically_reserved() {
-        assert!(reserved_target_conflict(r"C:\"));
-        assert!(!reserved_target_conflict(r"C:\workspace"));
-    }
-
-    #[test]
     fn defaults_are_resolved() {
-        let limits = resolve_resources(&PartialResourceLimits::default(), 16 * 1024 * 1024 * 1024)
-            .expect("limits");
-        assert_eq!(limits.memory_bytes, 4_294_967_296);
-        assert_eq!(limits.wall_time_ms, 600_000);
-        assert_eq!(limits.max_output_bytes, 33_554_432);
+        let limits = resolve_resources(&PartialResourceLimits::default()).expect("limits");
+        assert!(limits.memory.is_none());
+        assert!(limits.process_count.is_none());
+        assert_eq!(limits.wall_time.value, 600_000);
+        assert_eq!(limits.output.value, 33_554_432);
     }
 
     #[test]
-    fn process_limits_cannot_widen() {
-        let session = resolve_resources(&PartialResourceLimits::default(), 8 * 1024 * 1024 * 1024)
-            .expect("limits");
-        let wider = PartialResourceLimits {
-            wall_time_ms: Some(session.wall_time_ms + 1),
+    fn resource_scopes_are_validated() {
+        let invalid = PartialResourceLimits {
+            wall_time: Some(hard_limit("descendant-tree", 1000)),
             ..Default::default()
         };
-        assert!(narrow_resources(&session, &wider).is_err());
+        assert!(resolve_resources(&invalid).is_err());
     }
 
     #[test]
     fn environment_values_are_captured_but_not_part_of_names() {
         let environment = Environment {
-            base: Some("empty".into()),
             inherit: Vec::new(),
             set: BTreeMap::from([(
                 "TOKEN".into(),

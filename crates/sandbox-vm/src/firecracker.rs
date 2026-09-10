@@ -2,7 +2,7 @@ use sandbox_launcher_linux::{
     LaunchSpec, LauncherEvent, LauncherStatus, MountSpec, PreparedCwd, file_identity,
     read_launcher_event, read_launcher_status, send_launch_spec, send_launcher_terminate,
 };
-use sandbox_policy::{NormalizedMask, ResourceLimits};
+use sandbox_policy::{HardLimit, NormalizedMask, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -47,7 +47,6 @@ impl FirecrackerProcess {
     pub fn spawn(config: &FirecrackerConfig) -> Result<Self, FirecrackerError> {
         validate_config(config)?;
         fs::create_dir(&config.state_directory)?;
-        let root_directory = config.state_directory.join("root");
         let vm_state = config.state_directory.join("vm-state");
         fs::create_dir(&vm_state)?;
         let vsock_path = vm_state.join("guest.vsock");
@@ -142,15 +141,14 @@ impl FirecrackerProcess {
             .open(&vm_state)?;
         let cwd_identity = file_identity(cwd.as_raw_fd())?;
         files.push(cwd);
+        let launcher_fd_index = files.len();
+        files.push(sandbox_launcher_linux::NamespaceLauncher::open()?.file);
         let spec = LaunchSpec {
-            root_path: root_directory.to_string_lossy().into_owned(),
+            launcher_fd_index,
             mounts,
             masks: Vec::<NormalizedMask>::new(),
-            private_home_enabled: false,
-            private_home_size_bytes: 1024 * 1024,
-            private_home_executable: false,
-            temporary_size_bytes: 64 * 1024 * 1024,
-            temporary_executable: false,
+            private_home: None,
+            temporary: None,
             executable_fd_index,
             executable_identity,
             executable_content_sha256: actual_digest,
@@ -170,15 +168,15 @@ impl FirecrackerProcess {
             ],
             environment: BTreeMap::new(),
             resources: ResourceLimits {
-                wall_time_ms: 24 * 60 * 60 * 1000,
-                cpu_time_ms: None,
-                memory_bytes: u64::from(config.memory_mib + 256) * 1024 * 1024,
-                max_processes: u64::from(config.vcpu_count) + 32,
-                max_open_files_per_process: Some(1024),
-                max_single_file_bytes: Some(16 * 1024 * 1024 * 1024),
-                max_output_bytes: 64 * 1024 * 1024,
-                termination_grace_ms: 1_000,
+                wall_time: hard_limit("process", 24 * 60 * 60 * 1000),
+                cpu_time: None,
+                memory: None,
+                process_count: None,
+                open_files: hard_limit("process", 1024),
+                single_file_size: hard_limit("process", 16 * 1024 * 1024 * 1024),
+                output: hard_limit("process", 64 * 1024 * 1024),
             },
+            termination_grace_ms: 1_000,
             network_mode: "none".into(),
         };
         let (mut control, launcher_control) = UnixStream::pair()?;
@@ -274,6 +272,14 @@ impl FirecrackerProcess {
         self.final_status
             .as_ref()
             .ok_or_else(|| FirecrackerError::Setup("missing VMM final status".into()))
+    }
+}
+
+fn hard_limit(scope: &str, value: u64) -> HardLimit {
+    HardLimit {
+        enforcement: "hard".into(),
+        scope: scope.into(),
+        value,
     }
 }
 

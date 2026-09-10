@@ -52,23 +52,24 @@ if (nativePlatform === "macos") {
 }
 const digest = createHash("sha256").update(await readFile(destination)).digest("hex");
 const manifestPath = resolve(repository, "native", "manifest.json");
+const packageNativeRoot = resolve(repository, "packages", "sandbox", "native");
 let currentFiles: Record<string, string> = {};
-try {
-  const current = JSON.parse(await readFile(manifestPath, "utf8")) as { files?: Record<string, string> };
-  currentFiles = current.files ?? {};
-} catch {
-  // A first platform build starts a new manifest.
+for (const currentManifest of [resolve(packageNativeRoot, "manifest.json"), manifestPath]) {
+  try {
+    const current = JSON.parse(await readFile(currentManifest, "utf8")) as { files?: Record<string, string> };
+    currentFiles = { ...currentFiles, ...current.files };
+  } catch {
+    // A first platform build starts a new manifest.
+  }
 }
 currentFiles[`${nativePlatform}-${architecture}/${destinationName}`] = digest;
 const manifest = `${JSON.stringify({
   formatVersion: 1,
   buildId: "sandbox-runtime-0.1.0",
-  conformanceManifestId: "cross-platform-sandbox-conformance-1",
   files: currentFiles,
 }, null, 2)}\n`;
 await writeFile(manifestPath, manifest, { mode: 0o644 });
 
-const packageNativeRoot = resolve(repository, "packages", "sandbox", "native");
 const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform}-${architecture}`);
 await mkdir(packageDestinationDirectory, { recursive: true });
 await copyFile(destination, resolve(packageDestinationDirectory, destinationName));

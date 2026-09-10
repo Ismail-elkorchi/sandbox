@@ -55,11 +55,11 @@ export type SandboxIsolation =
   | {
       kind: "hardware-vm";
       image: SandboxImageReference;
-      filesystemTransport: "ephemeral" | "import";
+      filesystemTransport: "import";
     };
 
 export interface CreateSandboxOptions {
-  allowExperimentalBackends?: boolean;
+  allowExperimentalImplementations?: boolean;
   extensions?: readonly SandboxExtensionRegistration[];
 }
 
@@ -67,7 +67,7 @@ export interface SandboxSessionOptions {
   isolation: SandboxIsolation;
   policy: SandboxPolicy;
   requirements: EnforcementRequirements;
-  resources?: Partial<ResourceLimits>;
+  resources?: ResourceLimits;
   preparedTtlMs?: number;
   signal?: AbortSignal;
 }
@@ -77,8 +77,10 @@ export interface SandboxRunOptions extends SandboxSessionOptions {
 }
 
 export interface SandboxProbeRequest {
-  isolation?: SandboxIsolation["kind"];
-  required?: readonly string[];
+  isolation?: SandboxIsolation;
+  policy?: SandboxPolicy;
+  requirements?: EnforcementRequirements;
+  resources?: ResourceLimits;
 }
 
 export type SandboxSupport = RuntimeSupport;
@@ -104,31 +106,33 @@ export async function createSandbox(options: CreateSandboxOptions = {}): Promise
     }
     extensions.set(registration.kind, await verifyExtension(registration));
   }
-  return new SandboxImplementation(options.allowExperimentalBackends ?? false, extensions);
+  return new SandboxImplementation(options.allowExperimentalImplementations ?? false, extensions);
 }
 
 class SandboxImplementation implements Sandbox {
-  readonly #allowExperimentalBackends: boolean;
+  readonly #allowExperimentalImplementations: boolean;
   readonly #extensions: ReadonlyMap<"hardware-vm", VerifiedSandboxExtension>;
   readonly #clients = new Set<RuntimeClient>();
   #disposed = false;
 
   constructor(
-    allowExperimentalBackends: boolean,
+    allowExperimentalImplementations: boolean,
     extensions: ReadonlyMap<"hardware-vm", VerifiedSandboxExtension>,
   ) {
-    this.#allowExperimentalBackends = allowExperimentalBackends;
+    this.#allowExperimentalImplementations = allowExperimentalImplementations;
     this.#extensions = extensions;
   }
 
   async probe(request: SandboxProbeRequest = {}): Promise<SandboxSupport> {
     this.#ensureOpen();
-    const client = await this.#client(request.isolation ?? "process");
+    const client = await this.#client(request.isolation?.kind ?? "process");
     try {
       return await client.probe({
-        isolation: request.isolation ?? "process",
-        required: request.required ?? [],
-        allowExperimentalBackends: this.#allowExperimentalBackends,
+        ...(request.isolation === undefined ? {} : { isolation: request.isolation }),
+        ...(request.policy === undefined ? {} : { policy: request.policy }),
+        requirements: request.requirements ?? {},
+        ...(request.resources === undefined ? {} : { resources: request.resources }),
+        allowExperimentalImplementations: this.#allowExperimentalImplementations,
       });
     } finally {
       await client.shutdown();
@@ -145,7 +149,7 @@ class SandboxImplementation implements Sandbox {
       const response = object(
         await raceAbort(
           client.request(MessageType.PrepareRun, MessageType.RunPrepared, {
-            options: serializeRunOptions(options, this.#allowExperimentalBackends),
+            options: serializeRunOptions(options, this.#allowExperimentalImplementations),
           }),
           options.signal,
           () => client.shutdown(),
@@ -180,7 +184,7 @@ class SandboxImplementation implements Sandbox {
       const response = object(
         await raceAbort(
           client.request(MessageType.PrepareSession, MessageType.SessionPrepared, {
-            options: serializeSessionOptions(options, this.#allowExperimentalBackends),
+            options: serializeSessionOptions(options, this.#allowExperimentalImplementations),
           }),
           options.signal,
           () => client.shutdown(),
@@ -642,8 +646,8 @@ function serializeSessionOptions(options: SandboxSessionOptions, globalExperimen
     policy: options.policy,
     requirements: {
       ...options.requirements,
-      allowExperimentalBackend:
-        (options.requirements.allowExperimentalBackend ?? false) && globalExperimental,
+      allowExperimentalImplementations:
+        (options.requirements.allowExperimentalImplementations ?? false) && globalExperimental,
     },
     resources: options.resources ?? {},
     ...(options.preparedTtlMs === undefined ? {} : { preparedTtlMs: options.preparedTtlMs }),
@@ -661,7 +665,6 @@ function serializeProcessOptions(options: SandboxProcessOptions): JsonObject {
     stderr: options.stderr ?? "capture",
     ...(options.artifacts === undefined ? {} : { artifacts: options.artifacts }),
     ...(options.changeSet === undefined ? {} : { changeSet: options.changeSet }),
-    resources: options.resources ?? {},
   };
 }
 

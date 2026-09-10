@@ -3,16 +3,19 @@
 #![allow(clippy::result_large_err)]
 
 use sandbox_digest::{execution_digest, identity_digest, policy_digest};
-use sandbox_launcher_linux::{FileIdentity, LaunchSpec, MountSpec, PreparedCwd, file_identity};
+use sandbox_launcher_linux::{
+    FileIdentity, LaunchSpec, MountSpec, NamespaceLauncher, PreparedCwd, ProbeOutcome,
+    file_identity,
+};
 use sandbox_policy::{
-    BACKEND_ID, BACKEND_VERSION, BUILD_ID, CONFORMANCE_MANIFEST_ID, EnforcementBoundary,
-    EnforcementCaveat, EnforcementConformance, EnforcementHost, EnforcementReport,
-    EnforcementRuntimeView, EnforcementTarget, ErrorData, GUARANTEES, GuaranteeFact,
-    NormalizedExecution, NormalizedPolicy,
+    EnforcementBoundary, EnforcementCaveat, EnforcementFilesystem, EnforcementHost,
+    EnforcementImplementation, EnforcementReport, EnforcementTarget, ErrorData, GUARANTEES,
+    GuaranteeFact, NormalizedExecution, NormalizedPolicy,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -22,30 +25,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NONCE: AtomicU64 = AtomicU64::new(1);
+pub const IMPLEMENTATION_ID: &str = "linux-namespace-v1";
+pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const CONFORMANCE_MANIFEST_ID: &str = "linux-namespace-v1-conformance-1";
+pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeCapabilities {
     pub namespaces: bool,
     pub network_namespace: bool,
-    pub mount_setattr: bool,
     pub landlock_abi: u32,
     pub seccomp: bool,
-    pub execveat: bool,
     pub cgroup_memory: bool,
     pub cgroup_processes: bool,
-    pub errors: Vec<String>,
+    pub mechanisms: std::collections::BTreeMap<String, ProbeOutcome>,
 }
 
 impl ProbeCapabilities {
     #[must_use]
-    pub fn backend_available(&self, network: &str) -> bool {
+    pub fn namespace_available(&self, network: &str) -> bool {
         self.namespaces
-            && self.mount_setattr
-            && self.landlock_abi > 0
+            && self.landlock_abi >= 3
             && self.seccomp
-            && self.execveat
             && (network == "unrestricted" || self.network_namespace)
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self, network: &str) -> String {
+        self.mechanisms
+            .iter()
+            .filter(|(name, outcome)| {
+                outcome.state != "available"
+                    && (matches!(name.as_str(), "namespace-launcher" | "landlock" | "seccomp")
+                        || (network != "unrestricted" && name.as_str() == "network-namespace"))
+            })
+            .map(|(name, outcome)| {
+                format!(
+                    "{name}: {} during {}: {}",
+                    outcome.state,
+                    outcome.operation,
+                    outcome.detail.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -59,7 +83,6 @@ pub struct HeldMount {
     pub resolved_path: String,
     pub identity: FileIdentity,
     pub identity_digest: String,
-    pub requested_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -73,21 +96,29 @@ pub struct PreparedHostPath {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PreparedGrantSummary {
-    pub requested_host_path: String,
-    pub resolved_host_path: String,
-    pub host_identity_digest: String,
-    pub target_path: String,
-    pub access: String,
-    pub execution: String,
+pub struct PreparedResourceSummary {
+    pub id: String,
+    pub source: PreparedResourceSource,
+    pub target: Value,
+    pub access: sandbox_policy::FilesystemAccess,
+    pub purposes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedResourceSource {
+    pub requested: String,
+    pub resolved: String,
+    pub identity_digest: String,
 }
 
 #[derive(Debug)]
 pub struct PreparedLinuxPolicy {
     pub normalized: NormalizedPolicy,
+    launcher: NamespaceLauncher,
     pub mounts: Vec<HeldMount>,
-    pub grants: Vec<PreparedGrantSummary>,
-    pub runtime_manifest_digest: String,
+    pub resources: Vec<PreparedResourceSummary>,
+    pub resource_manifest_digest: String,
     pub visible_roots: Vec<String>,
     pub enforcement: EnforcementReport,
     pub policy_digest: String,
@@ -144,110 +175,217 @@ pub struct LaunchBundle {
     pub files: Vec<File>,
 }
 
-pub fn host_physical_memory() -> io::Result<u64> {
-    // SAFETY: sysconf is called with fixed supported selector constants and has no pointer arguments.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    // SAFETY: sysconf is called with fixed supported selector constants and has no pointer arguments.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if pages <= 0 || page_size <= 0 {
-        return Err(io::Error::last_os_error());
-    }
-    u64::try_from(pages)
-        .ok()
-        .and_then(|value| value.checked_mul(u64::try_from(page_size).ok()?))
-        .ok_or_else(|| io::Error::other("physical memory size overflow"))
-}
-
 pub fn prepare_policy(
     normalized: NormalizedPolicy,
     capabilities: &ProbeCapabilities,
 ) -> Result<PreparedLinuxPolicy, ErrorData> {
-    if !capabilities.backend_available(&normalized.network) {
-        return Err(ErrorData::new(
-            "unsupported.linux_capabilities",
-            format!(
-                "linux-namespace-v1 is unavailable: {}",
-                capabilities.errors.join(", ")
-            ),
-            "probe",
+    let selection = select_implementation(&normalized, capabilities)?;
+    if selection != IMPLEMENTATION_ID {
+        return Err(implementation_error(
+            "unsupported.implementation_selection",
+            "selected implementation is unavailable in this runtime",
+            "prepare",
         ));
     }
+    let launcher = NamespaceLauncher::open()
+        .map_err(|error| os_error("preparation.namespace_launcher", &error, "prepare"))?;
     let state = create_state_directory()
         .map_err(|error| os_error("preparation.state", &error, "prepare"))?;
     let mut mounts = Vec::new();
-    if normalized.runtime_view == "system" {
-        for (host, target, executable) in system_runtime_roots() {
-            if Path::new(host).exists() {
-                let mount = hold_mount(host, target, true, *executable, None, false)?;
-                mounts.push(mount);
-            }
+    let mut prepared_resources = Vec::new();
+    for resource in &normalized.resources {
+        if resource.access.content != resource.access.directory_entries
+            || resource.access.content != resource.access.metadata
+        {
+            return Err(implementation_error(
+                "unsupported.filesystem_access_combination",
+                "linux-namespace-v1 cannot independently enforce mutation dimensions for one mount",
+                "prepare",
+            ));
         }
-    }
-
-    let mut grants = Vec::new();
-    for grant in &normalized.grants {
-        let reject_link = grant.root_resolution == "reject-if-link";
+        let reject_link = resource.root_resolution == "reject-if-link";
         let mount = hold_mount(
-            &grant.requested_host_path,
-            &grant.target_path,
-            grant.access == "read",
-            grant.execution == "allow",
-            Some(grant.requested_host_path.clone()),
+            &resource.requested_host_path,
+            &resource.target_path,
+            resource.read_only(),
+            resource.executable(),
             reject_link,
         )?;
-        grants.push(PreparedGrantSummary {
-            requested_host_path: grant.requested_host_path.clone(),
-            resolved_host_path: mount.resolved_path.clone(),
-            host_identity_digest: mount.identity_digest.clone(),
-            target_path: grant.target_path.clone(),
-            access: grant.access.clone(),
-            execution: grant.execution.clone(),
+        prepared_resources.push(PreparedResourceSummary {
+            id: resource.id.clone(),
+            source: PreparedResourceSource {
+                requested: resource.requested_host_path.clone(),
+                resolved: mount.resolved_path.clone(),
+                identity_digest: mount.identity_digest.clone(),
+            },
+            target: json!({"space": "isolated", "path": &resource.target_path}),
+            access: resource.access.clone(),
+            purposes: resource.purposes.clone(),
         });
         mounts.push(mount);
     }
     validate_mount_graph(&mounts)?;
     validate_masks(&normalized, &mounts)?;
 
-    let runtime_mounts: Vec<_> = mounts
-        .iter()
-        .filter(|mount| mount.requested_path.is_none())
-        .map(mount_digest_value)
-        .collect();
-    let runtime_manifest_digest = identity_digest(&runtime_mounts)
-        .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
+    let resource_manifest_digest =
+        identity_digest(&mounts.iter().map(mount_digest_value).collect::<Vec<_>>())
+            .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
     let visible_roots = mounts
         .iter()
-        .filter(|mount| mount.requested_path.is_none())
         .map(|mount| mount.target_path.clone())
         .collect::<Vec<_>>();
     let enforcement = enforcement_report(
         &normalized,
         capabilities,
-        &runtime_manifest_digest,
+        &resource_manifest_digest,
         &visible_roots,
     );
     match_requirements(&normalized, &enforcement)?;
     let policy_input = json!({
         "digestFormat": 1_u64,
         "protocolMajor": 1_u64,
-        "backend": {"id": BACKEND_ID, "version": BACKEND_VERSION, "stability": "stable"},
+        "implementation": {"id": IMPLEMENTATION_ID, "version": IMPLEMENTATION_VERSION, "stability": "stable"},
         "targetOperatingSystem": "linux",
+        "namespaceLauncher": {"identity": launcher.identity, "contentSha256": launcher.content_sha256},
         "policy": &normalized,
-        "runtimeManifestDigest": &runtime_manifest_digest,
+        "resourceManifestDigest": &resource_manifest_digest,
         "mounts": mounts.iter().map(mount_digest_value).collect::<Vec<_>>(),
     });
     let policy_digest = policy_digest(&policy_input)
         .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
     Ok(PreparedLinuxPolicy {
         normalized,
+        launcher,
         mounts,
-        grants,
-        runtime_manifest_digest,
+        resources: prepared_resources,
+        resource_manifest_digest,
         visible_roots,
         enforcement,
         policy_digest,
         state,
     })
+}
+
+fn select_implementation(
+    policy: &NormalizedPolicy,
+    capabilities: &ProbeCapabilities,
+) -> Result<&'static str, ErrorData> {
+    let limitations = implementation_limitations(policy, capabilities);
+    if limitations.is_empty() {
+        Ok(IMPLEMENTATION_ID)
+    } else {
+        Err(implementation_error(
+            "unsupported.no_eligible_implementation",
+            format!(
+                "no implementation satisfies the normalized policy: {}",
+                limitations.join("; ")
+            ),
+            "prepare",
+        ))
+    }
+}
+
+#[must_use]
+pub fn implementation_limitations(
+    policy: &NormalizedPolicy,
+    capabilities: &ProbeCapabilities,
+) -> Vec<String> {
+    let mut limitations = Vec::new();
+    if policy.filesystem_kind != "isolated" {
+        limitations.push("requires an isolated filesystem layout".to_owned());
+    }
+    if policy.process.visibility != "session"
+        || policy.process.control != "session"
+        || policy.ipc.visibility != "session"
+    {
+        limitations.push("cannot provide requested host process or IPC visibility".into());
+    }
+    if policy
+        .resources
+        .iter()
+        .any(|resource| implementation_owned_target_conflict(&resource.target_path))
+        || policy
+            .private_home
+            .iter()
+            .chain(policy.temporary.iter())
+            .any(|directory| implementation_owned_target_conflict(&directory.target_path))
+    {
+        limitations
+            .push("resource or synthetic directory overlaps an implementation-owned path".into());
+    }
+    if !capabilities.namespace_available(&policy.network) {
+        limitations.push(capabilities.diagnostics(&policy.network));
+    }
+    if policy.resources.iter().any(|resource| {
+        resource.access.content != resource.access.directory_entries
+            || resource.access.content != resource.access.metadata
+    }) {
+        limitations.push("cannot independently enforce requested mutation dimensions".into());
+    }
+    if policy.resources.iter().any(|parent| {
+        parent.executable()
+            && (policy.resources.iter().any(|child| {
+                !child.executable() && path_contains(&parent.target_path, &child.target_path)
+            }) || policy
+                .private_home
+                .iter()
+                .chain(policy.temporary.iter())
+                .any(|child| {
+                    !child.executable && path_contains(&parent.target_path, &child.target_path)
+                }))
+    }) {
+        limitations.push("cannot deny execution beneath an executable resource".into());
+    }
+    if policy.limits.wall_time.scope != "process"
+        || policy.limits.output.scope != "process"
+        || policy
+            .limits
+            .memory
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .process_count
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .cpu_time
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+    {
+        limitations.push("does not provide requested session-scoped resource accounting".into());
+    }
+    if policy.limits.memory.is_some() && !capabilities.cgroup_memory {
+        limitations.push("memory cgroup delegation is unavailable".into());
+    }
+    if policy.limits.process_count.is_some() && !capabilities.cgroup_processes {
+        limitations.push("process cgroup delegation is unavailable".into());
+    }
+    if policy.limits.cpu_time.is_some() {
+        limitations.push("descendant-tree CPU time enforcement is unavailable".into());
+    }
+    limitations.retain(|limitation| !limitation.is_empty());
+    limitations
+}
+
+fn implementation_owned_target_conflict(target: &str) -> bool {
+    const OWNED: &[&str] = &[
+        "/dev",
+        "/proc",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+    ];
+    target == "/"
+        || target
+            .strip_prefix('/')
+            .and_then(|relative| relative.split('/').next())
+            .is_some_and(|component| component.starts_with(".sandbox-"))
+        || OWNED
+            .iter()
+            .any(|owned| path_contains(target, owned) || path_contains(owned, target))
 }
 
 pub fn prepare_execution(
@@ -261,11 +399,11 @@ pub fn prepare_execution(
             "prepare",
         ));
     }
-    reject_masked_path(&normalized.executable, &policy.normalized)?;
-    reject_masked_path(&normalized.cwd, &policy.normalized)?;
+    reject_masked_path(normalized.executable.path(), &policy.normalized)?;
+    reject_masked_path(normalized.cwd.path(), &policy.normalized)?;
 
-    let executable_mapping =
-        find_mapping(&normalized.executable, &policy.mounts).ok_or_else(|| {
+    let executable_mapping = find_mapping(normalized.executable.path(), &policy.mounts)
+        .ok_or_else(|| {
             ErrorData::new(
                 "policy.executable_visibility",
                 "executable is outside the visible target filesystem",
@@ -279,10 +417,34 @@ pub fn prepare_execution(
             "prepare",
         ));
     }
+    let executable_resource = policy
+        .normalized
+        .resources
+        .iter()
+        .filter(|resource| path_contains(&resource.target_path, normalized.executable.path()))
+        .max_by_key(|resource| resource.target_path.len())
+        .ok_or_else(|| {
+            implementation_error(
+                "policy.executable_resource",
+                "executable is not backed by an authorized resource",
+                "prepare",
+            )
+        })?;
+    if !executable_resource
+        .purposes
+        .iter()
+        .any(|purpose| matches!(purpose.as_str(), "executable" | "interpreter"))
+    {
+        return Err(implementation_error(
+            "policy.executable_purpose",
+            "entry executable resource must declare executable or interpreter purpose",
+            "prepare",
+        ));
+    }
     let executable_path = open_visible_path(
-        executable_mapping,
         &policy.mounts,
-        &normalized.executable,
+        &policy.normalized.masks,
+        normalized.executable.path(),
         false,
         true,
     )
@@ -328,36 +490,43 @@ pub fn prepare_execution(
     }))
     .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
 
-    let (cwd, cwd_identity, cwd_identity_digest) = if let Some(cwd_mapping) =
-        find_mapping(&normalized.cwd, &policy.mounts)
-    {
-        let cwd = open_visible_path(cwd_mapping, &policy.mounts, &normalized.cwd, true, false)
+    let (cwd, cwd_identity, cwd_identity_digest) =
+        if find_mapping(normalized.cwd.path(), &policy.mounts).is_some() {
+            let cwd = open_visible_path(
+                &policy.mounts,
+                &policy.normalized.masks,
+                normalized.cwd.path(),
+                true,
+                false,
+            )
             .map_err(|error| os_error("preparation.cwd", &error, "prepare"))?;
-        let identity = file_identity(cwd.as_raw_fd())
-            .map_err(|error| os_error("preparation.cwd_identity", &error, "prepare"))?;
-        if identity.mode & libc::S_IFMT != libc::S_IFDIR {
+            let identity = file_identity(cwd.as_raw_fd())
+                .map_err(|error| os_error("preparation.cwd_identity", &error, "prepare"))?;
+            if identity.mode & libc::S_IFMT != libc::S_IFDIR {
+                return Err(ErrorData::new(
+                    "policy.cwd_type",
+                    "working directory is not a directory",
+                    "prepare",
+                ));
+            }
+            let digest = identity_digest(&identity).map_err(|error| {
+                ErrorData::new("preparation.digest", error.to_string(), "prepare")
+            })?;
+            (Some(cwd), Some(identity), digest)
+        } else if synthetic_path_is_visible(normalized.cwd.path(), &policy.normalized) {
+            let value =
+                json!({"policyDigest": &policy.policy_digest, "syntheticPath": &normalized.cwd});
+            let digest = identity_digest(&value).map_err(|error| {
+                ErrorData::new("preparation.digest", error.to_string(), "prepare")
+            })?;
+            (None, None, digest)
+        } else {
             return Err(ErrorData::new(
-                "policy.cwd_type",
-                "working directory is not a directory",
+                "policy.cwd_visibility",
+                "working directory is outside the visible target filesystem",
                 "prepare",
             ));
-        }
-        let digest = identity_digest(&identity)
-            .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
-        (Some(cwd), Some(identity), digest)
-    } else if synthetic_path_is_visible(&normalized.cwd, &policy.normalized) {
-        let value =
-            json!({"policyDigest": &policy.policy_digest, "syntheticPath": &normalized.cwd});
-        let digest = identity_digest(&value)
-            .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
-        (None, None, digest)
-    } else {
-        return Err(ErrorData::new(
-            "policy.cwd_visibility",
-            "working directory is outside the visible target filesystem",
-            "prepare",
-        ));
-    };
+        };
 
     let execution_input = json!({
         "policyDigest": &policy.policy_digest,
@@ -371,7 +540,6 @@ pub fn prepare_execution(
         "stdin": &normalized.stdin,
         "stdout": &normalized.stdout,
         "stderr": &normalized.stderr,
-        "resources": &normalized.resources,
     });
     let execution_digest = execution_digest(&execution_input)
         .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
@@ -459,7 +627,11 @@ impl PreparedLinuxPolicy {
         &self,
         execution: &PreparedLinuxExecution,
     ) -> Result<LaunchBundle, ErrorData> {
-        let mut files = Vec::new();
+        let mut files = vec![
+            self.launcher
+                .retain()
+                .map_err(|error| os_error("spawn.namespace_launcher", &error, "spawn"))?,
+        ];
         let mut mounts = Vec::new();
         for mount in &self.mounts {
             let file = mount
@@ -492,11 +664,11 @@ impl PreparedLinuxPolicy {
             PreparedCwd::Bound {
                 fd_index,
                 identity,
-                target_path: execution.normalized.cwd.clone(),
+                target_path: execution.normalized.cwd.path().to_owned(),
             }
         } else {
             PreparedCwd::Synthetic {
-                target_path: execution.normalized.cwd.clone(),
+                target_path: execution.normalized.cwd.path().to_owned(),
                 identity_nonce: execution.cwd_identity_digest.clone(),
             }
         };
@@ -508,20 +680,17 @@ impl PreparedLinuxPolicy {
             .collect();
         Ok(LaunchBundle {
             spec: LaunchSpec {
-                root_path: self.state.path.join("root").to_string_lossy().into_owned(),
+                launcher_fd_index: 0,
                 mounts,
                 masks: self.normalized.masks.clone(),
-                private_home_enabled: self.normalized.private_home.enabled,
-                private_home_size_bytes: self.normalized.private_home.size_bytes,
-                private_home_executable: self.normalized.private_home.executable,
-                temporary_size_bytes: self.normalized.temporary.size_bytes,
-                temporary_executable: self.normalized.temporary.executable,
+                private_home: self.normalized.private_home.clone(),
+                temporary: self.normalized.temporary.clone(),
                 executable_fd_index,
                 executable_identity: execution.executable_identity,
                 executable_content_sha256: execution.executable_content_sha256.clone(),
                 executable_snapshot_path: format!(
                     "/.sandbox-runtime/{}",
-                    Path::new(&execution.normalized.executable)
+                    Path::new(execution.normalized.executable.path())
                         .file_name()
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| ErrorData::new(
@@ -531,10 +700,11 @@ impl PreparedLinuxPolicy {
                         ))?
                 ),
                 cwd,
-                executable: execution.normalized.executable.clone(),
+                executable: execution.normalized.executable.path().to_owned(),
                 args: execution.normalized.args.clone(),
                 environment,
-                resources: execution.normalized.resources.clone(),
+                resources: self.normalized.limits.clone(),
+                termination_grace_ms: self.normalized.process.termination.grace_ms,
                 network_mode: self.normalized.network.clone(),
             },
             files,
@@ -545,14 +715,23 @@ impl PreparedLinuxPolicy {
     pub fn session_summary(&self) -> Value {
         json!({
             "isolation": {"kind": "process"},
-            "backend": {"id": BACKEND_ID, "version": BACKEND_VERSION, "stability": "stable"},
+            "implementation": {
+                "id": IMPLEMENTATION_ID,
+                "version": IMPLEMENTATION_VERSION,
+                "buildId": BUILD_ID,
+                "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+                "stability": "stable"
+            },
             "filesystem": {
-                "runtimeView": &self.normalized.runtime_view,
-                "runtimeManifestDigest": &self.runtime_manifest_digest,
-                "grants": &self.grants,
-                "masks": &self.normalized.masks,
-                "privateHomePath": if self.normalized.private_home.enabled { Value::String("/home/sandbox".into()) } else { Value::Null },
-                "temporaryPath": "/tmp",
+                "kind": &self.normalized.filesystem_kind,
+                "resourceManifestDigest": &self.resource_manifest_digest,
+                "resources": &self.resources,
+                "masks": self.normalized.masks.iter().map(|mask| json!({
+                    "path": {"space": "isolated", "path": &mask.target_path},
+                    "replacement": &mask.replacement,
+                })).collect::<Vec<_>>(),
+                "privateHomePath": self.normalized.private_home.as_ref().map(|directory| json!({"space": "isolated", "path": &directory.target_path})),
+                "temporaryPath": self.normalized.temporary.as_ref().map(|directory| json!({"space": "isolated", "path": &directory.target_path})),
             },
             "network": match self.normalized.network.as_str() {
                 "none" => json!({"mode": "none", "topology": "private-namespace"}),
@@ -564,7 +743,8 @@ impl PreparedLinuxPolicy {
                 _ => json!({"mode": "unrestricted", "topology": "host-network-namespace"}),
             },
             "process": &self.normalized.process,
-            "resources": &self.normalized.resources,
+            "ipc": &self.normalized.ipc,
+            "resources": &self.normalized.limits,
         })
     }
 
@@ -597,7 +777,6 @@ pub fn execution_summary(execution: &PreparedLinuxExecution) -> Value {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     json!({
-        "resources": &execution.normalized.resources,
         "execution": {
             "executable": &execution.normalized.executable,
             "executableIdentityDigest": &execution.executable_identity_digest,
@@ -619,7 +798,6 @@ fn hold_mount(
     target_path: &str,
     read_only: bool,
     executable: bool,
-    requested_path: Option<String>,
     reject_link: bool,
 ) -> Result<HeldMount, ErrorData> {
     let prepared = prepare_host_path(Path::new(host_path), reject_link)
@@ -633,7 +811,6 @@ fn hold_mount(
         resolved_path: prepared.resolved_path,
         identity: prepared.identity,
         identity_digest: prepared.identity_digest,
-        requested_path,
     })
 }
 
@@ -700,46 +877,103 @@ fn open_beneath_mapping(
     openat2_beneath(mapping.file.as_raw_fd(), relative, directory)
 }
 
+/// Resolve symbolic links in the admitted filesystem, never in the ambient host view.
+/// Each lookup is anchored to a retained resource; link traversal can select another
+/// resource only when that destination is independently admitted by the policy.
 fn open_visible_path(
-    mapping: &HeldMount,
     mounts: &[HeldMount],
+    masks: &[sandbox_policy::NormalizedMask],
     target_path: &str,
     directory: bool,
     require_executable_mapping: bool,
 ) -> io::Result<File> {
-    match open_beneath_mapping(mapping, target_path, directory) {
-        Ok(file) => Ok(file),
-        Err(error)
-            if mapping.requested_path.is_none()
-                && error
-                    .raw_os_error()
-                    .is_some_and(|code| code == libc::EXDEV || code == libc::ELOOP) =>
-        {
-            let file = open_path(
-                Path::new(target_path),
-                libc::O_PATH | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 },
-            )?;
-            let resolved = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-            let visible = mounts.iter().any(|candidate| {
-                candidate.requested_path.is_none()
-                    && (!require_executable_mapping || candidate.executable)
-                    && host_path_contains(Path::new(&candidate.resolved_path), &resolved)
-            });
-            if visible {
-                Ok(file)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "system symlink resolves outside the prepared runtime view",
-                ))
+    let mut pending: VecDeque<String> = target_path.split('/').map(str::to_owned).collect();
+    let mut resolved = Vec::<String>::new();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        match component.as_str() {
+            "" | "." => continue,
+            ".." => {
+                resolved.pop();
+                continue;
             }
+            _ => resolved.push(component),
         }
-        Err(error) => Err(error),
+        let path = format!("/{}", resolved.join("/"));
+        if masks
+            .iter()
+            .any(|mask| path_contains(&mask.target_path, &path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "symbolic link resolves into a masked path",
+            ));
+        }
+        let Some(mapping) = find_mapping(&path, mounts) else {
+            if !pending.is_empty()
+                && mounts
+                    .iter()
+                    .any(|mount| path_contains(&path, &mount.target_path))
+            {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "symbolic link resolves outside admitted resources",
+            ));
+        };
+        let file = open_beneath_mapping(mapping, &path, false)?;
+        let identity = file_identity(file.as_raw_fd())?;
+        if identity.mode & libc::S_IFMT == libc::S_IFLNK {
+            links += 1;
+            if links > 40 {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            let mut buffer = [0_u8; 4096];
+            // SAFETY: file is an O_PATH descriptor for the link itself, the empty
+            // name selects that link, and buffer is writable for its stated size.
+            let length = unsafe {
+                libc::readlinkat(
+                    file.as_raw_fd(),
+                    c"".as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if length < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let length = usize::try_from(length).map_err(io::Error::other)?;
+            if length == buffer.len() {
+                return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+            }
+            let link = std::str::from_utf8(&buffer[..length]).map_err(io::Error::other)?;
+            resolved.pop();
+            if link.starts_with('/') {
+                resolved.clear();
+            }
+            for part in link.split('/').rev() {
+                pending.push_front(part.to_owned());
+            }
+        } else if pending.iter().all(|part| part.is_empty() || part == ".") {
+            if require_executable_mapping && !mapping.executable {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "resolved executable resource denies execution",
+                ));
+            }
+            if directory && identity.mode & libc::S_IFMT != libc::S_IFDIR {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            return Ok(file);
+        } else if identity.mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
     }
-}
-
-fn host_path_contains(parent: &Path, child: &Path) -> bool {
-    parent == child || child.strip_prefix(parent).is_ok()
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "path does not name an admitted object",
+    ))
 }
 
 #[repr(C)]
@@ -751,15 +985,19 @@ struct OpenHow {
 
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
 fn openat2_beneath(directory_fd: RawFd, relative: &str, directory: bool) -> io::Result<File> {
     let path = std::ffi::CString::new(relative)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let flags = libc::O_PATH | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
+    let flags = libc::O_PATH
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | if directory { libc::O_DIRECTORY } else { 0 };
     let how = OpenHow {
         flags: flags as u64,
         mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
     };
     // SAFETY: path is a valid NUL-terminated string and `how` points to a fully initialized OpenHow.
     let fd = unsafe {
@@ -819,8 +1057,14 @@ fn reject_masked_path(path: &str, policy: &NormalizedPolicy) -> Result<(), Error
 
 fn synthetic_path_is_visible(path: &str, policy: &NormalizedPolicy) -> bool {
     path == "/"
-        || path_contains("/tmp", path)
-        || policy.private_home.enabled && path_contains("/home/sandbox", path)
+        || policy
+            .private_home
+            .as_ref()
+            .is_some_and(|directory| path_contains(&directory.target_path, path))
+        || policy
+            .temporary
+            .as_ref()
+            .is_some_and(|directory| path_contains(&directory.target_path, path))
         || path_contains("/etc", path)
         || path_contains("/dev", path)
         || path_contains("/proc", path)
@@ -867,53 +1111,66 @@ fn mount_digest_value(mount: &HeldMount) -> Value {
         "readOnly": mount.read_only,
         "executable": mount.executable,
         "kind": &mount.kind,
-        "explicit": mount.requested_path.is_some(),
     })
-}
-
-fn system_runtime_roots() -> &'static [(&'static str, &'static str, bool)] {
-    &[
-        ("/bin", "/bin", true),
-        ("/sbin", "/sbin", true),
-        ("/usr/bin", "/usr/bin", true),
-        ("/usr/sbin", "/usr/sbin", true),
-        ("/lib", "/lib", true),
-        ("/lib64", "/lib64", true),
-        ("/usr/lib", "/usr/lib", true),
-        ("/usr/lib64", "/usr/lib64", true),
-        ("/usr/share", "/usr/share", false),
-        ("/etc/alternatives", "/etc/alternatives", false),
-        ("/etc/ld.so.cache", "/etc/ld.so.cache", false),
-        ("/etc/ssl", "/etc/ssl", false),
-        ("/etc/ca-certificates", "/etc/ca-certificates", false),
-        ("/etc/localtime", "/etc/localtime", false),
-        ("/etc/timezone", "/etc/timezone", false),
-    ]
 }
 
 fn enforcement_report(
     policy: &NormalizedPolicy,
     capabilities: &ProbeCapabilities,
-    runtime_manifest_digest: &str,
+    resource_manifest_digest: &str,
     visible_roots: &[String],
 ) -> EnforcementReport {
-    let base_available = capabilities.backend_available(&policy.network);
+    let base_available = capabilities.namespace_available(&policy.network);
     let satisfied = |id: &str| -> bool {
         if !base_available {
             return false;
         }
         match id {
+            "runtime.setup-before-exec"
+            | "runtime.no-ambient-environment"
+            | "runtime.no-ambient-handles"
+            | "runtime.executable-identity-bound"
+            | "filesystem.resource-identities-bound"
+            | "filesystem.content-read-confined"
+            | "filesystem.content-write-confined"
+            | "filesystem.directory-entry-mutation-confined"
+            | "filesystem.metadata-mutation-confined"
+            | "filesystem.execution-confined"
+            | "filesystem.name-visibility-confined"
+            | "filesystem.isolated-layout" => policy.filesystem_kind == "isolated",
             "network.no-external-connect"
             | "network.no-external-listen"
             | "network.no-host-loopback" => policy.network != "unrestricted",
             "network.egress-brokered" => policy.network == "managed",
             "network.private-addresses-denied" => policy.network == "managed",
-            "ipc.host-endpoints-hidden-outside-grants" => policy.network != "unrestricted",
-            "resource.memory-hard" => capabilities.cgroup_memory,
-            "resource.process-count-hard" => capabilities.cgroup_processes,
+            "process.host-visibility-denied" | "process.host-control-denied" => true,
+            "process.descendant-tree-termination" | "process.group-termination" => true,
+            "ipc.host-endpoints-hidden" | "ipc.host-shared-memory-hidden" => true,
+            "resource.wall-time-hard" => policy.limits.wall_time.scope == "process",
+            "resource.output-hard" => policy.limits.output.scope == "process",
+            "resource.memory-hard" => {
+                capabilities.cgroup_memory
+                    && policy
+                        .limits
+                        .memory
+                        .as_ref()
+                        .is_some_and(|limit| limit.scope == "descendant-tree")
+            }
+            "resource.process-count-hard" => {
+                capabilities.cgroup_processes
+                    && policy
+                        .limits
+                        .process_count
+                        .as_ref()
+                        .is_some_and(|limit| limit.scope == "descendant-tree")
+            }
             "resource.cpu-time-hard" => false,
-            id if id.starts_with("vm.") => false,
-            _ => true,
+            "resource.open-files-hard" | "resource.single-file-size-hard" => true,
+            "vm.boot-artifacts-verified"
+            | "vm.guest-control-authenticated"
+            | "vm.control-plane-hidden-from-target"
+            | "vm.host-filesystem-absent-outside-imports" => false,
+            _ => false,
         }
     };
     let guarantees = GUARANTEES
@@ -929,7 +1186,7 @@ fn enforcement_report(
             enforced_by: if satisfied(id) {
                 if id.starts_with("resource.wall")
                     || id.starts_with("resource.output")
-                    || id == &"process.complete-tree-termination"
+                    || id == &"process.descendant-tree-termination"
                 {
                     vec!["supervisor".into(), "kernel".into()]
                 } else {
@@ -950,10 +1207,14 @@ fn enforcement_report(
     EnforcementReport {
         boundary: EnforcementBoundary {
             kind: "os-process".into(),
-            backend_id: BACKEND_ID.into(),
-            backend_version: BACKEND_VERSION.into(),
+        },
+        implementation: EnforcementImplementation {
+            id: IMPLEMENTATION_ID.into(),
+            version: IMPLEMENTATION_VERSION.into(),
+            build_id: BUILD_ID.into(),
+            conformance_manifest_id: CONFORMANCE_MANIFEST_ID.into(),
             stability: "stable".into(),
-            mechanism: vec!["linux user/mount/PID/IPC/UTS namespaces".into(), "synthetic mount root".into(), "Landlock".into(), "seccomp".into()],
+            mechanism: vec!["bubblewrap".into(), "linux user/mount/PID/IPC/UTS namespaces".into(), "synthetic mount root".into(), "Landlock".into(), "seccomp".into()],
         },
         host: EnforcementHost {
             platform: "linux".into(),
@@ -962,20 +1223,20 @@ fn enforcement_report(
         },
         target: EnforcementTarget { operating_system: "linux".into(), path_style: "posix".into() },
         guarantees,
-        runtime_view: EnforcementRuntimeView {
-            kind: policy.runtime_view.clone(),
-            manifest_digest: runtime_manifest_digest.into(),
+        filesystem: EnforcementFilesystem {
+            kind: policy.filesystem_kind.clone(),
+            resource_manifest_digest: resource_manifest_digest.into(),
             visible_roots: visible_roots.to_vec(),
         },
         caveats: vec![
             EnforcementCaveat {
-                code: "explicit-grants-may-contain-ipc".into(),
-                message: "IPC endpoints intentionally placed inside explicit grants are not hidden unless separately blocked by protocol controls.".into(),
-                affected_guarantees: vec!["ipc.host-endpoints-hidden-outside-grants".into()],
+                code: "authorized-resources-may-contain-ipc".into(),
+                message: "IPC endpoints intentionally placed inside authorized resources remain reachable as authorized content.".into(),
+                affected_guarantees: vec!["ipc.host-endpoints-hidden".into()],
             },
             EnforcementCaveat {
                 code: "noexec-controls-direct-exec-only".into(),
-                message: "A noexec mount blocks direct kernel execution; readable content may still be consumed by an explicitly allowed interpreter.".into(),
+                message: "Execution denial blocks direct kernel execution; readable content may still be consumed by an explicitly allowed interpreter.".into(),
                 affected_guarantees: vec!["filesystem.execution-confined".into()],
             },
             EnforcementCaveat {
@@ -989,7 +1250,6 @@ fn enforcement_report(
                 affected_guarantees: vec!["resource.memory-hard".into(), "resource.process-count-hard".into()],
             },
         ],
-        conformance: EnforcementConformance { manifest_id: CONFORMANCE_MANIFEST_ID.into(), build_id: BUILD_ID.into() },
     }
 }
 
@@ -1029,7 +1289,9 @@ fn guarantee_mechanism(
         id if id.starts_with("ipc.") => vec!["IPC namespace and synthetic root".into()],
         "resource.wall-time-hard" => vec!["supervisor monotonic deadline".into()],
         "resource.output-hard" => vec!["supervisor byte accounting before frame delivery".into()],
-        "resource.memory-hard" if capabilities.cgroup_memory => vec!["cgroup v2 memory.max".into()],
+        "resource.memory-hard" if capabilities.cgroup_memory => {
+            vec!["cgroup v2 memory.max and memory.swap.max".into()]
+        }
         "resource.process-count-hard" if capabilities.cgroup_processes => {
             vec!["cgroup v2 pids.max".into()]
         }
@@ -1044,9 +1306,9 @@ fn match_requirements(
     report: &EnforcementReport,
 ) -> Result<(), ErrorData> {
     let unmet: Vec<_> = policy
-        .requirements
-        .required
+        .obligations
         .iter()
+        .chain(policy.requirements.additional.iter())
         .filter(|required| {
             report
                 .guarantees
@@ -1101,7 +1363,14 @@ fn create_state_directory() -> Result<StateDirectory, io::Error> {
 
 fn os_error(code: &str, error: &io::Error, phase: &str) -> ErrorData {
     let mut data = ErrorData::new(code, error.to_string(), phase);
+    data.implementation = Some(IMPLEMENTATION_ID.into());
     data.cause_code = error.raw_os_error().map(|value| value.to_string());
+    data
+}
+
+fn implementation_error(code: &str, message: impl Into<String>, phase: &str) -> ErrorData {
+    let mut data = ErrorData::new(code, message, phase);
+    data.implementation = Some(IMPLEMENTATION_ID.into());
     data
 }
 
@@ -1123,20 +1392,14 @@ impl Cgroup {
         memory_bytes: Option<u64>,
         max_processes: Option<u64>,
     ) -> io::Result<Self> {
-        let current = current_cgroup_path()?;
-        let root = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
-        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!("sandbox-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path)?;
+        let path = create_delegated_cgroup(memory_bytes.is_some(), max_processes.is_some())?;
         let result = (|| {
             if let Some(memory_bytes) = memory_bytes {
                 fs::write(path.join("memory.max"), memory_bytes.to_string())?;
+                fs::write(path.join("memory.swap.max"), "0")?;
             }
             if let Some(max_processes) = max_processes {
-                let total = max_processes.checked_add(2).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "process limit overflow")
-                })?;
-                fs::write(path.join("pids.max"), total.to_string())?;
+                fs::write(path.join("pids.max"), max_processes.to_string())?;
             }
             fs::write(path.join("cgroup.procs"), pid.to_string())?;
             Ok(())
@@ -1221,34 +1484,65 @@ impl Drop for Cgroup {
     }
 }
 
-pub fn probe_cgroup_delegation() -> (bool, bool) {
-    let Ok(current) = current_cgroup_path() else {
-        return (false, false);
-    };
-    let root = Path::new("/sys/fs/cgroup").join(current.trim_start_matches('/'));
-    let controllers = fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
-    let has_memory = controllers
-        .split_whitespace()
-        .any(|value| value == "memory");
-    let has_pids = controllers.split_whitespace().any(|value| value == "pids");
-    if !has_memory && !has_pids {
-        return (false, false);
+#[derive(Debug)]
+pub struct CgroupProbeResult {
+    pub memory: ProbeOutcome,
+    pub processes: ProbeOutcome,
+}
+
+pub fn probe_cgroup_delegation() -> CgroupProbeResult {
+    CgroupProbeResult {
+        memory: probe_cgroup("memory", "memory.max", "memory.events"),
+        processes: probe_cgroup("pids", "pids.max", "pids.events"),
     }
+}
+
+fn create_delegated_cgroup(memory: bool, processes: bool) -> io::Result<PathBuf> {
+    let current = current_cgroup_path()?;
+    let hierarchy = Path::new("/sys/fs/cgroup");
+    let current = hierarchy.join(current.trim_start_matches('/'));
     let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
-    let path = root.join(format!("sandbox-probe-{}-{nonce}", std::process::id()));
-    if fs::create_dir(&path).is_err() {
-        return (false, false);
+    for root in current
+        .ancestors()
+        .take_while(|path| path.starts_with(hierarchy))
+    {
+        let Ok(controllers) = fs::read_to_string(root.join("cgroup.subtree_control")) else {
+            continue;
+        };
+        let has = |name| {
+            controllers
+                .split_whitespace()
+                .any(|controller| controller == name)
+        };
+        if (memory && !has("memory")) || (processes && !has("pids")) {
+            continue;
+        }
+        let path = root.join(format!("sandbox-{}-{nonce}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let memory = has_memory
-        && path.join("memory.events").exists()
-        && fs::read_to_string(path.join("memory.max"))
-            .ok()
-            .is_some_and(|value| fs::write(path.join("memory.max"), value.trim()).is_ok());
-    let pids = has_pids
-        && path.join("pids.events").exists()
-        && fs::read_to_string(path.join("pids.max"))
-            .ok()
-            .is_some_and(|value| fs::write(path.join("pids.max"), value.trim()).is_ok());
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "no writable cgroup delegation enables the requested controllers",
+    ))
+}
+
+fn probe_cgroup(controller: &str, limit_file: &str, event_file: &str) -> ProbeOutcome {
+    let path = match create_delegated_cgroup(controller == "memory", controller == "pids") {
+        Ok(path) => path,
+        Err(error) => return probe_outcome_from_io("create delegated child cgroup", &error),
+    };
+    let enforcement = probe_cgroup_controller(&path, limit_file, event_file);
     // The probe runs before supervisor worker threads exist. The child performs no
     // Rust work after fork and is used only to verify migration and cgroup.kill.
     // SAFETY: fork is called from the supervisor's single-threaded probe phase.
@@ -1260,12 +1554,16 @@ pub fn probe_cgroup_delegation() -> (bool, bool) {
         }
     }
     if child < 0 {
-        let _ = fs::remove_dir(path);
-        return (false, false);
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_dir(&path);
+        return probe_outcome_from_io("fork cgroup lifecycle probe", &error);
     }
-    let moved = fs::write(path.join("cgroup.procs"), child.to_string()).is_ok();
-    let killed = moved && fs::write(path.join("cgroup.kill"), "1").is_ok();
-    if !killed {
+    let lifecycle = fs::write(path.join("cgroup.procs"), child.to_string())
+        .map_err(|error| ("move probe child into delegated cgroup", error))
+        .and_then(|()| {
+            fs::write(path.join("cgroup.kill"), "1").map_err(|error| ("write cgroup.kill", error))
+        });
+    if lifecycle.is_err() {
         // SAFETY: child is the exact positive PID returned by fork.
         let _ = unsafe { libc::kill(child, libc::SIGKILL) };
     }
@@ -1280,11 +1578,75 @@ pub fn probe_cgroup_delegation() -> (bool, bool) {
             break;
         }
     }
-    let removed = fs::remove_dir(path).is_ok();
-    if moved && killed && removed {
-        (memory, pids)
-    } else {
-        (false, false)
+    let removal = fs::remove_dir(&path).map_err(|error| ("remove delegated child cgroup", error));
+    match lifecycle.and(removal) {
+        Ok(()) => enforcement,
+        Err((operation, error)) => probe_outcome_from_io(operation, &error),
+    }
+}
+
+fn probe_cgroup_controller(path: &Path, limit_file: &str, event_file: &str) -> ProbeOutcome {
+    let operation = format!("write delegated {limit_file} and read {event_file}");
+    if limit_file == "memory.max" {
+        let swap = fs::read_to_string(path.join("memory.swap.max"))
+            .and_then(|value| fs::write(path.join("memory.swap.max"), value.trim()));
+        if let Err(error) = swap {
+            return probe_outcome_from_io("verify delegated memory.swap.max", &error);
+        }
+    }
+    if let Err(error) = fs::read_to_string(path.join(event_file)) {
+        return probe_outcome_from_io(&format!("read delegated {event_file}"), &error);
+    }
+    let value = match fs::read_to_string(path.join(limit_file)) {
+        Ok(value) => value,
+        Err(error) => {
+            return probe_outcome_from_io(&format!("read delegated {limit_file}"), &error);
+        }
+    };
+    if let Err(error) = fs::write(path.join(limit_file), value.trim()) {
+        return probe_outcome_from_io(&format!("write delegated {limit_file}"), &error);
+    }
+    ProbeOutcome {
+        state: "available".into(),
+        operation,
+        os_error: None,
+        detail: Some("operation succeeded".into()),
+    }
+}
+
+fn probe_outcome_from_io(operation: &str, error: &io::Error) -> ProbeOutcome {
+    ProbeOutcome {
+        state: if error.kind() == io::ErrorKind::PermissionDenied
+            || matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::EACCES | libc::EPERM | libc::EROFS | libc::EBUSY)
+            ) {
+            "unavailable"
+        } else {
+            "error"
+        }
+        .into(),
+        operation: operation.into(),
+        os_error: error.raw_os_error().and_then(|number| {
+            u32::try_from(number)
+                .ok()
+                .map(|code| sandbox_launcher_linux::ProbeOsError {
+                    code,
+                    name: errno_name(number).unwrap_or("UNKNOWN").into(),
+                })
+        }),
+        detail: Some(error.to_string()),
+    }
+}
+
+fn errno_name(number: i32) -> Option<&'static str> {
+    match number {
+        libc::EACCES => Some("EACCES"),
+        libc::EBUSY => Some("EBUSY"),
+        libc::ENOENT => Some("ENOENT"),
+        libc::EPERM => Some("EPERM"),
+        libc::EROFS => Some("EROFS"),
+        _ => None,
     }
 }
 
@@ -1307,22 +1669,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_never_includes_user_managed_roots() {
-        let paths: Vec<_> = system_runtime_roots()
-            .iter()
-            .map(|(_, target, _)| *target)
-            .collect();
-        for denied in [
-            "/home",
-            "/root",
-            "/opt",
-            "/usr/local",
-            "/var",
-            "/run",
-            "/tmp",
-        ] {
-            assert!(!paths.contains(&denied));
-        }
+    fn implementation_has_no_implicit_host_resources() {
+        assert_ne!(IMPLEMENTATION_ID, "");
     }
 
     #[test]

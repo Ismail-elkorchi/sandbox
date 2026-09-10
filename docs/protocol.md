@@ -54,7 +54,7 @@ Lifecycle and termination use independent control paths. A target that never rea
 
 ## Errors and results
 
-Runtime errors are structured and include a bounded code, lifecycle context, target-executed flag, and relevant backend/platform identity. They do not include environment values, unbounded target text, complete host paths unless explicitly safe, or raw backend diagnostics.
+Runtime errors are structured and include a bounded code, lifecycle context, target-executed flag, and relevant implementation or host-platform identity. They do not include environment values, unbounded target text, complete host paths unless explicitly safe, or raw implementation diagnostics.
 
 Final process messages contain structured termination, enforcement, resource use, violations, cleanup, and optional artifact/change-set metadata. Raw wait status is translated by the authoritative supervisor so signals and resource causes are not collapsed into ordinary numeric exits.
 

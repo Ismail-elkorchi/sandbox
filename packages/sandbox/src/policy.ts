@@ -1,40 +1,83 @@
+/** A path interpreted in the host filesystem. */
+export interface HostPath {
+  space: "host";
+  path: string;
+}
+
+/** A path interpreted inside an isolated filesystem constructed for the target. */
+export interface IsolatedPath {
+  space: "isolated";
+  path: string;
+}
+
+export type SandboxPath = HostPath | IsolatedPath;
+
 export interface SandboxPolicy {
   filesystem: FilesystemPolicy;
   network: NetworkPolicy;
   process: ProcessPolicy;
+  ipc: IpcPolicy;
 }
 
-export interface FilesystemPolicy {
-  runtime: RuntimeView;
-  grants: readonly FilesystemGrant[];
+/**
+ * Host layout keeps host path names. Isolated layout constructs a new filesystem
+ * and may remap resources to target paths or add synthetic directories.
+ */
+export type FilesystemPolicy = HostFilesystemPolicy | IsolatedFilesystemPolicy;
+
+export interface HostFilesystemPolicy {
+  kind: "host";
+  resources: readonly HostFilesystemResource[];
+}
+
+export interface IsolatedFilesystemPolicy {
+  kind: "isolated";
+  resources: readonly IsolatedFilesystemResource[];
   masks?: readonly FilesystemMask[];
-  privateHome?: PrivateDirectoryPolicy;
-  temporary?: TemporaryDirectoryPolicy;
+  privateHome?: SyntheticDirectoryPolicy;
+  temporary?: SyntheticDirectoryPolicy;
 }
 
-export type RuntimeView = { kind: "system" } | { kind: "empty" };
+export type FilesystemResourcePurpose =
+  | "executable"
+  | "interpreter"
+  | "loader"
+  | "library"
+  | "cache"
+  | "data";
 
-export interface FilesystemGrant {
-  hostPath: string;
-  targetPath: string;
-  access: "read" | "read-write";
-  execution?: "deny" | "allow";
+/** Access dimensions are independent requests. Implementations reject combinations they cannot enforce. */
+export interface FilesystemAccess {
+  content: "read" | "read-write";
+  directoryEntries: "read" | "read-write";
+  metadata: "read" | "read-write";
+  execution: "deny" | "allow";
+}
+
+interface FilesystemResourceBase {
+  id: string;
+  access: FilesystemAccess;
+  purposes: readonly FilesystemResourcePurpose[];
   rootResolution?: "resolve-once" | "reject-if-link";
 }
 
+export interface HostFilesystemResource extends FilesystemResourceBase {
+  path: HostPath;
+}
+
+export interface IsolatedFilesystemResource extends FilesystemResourceBase {
+  source: HostPath;
+  target: IsolatedPath;
+}
+
 export interface FilesystemMask {
-  targetPath: string;
+  path: IsolatedPath;
   replacement?: "inaccessible" | "empty-file" | "empty-directory";
 }
 
-export interface PrivateDirectoryPolicy {
-  enabled?: boolean;
-  sizeBytes?: number;
-  executable?: boolean;
-}
-
-export interface TemporaryDirectoryPolicy {
-  sizeBytes?: number;
+export interface SyntheticDirectoryPolicy {
+  path: IsolatedPath;
+  sizeBytes: number;
   executable?: boolean;
 }
 
@@ -65,6 +108,14 @@ export interface ManagedNetworkRule {
 }
 
 export interface ProcessPolicy {
-  hostProcesses: "deny";
-  hostIpc: "deny";
+  visibility: "session" | "host";
+  control: "session" | "host";
+  termination: {
+    scope: "descendant-tree" | "process-group";
+    graceMs: number;
+  };
+}
+
+export interface IpcPolicy {
+  visibility: "session" | "host";
 }

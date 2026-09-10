@@ -1,49 +1,41 @@
-# @ismail-elkorchi/sandbox
+# `@ismail-elkorchi/sandbox`
 
-Fail-closed sandbox execution for Node.js with prepared approval, exact executable/argument transport, explicit filesystem and network policy, hard resource controls, structured enforcement reports, and verified cleanup.
+Fail-closed sandbox execution with prepared authorization, explicit resource manifests, scoped hard limits, structured termination, cleanup reports, and recovery support.
 
-```sh
-npm install @ismail-elkorchi/sandbox
-```
+Filesystem and execution paths are tagged as host or isolated coordinates. The library does not add a system runtime: callers authorize every executable, interpreter, loader, library, cache, and data resource needed by the workload.
 
 ```ts
-import {
-  createSandbox,
-  LINUX_PROCESS_BASELINE_REQUIREMENTS,
-} from "@ismail-elkorchi/sandbox";
+import { createSandbox } from "@ismail-elkorchi/sandbox";
 
 const sandbox = await createSandbox();
-try {
-  const result = await sandbox.run({
+const support = await sandbox.probe({
+  isolation: { kind: "process" },
+  policy,
+  requirements: {},
+  resources,
+});
+
+if (support.implementations.some((value) => value.eligibility.state === "eligible")) {
+  const prepared = await sandbox.prepareRun({
     isolation: { kind: "process" },
-    policy: {
-      filesystem: { runtime: { kind: "system" }, grants: [] },
-      network: { mode: "none" },
-      process: { hostProcesses: "deny", hostIpc: "deny" },
-    },
-    requirements: LINUX_PROCESS_BASELINE_REQUIREMENTS,
+    policy,
+    requirements: {},
+    resources,
     process: {
-      executable: "/bin/printf",
-      args: ["%s", "hello"],
-      cwd: "/",
-      stdout: "capture",
-      stderr: "capture",
+      executable: { space: "isolated", path: "/tools/program" },
+      cwd: { space: "isolated", path: "/workspace" },
     },
   });
-  console.log(result.stdout?.toString());
-} finally {
-  await sandbox.dispose();
+  const process = await prepared.start({
+    policyDigest: prepared.policyDigest,
+    executionDigest: prepared.executionDigest,
+  });
+  console.log(await process.wait());
 }
+
+await sandbox.dispose();
 ```
 
-Use `prepareRun()` instead of `run()` when another component must inspect and approve the Rust-produced summary, enforcement report, policy digest, and execution digest before starting a command.
+See the repository [policy guide](../../docs/policy.md) and [getting started guide](../../docs/getting-started.md).
 
-Applications that need one isolated command to survive loss of the admitting Node.js process can use `openSandboxExecutionRepository()`. It binds one caller-provided execution identity to one exact request, retains bounded cursor-addressable output and one final receipt, and reports helper, operating-system, or storage loss as an explicit unknown outcome. See the [execution repository guide](https://github.com/Ismail-elkorchi/sandbox/blob/main/docs/execution-repository.md).
-
-Supported backends include stable Linux namespace isolation and explicitly enabled experimental Windows AppContainer and macOS Seatbelt backends. The separate `@ismail-elkorchi/sandbox-hardware-vm` package provides the experimental Firecracker extension.
-
-Full documentation: [github.com/Ismail-elkorchi/sandbox](https://github.com/Ismail-elkorchi/sandbox#readme)
-
-Security policy: [SECURITY.md](https://github.com/Ismail-elkorchi/sandbox/blob/main/SECURITY.md)
-
-Licensed under Apache-2.0.
+Linux process isolation requires system bubblewrap at `/usr/bin/bwrap`, Landlock ABI 3 or later, and seccomp. `probe()` reports host support for the supplied policy. Explicit memory and process-count limits additionally require writable cgroup delegation.

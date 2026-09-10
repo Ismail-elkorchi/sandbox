@@ -1,7 +1,11 @@
 #![cfg(target_os = "linux")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use sandbox_policy::{NormalizedMask, ResourceLimits};
+mod namespace;
+
+pub use namespace::{NamespaceLauncher, isolated_main, namespace_probe_main};
+
+use sandbox_policy::{NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -12,7 +16,6 @@ use std::mem::{self, MaybeUninit};
 use std::net::{TcpListener, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -30,14 +33,11 @@ const INTERNAL_STDIN_CREDIT: u8 = 104;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchSpec {
-    pub root_path: String,
+    pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
     pub masks: Vec<NormalizedMask>,
-    pub private_home_enabled: bool,
-    pub private_home_size_bytes: u64,
-    pub private_home_executable: bool,
-    pub temporary_size_bytes: u64,
-    pub temporary_executable: bool,
+    pub private_home: Option<NormalizedSyntheticDirectory>,
+    pub temporary: Option<NormalizedSyntheticDirectory>,
     pub executable_fd_index: usize,
     pub executable_identity: FileIdentity,
     pub executable_content_sha256: String,
@@ -47,6 +47,7 @@ pub struct LaunchSpec {
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub resources: ResourceLimits,
+    pub termination_grace_ms: u64,
     pub network_mode: String,
 }
 
@@ -122,13 +123,26 @@ pub enum LauncherStatus {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernelProbeResult {
-    pub namespaces: bool,
-    pub network_namespace: bool,
-    pub mount_setattr: bool,
+    pub mechanisms: BTreeMap<String, ProbeOutcome>,
     pub landlock_abi: u32,
-    pub seccomp: bool,
-    pub execveat: bool,
-    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeOutcome {
+    pub state: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<ProbeOsError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeOsError {
+    pub code: u32,
+    pub name: String,
 }
 
 pub fn probe_main() -> i32 {
@@ -146,86 +160,169 @@ pub fn probe_main() -> i32 {
 }
 
 fn run_kernel_probe() -> KernelProbeResult {
-    let mut result = KernelProbeResult {
-        namespaces: false,
-        network_namespace: false,
-        mount_setattr: false,
-        landlock_abi: 0,
-        seccomp: false,
-        execveat: false,
-        errors: Vec::new(),
-    };
-    // SAFETY: getuid has no arguments or memory-safety preconditions.
-    let uid = unsafe { libc::getuid() };
-    // SAFETY: getgid has no arguments or memory-safety preconditions.
-    let gid = unsafe { libc::getgid() };
-    if let Err(error) = checked_unshare(libc::CLONE_NEWUSER)
-        .and_then(|()| write_user_mapping(uid, gid))
-        .and_then(|()| {
-            checked_unshare(
-                libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS,
-            )
-        })
-        .and_then(|()| mount_private_root())
-    {
-        result.errors.push(format!("required namespaces: {error}"));
-        return result;
-    }
-    result.namespaces = true;
-    match checked_unshare(libc::CLONE_NEWNET) {
-        Ok(()) => result.network_namespace = true,
-        Err(error) => result.errors.push(format!("network namespace: {error}")),
-    }
-    match landlock_abi() {
-        Ok(abi) => result.landlock_abi = abi,
-        Err(error) => result.errors.push(format!("Landlock: {error}")),
-    }
-    let probe_root =
-        std::env::temp_dir().join(format!("sandbox-kernel-probe-{}", std::process::id()));
-    match fs::create_dir(&probe_root)
-        .and_then(|()| mount_tmpfs(&probe_root, 1024 * 1024, true, 0o700))
-        .and_then(|()| set_mount_attributes(&probe_root, false, true))
-    {
-        Ok(()) => {
-            result.mount_setattr = true;
-            if let Ok(path) = path_cstring(&probe_root) {
-                // SAFETY: path is a live NUL-terminated CString; failure is intentionally best-effort cleanup.
-                let _ = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
-            }
+    let mut mechanisms = BTreeMap::new();
+    let mut landlock_version = 0;
+    let namespace = namespace::probe(false);
+    let network = namespace::probe(true);
+    mechanisms.insert("namespace-launcher".into(), namespace);
+    mechanisms.insert("network-namespace".into(), network);
+    match probe_landlock_enforcement() {
+        Ok(abi) => {
+            landlock_version = abi;
+            mechanisms.insert(
+                "landlock".into(),
+                available(
+                    "landlock_restrict_self",
+                    &format!("ABI {abi}; allowed read succeeded and denied read returned EACCES"),
+                ),
+            );
         }
-        Err(error) => result.errors.push(format!("mount_setattr: {error}")),
-    }
-    let _ = fs::remove_dir_all(&probe_root);
-
-    let empty = c"";
-    // SAFETY: this deliberately invalid descriptor probe passes null vectors only to elicit EBADF/ENOSYS; no exec can occur.
-    let execveat = unsafe {
-        libc::syscall(
-            libc::SYS_execveat,
-            -1,
-            empty.as_ptr(),
-            ptr::null::<*const libc::c_char>(),
-            ptr::null::<*const libc::c_char>(),
-            libc::AT_EMPTY_PATH,
-        )
-    };
-    let exec_error = io::Error::last_os_error();
-    result.execveat = execveat == 0 || exec_error.raw_os_error() != Some(libc::ENOSYS);
-    if !result.execveat {
-        result.errors.push("execveat is unavailable".into());
+        Err(error) => {
+            mechanisms.insert(
+                "landlock".into(),
+                probe_outcome("landlock_restrict_self", Err(error)),
+            );
+        }
     }
     // SAFETY: PR_SET_NO_NEW_PRIVS accepts scalar arguments and monotonically restricts this probe process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        result
-            .errors
-            .push(format!("no_new_privs: {}", io::Error::last_os_error()));
+        mechanisms.insert(
+            "seccomp".into(),
+            unavailable("prctl(PR_SET_NO_NEW_PRIVS)", &io::Error::last_os_error()),
+        );
     } else {
         match apply_seccomp() {
-            Ok(()) => result.seccomp = true,
-            Err(error) => result.errors.push(format!("seccomp: {error}")),
+            Ok(()) => {
+                // SAFETY: PR_GET_SECCOMP has no pointer arguments and returns the active mode.
+                let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+                mechanisms.insert(
+                    "seccomp".into(),
+                    if mode == 2 {
+                        available(
+                            "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)",
+                            "filter mode is active",
+                        )
+                    } else {
+                        ProbeOutcome {
+                            state: "error".into(),
+                            operation: "prctl(PR_GET_SECCOMP)".into(),
+                            os_error: None,
+                            detail: Some(format!("unexpected seccomp mode {mode}")),
+                        }
+                    },
+                );
+            }
+            Err(error) => {
+                mechanisms.insert(
+                    "seccomp".into(),
+                    probe_outcome("install seccomp filter", Err(error)),
+                );
+            }
         }
     }
-    result
+    KernelProbeResult {
+        mechanisms,
+        landlock_abi: landlock_version,
+    }
+}
+
+fn available(operation: &str, detail: &str) -> ProbeOutcome {
+    ProbeOutcome {
+        state: "available".into(),
+        operation: operation.into(),
+        os_error: None,
+        detail: Some(detail.chars().take(1024).collect()),
+    }
+}
+
+fn unavailable(operation: &str, error: &io::Error) -> ProbeOutcome {
+    ProbeOutcome {
+        state: "unavailable".into(),
+        operation: operation.into(),
+        os_error: error.raw_os_error().and_then(|code| {
+            u32::try_from(code).ok().map(|code| ProbeOsError {
+                code,
+                name: format!("{:?}", error.kind()),
+            })
+        }),
+        detail: Some(error.to_string().chars().take(1024).collect()),
+    }
+}
+
+fn probe_outcome(operation: &str, result: io::Result<()>) -> ProbeOutcome {
+    match result {
+        Ok(()) => available(operation, "operation succeeded"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) || matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+            ) =>
+        {
+            unavailable(operation, &error)
+        }
+        Err(error) => ProbeOutcome {
+            state: "error".into(),
+            operation: operation.into(),
+            os_error: error.raw_os_error().and_then(|code| {
+                u32::try_from(code).ok().map(|code| ProbeOsError {
+                    code,
+                    name: format!("{:?}", error.kind()),
+                })
+            }),
+            detail: Some(error.to_string().chars().take(1024).collect()),
+        },
+    }
+}
+
+fn probe_landlock_enforcement() -> io::Result<u32> {
+    let abi = landlock_abi()?;
+    if abi < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Landlock ABI {abi} lacks truncate mediation"),
+        ));
+    }
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let handled = LL_READ_FILE;
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: handled,
+        handled_access_net: 0,
+        scoped: 0,
+    };
+    // SAFETY: attr is initialized and the exact C layout size is passed.
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr,
+            mem::size_of::<LandlockRulesetAttr>(),
+            0,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: create_ruleset returned a new owned descriptor.
+    let ruleset = unsafe { File::from_raw_fd(ruleset_fd as RawFd) };
+    add_landlock_rule(&ruleset, &executable, LL_READ_FILE)?;
+    // SAFETY: no_new_privs takes scalar arguments and monotonically restricts this process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ruleset is a live Landlock ruleset and flags must be zero.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    File::open(executable)?;
+    match File::open("/proc/self/status") {
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => Ok(abi),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other(
+            "Landlock denied-read check unexpectedly succeeded",
+        )),
+    }
 }
 
 pub fn send_launch_spec(
@@ -308,6 +405,44 @@ pub fn receive_managed_listener_fds(stream: &UnixStream) -> io::Result<Vec<File>
     Ok(files)
 }
 
+/// Retain a process identity independently of numeric PID reuse.
+pub fn open_pidfd(pid: u32) -> io::Result<File> {
+    // SAFETY: pidfd_open takes scalar arguments and returns an owned process descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful syscall returned a new descriptor, transferred once to File.
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+
+/// Receive the gated target's pidfd in the host PID namespace. The target cannot
+/// execute or fork until the supervisor admits it to the requested resource scope.
+pub fn receive_target_pid(stream: &UnixStream) -> io::Result<u32> {
+    let (count, files) = receive_fds(stream.as_raw_fd())?;
+    if count != 1 || files.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected one target pidfd",
+        ));
+    }
+    let information = fs::read_to_string(format!("/proc/self/fdinfo/{}", files[0].as_raw_fd()))?;
+    information
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:")?.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "target pidfd has no live host process",
+            )
+        })
+}
+
+pub fn admit_target(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(&[1])
+}
+
 pub fn launcher_main() -> i32 {
     // Keep an independent failure channel because run_launcher owns and may close descriptor 0.
     // SAFETY: fd 0 is the trusted Unix socket in launcher mode; F_DUPFD_CLOEXEC creates an owned duplicate.
@@ -347,84 +482,26 @@ fn run_launcher() -> io::Result<i32> {
     let spec: LaunchSpec = serde_json::from_slice(&payload).map_err(invalid_data)?;
     validate_spec(&spec, files.len())?;
 
-    // SAFETY: getuid has no arguments or memory-safety preconditions.
-    let host_uid = unsafe { libc::getuid() };
-    // SAFETY: getgid has no arguments or memory-safety preconditions.
-    let host_gid = unsafe { libc::getgid() };
-    checked_unshare(libc::CLONE_NEWUSER)?;
-    write_user_mapping(host_uid, host_gid)?;
-    let flags = libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS | libc::CLONE_NEWPID;
-    checked_unshare(flags)?;
-    mount_private_root()?;
-
-    // SAFETY: launcher mode is single-threaded, so fork cannot strand Rust synchronization state.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if pid == 0 {
-        // The namespace init must die if its outer launcher disappears unexpectedly.
-        // SAFETY: PR_SET_PDEATHSIG takes scalar values and establishes a lifecycle restriction.
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // The parent is in an ancestor PID namespace and may appear as PID 0 here;
-        // PR_SET_PDEATHSIG still tracks the actual task relationship.
-        let result = namespace_init(&mut control, &spec, &files);
-        let code = match result {
-            Ok(code) => code,
-            Err(error) => {
-                let failure = LauncherSetupError {
-                    code: "setup.linux".into(),
-                    message: bounded_error(&error),
-                };
-                let payload = serde_json::to_vec(&failure).unwrap_or_else(|_| b"{}".to_vec());
-                let _ = write_internal(&mut control, INTERNAL_SETUP_ERROR, &payload);
-                125
-            }
-        };
-        // SAFETY: this is the post-fork child and _exit avoids running duplicated parent destructors.
-        unsafe { libc::_exit(code) };
-    }
-    drop(files);
-    drop(control);
-    let mut status = 0;
-    loop {
-        // SAFETY: status is writable and pid is the direct child returned by fork.
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if waited == pid {
-            break;
-        }
-        if waited < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if libc::WIFEXITED(status) {
-        Ok(libc::WEXITSTATUS(status))
-    } else if libc::WIFSIGNALED(status) {
-        Ok(128 + libc::WTERMSIG(status))
-    } else {
-        Ok(125)
-    }
+    namespace::launch(&spec, &files)
 }
 
-fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -> io::Result<i32> {
-    if spec.network_mode != "unrestricted" {
-        checked_unshare(libc::CLONE_NEWNET)
-            .map_err(|error| context("create target network namespace", error))?;
-        bring_loopback_up().map_err(|error| context("enable private loopback", error))?;
-    }
+fn namespace_init(
+    control: &mut UnixStream,
+    spec: &LaunchSpec,
+    files: Vec<File>,
+) -> io::Result<i32> {
     let managed_environment = if spec.network_mode == "managed" {
         setup_managed_listeners(control)?
     } else {
         BTreeMap::new()
     };
-    set_hostname().map_err(|error| context("set hostname", error))?;
-    construct_root(spec, files).map_err(|error| context("construct root", error))?;
-    apply_rlimits(&spec.resources).map_err(|error| context("apply rlimits", error))?;
-
     let (stdin_read, stdin_write) = pipe_cloexec()?;
     let (exec_status_read, mut exec_status_write) = pipe_cloexec()?;
+    let gate = if spec.resources.memory.is_some() || spec.resources.process_count.is_some() {
+        Some(pipe_cloexec()?)
+    } else {
+        None
+    };
     // SAFETY: namespace init remains single-threaded, and the child immediately performs bounded setup then exec/_exit.
     let target_pid = unsafe { libc::fork() };
     if target_pid < 0 {
@@ -433,6 +510,14 @@ fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -
     if target_pid == 0 {
         drop(stdin_write);
         drop(exec_status_read);
+        if let Some((mut read, write)) = gate {
+            drop(write);
+            let mut admitted = [0];
+            if read.read_exact(&mut admitted).is_err() || admitted != [1] {
+                // SAFETY: this post-fork child has not executed target code; failed admission terminates it.
+                unsafe { libc::_exit(125) };
+            }
+        }
         // SAFETY: setpgid(0, 0) affects only the calling child and uses no pointers.
         if unsafe { libc::setpgid(0, 0) } != 0 {
             let error = context("create target process group", io::Error::last_os_error());
@@ -440,13 +525,8 @@ fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
             unsafe { libc::_exit(125) };
         }
-        if let Err(error) = target_exec(
-            control.as_raw_fd(),
-            stdin_read.as_raw_fd(),
-            spec,
-            files,
-            &managed_environment,
-        ) {
+        if let Err(error) = target_exec(stdin_read.as_raw_fd(), spec, &files, &managed_environment)
+        {
             let error = context("target exec setup", error);
             let _ = exec_status_write.write_all(error.to_string().as_bytes());
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
@@ -454,8 +534,29 @@ fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -
         }
         unreachable!();
     }
+    drop(files);
     drop(stdin_read);
     drop(exec_status_write);
+    if let Some((read, mut write)) = gate {
+        drop(read);
+        // SAFETY: target_pid is this process's live, gated child; pidfd_open takes scalar arguments.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target_pid, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pidfd_open returned a new owned descriptor, transferred once to File.
+        let target = unsafe { File::from_raw_fd(fd as RawFd) };
+        send_fds(control.as_raw_fd(), 1, &[target])?;
+        let mut admitted = [0];
+        control.read_exact(&mut admitted)?;
+        if admitted != [1] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid resource admission",
+            ));
+        }
+        write.write_all(&admitted)?;
+    }
     let mut setup_error = Vec::new();
     exec_status_read.take(4097).read_to_end(&mut setup_error)?;
     if !setup_error.is_empty() {
@@ -482,12 +583,8 @@ fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -
         INTERNAL_STARTED,
         &serde_json::to_vec(&started).map_err(invalid_data)?,
     )?;
-    let final_status = supervise_namespace(
-        control,
-        stdin_write,
-        target_pid,
-        spec.resources.termination_grace_ms,
-    )?;
+    let final_status =
+        supervise_namespace(control, stdin_write, target_pid, spec.termination_grace_ms)?;
     write_internal(
         control,
         INTERNAL_EXIT,
@@ -496,132 +593,7 @@ fn namespace_init(control: &mut UnixStream, spec: &LaunchSpec, files: &[File]) -
     Ok(status_to_exit(final_status.raw_wait_status))
 }
 
-fn construct_root(spec: &LaunchSpec, files: &[File]) -> io::Result<()> {
-    let root = Path::new(&spec.root_path);
-    if !root.is_absolute() || root == Path::new("/") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid launcher root",
-        ));
-    }
-    fs::create_dir_all(root)?;
-    mount_tmpfs(root, 64 * 1024 * 1024, false, 0o755)
-        .map_err(|error| context("mount root tmpfs", error))?;
-    let root_fd = open_path(root, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)?;
-
-    for directory in ["proc", "dev", "etc", "home", "home/sandbox", "tmp"] {
-        fs::create_dir_all(root.join(directory))?;
-    }
-    synthesize_identity_files(root, &spec.network_mode)?;
-
-    let mut mounts: Vec<_> = spec.mounts.iter().collect();
-    mounts.sort_by_key(|mount| component_count(&mount.target_path));
-    for mount in mounts
-        .iter()
-        .copied()
-        .filter(|mount| !mount.target_path.starts_with("/dev/"))
-    {
-        let source = files.get(mount.fd_index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "mount descriptor index is invalid",
-            )
-        })?;
-        let target = create_mount_target_at(root_fd.as_raw_fd(), &mount.target_path, &mount.kind)?;
-        bind_mount_fd_to_fd(source.as_raw_fd(), target.as_raw_fd())
-            .map_err(|error| context(&format!("bind mount {}", mount.target_path), error))?;
-        let mounted = open_target_beneath(
-            root_fd.as_raw_fd(),
-            &mount.target_path,
-            mount.kind == "directory",
-        )?;
-        set_mount_attributes_fd(
-            mounted.as_raw_fd(),
-            mount.read_only,
-            !mount.executable,
-            true,
-        )
-        .map_err(|error| {
-            context(
-                &format!("set mount attributes {}", mount.target_path),
-                error,
-            )
-        })?;
-    }
-
-    let executable = files.get(spec.executable_fd_index).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executable descriptor index is invalid",
-        )
-    })?;
-    install_executable_snapshot(
-        root_fd.as_raw_fd(),
-        executable,
-        &spec.executable_content_sha256,
-        &spec.executable_snapshot_path,
-    )?;
-
-    apply_masks(root, root_fd.as_raw_fd(), &spec.masks)
-        .map_err(|error| context("apply masks", error))?;
-    if spec.private_home_enabled {
-        mount_tmpfs(
-            &root.join("home/sandbox"),
-            spec.private_home_size_bytes,
-            !spec.private_home_executable,
-            0o700,
-        )
-        .map_err(|error| context("mount private home", error))?;
-    }
-    mount_tmpfs(
-        &root.join("tmp"),
-        spec.temporary_size_bytes,
-        !spec.temporary_executable,
-        0o1777,
-    )
-    .map_err(|error| context("mount private temporary directory", error))?;
-    create_minimal_dev(root).map_err(|error| context("construct minimal dev", error))?;
-    for mount in mounts
-        .iter()
-        .copied()
-        .filter(|mount| mount.target_path.starts_with("/dev/"))
-    {
-        if mount.kind != "file"
-            || mount.target_path.trim_start_matches("/dev/").contains('/')
-            || mount.read_only
-            || !mount.executable
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "internal device mounts must be writable direct /dev children",
-            ));
-        }
-        let source = files.get(mount.fd_index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "device descriptor index is invalid",
-            )
-        })?;
-        let source_identity = file_identity(source.as_raw_fd())?;
-        if source_identity.mode & libc::S_IFMT != libc::S_IFCHR
-            && source_identity.mode & libc::S_IFMT != libc::S_IFBLK
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "internal device source is not a device node",
-            ));
-        }
-        let target = create_mount_target_at(root_fd.as_raw_fd(), &mount.target_path, "file")?;
-        bind_mount_fd_to_fd(source.as_raw_fd(), target.as_raw_fd())?;
-        let mounted = open_target_beneath(root_fd.as_raw_fd(), &mount.target_path, false)?;
-        set_mount_attributes_fd(mounted.as_raw_fd(), false, false, false)?;
-    }
-    mount_proc(&root.join("proc")).map_err(|error| context("mount private proc", error))?;
-    Ok(())
-}
-
 fn target_exec(
-    control_fd: RawFd,
     stdin_fd: RawFd,
     spec: &LaunchSpec,
     files: &[File],
@@ -643,7 +615,7 @@ fn target_exec(
                     "cwd descriptor index is invalid",
                 )
             })?;
-            let target = Path::new(&spec.root_path).join(target_path.trim_start_matches('/'));
+            let target = PathBuf::from(target_path);
             let opened = open_path(&target, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
                 .map_err(|error| context("open mounted working directory", error))?;
             if file_identity(opened.as_raw_fd())? != *identity
@@ -678,7 +650,7 @@ fn target_exec(
         ));
     }
     let mounted_executable = open_path(
-        &Path::new(&spec.root_path).join(spec.executable_snapshot_path.trim_start_matches('/')),
+        Path::new(&spec.executable_snapshot_path),
         libc::O_RDONLY | libc::O_CLOEXEC,
     )?;
     if sha256_file(&mounted_executable)? != spec.executable_content_sha256 {
@@ -688,11 +660,6 @@ fn target_exec(
         ));
     }
 
-    let root = path_cstring(Path::new(&spec.root_path))?;
-    // SAFETY: root is a valid CString naming the fully constructed private mount root.
-    if unsafe { libc::chroot(root.as_ptr()) } != 0 {
-        return Err(context("enter synthetic root", io::Error::last_os_error()));
-    }
     let cwd = CString::new(cwd_target.0).map_err(invalid_data)?;
     // SAFETY: cwd is a valid CString validated and identity-checked inside the new root.
     if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
@@ -711,8 +678,7 @@ fn target_exec(
     apply_landlock(spec).map_err(|error| context("install Landlock ruleset", error))?;
     apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
 
-    prepare_descriptors_for_exec(executable.as_raw_fd(), control_fd)
-        .map_err(|error| context("close ambient descriptors", error))?;
+    prepare_descriptors_for_exec().map_err(|error| context("close ambient descriptors", error))?;
 
     let executable_name = CString::new(spec.executable.as_bytes()).map_err(invalid_data)?;
     let mut arguments = Vec::with_capacity(spec.args.len() + 1);
@@ -730,6 +696,7 @@ fn target_exec(
     let environment_pointers = c_string_pointers(&environment);
     let launch_path =
         CString::new(spec.executable_snapshot_path.as_bytes()).map_err(invalid_data)?;
+    apply_rlimits(&spec.resources).map_err(|error| context("apply target rlimits", error))?;
     // SAFETY: launch_path names the read-only bind mount of the sealed snapshot, and argv/envp are live NUL-terminated arrays.
     let result = unsafe {
         libc::execve(
@@ -935,7 +902,8 @@ fn sandbox_protocol_credit_limit() -> usize {
 }
 
 fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
-    if spec.executable_fd_index >= descriptor_count
+    if spec.launcher_fd_index >= descriptor_count
+        || spec.executable_fd_index >= descriptor_count
         || spec
             .mounts
             .iter()
@@ -983,623 +951,11 @@ fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn write_user_mapping(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-    let _ = fs::write("/proc/self/setgroups", "deny\n");
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
-}
-
-fn checked_unshare(flags: libc::c_int) -> io::Result<()> {
-    // SAFETY: flags is a validated fixed namespace bitmask and unshare has no pointer arguments.
-    if unsafe { libc::unshare(flags) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[repr(C)]
-union IfreqData {
-    flags: libc::c_short,
-    padding: [u8; 24],
-}
-
-#[repr(C)]
-struct Ifreq {
-    name: [libc::c_char; libc::IFNAMSIZ],
-    data: IfreqData,
-}
-
-fn bring_loopback_up() -> io::Result<()> {
-    // SAFETY: socket arguments request a standard IPv4 datagram control socket.
-    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if socket < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socket returned a new descriptor transferred exactly once.
-    let socket = unsafe { File::from_raw_fd(socket) };
-    let mut request = Ifreq {
-        name: [0; libc::IFNAMSIZ],
-        data: IfreqData { padding: [0; 24] },
-    };
-    for (slot, byte) in request.name.iter_mut().zip(b"lo") {
-        *slot = *byte as libc::c_char;
-    }
-    #[cfg(not(target_env = "musl"))]
-    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-    #[cfg(not(target_env = "musl"))]
-    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-    #[cfg(target_env = "musl")]
-    const SIOCGIFFLAGS: libc::c_int = 0x8913;
-    #[cfg(target_env = "musl")]
-    const SIOCSIFFLAGS: libc::c_int = 0x8914;
-    // SAFETY: request points to a writable ifreq-compatible buffer for the fixed ioctl.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCGIFFLAGS, &mut request) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: SIOCGIFFLAGS initialized the flags field of the ifreq union.
-    let flags = unsafe { request.data.flags } | (libc::IFF_UP | libc::IFF_RUNNING) as i16;
-    request.data = IfreqData { flags };
-    // SAFETY: request contains the fixed loopback name and initialized interface flags.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), SIOCSIFFLAGS, &request) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn mount_private_root() -> io::Result<()> {
-    let slash = c"/";
-    // SAFETY: slash is NUL-terminated and null source/type/data are valid for propagation-only mount changes.
-    let result = unsafe {
-        libc::mount(
-            ptr::null(),
-            slash.as_ptr(),
-            ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            ptr::null(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn mount_tmpfs(target: &Path, size: u64, noexec: bool, mode: u32) -> io::Result<()> {
-    let source = c"tmpfs";
-    let filesystem = c"tmpfs";
-    let target = path_cstring(target)?;
-    let options = CString::new(format!("size={size},mode={mode:o}")).map_err(invalid_data)?;
-    let mut flags = libc::MS_NOSUID | libc::MS_NODEV;
-    if noexec {
-        flags |= libc::MS_NOEXEC;
-    }
-    // SAFETY: all strings are live CStrings, options is initialized, and mount only consumes them during the call.
-    let result = unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            filesystem.as_ptr(),
-            flags,
-            options.as_ptr().cast(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn bind_mount_fd(fd: RawFd, target: &Path) -> io::Result<()> {
-    let target = open_path(target, libc::O_PATH | libc::O_CLOEXEC)?;
-    bind_mount_fd_to_fd(fd, target.as_raw_fd())
-}
-
-fn bind_mount_fd_to_fd(fd: RawFd, target_fd: RawFd) -> io::Result<()> {
-    let source_path = format!("/proc/self/fd/{fd}");
-    let resolved = fs::read_link(&source_path)?;
-    let source = path_cstring(&resolved)?;
-    let empty = c"";
-    const OPEN_TREE_CLONE: libc::c_uint = 1;
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
-    const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x0000_0040;
-    let recursive = file_identity(fd)?.mode & libc::S_IFMT == libc::S_IFDIR;
-    let open_flags = OPEN_TREE_CLONE
-        | libc::O_CLOEXEC as libc::c_uint
-        | if recursive { AT_RECURSIVE } else { 0 };
-    // SAFETY: source is a live CString and flags are restricted to documented open_tree cloning flags.
-    let tree_fd = unsafe {
-        libc::syscall(
-            libc::SYS_open_tree,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            open_flags,
-        )
-    };
-    if tree_fd < 0 {
-        return legacy_bind_mount_fd(fd, target_fd).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "open_tree source {} resolved to {} and descriptor bind fallback failed: {error}",
-                    source_path,
-                    resolved.display()
-                ),
-            )
-        });
-    }
-    // SAFETY: successful open_tree returns a new owned descriptor transferred exactly once to File.
-    let tree = unsafe { File::from_raw_fd(tree_fd as RawFd) };
-    if file_identity(tree.as_raw_fd())? != file_identity(fd)? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "open_tree source identity differs from the retained descriptor",
-        ));
-    }
-    // SAFETY: tree and target_fd are live descriptors; both empty-path flags bind the move to those descriptors without path re-resolution.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            tree.as_raw_fd(),
-            empty.as_ptr(),
-            target_fd,
-            empty.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
-        )
-    };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "move_mount source {} resolved to {}: {error}",
-                source_path,
-                resolved.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn legacy_bind_mount_fd(source_fd: RawFd, target_fd: RawFd) -> io::Result<()> {
-    let source = CString::new(format!("/proc/self/fd/{source_fd}")).map_err(invalid_data)?;
-    let target = CString::new(format!("/proc/self/fd/{target_fd}")).map_err(invalid_data)?;
-    // SAFETY: both procfd paths refer to live retained descriptors and MS_BIND consumes them synchronously.
-    let result = unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            ptr::null(),
-            libc::MS_BIND,
-            ptr::null(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[repr(C)]
-struct MountAttr {
-    attr_set: u64,
-    attr_clr: u64,
-    propagation: u64,
-    userns_fd: u64,
-}
-
-const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
-const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
-const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
-const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
-const AT_RECURSIVE: libc::c_uint = 0x8000;
-
-fn set_mount_attributes(target: &Path, read_only: bool, noexec: bool) -> io::Result<()> {
-    set_mount_attributes_raw(target, read_only, noexec, true)
-}
-
-fn set_mount_attributes_raw(
-    target: &Path,
-    read_only: bool,
-    noexec: bool,
-    nodev: bool,
-) -> io::Result<()> {
-    let recursive = fs::metadata(target)?.is_dir();
-    let target = path_cstring(target)?;
-    let mut attr_set = MOUNT_ATTR_NOSUID;
-    if nodev {
-        attr_set |= MOUNT_ATTR_NODEV;
-    }
-    if read_only {
-        attr_set |= MOUNT_ATTR_RDONLY;
-    }
-    if noexec {
-        attr_set |= MOUNT_ATTR_NOEXEC;
-    }
-    let attributes = MountAttr {
-        attr_set,
-        attr_clr: if nodev { 0 } else { MOUNT_ATTR_NODEV },
-        propagation: 0,
-        userns_fd: 0,
-    };
-    // SAFETY: target and MountAttr are fully initialized and the structure size matches the kernel ABI.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_mount_setattr,
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            if recursive { AT_RECURSIVE } else { 0 },
-            &attributes,
-            mem::size_of::<MountAttr>(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn set_mount_attributes_fd(
-    target_fd: RawFd,
-    read_only: bool,
-    noexec: bool,
-    nodev: bool,
-) -> io::Result<()> {
-    let recursive = file_identity(target_fd)?.mode & libc::S_IFMT == libc::S_IFDIR;
-    let empty = c"";
-    let mut attr_set = MOUNT_ATTR_NOSUID;
-    if nodev {
-        attr_set |= MOUNT_ATTR_NODEV;
-    }
-    if read_only {
-        attr_set |= MOUNT_ATTR_RDONLY;
-    }
-    if noexec {
-        attr_set |= MOUNT_ATTR_NOEXEC;
-    }
-    let attributes = MountAttr {
-        attr_set,
-        attr_clr: if nodev { 0 } else { MOUNT_ATTR_NODEV },
-        propagation: 0,
-        userns_fd: 0,
-    };
-    // SAFETY: target_fd is retained by the caller and AT_EMPTY_PATH prevents path re-resolution.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_mount_setattr,
-            target_fd,
-            empty.as_ptr(),
-            libc::AT_EMPTY_PATH as libc::c_uint | if recursive { AT_RECURSIVE } else { 0 },
-            &attributes,
-            mem::size_of::<MountAttr>(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-struct MaskStage(PathBuf);
-
-impl Drop for MaskStage {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn apply_masks(root: &Path, root_fd: RawFd, masks: &[NormalizedMask]) -> io::Result<()> {
-    if masks.is_empty() {
-        return Ok(());
-    }
-    let state = root
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "root has no state parent"))?;
-    let mask_root = state.join(format!("mask-sources-{}", std::process::id()));
-    fs::create_dir(&mask_root)?;
-    fs::set_permissions(&mask_root, fs::Permissions::from_mode(0o700))?;
-    let _stage = MaskStage(mask_root.clone());
-    let inaccessible_file = mask_root.join("inaccessible-file");
-    let inaccessible_dir = mask_root.join("inaccessible-directory");
-    File::create(&inaccessible_file)?;
-    fs::create_dir(&inaccessible_dir)?;
-    fs::set_permissions(&inaccessible_file, fs::Permissions::from_mode(0o0))?;
-    fs::set_permissions(&inaccessible_dir, fs::Permissions::from_mode(0o0))?;
-    for (index, mask) in masks.iter().enumerate() {
-        let target = open_target_beneath(root_fd, &mask.target_path, false)?;
-        let identity = file_identity(target.as_raw_fd())?;
-        let is_directory = identity.mode & libc::S_IFMT == libc::S_IFDIR;
-        let is_file = identity.mode & libc::S_IFMT == libc::S_IFREG;
-        let source = match mask.replacement.as_str() {
-            "inaccessible" if is_directory => inaccessible_dir.clone(),
-            "inaccessible" => inaccessible_file.clone(),
-            "empty-file" if is_file => {
-                let path = mask_root.join(format!("empty-file-{index}"));
-                File::create(&path)?;
-                path
-            }
-            "empty-directory" if is_directory => {
-                let path = mask_root.join(format!("empty-directory-{index}"));
-                fs::create_dir(&path)?;
-                path
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "mask replacement type conflicts with target",
-                ));
-            }
-        };
-        let source = open_path(&source, libc::O_PATH | libc::O_CLOEXEC)?;
-        bind_mount_fd_to_fd(source.as_raw_fd(), target.as_raw_fd())?;
-        let mounted = open_target_beneath(root_fd, &mask.target_path, is_directory)?;
-        set_mount_attributes_fd(mounted.as_raw_fd(), true, true, true)?;
-    }
-    Ok(())
-}
-
-fn synthesize_identity_files(root: &Path, network_mode: &str) -> io::Result<()> {
-    fs::write(
-        root.join("etc/passwd"),
-        "sandbox:x:0:0:Sandbox:/home/sandbox:/bin/sh\n",
-    )?;
-    fs::write(root.join("etc/group"), "sandbox:x:0:\n")?;
-    fs::write(
-        root.join("etc/hosts"),
-        "127.0.0.1 localhost\n::1 localhost\n",
-    )?;
-    let resolver = match network_mode {
-        "managed" => "nameserver 127.0.0.1\noptions timeout:1 attempts:2\n".into(),
-        "unrestricted" => fs::read_to_string("/etc/resolv.conf")
-            .unwrap_or_default()
-            .chars()
-            .take(16 * 1024)
-            .collect(),
-        _ => String::new(),
-    };
-    fs::write(root.join("etc/resolv.conf"), resolver)?;
-    Ok(())
-}
-
-fn create_minimal_dev(root: &Path) -> io::Result<()> {
-    let dev = root.join("dev");
-    mount_tmpfs(&dev, 1024 * 1024, true, 0o755)?;
-    for name in ["null", "zero", "random", "urandom"] {
-        let target = dev.join(name);
-        File::create(&target)?;
-        let source = open_path(
-            Path::new("/dev").join(name).as_path(),
-            libc::O_PATH | libc::O_CLOEXEC,
-        )?;
-        bind_mount_fd(source.as_raw_fd(), &target)?;
-        set_mount_attributes_raw(&target, false, true, false)?;
-    }
-    let fd_link = dev.join("fd");
-    std::os::unix::fs::symlink("/proc/self/fd", fd_link)?;
-    std::os::unix::fs::symlink("/proc/self/fd/0", dev.join("stdin"))?;
-    std::os::unix::fs::symlink("/proc/self/fd/1", dev.join("stdout"))?;
-    std::os::unix::fs::symlink("/proc/self/fd/2", dev.join("stderr"))?;
-    Ok(())
-}
-
-fn mount_proc(target: &Path) -> io::Result<()> {
-    let source = c"proc";
-    let filesystem = c"proc";
-    let target = path_cstring(target)?;
-    let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
-    // SAFETY: all proc mount string pointers are live and null data is valid for procfs.
-    let result = unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            filesystem.as_ptr(),
-            flags,
-            ptr::null(),
-        )
-    };
-    if result != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn create_mount_target_at(root_fd: RawFd, target: &str, kind: &str) -> io::Result<File> {
-    let components = target_components(target)?;
-    let (leaf, parents) = components.split_last().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "root cannot be a mount target")
-    })?;
-    let parent = ensure_directories_beneath(root_fd, parents)?;
-    if kind == "directory" {
-        mkdirat_if_missing(parent.as_raw_fd(), leaf, 0o755)?;
-        open_component(parent.as_raw_fd(), leaf, true)
-    } else {
-        let name = CString::new(leaf.as_bytes()).map_err(invalid_data)?;
-        // SAFETY: name is one validated component and parent is a retained directory descriptor.
-        let created = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_RDONLY,
-                0o644,
-            )
-        };
-        if created >= 0 {
-            // SAFETY: openat returned a new owned descriptor; closing it leaves the created target in place.
-            drop(unsafe { File::from_raw_fd(created) });
-        } else if io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            return Err(io::Error::last_os_error());
-        }
-        let target = open_component(parent.as_raw_fd(), leaf, false)?;
-        if file_identity(target.as_raw_fd())?.mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "file mount target is not a regular file",
-            ));
-        }
-        Ok(target)
-    }
-}
-
-fn install_executable_snapshot(
-    root_fd: RawFd,
-    snapshot: &File,
-    digest: &str,
-    snapshot_path: &str,
-) -> io::Result<()> {
-    let source = create_mount_target_at(root_fd, "/.sandbox-runtime/source", "file")?;
-    let source_proc = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
-    let mut destination = open_path(&source_proc, libc::O_WRONLY | libc::O_CLOEXEC)?;
-    let mut input = snapshot.try_clone()?;
-    input.seek(SeekFrom::Start(0))?;
-    io::copy(&mut input, &mut destination)?;
-    destination.flush()?;
-    let installed = open_path(&source_proc, libc::O_RDONLY | libc::O_CLOEXEC)?;
-    if sha256_file(snapshot)? != digest || sha256_file(&installed)? != digest {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "executable snapshot changed during installation",
-        ));
-    }
-    // SAFETY: destination is the private snapshot source and mode contains permission bits only.
-    if unsafe { libc::fchmod(destination.as_raw_fd(), 0o500) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    drop(destination);
-
-    let target = create_mount_target_at(root_fd, snapshot_path, "file")?;
-    bind_mount_fd_to_fd(source.as_raw_fd(), target.as_raw_fd())?;
-    let mounted = open_target_beneath(root_fd, snapshot_path, false)?;
-    set_mount_attributes_fd(mounted.as_raw_fd(), true, false, true)?;
-
-    let runtime = open_target_beneath(root_fd, "/.sandbox-runtime", true)?;
-    let source_name = c"source";
-    // SAFETY: runtime is the retained private directory and source_name is a single static component.
-    if unsafe { libc::unlinkat(runtime.as_raw_fd(), source_name.as_ptr(), 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-const RESOLVE_NO_SYMLINKS: u64 = 0x04;
-const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-const RESOLVE_BENEATH: u64 = 0x08;
-
-fn target_components(target: &str) -> io::Result<Vec<&str>> {
-    validate_target(target)?;
-    let components: Vec<_> = target
-        .split('/')
-        .filter(|component| !component.is_empty())
-        .collect();
-    if components.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "target root is runtime-owned",
-        ));
-    }
-    Ok(components)
-}
-
-fn duplicate_fd(fd: RawFd) -> io::Result<File> {
-    // SAFETY: fd is retained by the caller and F_DUPFD_CLOEXEC returns an independent descriptor.
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fcntl returned a new owned descriptor transferred exactly once.
-    Ok(unsafe { File::from_raw_fd(duplicate) })
-}
-
-fn mkdirat_if_missing(parent_fd: RawFd, component: &str, mode: libc::mode_t) -> io::Result<()> {
-    let component = CString::new(component.as_bytes()).map_err(invalid_data)?;
-    // SAFETY: component is a single NUL-terminated name and parent_fd is a live directory.
-    if unsafe { libc::mkdirat(parent_fd, component.as_ptr(), mode) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::EEXIST) {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-fn open_component(parent_fd: RawFd, component: &str, directory: bool) -> io::Result<File> {
-    if component.is_empty() || component == "." || component == ".." || component.contains('/') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid target component",
-        ));
-    }
-    let component = CString::new(component.as_bytes()).map_err(invalid_data)?;
-    let flags = libc::O_PATH | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
-    let how = OpenHow {
-        flags: flags as u64,
-        mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
-    };
-    // SAFETY: component and OpenHow are initialized; resolution is anchored to parent_fd.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            parent_fd,
-            component.as_ptr(),
-            &how,
-            mem::size_of::<OpenHow>(),
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat2 returned a new descriptor transferred exactly once.
-    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
-}
-
-fn ensure_directories_beneath(root_fd: RawFd, components: &[&str]) -> io::Result<File> {
-    let mut directory = duplicate_fd(root_fd)?;
-    for component in components {
-        mkdirat_if_missing(directory.as_raw_fd(), component, 0o755)?;
-        directory = open_component(directory.as_raw_fd(), component, true)?;
-    }
-    Ok(directory)
-}
-
-fn open_target_beneath(root_fd: RawFd, target: &str, directory: bool) -> io::Result<File> {
-    let components = target_components(target)?;
-    let mut current = duplicate_fd(root_fd)?;
-    for (index, component) in components.iter().enumerate() {
-        current = open_component(
-            current.as_raw_fd(),
-            component,
-            index + 1 != components.len() || directory,
-        )?;
-    }
-    Ok(current)
-}
-
-fn set_hostname() -> io::Result<()> {
-    let hostname = b"sandbox";
-    // SAFETY: hostname points to exactly hostname.len() initialized bytes.
-    if unsafe { libc::sethostname(hostname.as_ptr().cast(), hostname.len()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn apply_rlimits(limits: &ResourceLimits) -> io::Result<()> {
-    if let Some(open_files) = limits.max_open_files_per_process {
-        set_rlimit(libc::RLIMIT_NOFILE, open_files)?;
-    }
-    if let Some(file_size) = limits.max_single_file_bytes {
-        set_rlimit(libc::RLIMIT_FSIZE, file_size)?;
-    }
-    if let Some(cpu_ms) = limits.cpu_time_ms {
-        let soft = cpu_ms.div_ceil(1000);
+    set_rlimit(libc::RLIMIT_NOFILE, limits.open_files.value)?;
+    set_rlimit(libc::RLIMIT_FSIZE, limits.single_file_size.value)?;
+    if let Some(cpu_time) = &limits.cpu_time {
+        let soft = cpu_time.value.div_ceil(1000);
         set_rlimit_pair(libc::RLIMIT_CPU, soft, soft.saturating_add(1))?;
     }
     Ok(())
@@ -1642,13 +998,21 @@ struct CapData {
 
 fn drop_capabilities() -> io::Result<()> {
     for capability in 0..64 {
-        // SAFETY: PR_CAPBSET_DROP accepts a scalar capability number; EINVAL terminates the supported range.
-        let result = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) };
-        if result != 0 {
+        // SAFETY: PR_CAPBSET_READ takes a scalar capability number and no pointers.
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if present == 0 {
+            continue;
+        }
+        if present < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINVAL) {
-                return Err(error);
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                break;
             }
+            return Err(error);
+        }
+        // SAFETY: PR_CAPBSET_DROP monotonically removes this supported capability.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     let mut header = CapHeader {
@@ -1777,8 +1141,6 @@ fn apply_landlock(spec: &LaunchSpec) -> io::Result<()> {
     // SAFETY: a successful create_ruleset returns a new descriptor transferred exactly once to File.
     let ruleset = unsafe { File::from_raw_fd(ruleset_fd as RawFd) };
 
-    add_landlock_rule(&ruleset, Path::new("/"), LL_READ_DIR & handled)
-        .map_err(|error| context("add Landlock rule /", error))?;
     for mount in &spec.mounts {
         let mut access = if mount.kind == "file" {
             LL_READ_FILE
@@ -1798,26 +1160,30 @@ fn apply_landlock(spec: &LaunchSpec) -> io::Result<()> {
         add_landlock_rule(&ruleset, Path::new(&mount.target_path), access & handled)
             .map_err(|error| context(&format!("add Landlock rule {}", mount.target_path), error))?;
     }
-    if spec.private_home_enabled {
+    if let Some(private_home) = &spec.private_home {
         let access = LL_READ
             | LL_WRITE
-            | if spec.private_home_executable {
+            | if private_home.executable {
                 LL_EXECUTE
             } else {
                 0
             };
-        add_landlock_rule(&ruleset, Path::new("/home/sandbox"), access & handled)
-            .map_err(|error| context("add Landlock rule /home/sandbox", error))?;
+        add_landlock_rule(
+            &ruleset,
+            Path::new(&private_home.target_path),
+            access & handled,
+        )
+        .map_err(|error| context("add Landlock rule private home", error))?;
     }
-    let temp_access = LL_READ
-        | LL_WRITE
-        | if spec.temporary_executable {
-            LL_EXECUTE
-        } else {
-            0
-        };
-    add_landlock_rule(&ruleset, Path::new("/tmp"), temp_access & handled)
-        .map_err(|error| context("add Landlock rule /tmp", error))?;
+    if let Some(temporary) = &spec.temporary {
+        let temp_access = LL_READ | LL_WRITE | if temporary.executable { LL_EXECUTE } else { 0 };
+        add_landlock_rule(
+            &ruleset,
+            Path::new(&temporary.target_path),
+            temp_access & handled,
+        )
+        .map_err(|error| context("add Landlock rule temporary directory", error))?;
+    }
     add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
         .map_err(|error| context("add Landlock rule /dev", error))?;
     add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
@@ -1999,38 +1365,18 @@ const fn jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
     }
 }
 
-fn prepare_descriptors_for_exec(executable_fd: RawFd, control_fd: RawFd) -> io::Result<()> {
-    let mut descriptors = Vec::new();
-    for entry in fs::read_dir("/proc/self/fd")? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Ok(fd) = name.parse::<RawFd>() {
-            descriptors.push(fd);
-        }
-    }
-    for fd in descriptors {
-        if fd > 2 {
-            // SAFETY: fd came from /proc/self/fd; fcntl only updates its close-on-exec flag.
-            let result = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-            if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-    if control_fd > 2 {
-        // SAFETY: control_fd is the live private launcher socket descriptor.
-        let result = unsafe { libc::fcntl(control_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    // The sealed snapshot is mounted at an immutable private path before this point, so both ELF
-    // and shebang execution reopen that path. The preparation descriptor must not leak to the
-    // target interpreter.
-    // SAFETY: executable_fd is live and F_SETFD only updates its close-on-exec flag.
-    if unsafe { libc::fcntl(executable_fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+fn prepare_descriptors_for_exec() -> io::Result<()> {
+    // SAFETY: close_range with CLOEXEC only marks descriptors above standard I/O;
+    // the qualified Linux kernel supports it and no pointers are passed.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -2532,19 +1878,6 @@ mod tests {
     fn kernel_abi_structures_have_expected_layout() {
         use std::mem::{offset_of, size_of};
 
-        assert_eq!(size_of::<IfreqData>(), 24);
-        assert_eq!(offset_of!(Ifreq, name), 0);
-        assert_eq!(offset_of!(Ifreq, data), libc::IFNAMSIZ);
-        assert_eq!(size_of::<Ifreq>(), libc::IFNAMSIZ + 24);
-        assert_eq!(size_of::<MountAttr>(), 32);
-        assert_eq!(offset_of!(MountAttr, attr_set), 0);
-        assert_eq!(offset_of!(MountAttr, attr_clr), 8);
-        assert_eq!(offset_of!(MountAttr, propagation), 16);
-        assert_eq!(offset_of!(MountAttr, userns_fd), 24);
-        assert_eq!(size_of::<OpenHow>(), 24);
-        assert_eq!(offset_of!(OpenHow, flags), 0);
-        assert_eq!(offset_of!(OpenHow, mode), 8);
-        assert_eq!(offset_of!(OpenHow, resolve), 16);
         assert_eq!(size_of::<CapHeader>(), 8);
         assert_eq!(offset_of!(CapHeader, pid), 4);
         assert_eq!(size_of::<CapData>(), 12);

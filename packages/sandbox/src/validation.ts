@@ -9,8 +9,14 @@ import type { SandboxErrorData } from "./errors.js";
 import type { GuaranteeId } from "./requirements.js";
 import type { ManagedNetworkRule } from "./policy.js";
 import type {
+  FilesystemAccess,
+  FilesystemResourcePurpose,
+  SandboxPath,
+} from "./policy.js";
+import type {
   SandboxArtifactBundle,
   SandboxArtifactEntry,
+  SandboxChangeArtifactEntry,
   SandboxChangeBaseEntry,
   SandboxChangeOperation,
   SandboxChangeSet,
@@ -20,7 +26,7 @@ import type {
   SandboxTermination,
   SandboxWorkspaceChangeSet,
 } from "./result.js";
-import type { ResourceLimits } from "./resources.js";
+import type { HardLimit, ResolvedResourceLimits, ResourceLimitScope } from "./resources.js";
 import type {
   PreparedProcessSummary,
   PreparedRunSummary,
@@ -90,21 +96,21 @@ export function stringArray(value: unknown, label: string): readonly string[] {
 export function parseEnforcement(value: unknown): EnforcementReport {
   const source = object(value, "enforcement");
   const boundary = object(source.boundary, "enforcement.boundary");
+  const implementation = object(source.implementation, "enforcement.implementation");
   const host = object(source.host, "enforcement.host");
   const target = object(source.target, "enforcement.target");
-  const runtimeView = object(source.runtimeView, "enforcement.runtimeView");
-  const conformance = object(source.conformance, "enforcement.conformance");
+  const filesystem = object(source.filesystem, "enforcement.filesystem");
   const boundaryKind = string(boundary.kind, "boundary.kind");
   if (boundaryKind !== "os-process" && boundaryKind !== "hardware-virtualized") {
     throw new TypeError("invalid enforcement boundary");
   }
-  const stability = string(boundary.stability, "boundary.stability");
+  const stability = string(implementation.stability, "implementation.stability");
   if (stability !== "stable" && stability !== "experimental") {
-    throw new TypeError("invalid backend stability");
+    throw new TypeError("invalid implementation stability");
   }
-  const runtimeKind = string(runtimeView.kind, "runtimeView.kind");
-  if (runtimeKind !== "system" && runtimeKind !== "empty") {
-    throw new TypeError("invalid runtime view");
+  const filesystemKind = string(filesystem.kind, "filesystem.kind");
+  if (filesystemKind !== "host" && filesystemKind !== "isolated") {
+    throw new TypeError("invalid filesystem kind");
   }
   const targetOs = string(target.operatingSystem, "target.operatingSystem");
   if (targetOs !== "linux" && targetOs !== "macos" && targetOs !== "windows") {
@@ -114,10 +120,14 @@ export function parseEnforcement(value: unknown): EnforcementReport {
   return {
     boundary: {
       kind: boundaryKind,
-      backendId: string(boundary.backendId, "boundary.backendId"),
-      backendVersion: string(boundary.backendVersion, "boundary.backendVersion"),
+    },
+    implementation: {
+      id: string(implementation.id, "implementation.id"),
+      version: string(implementation.version, "implementation.version"),
+      buildId: string(implementation.buildId, "implementation.buildId"),
+      conformanceManifestId: string(implementation.conformanceManifestId, "implementation.conformanceManifestId"),
       stability,
-      mechanism: stringArray(boundary.mechanism, "boundary.mechanism"),
+      mechanism: stringArray(implementation.mechanism, "implementation.mechanism"),
     },
     host: {
       platform: platform(host.platform),
@@ -129,16 +139,12 @@ export function parseEnforcement(value: unknown): EnforcementReport {
       pathStyle: targetPathStyle,
     },
     guarantees: array(source.guarantees, "enforcement.guarantees").map(parseGuarantee),
-    runtimeView: {
-      kind: runtimeKind,
-      manifestDigest: digest(runtimeView.manifestDigest, "runtimeView.manifestDigest"),
-      visibleRoots: stringArray(runtimeView.visibleRoots, "runtimeView.visibleRoots"),
+    filesystem: {
+      kind: filesystemKind,
+      resourceManifestDigest: digest(filesystem.resourceManifestDigest, "filesystem.resourceManifestDigest"),
+      visibleRoots: stringArray(filesystem.visibleRoots, "filesystem.visibleRoots"),
     },
     caveats: array(source.caveats, "enforcement.caveats").map(parseCaveat),
-    conformance: {
-      manifestId: string(conformance.manifestId, "conformance.manifestId"),
-      buildId: string(conformance.buildId, "conformance.buildId"),
-    },
   };
 }
 
@@ -176,10 +182,10 @@ function guaranteeId(value: unknown): GuaranteeId {
   const id = string(value, "guarantee.id");
   switch (id) {
     case "runtime.setup-before-exec": case "runtime.no-ambient-environment": case "runtime.no-ambient-handles": case "runtime.executable-identity-bound":
-    case "filesystem.grant-roots-identity-bound": case "filesystem.read-confined": case "filesystem.content-write-confined": case "filesystem.namespace-mutation-confined": case "filesystem.metadata-mutation-confined": case "filesystem.execution-confined": case "filesystem.host-user-data-hidden":
+    case "filesystem.resource-identities-bound": case "filesystem.content-read-confined": case "filesystem.content-write-confined": case "filesystem.directory-entry-mutation-confined": case "filesystem.metadata-mutation-confined": case "filesystem.execution-confined": case "filesystem.name-visibility-confined": case "filesystem.isolated-layout":
     case "network.no-external-connect": case "network.no-external-listen": case "network.no-host-loopback": case "network.egress-brokered": case "network.private-addresses-denied":
-    case "process.host-enumeration-denied": case "process.host-control-denied": case "process.complete-tree-termination":
-    case "ipc.host-endpoints-hidden-outside-grants": case "ipc.host-shared-memory-hidden":
+    case "process.host-visibility-denied": case "process.host-control-denied": case "process.descendant-tree-termination": case "process.group-termination":
+    case "ipc.host-endpoints-hidden": case "ipc.host-shared-memory-hidden":
     case "resource.wall-time-hard": case "resource.output-hard": case "resource.memory-hard": case "resource.cpu-time-hard": case "resource.process-count-hard": case "resource.open-files-hard": case "resource.single-file-size-hard":
     case "vm.boot-artifacts-verified": case "vm.guest-control-authenticated": case "vm.control-plane-hidden-from-target": case "vm.host-filesystem-absent-outside-imports":
       return id;
@@ -209,19 +215,27 @@ function pathStyle(value: unknown, label: string): "posix" | "windows" {
   throw new TypeError(`${label} is invalid`);
 }
 
-export function parseResourceLimits(value: unknown): ResourceLimits {
+export function parseResourceLimits(value: unknown): ResolvedResourceLimits {
   const source = object(value, "resources");
-  const result: ResourceLimits = {
-    wallTimeMs: number(source.wallTimeMs, "resources.wallTimeMs"),
-    memoryBytes: number(source.memoryBytes, "resources.memoryBytes"),
-    maxProcesses: number(source.maxProcesses, "resources.maxProcesses"),
-    maxOutputBytes: number(source.maxOutputBytes, "resources.maxOutputBytes"),
-    terminationGraceMs: number(source.terminationGraceMs, "resources.terminationGraceMs"),
+  const result: ResolvedResourceLimits = {
+    wallTime: parseHardLimit(source.wallTime, "resources.wallTime", ["process", "session"]),
+    openFiles: parseHardLimit(source.openFiles, "resources.openFiles", ["process"]),
+    singleFileSize: parseHardLimit(source.singleFileSize, "resources.singleFileSize", ["process"]),
+    output: parseHardLimit(source.output, "resources.output", ["process", "session"]),
   };
-  if (source.cpuTimeMs !== undefined) result.cpuTimeMs = number(source.cpuTimeMs, "resources.cpuTimeMs");
-  if (source.maxOpenFilesPerProcess !== undefined) result.maxOpenFilesPerProcess = number(source.maxOpenFilesPerProcess, "resources.maxOpenFilesPerProcess");
-  if (source.maxSingleFileBytes !== undefined) result.maxSingleFileBytes = number(source.maxSingleFileBytes, "resources.maxSingleFileBytes");
+  if (source.memory !== undefined) result.memory = parseHardLimit(source.memory, "resources.memory", ["descendant-tree", "session"]);
+  if (source.processCount !== undefined) result.processCount = parseHardLimit(source.processCount, "resources.processCount", ["descendant-tree", "session"]);
+  if (source.cpuTime !== undefined) result.cpuTime = parseHardLimit(source.cpuTime, "resources.cpuTime", ["descendant-tree", "session"]);
   return result;
+}
+
+function parseHardLimit<const Scope extends ResourceLimitScope>(value: unknown, label: string, scopes: readonly Scope[]): HardLimit<Scope> {
+  const source = object(value, label);
+  if (string(source.enforcement, `${label}.enforcement`) !== "hard") throw new TypeError(`${label}.enforcement must be hard`);
+  const scope = string(source.scope, `${label}.scope`);
+  const matched = scopes.find((candidate) => candidate === scope);
+  if (matched === undefined) throw new TypeError(`${label}.scope is invalid`);
+  return { enforcement: "hard", scope: matched, value: number(source.value, `${label}.value`) };
 }
 
 export function parseRunSummary(value: unknown): PreparedRunSummary {
@@ -239,14 +253,20 @@ export function parseSessionSummary(value: unknown): PreparedSessionSummary {
     : isolationKind === "hardware-vm"
       ? parseHardwareVmIsolation(isolation)
       : (() => { throw new TypeError("unsupported summary isolation"); })();
-  const backend = object(source.backend, "summary.backend");
-  const backendStability = string(backend.stability, "backend.stability");
-  if (backendStability !== "stable" && backendStability !== "experimental") throw new TypeError("invalid backend stability");
+  const implementation = object(source.implementation, "summary.implementation");
+  const implementationStability = string(implementation.stability, "implementation.stability");
+  if (implementationStability !== "stable" && implementationStability !== "experimental") throw new TypeError("invalid implementation stability");
   const filesystem = object(source.filesystem, "summary.filesystem");
-  const runtimeView = string(filesystem.runtimeView, "filesystem.runtimeView");
-  if (runtimeView !== "system" && runtimeView !== "empty") throw new TypeError("invalid runtime view");
+  const filesystemKind = string(filesystem.kind, "filesystem.kind");
+  if (filesystemKind !== "host" && filesystemKind !== "isolated") throw new TypeError("invalid filesystem kind");
   const processPolicy = object(source.process, "summary.process");
-  if (string(processPolicy.hostProcesses, "process.hostProcesses") !== "deny" || string(processPolicy.hostIpc, "process.hostIpc") !== "deny") throw new TypeError("invalid process policy");
+  const visibility = streamMode(processPolicy.visibility, ["session", "host"], "process.visibility");
+  const control = streamMode(processPolicy.control, ["session", "host"], "process.control");
+  const processTermination = object(processPolicy.termination, "process.termination");
+  const terminationScope = streamMode(processTermination.scope, ["descendant-tree", "process-group"], "process.termination.scope");
+  const terminationGraceMs = number(processTermination.graceMs, "process.termination.graceMs");
+  const ipcPolicy = object(source.ipc, "summary.ipc");
+  const ipcVisibility = streamMode(ipcPolicy.visibility, ["session", "host"], "ipc.visibility");
   const network = object(source.network, "summary.network");
   const networkMode = string(network.mode, "network.mode");
   if (networkMode !== "none" && networkMode !== "managed" && networkMode !== "unrestricted") throw new TypeError("invalid prepared network mode");
@@ -264,43 +284,49 @@ export function parseSessionSummary(value: unknown): PreparedSessionSummary {
           allow: array(network.allow, "network.allow").map(parseManagedNetworkRule),
         }
       : { mode: "unrestricted" as const, topology: requireLiteral(network.topology, "host-network-namespace", "network.topology") };
-  const privateHomePath = filesystem.privateHomePath === null ? null : string(filesystem.privateHomePath, "filesystem.privateHomePath");
+  const privateHomePath = filesystem.privateHomePath === null ? null : parseSandboxPath(filesystem.privateHomePath, "filesystem.privateHomePath");
+  const temporaryPath = filesystem.temporaryPath === null ? null : parseSandboxPath(filesystem.temporaryPath, "filesystem.temporaryPath");
   return {
     isolation: preparedIsolation,
-    backend: {
-      id: string(backend.id, "backend.id"),
-      version: string(backend.version, "backend.version"),
-      stability: backendStability,
+    implementation: {
+      id: string(implementation.id, "implementation.id"),
+      version: string(implementation.version, "implementation.version"),
+      buildId: string(implementation.buildId, "implementation.buildId"),
+      conformanceManifestId: string(implementation.conformanceManifestId, "implementation.conformanceManifestId"),
+      stability: implementationStability,
     },
     filesystem: {
-      runtimeView,
-      runtimeManifestDigest: digest(filesystem.runtimeManifestDigest, "filesystem.runtimeManifestDigest"),
-      grants: array(filesystem.grants, "filesystem.grants").map((entry) => {
-        const grant = object(entry, "grant");
-        const access = string(grant.access, "grant.access");
-        const execution = string(grant.execution, "grant.execution");
-        if (access !== "read" && access !== "read-write") throw new TypeError("invalid grant access");
-        if (execution !== "deny" && execution !== "allow") throw new TypeError("invalid grant execution");
+      kind: filesystemKind,
+      resourceManifestDigest: digest(filesystem.resourceManifestDigest, "filesystem.resourceManifestDigest"),
+      resources: array(filesystem.resources, "filesystem.resources").map((entry) => {
+        const resource = object(entry, "resource");
+        const sourcePath = object(resource.source, "resource.source");
         return {
-          requestedHostPath: string(grant.requestedHostPath, "grant.requestedHostPath"),
-          resolvedHostPath: string(grant.resolvedHostPath, "grant.resolvedHostPath"),
-          hostIdentityDigest: digest(grant.hostIdentityDigest, "grant.hostIdentityDigest"),
-          targetPath: string(grant.targetPath, "grant.targetPath"),
-          access,
-          execution,
+          id: string(resource.id, "resource.id"),
+          source: {
+            requested: string(sourcePath.requested, "resource.source.requested"),
+            resolved: string(sourcePath.resolved, "resource.source.resolved"),
+            identityDigest: digest(sourcePath.identityDigest, "resource.source.identityDigest"),
+          },
+          target: parseSandboxPath(resource.target, "resource.target"),
+          access: parseFilesystemAccess(resource.access, "resource.access"),
+          purposes: array(resource.purposes, "resource.purposes").map(parseResourcePurpose),
         };
       }),
       masks: array(filesystem.masks, "filesystem.masks").map((entry) => {
         const mask = object(entry, "mask");
         const replacement = string(mask.replacement, "mask.replacement");
         if (replacement !== "inaccessible" && replacement !== "empty-file" && replacement !== "empty-directory") throw new TypeError("invalid mask replacement");
-        return { targetPath: string(mask.targetPath, "mask.targetPath"), replacement };
+        const path = parseSandboxPath(mask.path, "mask.path");
+        if (path.space !== "isolated") throw new TypeError("mask.path must be isolated");
+        return { path, replacement };
       }),
       privateHomePath,
-      temporaryPath: string(filesystem.temporaryPath, "filesystem.temporaryPath"),
+      temporaryPath,
     },
     network: preparedNetwork,
-    process: { hostProcesses: "deny", hostIpc: "deny" },
+    process: { visibility, control, termination: { scope: terminationScope, graceMs: terminationGraceMs } },
+    ipc: { visibility: ipcVisibility },
     resources: parseResourceLimits(source.resources),
   };
 }
@@ -310,7 +336,7 @@ function parseHardwareVmIsolation(source: JsonObject): import("./sandbox.js").Sa
   const trust = string(image.trust, "isolation.image.trust");
   if (trust !== "bundled" && trust !== "explicit-local") throw new TypeError("invalid image trust");
   const filesystemTransport = string(source.filesystemTransport, "isolation.filesystemTransport");
-  if (filesystemTransport !== "ephemeral" && filesystemTransport !== "import") {
+  if (filesystemTransport !== "import") {
     throw new TypeError("invalid VM filesystem transport");
   }
   return {
@@ -353,7 +379,6 @@ function parseManagedNetworkRule(value: unknown): ManagedNetworkRule {
 export function parseProcessSummary(value: unknown): PreparedProcessSummary {
   const source = object(value, "process summary");
   return {
-    resources: parseResourceLimits(source.resources),
     execution: parseExecutionSummary(source.execution),
   };
 }
@@ -364,9 +389,11 @@ function parseExecutionSummary(value: unknown): PreparedRunSummary["execution"] 
   const stdout = streamMode(source.stdout, ["pipe", "capture", "discard"], "execution.stdout");
   const stderr = streamMode(source.stderr, ["pipe", "capture", "discard"], "execution.stderr");
   const result: PreparedRunSummary["execution"] = {
-    executable: string(source.executable, "execution.executable"),
+    executable: parseSandboxPath(source.executable, "execution.executable"),
+    executableIdentityDigest: digest(source.executableIdentityDigest, "execution.executableIdentityDigest"),
+    executableContentSha256: digest(source.executableContentSha256, "execution.executableContentSha256"),
     args: stringArray(source.args, "execution.args"),
-    cwd: string(source.cwd, "execution.cwd"),
+    cwd: parseSandboxPath(source.cwd, "execution.cwd"),
     cwdIdentityDigest: digest(source.cwdIdentityDigest, "execution.cwdIdentityDigest"),
     environmentNames: stringArray(source.environmentNames, "execution.environmentNames"),
     sensitiveEnvironmentNames: stringArray(source.sensitiveEnvironmentNames, "execution.sensitiveEnvironmentNames"),
@@ -374,9 +401,29 @@ function parseExecutionSummary(value: unknown): PreparedRunSummary["execution"] 
     stdout,
     stderr,
   };
-  if (source.executableIdentityDigest !== undefined) result.executableIdentityDigest = digest(source.executableIdentityDigest, "execution.executableIdentityDigest");
-  if (source.executableContentSha256 !== undefined) result.executableContentSha256 = digest(source.executableContentSha256, "execution.executableContentSha256");
   return result;
+}
+
+function parseSandboxPath(value: unknown, label: string): SandboxPath {
+  const source = object(value, label);
+  const space = string(source.space, `${label}.space`);
+  const path = string(source.path, `${label}.path`);
+  if (space === "host" || space === "isolated") return { space, path };
+  throw new TypeError(`${label}.space is invalid`);
+}
+
+function parseFilesystemAccess(value: unknown, label: string): FilesystemAccess {
+  const source = object(value, label);
+  return {
+    content: streamMode(source.content, ["read", "read-write"], `${label}.content`),
+    directoryEntries: streamMode(source.directoryEntries, ["read", "read-write"], `${label}.directoryEntries`),
+    metadata: streamMode(source.metadata, ["read", "read-write"], `${label}.metadata`),
+    execution: streamMode(source.execution, ["deny", "allow"], `${label}.execution`),
+  };
+}
+
+function parseResourcePurpose(value: unknown): FilesystemResourcePurpose {
+  return streamMode(value, ["executable", "interpreter", "loader", "library", "cache", "data"], "resource purpose");
 }
 
 function streamMode<const T extends string>(value: unknown, choices: readonly T[], label: string): T {
@@ -404,7 +451,7 @@ export function parseErrorData(value: unknown): SandboxErrorData {
     phase,
     targetExecuted: boolean(source.targetExecuted, "error.targetExecuted"),
   };
-  if (source.backend !== undefined) result.backend = string(source.backend, "error.backend");
+  if (source.implementation !== undefined) result.implementation = string(source.implementation, "error.implementation");
   if (source.platform !== undefined) result.platform = string(source.platform, "error.platform");
   if (source.causeCode !== undefined) result.causeCode = string(source.causeCode, "error.causeCode");
   if (source.enforcement !== undefined) result.enforcement = parseEnforcement(source.enforcement);
@@ -453,7 +500,7 @@ function parseArtifactBundle(
   if (segment.byteLength !== bytes) throw new TypeError("artifact content range exceeds the stream");
   const ranges: BinaryRange[] = [];
   const files = array(source.files, "artifacts.files").map((entry) =>
-    parseArtifactEntry(entry, segment, ranges, "artifact entry"));
+    parseArtifactEntry(entry, segment, ranges, "artifact entry", true));
   validateBinaryRanges(ranges, bytes, "artifact content");
   return {
     bundle: { digest: digest(source.digest, "artifacts.digest"), bytes, files },
@@ -466,7 +513,7 @@ function parseWorkspaceChangeSet(
   content: Buffer,
 ): { value: SandboxWorkspaceChangeSet; segment: BinaryRange } {
   const source = object(value, "workspace change set");
-  const targetPath = normalizedAbsolutePath(source.targetPath, "change-set targetPath");
+  const root = parseSandboxPath(source.root, "change-set root");
   const binaryOffset = number(source.binaryOffset, "change-set binaryOffset");
   const bytes = number(source.bytes, "change-set bytes");
   const segmentContent = content.subarray(binaryOffset, binaryOffset + bytes);
@@ -505,7 +552,7 @@ function parseWorkspaceChangeSet(
   });
   if (actualDigest !== expectedDigest) throw new TypeError("change-set digest mismatch");
   return {
-    value: { targetPath, bytes, changeSet: parsed },
+    value: { root, bytes, changeSet: parsed },
     segment: { offset: binaryOffset, length: bytes },
   };
 }
@@ -533,7 +580,7 @@ function parseChangeOperation(
   const source = object(value, "change-set operation");
   const kind = string(source.kind, "change-set operation kind");
   if (kind === "upsert") {
-    return { kind, entry: parseArtifactEntry(source.entry, content, ranges, "change-set upsert") };
+    return { kind, entry: parseArtifactEntry(source.entry, content, ranges, "change-set upsert", false) };
   }
   if (kind === "delete") {
     return { kind, path: normalizedRelativePath(source.path, "change-set delete path") };
@@ -553,18 +600,35 @@ function parseArtifactEntry(
   content: Buffer,
   ranges: BinaryRange[],
   label: string,
-): SandboxArtifactEntry {
+  coordinatePath: true,
+): SandboxArtifactEntry;
+function parseArtifactEntry(
+  value: unknown,
+  content: Buffer,
+  ranges: BinaryRange[],
+  label: string,
+  coordinatePath: false,
+): SandboxChangeArtifactEntry;
+function parseArtifactEntry(
+  value: unknown,
+  content: Buffer,
+  ranges: BinaryRange[],
+  label: string,
+  coordinatePath: boolean,
+): SandboxArtifactEntry | SandboxChangeArtifactEntry {
   const source = object(value, label);
   if (source.contentHex !== undefined && source.contentHex !== null) {
     throw new TypeError(`${label} content must use binary protocol frames`);
   }
   const kind = artifactKind(source.kind, `${label} kind`);
-  const parsed: SandboxArtifactEntry = {
-    path: noNulString(source.path, `${label} path`),
+  const common = {
     kind,
     mode: boundedMode(source.mode, `${label} mode`),
     modifiedUnixMs: integer(source.modifiedUnixMs, `${label} modifiedUnixMs`),
   };
+  const parsed: SandboxArtifactEntry | SandboxChangeArtifactEntry = coordinatePath
+    ? { ...common, path: parseSandboxPath(source.path, `${label} path`) }
+    : { ...common, path: normalizedRelativePath(source.path, `${label} path`) };
   if (kind === "regular-file") {
     const offset = number(source.contentOffset, `${label} content offset`);
     const length = number(source.contentLength, `${label} content length`);
@@ -589,7 +653,7 @@ function parseArtifactEntry(
   return parsed;
 }
 
-function artifactKind(value: unknown, label: string): SandboxArtifactEntry["kind"] {
+function artifactKind(value: unknown, label: string): SandboxChangeArtifactEntry["kind"] {
   const kind = string(value, label);
   if (kind !== "directory" && kind !== "regular-file" && kind !== "symbolic-link") {
     throw new TypeError(`${label} is invalid`);
@@ -597,7 +661,10 @@ function artifactKind(value: unknown, label: string): SandboxArtifactEntry["kind
   return kind;
 }
 
-function validateArtifactShape(entry: SandboxArtifactEntry | SandboxChangeBaseEntry, requireContent: boolean): void {
+function validateArtifactShape(
+  entry: SandboxArtifactEntry | SandboxChangeArtifactEntry | SandboxChangeBaseEntry,
+  requireContent: boolean,
+): void {
   if (entry.kind === "regular-file") {
     if (entry.sha256 === undefined || (requireContent && !("contentHex" in entry && entry.contentHex !== undefined)) || entry.linkTarget !== undefined) {
       throw new TypeError("regular-file change-set entry is incomplete");

@@ -6,9 +6,9 @@ The sandbox limits what an untrusted target process and all of its descendants c
 
 ## Protected assets
 
-Depending on policy and backend, protected host assets include:
+Depending on policy and implementation, protected host assets include:
 
-- filesystem content, metadata, namespace structure, credentials, user profiles, and runtime sockets outside explicit grants;
+- filesystem content, metadata, namespace structure, credentials, user profiles, and runtime sockets outside explicit resources;
 - ambient environment variables and inherited file descriptors or handles;
 - unrelated host processes, IPC objects, shared memory, and control endpoints;
 - host loopback, LAN, private services, cloud metadata endpoints, and external networks;
@@ -27,7 +27,7 @@ The target executable, scripts, plugins, dependencies, input workspace, and ever
 - crash or starve the guest agent, VMM, launcher, broker, or supervisor;
 - attempt nested namespaces and platform-specific escape surfaces.
 
-The attacker may control a granted workspace before and during a run. It does not control the trusted host account, installed package directory, release signing key, host kernel/hypervisor, or authorization component.
+The attacker may control an authorized workspace before and during a run. It does not control the trusted host account, installed package directory, release signing key, host kernel/hypervisor, or authorization component.
 
 ## Trust boundaries
 
@@ -37,7 +37,7 @@ The TypeScript package validates its public input, verifies package-owned native
 
 Node performs no direct native FFI. The Node process and application approval logic are trusted not to replace approved digests or disclose sensitive summaries.
 
-### Linux process backend
+### Linux process implementation
 
 The trusted computing base includes the package-owned supervisor and launcher, the managed-network broker when selected, and the host Linux kernel. Namespaces, Landlock, seccomp, mounts, cgroups, rlimits, and descriptor-relative operations compose the process boundary.
 
@@ -57,32 +57,32 @@ The target receives no control nonce, host path, virtual NIC, guest-agent descri
 
 The runtime does not execute the target when:
 
-- a backend or required mechanism is unavailable;
+- an implementation or required mechanism is unavailable;
 - native or boot artifact integrity fails;
 - policy validation or requirement matching fails;
 - prepared authority expires or its digest differs;
 - setup cannot establish the exact filesystem, process, resource, or network view;
-- an experimental backend lacks both forms of explicit opt-in.
+- an experimental implementation lacks both forms of explicit opt-in.
 
-There is no unconfined fallback and no silent backend substitution.
+There is no unconfined fallback and no silent implementation substitution.
 
 ## Approval and race resistance
 
 The Rust runtime returns the summary and digests that an authorization layer must approve. Prepared objects are single-use and time-limited. Environment values marked sensitive are represented by name in summaries while their bytes remain bound to execution identity.
 
-Linux retains grant and working-directory descriptors and snapshots supported executable bytes. VM preparation snapshots verified boot artifacts into private state before launch. Package runtimes and extensions are hash-verified and executed through already-open descriptors or private immutable copies where the platform permits.
+Linux retains resource and working-directory descriptors and snapshots executable bytes. VM preparation snapshots verified boot artifacts into private state before launch. Package runtimes and extensions are hash-verified and executed through already-open descriptors or private immutable copies where the platform permits.
 
 These controls bind entry authority. They do not claim that every transitive runtime library, host kernel component, firmware component, or interpreter data file is immutable unless an enforcement fact explicitly says so.
 
 ## Network model
 
-`none` provides no external route, host loopback, or virtual NIC as appropriate to the backend. `managed` permits only broker-supported TCP/DNS flows matching normalized deny-by-default rules. The broker rechecks final addresses and private ranges to resist DNS rebinding.
+`none` provides no external route, host loopback, or virtual NIC as appropriate to the implementation. `managed` permits only broker-supported TCP/DNS flows matching normalized deny-by-default rules. The broker rechecks final addresses and private ranges to resist DNS rebinding.
 
 Managed networking does not intercept TLS or inject credentials. It does not support arbitrary UDP, inbound listeners, or raw packets. Unrestricted networking deliberately removes egress confinement and changes related IPC guarantees.
 
 ## Availability and cleanup
 
-Resource limits protect the host only to the mechanisms stated in the report. Some resource exhaustion can affect the trusted runtime or host before a backend-specific kernel limit accounts for it; hard guarantees are not reported without an enforcing mechanism.
+Resource limits protect the host only to the mechanisms stated in the report. Some resource exhaustion can affect the trusted runtime or host before an implementation-specific kernel limit accounts for it; hard guarantees are not reported without an enforcing mechanism.
 
 The runtime owns launchers, descendants, brokers, VMMs, cgroups/jobs, and state. Cleanup is a security result, not a best-effort footnote. Every failed postcondition is returned. Crash recovery uses narrowly validated ownership records and never kills a process based only on an untrusted PID.
 
@@ -101,4 +101,4 @@ The project does not provide:
 
 ## Reporting
 
-Generic target stderr is not security evidence. Policy denials are structured runtime or broker events. Suspected boundary failures should be reported privately according to [SECURITY.md](../SECURITY.md), including backend, host version, policy, requested guarantees, and cleanup outcome.
+Generic target stderr is not security evidence. Policy denials are structured runtime or broker events. Suspected boundary failures should be reported privately according to [SECURITY.md](../SECURITY.md), including implementation identity, host version, policy, requested guarantees, and cleanup outcome.

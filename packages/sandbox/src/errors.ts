@@ -14,7 +14,7 @@ export interface SandboxErrorData {
     | "artifact-export"
     | "cleanup";
   targetExecuted: boolean;
-  backend?: string;
+  implementation?: string;
   platform?: string;
   causeCode?: string;
   enforcement?: EnforcementReport;

@@ -9,7 +9,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub const BACKEND_ID: &str = "windows-appcontainer-v1";
+pub const IMPLEMENTATION_ID: &str = "windows-appcontainer-v1";
 
 /// Encode an executable and argument vector using the quoting rules consumed by
 /// `CommandLineToArgvW` and the Microsoft C runtime.

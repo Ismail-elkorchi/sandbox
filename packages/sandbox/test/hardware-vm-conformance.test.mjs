@@ -26,7 +26,7 @@ test("hardware VM verifies boot, imports explicitly, hides control, exports arti
     await writeFile(join(workspace, "input"), "old");
     const hostSecret = join(hostOnly, "must-not-be-visible");
     await writeFile(hostSecret, "host-secret");
-    const sandbox = await vmSandbox();
+    const sandbox = await vmSandbox(workspace);
     let result;
     try {
       result = await sandbox.run(vmOptions(workspace, {
@@ -42,7 +42,7 @@ test("hardware VM verifies boot, imports explicitly, hides control, exports arti
     assert.deepEqual(result.termination, { reason: "exit", code: 0 });
     assert.equal(result.enforcement.boundary.kind, "hardware-virtualized");
     assert.equal(result.cleanup.completed, true);
-    assert.equal(result.artifacts?.files.some((entry) => entry.path.endsWith("/output") && Buffer.from(entry.contentHex, "hex").toString() === "artifact"), true);
+    assert.equal(result.artifacts?.files.some((entry) => entry.path.path.endsWith("/output") && Buffer.from(entry.contentHex, "hex").toString() === "artifact"), true);
     assert.equal(await readFile(join(workspace, "input"), "utf8"), "old", "VM completion must not mutate the host");
     assert.equal(result.changeSets?.length, 1);
     const report = await applyHardwareVmChangeSet({
@@ -66,19 +66,19 @@ test("hardware VM verifies boot, imports explicitly, hides control, exports arti
 
 test("hardware VM sessions execute sequentially and clean the VMM", { skip: !supported, timeout: 60_000 }, async () => {
   const workspace = await workspaceWithTarget("session");
-  const sandbox = await vmSandbox();
+  const sandbox = await vmSandbox(workspace);
   try {
     const options = vmOptions(workspace);
     const prepared = await sandbox.prepareSession(options);
     const session = await prepared.activate({ policyDigest: prepared.policyDigest });
     try {
-      const first = await session.run({ executable: "/workspace/target", args: ["echo", "one two"], cwd: "/workspace" });
-      const second = await session.run({ executable: "/workspace/target", args: ["echo", "two"], cwd: "/workspace" });
+      const first = await session.run({ executable: { space: "isolated", path: "/workspace/target" }, args: ["echo", "one two"], cwd: { space: "isolated", path: "/workspace" } });
+      const second = await session.run({ executable: { space: "isolated", path: "/workspace/target" }, args: ["echo", "two"], cwd: { space: "isolated", path: "/workspace" } });
       assert.equal(first.stdout?.toString(), "one two");
       assert.equal(second.stdout?.toString(), "two");
-      const daemon = await session.run({ executable: "/workspace/target", args: ["daemon-sentinel"], cwd: "/workspace" });
+      const daemon = await session.run({ executable: { space: "isolated", path: "/workspace/target" }, args: ["daemon-sentinel"], cwd: { space: "isolated", path: "/workspace" } });
       assert.deepEqual(daemon.termination, { reason: "exit", code: 0 });
-      const reaped = await session.run({ executable: "/workspace/target", args: ["sentinel-absent"], cwd: "/workspace" });
+      const reaped = await session.run({ executable: { space: "isolated", path: "/workspace/target" }, args: ["sentinel-absent"], cwd: { space: "isolated", path: "/workspace" } });
       assert.deepEqual(reaped.termination, { reason: "exit", code: 0 });
     } finally {
       await session.close();
@@ -91,7 +91,7 @@ test("hardware VM sessions execute sequentially and clean the VMM", { skip: !sup
 
 test("hardware VM starts before stdin closes and streams binary-safe I/O", { skip: !supported, timeout: 60_000 }, async () => {
   const workspace = await workspaceWithTarget("streams");
-  const sandbox = await vmSandbox();
+  const sandbox = await vmSandbox(workspace);
   try {
     const prepared = await sandbox.prepareRun(vmOptions(workspace, {
       executable: "/workspace/target",
@@ -135,7 +135,7 @@ test("hardware VM managed networking permits only brokered rules and reports den
     const address = server.address();
     assert.equal(typeof address, "object");
     const port = address.port;
-    const sandbox = await vmSandbox();
+    const sandbox = await vmSandbox(workspace);
     try {
       const allowed = await sandbox.run(vmOptions(workspace, {
         executable: "/workspace/target",
@@ -181,7 +181,7 @@ test("SIGKILL of the VM runtime terminates the VMM tree and the next probe recov
   const workspace = await workspaceWithTarget("runtime-crash");
   const beforeChildren = new Set(await directChildren(process.pid));
   const beforeState = new Set(await vmStateRoots());
-  const sandbox = await vmSandbox();
+  const sandbox = await vmSandbox(workspace);
   try {
     const prepared = await sandbox.prepareRun(vmOptions(workspace, {
       executable: "/workspace/target",
@@ -209,7 +209,7 @@ test("SIGKILL of the VM runtime terminates the VMM tree and the next probe recov
     }, 5_000);
     const abandoned = (await vmStateRoots()).filter((path) => !beforeState.has(path));
     assert.equal(abandoned.length >= 1, true, "the killed runtime must leave recoverable state");
-    const recoverySandbox = await vmSandbox();
+    const recoverySandbox = await vmSandbox(workspace);
     await recoverySandbox.dispose();
     await waitUntil(async () => {
       const remaining = await Promise.all(abandoned.map((path) => accessible(path, constants.F_OK)));
@@ -221,10 +221,18 @@ test("SIGKILL of the VM runtime terminates the VMM tree and the next probe recov
   }
 });
 
-async function vmSandbox() {
-  const sandbox = await createSandbox({ allowExperimentalBackends: true, extensions: [hardwareVmExtension()] });
-  const support = await sandbox.probe({ isolation: "hardware-vm" });
-  assert.equal(support.backends.some((backend) => backend.id === "linux-firecracker-v1" && backend.available), true);
+async function vmSandbox(workspace) {
+  const sandbox = await createSandbox({ allowExperimentalImplementations: true, extensions: [hardwareVmExtension()] });
+  const probeOptions = vmOptions(workspace);
+  const support = await sandbox.probe({
+    isolation: probeOptions.isolation,
+    policy: probeOptions.policy,
+    requirements: probeOptions.requirements,
+    resources: probeOptions.resources,
+  });
+  assert.equal(support.implementations.some((implementation) =>
+    implementation.identity.id === "linux-firecracker-v1"
+      && implementation.eligibility.state === "eligible"), true);
   return sandbox;
 }
 
@@ -233,30 +241,55 @@ function vmOptions(workspace, process, managedRules) {
     isolation: { kind: "hardware-vm", image: minimalHardwareVmImage(), filesystemTransport: "import" },
     policy: {
       filesystem: {
-        runtime: { kind: "empty" },
-        grants: [{ hostPath: workspace, targetPath: "/workspace", access: "read-write", execution: "allow" }],
+        kind: "isolated",
+        resources: [{
+          id: "workspace",
+          source: { space: "host", path: workspace },
+          target: { space: "isolated", path: "/workspace" },
+          access: {
+            content: "read-write",
+            directoryEntries: "read-write",
+            metadata: "read-write",
+            execution: "allow",
+          },
+          purposes: ["executable", "data"],
+        }],
       },
       network: managedRules === undefined ? { mode: "none" } : { mode: "managed", allow: managedRules },
-      process: { hostProcesses: "deny", hostIpc: "deny" },
+      process: {
+        visibility: "session",
+        control: "session",
+        termination: { scope: "descendant-tree", graceMs: 100 },
+      },
+      ipc: { visibility: "session" },
     },
     requirements: {
-      boundary: "hardware-virtualized",
-      allowExperimentalBackend: true,
-      required: [
-        "runtime.setup-before-exec",
-        "runtime.no-ambient-environment",
-        "runtime.no-ambient-handles",
-        "vm.boot-artifacts-verified",
-        "vm.guest-control-authenticated",
-        "vm.control-plane-hidden-from-target",
-        "vm.host-filesystem-absent-outside-imports",
-        "process.complete-tree-termination",
-        "resource.wall-time-hard",
-        "resource.output-hard",
-      ],
+      allowExperimentalImplementations: true,
     },
-    resources: { wallTimeMs: 10_000, memoryBytes: 256 * 1024 * 1024, maxProcesses: 16 },
-    ...(process === undefined ? {} : { process }),
+    resources: {
+      wallTime: { enforcement: "hard", scope: "process", value: 10_000 },
+      memory: { enforcement: "hard", scope: "descendant-tree", value: 256 * 1024 * 1024 },
+      processCount: { enforcement: "hard", scope: "descendant-tree", value: 16 },
+    },
+    ...(process === undefined ? {} : {
+      process: {
+        ...process,
+        executable: { space: "isolated", path: process.executable },
+        cwd: { space: "isolated", path: process.cwd },
+        ...(process.artifacts === undefined ? {} : {
+          artifacts: {
+            ...process.artifacts,
+            paths: process.artifacts.paths.map((path) => ({ space: "isolated", path })),
+          },
+        }),
+        ...(process.changeSet === undefined ? {} : {
+          changeSet: {
+            ...process.changeSet,
+            root: { space: "isolated", path: "/workspace" },
+          },
+        }),
+      },
+    }),
   };
 }
 

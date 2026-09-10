@@ -1,116 +1,94 @@
-# Policies and enforcement requirements
+# Policy model
 
-Policy describes what the target may access. Requirements describe which guarantees the caller refuses to run without. The runtime normalizes both, reports the mechanisms it can establish, and rejects the run atomically when any required guarantee is unsatisfied.
+`SandboxPolicy` has four independent domains: filesystem, network, process, and IPC. Resource limits are supplied beside the policy because they are hard execution controls with explicit scope.
 
-## Filesystem policy
+## Filesystem layouts and coordinates
+
+A host layout restricts access while retaining host path names:
 
 ```ts
 filesystem: {
-  runtime: { kind: "system" },
-  grants: [{
-    hostPath: "/absolute/host/workspace",
-    targetPath: "/workspace",
-    access: "read-write",
-    execution: "deny",
-    rootResolution: "reject-if-link",
+  kind: "host",
+  resources: [{
+    id: "tool",
+    path: { space: "host", path: "/opt/tool/bin/tool" },
+    access,
+    purposes: ["executable"],
   }],
-  masks: [{
-    targetPath: "/workspace/.env",
-    replacement: "inaccessible",
-  }],
-  privateHome: { enabled: true, sizeBytes: 64 * 1024 * 1024 },
-  temporary: { sizeBytes: 256 * 1024 * 1024, executable: false },
 }
 ```
 
-`runtime: "system"` exposes a backend-defined minimal runtime view, not the host root. On Linux it includes selected executable and library roots plus synthetic identity files. Host homes, `/usr/local`, `/opt`, `/var`, `/run`, host `/tmp`, devices, and host `/proc` are excluded by default. `runtime: "empty"` provides only private runtime scaffolding and explicit grants.
-
-Grant host paths must be absolute. Target paths must be normalized absolute paths in the target path style. Runtime-owned targets, overlapping ambiguous grants, and grants to the target root are rejected. The Linux backend retains descriptors for grant roots and creates mount targets without following target-controlled symlinks.
-
-Read-only grants constrain content, namespace, and metadata mutation. `execution: "deny"` prevents direct kernel execution from that mount; it does not claim that a readable file cannot be interpreted as data by an explicitly available interpreter.
-
-Masks hide a path after grants are installed. Private home and temporary directories are fresh per sandbox and are removed during cleanup.
-
-## Environment
+An isolated layout constructs a filesystem and maps each host source to an isolated target:
 
 ```ts
-environment: {
-  base: "empty",
-  inherit: ["LANG"],
-  set: {
-    MODE: "batch",
-    TOKEN: { value: process.env.TOKEN!, sensitive: true },
+filesystem: {
+  kind: "isolated",
+  resources: [{
+    id: "workspace",
+    source: { space: "host", path: "/srv/jobs/42" },
+    target: { space: "isolated", path: "/workspace" },
+    access: {
+      content: "read-write",
+      directoryEntries: "read-write",
+      metadata: "read-write",
+      execution: "deny",
+    },
+    purposes: ["data"],
+  }],
+  masks: [{
+    path: { space: "isolated", path: "/workspace/secret" },
+    replacement: "inaccessible",
+  }],
+  temporary: {
+    path: { space: "isolated", path: "/tmp" },
+    sizeBytes: 64 * 1024 * 1024,
   },
-  unset: ["LANG"],
 }
 ```
 
-The target never receives the entire Node environment by default. `minimal` creates the documented baseline; `empty` starts with no caller-controlled entries. Backends still set private home and temporary-directory variables. Windows also supplies the operating system's `SystemRoot`, which common Windows executables require during startup; it does not inherit the caller's profile path. Runtime-managed names cannot be overridden through the process environment. Only valid portable variable names are accepted. Sensitive values contribute to the execution digest but do not appear in prepared summaries, enforcement reports, or normal error messages.
+Host and isolated coordinates cannot be mixed. Executable, working-directory, artifact, and change-set root paths use the layout's coordinate space. Artifact results preserve that coordinate tag. Change-set entries remain relative to their tagged root.
 
-The trusted native runtime itself is launched with a fixed minimal environment, not the caller's ambient secrets.
+There is no implicit runtime resource. A dynamically linked program normally needs separate resources for its executable, interpreter, loader, libraries, and any required data or cache. PATH affects lookup performed by the program; it grants no filesystem access.
 
-## Network
+Each resource has independent content, directory-entry, metadata, and execution access. An implementation that cannot enforce a requested combination rejects it. Read access to a script still lets an authorized interpreter consume it as data, so direct execution denial is not a non-interpretation claim.
 
-- `{ mode: "none" }` creates an isolated network namespace or platform-equivalent denial and exposes no host loopback.
-- `{ mode: "managed", allow: [...] }` keeps the target without a direct external route and brokers supported TCP connections through deny-by-default rules.
-- `{ mode: "unrestricted", acknowledgement: "network-is-not-restricted" }` deliberately shares ordinary host networking where supported. Guarantees affected by host network and abstract Unix-socket visibility are reported unsatisfied.
-
-See [managed networking](managed-networking.md) for rule semantics and supported protocols.
-
-## Process policy
-
-The initial contract requires:
+## Process, IPC, and network
 
 ```ts
 process: {
-  hostProcesses: "deny",
-  hostIpc: "deny",
+  visibility: "session",
+  control: "session",
+  termination: { scope: "descendant-tree", graceMs: 100 },
+},
+ipc: { visibility: "session" },
+network: { mode: "none" },
+```
+
+Process visibility and control are separate from termination ownership. IPC visibility covers host endpoints and shared-memory namespaces. Network modes are `none`, policy-brokered `managed`, or explicitly acknowledged `unrestricted`.
+
+## Hard limits and scope
+
+```ts
+resources: {
+  wallTime: { enforcement: "hard", scope: "process", value: 30_000 },
+  memory: { enforcement: "hard", scope: "descendant-tree", value: 512 * 1024 * 1024 },
+  processCount: { enforcement: "hard", scope: "descendant-tree", value: 32 },
+  output: { enforcement: "hard", scope: "process", value: 8 * 1024 * 1024 },
 }
 ```
 
-Backend reports distinguish process visibility, process control, shared memory, and IPC endpoints. An IPC endpoint intentionally included inside a grant is not hidden merely because host IPC is otherwise denied.
+Scopes are part of the request. An implementation cannot substitute a per-process limit for a descendant-tree or session limit. Memory, process-count, and CPU limits are absent unless explicitly requested. The remaining defaults are 600,000 ms wall time, 1,024 open files, 1 GiB per file, and 32 MiB output. Resolved limits appear in the prepared summary and digest. Usage in results is measurement, not another limit declaration.
 
-## Resources
+## Requirements and implementation selection
 
-All resolved limits are included in the prepared summary and digests. When omitted, defaults are:
-
-| Limit | Default |
-| --- | ---: |
-| Wall time | 600,000 ms |
-| Memory | half host memory, capped at 4 GiB |
-| Processes | 256 |
-| Open files per process | 1,024 |
-| Single-file size | 1 GiB |
-| Combined output | 32 MiB |
-| Termination grace | 2,000 ms |
-
-CPU time is optional. The default memory envelope is rejected on hosts where it would be below 512 MiB; provide an explicit value there. Session processes may narrow but never widen their session envelope.
-
-Wall time and output are hard supervisor limits. Linux aggregate memory and process-count guarantees are satisfied only after a functional cgroup v2 delegation probe; otherwise the report states the available fallback and required aggregate guarantees fail preparation.
-
-## Requirements
+Policy normalization derives its enforcement obligations. `requirements.additional` is only for constraints independent of the policy:
 
 ```ts
 requirements: {
-  boundary: "os-process",
-  required: [
-    "runtime.setup-before-exec",
-    "filesystem.read-confined",
-    "filesystem.content-write-confined",
-    "process.complete-tree-termination",
-    "network.no-external-connect",
-    "resource.wall-time-hard",
-    "resource.output-hard",
-  ],
+  additional: ["runtime.executable-identity-bound"],
 }
 ```
 
-Use `LINUX_PROCESS_BASELINE_REQUIREMENTS` as a conservative Linux starting point. Add network and optional hard-resource guarantees that your application needs. Do not remove requirements based only on the current platform; probe and preparation should decide availability.
+Experimental implementations require both `createSandbox({ allowExperimentalImplementations: true })` and `requirements.allowExperimentalImplementations: true`.
 
-Experimental backends require both `createSandbox({ allowExperimentalBackends: true })` and `requirements.allowExperimentalBackend: true`. Hardware VMs also require `boundary: "hardware-virtualized"`.
-
-## Prepared identity
-
-The policy digest binds normalized policy, resolved limits, backend identity, runtime view, and enforcement-relevant configuration. The execution digest additionally binds executable content, exact arguments, working directory, captured environment, stream modes, and artifact/change-set requests.
-
-On Linux, supported executables are snapshotted and executed by descriptor. Shebang scripts bind both script bytes and the verified interpreter entry. Dynamic loaders and shared libraries are runtime-view inputs, so reports distinguish entry-executable binding from complete dependency-graph immutability.
+Selection is deterministic. The selected implementation identity, build and conformance attribution, normalized policy, concrete resource identities, resolved limits, and executable identity are bound before approval. Unsupported requests stay unsupported.

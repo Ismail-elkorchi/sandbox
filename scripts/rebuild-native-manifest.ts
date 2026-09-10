@@ -18,7 +18,6 @@ if (Object.keys(files).length === 0) throw new Error("no native runtimes were fo
 const manifest = {
   formatVersion: 1,
   buildId: "sandbox-runtime-0.1.0",
-  conformanceManifestId: "cross-platform-sandbox-conformance-1",
   files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
 };
 await writeFile(resolve(nativeRoot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });

@@ -7,11 +7,12 @@ use sandbox_guest::{
 use sandbox_image::{Architecture, ImageTrust, VerifiedImage, verify_image};
 use sandbox_launcher_linux::{kill_process, try_lock_exclusive};
 use sandbox_policy::{
-    ActivateSessionMessage, EnforcementBoundary, EnforcementCaveat, EnforcementConformance,
-    EnforcementHost, EnforcementReport, EnforcementRuntimeView, EnforcementTarget, ErrorData,
+    ActivateSessionMessage, EnforcementBoundary, EnforcementCaveat, EnforcementFilesystem,
+    EnforcementHost, EnforcementImplementation, EnforcementReport, EnforcementTarget, ErrorData,
     GUARANTEES, GuaranteeFact, IdMessage, Isolation, NormalizedExecution, NormalizedPolicy,
-    PrepareProcessMessage, PrepareRunMessage, PrepareSessionMessage, StartProcessMessage,
-    StartRunMessage, TerminateMessage, normalize_process, normalize_run, normalize_session,
+    PrepareProcessMessage, PrepareRunMessage, PrepareSessionMessage, SessionOptions,
+    StartProcessMessage, StartRunMessage, TerminateMessage, normalize_process, normalize_run,
+    normalize_session,
 };
 use sandbox_protocol::{
     Frame, Hello, INITIAL_STREAM_CREDIT, MessageType, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -36,7 +37,9 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BACKEND_ID: &str = "linux-firecracker-v1";
+const IMPLEMENTATION_ID: &str = "linux-firecracker-v1";
+const CONFORMANCE_MANIFEST_ID: &str = "linux-firecracker-v1-conformance-1";
+const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 const FIRECRACKER_SHA256_X64: &str =
     "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7";
 const FIRECRACKER_NAME_X64: &str = "firecracker-v1.16.1-x86_64";
@@ -63,6 +66,12 @@ pub fn run() {
         .as_deref()
     {
         Some("--linux-launcher") => std::process::exit(sandbox_launcher_linux::launcher_main()),
+        Some("--linux-isolated") => {
+            std::process::exit(sandbox_launcher_linux::isolated_main(arguments.next()))
+        }
+        Some("--linux-namespace-probe") => {
+            std::process::exit(sandbox_launcher_linux::namespace_probe_main())
+        }
         Some("--linux-probe") => std::process::exit(sandbox_launcher_linux::probe_main()),
         Some("--apply-change-set") => std::process::exit(change_set_apply_main(arguments)),
         Some("--recover-change-set") => std::process::exit(change_set_recover_main(arguments)),
@@ -174,7 +183,7 @@ impl ProtocolWriter {
 
     fn error(&self, request_id: Option<&str>, error: &ErrorData) {
         let mut error = error.clone();
-        error.backend = Some(BACKEND_ID.into());
+        error.implementation = Some(IMPLEMENTATION_ID.into());
         let _ = self.control(
             MessageType::Error,
             &json!({"requestId": request_id, "error": error}),
@@ -184,19 +193,20 @@ impl ProtocolWriter {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PreparedGrant {
+struct PreparedResource {
+    id: String,
     requested_host_path: String,
     resolved_host_path: String,
     host_identity_digest: String,
     target_path: String,
-    access: String,
-    execution: String,
+    access: sandbox_policy::FilesystemAccess,
+    purposes: Vec<String>,
     guest_source: String,
 }
 
 struct PreparedPolicy {
     normalized: NormalizedPolicy,
-    grants: Vec<PreparedGrant>,
+    resources: Vec<PreparedResource>,
     mounts: Vec<GuestMount>,
     workspace_bases: Vec<WorkspaceBase>,
     policy_digest: String,
@@ -557,7 +567,7 @@ fn handle_frame(
                 "protocolMajor": PROTOCOL_MAJOR,
                 "protocolMinor": PROTOCOL_MINOR,
                 "runtimeVersion": env!("CARGO_PKG_VERSION"),
-                "backendVersions": {BACKEND_ID: env!("CARGO_PKG_VERSION")},
+                "implementationVersions": {IMPLEMENTATION_ID: env!("CARGO_PKG_VERSION")},
             }),
         )?;
         return Ok(false);
@@ -568,6 +578,93 @@ fn handle_frame(
             let request_id = request_id(&value)?;
             unique(request_ids, &request_id)?;
             let capability = probe();
+            let request = value.get("request").cloned().unwrap_or_else(|| json!({}));
+            let available = capability
+                .get("availability")
+                .and_then(Value::as_str)
+                .unwrap_or("error");
+            let mut unmet = Vec::<String>::new();
+            if available != "available" {
+                unmet.push("implementation mechanisms".into());
+            }
+            if request
+                .get("isolation")
+                .and_then(|isolation| isolation.get("kind"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "hardware-vm")
+            {
+                unmet.push("requested isolation boundary".into());
+            }
+            if request
+                .get("policy")
+                .and_then(|policy| policy.get("filesystem"))
+                .and_then(|filesystem| filesystem.get("kind"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "isolated")
+            {
+                unmet.push("requested filesystem layout".into());
+            }
+            if request
+                .get("policy")
+                .and_then(|policy| policy.get("network"))
+                .and_then(|network| network.get("mode"))
+                .and_then(Value::as_str)
+                .is_some_and(|mode| mode == "unrestricted")
+            {
+                unmet.push("requested network topology".into());
+            }
+            if !request
+                .get("allowExperimentalImplementations")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                unmet.push("experimental implementation permission".into());
+            }
+            if request.get("isolation").is_some() && request.get("policy").is_some() {
+                let mut requirements = request
+                    .get("requirements")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                requirements["allowExperimentalImplementations"] = json!(
+                    requirements
+                        .get("allowExperimentalImplementations")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        && request
+                            .get("allowExperimentalImplementations")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                );
+                let options = json!({
+                    "isolation": request.get("isolation"),
+                    "policy": request.get("policy"),
+                    "requirements": requirements,
+                    "resources": request.get("resources").cloned().unwrap_or_else(|| json!({})),
+                    "preparedTtlMs": null,
+                });
+                match serde_json::from_value::<SessionOptions>(options)
+                    .map_err(|error| error.to_string())
+                    .and_then(|options| {
+                        normalize_session(options).map_err(|error| error.0.message.clone())
+                    }) {
+                    Ok(policy) => {
+                        unmet.extend(vm_policy_limitations(&policy));
+                        for required in policy
+                            .obligations
+                            .iter()
+                            .chain(policy.requirements.additional.iter())
+                        {
+                            if !vm_probe_guarantee(required) {
+                                unmet.push(required.clone());
+                            }
+                        }
+                    }
+                    Err(error) => unmet.push(format!("invalid policy: {error}")),
+                }
+            }
+            unmet.sort();
+            unmet.dedup();
+            let evaluated = request.as_object().is_some_and(|object| !object.is_empty());
             writer.control(
                 MessageType::ProbeResult,
                 &json!({
@@ -576,12 +673,22 @@ fn handle_frame(
                         "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
                         "packageVersion": env!("CARGO_PKG_VERSION"),
                         "host": {"platform": "linux", "architecture": std::env::consts::ARCH},
-                        "backends": [{
-                            "id": BACKEND_ID,
-                            "isolation": "hardware-vm",
+                        "implementations": [{
+                            "identity": {
+                                "id": IMPLEMENTATION_ID,
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "buildId": BUILD_ID,
+                                "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+                            },
+                            "boundary": "hardware-virtualized",
+                            "filesystem": ["isolated"],
                             "stability": "experimental",
-                            "available": capability.get("available").and_then(Value::as_bool).unwrap_or(false),
-                            "capabilities": capability,
+                            "availability": available,
+                            "eligibility": {
+                                "state": if !evaluated { "not-evaluated" } else if unmet.is_empty() { "eligible" } else { "ineligible" },
+                                "unmet": unmet,
+                            },
+                            "mechanisms": capability.get("mechanisms").cloned().unwrap_or_else(|| json!({})),
                         }],
                     },
                 }),
@@ -737,10 +844,9 @@ fn prepare_run(
     request_ids: &mut HashSet<String>,
 ) -> Result<(), ErrorData> {
     ensure_empty(state)?;
-    let message: PrepareRunMessage = parse(&frame)?;
+    let message: PrepareRunMessage = parse_policy_message(&frame)?;
     unique(request_ids, &message.request_id)?;
-    let (policy, execution) =
-        normalize_run(message.options, host_memory()?).map_err(|error| *error.0)?;
+    let (policy, execution) = normalize_run(message.options).map_err(|error| *error.0)?;
     let policy = Arc::new(prepare_policy(policy)?);
     let execution = Arc::new(prepare_execution(&policy, execution)?);
     let id = new_id("run");
@@ -815,10 +921,9 @@ fn prepare_session(
     request_ids: &mut HashSet<String>,
 ) -> Result<(), ErrorData> {
     ensure_empty(state)?;
-    let message: PrepareSessionMessage = parse(&frame)?;
+    let message: PrepareSessionMessage = parse_policy_message(&frame)?;
     unique(request_ids, &message.request_id)?;
-    let normalized =
-        normalize_session(message.options, host_memory()?).map_err(|error| *error.0)?;
+    let normalized = normalize_session(message.options).map_err(|error| *error.0)?;
     let policy = Arc::new(prepare_policy(normalized)?);
     let id = new_id("session");
     let (deadline, expires_at_ms) = expiration(policy.normalized.prepared_ttl_ms);
@@ -884,15 +989,15 @@ fn prepare_process(
     state: &mut RuntimeState,
     request_ids: &mut HashSet<String>,
 ) -> Result<(), ErrorData> {
-    let message: PrepareProcessMessage = parse(&frame)?;
+    let message: PrepareProcessMessage = parse_policy_message(&frame)?;
     unique(request_ids, &message.request_id)?;
     let session = active_session(state, &message.session_id)?;
     clear_finished(session);
     if session.running.is_some() || session.prepared.is_some() {
         return Err(state_error("session is busy"));
     }
-    let normalized = normalize_process(message.process, &session.policy.normalized.resources)
-        .map_err(|error| *error.0)?;
+    let normalized =
+        normalize_process(message.process, &session.policy.normalized).map_err(|error| *error.0)?;
     let execution = Arc::new(prepare_execution(&session.policy, normalized)?);
     let id = new_id("process");
     let (deadline, expires_at_ms) = expiration(session.policy.normalized.prepared_ttl_ms);
@@ -1010,40 +1115,145 @@ fn close_session(
     )
 }
 
+fn vm_policy_limitations(policy: &NormalizedPolicy) -> Vec<String> {
+    let mut limitations = Vec::new();
+    if policy.filesystem_kind != "isolated" {
+        limitations.push("requires an isolated filesystem layout".into());
+    }
+    if policy.process.visibility != "session"
+        || policy.process.control != "session"
+        || policy.ipc.visibility != "session"
+    {
+        limitations.push("cannot provide host process or IPC visibility".into());
+    }
+    if policy.limits.wall_time.scope != "process"
+        || policy.limits.output.scope != "process"
+        || policy
+            .limits
+            .memory
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .process_count
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .cpu_time
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+    {
+        limitations.push("does not provide requested session-scoped resource limits".into());
+    }
+    if policy.resources.iter().any(|resource| {
+        resource.access.content != resource.access.directory_entries
+            || resource.access.content != resource.access.metadata
+    }) {
+        limitations.push("cannot independently enforce requested mutation dimensions".into());
+    }
+    if policy
+        .resources
+        .iter()
+        .any(|resource| vm_owned_target_conflict(&resource.target_path))
+        || policy
+            .private_home
+            .iter()
+            .chain(policy.temporary.iter())
+            .any(|directory| vm_owned_target_conflict(&directory.target_path))
+    {
+        limitations
+            .push("resource or synthetic directory overlaps a VM implementation-owned path".into());
+    }
+    if !policy.requirements.allow_experimental_implementations {
+        limitations.push("experimental implementation permission is absent".into());
+    }
+    if policy.network != "none" && policy.network != "managed" {
+        limitations.push("supports only none or managed networking".into());
+    }
+    if policy
+        .private_home
+        .as_ref()
+        .is_some_and(|directory| directory.target_path != "/home/sandbox")
+        || policy
+            .temporary
+            .as_ref()
+            .is_some_and(|directory| directory.target_path != "/tmp")
+    {
+        limitations.push("supports synthetic directories only at /home/sandbox and /tmp".into());
+    }
+    if !matches!(
+        &policy.isolation,
+        Isolation::HardwareVm {
+            filesystem_transport,
+            ..
+        } if filesystem_transport == "import"
+    ) {
+        limitations.push("requires hardware-vm isolation with import transport".into());
+    }
+    limitations
+}
+
+fn vm_probe_guarantee(id: &str) -> bool {
+    matches!(
+        id,
+        "runtime.setup-before-exec"
+            | "runtime.no-ambient-environment"
+            | "runtime.no-ambient-handles"
+            | "runtime.executable-identity-bound"
+            | "filesystem.resource-identities-bound"
+            | "filesystem.content-read-confined"
+            | "filesystem.content-write-confined"
+            | "filesystem.directory-entry-mutation-confined"
+            | "filesystem.metadata-mutation-confined"
+            | "filesystem.execution-confined"
+            | "filesystem.name-visibility-confined"
+            | "filesystem.isolated-layout"
+            | "network.no-external-connect"
+            | "network.no-external-listen"
+            | "network.no-host-loopback"
+            | "network.egress-brokered"
+            | "network.private-addresses-denied"
+            | "process.host-visibility-denied"
+            | "process.host-control-denied"
+            | "process.descendant-tree-termination"
+            | "process.group-termination"
+            | "ipc.host-endpoints-hidden"
+            | "ipc.host-shared-memory-hidden"
+            | "resource.wall-time-hard"
+            | "resource.output-hard"
+            | "resource.memory-hard"
+            | "resource.cpu-time-hard"
+            | "resource.process-count-hard"
+            | "resource.open-files-hard"
+            | "resource.single-file-size-hard"
+            | "vm.boot-artifacts-verified"
+            | "vm.guest-control-authenticated"
+            | "vm.control-plane-hidden-from-target"
+            | "vm.host-filesystem-absent-outside-imports"
+    )
+}
+
 fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorData> {
     recover_abandoned_vm_state()?;
-    if !normalized.requirements.allow_experimental_backend {
+    let limitations = vm_policy_limitations(&normalized);
+    if !limitations.is_empty() {
         return Err(ErrorData::new(
-            "requirement.experimental_backend",
-            "the hardware-VM backend requires explicit experimental activation",
+            "unsupported.no_eligible_implementation",
+            format!(
+                "no VM implementation satisfies the normalized policy: {}",
+                limitations.join("; ")
+            ),
             "prepare",
         ));
     }
-    if normalized.network != "none" && normalized.network != "managed" {
-        return Err(ErrorData::new(
-            "unsupported.vm_network",
-            "the hardware-VM runtime supports network none or managed",
-            "prepare",
-        ));
-    }
-    let Isolation::HardwareVm {
-        image,
-        filesystem_transport,
-    } = &normalized.isolation
-    else {
+    let Isolation::HardwareVm { image, .. } = &normalized.isolation else {
         return Err(ErrorData::new(
             "unsupported.isolation",
             "VM runtime requires hardware-vm isolation",
             "prepare",
         ));
     };
-    if filesystem_transport == "ephemeral" && !normalized.grants.is_empty() {
-        return Err(ErrorData::new(
-            "policy.vm_ephemeral_grants",
-            "ephemeral VM mode does not implicitly import host grants",
-            "prepare",
-        ));
-    }
     let trust = if image.trust == "explicit-local" {
         ImageTrust::ExplicitLocal
     } else {
@@ -1073,19 +1283,8 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
         ));
     }
     validate_image_architecture(&verified)?;
-    let (entries, grants, mounts, workspace_bases, import_digest, import_bytes) =
-        if filesystem_transport == "import" {
-            prepare_imports(&normalized)?
-        } else {
-            (
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                identity_digest(&Vec::<String>::new()).map_err(digest_data)?,
-                0,
-            )
-        };
+    let (entries, resources, mounts, workspace_bases, import_digest, import_bytes) =
+        prepare_imports(&normalized)?;
     let authority = Arc::new(boot_vm(&normalized, &verified)?);
     if !entries.is_empty() {
         transfer_imports(&authority, entries, import_bytes)?;
@@ -1105,7 +1304,7 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
     let policy_digest = policy_digest(&json!({
         "digestFormat": 1,
         "protocolMajor": PROTOCOL_MAJOR,
-        "backend": {"id": BACKEND_ID, "version": env!("CARGO_PKG_VERSION"), "stability": "experimental"},
+        "implementation": {"id": IMPLEMENTATION_ID, "version": env!("CARGO_PKG_VERSION"), "stability": "experimental"},
         "targetOperatingSystem": "linux",
         "policy": normalized,
         "verifiedImage": {
@@ -1117,12 +1316,12 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
         "firecrackerSha256": firecracker_digest(),
         "workspaceTemplateSha256": WORKSPACE_TEMPLATE_SHA256,
         "importDigest": import_digest,
-        "grants": grants,
+        "resources": resources,
     }))
     .map_err(digest_data)?;
     Ok(PreparedPolicy {
         normalized,
-        grants,
+        resources,
         mounts,
         workspace_bases,
         policy_digest,
@@ -1132,32 +1331,71 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
     })
 }
 
+fn vm_owned_target_conflict(target: &str) -> bool {
+    const OWNED: &[&str] = &[
+        "/dev",
+        "/proc",
+        "/run",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+    ];
+    target == "/"
+        || target
+            .strip_prefix('/')
+            .and_then(|relative| relative.split('/').next())
+            .is_some_and(|component| component.starts_with(".sandbox-"))
+        || OWNED
+            .iter()
+            .any(|owned| target_contains(target, owned) || target_contains(owned, target))
+}
+
+fn target_contains(parent: &str, child: &str) -> bool {
+    parent == child
+        || parent == "/"
+        || child
+            .strip_prefix(parent)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
 fn prepare_execution(
     policy: &PreparedPolicy,
     normalized: NormalizedExecution,
 ) -> Result<PreparedExecution, ErrorData> {
-    if normalized.change_set.is_some() {
-        if policy.workspace_bases.is_empty() {
-            return Err(ErrorData::new(
-                "vm.change_set_grants",
-                "workspace change-set export requires at least one read-write imported grant",
-                "prepare",
-            ));
-        }
-        if policy.workspace_bases.iter().any(|base| !base.directory) {
-            return Err(ErrorData::new(
-                "vm.change_set_root",
-                "workspace change-set export supports read-write directory grants",
-                "prepare",
-            ));
-        }
+    let executable_path = Path::new(normalized.executable.path());
+    let executable_authorized = policy.normalized.resources.iter().any(|resource| {
+        executable_path.starts_with(&resource.target_path)
+            && resource.executable()
+            && resource
+                .purposes
+                .iter()
+                .any(|purpose| matches!(purpose.as_str(), "executable" | "interpreter"))
+    });
+    if !executable_authorized {
+        return Err(ErrorData::new(
+            "policy.executable_resource",
+            "entry executable is not covered by an executable authorized resource",
+            "prepare",
+        ));
+    }
+    if let Some(request) = &normalized.change_set
+        && !policy
+            .workspace_bases
+            .iter()
+            .any(|base| base.directory && base.target_path == request.root.path())
+    {
+        return Err(ErrorData::new(
+            "vm.change_set_root",
+            "workspace change-set root must identify one read-write imported directory",
+            "prepare",
+        ));
     }
     let response = policy.authority.request(&GuestRequest::Inspect {
-        executable: normalized.executable.clone(),
-        cwd: normalized.cwd.clone(),
+        executable: normalized.executable.path().to_owned(),
+        cwd: normalized.cwd.path().to_owned(),
         mounts: policy.mounts.clone(),
         masks: guest_masks(&policy.normalized),
-        system_runtime: policy.normalized.runtime_view == "system",
     })?;
     let GuestResponse::Inspected {
         executable_sha256,
@@ -1190,7 +1428,6 @@ fn prepare_execution(
         "stderr": normalized.stderr,
         "artifacts": normalized.artifacts,
         "changeSet": normalized.change_set,
-        "resources": normalized.resources,
     }))
     .map_err(digest_data)?;
     Ok(PreparedExecution {
@@ -1248,7 +1485,13 @@ fn boot_vm(policy: &NormalizedPolicy, image: &VerifiedImage) -> Result<VmAuthori
     let (authentication, nonce) = create_authentication_drive(&state_root)?;
     let owner_token = encode_hex(&nonce);
     let vmm_state = state_root.join("vmm");
-    let memory_mib = ((policy.resources.memory_bytes / (1024 * 1024)).clamp(128, 65_536)) as u32;
+    let memory_mib = ((policy
+        .limits
+        .memory
+        .as_ref()
+        .map_or(512 * 1024 * 1024, |limit| limit.value)
+        / (1024 * 1024))
+        .clamp(128, 65_536)) as u32;
     let mut vmm = FirecrackerProcess::spawn(&FirecrackerConfig {
         launcher_executable: PathBuf::from("/proc/self/exe"),
         firecracker_executable: firecracker,
@@ -1491,10 +1734,11 @@ fn start_running(
     let watchdog = running.clone();
     let duration = Duration::from_millis(
         watchdog
-            .execution
+            .policy
             .normalized
-            .resources
-            .wall_time_ms
+            .limits
+            .wall_time
+            .value
             .saturating_add(1_000),
     );
     thread::spawn(move || {
@@ -1541,38 +1785,57 @@ fn guest_run_request(running: &Running) -> GuestRequest {
         );
         environment.insert("NO_PROXY".into(), String::new());
     }
-    let limits = &running.execution.normalized.resources;
+    let limits = &running.policy.normalized.limits;
     GuestRequest::Run {
-        executable: running.execution.normalized.executable.clone(),
+        executable: running.execution.normalized.executable.path().to_owned(),
         expected_executable_sha256: running.execution.executable_sha256.clone(),
         expected_executable_identity_digest: running.execution.executable_identity_digest.clone(),
         args: running.execution.normalized.args.clone(),
-        cwd: running.execution.normalized.cwd.clone(),
+        cwd: running.execution.normalized.cwd.path().to_owned(),
         expected_cwd_identity_digest: running.execution.cwd_identity_digest.clone(),
         environment,
         mounts: running.policy.mounts.clone(),
         masks: guest_masks(&running.policy.normalized),
-        private_home: GuestPrivateDirectory {
-            enabled: running.policy.normalized.private_home.enabled,
-            size_bytes: running.policy.normalized.private_home.size_bytes,
-            executable: running.policy.normalized.private_home.executable,
-        },
-        temporary: GuestPrivateDirectory {
-            enabled: true,
-            size_bytes: running.policy.normalized.temporary.size_bytes,
-            executable: running.policy.normalized.temporary.executable,
-        },
+        private_home: running.policy.normalized.private_home.as_ref().map_or(
+            GuestPrivateDirectory {
+                enabled: false,
+                size_bytes: 1,
+                executable: false,
+            },
+            |directory| GuestPrivateDirectory {
+                enabled: true,
+                size_bytes: directory.size_bytes,
+                executable: directory.executable,
+            },
+        ),
+        temporary: running.policy.normalized.temporary.as_ref().map_or(
+            GuestPrivateDirectory {
+                enabled: false,
+                size_bytes: 1,
+                executable: false,
+            },
+            |directory| GuestPrivateDirectory {
+                enabled: true,
+                size_bytes: directory.size_bytes,
+                executable: directory.executable,
+            },
+        ),
         network_mode: running.policy.normalized.network.clone(),
-        system_runtime: running.policy.normalized.runtime_view == "system",
         limits: GuestLimits {
-            wall_time_ms: limits.wall_time_ms,
-            cpu_time_ms: limits.cpu_time_ms,
-            memory_bytes: limits.memory_bytes,
-            max_processes: limits.max_processes,
-            max_open_files: limits.max_open_files_per_process,
-            max_single_file_bytes: limits.max_single_file_bytes,
-            max_output_bytes: limits.max_output_bytes,
-            termination_grace_ms: limits.termination_grace_ms,
+            wall_time_ms: limits.wall_time.value,
+            cpu_time_ms: limits.cpu_time.as_ref().map(|limit| limit.value),
+            memory_bytes: limits
+                .memory
+                .as_ref()
+                .map_or(512 * 1024 * 1024, |limit| limit.value),
+            max_processes: limits
+                .process_count
+                .as_ref()
+                .map_or(256, |limit| limit.value),
+            max_open_files: Some(limits.open_files.value),
+            max_single_file_bytes: Some(limits.single_file_size.value),
+            max_output_bytes: limits.output.value,
+            termination_grace_ms: running.policy.normalized.process.termination.grace_ms,
         },
     }
 }
@@ -1994,7 +2257,7 @@ fn finish_worker(
     if termination.get("reason").and_then(Value::as_str) == Some("runtime-failure")
         && let Some(error) = termination.get_mut("error").and_then(Value::as_object_mut)
     {
-        error.insert("backend".into(), json!(BACKEND_ID));
+        error.insert("implementation".into(), json!(IMPLEMENTATION_ID));
         error.insert("platform".into(), json!("linux"));
     }
     running.alive.store(false, Ordering::Release);
@@ -2047,14 +2310,22 @@ fn export_requested(running: &Running) -> Result<Option<ExportedArtifacts>, Erro
     let translated = request
         .paths
         .iter()
-        .map(|path| translate_export_path(path, &running.policy.grants))
+        .map(|path| translate_export_path(path.path(), &running.policy.resources))
         .collect::<Result<Vec<_>, _>>()?;
     let (mut entries, bytes) =
         read_guest_export(&running.policy.authority, translated, request.max_bytes)?;
     for entry in &mut entries {
-        entry.path = restore_export_path(&entry.path, &running.policy.grants);
+        entry.path = restore_export_path(&entry.path, &running.policy.resources)?;
     }
-    let digest = identity_digest(&entries).map_err(digest_data)?;
+    let digest_entries = entries
+        .iter()
+        .map(|entry| {
+            let mut value = serde_json::to_value(entry).expect("guest artifact is serializable");
+            value["path"] = json!({"space": "isolated", "path": entry.path});
+            value
+        })
+        .collect::<Vec<_>>();
+    let digest = identity_digest(&digest_entries).map_err(digest_data)?;
     let (files, content) = encode_guest_entries(entries)?;
     if content.len() as u64 != bytes {
         return Err(ErrorData::new(
@@ -2077,8 +2348,13 @@ fn export_change_sets(
     };
     let mut remaining = request.max_bytes;
     let mut content = Vec::new();
-    let mut values = Vec::with_capacity(running.policy.workspace_bases.len());
-    for base in &running.policy.workspace_bases {
+    let mut values = Vec::with_capacity(1);
+    for base in running
+        .policy
+        .workspace_bases
+        .iter()
+        .filter(|base| base.target_path == request.root.path())
+    {
         let (entries, bytes) = read_guest_export(
             &running.policy.authority,
             vec![base.guest_path.clone()],
@@ -2166,7 +2442,7 @@ fn export_change_sets(
         }
         let segment_bytes = content.len() - segment_start;
         values.push(json!({
-            "targetPath": base.target_path,
+            "root": {"space": "isolated", "path": &base.target_path},
             "binaryOffset": binary_offset + segment_start,
             "bytes": segment_bytes,
             "changeSet": value,
@@ -2334,6 +2610,7 @@ fn encode_guest_entries(
         let mut value = serde_json::to_value(entry).map_err(|error| {
             ErrorData::new("vm.artifact_encoding", error.to_string(), "artifact-export")
         })?;
+        value["path"] = json!({"space": "isolated", "path": value["path"].take()});
         if regular_file {
             let object = value.as_object_mut().expect("artifact entry is an object");
             object.insert("contentOffset".into(), json!(offset));
@@ -2382,7 +2659,7 @@ fn send_output(running: &Running, message_type: MessageType, bytes: &[u8]) {
 
 type ImportPreparation = (
     Vec<GuestArtifactEntry>,
-    Vec<PreparedGrant>,
+    Vec<PreparedResource>,
     Vec<GuestMount>,
     Vec<WorkspaceBase>,
     String,
@@ -2476,12 +2753,17 @@ fn prepare_imports(policy: &NormalizedPolicy) -> Result<ImportPreparation, Error
         link_target: None,
         sha256: None,
     }];
-    let mut grants = Vec::new();
+    let mut resources = Vec::new();
     let mut mounts = Vec::new();
     let mut workspace_bases = Vec::new();
     let mut total = 0_u64;
-    let maximum = policy.resources.memory_bytes.min(1024 * 1024 * 1024);
-    for (index, grant) in policy.grants.iter().enumerate() {
+    let maximum = policy
+        .limits
+        .memory
+        .as_ref()
+        .map_or(512 * 1024 * 1024, |limit| limit.value)
+        .min(1024 * 1024 * 1024);
+    for (index, grant) in policy.resources.iter().enumerate() {
         let requested = Path::new(&grant.requested_host_path);
         if grant.root_resolution == "reject-if-link"
             && fs::symlink_metadata(requested)
@@ -2562,22 +2844,23 @@ fn prepare_imports(policy: &NormalizedPolicy) -> Result<ImportPreparation, Error
         }))
         .map_err(digest_data)?;
         let guest_source = format!("/workspace/{source_relative}");
-        grants.push(PreparedGrant {
+        resources.push(PreparedResource {
+            id: grant.id.clone(),
             requested_host_path: grant.requested_host_path.clone(),
             resolved_host_path: resolved.to_string_lossy().into_owned(),
             host_identity_digest: identity,
             target_path: grant.target_path.clone(),
             access: grant.access.clone(),
-            execution: grant.execution.clone(),
+            purposes: grant.purposes.clone(),
             guest_source: guest_source.clone(),
         });
         mounts.push(GuestMount {
             source: guest_source,
             target: grant.target_path.clone(),
-            read_only: grant.access == "read",
-            executable: grant.execution == "allow",
+            read_only: grant.read_only(),
+            executable: grant.executable(),
         });
-        if grant.access == "read-write" {
+        if !grant.read_only() {
             base_files.sort_by(|left, right| left.path.cmp(&right.path));
             workspace_bases.push(WorkspaceBase {
                 target_path: grant.target_path.clone(),
@@ -2595,7 +2878,7 @@ fn prepare_imports(policy: &NormalizedPolicy) -> Result<ImportPreparation, Error
             .then_with(|| left.path.cmp(&right.path))
     });
     let digest = identity_digest(&entries).map_err(digest_data)?;
-    Ok((entries, grants, mounts, workspace_bases, digest, total))
+    Ok((entries, resources, mounts, workspace_bases, digest, total))
 }
 
 fn enforcement_report(
@@ -2610,8 +2893,12 @@ fn enforcement_report(
     EnforcementReport {
         boundary: EnforcementBoundary {
             kind: "hardware-virtualized".into(),
-            backend_id: BACKEND_ID.into(),
-            backend_version: env!("CARGO_PKG_VERSION").into(),
+        },
+        implementation: EnforcementImplementation {
+            id: IMPLEMENTATION_ID.into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_id: BUILD_ID.into(),
+            conformance_manifest_id: CONFORMANCE_MANIFEST_ID.into(),
             stability: "experimental".into(),
             mechanism: vec![
                 "KVM hardware virtualization through pinned Firecracker".into(),
@@ -2633,32 +2920,31 @@ fn enforcement_report(
             path_style: "posix".into(),
         },
         guarantees,
-        runtime_view: EnforcementRuntimeView {
-            kind: policy.runtime_view.clone(),
-            manifest_digest: manifest_digest.into(),
-            visible_roots: if policy.runtime_view == "system" {
-                let mut roots = vec![
-                    "/bin".into(),
-                    "/usr".into(),
-                    "/lib".into(),
-                    "/workspace".into(),
-                ];
-                if policy.network == "managed" {
-                    roots.push("/etc/resolv.conf".into());
-                }
-                roots
-            } else {
-                let mut roots = vec!["/workspace".into()];
-                if policy.network == "managed" {
-                    roots.push("/etc/resolv.conf".into());
-                }
-                roots
-            },
+        filesystem: EnforcementFilesystem {
+            kind: policy.filesystem_kind.clone(),
+            resource_manifest_digest: manifest_digest.into(),
+            visible_roots: policy
+                .resources
+                .iter()
+                .map(|resource| resource.target_path.clone())
+                .chain(
+                    policy
+                        .private_home
+                        .iter()
+                        .map(|directory| directory.target_path.clone()),
+                )
+                .chain(
+                    policy
+                        .temporary
+                        .iter()
+                        .map(|directory| directory.target_path.clone()),
+                )
+                .collect(),
         },
         caveats: {
             let mut caveats = vec![EnforcementCaveat {
                 code: "experimental.hardware-vm".into(),
-                message: "the Firecracker backend remains experimental until dedicated KVM-host conformance passes".into(),
+                message: "the Firecracker implementation remains experimental until dedicated KVM-host conformance passes".into(),
                 affected_guarantees: Vec::new(),
             }];
             if policy.network == "managed" {
@@ -2670,10 +2956,6 @@ fn enforcement_report(
             }
             caveats
         },
-        conformance: EnforcementConformance {
-            manifest_id: "linux-firecracker-v1-conformance-1".into(),
-            build_id: concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION")).into(),
-        },
     }
 }
 
@@ -2683,29 +2965,43 @@ fn vm_guarantee(policy: &NormalizedPolicy, id: &str, image: &VerifiedImage) -> G
         | "runtime.no-ambient-environment"
         | "runtime.no-ambient-handles"
         | "runtime.executable-identity-bound"
-        | "filesystem.grant-roots-identity-bound"
-        | "filesystem.read-confined"
+        | "filesystem.resource-identities-bound"
+        | "filesystem.content-read-confined"
         | "filesystem.content-write-confined"
-        | "filesystem.namespace-mutation-confined"
+        | "filesystem.directory-entry-mutation-confined"
         | "filesystem.metadata-mutation-confined"
-        | "filesystem.host-user-data-hidden"
-        | "process.host-enumeration-denied"
+        | "filesystem.execution-confined"
+        | "filesystem.name-visibility-confined"
+        | "filesystem.isolated-layout"
+        | "process.host-visibility-denied"
         | "process.host-control-denied"
-        | "process.complete-tree-termination"
-        | "ipc.host-endpoints-hidden-outside-grants"
+        | "process.descendant-tree-termination"
+        | "process.group-termination"
+        | "ipc.host-endpoints-hidden"
         | "ipc.host-shared-memory-hidden"
-        | "resource.wall-time-hard"
-        | "resource.output-hard"
-        | "resource.memory-hard"
-        | "resource.cpu-time-hard"
-        | "resource.process-count-hard"
         | "resource.open-files-hard"
         | "resource.single-file-size-hard"
         | "vm.boot-artifacts-verified"
         | "vm.guest-control-authenticated"
         | "vm.control-plane-hidden-from-target"
         | "vm.host-filesystem-absent-outside-imports" => true,
-        "filesystem.execution-confined" => false,
+        "resource.wall-time-hard" => policy.limits.wall_time.scope == "process",
+        "resource.output-hard" => policy.limits.output.scope == "process",
+        "resource.memory-hard" => policy
+            .limits
+            .memory
+            .as_ref()
+            .is_some_and(|limit| limit.scope == "descendant-tree"),
+        "resource.cpu-time-hard" => policy
+            .limits
+            .cpu_time
+            .as_ref()
+            .is_some_and(|limit| limit.scope == "descendant-tree"),
+        "resource.process-count-hard" => policy
+            .limits
+            .process_count
+            .as_ref()
+            .is_some_and(|limit| limit.scope == "descendant-tree"),
         "network.no-external-connect"
         | "network.no-external-listen"
         | "network.no-host-loopback" => policy.network != "unrestricted",
@@ -2754,7 +3050,7 @@ fn vm_guarantee(policy: &NormalizedPolicy, id: &str, image: &VerifiedImage) -> G
             _ => Vec::new(),
         },
         evidence: if satisfied {
-            vec![format!("backend={BACKEND_ID}")]
+            vec![format!("implementation={IMPLEMENTATION_ID}")]
         } else {
             Vec::new()
         },
@@ -2771,9 +3067,9 @@ fn match_requirements(
     report: &EnforcementReport,
 ) -> Result<(), ErrorData> {
     let unmet = policy
-        .requirements
-        .required
+        .obligations
         .iter()
+        .chain(policy.requirements.additional.iter())
         .filter(|required| {
             !report
                 .guarantees
@@ -2814,24 +3110,47 @@ fn session_summary(policy: &PreparedPolicy) -> Value {
     };
     json!({
         "isolation": {"kind": "hardware-vm", "image": image, "filesystemTransport": filesystem_transport},
-        "backend": {"id": BACKEND_ID, "version": env!("CARGO_PKG_VERSION"), "stability": "experimental"},
-        "filesystem": {
-            "runtimeView": policy.normalized.runtime_view,
-            "runtimeManifestDigest": policy.manifest_digest,
-            "grants": policy.grants,
-            "masks": policy.normalized.masks,
-            "privateHomePath": if policy.normalized.private_home.enabled { Some("/home/sandbox") } else { None },
-            "temporaryPath": "/tmp",
+        "implementation": {
+            "id": IMPLEMENTATION_ID,
+            "version": env!("CARGO_PKG_VERSION"),
+            "buildId": BUILD_ID,
+            "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+            "stability": "experimental"
         },
-        "network": {"mode": "none", "topology": "no-virtual-nic"},
+        "filesystem": {
+            "kind": policy.normalized.filesystem_kind,
+            "resourceManifestDigest": policy.manifest_digest,
+            "resources": policy.resources.iter().map(|resource| json!({
+                "id": &resource.id,
+                "source": {
+                    "requested": &resource.requested_host_path,
+                    "resolved": &resource.resolved_host_path,
+                    "identityDigest": &resource.host_identity_digest,
+                },
+                "target": {"space": "isolated", "path": &resource.target_path},
+                "access": &resource.access,
+                "purposes": &resource.purposes,
+            })).collect::<Vec<_>>(),
+            "masks": policy.normalized.masks.iter().map(|mask| json!({
+                "path": {"space": "isolated", "path": &mask.target_path},
+                "replacement": &mask.replacement,
+            })).collect::<Vec<_>>(),
+            "privateHomePath": policy.normalized.private_home.as_ref().map(|directory| json!({"space": "isolated", "path": &directory.target_path})),
+            "temporaryPath": policy.normalized.temporary.as_ref().map(|directory| json!({"space": "isolated", "path": &directory.target_path})),
+        },
+        "network": if policy.normalized.network == "managed" {
+            json!({"mode": "managed", "topology": "private-namespace-broker", "allow": &policy.normalized.managed_network_rules})
+        } else {
+            json!({"mode": "none", "topology": "no-virtual-nic"})
+        },
         "process": policy.normalized.process,
-        "resources": policy.normalized.resources,
+        "ipc": policy.normalized.ipc,
+        "resources": policy.normalized.limits,
     })
 }
 
 fn process_summary(execution: &PreparedExecution) -> Value {
     json!({
-        "resources": execution.normalized.resources,
         "execution": execution_summary(execution)
     })
 }
@@ -2865,10 +3184,9 @@ fn execution_summary(execution: &PreparedExecution) -> Value {
     })
 }
 
-fn translate_export_path(path: &str, grants: &[PreparedGrant]) -> Result<String, ErrorData> {
-    let absolute = format!("/{path}");
-    let target = Path::new(&absolute);
-    if let Some((index, grant)) = grants
+fn translate_export_path(path: &str, resources: &[PreparedResource]) -> Result<String, ErrorData> {
+    let target = Path::new(path);
+    if let Some((index, grant)) = resources
         .iter()
         .enumerate()
         .filter(|(_, grant)| target.starts_with(&grant.target_path))
@@ -2883,64 +3201,122 @@ fn translate_export_path(path: &str, grants: &[PreparedGrant]) -> Result<String,
             .to_string_lossy()
             .into_owned());
     }
-    target
-        .strip_prefix("/workspace")
-        .ok()
-        .and_then(|path| path.to_str())
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            ErrorData::new(
-                "artifact.outside_workspace",
-                "artifact path is outside an imported grant or /workspace",
-                "artifact-export",
-            )
-        })
+    Err(ErrorData::new(
+        "artifact.outside_resource",
+        "artifact path is outside an authorized imported resource",
+        "artifact-export",
+    ))
 }
 
-fn restore_export_path(path: &str, grants: &[PreparedGrant]) -> String {
-    for (index, grant) in grants.iter().enumerate() {
+fn restore_export_path(path: &str, resources: &[PreparedResource]) -> Result<String, ErrorData> {
+    for (index, grant) in resources.iter().enumerate() {
         let prefix = format!("imports/{index}");
         if let Some(suffix) = path.strip_prefix(&prefix) {
-            return format!("{}{}", grant.target_path, suffix);
+            return Ok(format!("{}{}", grant.target_path, suffix));
         }
     }
-    format!("/workspace/{path}")
+    Err(ErrorData::new(
+        "artifact.unexpected_guest_path",
+        "guest returned an artifact outside the requested imported resources",
+        "artifact-export",
+    ))
 }
 
 fn probe() -> Value {
     let executable = std::env::current_exe().ok();
     let native = executable.as_deref().and_then(Path::parent);
-    let kvm = OpenOptions::new()
+    let kvm_result = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_CLOEXEC)
-        .open("/dev/kvm")
-        .is_ok();
-    let firecracker = native
+        .open("/dev/kvm");
+    let kvm = kvm_result.is_ok();
+    let firecracker_result = native
         .map(|path| path.join(firecracker_name()))
-        .is_some_and(|path| verify_file_digest(&path, firecracker_digest(), "Firecracker").is_ok());
-    let workspace = native
+        .ok_or_else(|| {
+            ErrorData::new(
+                "vm.runtime_path",
+                "runtime directory is unavailable",
+                "probe",
+            )
+        })
+        .and_then(|path| verify_file_digest(&path, firecracker_digest(), "Firecracker"));
+    let firecracker = firecracker_result.is_ok();
+    let workspace_result = native
         .map(|path| path.join(WORKSPACE_TEMPLATE))
-        .is_some_and(|path| {
-            verify_file_digest(&path, WORKSPACE_TEMPLATE_SHA256, "workspace template").is_ok()
+        .ok_or_else(|| {
+            ErrorData::new(
+                "vm.runtime_path",
+                "runtime directory is unavailable",
+                "probe",
+            )
+        })
+        .and_then(|path| {
+            verify_file_digest(&path, WORKSPACE_TEMPLATE_SHA256, "workspace template")
         });
+    let workspace = workspace_result.is_ok();
     let recovery = recover_abandoned_vm_state();
     let recovery_available = recovery.is_ok();
     let recovered_state_directories = recovery.as_ref().copied().unwrap_or_default();
-    let recovery_error = recovery.err().map(|error| error.message);
+    let state = if kvm && firecracker && workspace && recovery_available {
+        "available"
+    } else if kvm_result.as_ref().err().is_some_and(|error| {
+        !matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        )
+    }) {
+        "error"
+    } else {
+        "unavailable"
+    };
     json!({
-        "available": kvm && firecracker && workspace && recovery_available,
-        "kvm": kvm,
-        "firecrackerVerified": firecracker,
-        "workspaceTemplate": workspace,
-        "abandonedStateRecovery": recovery_available,
-        "recoveredStateDirectories": recovered_state_directories,
-        "recoveryError": recovery_error,
-        "guestChannel": "virtio-vsock",
-        "networkNone": "no-virtual-nic",
-        "managedNetwork": "authenticated-vsock-policy-broker",
+        "availability": state,
+        "mechanisms": {
+            "kvm": io_probe("open(/dev/kvm, O_RDWR)", &kvm_result),
+            "firecracker": error_data_probe("verify packaged Firecracker digest", &firecracker_result),
+            "workspace-image": error_data_probe("verify workspace image digest", &workspace_result),
+            "abandoned-state-recovery": if recovery_available {
+                json!({"state": "available", "operation": "recover abandoned VM state", "detail": format!("recovered {recovered_state_directories} state directories")})
+            } else {
+                json!({"state": "error", "operation": "recover abandoned VM state", "detail": recovery.err().map(|error| error.message).unwrap_or_default()})
+            },
+            "guest-channel": {"state": "available", "operation": "authenticated virtio-vsock channel", "detail": "verified protocol implementation"},
+            "network-isolation": {"state": "available", "operation": "omit virtual NIC", "detail": "managed networking uses an authenticated policy broker"},
+        },
     })
+}
+
+fn io_probe<T>(operation: &str, result: &io::Result<T>) -> Value {
+    match result {
+        Ok(_) => {
+            json!({"state": "available", "operation": operation, "detail": "operation succeeded"})
+        }
+        Err(error) => {
+            let mut value = json!({
+                "state": if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) { "unavailable" } else { "error" },
+                "operation": operation,
+                "detail": bounded(&error.to_string()),
+            });
+            if let Some(code) = error.raw_os_error() {
+                value["osError"] = json!({"code": code, "name": format!("{:?}", error.kind())});
+            }
+            value
+        }
+    }
+}
+
+fn error_data_probe<T>(operation: &str, result: &Result<T, ErrorData>) -> Value {
+    match result {
+        Ok(_) => {
+            json!({"state": "available", "operation": operation, "detail": "operation succeeded"})
+        }
+        Err(error) => json!({
+            "state": "unavailable",
+            "operation": operation,
+            "detail": bounded(&error.message),
+        }),
+    }
 }
 
 fn validate_image_architecture(image: &VerifiedImage) -> Result<(), ErrorData> {
@@ -3316,27 +3692,6 @@ fn create_authentication_drive(root: &Path) -> Result<(PathBuf, [u8; 32]), Error
     Ok((path, nonce))
 }
 
-fn host_memory() -> Result<u64, ErrorData> {
-    let text = fs::read_to_string("/proc/meminfo")
-        .map_err(|error| os_error("preparation.host_memory", &error, "prepare"))?;
-    let kib = text
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("MemTotal:")
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
-        .ok_or_else(|| {
-            ErrorData::new(
-                "preparation.host_memory",
-                "MemTotal is unavailable",
-                "prepare",
-            )
-        })?;
-    kib.checked_mul(1024)
-        .ok_or_else(|| ErrorData::new("preparation.host_memory", "host memory overflow", "prepare"))
-}
-
 fn cleanup_state(state: &RuntimeState) {
     match state {
         RuntimeState::PreparedRun(run) => {
@@ -3537,6 +3892,18 @@ fn unique(ids: &mut HashSet<String>, id: &str) -> Result<(), ErrorData> {
 
 fn parse<T: for<'de> serde::Deserialize<'de>>(frame: &Frame) -> Result<T, ErrorData> {
     frame.parse_control().map_err(protocol_error)
+}
+
+fn parse_policy_message<T: for<'de> serde::Deserialize<'de>>(
+    frame: &Frame,
+) -> Result<T, ErrorData> {
+    frame.parse_control().map_err(|error| {
+        ErrorData::new(
+            "policy.invalid_contract",
+            bounded(&error.to_string()),
+            "validate",
+        )
+    })
 }
 
 fn write_guest_frame(

@@ -1,45 +1,50 @@
+import type { ImplementationIdentity } from "./enforcement.js";
 import type { SandboxIsolation } from "./sandbox.js";
-import type { FilesystemMask, ManagedNetworkRule, ProcessPolicy } from "./policy.js";
-import type { ResourceLimits } from "./resources.js";
+import type {
+  FilesystemAccess,
+  FilesystemMask,
+  FilesystemResourcePurpose,
+  IpcPolicy,
+  ManagedNetworkRule,
+  ProcessPolicy,
+  SandboxPath,
+} from "./policy.js";
+import type { ResolvedResourceLimits } from "./resources.js";
 
-export interface PreparedGrantSummary {
-  requestedHostPath: string;
-  resolvedHostPath: string;
-  hostIdentityDigest: string;
-  targetPath: string;
-  access: "read" | "read-write";
-  execution: "deny" | "allow";
+export interface PreparedResourceSummary {
+  id: string;
+  source: { requested: string; resolved: string; identityDigest: string };
+  target: SandboxPath;
+  access: FilesystemAccess;
+  purposes: readonly FilesystemResourcePurpose[];
 }
 
 export type PreparedNetworkSummary =
-  | { mode: "none"; topology: "private-namespace" | "no-virtual-nic" }
+  | { mode: "none"; topology: "private-namespace" | "no-virtual-nic" | "blocked-system-calls" }
   | { mode: "managed"; topology: "private-namespace-broker"; allow: readonly ManagedNetworkRule[] }
   | { mode: "unrestricted"; topology: "host-network-namespace" };
 
 export interface PreparedRunSummary {
   isolation: SandboxIsolation;
-  backend: {
-    id: string;
-    version: string;
-    stability: "stable" | "experimental";
-  };
+  implementation: ImplementationIdentity;
   filesystem: {
-    runtimeView: "system" | "empty";
-    runtimeManifestDigest: string;
-    grants: readonly PreparedGrantSummary[];
+    kind: "host" | "isolated";
+    resourceManifestDigest: string;
+    resources: readonly PreparedResourceSummary[];
     masks: readonly FilesystemMask[];
-    privateHomePath: string | null;
-    temporaryPath: string;
+    privateHomePath: SandboxPath | null;
+    temporaryPath: SandboxPath | null;
   };
   network: PreparedNetworkSummary;
   process: ProcessPolicy;
-  resources: ResourceLimits;
+  ipc: IpcPolicy;
+  resources: ResolvedResourceLimits;
   execution: {
-    executable: string;
-    executableIdentityDigest?: string;
-    executableContentSha256?: string;
+    executable: SandboxPath;
+    executableIdentityDigest: string;
+    executableContentSha256: string;
     args: readonly string[];
-    cwd: string;
+    cwd: SandboxPath;
     cwdIdentityDigest: string;
     environmentNames: readonly string[];
     sensitiveEnvironmentNames: readonly string[];
@@ -52,6 +57,5 @@ export interface PreparedRunSummary {
 export type PreparedSessionSummary = Omit<PreparedRunSummary, "execution">;
 
 export interface PreparedProcessSummary {
-  resources: ResourceLimits;
   execution: PreparedRunSummary["execution"];
 }

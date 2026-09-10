@@ -70,7 +70,7 @@ fn handle_probe(mode: &str, body: &Value, output: &mut impl Write) -> Result<(),
                         "protocol": { "major": 1, "minor": 0 },
                         "packageVersion": "test",
                         "host": { "platform": std::env::consts::OS, "architecture": std::env::consts::ARCH },
-                        "backends": []
+                        "implementations": []
                     }
                 }),
             )?;
