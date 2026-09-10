@@ -50,31 +50,36 @@ await chmod(destination, 0o755);
 if (nativePlatform === "macos") {
   await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
 }
-const digest = createHash("sha256").update(await readFile(destination)).digest("hex");
-const manifestPath = resolve(repository, "native", "manifest.json");
 const packageNativeRoot = resolve(repository, "packages", "sandbox", "native");
-let currentFiles: Record<string, string> = {};
-for (const currentManifest of [resolve(packageNativeRoot, "manifest.json"), manifestPath]) {
-  try {
-    const current = JSON.parse(await readFile(currentManifest, "utf8")) as { files?: Record<string, string> };
-    currentFiles = { ...currentFiles, ...current.files };
-  } catch {
-    // A first platform build starts a new manifest.
-  }
-}
-currentFiles[`${nativePlatform}-${architecture}/${destinationName}`] = digest;
-const manifest = `${JSON.stringify({
-  formatVersion: 1,
-  buildId: "sandbox-runtime-0.1.0",
-  files: currentFiles,
-}, null, 2)}\n`;
-await writeFile(manifestPath, manifest, { mode: 0o644 });
-
 const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform}-${architecture}`);
 await mkdir(packageDestinationDirectory, { recursive: true });
 await copyFile(destination, resolve(packageDestinationDirectory, destinationName));
 await chmod(resolve(packageDestinationDirectory, destinationName), 0o755);
-await writeFile(resolve(packageNativeRoot, "manifest.json"), manifest, { mode: 0o644 });
+await writeManifest(resolve(repository, "native"));
+await writeManifest(packageNativeRoot);
+
+async function writeManifest(root: string): Promise<void> {
+  const files: Record<string, string> = {};
+  for (const platform of ["linux", "macos", "windows"]) {
+    for (const architecture of ["x64", "arm64"]) {
+      const name = `sandbox-runtime-${platform}-${architecture}${platform === "windows" ? ".exe" : ""}`;
+      const relativePath = `${platform}-${architecture}/${name}`;
+      let bytes: Buffer;
+      try {
+        bytes = await readFile(resolve(root, relativePath));
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        throw error;
+      }
+      files[relativePath] = createHash("sha256").update(bytes).digest("hex");
+    }
+  }
+  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
+    formatVersion: 1,
+    buildId: "sandbox-runtime-0.1.0",
+    files,
+  }, null, 2)}\n`, { mode: 0o644 });
+}
 
 function classifyTarget(target: string): { platform: "linux" | "macos" | "windows"; architecture: "x64" | "arm64" } {
   const architecture = target.startsWith("x86_64-") ? "x64" : target.startsWith("aarch64-") ? "arm64" : undefined;
