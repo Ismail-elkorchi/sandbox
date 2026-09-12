@@ -411,7 +411,8 @@ mod macos {
                 posix_result(unsafe {
                     libc::posix_spawnattr_setflags(
                         &mut attributes,
-                        libc::POSIX_SPAWN_SETPGROUP as libc::c_short,
+                        (libc::POSIX_SPAWN_SETPGROUP | libc::POSIX_SPAWN_CLOEXEC_DEFAULT)
+                            as libc::c_short,
                     )
                 })?;
                 // SAFETY: all C strings, vectors and initialized spawn objects remain live
@@ -692,19 +693,10 @@ mod macos {
         if unsafe { libc::fcntl(status_fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             fail_child(status_fd, errno());
         }
-        // `closefrom` is unavailable at the deployment target used by the ARM64 release build.
-        // The dedicated launcher has no other threads, and `getdtablesize` bounds every possible
-        // inherited descriptor without depending on that newer symbol.
-        // SAFETY: this fresh child owns its descriptor table and keeps only 0-3. Descriptor 3
-        // reports setup and closes on exec; close errors for absent descriptors are harmless.
-        let descriptor_limit = unsafe { libc::getdtablesize() };
-        if descriptor_limit < 0 {
-            fail_child(status_fd, errno());
-        }
-        for descriptor in 4..descriptor_limit {
-            // SAFETY: each integer is within the child's descriptor table; EBADF is ignored.
-            unsafe { libc::close(descriptor) };
-        }
+        // POSIX_SPAWN_CLOEXEC_DEFAULT limits launcher inheritance to descriptors named by the
+        // spawn actions. The target keeps standard I/O and setup status, and releases the three
+        // guardian-only channels inherited across fork.
+        close_fds(&[4, 5, 6]);
         if unsafe { libc::setpgid(0, 0) } != 0 {
             fail_child(status_fd, errno());
         }

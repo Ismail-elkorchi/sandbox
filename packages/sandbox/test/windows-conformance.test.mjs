@@ -109,7 +109,7 @@ test("Windows AppContainer confines a native process and owns its descendant tre
         executable: hostPath(executable),
         args: ["-e", [
           "const { spawn } = require('node:child_process');",
-          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { stdio: 'ignore' });`,
+          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { stdio: 'inherit' });`,
           "child.on('error', () => {});",
           "setInterval(() => {}, 1000);",
         ].join("\n")],
