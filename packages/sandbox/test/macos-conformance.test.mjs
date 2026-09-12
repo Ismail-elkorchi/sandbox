@@ -76,7 +76,11 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
         environment: { set: {} },
       },
     });
-    assert.deepEqual(result.termination, { reason: "exit", code: 0 });
+    assert.deepEqual(
+      result.termination,
+      { reason: "exit", code: 0 },
+      result.stderr.toString("utf8"),
+    );
     assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), {
       secretDenied: true,
       hostControlDenied: true,
