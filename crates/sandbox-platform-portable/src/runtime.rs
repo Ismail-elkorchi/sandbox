@@ -173,7 +173,7 @@ struct OutputCredits {
 impl OutputCredits {
     fn new() -> Self {
         Self {
-            values: Mutex::new((0, 0)),
+            values: Mutex::new((INITIAL_STREAM_CREDIT, INITIAL_STREAM_CREDIT)),
             changed: Condvar::new(),
         }
     }

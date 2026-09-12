@@ -710,20 +710,6 @@ mod macos {
         if let Err(error) = apply_limits(spec.resources) {
             fail_child(status_fd, error.raw_os_error().unwrap_or(libc::EINVAL));
         }
-        let profile = match CString::new(spec.policy.profile.as_bytes()) {
-            Ok(value) => value,
-            Err(_) => fail_child(status_fd, libc::EINVAL),
-        };
-        let mut sandbox_error: *mut c_char = null_mut();
-        // SAFETY: direct profile string is NUL-terminated, flags zero selects a literal profile,
-        // and error_buffer is a valid output pointer.
-        if unsafe { sandbox_init(profile.as_ptr(), 0, &mut sandbox_error) } != 0 {
-            if !sandbox_error.is_null() {
-                // SAFETY: buffer came from sandbox_init and is released once.
-                unsafe { sandbox_free_error(sandbox_error) };
-            }
-            fail_child(status_fd, libc::EPERM);
-        }
         let cwd = match CString::new(spec.cwd.as_os_str().as_bytes()) {
             Ok(value) => value,
             Err(_) => fail_child(status_fd, libc::EINVAL),
@@ -777,8 +763,23 @@ mod macos {
 
     // SAFETY: this runs only in the dedicated single-threaded helper produced by posix_spawn.
     // Descriptors 3-6 are respectively setup status, specification, parent lifeline, and
-    // lifecycle status. The fresh child is the only process that applies Seatbelt and execs.
+    // lifecycle status. This guardian enters Seatbelt before forking so the target inherits an
+    // established sandbox identity through the ordinary macOS process lifecycle.
     unsafe fn guardian_main(spec: &OwnedLaunchSpec) -> ! {
+        let profile = match CString::new(spec.policy.profile.as_bytes()) {
+            Ok(value) => value,
+            Err(_) => fail_child(3, libc::EINVAL),
+        };
+        let mut sandbox_error: *mut c_char = null_mut();
+        // SAFETY: direct profile string is NUL-terminated, flags zero selects a literal profile,
+        // and error_buffer is a valid output pointer. The dedicated guardian has no other threads.
+        if unsafe { sandbox_init(profile.as_ptr(), 0, &mut sandbox_error) } != 0 {
+            if !sandbox_error.is_null() {
+                // SAFETY: buffer came from sandbox_init and is released once.
+                unsafe { sandbox_free_error(sandbox_error) };
+            }
+            fail_child(3, libc::EPERM);
+        }
         // SAFETY: the helper is single-threaded, so fork does not duplicate any foreign locks.
         let target_pid = unsafe { libc::fork() };
         if target_pid < 0 {
