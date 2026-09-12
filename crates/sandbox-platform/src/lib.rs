@@ -26,8 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static NONCE: AtomicU64 = AtomicU64::new(1);
 pub const IMPLEMENTATION_ID: &str = "linux-namespace-v1";
+pub const HOST_IMPLEMENTATION_ID: &str = "linux-landlock-v1";
 pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CONFORMANCE_MANIFEST_ID: &str = "linux-namespace-v1-conformance-1";
+pub const HOST_CONFORMANCE_MANIFEST_ID: &str = "linux-landlock-v1-conformance-1";
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,7 +117,7 @@ pub struct PreparedResourceSource {
 #[derive(Debug)]
 pub struct PreparedLinuxPolicy {
     pub normalized: NormalizedPolicy,
-    launcher: NamespaceLauncher,
+    implementation: LinuxImplementation,
     pub mounts: Vec<HeldMount>,
     pub resources: Vec<PreparedResourceSummary>,
     pub resource_manifest_digest: String,
@@ -123,6 +125,28 @@ pub struct PreparedLinuxPolicy {
     pub enforcement: EnforcementReport,
     pub policy_digest: String,
     state: StateDirectory,
+}
+
+#[derive(Debug)]
+enum LinuxImplementation {
+    Namespace(NamespaceLauncher),
+    Host,
+}
+
+impl LinuxImplementation {
+    const fn id(&self) -> &'static str {
+        match self {
+            Self::Namespace(_) => IMPLEMENTATION_ID,
+            Self::Host => HOST_IMPLEMENTATION_ID,
+        }
+    }
+
+    const fn conformance_manifest_id(&self) -> &'static str {
+        match self {
+            Self::Namespace(_) => CONFORMANCE_MANIFEST_ID,
+            Self::Host => HOST_CONFORMANCE_MANIFEST_ID,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -179,16 +203,7 @@ pub fn prepare_policy(
     normalized: NormalizedPolicy,
     capabilities: &ProbeCapabilities,
 ) -> Result<PreparedLinuxPolicy, ErrorData> {
-    let selection = select_implementation(&normalized, capabilities)?;
-    if selection != IMPLEMENTATION_ID {
-        return Err(implementation_error(
-            "unsupported.implementation_selection",
-            "selected implementation is unavailable in this runtime",
-            "prepare",
-        ));
-    }
-    let launcher = NamespaceLauncher::open()
-        .map_err(|error| os_error("preparation.namespace_launcher", &error, "prepare"))?;
+    let implementation = select_implementation(&normalized, capabilities)?;
     let state = create_state_directory()
         .map_err(|error| os_error("preparation.state", &error, "prepare"))?;
     let mut mounts = Vec::new();
@@ -218,7 +233,10 @@ pub fn prepare_policy(
                 resolved: mount.resolved_path.clone(),
                 identity_digest: mount.identity_digest.clone(),
             },
-            target: json!({"space": "isolated", "path": &resource.target_path}),
+            target: json!({
+                "space": if normalized.filesystem_kind == "host" { "host" } else { "isolated" },
+                "path": &resource.target_path
+            }),
             access: resource.access.clone(),
             purposes: resource.purposes.clone(),
         });
@@ -239,14 +257,27 @@ pub fn prepare_policy(
         capabilities,
         &resource_manifest_digest,
         &visible_roots,
+        &implementation,
     );
     match_requirements(&normalized, &enforcement)?;
+    let implementation_authority = match &implementation {
+        LinuxImplementation::Namespace(launcher) => json!({
+            "namespaceLauncher": {
+                "identity": launcher.identity,
+                "contentSha256": launcher.content_sha256
+            }
+        }),
+        LinuxImplementation::Host => json!({
+            "landlockAbi": capabilities.landlock_abi,
+            "seccomp": capabilities.seccomp
+        }),
+    };
     let policy_input = json!({
         "digestFormat": 1_u64,
         "protocolMajor": 1_u64,
-        "implementation": {"id": IMPLEMENTATION_ID, "version": IMPLEMENTATION_VERSION, "stability": "stable"},
+        "implementation": {"id": implementation.id(), "version": IMPLEMENTATION_VERSION, "stability": "stable"},
         "targetOperatingSystem": "linux",
-        "namespaceLauncher": {"identity": launcher.identity, "contentSha256": launcher.content_sha256},
+        "implementationAuthority": implementation_authority,
         "policy": &normalized,
         "resourceManifestDigest": &resource_manifest_digest,
         "mounts": mounts.iter().map(mount_digest_value).collect::<Vec<_>>(),
@@ -255,7 +286,7 @@ pub fn prepare_policy(
         .map_err(|error| ErrorData::new("preparation.digest", error.to_string(), "prepare"))?;
     Ok(PreparedLinuxPolicy {
         normalized,
-        launcher,
+        implementation,
         mounts,
         resources: prepared_resources,
         resource_manifest_digest,
@@ -269,19 +300,24 @@ pub fn prepare_policy(
 fn select_implementation(
     policy: &NormalizedPolicy,
     capabilities: &ProbeCapabilities,
-) -> Result<&'static str, ErrorData> {
+) -> Result<LinuxImplementation, ErrorData> {
     let limitations = implementation_limitations(policy, capabilities);
-    if limitations.is_empty() {
-        Ok(IMPLEMENTATION_ID)
-    } else {
-        Err(implementation_error(
+    if !limitations.is_empty() {
+        return Err(implementation_error(
             "unsupported.no_eligible_implementation",
             format!(
                 "no implementation satisfies the normalized policy: {}",
                 limitations.join("; ")
             ),
             "prepare",
-        ))
+        ));
+    }
+    if policy.filesystem_kind == "isolated" {
+        NamespaceLauncher::open()
+            .map(LinuxImplementation::Namespace)
+            .map_err(|error| os_error("preparation.namespace_launcher", &error, "prepare"))
+    } else {
+        Ok(LinuxImplementation::Host)
     }
 }
 
@@ -290,6 +326,9 @@ pub fn implementation_limitations(
     policy: &NormalizedPolicy,
     capabilities: &ProbeCapabilities,
 ) -> Vec<String> {
+    if policy.filesystem_kind == "host" {
+        return host_implementation_limitations(policy, capabilities);
+    }
     let mut limitations = Vec::new();
     if policy.filesystem_kind != "isolated" {
         limitations.push("requires an isolated filesystem layout".to_owned());
@@ -366,6 +405,68 @@ pub fn implementation_limitations(
         limitations.push("descendant-tree CPU time enforcement is unavailable".into());
     }
     limitations.retain(|limitation| !limitation.is_empty());
+    limitations
+}
+
+#[must_use]
+pub fn host_implementation_limitations(
+    policy: &NormalizedPolicy,
+    capabilities: &ProbeCapabilities,
+) -> Vec<String> {
+    let mut limitations = Vec::new();
+    if policy.filesystem_kind != "host" {
+        limitations.push("requires a host filesystem layout".into());
+    }
+    if capabilities.landlock_abi < 3 {
+        limitations.push("Landlock ABI 3 or newer is unavailable".into());
+    }
+    if !capabilities.seccomp {
+        limitations.push("seccomp filter mode is unavailable".into());
+    }
+    if policy.network == "managed" {
+        limitations.push("managed networking requires an isolated network namespace".into());
+    }
+    if policy.process.visibility != "host" {
+        limitations.push("host process visibility cannot be hidden without a PID namespace".into());
+    }
+    if policy.ipc.visibility != "host" {
+        limitations.push("host IPC visibility cannot be hidden without an IPC namespace".into());
+    }
+    if policy.resources.iter().any(|resource| {
+        resource.access.content != resource.access.directory_entries
+            || resource.access.content != resource.access.metadata
+    }) {
+        limitations.push("cannot independently enforce requested mutation dimensions".into());
+    }
+    if policy.limits.wall_time.scope != "process"
+        || policy.limits.output.scope != "process"
+        || policy
+            .limits
+            .memory
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .process_count
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+        || policy
+            .limits
+            .cpu_time
+            .as_ref()
+            .is_some_and(|limit| limit.scope != "descendant-tree")
+    {
+        limitations.push("does not provide requested session-scoped resource accounting".into());
+    }
+    if policy.limits.memory.is_some() && !capabilities.cgroup_memory {
+        limitations.push("memory cgroup delegation is unavailable".into());
+    }
+    if policy.limits.process_count.is_some() && !capabilities.cgroup_processes {
+        limitations.push("process cgroup delegation is unavailable".into());
+    }
+    if policy.limits.cpu_time.is_some() {
+        limitations.push("descendant-tree CPU time enforcement is unavailable".into());
+    }
     limitations
 }
 
@@ -627,11 +728,16 @@ impl PreparedLinuxPolicy {
         &self,
         execution: &PreparedLinuxExecution,
     ) -> Result<LaunchBundle, ErrorData> {
-        let mut files = vec![
-            self.launcher
+        let mut files = vec![match &self.implementation {
+            LinuxImplementation::Namespace(launcher) => launcher
                 .retain()
                 .map_err(|error| os_error("spawn.namespace_launcher", &error, "spawn"))?,
-        ];
+            LinuxImplementation::Host => File::open(
+                std::env::current_exe()
+                    .map_err(|error| os_error("spawn.runtime_path", &error, "spawn"))?,
+            )
+            .map_err(|error| os_error("spawn.runtime_open", &error, "spawn"))?,
+        }];
         let mut mounts = Vec::new();
         for mount in &self.mounts {
             let file = mount
@@ -680,6 +786,7 @@ impl PreparedLinuxPolicy {
             .collect();
         Ok(LaunchBundle {
             spec: LaunchSpec {
+                filesystem_kind: self.normalized.filesystem_kind.clone(),
                 launcher_fd_index: 0,
                 mounts,
                 masks: self.normalized.masks.clone(),
@@ -716,10 +823,10 @@ impl PreparedLinuxPolicy {
         json!({
             "isolation": {"kind": "process"},
             "implementation": {
-                "id": IMPLEMENTATION_ID,
+                "id": self.implementation.id(),
                 "version": IMPLEMENTATION_VERSION,
                 "buildId": BUILD_ID,
-                "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+                "conformanceManifestId": self.implementation.conformance_manifest_id(),
                 "stability": "stable"
             },
             "filesystem": {
@@ -734,7 +841,11 @@ impl PreparedLinuxPolicy {
                 "temporaryPath": self.normalized.temporary.as_ref().map(|directory| json!({"space": "isolated", "path": &directory.target_path})),
             },
             "network": match self.normalized.network.as_str() {
-                "none" => json!({"mode": "none", "topology": "private-namespace"}),
+                "none" => if self.normalized.filesystem_kind == "host" {
+                    json!({"mode": "none", "topology": "blocked-system-calls"})
+                } else {
+                    json!({"mode": "none", "topology": "private-namespace"})
+                },
                 "managed" => json!({
                     "mode": "managed",
                     "topology": "private-namespace-broker",
@@ -1119,8 +1230,14 @@ fn enforcement_report(
     capabilities: &ProbeCapabilities,
     resource_manifest_digest: &str,
     visible_roots: &[String],
+    implementation: &LinuxImplementation,
 ) -> EnforcementReport {
-    let base_available = capabilities.namespace_available(&policy.network);
+    let isolated = matches!(implementation, LinuxImplementation::Namespace(_));
+    let base_available = if isolated {
+        capabilities.namespace_available(&policy.network)
+    } else {
+        capabilities.landlock_abi >= 3 && capabilities.seccomp
+    };
     let satisfied = |id: &str| -> bool {
         if !base_available {
             return false;
@@ -1129,23 +1246,25 @@ fn enforcement_report(
             "runtime.setup-before-exec"
             | "runtime.no-ambient-environment"
             | "runtime.no-ambient-handles"
-            | "runtime.executable-identity-bound"
-            | "filesystem.resource-identities-bound"
             | "filesystem.content-read-confined"
             | "filesystem.content-write-confined"
             | "filesystem.directory-entry-mutation-confined"
             | "filesystem.metadata-mutation-confined"
-            | "filesystem.execution-confined"
+            | "filesystem.execution-confined" => true,
+            "runtime.executable-identity-bound"
+            | "filesystem.resource-identities-bound"
             | "filesystem.name-visibility-confined"
-            | "filesystem.isolated-layout" => policy.filesystem_kind == "isolated",
+            | "filesystem.isolated-layout" => isolated,
             "network.no-external-connect"
             | "network.no-external-listen"
-            | "network.no-host-loopback" => policy.network != "unrestricted",
-            "network.egress-brokered" => policy.network == "managed",
-            "network.private-addresses-denied" => policy.network == "managed",
-            "process.host-visibility-denied" | "process.host-control-denied" => true,
+            | "network.no-host-loopback" => policy.network == "none" || isolated,
+            "network.egress-brokered" | "network.private-addresses-denied" => {
+                isolated && policy.network == "managed"
+            }
+            "process.host-visibility-denied" => isolated,
+            "process.host-control-denied" => true,
             "process.descendant-tree-termination" | "process.group-termination" => true,
-            "ipc.host-endpoints-hidden" | "ipc.host-shared-memory-hidden" => true,
+            "ipc.host-endpoints-hidden" | "ipc.host-shared-memory-hidden" => isolated,
             "resource.wall-time-hard" => policy.limits.wall_time.scope == "process",
             "resource.output-hard" => policy.limits.output.scope == "process",
             "resource.memory-hard" => {
@@ -1195,9 +1314,9 @@ fn enforcement_report(
             } else {
                 Vec::new()
             },
-            mechanism: guarantee_mechanism(id, policy, capabilities),
+            mechanism: guarantee_mechanism(id, policy, capabilities, isolated),
             evidence: if satisfied(id) {
-                vec![CONFORMANCE_MANIFEST_ID.into()]
+                vec![implementation.conformance_manifest_id().into()]
             } else {
                 Vec::new()
             },
@@ -1209,26 +1328,45 @@ fn enforcement_report(
             kind: "os-process".into(),
         },
         implementation: EnforcementImplementation {
-            id: IMPLEMENTATION_ID.into(),
+            id: implementation.id().into(),
             version: IMPLEMENTATION_VERSION.into(),
             build_id: BUILD_ID.into(),
-            conformance_manifest_id: CONFORMANCE_MANIFEST_ID.into(),
+            conformance_manifest_id: implementation.conformance_manifest_id().into(),
             stability: "stable".into(),
-            mechanism: vec!["bubblewrap".into(), "linux user/mount/PID/IPC/UTS namespaces".into(), "synthetic mount root".into(), "Landlock".into(), "seccomp".into()],
+            mechanism: if isolated {
+                vec![
+                    "bubblewrap".into(),
+                    "linux user/mount/PID/IPC/UTS namespaces".into(),
+                    "synthetic mount root".into(),
+                    "Landlock".into(),
+                    "seccomp".into(),
+                ]
+            } else {
+                vec![
+                    "Landlock".into(),
+                    "seccomp".into(),
+                    "no_new_privs".into(),
+                    "process-group supervisor".into(),
+                ]
+            },
         },
         host: EnforcementHost {
             platform: "linux".into(),
             architecture: std::env::consts::ARCH.into(),
             path_style: "posix".into(),
         },
-        target: EnforcementTarget { operating_system: "linux".into(), path_style: "posix".into() },
+        target: EnforcementTarget {
+            operating_system: "linux".into(),
+            path_style: "posix".into(),
+        },
         guarantees,
         filesystem: EnforcementFilesystem {
             kind: policy.filesystem_kind.clone(),
             resource_manifest_digest: resource_manifest_digest.into(),
             visible_roots: visible_roots.to_vec(),
         },
-        caveats: vec![
+        caveats: if isolated {
+            vec![
             EnforcementCaveat {
                 code: "authorized-resources-may-contain-ipc".into(),
                 message: "IPC endpoints intentionally placed inside authorized resources remain reachable as authorized content.".into(),
@@ -1249,7 +1387,26 @@ fn enforcement_report(
                 message: "Memory accounting includes the outer launcher and namespace init. Process accounting reserves two fixed slots for those helpers.".into(),
                 affected_guarantees: vec!["resource.memory-hard".into(), "resource.process-count-hard".into()],
             },
-        ],
+        ]
+        } else {
+            vec![
+            EnforcementCaveat {
+                code: "host-layout-path-authority".into(),
+                message: "Host-layout filesystem authority is path based; preparation does not bind later path resolution to the same object identity.".into(),
+                affected_guarantees: vec!["runtime.executable-identity-bound".into(), "filesystem.resource-identities-bound".into()],
+            },
+            EnforcementCaveat {
+                code: "host-process-and-ipc-visible".into(),
+                message: "Host process metadata and host IPC namespaces remain visible; seccomp denies process-control operations.".into(),
+                affected_guarantees: vec!["process.host-visibility-denied".into(), "ipc.host-endpoints-hidden".into(), "ipc.host-shared-memory-hidden".into()],
+            },
+            EnforcementCaveat {
+                code: "noexec-controls-direct-exec-only".into(),
+                message: "Execution denial blocks direct kernel execution; readable content may still be consumed by an explicitly allowed interpreter.".into(),
+                affected_guarantees: vec!["filesystem.execution-confined".into()],
+            },
+        ]
+        },
     }
 }
 
@@ -1257,6 +1414,7 @@ fn guarantee_mechanism(
     id: &str,
     policy: &NormalizedPolicy,
     capabilities: &ProbeCapabilities,
+    isolated: bool,
 ) -> Vec<String> {
     match id {
         "runtime.setup-before-exec" => {
@@ -1264,29 +1422,48 @@ fn guarantee_mechanism(
         }
         "runtime.no-ambient-environment" => vec!["explicit environment vector".into()],
         "runtime.no-ambient-handles" => vec!["descriptor closure before exec".into()],
-        "runtime.executable-identity-bound" => {
+        "runtime.executable-identity-bound" if isolated => {
             vec![
                 "SHA-256-bound sealed memfd snapshot installed as a read-only private mount".into(),
             ]
         }
-        id if id.starts_with("filesystem.") => vec![
-            "retained bind mounts".into(),
-            "private mount namespace".into(),
-            format!("Landlock ABI {}", capabilities.landlock_abi),
-        ],
+        id if id.starts_with("filesystem.") => {
+            if isolated {
+                vec![
+                    "retained bind mounts".into(),
+                    "private mount namespace".into(),
+                    format!("Landlock ABI {}", capabilities.landlock_abi),
+                ]
+            } else {
+                vec![format!("Landlock ABI {}", capabilities.landlock_abi)]
+            }
+        }
         id if id.starts_with("network.") && policy.network == "none" => {
-            vec!["private network namespace without external interfaces".into()]
+            if isolated {
+                vec!["private network namespace without external interfaces".into()]
+            } else {
+                vec!["seccomp denial of socket creation and network operations".into()]
+            }
         }
         id if id.starts_with("network.") && policy.network == "managed" => vec![
             "private network namespace without an external interface".into(),
             "host-side HTTP CONNECT, HTTP, SOCKS5 and DNS broker".into(),
             "connection-time DNS and address validation".into(),
         ],
-        id if id.starts_with("process.") => vec![
-            "PID and user namespaces".into(),
-            "namespace-init reaping".into(),
-        ],
-        id if id.starts_with("ipc.") => vec!["IPC namespace and synthetic root".into()],
+        id if id.starts_with("process.") => {
+            if isolated {
+                vec![
+                    "PID and user namespaces".into(),
+                    "namespace-init reaping".into(),
+                ]
+            } else {
+                vec![
+                    "seccomp process-control denial".into(),
+                    "subreaper process-group supervision".into(),
+                ]
+            }
+        }
+        id if id.starts_with("ipc.") && isolated => vec!["IPC namespace and synthetic root".into()],
         "resource.wall-time-hard" => vec!["supervisor monotonic deadline".into()],
         "resource.output-hard" => vec!["supervisor byte accounting before frame delivery".into()],
         "resource.memory-hard" if capabilities.cgroup_memory => {

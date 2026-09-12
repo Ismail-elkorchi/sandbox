@@ -413,28 +413,11 @@ fn handle_frame(
             {
                 unmet.push("requested filesystem layout".into());
             }
-            if !request
-                .get("allowExperimentalImplementations")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                unmet.push("experimental implementation permission".into());
-            }
             if request.get("isolation").is_some() && request.get("policy").is_some() {
-                let mut requirements = request
+                let requirements = request
                     .get("requirements")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                requirements["allowExperimentalImplementations"] = json!(
-                    requirements
-                        .get("allowExperimentalImplementations")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                        && request
-                            .get("allowExperimentalImplementations")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                );
                 let options = json!({
                     "isolation": request.get("isolation"),
                     "policy": request.get("policy"),
@@ -480,7 +463,7 @@ fn handle_frame(
                             },
                             "boundary": "os-process",
                             "filesystem": ["host"],
-                            "stability": "experimental",
+                            "stability": "stable",
                             "availability": capability.availability,
                             "eligibility": {
                                 "state": if !evaluated { "not-evaluated" } else if unmet.is_empty() { "eligible" } else { "ineligible" },
@@ -871,13 +854,6 @@ fn handle_frame(
 }
 
 fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorData> {
-    if !normalized.requirements.allow_experimental_implementations {
-        return Err(ErrorData::new(
-            "requirement.experimental_implementation",
-            format!("{IMPLEMENTATION_ID} requires explicit experimental implementation permission"),
-            "prepare",
-        ));
-    }
     #[cfg(target_os = "windows")]
     if normalized.network != "none" {
         return Err(ErrorData::new(
@@ -966,11 +942,14 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
         return Err(error);
     }
     let authority = Arc::new(Mutex::new(authority));
-    let visible_roots = normalized
+    let mut visible_roots = normalized
         .resources
         .iter()
         .map(|resource| resource.target_path.clone())
         .collect::<Vec<_>>();
+    visible_roots.push(private_home.to_string_lossy().into_owned());
+    visible_roots.push(temporary.to_string_lossy().into_owned());
+    visible_roots.sort();
     let manifest_digest = identity_digest(&json!({
         "implementation": IMPLEMENTATION_ID,
         "filesystemKind": normalized.filesystem_kind,
@@ -982,7 +961,7 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
     let digest = policy_digest(&json!({
         "digestFormat": 1,
         "protocolMajor": PROTOCOL_MAJOR,
-        "implementation": {"id": IMPLEMENTATION_ID, "version": IMPLEMENTATION_VERSION, "stability": "experimental"},
+        "implementation": {"id": IMPLEMENTATION_ID, "version": IMPLEMENTATION_VERSION, "stability": "stable"},
         "targetOperatingSystem": TARGET_OPERATING_SYSTEM,
         "policy": normalized,
         "runtimeManifestDigest": manifest_digest,
@@ -1102,16 +1081,7 @@ fn enforcement_report(
     visible_roots: &[String],
 ) -> EnforcementReport {
     let guarantees = GUARANTEES.iter().map(|id| guarantee(policy, id)).collect();
-    let mut caveats = vec![EnforcementCaveat {
-        code: "experimental.compatibility-boundary".into(),
-        message: format!(
-            "{IMPLEMENTATION_ID} is experimental and must not be treated as a Linux namespace-equivalent boundary"
-        ),
-        affected_guarantees: vec![
-            "process.host-visibility-denied".into(),
-            "ipc.host-endpoints-hidden".into(),
-        ],
-    }];
+    let mut caveats = Vec::new();
     #[cfg(target_os = "windows")]
     caveats.push(EnforcementCaveat {
         code: "windows.path-identity".into(),
@@ -1119,8 +1089,6 @@ fn enforcement_report(
         affected_guarantees: vec![
             "filesystem.resource-identities-bound".into(),
             "runtime.executable-identity-bound".into(),
-            "filesystem.content-read-confined".into(),
-            "filesystem.metadata-mutation-confined".into(),
         ],
     });
     #[cfg(target_os = "macos")]
@@ -1130,23 +1098,21 @@ fn enforcement_report(
         affected_guarantees: vec![
             "filesystem.resource-identities-bound".into(),
             "runtime.executable-identity-bound".into(),
-            "filesystem.execution-confined".into(),
         ],
     });
     #[cfg(target_os = "macos")]
     caveats.push(EnforcementCaveat {
         code: "macos.process-namespace".into(),
-        message: "Seatbelt provides no PID namespace: unrelated process visibility and same-user signalling are not claimed, and cleanup owns a process group rather than an unescapable kernel job".into(),
+        message: "Seatbelt provides no PID namespace, so unrelated process visibility and descendant-tree ownership are not claimed; process-control operations outside the target group remain denied".into(),
         affected_guarantees: vec![
             "process.host-visibility-denied".into(),
-            "process.host-control-denied".into(),
             "process.descendant-tree-termination".into(),
         ],
     });
     #[cfg(target_os = "macos")]
     caveats.push(EnforcementCaveat {
         code: "macos.mach-bootstrap-services".into(),
-        message: "The compatibility profile permits only documented runtime Mach lookups, but macOS supplies no private bootstrap namespace and the implementation does not claim host IPC endpoint isolation".into(),
+        message: "The generated profile permits only documented runtime Mach lookups, but macOS supplies no private bootstrap namespace and the implementation does not claim host IPC endpoint isolation".into(),
         affected_guarantees: vec![
             "ipc.host-endpoints-hidden".into(),
             "ipc.host-shared-memory-hidden".into(),
@@ -1155,13 +1121,13 @@ fn enforcement_report(
     #[cfg(target_os = "macos")]
     caveats.push(EnforcementCaveat {
         code: "macos.desktop-services".into(),
-        message: "Pasteboard and GUI services are not granted by the generated profile; this is a compatibility policy, not a private desktop or login session".into(),
+        message: "Pasteboard and GUI services are not granted by the generated profile; it does not create a private desktop or login session".into(),
         affected_guarantees: vec!["ipc.host-endpoints-hidden".into()],
     });
     #[cfg(target_os = "macos")]
     caveats.push(EnforcementCaveat {
         code: "macos.local-sockets".into(),
-        message: "network none denies local sockets with all other networking; unrestricted mode exposes host-local and Unix-socket endpoints, so host IPC isolation remains unsatisfied in either compatibility mode".into(),
+        message: "network none denies local sockets with all other networking; unrestricted mode exposes host-local and Unix-socket endpoints, so host IPC isolation remains unsatisfied in either mode".into(),
         affected_guarantees: vec!["ipc.host-endpoints-hidden".into()],
     });
     #[cfg(target_os = "macos")]
@@ -1181,7 +1147,7 @@ fn enforcement_report(
             version: IMPLEMENTATION_VERSION.into(),
             build_id: format!("sandbox-platform-portable-{IMPLEMENTATION_VERSION}"),
             conformance_manifest_id: CONFORMANCE_ID.into(),
-            stability: "experimental".into(),
+            stability: "stable".into(),
             mechanism: mechanisms(),
         },
         host: EnforcementHost {
@@ -1219,21 +1185,28 @@ fn guarantee(policy: &NormalizedPolicy, id: &str) -> GuaranteeFact {
         "runtime.setup-before-exec"
         | "runtime.no-ambient-environment"
         | "runtime.no-ambient-handles"
+        | "filesystem.content-read-confined"
         | "filesystem.content-write-confined"
-        | "filesystem.directory-entry-mutation-confined" => true,
-        "filesystem.content-read-confined" | "filesystem.name-visibility-confined" => {
-            cfg!(target_os = "macos")
-        }
+        | "filesystem.directory-entry-mutation-confined"
+        | "filesystem.metadata-mutation-confined"
+        | "filesystem.execution-confined" => true,
+        "filesystem.name-visibility-confined" => false,
         "resource.wall-time-hard" => policy.limits.wall_time.scope == "process",
         "resource.output-hard" => policy.limits.output.scope == "process",
         "resource.single-file-size-hard" => {
-            cfg!(target_os = "macos") && policy.limits.single_file_size.scope == "process"
+            cfg!(target_os = "macos")
+                && policy
+                    .limits
+                    .single_file_size
+                    .as_ref()
+                    .is_some_and(|limit| limit.scope == "process")
         }
         "network.no-external-connect"
         | "network.no-external-listen"
         | "network.no-host-loopback" => network_none,
         "process.descendant-tree-termination" => cfg!(target_os = "windows"),
         "process.group-termination" => cfg!(target_os = "macos") || cfg!(target_os = "windows"),
+        "process.host-control-denied" => true,
         "resource.memory-hard" => {
             cfg!(target_os = "windows")
                 && policy
@@ -1250,24 +1223,14 @@ fn guarantee(policy: &NormalizedPolicy, id: &str) -> GuaranteeFact {
                     .as_ref()
                     .is_some_and(|limit| limit.scope == "descendant-tree")
         }
-        "resource.cpu-time-hard" => {
-            cfg!(target_os = "macos")
-                && policy
-                    .limits
-                    .cpu_time
-                    .as_ref()
-                    .is_some_and(|limit| limit.scope == "descendant-tree")
-        }
+        "resource.cpu-time-hard" => false,
         "resource.open-files-hard" => cfg!(target_os = "macos"),
         "runtime.executable-identity-bound"
         | "filesystem.resource-identities-bound"
-        | "filesystem.metadata-mutation-confined"
-        | "filesystem.execution-confined"
         | "filesystem.isolated-layout"
         | "network.egress-brokered"
         | "network.private-addresses-denied"
         | "process.host-visibility-denied"
-        | "process.host-control-denied"
         | "ipc.host-endpoints-hidden"
         | "ipc.host-shared-memory-hidden"
         | "vm.boot-artifacts-verified"
@@ -1285,7 +1248,11 @@ fn guarantee(policy: &NormalizedPolicy, id: &str) -> GuaranteeFact {
             Vec::new()
         },
         mechanism: if status { mechanisms() } else { Vec::new() },
-        evidence: Vec::new(),
+        evidence: if status {
+            vec![CONFORMANCE_ID.into()]
+        } else {
+            Vec::new()
+        },
         caveats: Vec::new(),
     }
 }
@@ -1492,7 +1459,7 @@ fn session_summary(policy: &PreparedPolicy) -> Value {
             "version": IMPLEMENTATION_VERSION,
             "buildId": format!("sandbox-platform-portable-{IMPLEMENTATION_VERSION}"),
             "conformanceManifestId": CONFORMANCE_ID,
-            "stability": "experimental"
+            "stability": "stable"
         },
         "filesystem": {
             "kind": policy.normalized.filesystem_kind,
@@ -1509,11 +1476,11 @@ fn session_summary(policy: &PreparedPolicy) -> Value {
                 "purposes": &resource.purposes,
             })).collect::<Vec<_>>(),
             "masks": [],
-            "privateHomePath": Value::Null,
-            "temporaryPath": Value::Null,
+            "privateHomePath": {"space": "host", "path": policy.private_home},
+            "temporaryPath": {"space": "host", "path": policy.temporary},
         },
         "network": match policy.normalized.network.as_str() {
-            "none" => json!({"mode": "none", "topology": "private-namespace"}),
+            "none" => json!({"mode": "none", "topology": "blocked-system-calls"}),
             "unrestricted" => json!({"mode": "unrestricted", "topology": "host-network-namespace"}),
             _ => json!({"mode": "managed", "topology": "private-namespace-broker", "allow": policy.normalized.managed_network_rules}),
         },
@@ -1963,7 +1930,12 @@ fn functional_probe() -> ProbeResult {
         fs::create_dir(&home)?;
         fs::create_dir(&temporary)?;
         let policy = sandbox_launcher_macos::SeatbeltPolicy::generate(
-            &[],
+            &[sandbox_launcher_macos::Grant {
+                resolved_host_path: PathBuf::from("/usr/bin"),
+                target_path: PathBuf::from("/usr/bin"),
+                access: sandbox_launcher_macos::GrantAccess::Read,
+                executable: true,
+            }],
             home,
             temporary,
             sandbox_launcher_macos::NetworkMode::None,
@@ -2608,6 +2580,7 @@ fn platform_spawn(
             } else {
                 sandbox_launcher_macos::GrantAccess::Read
             },
+            executable: grant.access.execution == "allow",
         })
         .collect::<Vec<_>>();
     let masks = policy
@@ -2648,14 +2621,24 @@ fn platform_spawn(
                     .cpu_time
                     .as_ref()
                     .map(|limit| limit.value),
-                max_file_bytes: Some(policy.normalized.limits.single_file_size.value),
+                max_file_bytes: policy
+                    .normalized
+                    .limits
+                    .single_file_size
+                    .as_ref()
+                    .map(|limit| limit.value),
                 max_processes: policy
                     .normalized
                     .limits
                     .process_count
                     .as_ref()
                     .map(|limit| limit.value),
-                max_open_files: Some(policy.normalized.limits.open_files.value),
+                max_open_files: policy
+                    .normalized
+                    .limits
+                    .open_files
+                    .as_ref()
+                    .map(|limit| limit.value),
             },
         });
     for fd in [stdin_pipe[0], stdout_pipe[1], stderr_pipe[1]] {

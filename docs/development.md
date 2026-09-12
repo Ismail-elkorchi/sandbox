@@ -34,7 +34,7 @@ cargo audit --deny warnings
 cargo audit --file fuzz/Cargo.lock --deny warnings
 ```
 
-Native tests probe required host functionality and record exact unavailable or error outcomes when the current machine cannot enforce an implementation. A Linux machine without usable namespaces, Landlock, or delegated cgroups is not treated as functional conformance. Windows and macOS probe tests run on their native hosts and keep currently unsatisfied replacement obligations visible.
+Native tests probe required host functionality and record exact unavailable or error outcomes when the current machine cannot enforce an implementation. A Linux machine without the mechanisms required by a concrete policy is not treated as functional conformance. Windows and macOS tests exercise policy denial, process-tree termination, results, and stronger-requirement rejection on their native hosts.
 
 ## Fuzzing
 

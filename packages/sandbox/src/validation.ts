@@ -219,13 +219,13 @@ export function parseResourceLimits(value: unknown): ResolvedResourceLimits {
   const source = object(value, "resources");
   const result: ResolvedResourceLimits = {
     wallTime: parseHardLimit(source.wallTime, "resources.wallTime", ["process", "session"]),
-    openFiles: parseHardLimit(source.openFiles, "resources.openFiles", ["process"]),
-    singleFileSize: parseHardLimit(source.singleFileSize, "resources.singleFileSize", ["process"]),
     output: parseHardLimit(source.output, "resources.output", ["process", "session"]),
   };
   if (source.memory !== undefined) result.memory = parseHardLimit(source.memory, "resources.memory", ["descendant-tree", "session"]);
   if (source.processCount !== undefined) result.processCount = parseHardLimit(source.processCount, "resources.processCount", ["descendant-tree", "session"]);
   if (source.cpuTime !== undefined) result.cpuTime = parseHardLimit(source.cpuTime, "resources.cpuTime", ["descendant-tree", "session"]);
+  if (source.openFiles !== undefined) result.openFiles = parseHardLimit(source.openFiles, "resources.openFiles", ["process"]);
+  if (source.singleFileSize !== undefined) result.singleFileSize = parseHardLimit(source.singleFileSize, "resources.singleFileSize", ["process"]);
   return result;
 }
 
@@ -275,7 +275,9 @@ export function parseSessionSummary(value: unknown): PreparedSessionSummary {
         mode: "none" as const,
         topology: preparedIsolation.kind === "hardware-vm"
           ? requireLiteral(network.topology, "no-virtual-nic", "network.topology")
-          : requireLiteral(network.topology, "private-namespace", "network.topology"),
+          : filesystem.kind === "host"
+            ? requireLiteral(network.topology, "blocked-system-calls", "network.topology")
+            : requireLiteral(network.topology, "private-namespace", "network.topology"),
       }
     : networkMode === "managed"
       ? {

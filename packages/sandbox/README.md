@@ -38,4 +38,4 @@ await sandbox.dispose();
 
 See the repository [policy guide](../../docs/policy.md) and [getting started guide](../../docs/getting-started.md).
 
-Linux process isolation requires system bubblewrap at `/usr/bin/bwrap`, Landlock ABI 3 or later, and seccomp. `probe()` reports host support for the supplied policy. Explicit memory and process-count limits additionally require writable cgroup delegation.
+Linux isolated process execution requires system bubblewrap at `/usr/bin/bwrap`, Landlock ABI 3 or later, and seccomp. A host-layout policy can use Landlock and seccomp when user namespaces or bubblewrap are unavailable. `probe()` reports host support for the supplied policy. Explicit memory and process-count limits additionally require writable cgroup delegation.

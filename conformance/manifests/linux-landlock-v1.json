@@ -1,0 +1,15 @@
+{
+  "id": "linux-landlock-v1-conformance-1",
+  "implementation": "linux-landlock-v1",
+  "version": "0.1.0",
+  "boundary": "os-process",
+  "filesystem": "host",
+  "stability": "stable",
+  "suites": [
+    "preparation",
+    "filesystem",
+    "network-none",
+    "resources",
+    "cleanup"
+  ]
+}

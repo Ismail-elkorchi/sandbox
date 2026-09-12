@@ -77,7 +77,7 @@ resources: {
 }
 ```
 
-Scopes are part of the request. An implementation cannot substitute a per-process limit for a descendant-tree or session limit. Memory, process-count, and CPU limits are absent unless explicitly requested. The remaining defaults are 600,000 ms wall time, 1,024 open files, 1 GiB per file, and 32 MiB output. Resolved limits appear in the prepared summary and digest. Usage in results is measurement, not another limit declaration.
+Scopes are part of the request. An implementation cannot substitute a per-process limit for a descendant-tree or session limit. Memory, process-count, CPU, open-file, and single-file-size limits are absent unless explicitly requested. Wall time defaults to 600,000 ms and output to 32 MiB. Resolved limits appear in the prepared summary and digest. Usage in results is measurement, not another limit declaration.
 
 ## Requirements and implementation selection
 

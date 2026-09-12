@@ -311,7 +311,7 @@ pub fn isolated_main(descriptor: Option<OsString>) -> i32 {
                 ));
             }
         }
-        namespace_init(&mut control, &handoff.spec, files)
+        namespace_init(&mut control, &handoff.spec, files, true)
     })();
     match result {
         Ok(code) => code,

@@ -2,15 +2,16 @@
 
 This repository provides prepared, policy-driven sandbox execution for Node.js. A preparation binds the selected implementation, explicit filesystem resources, resolved hard limits, executable bytes and identity, arguments, working directory, environment, and output requests before authorization.
 
-Linux execution uses system bubblewrap; see [Linux requirements](docs/linux-backend.md).
+Linux isolated execution uses system bubblewrap. Linux host-layout execution uses Landlock and seccomp without a user namespace; see [Linux requirements](docs/linux-backend.md).
 
 The runtime fails closed. `probe()` reports observed mechanisms and request eligibility, while preparation opens and verifies the concrete resources. It never changes the requested filesystem layout or isolation boundary to find a fallback.
 
 | Implementation | Boundary | Filesystem | Status |
 | --- | --- | --- | --- |
 | `linux-namespace-v1` | OS process | isolated | Stable when requested guarantees are supported |
-| `windows-appcontainer-v1` | OS process | host | Experimental; object identity guarantees are not implemented |
-| `darwin-seatbelt-v1` | OS process | host | Experimental; object identity guarantees are not implemented |
+| `linux-landlock-v1` | OS process | host | Stable when requested guarantees are supported |
+| `windows-appcontainer-v1` | OS process | host | Stable; path identity limitations are reported |
+| `darwin-seatbelt-v1` | OS process | host | Stable; path identity limitations are reported |
 | `linux-firecracker-v1` | hardware virtualized | isolated imports | Experimental extension |
 
 ```ts

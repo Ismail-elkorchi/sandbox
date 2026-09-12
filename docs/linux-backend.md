@@ -1,4 +1,4 @@
-# Linux namespace implementation
+# Linux process implementations
 
 `linux-namespace-v1` constructs an isolated filesystem and process context with the system bubblewrap executable at `/usr/bin/bwrap`. Bubblewrap must be installed and permitted by the host's security policy. The runtime verifies root ownership and write permissions, retains its executable descriptor, and binds its identity and content digest during preparation. It does not change host security settings.
 
@@ -18,4 +18,6 @@ PID-namespace ownership provides descendant cleanup, including daemonized proces
 
 Child exit, output draining, and completed cleanup are distinct lifecycle states. In-flight stream credits cannot invalidate a completed execution, and delayed consumers cannot return credit to another process. Deadline watchers stop when their process exits.
 
-There is one namespace construction path. A host-filesystem implementation is not qualified. macOS, Windows, and hardware-VM support are described in [implementation support](backends.md).
+`linux-landlock-v1` handles host-layout policies without bubblewrap or user namespaces. It preserves host path names, admits only declared filesystem roots through Landlock, denies networking and host-process control through seccomp when requested, and supervises an unescapable process group as a subreaper. It does not claim hidden host names, processes, IPC, or path object identity. Memory and process-count limits require the same cgroup delegation only when requested.
+
+macOS, Windows, and hardware-VM support are described in [implementation support](backends.md).

@@ -144,6 +144,7 @@ impl FirecrackerProcess {
         let launcher_fd_index = files.len();
         files.push(sandbox_launcher_linux::NamespaceLauncher::open()?.file);
         let spec = LaunchSpec {
+            filesystem_kind: "isolated".into(),
             launcher_fd_index,
             mounts,
             masks: Vec::<NormalizedMask>::new(),
@@ -172,8 +173,8 @@ impl FirecrackerProcess {
                 cpu_time: None,
                 memory: None,
                 process_count: None,
-                open_files: hard_limit("process", 1024),
-                single_file_size: hard_limit("process", 16 * 1024 * 1024 * 1024),
+                open_files: Some(hard_limit("process", 1024)),
+                single_file_size: Some(hard_limit("process", 16 * 1024 * 1024 * 1024)),
                 output: hard_limit("process", 64 * 1024 * 1024),
             },
             termination_grace_ms: 1_000,

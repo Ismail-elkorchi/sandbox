@@ -350,8 +350,10 @@ pub struct ResourceLimits {
     pub memory: Option<HardLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_count: Option<HardLimit>,
-    pub open_files: HardLimit,
-    pub single_file_size: HardLimit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_files: Option<HardLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub single_file_size: Option<HardLimit>,
     pub output: HardLimit,
 }
 
@@ -967,8 +969,6 @@ fn derive_obligations(policy: &NormalizedPolicy) -> Vec<String> {
         "runtime.setup-before-exec".to_owned(),
         "runtime.no-ambient-environment".to_owned(),
         "runtime.no-ambient-handles".to_owned(),
-        "runtime.executable-identity-bound".to_owned(),
-        "filesystem.resource-identities-bound".to_owned(),
         "filesystem.content-read-confined".to_owned(),
         "filesystem.content-write-confined".to_owned(),
         "filesystem.directory-entry-mutation-confined".to_owned(),
@@ -976,10 +976,10 @@ fn derive_obligations(policy: &NormalizedPolicy) -> Vec<String> {
         "filesystem.execution-confined".to_owned(),
         "resource.wall-time-hard".to_owned(),
         "resource.output-hard".to_owned(),
-        "resource.open-files-hard".to_owned(),
-        "resource.single-file-size-hard".to_owned(),
     ]);
     if policy.filesystem_kind == "isolated" {
+        obligations.insert("runtime.executable-identity-bound".into());
+        obligations.insert("filesystem.resource-identities-bound".into());
         obligations.insert("filesystem.name-visibility-confined".into());
         obligations.insert("filesystem.isolated-layout".into());
     }
@@ -1023,6 +1023,12 @@ fn derive_obligations(policy: &NormalizedPolicy) -> Vec<String> {
     }
     if policy.limits.cpu_time.is_some() {
         obligations.insert("resource.cpu-time-hard".into());
+    }
+    if policy.limits.open_files.is_some() {
+        obligations.insert("resource.open-files-hard".into());
+    }
+    if policy.limits.single_file_size.is_some() {
+        obligations.insert("resource.single-file-size-hard".into());
     }
     if matches!(policy.isolation, Isolation::HardwareVm { .. }) {
         obligations.extend([
@@ -1407,14 +1413,8 @@ pub fn resolve_resources(partial: &PartialResourceLimits) -> Result<ResourceLimi
         cpu_time: partial.cpu_time.clone(),
         memory: partial.memory.clone(),
         process_count: partial.process_count.clone(),
-        open_files: partial
-            .open_files
-            .clone()
-            .unwrap_or_else(|| hard_limit("process", 1024)),
-        single_file_size: partial
-            .single_file_size
-            .clone()
-            .unwrap_or_else(|| hard_limit("process", 1_073_741_824)),
+        open_files: partial.open_files.clone(),
+        single_file_size: partial.single_file_size.clone(),
         output: partial
             .output
             .clone()
@@ -1438,8 +1438,14 @@ fn validate_limits(limits: &ResourceLimits) -> Result<(), PolicyError> {
             .process_count
             .as_ref()
             .is_none_or(|limit| validate_limit(limit, &["descendant-tree", "session"]))
-        && validate_limit(&limits.open_files, &["process"])
-        && validate_limit(&limits.single_file_size, &["process"])
+        && limits
+            .open_files
+            .as_ref()
+            .is_none_or(|limit| validate_limit(limit, &["process"]))
+        && limits
+            .single_file_size
+            .as_ref()
+            .is_none_or(|limit| validate_limit(limit, &["process"]))
         && validate_limit(&limits.output, &["process", "session"]);
     if !valid {
         return Err(policy_error(

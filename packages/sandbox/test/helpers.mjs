@@ -27,6 +27,10 @@ export function isolatedResource(id, source, target, access = readAccess(), purp
   };
 }
 
+export function hostResource(id, path, access = readAccess(), purposes = ["data"]) {
+  return { id, path: hostPath(path), access, purposes };
+}
+
 export function runtimeResources() {
   const candidates = [
     ["runtime-bin", "/bin", "executable"],
@@ -58,6 +62,19 @@ export function isolatedPolicy(resources = runtimeResources(), overrides = {}) {
       termination: { scope: "descendant-tree", graceMs: 100 },
     },
     ipc: overrides.ipc ?? { visibility: "session" },
+  };
+}
+
+export function hostPolicy(resources, overrides = {}) {
+  return {
+    filesystem: { kind: "host", resources },
+    network: overrides.network ?? { mode: "none" },
+    process: overrides.process ?? {
+      visibility: "host",
+      control: "session",
+      termination: { scope: "descendant-tree", graceMs: 100 },
+    },
+    ipc: overrides.ipc ?? { visibility: "host" },
   };
 }
 

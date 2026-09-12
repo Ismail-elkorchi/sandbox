@@ -33,6 +33,7 @@ const INTERNAL_STDIN_CREDIT: u8 = 104;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchSpec {
+    pub filesystem_kind: String,
     pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
     pub masks: Vec<NormalizedMask>,
@@ -191,7 +192,7 @@ fn run_kernel_probe() -> KernelProbeResult {
             unavailable("prctl(PR_SET_NO_NEW_PRIVS)", &io::Error::last_os_error()),
         );
     } else {
-        match apply_seccomp() {
+        match apply_seccomp("unrestricted", false) {
             Ok(()) => {
                 // SAFETY: PR_GET_SECCOMP has no pointer arguments and returns the active mode.
                 let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
@@ -482,13 +483,35 @@ fn run_launcher() -> io::Result<i32> {
     let spec: LaunchSpec = serde_json::from_slice(&payload).map_err(invalid_data)?;
     validate_spec(&spec, files.len())?;
 
-    namespace::launch(&spec, &files)
+    if spec.filesystem_kind == "host" {
+        host_launch(&mut control, &spec, files)
+    } else {
+        namespace::launch(&spec, &files)
+    }
+}
+
+fn host_launch(control: &mut UnixStream, spec: &LaunchSpec, files: Vec<File>) -> io::Result<i32> {
+    if !spec.masks.is_empty() || spec.private_home.is_some() || spec.temporary.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host layout cannot contain isolated filesystem features",
+        ));
+    }
+    // SAFETY: these prctl operations apply monotonic lifecycle restrictions to this
+    // single-threaded launcher before it creates the target.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    namespace_init(control, spec, files, false)
 }
 
 fn namespace_init(
     control: &mut UnixStream,
     spec: &LaunchSpec,
     files: Vec<File>,
+    isolated: bool,
 ) -> io::Result<i32> {
     let managed_environment = if spec.network_mode == "managed" {
         setup_managed_listeners(control)?
@@ -525,8 +548,13 @@ fn namespace_init(
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
             unsafe { libc::_exit(125) };
         }
-        if let Err(error) = target_exec(stdin_read.as_raw_fd(), spec, &files, &managed_environment)
-        {
+        if let Err(error) = target_exec(
+            stdin_read.as_raw_fd(),
+            spec,
+            &files,
+            &managed_environment,
+            isolated,
+        ) {
             let error = context("target exec setup", error);
             let _ = exec_status_write.write_all(error.to_string().as_bytes());
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
@@ -583,8 +611,13 @@ fn namespace_init(
         INTERNAL_STARTED,
         &serde_json::to_vec(&started).map_err(invalid_data)?,
     )?;
-    let final_status =
-        supervise_namespace(control, stdin_write, target_pid, spec.termination_grace_ms)?;
+    let final_status = supervise_process(
+        control,
+        stdin_write,
+        target_pid,
+        spec.termination_grace_ms,
+        isolated,
+    )?;
     write_internal(
         control,
         INTERNAL_EXIT,
@@ -598,6 +631,7 @@ fn target_exec(
     spec: &LaunchSpec,
     files: &[File],
     managed_environment: &BTreeMap<String, String>,
+    isolated: bool,
 ) -> io::Result<()> {
     // SAFETY: stdin_fd is an owned live pipe descriptor; dup2 atomically replaces descriptor 0.
     if unsafe { libc::dup2(stdin_fd, libc::STDIN_FILENO) } < 0 {
@@ -649,15 +683,17 @@ fn target_exec(
             "prepared executable snapshot digest changed",
         ));
     }
-    let mounted_executable = open_path(
-        Path::new(&spec.executable_snapshot_path),
-        libc::O_RDONLY | libc::O_CLOEXEC,
-    )?;
-    if sha256_file(&mounted_executable)? != spec.executable_content_sha256 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "mounted executable snapshot digest changed",
-        ));
+    if spec.filesystem_kind == "isolated" {
+        let mounted_executable = open_path(
+            Path::new(&spec.executable_snapshot_path),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )?;
+        if sha256_file(&mounted_executable)? != spec.executable_content_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "mounted executable snapshot digest changed",
+            ));
+        }
     }
 
     let cwd = CString::new(cwd_target.0).map_err(invalid_data)?;
@@ -670,13 +706,14 @@ fn target_exec(
     }
     drop(cwd_target.1);
 
-    drop_capabilities().map_err(|error| context("drop capabilities", error))?;
+    drop_capabilities(isolated).map_err(|error| context("drop capabilities", error))?;
     // SAFETY: PR_SET_NO_NEW_PRIVS takes scalar arguments and only restricts this process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(context("set no_new_privs", io::Error::last_os_error()));
     }
     apply_landlock(spec).map_err(|error| context("install Landlock ruleset", error))?;
-    apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
+    apply_seccomp(&spec.network_mode, spec.filesystem_kind == "host")
+        .map_err(|error| context("install seccomp filter", error))?;
 
     prepare_descriptors_for_exec().map_err(|error| context("close ambient descriptors", error))?;
 
@@ -694,16 +731,28 @@ fn target_exec(
         .map(|(name, value)| CString::new(format!("{name}={value}")).map_err(invalid_data))
         .collect::<io::Result<_>>()?;
     let environment_pointers = c_string_pointers(&environment);
-    let launch_path =
-        CString::new(spec.executable_snapshot_path.as_bytes()).map_err(invalid_data)?;
     apply_rlimits(&spec.resources).map_err(|error| context("apply target rlimits", error))?;
-    // SAFETY: launch_path names the read-only bind mount of the sealed snapshot, and argv/envp are live NUL-terminated arrays.
-    let result = unsafe {
-        libc::execve(
-            launch_path.as_ptr(),
-            argument_pointers.as_ptr(),
-            environment_pointers.as_ptr(),
-        )
+    let result = if spec.filesystem_kind == "host" {
+        // SAFETY: executable is the verified sealed snapshot retained through setup;
+        // argv and envp are live NUL-terminated arrays.
+        unsafe {
+            libc::fexecve(
+                executable.as_raw_fd(),
+                argument_pointers.as_ptr(),
+                environment_pointers.as_ptr(),
+            )
+        }
+    } else {
+        let launch_path =
+            CString::new(spec.executable_snapshot_path.as_bytes()).map_err(invalid_data)?;
+        // SAFETY: launch_path names the read-only bind mount of the sealed snapshot.
+        unsafe {
+            libc::execve(
+                launch_path.as_ptr(),
+                argument_pointers.as_ptr(),
+                environment_pointers.as_ptr(),
+            )
+        }
     } as libc::c_long;
     if result != 0 {
         return Err(context(
@@ -746,11 +795,12 @@ fn setup_managed_listeners(control: &mut UnixStream) -> io::Result<BTreeMap<Stri
     ]))
 }
 
-fn supervise_namespace(
+fn supervise_process(
     control: &mut UnixStream,
     stdin_write: File,
     target_pid: libc::pid_t,
     termination_grace_ms: u64,
+    isolated: bool,
 ) -> io::Result<LauncherFinalStatus> {
     let mut target_status = None;
     let mut terminating_at: Option<Instant> = None;
@@ -766,7 +816,12 @@ fn supervise_namespace(
         reap_children(target_pid, &mut target_status)?;
         if let Some(status) = target_status {
             let mut cleanup_failures = Vec::new();
-            if let Err(error) = kill_all_children() {
+            let cleanup = if isolated {
+                kill_all_children()
+            } else {
+                signal_process_group(target_pid, libc::SIGKILL)
+            };
+            if let Err(error) = cleanup {
                 cleanup_failures.push(format!("kill descendants: {error}"));
             }
             let tree_reaped = match reap_until_empty() {
@@ -902,6 +957,14 @@ fn sandbox_protocol_credit_limit() -> usize {
 }
 
 fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
+    if !matches!(spec.filesystem_kind.as_str(), "host" | "isolated")
+        || (spec.filesystem_kind == "host" && spec.network_mode == "managed")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid launcher filesystem and network combination",
+        ));
+    }
     if spec.launcher_fd_index >= descriptor_count
         || spec.executable_fd_index >= descriptor_count
         || spec
@@ -952,8 +1015,12 @@ fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
 }
 
 fn apply_rlimits(limits: &ResourceLimits) -> io::Result<()> {
-    set_rlimit(libc::RLIMIT_NOFILE, limits.open_files.value)?;
-    set_rlimit(libc::RLIMIT_FSIZE, limits.single_file_size.value)?;
+    if let Some(limit) = &limits.open_files {
+        set_rlimit(libc::RLIMIT_NOFILE, limit.value)?;
+    }
+    if let Some(limit) = &limits.single_file_size {
+        set_rlimit(libc::RLIMIT_FSIZE, limit.value)?;
+    }
     if let Some(cpu_time) = &limits.cpu_time {
         let soft = cpu_time.value.div_ceil(1000);
         set_rlimit_pair(libc::RLIMIT_CPU, soft, soft.saturating_add(1))?;
@@ -996,23 +1063,25 @@ struct CapData {
     inheritable: u32,
 }
 
-fn drop_capabilities() -> io::Result<()> {
-    for capability in 0..64 {
-        // SAFETY: PR_CAPBSET_READ takes a scalar capability number and no pointers.
-        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
-        if present == 0 {
-            continue;
-        }
-        if present < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                break;
+fn drop_capabilities(drop_bounding_set: bool) -> io::Result<()> {
+    if drop_bounding_set {
+        for capability in 0..64 {
+            // SAFETY: PR_CAPBSET_READ takes a scalar capability number and no pointers.
+            let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+            if present == 0 {
+                continue;
             }
-            return Err(error);
-        }
-        // SAFETY: PR_CAPBSET_DROP monotonically removes this supported capability.
-        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
+            if present < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    break;
+                }
+                return Err(error);
+            }
+            // SAFETY: PR_CAPBSET_DROP monotonically removes this supported capability.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
     let mut header = CapHeader {
@@ -1184,18 +1253,20 @@ fn apply_landlock(spec: &LaunchSpec) -> io::Result<()> {
         )
         .map_err(|error| context("add Landlock rule temporary directory", error))?;
     }
-    add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
-        .map_err(|error| context("add Landlock rule /dev", error))?;
-    add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
-        .map_err(|error| context("add Landlock rule /proc", error))?;
-    add_landlock_rule(&ruleset, Path::new("/etc"), LL_READ & handled)
-        .map_err(|error| context("add Landlock rule /etc", error))?;
-    add_landlock_rule(
-        &ruleset,
-        Path::new(&spec.executable_snapshot_path),
-        (LL_READ_FILE | LL_EXECUTE) & handled,
-    )
-    .map_err(|error| context("add Landlock rule executable snapshot", error))?;
+    if spec.filesystem_kind == "isolated" {
+        add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
+            .map_err(|error| context("add Landlock rule /dev", error))?;
+        add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
+            .map_err(|error| context("add Landlock rule /proc", error))?;
+        add_landlock_rule(&ruleset, Path::new("/etc"), LL_READ & handled)
+            .map_err(|error| context("add Landlock rule /etc", error))?;
+        add_landlock_rule(
+            &ruleset,
+            Path::new(&spec.executable_snapshot_path),
+            (LL_READ_FILE | LL_EXECUTE) & handled,
+        )
+        .map_err(|error| context("add Landlock rule executable snapshot", error))?;
+    }
 
     // SAFETY: ruleset is a live Landlock ruleset descriptor and flags zero is required by the negotiated ABI.
     if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 {
@@ -1238,13 +1309,13 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
-fn apply_seccomp() -> io::Result<()> {
+fn apply_seccomp(network_mode: &str, host_layout: bool) -> io::Result<()> {
     let architecture = if cfg!(target_arch = "x86_64") {
         AUDIT_ARCH_X86_64
     } else {
         AUDIT_ARCH_AARCH64
     };
-    let blocked = blocked_syscalls();
+    let blocked = blocked_syscalls(network_mode, host_layout);
     let mut filters = Vec::with_capacity(blocked.len() * 2 + 10);
     filters.push(stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4));
     filters.push(jump(
@@ -1319,8 +1390,8 @@ fn apply_seccomp() -> io::Result<()> {
     Ok(())
 }
 
-fn blocked_syscalls() -> Vec<libc::c_long> {
-    vec![
+fn blocked_syscalls(network_mode: &str, host_layout: bool) -> Vec<libc::c_long> {
+    let mut syscalls = vec![
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -1344,7 +1415,32 @@ fn blocked_syscalls() -> Vec<libc::c_long> {
         libc::SYS_keyctl,
         libc::SYS_perf_event_open,
         libc::SYS_clone3,
-    ]
+    ];
+    if host_layout {
+        syscalls.extend([
+            libc::SYS_setsid,
+            libc::SYS_setpgid,
+            libc::SYS_kill,
+            libc::SYS_tkill,
+            libc::SYS_tgkill,
+            libc::SYS_pidfd_open,
+            libc::SYS_pidfd_send_signal,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+        ]);
+    }
+    if host_layout && network_mode == "none" {
+        syscalls.extend([
+            libc::SYS_socket,
+            libc::SYS_socketpair,
+            libc::SYS_connect,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+        ]);
+    }
+    syscalls
 }
 
 const fn stmt(code: u16, value: u32) -> libc::sock_filter {

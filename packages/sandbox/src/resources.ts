@@ -22,7 +22,7 @@ export interface ResolvedResourceLimits {
   cpuTime?: HardLimit<"descendant-tree" | "session">;
   memory?: HardLimit<"descendant-tree" | "session">;
   processCount?: HardLimit<"descendant-tree" | "session">;
-  openFiles: HardLimit<"process">;
-  singleFileSize: HardLimit<"process">;
+  openFiles?: HardLimit<"process">;
+  singleFileSize?: HardLimit<"process">;
   output: HardLimit<"process" | "session">;
 }

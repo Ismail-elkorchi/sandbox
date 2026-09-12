@@ -43,9 +43,9 @@ The trusted computing base includes the package-owned supervisor and launcher, t
 
 This boundary does not defend against a compromised host kernel, kernel vulnerabilities reachable by the target, malicious host administrators, physical attacks, or broad microarchitectural side channels.
 
-### Windows and macOS previews
+### Windows and macOS process implementations
 
-Windows additionally trusts AppContainer, Job Objects, Windows access checks, and ACL semantics. macOS trusts Seatbelt, process-group signaling, and the guardian lifeline. Both are experimental and report guarantees they cannot establish rather than inheriting Linux claims.
+Windows additionally trusts AppContainer, Job Objects, Windows access checks, and ACL semantics. macOS trusts Seatbelt, process-group signaling, and the guardian lifeline. Both retain host path, process, and IPC visibility and report guarantees their native mechanisms do not establish.
 
 ### Firecracker
 

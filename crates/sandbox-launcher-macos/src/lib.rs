@@ -22,6 +22,7 @@ pub struct Grant {
     pub resolved_host_path: PathBuf,
     pub target_path: PathBuf,
     pub access: GrantAccess,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,27 +82,11 @@ impl SeatbeltPolicy {
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
-             (allow process-exec)\n\
              (allow process-fork)\n\
              (allow signal (target self))\n\
              (allow sysctl-read)\n\
              (allow file-read-metadata)\n",
         );
-        for runtime_root in [
-            "/System",
-            "/usr/bin",
-            "/usr/lib",
-            "/usr/share",
-            "/bin",
-            "/sbin",
-            "/Library/Apple",
-            "/private/etc",
-            "/dev/null",
-            "/dev/urandom",
-            "/dev/random",
-        ] {
-            append_path_rule(&mut profile, "file-read*", runtime_root)?;
-        }
         // Dynamic linking and ordinary CLI startup require these global services. They are
         // reported as compatibility caveats instead of being described as process isolation.
         for service in [
@@ -124,6 +109,13 @@ impl SeatbeltPolicy {
                 operation,
                 path_text(&grant.resolved_host_path)?,
             )?;
+            if grant.executable {
+                append_path_rule(
+                    &mut profile,
+                    "process-exec",
+                    path_text(&grant.resolved_host_path)?,
+                )?;
+            }
         }
         append_path_rule(
             &mut profile,
@@ -1145,6 +1137,7 @@ mod tests {
                 resolved_host_path: PathBuf::from("/tmp/a quote \" here"),
                 target_path: PathBuf::from("/tmp/a quote \" here"),
                 access: GrantAccess::Read,
+                executable: true,
             }],
             PathBuf::from("/private/tmp/home"),
             PathBuf::from("/private/tmp/tmp"),
@@ -1163,6 +1156,7 @@ mod tests {
                 resolved_host_path: PathBuf::from("/tmp/a"),
                 target_path: PathBuf::from("/workspace"),
                 access: GrantAccess::ReadWrite,
+                executable: false,
             }],
             PathBuf::from("/tmp/home"),
             PathBuf::from("/tmp/tmp"),

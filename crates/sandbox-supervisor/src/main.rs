@@ -12,9 +12,10 @@ mod linux {
     };
     use sandbox_network_broker::{BrokerHandle, NetworkViolation};
     use sandbox_platform::{
-        BUILD_ID, CONFORMANCE_MANIFEST_ID, Cgroup, IMPLEMENTATION_ID, IMPLEMENTATION_VERSION,
-        PreparedLinuxExecution, PreparedLinuxPolicy, ProbeCapabilities, execution_summary,
-        implementation_limitations, prepare_execution, prepare_policy, probe_cgroup_delegation,
+        BUILD_ID, CONFORMANCE_MANIFEST_ID, Cgroup, HOST_CONFORMANCE_MANIFEST_ID,
+        HOST_IMPLEMENTATION_ID, IMPLEMENTATION_ID, IMPLEMENTATION_VERSION, PreparedLinuxExecution,
+        PreparedLinuxPolicy, ProbeCapabilities, execution_summary, implementation_limitations,
+        prepare_execution, prepare_policy, probe_cgroup_delegation,
     };
     use sandbox_policy::{
         ActivateSessionMessage, ErrorData, IdMessage, PrepareProcessMessage, PrepareRunMessage,
@@ -1846,49 +1847,9 @@ mod linux {
     }
 
     fn probe_support(capabilities: &ProbeCapabilities, request: &Value) -> Value {
-        let core =
-            capabilities.namespaces && capabilities.landlock_abi >= 3 && capabilities.seccomp;
-        let availability = if core {
-            "available"
-        } else if capabilities
-            .mechanisms
-            .values()
-            .any(|outcome| outcome.state == "error")
-        {
-            "error"
-        } else {
-            "unavailable"
-        };
-        let request_object = request.as_object();
-        let evaluated = request_object.is_some_and(|object| !object.is_empty());
-        let filesystem = request
-            .get("filesystem")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                request
-                    .get("policy")
-                    .and_then(|policy| policy.get("filesystem"))
-                    .and_then(|filesystem| filesystem.get("kind"))
-                    .and_then(Value::as_str)
-            });
-        let network = request.get("network").and_then(Value::as_str).or_else(|| {
-            request
-                .get("policy")
-                .and_then(|policy| policy.get("network"))
-                .and_then(|network| network.get("mode"))
-                .and_then(Value::as_str)
-        });
-        let isolation = request.get("isolation").and_then(|value| {
-            value
-                .as_str()
-                .or_else(|| value.get("kind").and_then(Value::as_str))
-        });
-        let mut unmet = Vec::new();
-        if !core {
-            unmet.push("implementation mechanisms".to_owned());
-        }
+        let evaluated = request.as_object().is_some_and(|object| !object.is_empty());
         let exact_request = request.get("isolation").is_some() && request.get("policy").is_some();
-        if exact_request {
+        let policy = if exact_request {
             let options = json!({
                 "isolation": request.get("isolation"),
                 "policy": request.get("policy"),
@@ -1896,107 +1857,173 @@ mod linux {
                 "resources": request.get("resources").cloned().unwrap_or_else(|| json!({})),
                 "preparedTtlMs": null,
             });
-            match serde_json::from_value::<SessionOptions>(options)
-                .map_err(|error| error.to_string())
-                .and_then(|options| {
-                    normalize_session(options).map_err(|error| error.0.message.clone())
-                }) {
-                Ok(policy) => {
-                    unmet.extend(implementation_limitations(&policy, capabilities));
+            Some(
+                serde_json::from_value::<SessionOptions>(options)
+                    .map_err(|error| error.to_string())
+                    .and_then(|options| {
+                        normalize_session(options).map_err(|error| error.0.message.clone())
+                    }),
+            )
+        } else {
+            None
+        };
+        let namespace_core =
+            capabilities.namespaces && capabilities.landlock_abi >= 3 && capabilities.seccomp;
+        let host_core = capabilities.landlock_abi >= 3 && capabilities.seccomp;
+        let namespace_unmet = probe_unmet(
+            capabilities,
+            request,
+            policy.as_ref(),
+            "isolated",
+            namespace_core,
+        );
+        let host_unmet = probe_unmet(capabilities, request, policy.as_ref(), "host", host_core);
+        let availability = |available: bool| {
+            if available {
+                "available"
+            } else if capabilities
+                .mechanisms
+                .values()
+                .any(|outcome| outcome.state == "error")
+            {
+                "error"
+            } else {
+                "unavailable"
+            }
+        };
+        json!({
+            "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
+            "packageVersion": env!("CARGO_PKG_VERSION"),
+            "host": {"platform": "linux", "architecture": std::env::consts::ARCH},
+            "implementations": [
+                {
+                    "identity": {
+                        "id": IMPLEMENTATION_ID,
+                        "version": IMPLEMENTATION_VERSION,
+                        "buildId": BUILD_ID,
+                        "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
+                    },
+                    "boundary": "os-process",
+                    "filesystem": ["isolated"],
+                    "stability": "stable",
+                    "availability": availability(namespace_core),
+                    "eligibility": {
+                        "state": if !evaluated { "not-evaluated" } else if namespace_unmet.is_empty() { "eligible" } else { "ineligible" },
+                        "unmet": namespace_unmet,
+                    },
+                    "mechanisms": &capabilities.mechanisms,
+                },
+                {
+                    "identity": {
+                        "id": HOST_IMPLEMENTATION_ID,
+                        "version": IMPLEMENTATION_VERSION,
+                        "buildId": BUILD_ID,
+                        "conformanceManifestId": HOST_CONFORMANCE_MANIFEST_ID,
+                    },
+                    "boundary": "os-process",
+                    "filesystem": ["host"],
+                    "stability": "stable",
+                    "availability": availability(host_core),
+                    "eligibility": {
+                        "state": if !evaluated { "not-evaluated" } else if host_unmet.is_empty() { "eligible" } else { "ineligible" },
+                        "unmet": host_unmet,
+                    },
+                    "mechanisms": &capabilities.mechanisms,
+                }
+            ],
+        })
+    }
+
+    fn probe_unmet(
+        capabilities: &ProbeCapabilities,
+        request: &Value,
+        policy: Option<&Result<sandbox_policy::NormalizedPolicy, String>>,
+        filesystem_kind: &str,
+        mechanisms_available: bool,
+    ) -> Vec<String> {
+        let mut unmet = Vec::new();
+        if !mechanisms_available {
+            unmet.push("implementation mechanisms".into());
+        }
+        if let Some(policy) = policy {
+            match policy {
+                Ok(policy) if policy.filesystem_kind == filesystem_kind => {
+                    unmet.extend(implementation_limitations(policy, capabilities));
                     for guarantee in policy
                         .obligations
                         .iter()
                         .chain(policy.requirements.additional.iter())
                     {
-                        if !probe_guarantee(capabilities, guarantee, &policy.network) {
+                        if !probe_guarantee(
+                            capabilities,
+                            guarantee,
+                            &policy.network,
+                            filesystem_kind == "isolated",
+                        ) {
                             unmet.push(guarantee.clone());
                         }
                     }
                 }
+                Ok(_) => unmet.push(format!("requires a {filesystem_kind} filesystem layout")),
                 Err(error) => unmet.push(format!("invalid policy: {error}")),
             }
         } else {
+            let isolation = request.get("isolation").and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("kind").and_then(Value::as_str))
+            });
             if isolation.is_some_and(|kind| kind != "process") {
                 unmet.push("requested isolation boundary".into());
             }
-            if filesystem.is_some_and(|kind| kind != "isolated") {
+            let requested_filesystem = request.get("filesystem").and_then(Value::as_str);
+            if requested_filesystem.is_some_and(|kind| kind != filesystem_kind) {
                 unmet.push("requested filesystem layout".into());
-            }
-            if network.is_some_and(|mode| mode != "unrestricted") && !capabilities.network_namespace
-            {
-                unmet.push("network namespace".into());
-            }
-        }
-        if let Some(additional) = request
-            .get("requirements")
-            .and_then(|requirements| requirements.get("additional"))
-            .and_then(Value::as_array)
-        {
-            for guarantee in additional.iter().filter_map(Value::as_str) {
-                if !probe_guarantee(capabilities, guarantee, network.unwrap_or("none")) {
-                    unmet.push(guarantee.to_owned());
-                }
             }
         }
         unmet.sort();
         unmet.dedup();
-        json!({
-            "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
-            "packageVersion": env!("CARGO_PKG_VERSION"),
-            "host": {"platform": "linux", "architecture": std::env::consts::ARCH},
-            "implementations": [{
-                "identity": {
-                    "id": IMPLEMENTATION_ID,
-                    "version": IMPLEMENTATION_VERSION,
-                    "buildId": BUILD_ID,
-                    "conformanceManifestId": CONFORMANCE_MANIFEST_ID,
-                },
-                "boundary": "os-process",
-                "filesystem": ["isolated"],
-                "stability": "stable",
-                "availability": availability,
-                "eligibility": {
-                    "state": if !evaluated { "not-evaluated" } else if unmet.is_empty() { "eligible" } else { "ineligible" },
-                    "unmet": unmet,
-                },
-                "mechanisms": &capabilities.mechanisms,
-            }],
-        })
+        unmet
     }
 
-    fn probe_guarantee(capabilities: &ProbeCapabilities, guarantee: &str, network: &str) -> bool {
+    fn probe_guarantee(
+        capabilities: &ProbeCapabilities,
+        guarantee: &str,
+        network: &str,
+        isolated: bool,
+    ) -> bool {
         match guarantee {
             "runtime.setup-before-exec"
             | "runtime.no-ambient-environment"
             | "runtime.no-ambient-handles"
-            | "runtime.executable-identity-bound"
-            | "filesystem.resource-identities-bound"
             | "filesystem.content-read-confined"
             | "filesystem.content-write-confined"
             | "filesystem.directory-entry-mutation-confined"
             | "filesystem.metadata-mutation-confined"
             | "filesystem.execution-confined"
-            | "filesystem.name-visibility-confined"
-            | "filesystem.isolated-layout"
-            | "process.host-visibility-denied"
             | "process.host-control-denied"
             | "process.group-termination"
-            | "ipc.host-endpoints-hidden"
-            | "ipc.host-shared-memory-hidden"
+            | "process.descendant-tree-termination"
             | "resource.wall-time-hard"
             | "resource.output-hard"
             | "resource.open-files-hard"
             | "resource.single-file-size-hard" => true,
+            "runtime.executable-identity-bound"
+            | "filesystem.resource-identities-bound"
+            | "filesystem.name-visibility-confined"
+            | "filesystem.isolated-layout"
+            | "process.host-visibility-denied"
+            | "ipc.host-endpoints-hidden"
+            | "ipc.host-shared-memory-hidden" => isolated,
             "network.no-external-connect"
             | "network.no-external-listen"
             | "network.no-host-loopback" => {
-                network != "unrestricted" && capabilities.network_namespace
+                network == "none" || (isolated && capabilities.network_namespace)
             }
             "network.egress-brokered" | "network.private-addresses-denied" => {
-                network == "managed" && capabilities.network_namespace
+                isolated && network == "managed" && capabilities.network_namespace
             }
             "resource.memory-hard" => capabilities.cgroup_memory,
-            "process.descendant-tree-termination" => capabilities.namespaces,
             "resource.process-count-hard" => capabilities.cgroup_processes,
             "resource.cpu-time-hard"
             | "vm.boot-artifacts-verified"

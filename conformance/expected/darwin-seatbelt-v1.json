@@ -1,0 +1,16 @@
+{
+  "implementation": "darwin-seatbelt-v1",
+  "requiredFacts": [
+    "runtime.setup-before-exec",
+    "runtime.no-ambient-environment",
+    "runtime.no-ambient-handles",
+    "filesystem.content-read-confined",
+    "filesystem.content-write-confined",
+    "filesystem.execution-confined",
+    "network.no-external-connect",
+    "process.host-control-denied",
+    "process.group-termination",
+    "resource.wall-time-hard",
+    "resource.output-hard"
+  ]
+}

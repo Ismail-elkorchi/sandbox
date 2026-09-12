@@ -1832,8 +1832,8 @@ fn guest_run_request(running: &Running) -> GuestRequest {
                 .process_count
                 .as_ref()
                 .map_or(256, |limit| limit.value),
-            max_open_files: Some(limits.open_files.value),
-            max_single_file_bytes: Some(limits.single_file_size.value),
+            max_open_files: limits.open_files.as_ref().map(|limit| limit.value),
+            max_single_file_bytes: limits.single_file_size.as_ref().map(|limit| limit.value),
             max_output_bytes: limits.output.value,
             termination_grace_ms: running.policy.normalized.process.termination.grace_ms,
         },
