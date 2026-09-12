@@ -1982,22 +1982,16 @@ fn functional_probe() -> ProbeResult {
         let policy = sandbox_launcher_macos::SeatbeltPolicy::generate(
             &[
                 sandbox_launcher_macos::Grant {
-                    resolved_host_path: PathBuf::from("/usr/bin"),
-                    target_path: PathBuf::from("/usr/bin"),
+                    resolved_host_path: PathBuf::from("/usr"),
+                    target_path: PathBuf::from("/usr"),
                     access: sandbox_launcher_macos::GrantAccess::Read,
                     executable: true,
-                },
-                sandbox_launcher_macos::Grant {
-                    resolved_host_path: PathBuf::from("/usr/lib"),
-                    target_path: PathBuf::from("/usr/lib"),
-                    access: sandbox_launcher_macos::GrantAccess::Read,
-                    executable: false,
                 },
                 sandbox_launcher_macos::Grant {
                     resolved_host_path: PathBuf::from("/System"),
                     target_path: PathBuf::from("/System"),
                     access: sandbox_launcher_macos::GrantAccess::Read,
-                    executable: false,
+                    executable: true,
                 },
             ],
             home,

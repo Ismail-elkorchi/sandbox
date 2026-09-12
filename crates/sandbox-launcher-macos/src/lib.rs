@@ -112,7 +112,7 @@ impl SeatbeltPolicy {
             if grant.executable {
                 append_path_rule(
                     &mut profile,
-                    "process-exec",
+                    "process-exec file-map-executable",
                     path_text(&grant.resolved_host_path)?,
                 )?;
             }
@@ -1150,6 +1150,7 @@ mod tests {
         .expect("policy");
         assert!(policy.profile.contains("(deny default)"));
         assert!(policy.profile.contains("(deny network*)"));
+        assert!(policy.profile.contains("process-exec file-map-executable"));
         assert!(policy.profile.contains("a quote \\\" here"));
     }
 
