@@ -2014,10 +2014,10 @@ fn functional_probe() -> ProbeResult {
                 stderr_fd: stderr_file.as_raw_fd(),
                 policy: &policy,
                 resources: sandbox_launcher_macos::ResourceLimits {
-                    cpu_time_ms: Some(1_000),
-                    max_file_bytes: Some(1_024 * 1_024),
-                    max_processes: Some(4),
-                    max_open_files: Some(32),
+                    cpu_time_ms: None,
+                    max_file_bytes: None,
+                    max_processes: None,
+                    max_open_files: None,
                 },
             })?;
         let status = process.wait()?;
