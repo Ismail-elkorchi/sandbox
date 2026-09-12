@@ -66,9 +66,13 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
         args: ["-e", [
           "const fs = require('node:fs');",
           "const net = require('node:net');",
+          "console.error('stage:start');",
           "fs.writeFileSync('created.txt', 'created');",
+          "console.error('stage:workspace-write');",
           `let secretDenied = false; try { fs.readFileSync(${JSON.stringify(secret)}); } catch { secretDenied = true; }`,
+          "console.error('stage:secret-read');",
           "let hostControlDenied = false; try { process.kill(1, 0); } catch { hostControlDenied = true; }",
+          "console.error('stage:host-control');",
           "const socket = net.connect(9, '127.0.0.1');",
           "socket.once('error', () => console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied: true })));",
           "socket.once('connect', () => { socket.destroy(); console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied: false })); });",
