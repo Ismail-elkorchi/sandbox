@@ -1480,7 +1480,7 @@ fn session_summary(policy: &PreparedPolicy) -> Value {
             "temporaryPath": {"space": "host", "path": policy.temporary},
         },
         "network": match policy.normalized.network.as_str() {
-            "none" => json!({"mode": "none", "topology": "blocked-system-calls"}),
+            "none" => network_none_summary(),
             "unrestricted" => json!({"mode": "unrestricted", "topology": "host-network-namespace"}),
             _ => json!({"mode": "managed", "topology": "private-namespace-broker", "allow": policy.normalized.managed_network_rules}),
         },
@@ -1505,19 +1505,27 @@ fn process_summary(execution: &PreparedExecution) -> Value {
 }
 
 fn execution_value(execution: &PreparedExecution) -> Value {
-    let environment_names = execution
-        .normalized
-        .environment
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    let sensitive_environment_names = execution
+    let mut environment_names = execution
         .normalized
         .environment
         .iter()
-        .filter(|(_, value)| value.sensitive)
+        .filter(|(name, _)| !managed_environment_name(name))
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
+    let mut sensitive_environment_names = execution
+        .normalized
+        .environment
+        .iter()
+        .filter(|(name, value)| !managed_environment_name(name) && value.sensitive)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    environment_names.push("HOME".into());
+    #[cfg(target_os = "windows")]
+    environment_names.extend(["LOCALAPPDATA", "TEMP", "TMP", "SystemRoot"].map(String::from));
+    #[cfg(target_os = "macos")]
+    environment_names.push("TMPDIR".into());
+    sort_environment_names(&mut environment_names);
+    sort_environment_names(&mut sensitive_environment_names);
     json!({
         "executable": execution.normalized.executable,
         "executableIdentityDigest": execution.executable_identity_digest,
@@ -1531,6 +1539,42 @@ fn execution_value(execution: &PreparedExecution) -> Value {
         "stdout": execution.normalized.stdout,
         "stderr": execution.normalized.stderr,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn network_none_summary() -> Value {
+    json!({"mode": "none", "topology": "no-virtual-nic"})
+}
+
+#[cfg(target_os = "macos")]
+fn network_none_summary() -> Value {
+    json!({"mode": "none", "topology": "blocked-system-calls"})
+}
+
+#[cfg(target_os = "windows")]
+fn managed_environment_name(name: &str) -> bool {
+    [
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LOCALAPPDATA",
+        "SYSTEMROOT",
+    ]
+    .iter()
+    .any(|managed| name.eq_ignore_ascii_case(managed))
+}
+
+#[cfg(target_os = "macos")]
+fn managed_environment_name(name: &str) -> bool {
+    matches!(name, "HOME" | "TMPDIR" | "TEMP" | "TMP" | "LOCALAPPDATA")
+}
+
+fn sort_environment_names(names: &mut [String]) {
+    #[cfg(target_os = "windows")]
+    names.sort_by_key(|name| name.to_ascii_uppercase());
+    #[cfg(target_os = "macos")]
+    names.sort();
 }
 
 fn path_visible(policy: &PreparedPolicy, path: &Path, executable: bool) -> bool {
@@ -2334,26 +2378,7 @@ fn target_environment(
         .iter()
         .map(|(name, value)| (name.clone(), value.value.clone()))
         .collect::<Vec<_>>();
-    #[cfg(not(target_os = "windows"))]
-    values.retain(|(name, _)| {
-        !matches!(
-            name.as_str(),
-            "HOME" | "TMPDIR" | "TEMP" | "TMP" | "LOCALAPPDATA"
-        )
-    });
-    #[cfg(target_os = "windows")]
-    values.retain(|(name, _)| {
-        ![
-            "HOME",
-            "TMPDIR",
-            "TEMP",
-            "TMP",
-            "LOCALAPPDATA",
-            "SYSTEMROOT",
-        ]
-        .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
-    });
+    values.retain(|(name, _)| !managed_environment_name(name));
     values.push((
         "HOME".into(),
         policy.private_home.to_string_lossy().into_owned(),
