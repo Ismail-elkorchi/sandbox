@@ -1030,8 +1030,7 @@ fn prepare_execution(
         path_within(
             Path::new(&resource.resolved_host_path),
             &executable.resolved_path,
-        )
-            && resource.access.execution == "allow"
+        ) && resource.access.execution == "allow"
             && resource
                 .purposes
                 .iter()
@@ -1547,7 +1546,7 @@ fn execution_value(execution: &PreparedExecution) -> Value {
 
 #[cfg(target_os = "windows")]
 fn network_none_summary() -> Value {
-    json!({"mode": "none", "topology": "no-virtual-nic"})
+    json!({"mode": "none", "topology": "blocked-system-calls"})
 }
 
 #[cfg(target_os = "macos")]

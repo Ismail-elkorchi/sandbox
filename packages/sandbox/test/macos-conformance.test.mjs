@@ -57,6 +57,32 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       JSON.stringify(implementation?.mechanisms),
     );
 
+    const startupDiagnostics = [];
+    for (const args of [
+      ["--version"],
+      ["--jitless", "--version"],
+      ["--jitless", "-e", "console.error('jitless-script-started')"],
+      ["-e", "console.error('script-started')"],
+    ]) {
+      const diagnostic = await sandbox.run({
+        isolation: { kind: "process" },
+        policy,
+        requirements: {},
+        process: {
+          executable: hostPath(executable),
+          args,
+          cwd: hostPath(workspace),
+          environment: { set: {} },
+        },
+      });
+      startupDiagnostics.push({
+        args,
+        termination: diagnostic.termination,
+        stdout: diagnostic.stdout.toString("utf8"),
+        stderr: diagnostic.stderr.toString("utf8"),
+      });
+    }
+
     const result = await sandbox.run({
       isolation: { kind: "process" },
       policy,
@@ -85,6 +111,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       result.termination,
       { reason: "exit", code: 0 },
       [
+        JSON.stringify(startupDiagnostics, null, 2),
         result.stderr.toString("utf8"),
         spawnSync(
           "/usr/bin/log",
