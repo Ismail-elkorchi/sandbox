@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -79,7 +80,22 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
     assert.deepEqual(
       result.termination,
       { reason: "exit", code: 0 },
-      result.stderr.toString("utf8"),
+      [
+        result.stderr.toString("utf8"),
+        spawnSync(
+          "/usr/bin/log",
+          [
+            "show",
+            "--last",
+            "1m",
+            "--style",
+            "compact",
+            "--predicate",
+            'eventMessage CONTAINS[c] "Sandbox:"',
+          ],
+          { encoding: "utf8", timeout: 10_000 },
+        ).stdout,
+      ].filter(Boolean).join("\n"),
     );
     assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), {
       secretDenied: true,

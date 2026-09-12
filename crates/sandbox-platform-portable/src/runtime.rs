@@ -1,11 +1,11 @@
 use sandbox_digest::{execution_digest, identity_digest, policy_digest};
 use sandbox_policy::{
-    ActivateSessionMessage, EnforcementBoundary, EnforcementCaveat, EnforcementFilesystem,
-    EnforcementHost, EnforcementImplementation, EnforcementReport, EnforcementTarget, ErrorData,
-    GUARANTEES, GuaranteeFact, IdMessage, NormalizedExecution, NormalizedPolicy,
-    PrepareProcessMessage, PrepareRunMessage, PrepareSessionMessage, SessionOptions,
-    StartProcessMessage, StartRunMessage, TerminateMessage, normalize_process, normalize_run,
-    normalize_session,
+    ActivateSessionMessage, CoordinatePath, EnforcementBoundary, EnforcementCaveat,
+    EnforcementFilesystem, EnforcementHost, EnforcementImplementation, EnforcementReport,
+    EnforcementTarget, ErrorData, GUARANTEES, GuaranteeFact, IdMessage, NormalizedExecution,
+    NormalizedPolicy, PrepareProcessMessage, PrepareRunMessage, PrepareSessionMessage,
+    SessionOptions, StartProcessMessage, StartRunMessage, TerminateMessage, normalize_process,
+    normalize_run, normalize_session,
 };
 use sandbox_protocol::{
     Frame, Hello, INITIAL_STREAM_CREDIT, MessageType, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -983,7 +983,7 @@ fn prepare_policy(normalized: NormalizedPolicy) -> Result<PreparedPolicy, ErrorD
 
 fn prepare_execution(
     policy: &PreparedPolicy,
-    normalized: NormalizedExecution,
+    mut normalized: NormalizedExecution,
 ) -> Result<PreparedExecution, ErrorData> {
     if normalized.change_set.is_some() {
         return Err(ErrorData::new(
@@ -1011,17 +1011,12 @@ fn prepare_execution(
             "prepare",
         ));
     }
-    if !same_path(
-        Path::new(normalized.executable.path()),
-        &executable.resolved_path,
-    ) || !same_path(Path::new(normalized.cwd.path()), &cwd.resolved_path)
-    {
-        return Err(ErrorData::new(
-            "unsupported.path_identity",
-            format!("{IMPLEMENTATION_ID} requires executable and cwd to be canonical paths"),
-            "prepare",
-        ));
-    }
+    normalized.executable = CoordinatePath::Host {
+        path: executable.resolved_path.to_string_lossy().into_owned(),
+    };
+    normalized.cwd = CoordinatePath::Host {
+        path: cwd.resolved_path.to_string_lossy().into_owned(),
+    };
     if !path_visible(policy, &executable.resolved_path, true)
         || !path_visible(policy, &cwd.resolved_path, false)
     {
