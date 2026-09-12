@@ -83,9 +83,15 @@ impl SeatbeltPolicy {
             "(version 1)\n\
              (deny default)\n\
              (allow process-fork)\n\
-             (allow signal (target self))\n\
+             (allow process-info* (target same-sandbox))\n\
+             (allow signal (target same-sandbox))\n\
              (allow sysctl-read)\n\
-             (allow file-read-metadata)\n",
+             (allow file-read-metadata file-test-existence)\n\
+             (allow system-mac-syscall (mac-policy-name \"vnguard\"))\n\
+             (allow system-mac-syscall\n\
+               (require-all\n\
+                 (mac-policy-name \"Sandbox\")\n\
+                 (mac-syscall-number 67)))\n",
         );
         // Dynamic linking and ordinary CLI startup require these global services. They are
         // reported as compatibility caveats instead of being described as process isolation.
@@ -101,8 +107,8 @@ impl SeatbeltPolicy {
         }
         for grant in grants {
             let operation = match grant.access {
-                GrantAccess::Read => "file-read*",
-                GrantAccess::ReadWrite => "file-read* file-write*",
+                GrantAccess::Read => "file-read* file-test-existence",
+                GrantAccess::ReadWrite => "file-read* file-test-existence file-write*",
             };
             append_path_rule(
                 &mut profile,
@@ -119,7 +125,7 @@ impl SeatbeltPolicy {
         }
         append_path_rule(
             &mut profile,
-            "file-read* file-write*",
+            "file-read* file-test-existence file-write*",
             path_text(&private_home)?,
         )?;
         for mask in masks {
@@ -129,7 +135,7 @@ impl SeatbeltPolicy {
         }
         append_path_rule(
             &mut profile,
-            "file-read* file-write*",
+            "file-read* file-test-existence file-write*",
             path_text(&private_temporary)?,
         )?;
         match network {

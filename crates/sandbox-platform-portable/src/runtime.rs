@@ -1974,6 +1974,7 @@ fn functional_probe() -> ProbeResult {
     let root = std::env::temp_dir().join(format!("sandbox-probe-{}", new_id("macos")));
     let home = root.join("home");
     let temporary = root.join("tmp");
+    let stderr_path = temporary.join("stderr");
     let mut errors = Vec::new();
     let result = (|| -> io::Result<()> {
         fs::create_dir(&root)?;
@@ -1999,6 +2000,7 @@ fn functional_probe() -> ProbeResult {
             sandbox_launcher_macos::NetworkMode::None,
         )?;
         let null = File::options().read(true).write(true).open("/dev/null")?;
+        let stderr_file = File::create(&stderr_path)?;
         let launcher = std::env::current_exe()?;
         let mut process =
             sandbox_launcher_macos::Process::spawn(&sandbox_launcher_macos::ProcessLaunchSpec {
@@ -2009,7 +2011,7 @@ fn functional_probe() -> ProbeResult {
                 environment: &[],
                 stdin_fd: null.as_raw_fd(),
                 stdout_fd: null.as_raw_fd(),
-                stderr_fd: null.as_raw_fd(),
+                stderr_fd: stderr_file.as_raw_fd(),
                 policy: &policy,
                 resources: sandbox_launcher_macos::ResourceLimits {
                     cpu_time_ms: Some(1_000),
@@ -2020,8 +2022,11 @@ fn functional_probe() -> ProbeResult {
             })?;
         let status = process.wait()?;
         if status.exit_code != Some(0) {
+            drop(stderr_file);
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
             return Err(io::Error::other(format!(
-                "Seatbelt probe exited with {status:?}"
+                "Seatbelt probe exited with {status:?}: {}",
+                stderr.trim()
             )));
         }
         process.terminate_descendants()
