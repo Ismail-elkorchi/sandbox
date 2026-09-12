@@ -88,6 +88,7 @@ impl SeatbeltPolicy {
              (allow signal (target same-sandbox))\n\
              (allow sysctl-read)\n\
              (allow file-read-metadata file-test-existence)\n\
+             (allow file-write-data (literal \"/dev/null\"))\n\
              (allow system-mac-syscall (mac-policy-name \"vnguard\"))\n\
              (allow system-mac-syscall\n\
                (require-all\n\
@@ -1167,6 +1168,9 @@ mod tests {
         .expect("policy");
         assert!(policy.profile.contains("(deny default)"));
         assert!(policy.profile.contains("(allow dynamic-code-generation)"));
+        assert!(policy
+            .profile
+            .contains("(allow file-write-data (literal \"/dev/null\"))"));
         assert!(policy.profile.contains("(deny network*)"));
         assert!(policy.profile.contains("process-exec file-map-executable"));
         assert!(policy.profile.contains("a quote \\\" here"));
