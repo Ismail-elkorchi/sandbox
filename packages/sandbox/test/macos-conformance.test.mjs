@@ -95,7 +95,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
             "--style",
             "compact",
             "--predicate",
-            'eventMessage CONTAINS[c] "Sandbox:"',
+            '(process == "node") OR (eventMessage CONTAINS[c] "Sandbox:")',
           ],
           { encoding: "utf8", timeout: 10_000 },
         ).stdout,

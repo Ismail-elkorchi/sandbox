@@ -1026,9 +1026,12 @@ fn prepare_execution(
             "prepare",
         ));
     }
-    if !policy.normalized.resources.iter().any(|resource| {
-        path_within(Path::new(&resource.target_path), &executable.resolved_path)
-            && resource.executable()
+    if !policy.resources.iter().any(|resource| {
+        path_within(
+            Path::new(&resource.resolved_host_path),
+            &executable.resolved_path,
+        )
+            && resource.access.execution == "allow"
             && resource
                 .purposes
                 .iter()
