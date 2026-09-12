@@ -111,7 +111,11 @@ test("Windows AppContainer confines a native process and owns its descendant tre
         environment: { set: {} },
       },
     });
-    assert.deepEqual(terminated.termination, { reason: "timeout" });
+    assert.deepEqual(
+      terminated.termination,
+      { reason: "timeout" },
+      terminated.stderr.toString("utf8"),
+    );
     await delay(400);
     await assert.rejects(access(escaped));
 
