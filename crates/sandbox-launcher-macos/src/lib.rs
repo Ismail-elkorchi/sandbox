@@ -97,15 +97,25 @@ impl SeatbeltPolicy {
         // Dynamic linking and ordinary CLI startup require these global services. They are
         // reported as compatibility caveats instead of being described as process isolation.
         for service in [
+            "com.apple.PowerManagement.control",
             "com.apple.cfprefsd.agent",
+            "com.apple.logd",
+            "com.apple.logd.events",
+            "com.apple.secinitd",
             "com.apple.system.opendirectoryd.libinfo",
             "com.apple.system.logger",
             "com.apple.system.notification_center",
+            "com.apple.trustd",
+            "com.apple.trustd.agent",
         ] {
             profile.push_str("(allow mach-lookup (global-name ");
             profile.push_str(&seatbelt_literal(service)?);
             profile.push_str("))\n");
         }
+        profile.push_str(
+            "(allow iokit-open\n\
+               (iokit-registry-entry-class \"RootDomainUserClient\"))\n",
+        );
         for grant in grants {
             let operation = match grant.access {
                 GrantAccess::Read => "file-read* file-test-existence",
