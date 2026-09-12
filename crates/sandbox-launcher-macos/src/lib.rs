@@ -497,7 +497,7 @@ mod macos {
             // the fresh guardian before exec.
             if unsafe { libc::kill(-self.target_pid, libc::SIGTERM) } != 0 {
                 let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::NotFound {
+                if !Self::process_absent(&error) {
                     return Err(error);
                 }
             }
@@ -535,7 +535,7 @@ mod macos {
             // SAFETY: negative PID addresses only the group created by the target child.
             if unsafe { libc::kill(-self.target_pid, libc::SIGKILL) } != 0 {
                 let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::NotFound {
+                if Self::process_absent(&error) {
                     return Ok(());
                 }
                 return Err(error);
@@ -545,7 +545,7 @@ mod macos {
                 // SAFETY: signal zero probes the exact target-owned process group.
                 if unsafe { libc::kill(-self.target_pid, 0) } != 0 {
                     let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::NotFound {
+                    if Self::process_absent(&error) {
                         return Ok(());
                     }
                     return Err(error);
@@ -609,6 +609,10 @@ mod macos {
                     ))
                 }
             }
+        }
+
+        fn process_absent(error: &io::Error) -> bool {
+            error.raw_os_error() == Some(libc::ESRCH)
         }
     }
 

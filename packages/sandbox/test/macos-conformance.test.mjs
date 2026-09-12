@@ -50,7 +50,11 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       (candidate) => candidate.identity.id === "darwin-seatbelt-v1",
     );
     assert.equal(implementation?.stability, "stable");
-    assert.equal(implementation?.eligibility.state, "eligible");
+    assert.equal(
+      implementation?.eligibility.state,
+      "eligible",
+      implementation?.eligibility.unmet.join("; "),
+    );
 
     const result = await sandbox.run({
       isolation: { kind: "process" },

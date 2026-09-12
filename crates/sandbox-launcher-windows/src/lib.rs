@@ -137,16 +137,17 @@ mod windows {
         CloseHandle, GetLastError, HANDLE, LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT,
-        SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetEffectiveRightsFromAclW, GetNamedSecurityInfoW,
+        REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+        TRUSTEE_IS_WELL_KNOWN_GROUP,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
         DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_CAPABILITIES,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, PSID, SECURITY_CAPABILITIES,
+        SECURITY_MAX_SID_SIZE, SUB_CONTAINERS_AND_OBJECTS_INHERIT, WinBuiltinAnyPackageSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
@@ -295,6 +296,9 @@ mod windows {
         }
 
         pub fn grant(&mut self, path: &Path, access: GrantAccess) -> io::Result<()> {
+            if app_packages_have_access(path, access)? {
+                return Ok(());
+            }
             self.journal.push(AclJournalEntry {
                 path: path.to_path_buf(),
                 access,
@@ -712,6 +716,16 @@ mod windows {
     }
 
     fn apply_appcontainer_ace(path: &Path, sid: PSID, access: GrantAccess) -> io::Result<()> {
+        update_appcontainer_ace(
+            path,
+            sid,
+            grant_rights(access),
+            GRANT_ACCESS,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        )
+    }
+
+    fn grant_rights(access: GrantAccess) -> u32 {
         let mut rights = FILE_GENERIC_READ;
         if matches!(
             access,
@@ -725,13 +739,68 @@ mod windows {
         ) {
             rights |= FILE_GENERIC_EXECUTE;
         }
-        update_appcontainer_ace(
-            path,
-            sid,
-            rights,
-            GRANT_ACCESS,
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        )
+        rights
+    }
+
+    fn app_packages_have_access(path: &Path, access: GrantAccess) -> io::Result<bool> {
+        let path = wide_os(path.as_os_str());
+        let mut current_acl: *mut ACL = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: output pointers are valid and the returned descriptor is released below.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut current_acl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(win32_error("GetNamedSecurityInfoW", status));
+        }
+        let result = (|| {
+            if current_acl.is_null() {
+                return Ok(true);
+            }
+            let mut sid_storage = [0_u64; 9];
+            let mut sid_size = SECURITY_MAX_SID_SIZE;
+            // SAFETY: aligned storage exceeds SECURITY_MAX_SID_SIZE and its byte length is supplied.
+            if unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAnyPackageSid,
+                    null_mut(),
+                    sid_storage.as_mut_ptr().cast(),
+                    &mut sid_size,
+                )
+            } == 0
+            {
+                return Err(last_error("CreateWellKnownSid"));
+            }
+            let trustee = windows_sys::Win32::Security::Authorization::TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: sid_storage.as_mut_ptr().cast(),
+            };
+            let mut effective_rights = 0_u32;
+            // SAFETY: ACL, trustee SID, and output mask remain live for the call.
+            let status = unsafe {
+                GetEffectiveRightsFromAclW(current_acl, &trustee, &mut effective_rights)
+            };
+            if status != 0 {
+                return Err(win32_error("GetEffectiveRightsFromAclW", status));
+            }
+            let required = grant_rights(access);
+            Ok(effective_rights & required == required)
+        })();
+        // SAFETY: descriptor was allocated by GetNamedSecurityInfoW.
+        unsafe { LocalFree(descriptor) };
+        result
     }
 
     fn remove_appcontainer_ace(path: &Path, sid: PSID) -> io::Result<()> {

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createSandbox } from "../dist/index.js";
@@ -16,11 +16,14 @@ test("Windows AppContainer confines a native process and owns its descendant tre
   const secret = join(parent, "secret.txt");
   await mkdir(workspace);
   await writeFile(secret, "secret");
-  const executable = realpathSync(process.execPath);
+  const runtime = join(parent, "runtime");
+  await mkdir(runtime);
+  const executable = join(runtime, "node.exe");
+  await copyFile(realpathSync(process.execPath), executable);
   const systemRoot = process.env.SystemRoot;
   assert.ok(systemRoot);
   const policy = hostPolicy([
-    hostResource("node-runtime", dirname(dirname(executable)), readAccess("allow"), [
+    hostResource("node-runtime", runtime, readAccess("allow"), [
       "executable",
       "interpreter",
       "loader",
@@ -41,7 +44,11 @@ test("Windows AppContainer confines a native process and owns its descendant tre
       (candidate) => candidate.identity.id === "windows-appcontainer-v1",
     );
     assert.equal(implementation?.stability, "stable");
-    assert.equal(implementation?.eligibility.state, "eligible");
+    assert.equal(
+      implementation?.eligibility.state,
+      "eligible",
+      implementation?.eligibility.unmet.join("; "),
+    );
 
     const result = await sandbox.run({
       isolation: { kind: "process" },

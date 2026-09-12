@@ -1355,7 +1355,13 @@ impl PlatformAuthority {
                 )
             })?
             .grant(path, access)
-            .map_err(|error| os_error("preparation.grant_acl", &error, "prepare"))
+            .map_err(|error| {
+                ErrorData::new(
+                    "preparation.grant_acl",
+                    format!("grant {}: {error}", path.display()),
+                    "prepare",
+                )
+            })
     }
 
     fn cleanup(&mut self) -> Vec<Value> {
