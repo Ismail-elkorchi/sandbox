@@ -53,7 +53,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
     assert.equal(
       implementation?.eligibility.state,
       "eligible",
-      implementation?.eligibility.unmet.join("; "),
+      JSON.stringify(implementation?.mechanisms),
     );
 
     const result = await sandbox.run({

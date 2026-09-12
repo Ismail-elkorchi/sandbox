@@ -18,8 +18,9 @@ test("Windows AppContainer confines a native process and owns its descendant tre
   await writeFile(secret, "secret");
   const runtime = join(parent, "runtime");
   await mkdir(runtime);
-  const executable = join(runtime, "node.exe");
-  await copyFile(realpathSync(process.execPath), executable);
+  const runtimeExecutable = join(runtime, "node.exe");
+  await copyFile(realpathSync(process.execPath), runtimeExecutable);
+  const executable = realpathSync(runtimeExecutable);
   const systemRoot = process.env.SystemRoot;
   assert.ok(systemRoot);
   const policy = hostPolicy([

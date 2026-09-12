@@ -1980,12 +1980,26 @@ fn functional_probe() -> ProbeResult {
         fs::create_dir(&home)?;
         fs::create_dir(&temporary)?;
         let policy = sandbox_launcher_macos::SeatbeltPolicy::generate(
-            &[sandbox_launcher_macos::Grant {
-                resolved_host_path: PathBuf::from("/usr/bin"),
-                target_path: PathBuf::from("/usr/bin"),
-                access: sandbox_launcher_macos::GrantAccess::Read,
-                executable: true,
-            }],
+            &[
+                sandbox_launcher_macos::Grant {
+                    resolved_host_path: PathBuf::from("/usr/bin"),
+                    target_path: PathBuf::from("/usr/bin"),
+                    access: sandbox_launcher_macos::GrantAccess::Read,
+                    executable: true,
+                },
+                sandbox_launcher_macos::Grant {
+                    resolved_host_path: PathBuf::from("/usr/lib"),
+                    target_path: PathBuf::from("/usr/lib"),
+                    access: sandbox_launcher_macos::GrantAccess::Read,
+                    executable: false,
+                },
+                sandbox_launcher_macos::Grant {
+                    resolved_host_path: PathBuf::from("/System"),
+                    target_path: PathBuf::from("/System"),
+                    access: sandbox_launcher_macos::GrantAccess::Read,
+                    executable: false,
+                },
+            ],
             home,
             temporary,
             sandbox_launcher_macos::NetworkMode::None,

@@ -789,9 +789,8 @@ mod windows {
             };
             let mut effective_rights = 0_u32;
             // SAFETY: ACL, trustee SID, and output mask remain live for the call.
-            let status = unsafe {
-                GetEffectiveRightsFromAclW(current_acl, &trustee, &mut effective_rights)
-            };
+            let status =
+                unsafe { GetEffectiveRightsFromAclW(current_acl, &trustee, &mut effective_rights) };
             if status != 0 {
                 return Err(win32_error("GetEffectiveRightsFromAclW", status));
             }
