@@ -697,6 +697,7 @@ mod macos {
         // spawn actions. The target keeps standard I/O and setup status, and releases the three
         // guardian-only channels inherited across fork.
         close_fds(&[4, 5, 6]);
+        // SAFETY: this fresh child has no threads and becomes leader of its own process group.
         if unsafe { libc::setpgid(0, 0) } != 0 {
             fail_child(status_fd, errno());
         }

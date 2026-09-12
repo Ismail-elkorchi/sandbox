@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -13,7 +12,6 @@ import { hostPath, hostPolicy, hostResource, readAccess, readWriteAccess } from 
 const macos = process.platform === "darwin";
 
 test("macOS Seatbelt confines a native process and owns its process group", { skip: !macos }, async () => {
-  const diagnosticStart = Date.now();
   const createdParent = await mkdtemp(join(tmpdir(), "sandbox-macos-"));
   const parent = realpathSync(createdParent);
   const workspace = join(parent, "workspace");
@@ -60,32 +58,6 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       JSON.stringify(implementation?.mechanisms),
     );
 
-    const startupDiagnostics = [];
-    for (const args of [
-      ["--version"],
-      ["--jitless", "--version"],
-      ["--jitless", "-e", "console.error('jitless-script-started')"],
-      ["-e", "console.error('script-started')"],
-    ]) {
-      const diagnostic = await sandbox.run({
-        isolation: { kind: "process" },
-        policy,
-        requirements: {},
-        process: {
-          executable: hostPath(executable),
-          args,
-          cwd: hostPath(workspace),
-          environment: { set: {} },
-        },
-      });
-      startupDiagnostics.push({
-        args,
-        termination: diagnostic.termination,
-        stdout: diagnostic.stdout.toString("utf8"),
-        stderr: diagnostic.stderr.toString("utf8"),
-      });
-    }
-
     const result = await sandbox.run({
       isolation: { kind: "process" },
       policy,
@@ -96,13 +68,9 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
         args: ["-e", [
           "const fs = require('node:fs');",
           "const net = require('node:net');",
-          "console.error('stage:start');",
           "fs.writeFileSync('created.txt', 'created');",
-          "console.error('stage:workspace-write');",
           `let secretDenied = false; try { fs.readFileSync(${JSON.stringify(secret)}); } catch { secretDenied = true; }`,
-          "console.error('stage:secret-read');",
           "let hostControlDenied = false; try { process.kill(1, 0); } catch { hostControlDenied = true; }",
-          "console.error('stage:host-control');",
           "let reported = false; let timer;",
           "const report = (socketDenied) => { if (reported) return; reported = true; clearTimeout(timer); socket.destroy(); console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied })); };",
           `const socket = net.connect(${network.port}, '127.0.0.1');`,
@@ -117,24 +85,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
     assert.deepEqual(
       result.termination,
       { reason: "exit", code: 0 },
-      [
-        JSON.stringify(startupDiagnostics, null, 2),
-        result.stderr.toString("utf8"),
-        await recentNodeCrashReport(diagnosticStart),
-        spawnSync(
-          "/usr/bin/log",
-          [
-            "show",
-            "--last",
-            "1m",
-            "--style",
-            "compact",
-            "--predicate",
-            '(process == "node") OR (eventMessage CONTAINS[c] "Sandbox:")',
-          ],
-          { encoding: "utf8", timeout: 10_000 },
-        ).stdout,
-      ].filter(Boolean).join("\n"),
+      result.stderr.toString("utf8"),
     );
     assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), {
       secretDenied: true,
@@ -205,25 +156,4 @@ function minimalRoots(candidates) {
     const path = relative(other, candidate);
     return path !== "" && path !== ".." && !path.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`);
   }));
-}
-
-async function recentNodeCrashReport(since) {
-  const directories = [
-    join(process.env.HOME ?? "", "Library", "Logs", "DiagnosticReports"),
-    "/Library/Logs/DiagnosticReports",
-  ];
-  const reports = [];
-  for (const directory of directories) {
-    const entries = await readdir(directory).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.startsWith("node-") || !entry.endsWith(".ips")) continue;
-      const file = join(directory, entry);
-      const metadata = await stat(file).catch(() => undefined);
-      if (metadata && metadata.mtimeMs >= since) reports.push({ file, modified: metadata.mtimeMs });
-    }
-  }
-  reports.sort((left, right) => right.modified - left.modified);
-  if (reports.length === 0) return "No recent Node crash report was found.";
-  const report = await readFile(reports[0].file, "utf8").catch(() => "");
-  return report.slice(0, 32 * 1024);
 }
