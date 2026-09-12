@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
 import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -16,6 +17,7 @@ test("Windows AppContainer confines a native process and owns its descendant tre
   const secret = join(parent, "secret.txt");
   await mkdir(workspace);
   await writeFile(secret, "secret");
+  const network = await loopbackServer();
   const runtime = join(parent, "runtime");
   await mkdir(runtime);
   const runtimeExecutable = join(runtime, "node.exe");
@@ -55,6 +57,7 @@ test("Windows AppContainer confines a native process and owns its descendant tre
       isolation: { kind: "process" },
       policy,
       requirements: {},
+      resources: { wallTime: { enforcement: "hard", scope: "process", value: 3_000 } },
       process: {
         executable: hostPath(executable),
         args: ["-e", [
@@ -62,9 +65,12 @@ test("Windows AppContainer confines a native process and owns its descendant tre
           "const net = require('node:net');",
           "fs.writeFileSync('created.txt', 'created');",
           `let secretDenied = false; try { fs.readFileSync(${JSON.stringify(secret)}); } catch { secretDenied = true; }`,
-          "const socket = net.connect(9, '127.0.0.1');",
-          "socket.once('error', () => console.log(JSON.stringify({ secretDenied, socketDenied: true })));",
-          "socket.once('connect', () => { socket.destroy(); console.log(JSON.stringify({ secretDenied, socketDenied: false })); });",
+          "let reported = false; let timer;",
+          "const report = (socketDenied) => { if (reported) return; reported = true; clearTimeout(timer); socket.destroy(); console.log(JSON.stringify({ secretDenied, socketDenied })); };",
+          `const socket = net.connect(${network.port}, '127.0.0.1');`,
+          "socket.once('error', () => report(true));",
+          "socket.once('connect', () => report(false));",
+          "timer = setTimeout(() => report(true), 1_000);",
         ].join("\n")],
         cwd: hostPath(workspace),
         environment: { set: {} },
@@ -103,7 +109,7 @@ test("Windows AppContainer confines a native process and owns its descendant tre
         executable: hostPath(executable),
         args: ["-e", [
           "const { spawn } = require('node:child_process');",
-          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { detached: true, stdio: 'ignore' });`,
+          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { stdio: 'ignore' });`,
           "child.on('error', () => {});",
           "setInterval(() => {}, 1000);",
         ].join("\n")],
@@ -131,6 +137,21 @@ test("Windows AppContainer confines a native process and owns its descendant tre
     );
   } finally {
     await sandbox.dispose();
+    await network.close();
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+async function loopbackServer() {
+  const server = createServer((socket) => socket.end());
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    port: address.port,
+    close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}

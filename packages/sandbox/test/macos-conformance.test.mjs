@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,6 +20,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
   const secret = join(parent, "secret.txt");
   await mkdir(workspace);
   await writeFile(secret, "secret");
+  const network = await loopbackServer();
   const executable = realpathSync(process.execPath);
   const runtimeRoots = minimalRoots([
     dirname(dirname(executable)),
@@ -88,6 +90,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       isolation: { kind: "process" },
       policy,
       requirements: {},
+      resources: { wallTime: { enforcement: "hard", scope: "process", value: 3_000 } },
       process: {
         executable: hostPath(executable),
         args: ["-e", [
@@ -100,9 +103,12 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
           "console.error('stage:secret-read');",
           "let hostControlDenied = false; try { process.kill(1, 0); } catch { hostControlDenied = true; }",
           "console.error('stage:host-control');",
-          "const socket = net.connect(9, '127.0.0.1');",
-          "socket.once('error', () => console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied: true })));",
-          "socket.once('connect', () => { socket.destroy(); console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied: false })); });",
+          "let reported = false; let timer;",
+          "const report = (socketDenied) => { if (reported) return; reported = true; clearTimeout(timer); socket.destroy(); console.log(JSON.stringify({ secretDenied, hostControlDenied, socketDenied })); };",
+          `const socket = net.connect(${network.port}, '127.0.0.1');`,
+          "socket.once('error', () => report(true));",
+          "socket.once('connect', () => report(false));",
+          "timer = setTimeout(() => report(true), 1_000);",
         ].join("\n")],
         cwd: hostPath(workspace),
         environment: { set: {} },
@@ -149,7 +155,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
         executable: hostPath(executable),
         args: ["-e", [
           "const { spawn } = require('node:child_process');",
-          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { detached: true, stdio: 'ignore' });`,
+          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childProgram)}], { stdio: 'ignore' });`,
           "child.on('error', () => {});",
           "setInterval(() => {}, 1000);",
         ].join("\n")],
@@ -173,9 +179,24 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
     );
   } finally {
     await sandbox.dispose();
+    await network.close();
     await rm(createdParent, { recursive: true, force: true });
   }
 });
+
+async function loopbackServer() {
+  const server = createServer((socket) => socket.end());
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    port: address.port,
+    close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
+}
 
 function minimalRoots(candidates) {
   const roots = [...new Set(candidates.filter(existsSync).map((candidate) => realpathSync(candidate)))];
