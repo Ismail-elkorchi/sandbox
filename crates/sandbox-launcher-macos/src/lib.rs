@@ -82,6 +82,7 @@ impl SeatbeltPolicy {
         let mut profile = String::from(
             "(version 1)\n\
              (deny default)\n\
+             (allow dynamic-code-generation)\n\
              (allow process-fork)\n\
              (allow process-info* (target same-sandbox))\n\
              (allow signal (target same-sandbox))\n\
@@ -1155,6 +1156,7 @@ mod tests {
         )
         .expect("policy");
         assert!(policy.profile.contains("(deny default)"));
+        assert!(policy.profile.contains("(allow dynamic-code-generation)"));
         assert!(policy.profile.contains("(deny network*)"));
         assert!(policy.profile.contains("process-exec file-map-executable"));
         assert!(policy.profile.contains("a quote \\\" here"));
