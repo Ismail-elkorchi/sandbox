@@ -70,7 +70,21 @@ test("Windows AppContainer confines a native process and owns its descendant tre
         environment: { set: {} },
       },
     });
-    assert.deepEqual(result.termination, { reason: "exit", code: 0 });
+    assert.deepEqual(
+      result.termination,
+      { reason: "exit", code: 0 },
+      result.stderr.toString("utf8"),
+    );
+    const createdContent = await readFile(join(workspace, "created.txt"), "utf8").catch(() => undefined);
+    assert.notEqual(
+      result.stdout.length,
+      0,
+      JSON.stringify({
+        usage: result.usage,
+        stderr: result.stderr.toString("utf8"),
+        createdContent,
+      }),
+    );
     assert.deepEqual(JSON.parse(result.stdout.toString("utf8")), {
       secretDenied: true,
       socketDenied: true,

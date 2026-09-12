@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,6 +12,7 @@ import { hostPath, hostPolicy, hostResource, readAccess, readWriteAccess } from 
 const macos = process.platform === "darwin";
 
 test("macOS Seatbelt confines a native process and owns its process group", { skip: !macos }, async () => {
+  const diagnosticStart = Date.now();
   const createdParent = await mkdtemp(join(tmpdir(), "sandbox-macos-"));
   const parent = realpathSync(createdParent);
   const workspace = join(parent, "workspace");
@@ -113,6 +114,7 @@ test("macOS Seatbelt confines a native process and owns its process group", { sk
       [
         JSON.stringify(startupDiagnostics, null, 2),
         result.stderr.toString("utf8"),
+        await recentNodeCrashReport(diagnosticStart),
         spawnSync(
           "/usr/bin/log",
           [
@@ -182,4 +184,25 @@ function minimalRoots(candidates) {
     const path = relative(other, candidate);
     return path !== "" && path !== ".." && !path.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`);
   }));
+}
+
+async function recentNodeCrashReport(since) {
+  const directories = [
+    join(process.env.HOME ?? "", "Library", "Logs", "DiagnosticReports"),
+    "/Library/Logs/DiagnosticReports",
+  ];
+  const reports = [];
+  for (const directory of directories) {
+    const entries = await readdir(directory).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.startsWith("node-") || !entry.endsWith(".ips")) continue;
+      const file = join(directory, entry);
+      const metadata = await stat(file).catch(() => undefined);
+      if (metadata && metadata.mtimeMs >= since) reports.push({ file, modified: metadata.mtimeMs });
+    }
+  }
+  reports.sort((left, right) => right.modified - left.modified);
+  if (reports.length === 0) return "No recent Node crash report was found.";
+  const report = await readFile(reports[0].file, "utf8").catch(() => "");
+  return report.slice(0, 32 * 1024);
 }

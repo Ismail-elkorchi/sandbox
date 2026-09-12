@@ -1168,9 +1168,11 @@ mod tests {
         .expect("policy");
         assert!(policy.profile.contains("(deny default)"));
         assert!(policy.profile.contains("(allow dynamic-code-generation)"));
-        assert!(policy
-            .profile
-            .contains("(allow file-write-data (literal \"/dev/null\"))"));
+        assert!(
+            policy
+                .profile
+                .contains("(allow file-write-data (literal \"/dev/null\"))")
+        );
         assert!(policy.profile.contains("(deny network*)"));
         assert!(policy.profile.contains("process-exec file-map-executable"));
         assert!(policy.profile.contains("a quote \\\" here"));
