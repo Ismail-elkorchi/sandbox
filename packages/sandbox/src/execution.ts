@@ -139,6 +139,7 @@ export interface SandboxExecutionRepository {
   inspect(executionId: string, query?: SandboxExecutionQuery): Promise<SandboxExecutionObservation>;
   writeInput(executionId: string, data: Uint8Array): Promise<void>;
   closeInput(executionId: string): Promise<void>;
+  /** Cancelling a prepared execution acknowledges its durable terminal publication. */
   terminate(executionId: string): Promise<void>;
   reconcile(): Promise<SandboxExecutionReconciliation>;
   /** Remove an explicitly accepted unknown outcome so it no longer blocks the owning application. */

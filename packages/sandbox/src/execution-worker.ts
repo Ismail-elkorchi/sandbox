@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createReadStream } from "node:fs";
 import net from "node:net";
+import { finished } from "node:stream/promises";
 import {
   appendOutput,
   parseRunForHost,
@@ -8,6 +9,7 @@ import {
   sandboxErrorData,
   writeReceipt,
   writeRecord,
+  type ExecutionRecord,
 } from "./execution-record.js";
 import { SandboxPreparationExpiredError, SandboxPreparationError } from "./errors.js";
 import { createSandbox } from "./sandbox.js";
@@ -55,6 +57,18 @@ async function run(executionDirectory: string): Promise<void> {
   let sequence = 0;
   let outputHash = "0".repeat(64);
   let outputWrites = Promise.resolve();
+  const terminalPublication = Promise.withResolvers<void>();
+  // Cancellation may await publication; ordinary execution has no waiter.
+  void terminalPublication.promise.catch(() => undefined);
+  async function publishTerminal(record: Extract<ExecutionRecord, { phase: "settled" | "rejected" | "unknown" }>): Promise<void> {
+    try {
+      await writeRecord(executionDirectory, record);
+      terminalPublication.resolve();
+    } catch (error) {
+      terminalPublication.reject(error);
+      throw error;
+    }
+  }
   const capturedStdout: Buffer[] = [];
   const capturedStderr: Buffer[] = [];
   let activationExpected: { policyDigest: string; executionDigest: string } | undefined;
@@ -110,6 +124,7 @@ async function run(executionDirectory: string): Promise<void> {
         phase: "activate",
         targetExecuted: false,
       }));
+      await terminalPublication.promise;
     },
   };
 
@@ -203,7 +218,12 @@ async function run(executionDirectory: string): Promise<void> {
     };
     processHandle.stdout?.on("data", (chunk: Buffer | string) => retain("stdout", Buffer.from(chunk)));
     processHandle.stderr?.on("data", (chunk: Buffer | string) => retain("stderr", Buffer.from(chunk)));
-    let result = await processHandle.wait();
+    const [completed] = await Promise.all([
+      processHandle.wait(),
+      ...[processHandle.stdout, processHandle.stderr].flatMap((stream) =>
+        stream === null ? [] : [finished(stream, { readable: true, writable: false, cleanup: true })]),
+    ]);
+    let result = completed;
     await outputWrites;
     if (stdoutMode === "capture" || stderrMode === "capture") {
       result = {
@@ -214,7 +234,7 @@ async function run(executionDirectory: string): Promise<void> {
     }
     await writeReceipt(executionDirectory, result);
     const settledAtMs = Date.now();
-    await writeRecord(executionDirectory, {
+    await publishTerminal({
       schemaVersion: 1,
       phase: "settled",
       executionId: initial.executionId,
@@ -233,7 +253,7 @@ async function run(executionDirectory: string): Promise<void> {
     await outputWrites.catch(() => undefined);
     const data = sandboxErrorData(error, targetMayHaveExecuted);
     if (data.targetExecuted) {
-      await writeRecord(executionDirectory, {
+      await publishTerminal({
         schemaVersion: 1,
         phase: "unknown",
         executionId: initial.executionId,
@@ -248,7 +268,7 @@ async function run(executionDirectory: string): Promise<void> {
       });
     } else {
       const rejectedAtMs = Date.now();
-      await writeRecord(executionDirectory, {
+      await publishTerminal({
         schemaVersion: 1,
         phase: "rejected",
         executionId: initial.executionId,

@@ -116,7 +116,11 @@ try {
     const prepared = await repository.prepare(request, { waitMs: 5000 });
     assert.equal(prepared.kind, "prepared");
     await repository.activate(request.executionId, prepared);
-    const settled = await repository.inspect(request.executionId, { waitMs: 5000 });
+    const deadline = Date.now() + 5000;
+    let settled;
+    do {
+      settled = await repository.inspect(request.executionId, { waitMs: Math.max(0, deadline - Date.now()) });
+    } while (settled.kind === "running" && Date.now() < deadline);
     assert.equal(settled.kind, "settled");
     await repository.close();
     repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });

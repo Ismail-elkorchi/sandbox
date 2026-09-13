@@ -18,6 +18,48 @@ import {
 
 const linux = await linuxImplementationEligible();
 
+test("cancelling a preparation publishes terminal truth before it can be forgotten", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-cancel-publication-"));
+  const repository = await openSandboxExecutionRepository({ directory });
+  try {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const executionId = `cancel-${attempt}`;
+      const prepared = await repository.prepare({ executionId, run: detachedRun({ executable: "/bin/true", cwd: "/" }) }, { waitMs: 5_000 });
+      assert.equal(prepared.kind, "prepared");
+      await repository.terminate(executionId);
+      // No poll or intervening read may make cancellation appear synchronous.
+      await repository.forget(executionId);
+      const absent = await repository.inspect(executionId);
+      assert.equal(absent.kind, "unknown");
+      assert.equal(absent.reason, "not-found");
+    }
+  } finally {
+    await repository.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("terminal output includes every stdout and stderr chunk before publication", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-output-publication-"));
+  const repository = await openSandboxExecutionRepository({ directory });
+  try {
+    const result = await activate(repository, {
+      executionId: "both-streams",
+      run: detachedRun({ executable: "/bin/sh", cwd: "/", args: ["-c", "i=0; while [ $i -lt 100 ]; do printf 'out-%s\\n' $i; printf 'err-%s\\n' $i >&2; i=$((i+1)); done; exit 7"], stdout: "pipe", stderr: "pipe" })
+    }, { waitMs: 5_000, maxBytes: 8_192 });
+    assert.equal(result.kind, "settled", JSON.stringify(result));
+    assert.deepEqual(result.result.termination, { reason: "exit", code: 7 });
+    for (const [stream, prefix] of [["stdout", "out"], ["stderr", "err"]]) {
+      const text = result.output.chunks.filter((chunk) => chunk.stream === stream).map((chunk) => chunk.data.toString()).join("");
+      assert.equal(text, Array.from({ length: 100 }, (_, index) => `${prefix}-${index}\n`).join(""));
+    }
+    assert.equal((await repository.inspect("both-streams")).kind, "settled");
+  } finally {
+    await repository.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 function detachedRun(process, overrides = {}) {
   const options = baseOptions(overrides);
   return {

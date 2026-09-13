@@ -30,3 +30,5 @@ const observation = await repository.inspect(request.executionId, { waitMs: 5_00
 ```
 
 Detached runs require a process-scoped hard output limit. Preparation, activation, output cursors, receipts, and cleanup are persisted atomically. Recovery reconciles the bound implementation and prepared identities; it never prepares against another implementation. Incompatible schema records are rejected and left unchanged.
+
+Cancelling a prepared execution acknowledges the durable terminal cancellation record. Once `terminate` resolves for that preparation, `forget` may remove it without a polling delay. Running process completion is published only after both output streams finish and all retained output writes are durable; the terminal cursor and hash cover the complete retained output.
