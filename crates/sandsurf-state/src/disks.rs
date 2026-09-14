@@ -68,7 +68,7 @@ impl DiskAttachment {
 
 impl RuntimeJournal {
     pub fn disk(&self, id: &DiskId) -> Result<Option<DiskRecord>> {
-        disk(&self.db.connection, id)
+        disk(&self.db.connection, &self.sandbox, id)
     }
 
     /// Commits copy intent and logical reservation before creating backing data.
@@ -84,7 +84,7 @@ impl RuntimeJournal {
             &(&self.sandbox, "raw-disk-copy", &request),
         )?;
         let tx = self.db.connection.transaction()?;
-        if let Some(old) = disk(&tx, &request.id)? {
+        if let Some(old) = disk(&tx, &self.sandbox, &request.id)? {
             return if old.request_digest == identity {
                 Ok(old)
             } else {
@@ -134,7 +134,7 @@ impl RuntimeJournal {
         expected: &Digest,
         source: &File,
     ) -> Result<DiskRecord> {
-        let record = require_disk(&self.db.connection, id, expected)?;
+        let record = require_disk(&self.db.connection, &self.sandbox, id, expected)?;
         if record.phase == DiskPhase::Ready {
             return Ok(record);
         }
@@ -191,7 +191,7 @@ impl RuntimeJournal {
     }
 
     pub fn acquire_disk(&self, id: &DiskId, expected: &Digest) -> Result<DiskAttachment> {
-        let record = require_disk(&self.db.connection, id, expected)?;
+        let record = require_disk(&self.db.connection, &self.sandbox, id, expected)?;
         if record.phase != DiskPhase::Ready {
             return Err(Error::Conflict("disk is not committed and attachable"));
         }
@@ -210,7 +210,7 @@ impl RuntimeJournal {
     /// Record deletion intent before unlinking. A live attachment can keep cleanup
     /// pending, but no new attachment may be acquired after this commit.
     pub fn retire_disk(&mut self, id: &DiskId, expected: &Digest) -> Result<DiskRecord> {
-        let mut record = require_disk(&self.db.connection, id, expected)?;
+        let mut record = require_disk(&self.db.connection, &self.sandbox, id, expected)?;
         if matches!(record.phase, DiskPhase::Deleting | DiskPhase::Deleted) {
             return Ok(record);
         }
@@ -223,7 +223,7 @@ impl RuntimeJournal {
     }
 
     pub fn cleanup_disk(&mut self, id: &DiskId, expected: &Digest) -> Result<DiskRecord> {
-        let mut record = require_disk(&self.db.connection, id, expected)?;
+        let mut record = require_disk(&self.db.connection, &self.sandbox, id, expected)?;
         if record.phase == DiskPhase::Deleted {
             return Ok(record);
         }
@@ -257,7 +257,7 @@ impl RuntimeJournal {
     }
 }
 
-fn disk(db: &rusqlite::Connection, id: &DiskId) -> Result<Option<DiskRecord>> {
+fn disk(db: &rusqlite::Connection, sandbox: &SandboxId, id: &DiskId) -> Result<Option<DiskRecord>> {
     let row: Option<(String, String, String, Option<String>)> = db
         .query_row(
             "SELECT request,request_digest,phase,cleanup_digest FROM disks WHERE id=?1",
@@ -266,17 +266,43 @@ fn disk(db: &rusqlite::Connection, id: &DiskId) -> Result<Option<DiskRecord>> {
         )
         .optional()?;
     row.map(|(request, request_digest, phase, cleanup_digest)| {
-        Ok(DiskRecord {
+        let record = DiskRecord {
             request: decode(&request)?,
             request_digest: request_digest.try_into()?,
             phase: decode(&phase)?,
             cleanup_digest: cleanup_digest.map(Digest::try_from).transpose()?,
-        })
+        };
+        let bound = digest(
+            Domain::Operation,
+            &(sandbox, "raw-disk-copy", &record.request),
+        )?;
+        if record.request.id != *id || record.request_digest != bound {
+            return Err(Error::Corrupt(
+                "retained disk request identity is inconsistent",
+            ));
+        }
+        let expected_cleanup = if record.phase == DiskPhase::Deleted {
+            Some(digest(
+                Domain::Operation,
+                &(sandbox, id, &bound, "raw-backing-removed"),
+            )?)
+        } else {
+            None
+        };
+        if record.cleanup_digest != expected_cleanup {
+            return Err(Error::Corrupt("disk cleanup evidence is inconsistent"));
+        }
+        Ok(record)
     })
     .transpose()
 }
-fn require_disk(db: &rusqlite::Connection, id: &DiskId, expected: &Digest) -> Result<DiskRecord> {
-    let record = disk(db, id)?.ok_or(Error::Missing("disk identity missing"))?;
+fn require_disk(
+    db: &rusqlite::Connection,
+    sandbox: &SandboxId,
+    id: &DiskId,
+    expected: &Digest,
+) -> Result<DiskRecord> {
+    let record = disk(db, sandbox, id)?.ok_or(Error::Missing("disk identity missing"))?;
     if record.request_digest != *expected {
         return Err(Error::Conflict("disk request identity mismatch"));
     }

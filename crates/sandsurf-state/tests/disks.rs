@@ -330,6 +330,45 @@ fn abrupt_disk_writer_child() {
 }
 
 #[test]
+fn corrupted_disk_metadata_cannot_change_copy_or_deletion_scope() {
+    for corrupt in [
+        "UPDATE disks SET request=json_set(request,'$.bytes',512)",
+        "UPDATE disks SET request=json_set(request,'$.id','other')",
+        "UPDATE disks SET cleanup_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+    ] {
+        let root = Root::new();
+        let bytes = vec![42; 4096];
+        let source = root.source("base", &bytes);
+        let mut runtime = root.runtime();
+        let record = runtime.prepare_disk_copy(request("bound", &bytes)).unwrap();
+        runtime
+            .materialize_disk(&record.request.id, &record.request_digest, &source)
+            .unwrap();
+        drop(runtime);
+        let db = rusqlite::Connection::open(root.0.join("runtime/authority.sqlite")).unwrap();
+        db.execute(corrupt, []).unwrap();
+        drop(db);
+        let mut runtime =
+            RuntimeJournal::open(&root.0.join("runtime"), &"box".try_into().unwrap()).unwrap();
+        assert!(runtime.disk(&record.request.id).is_err());
+        assert!(
+            runtime
+                .acquire_disk(&record.request.id, &record.request_digest)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .retire_disk(&record.request.id, &record.request_digest)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(root.0.join("runtime/disk-bound.raw")).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
 fn abrupt_disk_copy_publication_and_deletion_reconcile_the_same_identity() {
     for stage in ["intent", "ready", "retired", "unlink"] {
         let root = Root::new();
