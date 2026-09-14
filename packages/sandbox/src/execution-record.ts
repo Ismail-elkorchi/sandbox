@@ -1,133 +1,56 @@
 import { Buffer } from "node:buffer";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type { SandboxErrorData } from "./errors.js";
 import type { EnforcementReport } from "./enforcement.js";
-import type { SandboxDetachedRunOptions, SandboxExecutionOutputChunk } from "./execution.js";
+import type { SandboxDetachedRunOptions, SandboxExecutionPreparation, SandboxExecutionReceipt, SandboxExecutionRepositoryOptions } from "./execution.js";
 import type { SandboxChangeArtifactEntry, SandboxRunResult } from "./result.js";
 import type { PreparedRunSummary } from "./summary.js";
 import { parseCleanup, parseEnforcement, parseErrorData, parseRunSummary, parseViolation } from "./validation.js";
+import { BASE_RECORD_BYTES, initializeStorage, MAX_RECORD_BYTES, transaction, withStorage } from "./execution-storage.js";
 
-export const EXECUTION_SCHEMA_VERSION = 1;
-export const STATE_FILE = "state.json";
 export const OUTPUT_FILE = "output.jsonl";
-export const RECEIPT_FILE = "receipt.json";
-export const MAX_CONTROL_BYTES = 1024 * 1024;
-
+export const ZERO_HASH = "0".repeat(64);
+export const executionRecordReadMetrics = { records: 0, bytes: 0 };
 export interface ExecutionRepositoryLimits {
-  completedRetentionMs: number;
-  expiredIdentityRetentionMs: number;
-  maxRetainedOutputBytes: number;
-  startupTimeoutMs: number;
+  maxRetainedOutputBytes: number; maxTotalOutputBytes: number; maxTotalMetadataBytes: number;
+  maxRetainedExecutions: number; maxRetainedIdentities: number; startupTimeoutMs: number;
 }
-
-export type ExecutionRecord =
-  | ExecutionPreparingRecord
-  | ExecutionPreparedRecord
-  | ExecutionActivatingRecord
-  | ExecutionRunningRecord
-  | ExecutionSettledRecord
-  | ExecutionRejectedRecord
-  | ExecutionUnknownRecord
-  | ExecutionExpiredRecord;
-
 interface ExecutionRecordBase {
-  schemaVersion: 1;
-  executionId: string;
-  requestDigest: string;
-  createdAtMs: number;
-  workerPid: number;
-  authToken: string;
-  endpoint?: number;
+  schemaVersion: 1; contract: "retained-execution"; executionId: string; requestDigest: string;
+  createdAtMs: number; admitterPid: number; workerPid: number; authToken: string; outputLimit: number; metadataLimit: number; endpoint?: number;
+  preparation?: SandboxExecutionPreparation;
 }
-
-export interface ExecutionPreparingRecord extends ExecutionRecordBase {
-  phase: "preparing";
-}
-
+export interface ExecutionPreparingRecord extends ExecutionRecordBase { phase: "preparing" }
 export interface ExecutionPreparedRecord extends ExecutionRecordBase {
-  phase: "prepared";
-  endpoint: number;
-  policyDigest: string;
-  executionDigest: string;
-  summary: PreparedRunSummary;
-  enforcement: EnforcementReport;
-  expiresAtMs: number;
+  phase: "prepared"; endpoint: number; policyDigest: string; executionDigest: string;
+  summary: PreparedRunSummary; enforcement: EnforcementReport; expiresAtMs: number;
 }
-
 export interface ExecutionActivatingRecord extends ExecutionRecordBase {
-  phase: "activating";
-  endpoint: number;
-  policyDigest: string;
-  executionDigest: string;
-  activatedAtMs: number;
+  phase: "activating"; endpoint: number; policyDigest: string; executionDigest: string; activatedAtMs: number;
 }
-
 export interface ExecutionRunningRecord extends ExecutionRecordBase {
-  phase: "running";
-  endpoint: number;
-  processId: string;
+  phase: "running"; endpoint: number; policyDigest: string; executionDigest: string; processId: string;
 }
-
 export interface ExecutionSettledRecord extends ExecutionRecordBase {
-  phase: "settled";
-  endpoint: number;
-  processId: string;
-  settledAtMs: number;
-  expiresAtMs: number;
-  cursorEnd: number;
-  outputHash: string;
+  phase: "settled"; endpoint: number; settledAtMs: number;
+  result: Omit<SandboxRunResult, "stdout" | "stderr">; receipt: SandboxExecutionReceipt;
 }
-
 export interface ExecutionRejectedRecord extends ExecutionRecordBase {
-  phase: "rejected";
-  endpoint: number;
-  rejectedAtMs: number;
-  expiresAtMs: number;
-  error: SandboxErrorData;
+  phase: "rejected"; endpoint: number; rejectedAtMs: number; error: SandboxErrorData; receipt: SandboxExecutionReceipt;
 }
-
 export interface ExecutionUnknownRecord extends ExecutionRecordBase {
-  phase: "unknown";
-  endpoint: number;
-  unknownAtMs: number;
-  reason: "execution-host-failed";
-  diagnostic: string;
+  phase: "unknown"; unknownAtMs: number; diagnostic: string;
 }
-
-export interface ExecutionExpiredRecord {
-  schemaVersion: 1;
-  phase: "expired";
-  executionId: string;
-  requestDigest: string;
-  createdAtMs: number;
-  expiredAtMs: number;
+export interface ExecutionRetiredRecord {
+  schemaVersion: 1; contract: "retained-execution"; phase: "retired";
+  executionId: string; requestDigest: string; createdAtMs: number;
+  reason: "released" | "acknowledged-unknown"; receiptDigest?: string; cleanupPending: boolean;
 }
-
-interface StoredEnvelope {
-  schemaVersion: 1;
-  sha256: string;
-  value: unknown;
-}
-
-interface StoredReceipt {
-  result: Omit<SandboxRunResult, "stdout" | "stderr"> & {
-    stdoutBase64?: string;
-    stderrBase64?: string;
-  };
-}
-
-interface StoredOutputChunk {
-  sequence: number;
-  cursorStart: number;
-  cursorEnd: number;
-  stream: "stdout" | "stderr";
-  dataBase64: string;
-  previousHash: string;
-  hash: string;
-}
+export type ExecutionRecord = ExecutionPreparingRecord | ExecutionPreparedRecord | ExecutionActivatingRecord
+  | ExecutionRunningRecord | ExecutionSettledRecord | ExecutionRejectedRecord | ExecutionUnknownRecord | ExecutionRetiredRecord;
+export type TerminalRecord = ExecutionSettledRecord | ExecutionRejectedRecord;
 
 export async function adoptExecutionRepositoryRoot(directory: string): Promise<string> {
   if (typeof directory !== "string" || directory.length === 0) throw new TypeError("Execution repository directory is required.");
@@ -136,361 +59,291 @@ export async function adoptExecutionRepositoryRoot(directory: string): Promise<s
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new TypeError("Execution repository must be a non-symbolic directory.");
   if (process.platform !== "win32") {
     if ((metadata.mode & 0o077) !== 0) await chmod(directory, 0o700);
-    const secured = await lstat(directory);
-    if ((secured.mode & 0o077) !== 0) throw new TypeError("Execution repository permissions must exclude group and other users.");
+    if (((await lstat(directory)).mode & 0o077) !== 0) throw new TypeError("Execution repository permissions must exclude group and other users.");
   }
   return realpath(directory);
 }
-
 export function executionDirectory(root: string, executionId: string): string {
-  return join(root, `execution-${createHash("sha256").update(executionId).digest("hex")}`);
+  return join(root, "execution-" + createHash("sha256").update(executionId).digest("hex"));
 }
-
 export function validateExecutionId(value: unknown): asserts value is string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 256 || value.trim() !== value) {
-    throw new TypeError("Execution ID must be a non-empty, trimmed string of at most 256 characters.");
-  }
-  for (const character of value) {
-    const code = character.codePointAt(0);
-    if (code !== undefined && (code <= 0x1f || code === 0x7f)) throw new TypeError("Execution ID must not contain control characters.");
+  if (typeof value !== "string" || value.length === 0 || value.length > 256 || !value.isWellFormed() || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new TypeError("Execution ID must be a non-empty, trimmed string of at most 256 characters without control characters.");
   }
 }
-
-export function normalizeLimits(options: {
-  completedRetentionMs?: number;
-  expiredIdentityRetentionMs?: number;
-  maxRetainedOutputBytes?: number;
-  startupTimeoutMs?: number;
-}): ExecutionRepositoryLimits {
-  return {
-    completedRetentionMs: positive(options.completedRetentionMs ?? 15 * 60_000, "completedRetentionMs"),
-    expiredIdentityRetentionMs: positive(options.expiredIdentityRetentionMs ?? 60 * 60_000, "expiredIdentityRetentionMs"),
+export function normalizeLimits(options: SandboxExecutionRepositoryOptions): ExecutionRepositoryLimits {
+  const allowed = new Set(["directory", "maxRetainedOutputBytes", "maxTotalOutputBytes", "maxTotalMetadataBytes", "maxRetainedExecutions", "maxRetainedIdentities", "startupTimeoutMs"]);
+  for (const key of Object.keys(options)) if (!allowed.has(key)) throw new TypeError("Unsupported execution repository option.");
+  const limits = {
     maxRetainedOutputBytes: positive(options.maxRetainedOutputBytes ?? 16 * 1024 * 1024, "maxRetainedOutputBytes"),
+    maxTotalOutputBytes: positive(options.maxTotalOutputBytes ?? 1024 * 1024 * 1024, "maxTotalOutputBytes"),
+    maxTotalMetadataBytes: positive(options.maxTotalMetadataBytes ?? 1024 * 1024 * 1024, "maxTotalMetadataBytes"),
+    maxRetainedExecutions: positive(options.maxRetainedExecutions ?? 128, "maxRetainedExecutions"),
+    maxRetainedIdentities: positive(options.maxRetainedIdentities ?? 16_384, "maxRetainedIdentities"),
     startupTimeoutMs: positive(options.startupTimeoutMs ?? 10_000, "startupTimeoutMs"),
   };
+  if (limits.maxRetainedExecutions > limits.maxRetainedIdentities) throw new RangeError("Retained executions cannot exceed the identity bound.");
+  if (limits.startupTimeoutMs > 30_000) throw new RangeError("Execution startup observation cannot exceed 30 seconds.");
+  return limits;
 }
-
+export async function initializeRepository(root: string, limits: ExecutionRepositoryLimits): Promise<void> {
+  const { startupTimeoutMs: _startup, ...storageLimits } = limits;
+  await initializeStorage(root, storageLimits);
+}
 export function validateDetachedRun(value: SandboxDetachedRunOptions, maxRetainedOutputBytes: number): void {
   if (typeof value !== "object" || value === null) throw new TypeError("Detached sandbox run must be an object.");
   if (value.isolation?.kind !== "process") throw new TypeError("Detached execution supports process isolation only.");
-  const limit = value.resources?.output?.value;
-  if (!Number.isSafeInteger(limit) || (limit ?? 0) < 1) throw new TypeError("Detached execution requires a positive process-scoped resources.output hard limit.");
-  if ((limit as number) > maxRetainedOutputBytes) {
-    throw new RangeError("Sandbox resources.output exceeds the execution repository output retention bound.");
+  const limit = value.resources?.output;
+  if (limit?.enforcement !== "hard" || limit.scope !== "process" || !Number.isSafeInteger(limit.value) || limit.value < 1) {
+    throw new TypeError("Detached execution requires a positive process-scoped resources.output hard limit.");
   }
-  rejectSignal(value, "run");
-  rejectSignal(value.process, "process");
+  if (limit.value > maxRetainedOutputBytes) throw new RangeError("Sandbox resources.output exceeds the execution repository output retention bound.");
+  if (typeof value.process !== "object" || value.process === null) throw new TypeError("Detached process options are required.");
+  if ("signal" in value || "signal" in value.process) throw new TypeError("Detached options must not contain a process-local AbortSignal.");
+}
+export function digestRun(value: unknown): string { return "sha256:" + createHash("sha256").update(canonicalJson(value)).digest("hex"); }
+export function repositoryIdentity(root: string): string { return "sandbox-execution-repository:sha256:" + createHash("sha256").update(root).digest("hex"); }
+export function authToken(): string { return randomBytes(32).toString("hex"); }
+
+export function metadataReservation(run: SandboxDetachedRunOptions): number {
+  let reserved = BASE_RECORD_BYTES;
+  for (const request of [run.process.artifacts, run.process.changeSet]) {
+    if (request === undefined) continue;
+    const bytes = positive(request.maxBytes, "artifact/change-set maxBytes");
+    if (bytes > 64 * 1024 * 1024) throw new RangeError("Artifact/change-set request exceeds its 64 MiB bound.");
+    // Stored artifact content uses the existing hex representation. The base
+    // allowance covers bounded native control messages and preparation evidence.
+    reserved += 2 * bytes;
+  }
+  return reserved;
 }
 
-function rejectSignal(value: object, label: string): void {
-  if ("signal" in value) throw new TypeError(`Detached ${label} options must not contain a process-local AbortSignal.`);
-}
-
-export function digestRun(value: SandboxDetachedRunOptions): string {
-  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
-}
-
-export function repositoryIdentity(root: string): string {
-  return `sandbox-execution-repository:sha256:${createHash("sha256").update(root).digest("hex")}`;
-}
-
-export function authToken(): string {
-  return randomBytes(32).toString("hex");
-}
-
-export async function createExecutionDirectory(directory: string): Promise<boolean> {
-  try {
-    await mkdir(directory, { mode: 0o700 });
+// Admission commits its reservations before a worker or output directory exists.
+export function admitExecution(root: string, initial: ExecutionPreparingRecord, limits: ExecutionRepositoryLimits): boolean {
+  const encoded = encodeRecord(initial);
+  return withStorage(root, (db) => transaction(db, () => {
+    const existing = db.prepare("SELECT request_digest FROM executions WHERE execution_id = ?").get(initial.executionId);
+    if (existing !== undefined) {
+      if (existing.request_digest !== initial.requestDigest) throw new Error("Execution identity is already bound to a different request.");
+      return false;
+    }
+    const totals = db.prepare("SELECT count(*) AS identities, coalesce(sum(retained), 0) AS retained, coalesce(sum(reserved_bytes), 0) AS bytes, coalesce(sum(reserved_metadata), 0) AS metadata FROM executions").get()!;
+    if (Number(totals.identities) >= limits.maxRetainedIdentities) throw new RangeError("Execution identity admission capacity is exhausted.");
+    if (Number(totals.retained) >= limits.maxRetainedExecutions || initial.outputLimit > limits.maxTotalOutputBytes - Number(totals.bytes)
+      || initial.metadataLimit > limits.maxTotalMetadataBytes - Number(totals.metadata)) {
+      throw new RangeError("Execution retention admission capacity is exhausted.");
+    }
+    db.prepare("INSERT INTO executions (execution_id, request_digest, reserved_bytes, reserved_metadata, retained, state) VALUES (?, ?, ?, ?, 1, ?)")
+      .run(initial.executionId, initial.requestDigest, initial.outputLimit, initial.metadataLimit, encoded);
     return true;
-  } catch (error) {
-    if (nodeCode(error) === "EEXIST") return false;
-    throw error;
-  }
+  }));
 }
-
-export async function writeRecord(directory: string, record: ExecutionRecord): Promise<void> {
-  await writeEnvelope(join(directory, STATE_FILE), record);
+function checkDirectory(directory: string, executionId: string): void {
+  if (basename(executionDirectory(dirname(directory), executionId)) !== basename(directory)) throw new TypeError("Execution record identity does not match its directory.");
 }
-
-export async function readRecord(directory: string): Promise<ExecutionRecord> {
-  return parseRecord(await readEnvelope(join(directory, STATE_FILE)));
+export async function readRecord(directory: string, executionId: string): Promise<ExecutionRecord> {
+  checkDirectory(directory, executionId);
+  return withStorage(dirname(directory), (db) => {
+    const row = db.prepare("SELECT state FROM executions WHERE execution_id = ?").get(executionId);
+    if (row === undefined) throw Object.assign(new Error("No execution record exists for this identity."), { code: "EXECUTION_NOT_FOUND" });
+    executionRecordReadMetrics.records++;
+    executionRecordReadMetrics.bytes += Buffer.byteLength(requiredString(row.state, "execution state"));
+    const parsed = decodeRecord(row.state);
+    if (parsed.executionId !== executionId) throw new TypeError("Execution record identity mismatch.");
+    return parsed;
+  });
 }
-
-export async function writeReceipt(directory: string, result: SandboxRunResult): Promise<void> {
-  const { stdout, stderr, ...fields } = result;
-  const stored: StoredReceipt = {
-    result: {
-      ...fields,
-      ...(stdout === undefined ? {} : { stdoutBase64: stdout.toString("base64") }),
-      ...(stderr === undefined ? {} : { stderrBase64: stderr.toString("base64") }),
-    },
-  };
-  await writeEnvelope(join(directory, RECEIPT_FILE), stored);
+export async function writeRecord(directory: string, next: ExecutionRecord, expectedPhase?: ExecutionRecord["phase"]): Promise<void> {
+  checkDirectory(directory, next.executionId);
+  const encoded = encodeRecord(next);
+  withStorage(dirname(directory), (db) => transaction(db, () => {
+    const row = db.prepare("SELECT state FROM executions WHERE execution_id = ?").get(next.executionId);
+    if (row === undefined) throw new Error("Execution must be admitted before publication.");
+    const current = decodeRecord(row.state);
+    if (current.requestDigest !== next.requestDigest) throw new Error("Execution request identity changed.");
+    if (current.phase === "settled" || current.phase === "rejected" || current.phase === "retired") {
+      if (digestRun(current) !== digestRun(next)) throw new Error("Committed terminal evidence is immutable.");
+      return;
+    }
+    if (expectedPhase !== undefined && current.phase !== expectedPhase) throw new Error("Execution publication lost its expected state.");
+    if (next.phase === "retired") throw new Error("Retirement requires an explicit release transaction.");
+    if (current.authToken !== next.authToken || current.outputLimit !== next.outputLimit || current.metadataLimit !== next.metadataLimit || current.admitterPid !== next.admitterPid
+      || current.createdAtMs !== next.createdAtMs || (current.workerPid !== 0 && current.workerPid !== next.workerPid)) {
+      throw new Error("Execution publication changed its immutable admission authority.");
+    }
+    if (current.preparation !== undefined && digestRun(current.preparation) !== digestRun(next.preparation)) throw new Error("Execution preparation evidence changed.");
+    const transitions: Record<typeof current.phase, readonly ExecutionRecord["phase"][]> = {
+      preparing: ["preparing", "prepared", "rejected", "unknown"],
+      prepared: ["activating", "rejected", "unknown"],
+      activating: ["running", "rejected", "unknown"],
+      running: ["settled", "unknown"],
+      unknown: ["unknown"],
+    };
+    if (!transitions[current.phase].includes(next.phase)) throw new Error("Invalid execution state transition.");
+    if (current.phase === "prepared" && next.phase === "activating"
+      && (current.policyDigest !== next.policyDigest || current.executionDigest !== next.executionDigest)) throw new Error("Activation does not match prepared authority.");
+    if (current.phase === "running" && next.phase === "settled" && current.processId !== next.result.processId) throw new Error("Terminal receipt process identity changed.");
+    if (current.phase === "activating" || current.phase === "running") {
+      const authority = next.phase === "settled" ? next.result : next;
+      if (("policyDigest" in authority && (authority.policyDigest !== current.policyDigest || authority.executionDigest !== current.executionDigest))
+        || (next.phase === "rejected" && current.phase === "running")) throw new Error("Execution publication does not match accepted authority.");
+    }
+    db.prepare("UPDATE executions SET state = ? WHERE execution_id = ?").run(encoded, next.executionId);
+  }));
 }
-
-export async function readReceipt(directory: string): Promise<SandboxRunResult> {
-  const source = record(await readEnvelope(join(directory, RECEIPT_FILE)), "execution receipt");
-  const stored = record(source.result, "execution result");
-  const value = { ...stored };
-  const stdoutBase64 = optionalString(value.stdoutBase64, "stdoutBase64");
-  const stderrBase64 = optionalString(value.stderrBase64, "stderrBase64");
-  delete value.stdoutBase64;
-  delete value.stderrBase64;
-  return parseStoredRunResult(value, stdoutBase64, stderrBase64);
+export function terminalReceipt<T extends Omit<TerminalRecord, "receipt">>(terminal: T, boundary: Omit<SandboxExecutionReceipt, "digest">): T & { receipt: SandboxExecutionReceipt } {
+  return { ...terminal, receipt: { ...boundary, digest: digestRun({ terminal, boundary }) } };
 }
-
-export async function appendOutput(
-  directory: string,
-  chunk: Omit<StoredOutputChunk, "hash">,
-): Promise<string> {
-  const unsigned = canonicalJson(chunk);
-  const hash = createHash("sha256").update(unsigned).digest("hex");
-  const line = `${JSON.stringify({ ...chunk, hash })}\n`;
-  const file = await open(join(directory, OUTPUT_FILE), constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  try {
-    await file.write(line);
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  return hash;
+export function retireExecution(root: string, executionId: string, expectedDigest: string | undefined, expectedUnknown?: ExecutionRecord): ExecutionRetiredRecord {
+  return withStorage(root, (db) => transaction(db, () => {
+    const row = db.prepare("SELECT state FROM executions WHERE execution_id = ?").get(executionId);
+    if (row === undefined) throw new Error("Execution identity is not retained.");
+    const current = decodeRecord(row.state);
+    if (current.phase === "retired") {
+      if (current.receiptDigest !== expectedDigest) throw new Error("Retirement receipt identity conflicts with the committed release.");
+      return current;
+    }
+    if (expectedDigest !== undefined) {
+      if (current.phase !== "settled" && current.phase !== "rejected") throw new Error("A live or uncertain execution cannot be forgotten.");
+      if (current.receipt.digest !== expectedDigest) throw new Error("Terminal receipt identity does not match the authorized release.");
+    } else if (expectedUnknown === undefined || encodeRecord(current) !== encodeRecord(expectedUnknown)) {
+      throw new Error("Unknown outcome changed before acknowledgement.");
+    }
+    const retired: ExecutionRetiredRecord = {
+      schemaVersion: 1, contract: "retained-execution", phase: "retired", executionId,
+      requestDigest: current.requestDigest, createdAtMs: current.createdAtMs,
+      reason: expectedDigest === undefined ? "acknowledged-unknown" : "released",
+      ...(expectedDigest === undefined ? {} : { receiptDigest: expectedDigest }), cleanupPending: true,
+    };
+    // Reservation is released only after output deletion completes.
+    db.prepare("UPDATE executions SET state = ?, control = NULL WHERE execution_id = ?").run(encodeRecord(retired), executionId);
+    return retired;
+  }));
 }
-
-export async function readOutput(
-  directory: string,
-  afterCursor: number,
-  maxBytes: number,
-  expectedEnd?: number,
-  expectedHash?: string,
-): Promise<{ cursorStart: number; cursorEnd: number; availableCursorEnd: number; stdoutBytes: number; stderrBytes: number; cursorExpired: boolean; chunks: readonly SandboxExecutionOutputChunk[]; outputHash: string }> {
-  let text = "";
-  try {
-    text = await readFile(join(directory, OUTPUT_FILE), "utf8");
-  } catch (error) {
-    if (nodeCode(error) !== "ENOENT") throw error;
-  }
-  const lines = text.split("\n");
-  const completeLines = lines.at(-1) === "" ? lines.slice(0, -1) : lines.slice(0, -1);
-  let previousHash = "0".repeat(64);
-  let cursorEnd = 0;
-  let stdoutBytes = 0;
-  let stderrBytes = 0;
-  const stored: StoredOutputChunk[] = [];
-  for (const [index, line] of completeLines.entries()) {
-    if (line.length === 0) continue;
-    const chunk = parseOutputChunk(JSON.parse(line), index + 1);
-    if (chunk.previousHash !== previousHash || chunk.cursorStart !== cursorEnd) throw new Error("Execution output hash chain is invalid.");
-    const unsigned = { ...chunk } as Record<string, unknown>;
-    delete unsigned.hash;
-    if (createHash("sha256").update(canonicalJson(unsigned)).digest("hex") !== chunk.hash) throw new Error("Execution output chunk checksum is invalid.");
-    previousHash = chunk.hash;
-    cursorEnd = chunk.cursorEnd;
-    if (chunk.stream === "stdout") stdoutBytes += chunk.cursorEnd - chunk.cursorStart;
-    else stderrBytes += chunk.cursorEnd - chunk.cursorStart;
-    stored.push(chunk);
-  }
-  if (expectedEnd !== undefined && (cursorEnd !== expectedEnd || previousHash !== expectedHash)) {
-    throw new Error("Execution output does not match its terminal receipt.");
-  }
-  if (!Number.isSafeInteger(afterCursor) || afterCursor < 0 || afterCursor > cursorEnd) throw new RangeError("Invalid execution output cursor.");
-  let remaining = positive(maxBytes, "maxBytes");
-  const chunks: SandboxExecutionOutputChunk[] = [];
-  let cursorStart = afterCursor;
-  for (const item of stored) {
-    if (item.cursorEnd <= afterCursor || remaining === 0) continue;
-    const data = Buffer.from(item.dataBase64, "base64");
-    const offset = Math.max(0, afterCursor - item.cursorStart);
-    const selected = data.subarray(offset, offset + remaining);
-    if (selected.byteLength === 0) continue;
-    const start = item.cursorStart + offset;
-    chunks.push(Object.freeze({ cursorStart: start, cursorEnd: start + selected.byteLength, stream: item.stream, data: Buffer.from(selected) }));
-    if (chunks.length === 1) cursorStart = start;
-    remaining -= selected.byteLength;
-  }
-  const observedEnd = chunks.at(-1)?.cursorEnd ?? afterCursor;
-  return Object.freeze({ cursorStart, cursorEnd: observedEnd, availableCursorEnd: cursorEnd, stdoutBytes, stderrBytes, cursorExpired: false, chunks: Object.freeze(chunks), outputHash: previousHash });
+export async function finishRetirement(root: string, retired: ExecutionRetiredRecord): Promise<void> {
+  if (!retired.cleanupPending) return;
+  await rm(executionDirectory(root, retired.executionId), { recursive: true, force: true });
+  withStorage(root, (db) => transaction(db, () => {
+    const current = decodeRecord(db.prepare("SELECT state FROM executions WHERE execution_id = ?").get(retired.executionId)?.state);
+    if (current.phase !== "retired" || current.receiptDigest !== retired.receiptDigest) throw new Error("Retirement identity changed.");
+    db.prepare("UPDATE executions SET state = ?, retained = 0, reserved_bytes = 0, reserved_metadata = 0 WHERE execution_id = ?")
+      .run(encodeRecord({ ...current, cleanupPending: false }), retired.executionId);
+  }));
 }
-
-export async function expireRecord(directory: string, recordValue: ExecutionSettledRecord | ExecutionRejectedRecord): Promise<void> {
-  const lock = join(directory, "expire.lock");
-  let handle;
-  try {
-    handle = await open(lock, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  } catch (error) {
-    if (nodeCode(error) === "EEXIST") return;
-    throw error;
-  }
-  try {
-    await rm(join(directory, OUTPUT_FILE), { force: true });
-    await rm(join(directory, RECEIPT_FILE), { force: true });
-    await writeRecord(directory, {
-      schemaVersion: 1,
-      phase: "expired",
-      executionId: recordValue.executionId,
-      requestDigest: recordValue.requestDigest,
-      createdAtMs: recordValue.createdAtMs,
-      expiredAtMs: recordValue.expiresAtMs,
-    });
-  } finally {
-    await handle.close();
-    await rm(lock, { force: true });
-  }
+export function inventory(root: string, afterCursor: number, limit: number): { sequence: number; executionId: string }[] {
+  return withStorage(root, (db) => db.prepare("SELECT sequence, execution_id FROM executions WHERE sequence > ? ORDER BY sequence LIMIT ?")
+    .all(afterCursor, limit).map((row) => ({ sequence: requiredNumber(row.sequence, "inventory sequence"), executionId: requiredString(row.execution_id, "inventory identity") })));
 }
-
-export async function removeExecutionDirectory(directory: string): Promise<void> {
-  await rm(directory, { recursive: true, force: true });
+export interface StoredControl { id: string; digest: string; status: "accepted" | "applied" }
+export function writeControl(root: string, executionId: string, control: StoredControl): void {
+  withStorage(root, (db) => transaction(db, () => {
+    const current = decodeRecord(db.prepare("SELECT state FROM executions WHERE execution_id = ?").get(executionId)?.state);
+    if (current.phase === "retired") throw new Error("Execution is retired.");
+    db.prepare("UPDATE executions SET control = ? WHERE execution_id = ?").run(JSON.stringify({ value: control, sha256: digestRun(control) }), executionId);
+  }));
 }
-
+export function readControl(root: string, executionId: string): StoredControl | undefined {
+  return withStorage(root, (db) => {
+    const row = db.prepare("SELECT control FROM executions WHERE execution_id = ?").get(executionId);
+    if (row?.control === null || row === undefined) return undefined;
+    const envelope = record(JSON.parse(requiredString(row.control, "control receipt")), "control receipt envelope");
+    if (envelope.sha256 !== digestRun(envelope.value)) throw new TypeError("Control receipt integrity binding is invalid.");
+    const value = record(envelope.value, "control receipt");
+    if (value.status !== "accepted" && value.status !== "applied") throw new TypeError("Invalid control receipt status.");
+    return { id: requiredString(value.id, "control identity"), digest: digestString(value.digest, "control digest"), status: value.status };
+  });
+}
 export function serializeRunForHost(run: SandboxDetachedRunOptions, limits: ExecutionRepositoryLimits): string {
   return JSON.stringify({ schemaVersion: 1, run, limits });
 }
-
 export function parseRunForHost(value: unknown): { run: SandboxDetachedRunOptions; limits: ExecutionRepositoryLimits } {
   const source = record(value, "execution host request");
   if (source.schemaVersion !== 1) throw new TypeError("Unsupported execution host request schema.");
-  const limits = record(source.limits, "execution repository limits");
-  const parsedLimits = normalizeLimits({
-    completedRetentionMs: requiredNumber(limits.completedRetentionMs, "completedRetentionMs"),
-    expiredIdentityRetentionMs: requiredNumber(limits.expiredIdentityRetentionMs, "expiredIdentityRetentionMs"),
-    maxRetainedOutputBytes: requiredNumber(limits.maxRetainedOutputBytes, "maxRetainedOutputBytes"),
-    startupTimeoutMs: requiredNumber(limits.startupTimeoutMs, "startupTimeoutMs"),
-  });
+  const parsedLimits = normalizeLimits({ ...record(source.limits, "execution repository limits"), directory: "" });
   const run = source.run as SandboxDetachedRunOptions;
   validateDetachedRun(run, parsedLimits.maxRetainedOutputBytes);
   return { run, limits: parsedLimits };
 }
-
 export function sandboxErrorData(error: unknown, targetExecuted: boolean): SandboxErrorData {
   if (typeof error === "object" && error !== null && "data" in error) {
-    try {
-      return parseErrorData((error as { data: unknown }).data);
-    } catch {
-      // Fall through to the bounded host error below.
-    }
+    try { return parseErrorData(error.data); } catch { /* Keep raw protocol and secret data out of diagnostics. */ }
   }
-  return {
-    code: targetExecuted ? "runtime_crashed.detached_host" : "spawn.detached_host",
-    message: bounded(error instanceof Error ? error.message : String(error)),
-    phase: targetExecuted ? "execute" : "spawn",
-    targetExecuted,
-  };
+  return { code: targetExecuted ? "runtime_crashed.detached_host" : "spawn.detached_host",
+    message: "Detached execution host failed.", phase: targetExecuted ? "execute" : "spawn", targetExecuted };
 }
-
-export function randomTempName(path: string): string {
-  return `${path}.${process.pid}.${randomUUID()}.tmp`;
+function encodeRecord(value: ExecutionRecord): string {
+  parseRecord(value);
+  const text = JSON.stringify({ schemaVersion: 1, sha256: digestRun(value), value });
+  if (Buffer.byteLength(text) > (value.phase === "retired" ? BASE_RECORD_BYTES : value.metadataLimit)) throw new RangeError("Execution metadata exceeds its reserved storage bound.");
+  return text;
 }
-
-async function writeEnvelope(path: string, value: unknown): Promise<void> {
-  const serializedValue = canonicalJson(value);
-  const envelope: StoredEnvelope = {
-    schemaVersion: 1,
-    sha256: createHash("sha256").update(serializedValue).digest("hex"),
-    value,
-  };
-  const temporary = randomTempName(path);
-  const file = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  try {
-    await file.writeFile(`${JSON.stringify(envelope)}\n`, "utf8");
-    await file.sync();
-  } finally {
-    await file.close();
-  }
-  await rename(temporary, path);
-  const directory = await open(dirname(path), constants.O_RDONLY);
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
-}
-
-async function readEnvelope(path: string): Promise<unknown> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let text: string;
-  try {
-    text = await file.readFile("utf8");
-  } finally {
-    await file.close();
-  }
+function decodeRecord(value: unknown): ExecutionRecord {
+  const text = requiredString(value, "stored execution record");
+  if (Buffer.byteLength(text) > MAX_RECORD_BYTES) throw new TypeError("Execution record exceeds its storage bound.");
   const envelope = record(JSON.parse(text), "stored execution envelope");
-  if (envelope.schemaVersion !== 1) throw new TypeError("Unsupported stored execution envelope schema.");
-  const checksum = requiredString(envelope.sha256, "stored execution checksum");
-  if (createHash("sha256").update(canonicalJson(envelope.value)).digest("hex") !== checksum) {
-    throw new TypeError("Stored execution envelope checksum is invalid.");
-  }
-  return envelope.value;
+  if (envelope.schemaVersion !== 1 || envelope.sha256 !== digestRun(envelope.value)) throw new TypeError("Stored execution envelope checksum is invalid.");
+  return parseRecord(envelope.value);
 }
-
 function parseRecord(value: unknown): ExecutionRecord {
   const source = record(value, "execution record");
-  if (source.schemaVersion !== 1) throw new TypeError("Unsupported execution record schema.");
-  const phase = requiredString(source.phase, "execution phase");
-  const base = {
-    schemaVersion: 1 as const,
-    executionId: requiredString(source.executionId, "execution ID"),
-    requestDigest: requiredString(source.requestDigest, "request digest"),
-    createdAtMs: requiredNumber(source.createdAtMs, "execution creation time"),
-  };
-  if (phase === "expired") return { ...base, phase, expiredAtMs: requiredNumber(source.expiredAtMs, "expiration time") };
-  const live = {
-    ...base,
-    workerPid: requiredNumber(source.workerPid, "worker PID"),
-    authToken: requiredString(source.authToken, "execution auth token"),
-  };
-  if (phase === "preparing") return { ...live, phase };
-  const endpoint = requiredNumber(source.endpoint, "execution endpoint");
-  if (phase === "prepared") return {
-    ...live, phase, endpoint,
-    policyDigest: digestString(source.policyDigest, "policy digest"),
-    executionDigest: digestString(source.executionDigest, "execution digest"),
-    summary: parseRunSummary(source.summary),
-    enforcement: parseEnforcement(source.enforcement),
-    expiresAtMs: requiredNumber(source.expiresAtMs, "preparation expiration"),
-  };
-  if (phase === "activating") return {
-    ...live, phase, endpoint,
-    policyDigest: digestString(source.policyDigest, "policy digest"),
-    executionDigest: digestString(source.executionDigest, "execution digest"),
-    activatedAtMs: requiredNumber(source.activatedAtMs, "activation time"),
-  };
-  if (phase === "running") return { ...live, phase, endpoint, processId: requiredString(source.processId, "process ID") };
-  if (phase === "settled") return {
-    ...live, phase, endpoint, processId: requiredString(source.processId, "process ID"),
-    settledAtMs: requiredNumber(source.settledAtMs, "settlement time"),
-    expiresAtMs: requiredNumber(source.expiresAtMs, "receipt expiration"),
-    cursorEnd: requiredNumber(source.cursorEnd, "output cursor"),
-    outputHash: requiredString(source.outputHash, "output hash"),
-  };
-  if (phase === "rejected") return {
-    ...live, phase, endpoint,
-    rejectedAtMs: requiredNumber(source.rejectedAtMs, "rejection time"),
-    expiresAtMs: requiredNumber(source.expiresAtMs, "receipt expiration"),
-    error: parseErrorData(source.error),
-  };
-  if (phase === "unknown") return {
-    ...live, phase, endpoint,
-    unknownAtMs: requiredNumber(source.unknownAtMs, "unknown outcome time"),
-    reason: source.reason === "execution-host-failed" ? source.reason : fail("Invalid unknown outcome reason."),
-    diagnostic: requiredString(source.diagnostic, "unknown outcome diagnostic"),
-  };
-  throw new TypeError(`Unknown execution record phase: ${phase}`);
+  if (source.schemaVersion !== 1 || source.contract !== "retained-execution") throw new TypeError("Incompatible stored execution record.");
+  const executionId = requiredString(source.executionId, "execution ID");
+  validateExecutionId(executionId);
+  const base = { schemaVersion: 1 as const, contract: "retained-execution" as const, executionId,
+    requestDigest: digestString(source.requestDigest, "request digest"), createdAtMs: requiredNumber(source.createdAtMs, "creation time") };
+  if (source.phase === "retired") {
+    if (source.reason !== "released" && source.reason !== "acknowledged-unknown") throw new TypeError("Invalid retirement reason.");
+    if (typeof source.cleanupPending !== "boolean") throw new TypeError("Invalid retirement cleanup state.");
+    return { ...base, phase: "retired", reason: source.reason, cleanupPending: source.cleanupPending,
+      ...(source.reason === "released" ? { receiptDigest: digestString(source.receiptDigest, "released receipt digest") } : {}) };
+  }
+  const live = { ...base, admitterPid: requiredNumber(source.admitterPid, "admitting process PID"), workerPid: requiredNumber(source.workerPid, "worker PID"),
+    authToken: requiredString(source.authToken, "execution auth token"), outputLimit: positive(requiredNumber(source.outputLimit, "output limit"), "output limit"),
+    metadataLimit: positive(requiredNumber(source.metadataLimit, "metadata limit"), "metadata limit"),
+    ...(source.endpoint === undefined ? {} : { endpoint: requiredNumber(source.endpoint, "execution endpoint") }),
+    ...(source.preparation === undefined ? {} : { preparation: parsePreparation(source.preparation) }) };
+  if (!/^[a-f0-9]{64}$/u.test(live.authToken)) throw new TypeError("Invalid execution authentication authority.");
+  if (live.metadataLimit < BASE_RECORD_BYTES || live.metadataLimit > MAX_RECORD_BYTES) throw new TypeError("Invalid execution metadata reservation.");
+  if (live.endpoint !== undefined && live.endpoint > 65_535) throw new TypeError("Invalid execution endpoint.");
+  if (source.phase === "preparing") return { ...live, phase: "preparing" };
+  if (source.phase === "unknown") return { ...live, phase: "unknown", unknownAtMs: requiredNumber(source.unknownAtMs, "unknown time"), diagnostic: requiredString(source.diagnostic, "unknown diagnostic") };
+  const endpoint = requiredNumber(source.endpoint, "endpoint");
+  if (source.phase === "prepared") return { ...live, phase: "prepared", endpoint,
+    policyDigest: digestString(source.policyDigest, "policy digest"), executionDigest: digestString(source.executionDigest, "execution digest"),
+    summary: parseRunSummary(source.summary), enforcement: parseEnforcement(source.enforcement), expiresAtMs: requiredNumber(source.expiresAtMs, "preparation expiration") };
+  if (source.phase === "activating" || source.phase === "running") {
+    const authority = { ...live, endpoint, policyDigest: digestString(source.policyDigest, "policy digest"), executionDigest: digestString(source.executionDigest, "execution digest") };
+    if (source.phase === "activating") return { ...authority, phase: "activating", activatedAtMs: requiredNumber(source.activatedAtMs, "activation time") };
+    return { ...authority, phase: "running", processId: requiredString(source.processId, "process ID") };
+  }
+  if (source.phase === "settled" || source.phase === "rejected") {
+    if ("expiresAtMs" in source) throw new TypeError("Incompatible terminal retention contract.");
+    const receipt = record(source.receipt, "terminal receipt boundary");
+    const boundary = {
+      finalCursor: requiredNumber(receipt.finalCursor, "final cursor"), outputHash: digestString(receipt.outputHash, "output hash"),
+      stdoutBytes: requiredNumber(receipt.stdoutBytes, "retained stdout bytes"), stderrBytes: requiredNumber(receipt.stderrBytes, "retained stderr bytes"),
+      omittedStdoutBytes: requiredNumber(receipt.omittedStdoutBytes, "omitted stdout bytes"), omittedStderrBytes: requiredNumber(receipt.omittedStderrBytes, "omitted stderr bytes"),
+    };
+    if (boundary.stdoutBytes + boundary.stderrBytes !== boundary.finalCursor || boundary.finalCursor > live.outputLimit) throw new TypeError("Invalid terminal output boundary.");
+    const terminal = source.phase === "settled"
+      ? { ...live, endpoint, phase: "settled" as const, settledAtMs: requiredNumber(source.settledAtMs, "settlement time"), result: parseStoredRunResult(record(source.result, "terminal result")) }
+      : { ...live, endpoint, phase: "rejected" as const, rejectedAtMs: requiredNumber(source.rejectedAtMs, "rejection time"), error: parseErrorData(source.error) };
+    if (terminal.phase === "rejected" && terminal.error.targetExecuted) throw new TypeError("An executed effect cannot be rejected as unstarted.");
+    if (terminal.phase === "settled" && (terminal.result.usage.stdoutBytes !== boundary.stdoutBytes + boundary.omittedStdoutBytes
+      || terminal.result.usage.stderrBytes !== boundary.stderrBytes + boundary.omittedStderrBytes)) throw new TypeError("Terminal output accounting is inconsistent.");
+    if (terminal.phase === "settled" && live.preparation !== undefined && (terminal.result.policyDigest !== live.preparation.policyDigest
+      || terminal.result.executionDigest !== live.preparation.executionDigest)) throw new TypeError("Terminal result does not match preparation authority.");
+    const digest = digestString(receipt.digest, "terminal receipt digest");
+    if (digestRun({ terminal, boundary }) !== digest) throw new TypeError("Terminal receipt integrity binding is invalid.");
+    return { ...terminal, receipt: { ...boundary, digest } };
+  }
+  throw new TypeError("Incompatible execution record phase.");
 }
 
-function parseOutputChunk(value: unknown, sequence: number): StoredOutputChunk {
-  const source = record(value, `output chunk ${sequence}`);
-  const parsed: StoredOutputChunk = {
-    sequence: requiredNumber(source.sequence, "output sequence"),
-    cursorStart: requiredNumber(source.cursorStart, "output cursor start"),
-    cursorEnd: requiredNumber(source.cursorEnd, "output cursor end"),
-    stream: source.stream === "stdout" || source.stream === "stderr" ? source.stream : fail("Invalid output stream."),
-    dataBase64: requiredString(source.dataBase64, "output data"),
-    previousHash: requiredString(source.previousHash, "previous output hash"),
-    hash: requiredString(source.hash, "output hash"),
-  };
-  if (parsed.sequence !== sequence || parsed.cursorEnd < parsed.cursorStart || Buffer.from(parsed.dataBase64, "base64").byteLength !== parsed.cursorEnd - parsed.cursorStart) {
-    throw new TypeError("Execution output chunk geometry is invalid.");
-  }
-  return parsed;
+function parsePreparation(value: unknown): SandboxExecutionPreparation {
+  const source = record(value, "preparation evidence");
+  return { policyDigest: digestString(source.policyDigest, "policy digest"), executionDigest: digestString(source.executionDigest, "execution digest"),
+    summary: parseRunSummary(source.summary), enforcement: parseEnforcement(source.enforcement), expiresAtMs: requiredNumber(source.expiresAtMs, "preparation expiration") };
 }
 
 function canonicalJson(value: unknown): string {
@@ -517,8 +370,6 @@ function canonicalJson(value: unknown): string {
 
 function parseStoredRunResult(
   source: Record<string, unknown>,
-  stdoutBase64: string | undefined,
-  stderrBase64: string | undefined,
 ): SandboxRunResult {
   const result: SandboxRunResult = {
     processId: requiredString(source.processId, "result processId"),
@@ -529,8 +380,6 @@ function parseStoredRunResult(
     violations: array(source.violations, "result violations").map(parseViolation),
     usage: parseStoredUsage(source.usage),
     cleanup: parseCleanup(source.cleanup),
-    ...(stdoutBase64 === undefined ? {} : { stdout: Buffer.from(stdoutBase64, "base64") }),
-    ...(stderrBase64 === undefined ? {} : { stderr: Buffer.from(stderrBase64, "base64") }),
   };
   if (source.artifacts !== undefined) result.artifacts = parseStoredArtifacts(source.artifacts);
   if (source.changeSets !== undefined) result.changeSets = array(source.changeSets, "result changeSets").map(parseStoredWorkspaceChangeSet);
@@ -659,10 +508,6 @@ function requiredString(value: unknown, label: string): string {
   return value;
 }
 
-function optionalString(value: unknown, label: string): string | undefined {
-  if (value === undefined) return undefined;
-  return requiredString(value, label);
-}
 
 function requiredNumber(value: unknown, label: string): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a non-negative safe integer.`);
@@ -674,14 +519,7 @@ function positive(value: number, label: string): number {
   return value;
 }
 
-function bounded(value: string): string {
-  return value.length <= 4096 ? value : `${value.slice(0, 4093)}...`;
-}
 
 function fail(message: string): never {
   throw new TypeError(message);
-}
-
-function nodeCode(error: unknown): string | undefined {
-  return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : undefined;
 }

@@ -10,11 +10,17 @@ export type {
 } from "./sandbox.js";
 export type { SandboxEnvironment, SandboxEnvironmentValue } from "./environment.js";
 export { openSandboxExecutionRepository } from "./execution-repository.js";
+export { SandboxExecutionControlError } from "./execution-control.js";
 export type {
   SandboxDetachedProcessOptions,
   SandboxDetachedRunOptions,
   SandboxExecutionObservation,
   SandboxExecutionOutput,
+  SandboxExecutionAvailableOutput,
+  SandboxExecutionReceipt,
+  SandboxExecutionPreparation,
+  SandboxExecutionControlFailure,
+  SandboxExecutionInventoryQuery,
   SandboxExecutionOutputChunk,
   SandboxExecutionQuery,
   SandboxExecutionReconciliation,

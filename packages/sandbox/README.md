@@ -38,4 +38,6 @@ await sandbox.dispose();
 
 See the repository [policy guide](../../docs/policy.md) and [getting started guide](../../docs/getting-started.md).
 
+Detached executions use an explicitly bounded repository, retain terminal receipts and original output until digest-bound release, and survive client termination. Status inspection does not load output by default; request output pages and check their availability separately. See the [execution repository contract](../../docs/execution-repository.md) for preparation authority, quotas, control diagnostics, and receipt consumption.
+
 Linux isolated process execution requires system bubblewrap at `/usr/bin/bwrap`, Landlock ABI 3 or later, and seccomp. A host-layout policy can use Landlock and seccomp when user namespaces or bubblewrap are unavailable. `probe()` reports host support for the supplied policy. Explicit memory and process-count limits additionally require writable cgroup delegation.

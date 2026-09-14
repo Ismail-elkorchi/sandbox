@@ -12,12 +12,16 @@ import type { PreparedRunSummary } from "./summary.js";
 export interface SandboxExecutionRepositoryOptions {
   /** Private host directory that owns execution identities and retained receipts. */
   directory: string;
-  /** Time a terminal receipt and its output remain queryable. */
-  completedRetentionMs?: number;
-  /** Additional time an expired identity remains distinguishable from an unknown identity. */
-  expiredIdentityRetentionMs?: number;
   /** Maximum output bytes retained for one execution. Must cover the requested sandbox output limit. */
   maxRetainedOutputBytes?: number;
+  /** Aggregate reserved original output bytes. Defaults to 1 GiB. */
+  maxTotalOutputBytes?: number;
+  /** Aggregate reserved receipt/authority metadata, including artifact content. Defaults to 1 GiB. */
+  maxTotalMetadataBytes?: number;
+  /** Maximum executions retaining evidence or an unresolved outcome. Defaults to 128. */
+  maxRetainedExecutions?: number;
+  /** Includes compact retired identities, which prevent replay. Defaults to 16,384. */
+  maxRetainedIdentities?: number;
   /** Maximum time allowed for the detached execution host to publish its control endpoint. */
   startupTimeoutMs?: number;
 }
@@ -56,7 +60,8 @@ export interface SandboxExecutionOutputChunk {
   data: Buffer;
 }
 
-export interface SandboxExecutionOutput {
+export interface SandboxExecutionAvailableOutput {
+  kind: "available";
   cursorStart: number;
   /** Cursor immediately after the bytes returned by this observation. */
   cursorEnd: number;
@@ -64,9 +69,34 @@ export interface SandboxExecutionOutput {
   availableCursorEnd: number;
   stdoutBytes: number;
   stderrBytes: number;
-  cursorExpired: boolean;
   chunks: readonly SandboxExecutionOutputChunk[];
 }
+
+export type SandboxExecutionOutput = SandboxExecutionAvailableOutput
+  | { kind: "not-requested" }
+  | { kind: "unavailable"; reason: "missing" | "corrupt" | "io" | "released"; diagnostic: string };
+
+export interface SandboxExecutionReceipt {
+  /** Binds the identity, exact authority, outcome, cleanup and final output boundary. */
+  digest: string;
+  finalCursor: number;
+  outputHash: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  /** Bytes reported by the runtime but not captured in the original log. */
+  omittedStdoutBytes: number;
+  omittedStderrBytes: number;
+}
+
+export interface SandboxExecutionPreparation {
+  policyDigest: string;
+  executionDigest: string;
+  summary: PreparedRunSummary;
+  enforcement: EnforcementReport;
+  expiresAtMs: number;
+}
+
+export type SandboxExecutionControlFailure = "unreachable" | "timeout" | "authentication-rejected" | "malformed-response" | "operation-rejected";
 
 interface SandboxExecutionBase {
   executionId: string;
@@ -95,41 +125,55 @@ export type SandboxExecutionObservation =
   | (SandboxExecutionBase & {
       kind: "settled";
       requestDigest: string;
-      result: SandboxRunResult;
+      result: Omit<SandboxRunResult, "stdout" | "stderr">;
+      receipt: SandboxExecutionReceipt;
+      preparation?: SandboxExecutionPreparation;
     })
   | (SandboxExecutionBase & {
       kind: "rejected";
       requestDigest: string;
       error: SandboxErrorData;
+      receipt: SandboxExecutionReceipt;
+      preparation?: SandboxExecutionPreparation;
     })
   | (SandboxExecutionBase & {
       kind: "unknown";
       requestDigest?: string;
-      reason: "not-found" | "execution-host-unreachable" | "corrupt-record";
+      reason: "not-found" | "execution-host-unreachable" | "corrupt-record" | "storage-unavailable";
       diagnostic: string;
+      controlFailure?: SandboxExecutionControlFailure;
     })
   | (SandboxExecutionBase & {
-      kind: "expired";
+      kind: "retired";
       requestDigest: string;
-      expiredAtMs: number;
+      receiptDigest?: string;
+      reason: "released" | "acknowledged-unknown";
+      cleanupPending: boolean;
     });
 
 export interface SandboxExecutionQuery {
   afterCursor?: number;
+  /** Zero (the default) inspects status without accessing output. Maximum 1 MiB. */
   maxBytes?: number;
   waitMs?: number;
 }
 
 export interface SandboxExecutionReconciliation {
-  settled: readonly SandboxExecutionObservation[];
-  unresolved: readonly SandboxExecutionObservation[];
+  observations: readonly SandboxExecutionObservation[];
+  nextCursor?: number;
+}
+
+export interface SandboxExecutionInventoryQuery {
+  afterCursor?: number;
+  limit?: number;
 }
 
 /**
  * Process-local client for a private, cross-process execution repository.
- * Executions survive application-process termination. Helper termination,
- * operating-system restart, power loss, and corrupt storage are reported as
- * unknown outcomes and are never replayed automatically.
+ * Executions survive application-process termination. Without valid terminal
+ * evidence, helper loss, operating-system restart, or storage damage can leave
+ * an unknown outcome. Independently verified terminal receipts remain terminal;
+ * executions are never replayed automatically.
  */
 export interface SandboxExecutionRepository {
   readonly identity: string;
@@ -141,9 +185,10 @@ export interface SandboxExecutionRepository {
   closeInput(executionId: string): Promise<void>;
   /** Cancelling a prepared execution acknowledges its durable terminal publication. */
   terminate(executionId: string): Promise<void>;
-  reconcile(): Promise<SandboxExecutionReconciliation>;
+  reconcile(query?: SandboxExecutionInventoryQuery): Promise<SandboxExecutionReconciliation>;
   /** Remove an explicitly accepted unknown outcome so it no longer blocks the owning application. */
   acknowledgeUnknown(executionId: string): Promise<void>;
-  forget(executionId: string): Promise<void>;
+  /** Release evidence only after consuming it durably or explicitly accepting its loss. */
+  forget(executionId: string, expected: { receiptDigest: string }): Promise<void>;
   close(): Promise<void>;
 }

@@ -124,9 +124,11 @@ try {
     assert.equal(settled.kind, "settled");
     await repository.close();
     repository = await openSandboxExecutionRepository({ directory: repositoryDirectory });
-    const recovered = await repository.inspect(request.executionId);
+    const recovered = await repository.inspect(request.executionId, { maxBytes: 1024 });
     assert.equal(recovered.kind, "settled");
     assert.equal(recovered.output.chunks.map((chunk) => chunk.data.toString()).join(""), "detached");
+    await repository.forget(request.executionId, { receiptDigest: recovered.receipt.digest });
+    assert.equal((await repository.inspect(request.executionId)).kind, "retired");
     await repository.close();
   }
 } finally {

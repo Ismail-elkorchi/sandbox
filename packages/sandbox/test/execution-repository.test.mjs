@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fixture } from "./fixtures/execution-records.mjs";
+import { sendControl } from "../dist/execution-control.js";
 import { openSandboxExecutionRepository } from "../dist/index.js";
 import { executionDirectory, readRecord, writeRecord } from "../dist/execution-record.js";
 import {
@@ -27,11 +30,12 @@ test("cancelling a preparation publishes terminal truth before it can be forgott
       const prepared = await repository.prepare({ executionId, run: detachedRun({ executable: "/bin/true", cwd: "/" }) }, { waitMs: 5_000 });
       assert.equal(prepared.kind, "prepared");
       await repository.terminate(executionId);
-      // No poll or intervening read may make cancellation appear synchronous.
-      await repository.forget(executionId);
+      const terminal = await repository.inspect(executionId);
+      assert.equal(terminal.kind, "rejected");
+      await repository.forget(executionId, { receiptDigest: terminal.receipt.digest });
       const absent = await repository.inspect(executionId);
-      assert.equal(absent.kind, "unknown");
-      assert.equal(absent.reason, "not-found");
+      assert.equal(absent.kind, "retired");
+      assert.equal(absent.reason, "released");
     }
   } finally {
     await repository.close();
@@ -58,6 +62,71 @@ test("terminal output includes every stdout and stderr chunk before publication"
     await repository.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("real worker rejects wrong tokens and digests and deduplicates a repeated input delivery", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-control-authority-"));
+  const repository = await openSandboxExecutionRepository({ directory });
+  const executionId = "input-once";
+  try {
+    const prepared = await repository.prepare({ executionId, run: detachedRun({ executable: "/bin/sh", cwd: "/", stdin: "pipe", stdout: "pipe",
+      args: ["-c", 'IFS= read -r first; IFS= read -r second; printf "%s|%s" "$first" "$second"'] }) });
+    assert.equal(prepared.kind, "prepared");
+    const state = await readRecord(executionDirectory(directory, executionId), executionId);
+    await assert.rejects(sendControl(state.endpoint, "f".repeat(64), { kind: "ping", id: randomUUID() }), (error) => error.failure === "authentication-rejected");
+    await assert.rejects(sendControl(state.endpoint, state.authToken, { kind: "activate", id: randomUUID(), policyDigest: "0".repeat(64), executionDigest: "0".repeat(64) }),
+      (error) => error.failure === "operation-rejected" && error.delivery === "not-applied");
+    assert.equal((await repository.inspect(executionId)).kind, "prepared");
+    await repository.activate(executionId, prepared);
+    let running;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      running = await repository.inspect(executionId, { waitMs: 25 });
+      if (running.kind === "running") break;
+    }
+    assert.equal(running.kind, "running");
+    const command = { id: randomUUID(), kind: "write", dataBase64: Buffer.from("one\n").toString("base64") };
+    await sendControl(state.endpoint, state.authToken, command);
+    await sendControl(state.endpoint, state.authToken, command);
+    await repository.writeInput(executionId, Buffer.from("two\n"));
+    const terminal = await inspectUntilTerminal(repository, executionId, { waitMs: 5000 });
+    assert.equal(terminal.kind, "settled");
+    assert.equal(Buffer.concat(terminal.output.chunks.map((chunk) => chunk.data)).toString(), "one|two");
+    assert.deepEqual(terminal.preparation.summary, prepared.summary);
+  } finally { await repository.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("unactivated preparation deadline rejects without running the effect", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-preparation-deadline-"));
+  const repository = await openSandboxExecutionRepository({ directory });
+  try {
+    const run = { ...detachedRun({ executable: "/bin/true", cwd: "/" }), preparedTtlMs: 100 };
+    const prepared = await repository.prepare({ executionId: "deadline", run });
+    assert.ok(prepared.kind === "prepared" || prepared.kind === "rejected");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const terminal = await repository.inspect("deadline");
+    assert.equal(terminal.kind, "rejected");
+    assert.equal(terminal.error.targetExecuted, false);
+    assert.match(terminal.error.code, /preparation_expired/);
+    if (prepared.kind === "prepared") await assert.rejects(repository.activate("deadline", prepared), /no live control/);
+  } finally { await repository.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("detached output limits preserve original captured bytes and exact omission counts", { skip: !linux }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-detached-output-limit-"));
+  const repository = await openSandboxExecutionRepository({ directory });
+  try {
+    const run = detachedRun({ executable: "/bin/sh", cwd: "/", stdout: "capture", args: ["-c", "while :; do printf 1234567890; done"] });
+    run.resources.output.value = 1024;
+    const terminal = await activate(repository, { executionId: "limit", run }, { waitMs: 5000, maxBytes: 1024 });
+    assert.equal(terminal.kind, "settled");
+    assert.equal(terminal.result.termination.reason, "output-limit");
+    assert.equal(terminal.result.stdout, undefined);
+    assert.equal(terminal.receipt.finalCursor, 1024);
+    assert.equal(terminal.receipt.stdoutBytes + terminal.receipt.omittedStdoutBytes, terminal.result.usage.stdoutBytes);
+    assert.ok(terminal.receipt.omittedStdoutBytes > 0);
+    const bytes = Buffer.concat(terminal.output.chunks.map((chunk) => chunk.data));
+    assert.deepEqual(bytes, Buffer.from("1234567890".repeat(103)).subarray(0, 1024));
+  } finally { await repository.close(); await rm(directory, { recursive: true, force: true }); }
 });
 
 function detachedRun(process, overrides = {}) {
@@ -151,7 +220,7 @@ test("execution repository creates a private authority directory", async () => {
       executionId: "missing",
       reason: "not-found",
       diagnostic: "No execution record exists for this identity.",
-      output: { cursorStart: 0, cursorEnd: 0, availableCursorEnd: 0, stdoutBytes: 0, stderrBytes: 0, cursorExpired: false, chunks: [] },
+      output: { kind: "not-requested" },
     });
   } finally {
     await repository.close();
@@ -163,25 +232,14 @@ test("accepted activation authority is never exposed as prepared", async () => {
   const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-activating-"));
   const repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 2_000 });
   try {
-    const stateDirectory = executionDirectory(directory, "accepted-authority");
-    await mkdir(stateDirectory, { mode: 0o700 });
-    await writeRecord(stateDirectory, {
-      schemaVersion: 1,
-      phase: "activating",
-      executionId: "accepted-authority",
-      requestDigest: `sha256:${"1".repeat(64)}`,
-      createdAtMs: Date.now(),
-      workerPid: process.pid,
-      authToken: "private-test-authority",
-      endpoint: 1,
-      policyDigest: `sha256:${"2".repeat(64)}`,
-      executionDigest: `sha256:${"3".repeat(64)}`,
-      activatedAtMs: Date.now(),
-    });
+    const item = await fixture(directory, "accepted-authority");
+    await item.accept();
+    const stateDirectory = item.directory;
 
     const observation = await repository.inspect("accepted-authority");
-    assert.equal(observation.kind, "preparing");
-    assert.equal((await readRecord(stateDirectory)).phase, "activating");
+    assert.equal(observation.kind, "unknown");
+    assert.equal(observation.controlFailure, "unreachable");
+    assert.equal((await readRecord(stateDirectory, "accepted-authority")).phase, "activating");
   } finally {
     await repository.close();
     await rm(directory, { recursive: true, force: true });
@@ -279,12 +337,11 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
     const prepared = await repository.prepare(request, { waitMs: 500 });
     assert.equal(prepared.kind, "prepared");
     await repository.activate(request.executionId, prepared);
-    assert.notEqual((await readRecord(executionDirectory(directory, request.executionId))).phase, "prepared");
+    assert.notEqual((await readRecord(executionDirectory(directory, request.executionId), request.executionId)).phase, "prepared");
     const observation = await repository.inspect(request.executionId, { waitMs: 500 });
     assert.equal(observation.kind, "running");
-    const statePath = await stateFile(directory, "host-loss");
-    const envelope = JSON.parse(await readFile(statePath, "utf8"));
-    process.kill(envelope.value.workerPid, "SIGKILL");
+    const state = await readRecord(executionDirectory(directory, "host-loss"), "host-loss");
+    process.kill(state.workerPid, "SIGKILL");
     await new Promise((resolve) => setTimeout(resolve, 250));
     const unknown = await repository.inspect("host-loss");
     assert.equal(unknown.kind, "unknown");
@@ -297,66 +354,29 @@ test("execution host loss becomes an unknown outcome and kills its isolated proc
   }
 });
 
-test("a durable result and cleanup receipt settles after worker death before state publication", { skip: !linux }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-receipt-recovery-"));
-  let repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 10 });
+test("terminal publication is immutable and survives former deadlines and restart", { skip: !linux }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-retention-"));
+  let repository = await openSandboxExecutionRepository({ directory });
   try {
-    const request = {
-      executionId: "receipt-recovery",
-      run: detachedRun({ executable: "/bin/printf", args: ["receipt-survives"], cwd: "/", stdout: "pipe" }),
-    };
-    const settled = await activate(repository, request, { waitMs: 5_000 });
-    assert.equal(settled.kind, "settled");
-    assert.equal(settled.result.cleanup.completed, true);
-    const stateDirectory = executionDirectory(directory, request.executionId);
-    const state = await readRecord(stateDirectory);
-    assert.equal(state.phase, "settled");
-    await writeRecord(stateDirectory, {
-      schemaVersion: 1,
-      phase: "running",
-      executionId: state.executionId,
-      requestDigest: state.requestDigest,
-      createdAtMs: state.createdAtMs,
-      workerPid: state.workerPid,
-      authToken: state.authToken,
-      endpoint: state.endpoint,
-      processId: state.processId,
-    });
-    await repository.close();
-    repository = await openSandboxExecutionRepository({ directory, startupTimeoutMs: 10 });
-    const recovered = await repository.inspect(request.executionId, { waitMs: 100 });
-    assert.equal(recovered.kind, "settled");
-    assert.equal(recovered.result.cleanup.completed, true);
-    assert.equal(recovered.output.chunks.map((chunk) => chunk.data.toString()).join(""), "receipt-survives");
-    assert.equal((await readRecord(stateDirectory)).phase, "settled");
-  } finally {
-    await repository.close();
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test("terminal execution receipts expire without becoming replayable", { skip: !linux }, async () => {
-  const directory = await mkdtemp(join(tmpdir(), "sandbox-execution-expiry-"));
-  const repository = await openSandboxExecutionRepository({ directory, expiredIdentityRetentionMs: 50 });
-  try {
-    const request = {
-      executionId: "expires",
-      run: detachedRun({ executable: "/bin/true", cwd: "/" }),
-    };
-    const settled = await activate(repository, request, { waitMs: 5_000 });
+    const request = { executionId: "retained", run: detachedRun({ executable: "/bin/printf", args: ["receipt-survives"], cwd: "/", stdout: "pipe" }) };
+    const settled = await activate(repository, request, { waitMs: 5_000, maxBytes: 1024 });
     assert.equal(settled.kind, "settled");
     const stateDirectory = executionDirectory(directory, request.executionId);
-    const settledRecord = await readRecord(stateDirectory);
-    assert.equal(settledRecord.phase, "settled");
-    await writeRecord(stateDirectory, { ...settledRecord, expiresAtMs: Date.now() - 1 });
-    assert.equal((await repository.inspect("expires")).kind, "expired");
-    const expiredRecord = await readRecord(stateDirectory);
-    assert.equal(expiredRecord.phase, "expired");
-    await writeRecord(stateDirectory, { ...expiredRecord, expiredAtMs: Date.now() - 51 });
-    const removed = await repository.inspect("expires");
-    assert.equal(removed.kind, "unknown");
-    assert.equal(removed.reason, "not-found");
+    const state = await readRecord(stateDirectory, request.executionId);
+    await assert.rejects(writeRecord(stateDirectory, { ...state, phase: "unknown", unknownAtMs: Date.now(), diagnostic: "stale failure" }), /immutable/);
+    await repository.close();
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+    repository = await openSandboxExecutionRepository({ directory });
+    const retained = await repository.inspect(request.executionId, { maxBytes: 1024 });
+    assert.equal(retained.kind, "settled");
+    assert.deepEqual(retained.receipt, settled.receipt);
+    assert.equal(retained.output.chunks.map((chunk) => chunk.data.toString()).join(""), "receipt-survives");
+    await assert.rejects(repository.forget(request.executionId, { receiptDigest: "sha256:" + "f".repeat(64) }), /does not match/);
+    await repository.forget(request.executionId, { receiptDigest: retained.receipt.digest });
+    await repository.forget(request.executionId, { receiptDigest: retained.receipt.digest });
+    assert.equal((await repository.prepare(request)).kind, "retired");
   } finally {
+    t.mock.timers.reset();
     await repository.close();
     await rm(directory, { recursive: true, force: true });
   }
@@ -373,6 +393,7 @@ async function readOneLine(stream) {
 }
 
 async function activate(repository, request, query) {
+  query = { maxBytes: 256 * 1024, ...query };
   const deadline = Date.now() + (query.waitMs ?? 0);
   let observation = await repository.prepare(request, query);
   while (observation.kind === "preparing" || observation.kind === "prepared" || observation.kind === "running") {
@@ -385,6 +406,7 @@ async function activate(repository, request, query) {
 }
 
 async function inspectUntilTerminal(repository, executionId, query) {
+  query = { maxBytes: 256 * 1024, ...query };
   const deadline = Date.now() + (query.waitMs ?? 0);
   let observation;
   do {
@@ -395,9 +417,4 @@ async function inspectUntilTerminal(repository, executionId, query) {
     }
     if (waitMs === 0) return observation;
   } while (true);
-}
-
-async function stateFile(root, executionId) {
-  const { createHash } = await import("node:crypto");
-  return join(root, `execution-${createHash("sha256").update(executionId).digest("hex")}`, "state.json");
 }
