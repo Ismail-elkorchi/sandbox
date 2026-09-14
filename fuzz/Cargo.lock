@@ -322,6 +322,7 @@ dependencies = [
  "sandbox-policy",
  "sandbox-protocol",
  "sandbox-vm",
+ "sandsurf-protocol",
  "serde_json",
 ]
 
@@ -424,6 +425,16 @@ dependencies = [
  "sandbox-launcher-linux",
  "sandbox-network-broker",
  "sandbox-policy",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "sandsurf-protocol"
+version = "0.1.0"
+dependencies = [
+ "sandbox-digest",
  "serde",
  "serde_json",
  "sha2",

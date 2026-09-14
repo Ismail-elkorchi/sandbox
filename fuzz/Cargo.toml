@@ -19,7 +19,15 @@ sandbox-network-broker = { path = "../crates/sandbox-network-broker" }
 sandbox-platform = { path = "../crates/sandbox-platform" }
 sandbox-policy = { path = "../crates/sandbox-policy" }
 sandbox-protocol = { path = "../crates/sandbox-protocol" }
+sandsurf-protocol = { path = "../crates/sandsurf-protocol" }
 sandbox-vm = { path = "../crates/sandbox-vm" }
+
+[[bin]]
+name = "sandsurf_protocol"
+path = "fuzz_targets/sandsurf_protocol.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "protocol"

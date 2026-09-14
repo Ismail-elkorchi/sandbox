@@ -1,0 +1,1027 @@
+#![cfg(unix)]
+
+use sandsurf_protocol::*;
+use sandsurf_state::*;
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+struct TempRoot(PathBuf);
+impl TempRoot {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "sandsurf-authority-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        Self(path)
+    }
+}
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+fn n(value: u64) -> Counter {
+    value.try_into().unwrap()
+}
+fn hash(value: &str) -> Digest {
+    bytes_digest(value.as_bytes())
+}
+fn resources() -> Resources {
+    Resources {
+        vcpus: n(2),
+        memory_mib: n(4096),
+        disk_bytes: n(100_000),
+        output_bytes: n(1000),
+        processes: n(8),
+    }
+}
+fn catalog_limits() -> CatalogLimits {
+    CatalogLimits {
+        identities: n(10),
+        operations: n(100),
+        grants: n(100),
+        usage_records: n(100),
+        resources: Resources {
+            vcpus: n(8),
+            memory_mib: n(16384),
+            disk_bytes: n(400_000),
+            output_bytes: n(4000),
+            processes: n(32),
+        },
+    }
+}
+fn runtime_limits() -> RuntimeLimits {
+    RuntimeLimits {
+        identities: n(16),
+        operations: n(64),
+        observations: n(1000),
+        chunks: n(1000),
+        pins: n(64),
+        output_bytes: n(1000),
+    }
+}
+
+struct Fixture {
+    runtime: RuntimeJournal,
+    host: HostCatalog,
+    root: TempRoot,
+    sandbox: SandboxId,
+    process: ProcessId,
+    mutation: Mutation,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = TempRoot::new();
+        let mut host = HostCatalog::create(
+            &root.0.join("host"),
+            "host".try_into().unwrap(),
+            catalog_limits(),
+        )
+        .unwrap();
+        let sandbox: SandboxId = "box".try_into().unwrap();
+        let create: OperationId = "create".try_into().unwrap();
+        let image = hash("image");
+        let request_digest =
+            digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+        host.create_sandbox(
+            sandbox.clone(),
+            image,
+            resources(),
+            create.clone(),
+            Approval {
+                id: "approve-create".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+        let mut runtime =
+            RuntimeJournal::create(&root.0.join("runtime"), sandbox.clone(), runtime_limits())
+                .unwrap();
+        runtime
+            .observe(MachineObservation {
+                sandbox_id: sandbox.clone(),
+                epoch: n(1),
+                sequence: n(1),
+                state: MachineState::Creating,
+                applied_revision: n(1),
+                operation_id: create.clone(),
+                evidence_digest: hash("owned"),
+            })
+            .unwrap();
+        let evidence = runtime
+            .observe(MachineObservation {
+                sandbox_id: sandbox.clone(),
+                epoch: n(1),
+                sequence: n(2),
+                state: MachineState::Running,
+                applied_revision: n(1),
+                operation_id: create,
+                evidence_digest: hash("booted"),
+            })
+            .unwrap();
+        host.complete_intent(&evidence).unwrap();
+        let grant_id: GrantId = "spawn".try_into().unwrap();
+        let scope = hash("workload");
+        let request_digest = digest(
+            Domain::Grant,
+            &(&sandbox, &grant_id, n(1), Capability::Spawn, &scope, false),
+        )
+        .unwrap();
+        host.set_grant(
+            GrantChange {
+                sandbox_id: sandbox.clone(),
+                id: grant_id.clone(),
+                expected_revision: n(1),
+                capability: Capability::Spawn,
+                scope_digest: scope,
+                revoked: false,
+            },
+            Approval {
+                id: "approve-spawn".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+        let mut observed = evidence.value().clone();
+        observed.sequence = n(3);
+        observed.applied_revision = n(2);
+        observed.evidence_digest = hash("installed-revision");
+        runtime.observe(observed).unwrap();
+        let mutation = Mutation {
+            sandbox_id: sandbox.clone(),
+            epoch: n(1),
+            operation_id: "command".try_into().unwrap(),
+            grant_id,
+            expected_revision: n(2),
+            request_digest: hash("argv-cwd-env"),
+        };
+        let authorization = host
+            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+            .unwrap();
+        runtime.admit(authorization).unwrap();
+        let process: ProcessId = "process".try_into().unwrap();
+        runtime
+            .admit_process(process.clone(), &mutation.operation_id, n(100), false)
+            .unwrap();
+        runtime
+            .record_delivery(
+                &mutation.operation_id,
+                &mutation.request_digest,
+                Delivery::Dispatched,
+                None,
+            )
+            .unwrap();
+        Self {
+            runtime,
+            host,
+            root,
+            sandbox,
+            process,
+            mutation,
+        }
+    }
+    fn terminal(&mut self) -> (Receipt, Digest) {
+        self.runtime
+            .append_output(&self.process, n(1), Stream::Stdout, b"hello\0\xff")
+            .unwrap();
+        self.runtime
+            .append_output(&self.process, n(2), Stream::Stderr, b"stderr")
+            .unwrap();
+        self.runtime
+            .publish_receipt(
+                &self.process,
+                ProcessOutcome::Exit { code: 0 },
+                hash("reaped"),
+                hash("accounted"),
+            )
+            .unwrap()
+    }
+    fn capture_release(&mut self) -> ReleaseRequest {
+        use std::io::Write;
+        let (receipt, receipt_digest) = self.terminal();
+        let page = self.runtime.read_output(&self.process, n(0), 64).unwrap();
+        let mut originals = fs::File::create_new(self.root.0.join("captured.output")).unwrap();
+        let mut chunks = Vec::new();
+        for chunk in page.chunks {
+            originals.write_all(&chunk.bytes).unwrap();
+            chunks.push((
+                chunk.sequence,
+                chunk.offset,
+                chunk.stream,
+                chunk.bytes_digest,
+            ));
+        }
+        originals.sync_all().unwrap();
+        let manifest = serde_json::to_vec(&(&receipt, &receipt_digest, chunks)).unwrap();
+        let mut commitment = fs::File::create_new(self.root.0.join("capture.manifest")).unwrap();
+        commitment.write_all(&manifest).unwrap();
+        commitment.sync_all().unwrap();
+        fs::File::open(&self.root.0).unwrap().sync_all().unwrap();
+        ReleaseRequest {
+            receipt_digest: receipt_digest.clone(),
+            output: receipt.output.clone(),
+            disposition: ReleaseDisposition::CompleteCapture {
+                commitment: CaptureCommitment {
+                    store_id: "application-store".try_into().unwrap(),
+                    commitment_id: "capture-commit".try_into().unwrap(),
+                    manifest_digest: bytes_digest(&manifest),
+                    receipt_digest,
+                    output: receipt.output,
+                },
+            },
+        }
+    }
+}
+
+#[test]
+fn exclusive_writers_and_role_separation() {
+    let fixture = Fixture::new();
+    assert!(HostCatalog::open(&fixture.root.0.join("host")).is_err());
+    assert!(RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.sandbox).is_err());
+    let path = fixture.root.0.join("host");
+    drop(fixture.host);
+    assert!(RuntimeJournal::open(&path, &fixture.sandbox).is_err());
+    assert_eq!(HostCatalog::open(&path).unwrap().host_id().as_str(), "host");
+}
+
+#[test]
+fn stop_intent_is_not_stopped_observation() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "stop".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &operation, n(2), DesiredState::Stopped),
+    )
+    .unwrap();
+    let intent = f
+        .host
+        .request_lifecycle(
+            &f.sandbox,
+            operation.clone(),
+            n(2),
+            DesiredState::Stopped,
+            Approval {
+                id: "approve-stop".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(intent.completion, None);
+    let mut fresh = f.mutation.clone();
+    fresh.expected_revision = n(3);
+    assert!(
+        f.host
+            .authorize(fresh, Capability::Spawn, &hash("workload"))
+            .is_err()
+    );
+    let old = f.runtime.last_observation().unwrap().unwrap();
+    assert_eq!(old.value().state, MachineState::Running);
+    let mut observation = old.value().clone();
+    observation.sequence = n(4);
+    observation.applied_revision = n(3);
+    observation.operation_id = operation.clone();
+    let evidence = f.runtime.observe(observation.clone()).unwrap();
+    assert!(f.host.complete_intent(&evidence).is_err());
+    observation.sequence = n(5);
+    observation.state = MachineState::Stopped;
+    let evidence = f.runtime.observe(observation).unwrap();
+    assert!(
+        f.host
+            .complete_intent(&evidence)
+            .unwrap()
+            .completion
+            .is_some()
+    );
+    assert_eq!(
+        f.host.intent(&operation).unwrap().unwrap().desired,
+        DesiredState::Stopped
+    );
+}
+
+#[test]
+fn revoked_grants_and_stale_revisions_cannot_authorize() {
+    let mut f = Fixture::new();
+    let scope = hash("workload");
+    let request_digest = digest(
+        Domain::Grant,
+        &(
+            &f.sandbox,
+            &f.mutation.grant_id,
+            n(2),
+            Capability::Spawn,
+            &scope,
+            true,
+        ),
+    )
+    .unwrap();
+    f.host
+        .set_grant(
+            GrantChange {
+                sandbox_id: f.sandbox.clone(),
+                id: f.mutation.grant_id.clone(),
+                expected_revision: n(2),
+                capability: Capability::Spawn,
+                scope_digest: scope.clone(),
+                revoked: true,
+            },
+            Approval {
+                id: "revoke".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    assert!(
+        f.host
+            .authorize(f.mutation.clone(), Capability::Spawn, &scope)
+            .is_err()
+    );
+    f.mutation.expected_revision = n(3);
+    assert!(
+        f.host
+            .authorize(f.mutation.clone(), Capability::Spawn, &scope)
+            .is_err()
+    );
+    let request_digest = digest(
+        Domain::Grant,
+        &(
+            &f.sandbox,
+            &f.mutation.grant_id,
+            n(3),
+            Capability::Spawn,
+            &scope,
+            false,
+        ),
+    )
+    .unwrap();
+    assert!(
+        f.host
+            .set_grant(
+                GrantChange {
+                    sandbox_id: f.sandbox.clone(),
+                    id: f.mutation.grant_id.clone(),
+                    expected_revision: n(3),
+                    capability: Capability::Spawn,
+                    scope_digest: scope,
+                    revoked: false
+                },
+                Approval {
+                    id: "revive".try_into().unwrap(),
+                    request_digest
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn unknown_dispatch_is_not_replayed_on_reconnect() {
+    let mut f = Fixture::new();
+    f.runtime
+        .record_delivery(
+            &f.mutation.operation_id,
+            &f.mutation.request_digest,
+            Delivery::Unknown,
+            None,
+        )
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let authorization = f
+        .host
+        .authorize(f.mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    assert_eq!(
+        runtime.admit(authorization).unwrap().delivery,
+        Delivery::Unknown
+    );
+    assert!(
+        runtime
+            .record_delivery(
+                &f.mutation.operation_id,
+                &f.mutation.request_digest,
+                Delivery::Dispatched,
+                None
+            )
+            .is_err()
+    );
+    assert!(
+        runtime
+            .record_delivery(
+                &f.mutation.operation_id,
+                &f.mutation.request_digest,
+                Delivery::Applied,
+                None
+            )
+            .is_err()
+    );
+    runtime
+        .record_delivery(
+            &f.mutation.operation_id,
+            &f.mutation.request_digest,
+            Delivery::Applied,
+            Some(hash("guest-completion")),
+        )
+        .unwrap();
+}
+
+#[test]
+fn admission_reservations_are_transactional_and_no_eviction_occurs() {
+    let mut f = Fixture::new();
+    let sandbox: SandboxId = "over-budget".try_into().unwrap();
+    let operation: OperationId = "over-budget".try_into().unwrap();
+    let mut resources = resources();
+    resources.vcpus = n(8);
+    let image = hash("image");
+    let request_digest =
+        digest(Domain::Sandbox, &(&sandbox, &image, &resources, &operation)).unwrap();
+    assert!(
+        f.host
+            .create_sandbox(
+                sandbox,
+                image,
+                resources,
+                operation.clone(),
+                Approval {
+                    id: "approve-too-large".try_into().unwrap(),
+                    request_digest
+                }
+            )
+            .is_err()
+    );
+    assert!(f.host.intent(&operation).unwrap().is_none());
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, &[4; 100])
+        .unwrap();
+    assert!(
+        f.runtime
+            .append_output(&f.process, n(2), Stream::Stdout, b"overflow")
+            .is_err()
+    );
+    assert_eq!(
+        f.runtime.read_output(&f.process, n(0), 256).unwrap().chunks[0].bytes,
+        vec![4; 100]
+    );
+}
+
+#[test]
+fn acknowledgement_and_disconnect_never_release_bytes() {
+    let mut f = Fixture::new();
+    let (receipt, identity) = f.terminal();
+    f.runtime
+        .acknowledge_receipt(&f.process, &identity)
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    assert_eq!(
+        runtime.receipt(&f.process).unwrap(),
+        Some((receipt, identity))
+    );
+    assert_eq!(
+        runtime.read_output(&f.process, n(0), 256).unwrap().cursor,
+        n(13)
+    );
+}
+
+#[test]
+fn original_binary_bytes_are_incremental_and_sequence_retries_are_idempotent() {
+    let mut f = Fixture::new();
+    f.terminal();
+    assert!(
+        f.runtime
+            .append_output(&f.process, n(1), Stream::Stdout, b"wrong")
+            .is_err()
+    );
+    let mut cursor = n(0);
+    let mut bytes = Vec::new();
+    let mut streams = Vec::new();
+    while cursor < n(13) {
+        let page = f.runtime.read_output(&f.process, cursor, 2).unwrap();
+        assert!(page.cursor > cursor);
+        for chunk in page.chunks {
+            bytes.extend_from_slice(&chunk.bytes);
+            streams.push(chunk.stream);
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(bytes, b"hello\0\xffstderr");
+    assert!(streams.contains(&Stream::Stdout));
+    assert!(streams.contains(&Stream::Stderr));
+    assert!(f.runtime.read_output(&f.process, n(14), 2).is_err());
+    assert!(
+        f.runtime
+            .read_output(&f.process, n(0), MAX_CONTROL_BYTES + 1)
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .read_output(&f.process, n(13), 2)
+            .unwrap()
+            .chunks
+            .is_empty()
+    );
+}
+
+#[test]
+fn incomplete_capture_wrong_hash_and_unbacked_reference_cannot_release() {
+    let mut f = Fixture::new();
+    let request = f.capture_release();
+    let mut incomplete = request.clone();
+    incomplete.output.final_cursor = n(1);
+    assert!(f.runtime.release(&f.process, incomplete).is_err());
+    let mut incomplete = request.clone();
+    if let ReleaseDisposition::CompleteCapture { commitment } = &mut incomplete.disposition {
+        commitment.output.stderr_bytes = n(0);
+    }
+    assert!(f.runtime.release(&f.process, incomplete).is_err());
+    let mut reference = request.clone();
+    reference.disposition = ReleaseDisposition::ContinuingRetention {
+        pin: "url-is-not-retention".try_into().unwrap(),
+    };
+    assert!(f.runtime.release(&f.process, reference).is_err());
+    let mut wrong = request.clone();
+    wrong.receipt_digest = hash("wrong-receipt");
+    assert!(f.runtime.release(&f.process, wrong).is_err());
+    let mut loss = request;
+    loss.disposition = ReleaseDisposition::AuthorizedLoss {
+        authorization: "not-approved".try_into().unwrap(),
+    };
+    assert!(f.runtime.release(&f.process, loss).is_err());
+    assert_eq!(
+        f.runtime.read_output(&f.process, n(0), 64).unwrap().cursor,
+        n(13)
+    );
+}
+
+#[test]
+fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
+    let mut f = Fixture::new();
+    let request = f.capture_release();
+    let status = f.runtime.release(&f.process, request.clone()).unwrap();
+    assert!(status.cleanup_pending);
+    assert!(f.root.0.join("runtime/process.output").exists());
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    assert_eq!(
+        runtime.release(&f.process, request.clone()).unwrap(),
+        status
+    );
+    let cleaned = runtime
+        .cleanup_released(&f.process, &status.request_digest)
+        .unwrap();
+    assert!(!cleaned.cleanup_pending);
+    assert!(!path.join("process.output").exists());
+    assert_eq!(
+        fs::read(f.root.0.join("captured.output")).unwrap(),
+        b"hello\0\xffstderr"
+    );
+    assert_eq!(
+        runtime
+            .cleanup_released(&f.process, &status.request_digest)
+            .unwrap(),
+        cleaned
+    );
+    assert!(runtime.read_output(&f.process, n(0), 64).is_err());
+    assert!(runtime.receipt(&f.process).unwrap().is_some());
+    let mut conflict = request;
+    conflict.disposition = ReleaseDisposition::AuthorizedLoss {
+        authorization: "changed".try_into().unwrap(),
+    };
+    assert!(runtime.release(&f.process, conflict).is_err());
+    let authorization = f
+        .host
+        .authorize(f.mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    assert_eq!(
+        runtime.admit(authorization).unwrap().delivery,
+        Delivery::Applied
+    );
+    assert!(
+        runtime
+            .admit_process(f.process, &f.mutation.operation_id, n(100), false)
+            .is_err()
+    );
+}
+
+#[test]
+fn continuing_retention_keeps_actual_originals_after_source_release() {
+    let mut f = Fixture::new();
+    let mut request = f.capture_release();
+    let pin: PinId = "archive-owner".try_into().unwrap();
+    f.runtime
+        .pin(&f.process, &request.receipt_digest, pin.clone())
+        .unwrap();
+    request.disposition = ReleaseDisposition::ContinuingRetention { pin: pin.clone() };
+    let status = f.runtime.release(&f.process, request).unwrap();
+    f.runtime
+        .cleanup_released(&f.process, &status.request_digest)
+        .unwrap();
+    assert!(f.root.0.join("runtime/process.output").exists());
+    assert!(f.runtime.read_output(&f.process, n(0), 64).is_err());
+    assert_eq!(f.runtime.read_pin(&pin, n(0), 64).unwrap().cursor, n(13));
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    assert_eq!(
+        RuntimeJournal::open(&path, &f.sandbox)
+            .unwrap()
+            .read_pin(&pin, n(0), 64)
+            .unwrap()
+            .cursor,
+        n(13)
+    );
+}
+
+#[test]
+fn explicit_loss_is_exactly_scoped_and_recorded() {
+    let mut f = Fixture::new();
+    let mut request = f.capture_release();
+    let authorization: CommitmentId = "loss-approved".try_into().unwrap();
+    let approval = Approval {
+        id: authorization.clone(),
+        request_digest: digest(
+            Domain::Release,
+            &(
+                &f.sandbox,
+                &f.process,
+                &request.receipt_digest,
+                &request.output,
+                "loss",
+            ),
+        )
+        .unwrap(),
+    };
+    let authorized = f
+        .host
+        .authorize_output_loss(
+            &f.sandbox,
+            &f.process,
+            &request.receipt_digest,
+            &request.output,
+            approval,
+        )
+        .unwrap();
+    f.runtime.record_loss_authorization(authorized).unwrap();
+    request.disposition = ReleaseDisposition::AuthorizedLoss { authorization };
+    let status = f.runtime.release(&f.process, request.clone()).unwrap();
+    f.runtime
+        .cleanup_released(&f.process, &status.request_digest)
+        .unwrap();
+    assert!(
+        !f.runtime
+            .release(&f.process, request)
+            .unwrap()
+            .cleanup_pending
+    );
+}
+
+#[test]
+fn corrupt_output_does_not_rewrite_terminal_truth_or_support_new_pin() {
+    let mut f = Fixture::new();
+    let receipt = f.terminal();
+    fs::write(f.root.0.join("runtime/process.output"), b"corrupt bytes").unwrap();
+    assert_eq!(
+        f.runtime.receipt(&f.process).unwrap(),
+        Some(receipt.clone())
+    );
+    assert!(f.runtime.read_output(&f.process, n(0), 64).is_err());
+    assert!(
+        f.runtime
+            .append_output(&f.process, n(1), Stream::Stdout, b"hello\0\xff")
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .pin(&f.process, &receipt.1, "bad-pin".try_into().unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn stream_label_corruption_is_detected() {
+    let mut f = Fixture::new();
+    let receipt = f.terminal();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let db = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    db.execute("UPDATE chunks SET stream='\"stderr\"' WHERE sequence=1", [])
+        .unwrap();
+    drop(db);
+    let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    assert_eq!(runtime.receipt(&f.process).unwrap(), Some(receipt));
+    assert!(runtime.read_output(&f.process, n(0), 64).is_err());
+}
+
+#[test]
+fn uncommitted_output_tail_is_not_exposed_and_is_reconciled_before_append() {
+    use std::io::Write;
+    let mut f = Fixture::new();
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"committed")
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path.join("process.output"))
+        .unwrap();
+    file.write_all(b"uncommitted").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    assert_eq!(
+        runtime.read_output(&f.process, n(0), 64).unwrap().cursor,
+        n(9)
+    );
+    runtime
+        .append_output(&f.process, n(2), Stream::Stderr, b"next")
+        .unwrap();
+    assert_eq!(
+        fs::read(path.join("process.output")).unwrap(),
+        b"committednext"
+    );
+}
+
+#[test]
+fn usage_is_monotonic_and_duplicate_delivery_does_not_double_charge() {
+    let mut f = Fixture::new();
+    let id: OperationId = "usage-1".try_into().unwrap();
+    f.host.account(&id, &f.sandbox, n(10), n(20)).unwrap();
+    f.host.account(&id, &f.sandbox, n(10), n(20)).unwrap();
+    assert!(f.host.account(&id, &f.sandbox, n(11), n(20)).is_err());
+    assert_eq!(f.host.usage(&f.sandbox).unwrap(), (n(10), n(20)));
+}
+
+#[test]
+fn missing_catalog_symlinks_and_foreign_permissions_are_refused_intact() {
+    let f = Fixture::new();
+    let path = f.root.0.join("host");
+    drop(f.host);
+    fs::rename(path.join("authority.sqlite"), path.join("evidence.sqlite")).unwrap();
+    assert!(HostCatalog::open(&path).is_err());
+    assert!(!path.join("authority.sqlite").exists());
+    std::os::unix::fs::symlink(path.join("evidence.sqlite"), path.join("authority.sqlite"))
+        .unwrap();
+    assert!(HostCatalog::open(&path).is_err());
+    assert!(path.join("evidence.sqlite").exists());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(HostCatalog::open(&path).is_err());
+}
+
+#[test]
+fn historical_intent_references_resolve_after_new_observations() {
+    let f = Fixture::new();
+    let create: OperationId = "create".try_into().unwrap();
+    let reference = f.host.intent(&create).unwrap().unwrap().completion.unwrap();
+    let historical = f.runtime.observation_at(&reference).unwrap();
+    assert_eq!(historical.value().sequence, n(2));
+    assert_eq!(
+        f.runtime
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .sequence,
+        n(3)
+    );
+}
+
+#[test]
+fn machine_restart_fences_old_epoch_without_rewinding_history() {
+    let mut f = Fixture::new();
+    let mut value = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    value.sequence = n(4);
+    value.state = MachineState::Stopped;
+    f.runtime.observe(value.clone()).unwrap();
+    value.sequence = n(5);
+    value.state = MachineState::Running;
+    assert!(f.runtime.observe(value.clone()).is_err());
+    value.state = MachineState::Starting;
+    value.epoch = n(2);
+    f.runtime.observe(value.clone()).unwrap();
+    value.sequence = n(6);
+    value.state = MachineState::Running;
+    f.runtime.observe(value).unwrap();
+    let mut stale = f.mutation.clone();
+    stale.operation_id = "stale-after-boot".try_into().unwrap();
+    let authorization = f
+        .host
+        .authorize(stale, Capability::Spawn, &hash("workload"))
+        .unwrap();
+    assert!(f.runtime.admit(authorization).is_err());
+}
+
+#[test]
+fn independent_jobs_and_pty_streams_have_separate_reservations() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "terminal".try_into().unwrap();
+    let authorization = f
+        .host
+        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    let terminal: ProcessId = "terminal".try_into().unwrap();
+    f.runtime
+        .admit_process(terminal.clone(), &mutation.operation_id, n(200), true)
+        .unwrap();
+    f.runtime
+        .record_delivery(
+            &mutation.operation_id,
+            &mutation.request_digest,
+            Delivery::Dispatched,
+            None,
+        )
+        .unwrap();
+    assert!(
+        f.runtime
+            .append_output(&terminal, n(1), Stream::Stdout, b"wrong stream")
+            .is_err()
+    );
+    f.runtime
+        .append_output(&terminal, n(1), Stream::Terminal, b"shell prompt")
+        .unwrap();
+    f.terminal();
+    f.runtime
+        .append_output(&terminal, n(2), Stream::Terminal, b"still running")
+        .unwrap();
+    assert!(f.runtime.receipt(&terminal).unwrap().is_none());
+}
+
+// Invoked only by the parent test with its newly allocated private fixture directory.
+#[test]
+fn abrupt_writer_child() {
+    let Some(root) = std::env::var_os("SANDSURF_TEST_CRASH_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let sandbox: SandboxId = "box".try_into().unwrap();
+    let process: ProcessId = "process".try_into().unwrap();
+    let mode = std::env::var("SANDSURF_TEST_CRASH_MODE").unwrap();
+    let mut runtime = RuntimeJournal::open(&root.join("runtime"), &sandbox).unwrap();
+    match mode.as_str() {
+        "after-output" => {
+            runtime
+                .append_output(&process, n(1), Stream::Stdout, b"durable-before-exit")
+                .unwrap();
+        }
+        "after-retirement" => {
+            let request: ReleaseRequest =
+                serde_json::from_slice(&fs::read(root.join("release-request.json")).unwrap())
+                    .unwrap();
+            runtime.release(&process, request).unwrap();
+        }
+        "after-deletion" => {
+            let request: ReleaseRequest =
+                serde_json::from_slice(&fs::read(root.join("release-request.json")).unwrap())
+                    .unwrap();
+            runtime.release(&process, request).unwrap();
+            // Crash after physical unlink, before committing cleanup completion.
+            fs::remove_file(root.join("runtime/process.output")).unwrap();
+            fs::File::open(root.join("runtime"))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        _ => panic!("unexpected crash case"),
+    }
+    // No Rust destructors, journal close, or cooperative shutdown.
+    std::process::exit(73);
+}
+
+#[test]
+fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
+    for mode in ["after-output", "after-retirement", "after-deletion"] {
+        let mut f = Fixture::new();
+        let release = if mode == "after-output" {
+            None
+        } else {
+            Some(f.capture_release())
+        };
+        if let Some(request) = &release {
+            fs::write(
+                f.root.0.join("release-request.json"),
+                serde_json::to_vec(request).unwrap(),
+            )
+            .unwrap();
+        }
+        let path = f.root.0.join("runtime");
+        drop(f.runtime);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "abrupt_writer_child", "--nocapture"])
+            .env("SANDSURF_TEST_CRASH_ROOT", &f.root.0)
+            .env("SANDSURF_TEST_CRASH_MODE", mode)
+            .output()
+            .unwrap();
+        assert_eq!(
+            status.status.code(),
+            Some(73),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+        if let Some(request) = release {
+            let status = runtime.release(&f.process, request).unwrap();
+            assert!(status.cleanup_pending);
+            runtime
+                .cleanup_released(&f.process, &status.request_digest)
+                .unwrap();
+            assert!(!path.join("process.output").exists());
+            assert_eq!(
+                fs::read(f.root.0.join("captured.output")).unwrap(),
+                b"hello\0\xffstderr"
+            );
+        } else {
+            assert_eq!(
+                runtime.read_output(&f.process, n(0), 64).unwrap().chunks[0].bytes,
+                b"durable-before-exit"
+            );
+            assert_eq!(
+                runtime
+                    .operation(&f.mutation.operation_id)
+                    .unwrap()
+                    .unwrap()
+                    .delivery,
+                Delivery::Dispatched
+            );
+            assert!(runtime.receipt(&f.process).unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+fn output_pages_bound_record_count_as_well_as_original_bytes() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "many-chunks".try_into().unwrap();
+    let authorization = f
+        .host
+        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    let process: ProcessId = "many-chunks".try_into().unwrap();
+    f.runtime
+        .admit_process(process.clone(), &mutation.operation_id, n(400), false)
+        .unwrap();
+    f.runtime
+        .record_delivery(
+            &mutation.operation_id,
+            &mutation.request_digest,
+            Delivery::Dispatched,
+            None,
+        )
+        .unwrap();
+    for sequence in 1..=300 {
+        f.runtime
+            .append_output(&process, n(sequence), Stream::Stdout, b"x")
+            .unwrap();
+    }
+    let first = f
+        .runtime
+        .read_output(&process, n(0), MAX_CONTROL_BYTES)
+        .unwrap();
+    assert_eq!(first.chunks.len(), 256);
+    assert_eq!(first.cursor, n(256));
+    let second = f
+        .runtime
+        .read_output(&process, first.cursor, MAX_CONTROL_BYTES)
+        .unwrap();
+    assert_eq!(second.chunks.len(), 44);
+    assert_eq!(second.cursor, n(300));
+}
+
+#[test]
+fn malformed_output_index_is_unavailable_without_panicking_or_erasing_receipt() {
+    for corruption in [
+        "UPDATE chunks SET sequence=0 WHERE sequence=1",
+        "UPDATE chunks SET length=0 WHERE sequence=1",
+        "UPDATE processes SET boundary=json_set(boundary,'$.finalCursor',999)",
+    ] {
+        let mut f = Fixture::new();
+        let receipt = f.terminal();
+        let path = f.root.0.join("runtime");
+        drop(f.runtime);
+        let database = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+        database.execute(corruption, []).unwrap();
+        drop(database);
+        let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+        assert_eq!(runtime.receipt(&f.process).unwrap(), Some(receipt));
+        assert!(runtime.read_output(&f.process, n(0), 64).is_err());
+    }
+}

@@ -44,6 +44,38 @@ pub fn identity_digest<T: Serialize>(value: &T) -> Result<String, DigestError> {
     digest(b"IDENTITY", value)
 }
 
+/// Sandsurf domains are closed and disjoint from the retired prepared-process domains.
+#[derive(Debug, Clone, Copy)]
+pub enum SandsurfDomain {
+    Sandbox,
+    Grant,
+    Operation,
+    Receipt,
+    Output,
+    Release,
+    Image,
+    Checkpoint,
+    Transfer,
+}
+
+pub fn sandsurf_digest<T: Serialize>(
+    domain: SandsurfDomain,
+    value: &T,
+) -> Result<String, DigestError> {
+    let domain: &[u8] = match domain {
+        SandsurfDomain::Sandbox => b"SANDSURF/SANDBOX/1",
+        SandsurfDomain::Grant => b"SANDSURF/GRANT/1",
+        SandsurfDomain::Operation => b"SANDSURF/OPERATION/1",
+        SandsurfDomain::Receipt => b"SANDSURF/RECEIPT/1",
+        SandsurfDomain::Output => b"SANDSURF/OUTPUT/1",
+        SandsurfDomain::Release => b"SANDSURF/RELEASE/1",
+        SandsurfDomain::Image => b"SANDSURF/IMAGE/1",
+        SandsurfDomain::Checkpoint => b"SANDSURF/CHECKPOINT/1",
+        SandsurfDomain::Transfer => b"SANDSURF/TRANSFER/1",
+    };
+    digest(domain, value)
+}
+
 fn digest<T: Serialize>(domain: &[u8], value: &T) -> Result<String, DigestError> {
     let value = serde_json::to_value(value).map_err(DigestError::Serialization)?;
     let mut bytes = Vec::new();

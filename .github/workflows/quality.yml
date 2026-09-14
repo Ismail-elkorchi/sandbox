@@ -18,6 +18,12 @@ jobs:
           cache: npm
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: npm ci
+      - name: Native virtualization prerequisites (not VM qualification)
+        run: node scripts/probe-sandsurf-host.ts sandsurf-host.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandsurf-host-linux
+          path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: cargo fmt --all -- --check
@@ -48,12 +54,20 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Native virtualization prerequisites (not VM qualification)
+        run: node scripts/probe-sandsurf-host.ts sandsurf-host.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandsurf-host-macos
+          path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
       - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-test-runtime
       - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/macos-conformance.test.mjs packages/sandbox/test/execution-reliability.test.mjs packages/sandbox/test/execution-output.test.mjs
+      - name: Sandsurf authority and wire contracts (not VM qualification)
+        run: npm run test:sandsurf
 
   windows:
     runs-on: windows-2025
@@ -64,12 +78,20 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Native virtualization prerequisites (not VM qualification)
+        run: node scripts/probe-sandsurf-host.ts sandsurf-host.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandsurf-host-windows
+          path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
       - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-test-runtime
       - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/windows-conformance.test.mjs packages/sandbox/test/execution-reliability.test.mjs packages/sandbox/test/execution-output.test.mjs
+      - name: Sandsurf authority and wire contracts (not VM qualification)
+        run: npm run test:sandsurf
 
   fuzz:
     runs-on: ubuntu-24.04
@@ -79,6 +101,6 @@ jobs:
       - run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz every required trust-boundary parser
         run: |
-          for target in protocol control_messages canonical_digest policy paths host_paths environment_block windows_arguments network_rules dns socks5 http_connect image_manifest guest_protocol artifact_manifest changesets; do
+          for target in sandsurf_protocol protocol control_messages canonical_digest policy paths host_paths environment_block windows_arguments network_rules dns socks5 http_connect image_manifest guest_protocol artifact_manifest changesets; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30 -max_len=1048576
           done

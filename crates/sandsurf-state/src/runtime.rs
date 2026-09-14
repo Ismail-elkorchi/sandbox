@@ -1,0 +1,955 @@
+use crate::{
+    Authorization, Error, Result,
+    catalog::capacity,
+    database::{Database, private_file, sync_directory},
+    decode, encode,
+};
+use rusqlite::{OptionalExtension, params};
+use sandsurf_protocol::*;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+const SCHEMA: &str = "
+CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT NULL, limits TEXT NOT NULL) STRICT;
+CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
+CREATE INDEX chunks_by_offset ON chunks(process,offset);
+CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE loss_authorizations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL, approval_digest TEXT NOT NULL) STRICT;
+";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeLimits {
+    pub identities: Counter,
+    pub operations: Counter,
+    pub observations: Counter,
+    pub chunks: Counter,
+    pub pins: Counter,
+    pub output_bytes: Counter,
+}
+
+/// Created only after a guardian journal commit. Host callers cannot construct/deserialise it.
+pub struct CommittedObservation(MachineObservation);
+impl CommittedObservation {
+    pub fn value(&self) -> &MachineObservation {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub sequence: Counter,
+    pub offset: Counter,
+    pub stream: Stream,
+    pub bytes: Vec<u8>,
+    pub bytes_digest: Digest,
+    pub chain_digest: Digest,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputPage {
+    pub cursor: Counter,
+    pub available: Counter,
+    pub chunks: Vec<OutputChunk>,
+}
+
+pub struct RuntimeJournal {
+    db: Database,
+    sandbox: SandboxId,
+    limits: RuntimeLimits,
+}
+
+impl RuntimeJournal {
+    pub fn create(path: &Path, sandbox: SandboxId, limits: RuntimeLimits) -> Result<Self> {
+        if [
+            limits.identities,
+            limits.operations,
+            limits.observations,
+            limits.chunks,
+            limits.pins,
+            limits.output_bytes,
+        ]
+        .contains(&Counter::ZERO)
+        {
+            return Err(Error::Capacity("runtime limits must be positive"));
+        }
+        let db = Database::create(path, "guardian", SCHEMA)?;
+        db.connection.execute(
+            "INSERT INTO configuration VALUES (1,?1,?2)",
+            params![sandbox.as_str(), encode(&limits)?],
+        )?;
+        Ok(Self {
+            db,
+            sandbox,
+            limits,
+        })
+    }
+    pub fn open(path: &Path, sandbox: &SandboxId) -> Result<Self> {
+        let db = Database::open(path, "guardian")?;
+        let (identity, limits): (String, String) = db.connection.query_row(
+            "SELECT sandbox,limits FROM configuration WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if identity != sandbox.as_str() {
+            return Err(Error::Conflict("guardian sandbox identity mismatch"));
+        }
+        Ok(Self {
+            db,
+            sandbox: sandbox.clone(),
+            limits: decode(&limits)?,
+        })
+    }
+    pub fn last_observation(&self) -> Result<Option<CommittedObservation>> {
+        Ok(observation(&self.db.connection)?.map(CommittedObservation))
+    }
+    pub fn observation_at(&self, reference: &ObservationRef) -> Result<CommittedObservation> {
+        let raw: String = self.db.connection.query_row(
+            "SELECT value FROM observations WHERE sequence=?1",
+            [reference.sequence.get()],
+            |r| r.get(0),
+        )?;
+        let value: MachineObservation = decode(&raw)?;
+        if reference.sandbox_id != self.sandbox
+            || reference.epoch != value.epoch
+            || reference.digest != digest(Domain::Operation, &value)?
+        {
+            return Err(Error::Conflict(
+                "observation reference does not match guardian history",
+            ));
+        }
+        Ok(CommittedObservation(value))
+    }
+    pub fn observe(&mut self, value: MachineObservation) -> Result<CommittedObservation> {
+        if value.sandbox_id != self.sandbox {
+            return Err(Error::Conflict("observation belongs to another sandbox"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = observation(&tx)? {
+            if old == value {
+                return Ok(CommittedObservation(old));
+            }
+            if value.sequence != old.sequence.next()?
+                || value.epoch < old.epoch
+                || value.epoch > old.epoch.next()?
+                || value.applied_revision < old.applied_revision
+                || old.state == MachineState::Destroyed
+            {
+                return Err(Error::Conflict(
+                    "stale, skipped, or rewound guardian observation",
+                ));
+            }
+            if value.epoch != old.epoch
+                && !matches!(
+                    value.state,
+                    MachineState::Starting | MachineState::Restoring
+                )
+            {
+                return Err(Error::Conflict(
+                    "new epoch requires an explicit boot/restore transition",
+                ));
+            }
+            if !valid_transition(&old, &value) {
+                return Err(Error::Conflict(
+                    "machine observation requires a valid lifecycle/epoch transition",
+                ));
+            }
+        } else if value.sequence != Counter::ONE
+            || value.epoch != Counter::ONE
+            || value.state != MachineState::Creating
+        {
+            return Err(Error::Conflict(
+                "first observation must establish creation identity",
+            ));
+        }
+        capacity(&tx, "observations", self.limits.observations)?;
+        tx.execute(
+            "INSERT INTO observations VALUES (?1,?2)",
+            params![value.sequence.get(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(CommittedObservation(value))
+    }
+    pub fn operation(&self, id: &OperationId) -> Result<Option<Operation>> {
+        operation(&self.db.connection, id)
+    }
+
+    pub fn admit(&mut self, authorization: Authorization<'_>) -> Result<Operation> {
+        let request = authorization.mutation;
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = operation(&tx, &request.operation_id)? {
+            if old.request == request && old.capability == authorization.capability {
+                return Ok(old);
+            }
+            return Err(Error::Conflict("runtime operation identity already bound"));
+        }
+        let observed =
+            observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
+        if request.sandbox_id != self.sandbox
+            || request.epoch != observed.epoch
+            || request.expected_revision != observed.applied_revision
+            || observed.state != MachineState::Running
+        {
+            return Err(Error::Conflict(
+                "machine epoch, applied revision or state does not admit work",
+            ));
+        }
+        capacity(&tx, "operations", self.limits.operations)?;
+        let value = Operation {
+            request,
+            capability: authorization.capability,
+            delivery: Delivery::Admitted,
+            evidence_digest: None,
+        };
+        tx.execute(
+            "INSERT INTO operations VALUES (?1,?2)",
+            params![value.request.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Persist Dispatched before the native effect. An interrupted dispatch remains unknown.
+    pub fn record_delivery(
+        &mut self,
+        id: &OperationId,
+        request: &Digest,
+        delivery: Delivery,
+        evidence: Option<Digest>,
+    ) -> Result<Operation> {
+        let tx = self.db.connection.transaction()?;
+        let mut value = operation(&tx, id)?.ok_or(Error::Missing("operation missing"))?;
+        if value.request.request_digest != *request {
+            return Err(Error::Conflict("operation digest mismatch"));
+        }
+        if value.delivery == delivery && value.evidence_digest == evidence {
+            return Ok(value);
+        }
+        let allowed = matches!(
+            (value.delivery, delivery),
+            (
+                Delivery::Admitted,
+                Delivery::Dispatched | Delivery::NotApplied
+            ) | (
+                Delivery::Dispatched,
+                Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+            ) | (Delivery::Unknown, Delivery::Applied | Delivery::NotApplied)
+        );
+        if !allowed
+            || (matches!(delivery, Delivery::Applied | Delivery::NotApplied) && evidence.is_none())
+        {
+            return Err(Error::Conflict(
+                "invalid delivery transition or missing effect evidence",
+            ));
+        }
+        value.delivery = delivery;
+        value.evidence_digest = evidence;
+        tx.execute(
+            "UPDATE operations SET value=?2 WHERE id=?1",
+            params![id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn admit_process(
+        &mut self,
+        id: ProcessId,
+        operation_id: &OperationId,
+        output_limit: Counter,
+        terminal: bool,
+    ) -> Result<()> {
+        if output_limit == Counter::ZERO {
+            return Err(Error::Capacity("output reservation must be positive"));
+        }
+        let tx = self.db.connection.transaction()?;
+        let op =
+            operation(&tx, operation_id)?.ok_or(Error::Missing("process operation missing"))?;
+        if op.capability != Capability::Spawn {
+            return Err(Error::Conflict("process creation requires spawn authority"));
+        }
+        if op.delivery != Delivery::Admitted {
+            return Err(Error::Conflict("process must be reserved before dispatch"));
+        }
+        capacity(&tx, "processes", self.limits.identities)?;
+        // Retired data retained by independent pins continues to consume storage.
+        let retained: u64 = tx.query_row(
+            "SELECT coalesce(sum(output_limit),0) FROM processes",
+            [],
+            |r| r.get(0),
+        )?;
+        if Counter::try_from(retained)?.checked_add(output_limit.get())? > self.limits.output_bytes
+        {
+            return Err(Error::Capacity("output reservations exhausted"));
+        }
+        let boundary = empty_boundary(&self.sandbox, &id, op.request.epoch)?;
+        tx.execute("INSERT INTO processes(id,operation,epoch,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.request.epoch.get(), output_limit.get(), terminal, encode(&boundary)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn append_output(
+        &mut self,
+        id: &ProcessId,
+        sequence: Counter,
+        stream: Stream,
+        bytes: &[u8],
+    ) -> Result<OutputBoundary> {
+        if bytes.is_empty() || bytes.len() > MAX_STREAM_BYTES {
+            return Err(Error::Capacity("invalid output chunk size"));
+        }
+        let path = self.db.root.join(format!("{}.output", id.as_str()));
+        let tx = self.db.connection.transaction()?;
+        let (raw, limit, terminal, receipt, released): (
+            String,
+            u64,
+            bool,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT boundary,output_limit,terminal_mode,receipt,release FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        let mut boundary: OutputBoundary = decode(&raw)?;
+        if terminal != (stream == Stream::Terminal) {
+            return Err(Error::Conflict(
+                "PTY and pipe stream identities cannot be mixed",
+            ));
+        }
+        let content = bytes_digest(bytes);
+        if let Some((old_stream, old_digest, offset, length)) = tx
+            .query_row(
+                "SELECT stream,bytes_digest,offset,length FROM chunks WHERE process=?1 AND sequence=?2",
+                params![id.as_str(), sequence.get()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?,r.get::<_,u64>(2)?,r.get::<_,usize>(3)?)),
+            )
+            .optional()?
+        {
+            if old_stream == encode(&stream)?
+                && old_digest == content.as_str()
+                && released.is_none()
+            {
+                if length != bytes.len() || offset.checked_add(length as u64).is_none_or(|end| end > boundary.final_cursor.get()) {
+                    return Err(Error::Corrupt("replayed output index is inconsistent"));
+                }
+                let mut file = private_file(&path,false)?;
+                let mut original = vec![0;length];
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut original)?;
+                if original != bytes { return Err(Error::Corrupt("cannot acknowledge replay with missing or corrupt retained originals")); }
+                return Ok(boundary);
+            }
+            return Err(Error::Conflict(
+                "output sequence conflict or retired evidence",
+            ));
+        }
+        if receipt.is_some() || released.is_some() {
+            return Err(Error::Conflict("terminal output is immutable"));
+        }
+        if sequence != boundary.chunks.next()? {
+            return Err(Error::Conflict("output sequence gap"));
+        }
+        let end = boundary.final_cursor.checked_add(bytes.len() as u64)?;
+        if end.get() > limit {
+            return Err(Error::Capacity(
+                "output reservation full; producer must stop before dropping evidence",
+            ));
+        }
+        capacity(&tx, "chunks", self.limits.chunks)?;
+        let chain = digest(
+            Domain::Output,
+            &(
+                &boundary.final_hash,
+                sequence,
+                boundary.final_cursor,
+                stream,
+                &content,
+                bytes.len(),
+            ),
+        )?;
+        let mut file = match private_file(&path, boundary.final_cursor == Counter::ZERO) {
+            Ok(file) => file,
+            Err(Error::Io(e))
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    && boundary.final_cursor == Counter::ZERO =>
+            {
+                private_file(&path, false)?
+            }
+            Err(e) => return Err(e),
+        };
+        if file.metadata()?.len() < boundary.final_cursor.get() {
+            return Err(Error::Corrupt("committed output is truncated"));
+        }
+        // Only discard the uncommitted tail. A crash before the SQLite commit never acknowledged it.
+        file.set_len(boundary.final_cursor.get())?;
+        file.seek(SeekFrom::Start(boundary.final_cursor.get()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        sync_directory(&self.db.root)?;
+        tx.execute(
+            "INSERT INTO chunks VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id.as_str(),
+                sequence.get(),
+                boundary.final_cursor.get(),
+                bytes.len() as u64,
+                encode(&stream)?,
+                content.as_str(),
+                chain.as_str()
+            ],
+        )?;
+        match stream {
+            Stream::Stdout => {
+                boundary.stdout_bytes = boundary.stdout_bytes.checked_add(bytes.len() as u64)?
+            }
+            Stream::Stderr => {
+                boundary.stderr_bytes = boundary.stderr_bytes.checked_add(bytes.len() as u64)?
+            }
+            Stream::Terminal => {
+                boundary.terminal_bytes = boundary.terminal_bytes.checked_add(bytes.len() as u64)?
+            }
+        }
+        boundary.final_cursor = end;
+        boundary.chunks = sequence;
+        boundary.final_hash = chain;
+        tx.execute(
+            "UPDATE processes SET boundary=?2 WHERE id=?1",
+            params![id.as_str(), encode(&boundary)?],
+        )?;
+        tx.commit()?;
+        Ok(boundary)
+    }
+
+    pub fn read_output(
+        &self,
+        id: &ProcessId,
+        after: Counter,
+        max_bytes: usize,
+    ) -> Result<OutputPage> {
+        if max_bytes == 0 || max_bytes > MAX_CONTROL_BYTES {
+            return Err(Error::Capacity("output page must be 1..256 KiB"));
+        }
+        let (raw, released): (String, Option<String>) = self.db.connection.query_row(
+            "SELECT boundary,release FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if released.is_some() {
+            return Err(Error::Conflict(
+                "source evidence released; use the retaining owner's handle",
+            ));
+        }
+        let boundary: OutputBoundary = decode(&raw)?;
+        if let Some((receipt, _)) = self.receipt(id)?
+            && boundary != receipt.output
+        {
+            return Err(Error::Corrupt(
+                "output boundary disagrees with terminal receipt",
+            ));
+        }
+        self.read_retained(id, boundary, after, max_bytes)
+    }
+
+    fn read_retained(
+        &self,
+        id: &ProcessId,
+        boundary: OutputBoundary,
+        after: Counter,
+        max_bytes: usize,
+    ) -> Result<OutputPage> {
+        if after > boundary.final_cursor {
+            return Err(Error::Conflict("output cursor beyond committed boundary"));
+        }
+        let mut page = OutputPage {
+            cursor: after,
+            available: boundary.final_cursor,
+            chunks: Vec::new(),
+        };
+        if after == boundary.final_cursor {
+            return Ok(page);
+        }
+        let mut file = private_file(&self.db.root.join(format!("{}.output", id.as_str())), false)?;
+        // Indexed predecessor plus forward range: do not rescan prior output on every poll.
+        let start: u64 = self.db.connection.query_row("SELECT offset FROM chunks WHERE process=?1 AND offset<=?2 ORDER BY offset DESC LIMIT 1", params![id.as_str(),after.get()], |r| r.get(0)).optional()?.ok_or(Error::Corrupt("output cursor has no retained segment"))?;
+        let mut statement = self.db.connection.prepare("SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM chunks WHERE process=?1 AND offset>=?2 ORDER BY offset LIMIT 256")?;
+        let rows = statement.query_map(params![id.as_str(), start], |r| {
+            Ok((
+                r.get::<_, u64>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, usize>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut remaining = max_bytes;
+        for row in rows {
+            let (sequence, offset, length, stream, expected, chain) = row?;
+            if sequence == 0
+                || sequence > boundary.chunks.get()
+                || length == 0
+                || length > MAX_STREAM_BYTES
+                || offset > page.cursor.get()
+                || offset
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > boundary.final_cursor.get() || end <= page.cursor.get())
+                || (!page.chunks.is_empty() && offset != page.cursor.get())
+            {
+                return Err(Error::Corrupt("invalid output segment index"));
+            }
+            let mut bytes = vec![0; length];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut bytes)?;
+            let content = bytes_digest(&bytes);
+            if content.as_str() != expected {
+                return Err(Error::Corrupt("output segment digest mismatch"));
+            }
+            let skip = (page.cursor.get() - offset) as usize;
+            let take = (length - skip).min(remaining);
+            let stream: Stream = decode(&stream)?;
+            let previous = if sequence == 1 {
+                let epoch: u64 = self.db.connection.query_row(
+                    "SELECT epoch FROM processes WHERE id=?1",
+                    [id.as_str()],
+                    |r| r.get(0),
+                )?;
+                empty_boundary(&self.sandbox, id, epoch.try_into()?)?.final_hash
+            } else {
+                let previous: String = self.db.connection.query_row(
+                    "SELECT chain_digest FROM chunks WHERE process=?1 AND sequence=?2",
+                    params![id.as_str(), sequence - 1],
+                    |r| r.get(0),
+                )?;
+                previous.try_into()?
+            };
+            let actual_chain = digest(
+                Domain::Output,
+                &(
+                    &previous,
+                    Counter::try_from(sequence)?,
+                    Counter::try_from(offset)?,
+                    stream,
+                    &content,
+                    length,
+                ),
+            )?;
+            if actual_chain.as_str() != chain
+                || (sequence == boundary.chunks.get() && actual_chain != boundary.final_hash)
+            {
+                return Err(Error::Corrupt(
+                    "output ordering or stream identity is corrupt",
+                ));
+            }
+            // Payload hashes describe complete stored chunks; partial-page bytes are also hash-bound.
+            let selected = bytes[skip..skip + take].to_vec();
+            page.chunks.push(OutputChunk {
+                sequence: sequence.try_into()?,
+                offset: page.cursor,
+                stream,
+                bytes_digest: bytes_digest(&selected),
+                bytes: selected,
+                chain_digest: chain.try_into()?,
+            });
+            page.cursor = page.cursor.checked_add(take as u64)?;
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if page.cursor == after {
+            return Err(Error::Corrupt("output coverage is missing"));
+        }
+        Ok(page)
+    }
+
+    pub fn publish_receipt(
+        &mut self,
+        id: &ProcessId,
+        outcome: ProcessOutcome,
+        cleanup: Digest,
+        accounting: Digest,
+    ) -> Result<(Receipt, Digest)> {
+        let tx = self.db.connection.transaction()?;
+        let (operation_id, epoch, boundary, old): (String, u64, String, Option<String>) = tx
+            .query_row(
+                "SELECT operation,epoch,boundary,receipt FROM processes WHERE id=?1",
+                [id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        let operation_id: OperationId = operation_id.try_into()?;
+        let mut op =
+            operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
+        if !matches!(
+            op.delivery,
+            Delivery::Dispatched | Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+        ) {
+            return Err(Error::Conflict(
+                "cannot settle a process before dispatch or confirmed non-application",
+            ));
+        }
+        let receipt = Receipt {
+            sandbox_id: self.sandbox.clone(),
+            epoch: epoch.try_into()?,
+            process_id: id.clone(),
+            operation_id,
+            request_digest: op.request.request_digest.clone(),
+            outcome,
+            output: decode(&boundary)?,
+            cleanup_digest: cleanup,
+            accounting_digest: accounting,
+        };
+        let receipt_digest = digest(Domain::Receipt, &receipt)?;
+        if let Some(old) = old {
+            if decode::<Receipt>(&old)? != receipt {
+                return Err(Error::Conflict("terminal receipt is immutable"));
+            }
+            return Ok((receipt, receipt_digest));
+        }
+        let delivery = match receipt.outcome {
+            ProcessOutcome::Exit { .. } | ProcessOutcome::Signal { .. } => Delivery::Applied,
+            ProcessOutcome::SpawnFailed { .. } => Delivery::NotApplied,
+            ProcessOutcome::Interrupted { .. } => op.delivery,
+        };
+        if matches!(
+            (op.delivery, delivery),
+            (Delivery::Applied, Delivery::NotApplied) | (Delivery::NotApplied, Delivery::Applied)
+        ) {
+            return Err(Error::Conflict(
+                "receipt contradicts committed execution evidence",
+            ));
+        }
+        op.delivery = delivery;
+        op.evidence_digest = Some(receipt_digest.clone());
+        tx.execute(
+            "UPDATE operations SET value=?2 WHERE id=?1",
+            params![op.request.operation_id.as_str(), encode(&op)?],
+        )?;
+        tx.execute(
+            "UPDATE processes SET receipt=?2,receipt_digest=?3 WHERE id=?1",
+            params![id.as_str(), encode(&receipt)?, receipt_digest.as_str()],
+        )?;
+        tx.commit()?;
+        Ok((receipt, receipt_digest))
+    }
+
+    pub fn receipt(&self, id: &ProcessId) -> Result<Option<(Receipt, Digest)>> {
+        receipt(&self.db.connection, id)
+    }
+
+    pub fn acknowledge_receipt(&mut self, id: &ProcessId, expected: &Digest) -> Result<()> {
+        require_receipt(&self.db.connection, id, expected)?;
+        self.db.connection.execute(
+            "UPDATE processes SET acknowledged=1 WHERE id=?1",
+            [id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn pin(&mut self, id: &ProcessId, expected: &Digest, pin: PinId) -> Result<()> {
+        let receipt = require_receipt(&self.db.connection, id, expected)?;
+        let mut cursor = Counter::ZERO;
+        while cursor < receipt.output.final_cursor {
+            cursor = self.read_output(id, cursor, MAX_CONTROL_BYTES)?.cursor;
+        }
+        let tx = self.db.connection.transaction()?;
+        require_receipt(&tx, id, expected)?;
+        let released: Option<String> = tx.query_row(
+            "SELECT release FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        if released.is_some() {
+            return Err(Error::Conflict(
+                "cannot create a retention obligation after release",
+            ));
+        }
+        if let Some((old_process, old_digest)) = tx
+            .query_row(
+                "SELECT process,receipt_digest FROM pins WHERE id=?1",
+                [pin.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            return if old_process == id.as_str() && old_digest == expected.as_str() {
+                Ok(())
+            } else {
+                Err(Error::Conflict("pin identity conflict"))
+            };
+        }
+        capacity(&tx, "pins", self.limits.pins)?;
+        tx.execute(
+            "INSERT INTO pins VALUES (?1,?2,?3)",
+            params![pin.as_str(), id.as_str(), expected.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn read_pin(&self, pin: &PinId, after: Counter, max_bytes: usize) -> Result<OutputPage> {
+        if max_bytes == 0 || max_bytes > MAX_CONTROL_BYTES {
+            return Err(Error::Capacity("invalid output page bound"));
+        }
+        let id: String = self.db.connection.query_row(
+            "SELECT process FROM pins WHERE id=?1",
+            [pin.as_str()],
+            |r| r.get(0),
+        )?;
+        let id: ProcessId = id.try_into()?;
+        let (receipt, _) = self
+            .receipt(&id)?
+            .ok_or(Error::Corrupt("retention receipt is missing"))?;
+        self.read_retained(&id, receipt.output, after, max_bytes)
+    }
+
+    /// Records delivery of a host-owned decision; the guardian cannot mint loss authority.
+    pub fn record_loss_authorization(
+        &mut self,
+        authorized: crate::LossAuthorization<'_>,
+    ) -> Result<()> {
+        let id = &authorized.process;
+        let expected = &authorized.receipt;
+        let approval = &authorized.approval;
+        let receipt = require_receipt(&self.db.connection, id, expected)?;
+        let binding = digest(
+            Domain::Release,
+            &(&self.sandbox, id, expected, &receipt.output, "loss"),
+        )?;
+        if authorized.sandbox != self.sandbox
+            || authorized.output != receipt.output
+            || approval.request_digest != binding
+        {
+            return Err(Error::Conflict(
+                "loss approval must bind complete deletion scope",
+            ));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = tx
+            .query_row(
+                "SELECT approval_digest FROM loss_authorizations WHERE id=?1",
+                [approval.id.as_str()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return if old == binding.as_str() {
+                Ok(())
+            } else {
+                Err(Error::Conflict("loss approval identity conflict"))
+            };
+        }
+        capacity(&tx, "loss_authorizations", self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO loss_authorizations VALUES (?1,?2,?3,?4)",
+            params![
+                approval.id.as_str(),
+                id.as_str(),
+                expected.as_str(),
+                binding.as_str()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commits retirement only; cleanup is deliberately a second, retryable operation.
+    pub fn release(&mut self, id: &ProcessId, request: ReleaseRequest) -> Result<ReleaseStatus> {
+        let identity = digest(Domain::Release, &request)?;
+        let tx = self.db.connection.transaction()?;
+        let receipt = require_receipt(&tx, id, &request.receipt_digest)?;
+        if receipt.output != request.output {
+            return Err(Error::Conflict(
+                "release scope does not cover all original output",
+            ));
+        }
+        let (old, pending): (Option<String>, bool) = tx.query_row(
+            "SELECT release,cleanup_pending FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let Some(old) = old {
+            if decode::<ReleaseRequest>(&old)? != request {
+                return Err(Error::Conflict("conflicting release disposition"));
+            }
+            return Ok(ReleaseStatus {
+                request_digest: identity,
+                cleanup_pending: pending,
+            });
+        }
+        match &request.disposition {
+            ReleaseDisposition::CompleteCapture { commitment } => {
+                if commitment.receipt_digest != request.receipt_digest
+                    || commitment.output != receipt.output
+                {
+                    return Err(Error::Conflict(
+                        "capture commitment has incomplete original-byte coverage",
+                    ));
+                }
+            }
+            ReleaseDisposition::ContinuingRetention { pin } => {
+                let pinned: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pins WHERE id=?1 AND process=?2 AND receipt_digest=?3)", params![pin.as_str(),id.as_str(),request.receipt_digest.as_str()], |r| r.get(0))?;
+                if !pinned {
+                    return Err(Error::Conflict(
+                        "reference has no committed independent retention obligation",
+                    ));
+                }
+            }
+            ReleaseDisposition::AuthorizedLoss { authorization } => {
+                let authorized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM loss_authorizations WHERE id=?1 AND process=?2 AND receipt_digest=?3)", params![authorization.as_str(),id.as_str(),request.receipt_digest.as_str()], |r| r.get(0))?;
+                if !authorized {
+                    return Err(Error::Conflict("loss has not been authorized"));
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE processes SET release=?2,cleanup_pending=1 WHERE id=?1",
+            params![id.as_str(), encode(&request)?],
+        )?;
+        tx.commit()?;
+        Ok(ReleaseStatus {
+            request_digest: identity,
+            cleanup_pending: true,
+        })
+    }
+
+    pub fn cleanup_released(
+        &mut self,
+        id: &ProcessId,
+        release_digest: &Digest,
+    ) -> Result<ReleaseStatus> {
+        let tx = self.db.connection.transaction()?;
+        let raw: Option<String> = tx.query_row(
+            "SELECT release FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        let request: ReleaseRequest =
+            decode(&raw.ok_or(Error::Conflict("evidence has not been released"))?)?;
+        if digest(Domain::Release, &request)? != *release_digest {
+            return Err(Error::Conflict("release digest mismatch"));
+        }
+        let pinned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pins WHERE process=?1)",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        if !pinned {
+            let path = self.db.root.join(format!("{}.output", id.as_str()));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            sync_directory(&self.db.root)?;
+            tx.execute("DELETE FROM chunks WHERE process=?1", [id.as_str()])?;
+            tx.execute(
+                "UPDATE processes SET output_limit=0 WHERE id=?1",
+                [id.as_str()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE processes SET cleanup_pending=0 WHERE id=?1",
+            [id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(ReleaseStatus {
+            request_digest: release_digest.clone(),
+            cleanup_pending: false,
+        })
+    }
+}
+
+fn observation(db: &rusqlite::Connection) -> Result<Option<MachineObservation>> {
+    db.query_row(
+        "SELECT value FROM observations ORDER BY sequence DESC LIMIT 1",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|s| decode(&s))
+    .transpose()
+}
+
+fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool {
+    use MachineState::*;
+    if old.epoch != new.epoch {
+        return matches!(old.state, Stopped | Failed | Suspended)
+            && matches!(new.state, Starting | Restoring);
+    }
+    if old.state == new.state {
+        return old.state != Destroyed;
+    }
+    if new.state == Failed {
+        return old.state != Destroyed;
+    }
+    if new.state == Destroying {
+        return !matches!(old.state, Destroyed | Destroying);
+    }
+    matches!(
+        (old.state, new.state),
+        (Creating, Starting | Running | Stopped)
+            | (Starting | Restoring, Running | Paused | Stopped)
+            | (Running, Paused | Stopped | Suspended)
+            | (Paused, Running | Stopped | Suspended)
+            | (Suspended, Stopped)
+            | (Failed, Stopped)
+            | (Destroying, Destroyed)
+    )
+}
+fn operation(db: &rusqlite::Connection, id: &OperationId) -> Result<Option<Operation>> {
+    db.query_row(
+        "SELECT value FROM operations WHERE id=?1",
+        [id.as_str()],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|s| decode(&s))
+    .transpose()
+}
+fn receipt(db: &rusqlite::Connection, id: &ProcessId) -> Result<Option<(Receipt, Digest)>> {
+    let (raw, expected): (Option<String>, Option<String>) = db.query_row(
+        "SELECT receipt,receipt_digest FROM processes WHERE id=?1",
+        [id.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    match (raw, expected) {
+        (None, None) => Ok(None),
+        (Some(raw), Some(expected)) => {
+            let value: Receipt = decode(&raw)?;
+            let actual = digest(Domain::Receipt, &value)?;
+            if actual.as_str() != expected {
+                return Err(Error::Corrupt("terminal receipt digest mismatch"));
+            }
+            Ok(Some((value, actual)))
+        }
+        _ => Err(Error::Corrupt("partial terminal receipt publication")),
+    }
+}
+fn require_receipt(
+    db: &rusqlite::Connection,
+    id: &ProcessId,
+    expected: &Digest,
+) -> Result<Receipt> {
+    let (value, actual) =
+        receipt(db, id)?.ok_or(Error::Conflict("process has no terminal receipt"))?;
+    if actual != *expected {
+        return Err(Error::Conflict("receipt digest mismatch"));
+    }
+    Ok(value)
+}
+fn empty_boundary(sandbox: &SandboxId, id: &ProcessId, epoch: Counter) -> Result<OutputBoundary> {
+    Ok(OutputBoundary {
+        final_cursor: Counter::ZERO,
+        chunks: Counter::ZERO,
+        stdout_bytes: Counter::ZERO,
+        stderr_bytes: Counter::ZERO,
+        terminal_bytes: Counter::ZERO,
+        omitted_bytes: Counter::ZERO,
+        final_hash: digest(Domain::Output, &(sandbox, id, epoch))?,
+    })
+}
