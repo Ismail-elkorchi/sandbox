@@ -63,6 +63,24 @@ pub struct RuntimeJournal {
     limits: RuntimeLimits,
 }
 
+/// A successful ledger write is not a reusable native-effect permission.
+pub enum DispatchDecision<'guardian, 'host> {
+    Perform(DispatchPermit<'guardian, 'host>),
+    Reconcile(Operation),
+}
+
+/// One in-process dispatch, holding both owners stable through the native effect.
+/// This is not serializable and must not be used as an inter-service capability.
+pub struct DispatchPermit<'guardian, 'host> {
+    authority: Authorization<'host>,
+    _guardian: &'guardian mut RuntimeJournal,
+}
+impl DispatchPermit<'_, '_> {
+    pub fn perform<T>(self, effect: impl FnOnce(&Mutation, &Capability) -> T) -> T {
+        effect(&self.authority.mutation, &self.authority.capability)
+    }
+}
+
 impl RuntimeJournal {
     pub fn create(path: &Path, sandbox: SandboxId, limits: RuntimeLimits) -> Result<Self> {
         if [
@@ -213,7 +231,43 @@ impl RuntimeJournal {
         Ok(value)
     }
 
-    /// Persist Dispatched before the native effect. An interrupted dispatch remains unknown.
+    /// Recheck current host authority and guardian state, then durably gate one effect.
+    /// A crash after this commit requires reconciliation even if no effect took place.
+    pub fn begin_dispatch<'guardian, 'host>(
+        &'guardian mut self,
+        authorization: Authorization<'host>,
+    ) -> Result<DispatchDecision<'guardian, 'host>> {
+        let tx = self.db.connection.transaction()?;
+        let request = &authorization.mutation;
+        let mut value = operation(&tx, &request.operation_id)?
+            .ok_or(Error::Missing("dispatch operation is not admitted"))?;
+        if value.request != *request || value.capability != authorization.capability {
+            return Err(Error::Conflict("dispatch identity or authority mismatch"));
+        }
+        if value.delivery != Delivery::Admitted {
+            return Ok(DispatchDecision::Reconcile(value));
+        }
+        let current = observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
+        if request.sandbox_id != self.sandbox
+            || request.epoch != current.epoch
+            || request.expected_revision != current.applied_revision
+            || current.state != MachineState::Running
+        {
+            return Err(Error::Conflict("machine no longer admits dispatch"));
+        }
+        value.delivery = Delivery::Dispatched;
+        tx.execute(
+            "UPDATE operations SET value=?2 WHERE id=?1",
+            params![request.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(DispatchDecision::Perform(DispatchPermit {
+            authority: authorization,
+            _guardian: self,
+        }))
+    }
+
+    /// Record delivery evidence only. Native dispatch requires begin_dispatch.
     pub fn record_delivery(
         &mut self,
         id: &OperationId,
@@ -221,6 +275,11 @@ impl RuntimeJournal {
         delivery: Delivery,
         evidence: Option<Digest>,
     ) -> Result<Operation> {
+        if delivery == Delivery::Dispatched {
+            return Err(Error::Conflict(
+                "dispatch requires a fresh single-use permission",
+            ));
+        }
         let tx = self.db.connection.transaction()?;
         let mut value = operation(&tx, id)?.ok_or(Error::Missing("operation missing"))?;
         if value.request.request_digest != *request {
@@ -231,13 +290,12 @@ impl RuntimeJournal {
         }
         let allowed = matches!(
             (value.delivery, delivery),
-            (
-                Delivery::Admitted,
-                Delivery::Dispatched | Delivery::NotApplied
-            ) | (
-                Delivery::Dispatched,
-                Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
-            ) | (Delivery::Unknown, Delivery::Applied | Delivery::NotApplied)
+            (Delivery::Admitted, Delivery::NotApplied)
+                | (
+                    Delivery::Dispatched,
+                    Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+                )
+                | (Delivery::Unknown, Delivery::Applied | Delivery::NotApplied)
         );
         if !allowed
             || (matches!(delivery, Delivery::Applied | Delivery::NotApplied) && evidence.is_none())

@@ -20,6 +20,7 @@ impl Database {
             return Err(Error::Conflict("state root must be absolute"));
         }
         create_private_directory(root)?;
+        let root = canonical_directory(root)?;
         let lease = private_file(&root.join("writer.lock"), true)?;
         lock(&lease)?;
         let database_path = root.join("authority.sqlite");
@@ -32,19 +33,19 @@ impl Database {
         tx.execute("INSERT INTO identity VALUES (?1)", [role])?;
         tx.execute_batch(schema)?;
         tx.commit()?;
-        sync_directory(root)?;
+        sync_directory(&root)?;
         if let Some(parent) = root.parent() {
             sync_directory(parent)?;
         }
         Ok(Self {
             connection,
-            root: root.to_owned(),
+            root,
             _lease: lease,
         })
     }
 
     pub fn open(root: &Path, role: &str) -> Result<Self> {
-        validate_directory(root)?;
+        let root = canonical_directory(root)?;
         let lease = private_file(&root.join("writer.lock"), false)?;
         lock(&lease)?;
         let path = root.join("authority.sqlite");
@@ -64,7 +65,7 @@ impl Database {
         configure_durability(&connection)?;
         Ok(Self {
             connection,
-            root: root.to_owned(),
+            root,
             _lease: lease,
         })
     }
@@ -98,6 +99,23 @@ fn lock(file: &File) -> Result<()> {
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
+}
+
+#[cfg(unix)]
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // macOS system paths such as /var are aliases. Resolve ancestors once at
+    // admission, keeping SQLite's all-components NOFOLLOW check enabled. The
+    // supplied state directory itself must still be private and not a symlink.
+    validate_directory(path)?;
+    let before = fs::symlink_metadata(path)?;
+    let canonical = fs::canonicalize(path)?;
+    validate_directory(&canonical)?;
+    let after = fs::symlink_metadata(&canonical)?;
+    if before.dev() != after.dev() || before.ino() != after.ino() {
+        return Err(Error::Conflict("state directory changed during resolution"));
+    }
+    Ok(canonical)
 }
 
 #[cfg(unix)]
@@ -165,7 +183,7 @@ pub(crate) fn create_private_directory(_: &Path) -> Result<()> {
     ))
 }
 #[cfg(not(unix))]
-fn validate_directory(_: &Path) -> Result<()> {
+fn canonical_directory(_: &Path) -> Result<PathBuf> {
     Err(Error::Unsupported(
         "native private-state provisioning is not implemented on this host",
     ))

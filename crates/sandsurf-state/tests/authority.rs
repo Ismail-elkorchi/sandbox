@@ -172,14 +172,7 @@ impl Fixture {
         runtime
             .admit_process(process.clone(), &mutation.operation_id, n(100), false)
             .unwrap();
-        runtime
-            .record_delivery(
-                &mutation.operation_id,
-                &mutation.request_digest,
-                Delivery::Dispatched,
-                None,
-            )
-            .unwrap();
+        dispatch(&mut runtime, &host, &mutation);
         Self {
             runtime,
             host,
@@ -240,6 +233,171 @@ impl Fixture {
             },
         }
     }
+}
+
+fn dispatch(runtime: &mut RuntimeJournal, host: &HostCatalog, mutation: &Mutation) {
+    let authorization = host
+        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    match runtime.begin_dispatch(authorization).unwrap() {
+        DispatchDecision::Perform(permit) => permit.perform(|actual, capability| {
+            assert_eq!(actual, mutation);
+            assert_eq!(*capability, Capability::Spawn);
+        }),
+        DispatchDecision::Reconcile(_) => panic!("first dispatch unexpectedly reconciled"),
+    }
+}
+
+#[test]
+fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "once".try_into().unwrap();
+    let authorize = || {
+        f.host
+            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+            .unwrap()
+    };
+    f.runtime.admit(authorize()).unwrap();
+    let mut effects = 0;
+    match f.runtime.begin_dispatch(authorize()).unwrap() {
+        DispatchDecision::Perform(permit) => permit.perform(|_, _| effects += 1),
+        DispatchDecision::Reconcile(_) => panic!("first dispatch must be new"),
+    }
+    assert_eq!(effects, 1);
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let mut reopened = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    match reopened.begin_dispatch(authorize()).unwrap() {
+        DispatchDecision::Perform(_) => panic!("dispatched operation cannot execute twice"),
+        DispatchDecision::Reconcile(old) => assert_eq!(old.delivery, Delivery::Dispatched),
+    }
+    reopened
+        .record_delivery(
+            &mutation.operation_id,
+            &mutation.request_digest,
+            Delivery::Unknown,
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        reopened.begin_dispatch(authorize()).unwrap(),
+        DispatchDecision::Reconcile(Operation {
+            delivery: Delivery::Unknown,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn dropped_dispatch_permission_preserves_uncertainty_instead_of_retrying() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "interrupted-native-dispatch".try_into().unwrap();
+    f.runtime
+        .admit(
+            f.host
+                .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+                .unwrap(),
+        )
+        .unwrap();
+    // The durable dispatch commit can precede a crash before any native effect.
+    drop(
+        f.runtime
+            .begin_dispatch(
+                f.host
+                    .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+                    .unwrap(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        f.runtime
+            .operation(&mutation.operation_id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Dispatched
+    );
+    assert!(matches!(
+        f.runtime
+            .begin_dispatch(
+                f.host
+                    .authorize(mutation, Capability::Spawn, &hash("workload"))
+                    .unwrap()
+            )
+            .unwrap(),
+        DispatchDecision::Reconcile(_)
+    ));
+}
+
+#[test]
+fn admitted_work_does_not_bypass_a_later_machine_barrier() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "queued".try_into().unwrap();
+    f.runtime
+        .admit(
+            f.host
+                .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+                .unwrap(),
+        )
+        .unwrap();
+    let mut observation = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    observation.sequence = n(4);
+    observation.state = MachineState::Paused;
+    f.runtime.observe(observation).unwrap();
+    assert!(
+        f.runtime
+            .begin_dispatch(
+                f.host
+                    .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+                    .unwrap()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        f.runtime
+            .operation(&mutation.operation_id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Admitted
+    );
+}
+
+#[test]
+fn system_ancestor_aliases_do_not_disable_final_component_protection() {
+    use std::os::unix::fs::symlink;
+    let root = TempRoot::new();
+    let real_parent = root.0.join("real-parent");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&real_parent)
+        .unwrap();
+    let alias = root.0.join("system-alias");
+    symlink(&real_parent, &alias).unwrap();
+    let path = alias.join("host");
+    let host =
+        HostCatalog::create(&path, "alias-host".try_into().unwrap(), catalog_limits()).unwrap();
+    assert!(HostCatalog::open(&real_parent.join("host")).is_err());
+    drop(host);
+    let host = HostCatalog::open(&path).unwrap();
+    assert_eq!(host.host_id().as_str(), "alias-host");
+    drop(host);
+    let final_alias = root.0.join("forbidden-state-alias");
+    symlink(real_parent.join("host"), &final_alias).unwrap();
+    assert!(HostCatalog::open(&final_alias).is_err());
+    let database = path.join("authority.sqlite");
+    fs::rename(&database, path.join("real.sqlite")).unwrap();
+    symlink(path.join("real.sqlite"), &database).unwrap();
+    assert!(HostCatalog::open(&path).is_err());
 }
 
 #[test]
@@ -841,14 +999,7 @@ fn independent_jobs_and_pty_streams_have_separate_reservations() {
     f.runtime
         .admit_process(terminal.clone(), &mutation.operation_id, n(200), true)
         .unwrap();
-    f.runtime
-        .record_delivery(
-            &mutation.operation_id,
-            &mutation.request_digest,
-            Delivery::Dispatched,
-            None,
-        )
-        .unwrap();
+    dispatch(&mut f.runtime, &f.host, &mutation);
     assert!(
         f.runtime
             .append_output(&terminal, n(1), Stream::Stdout, b"wrong stream")
@@ -979,14 +1130,7 @@ fn output_pages_bound_record_count_as_well_as_original_bytes() {
     f.runtime
         .admit_process(process.clone(), &mutation.operation_id, n(400), false)
         .unwrap();
-    f.runtime
-        .record_delivery(
-            &mutation.operation_id,
-            &mutation.request_digest,
-            Delivery::Dispatched,
-            None,
-        )
-        .unwrap();
+    dispatch(&mut f.runtime, &f.host, &mutation);
     for sequence in 1..=300 {
         f.runtime
             .append_output(&process, n(sequence), Stream::Stdout, b"x")
