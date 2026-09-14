@@ -13,9 +13,11 @@
 
 mod catalog;
 mod database;
+mod disks;
 mod runtime;
 
 pub use catalog::*;
+pub use disks::*;
 pub use runtime::*;
 
 use sandsurf_protocol::Invalid;

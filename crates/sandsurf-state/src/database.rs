@@ -11,7 +11,20 @@ const APPLICATION_ID: i64 = 0x53534631;
 pub(crate) struct Database {
     pub connection: Connection,
     pub root: PathBuf,
-    _lease: File,
+    // Field order closes SQLite before releasing its exclusive writer lease.
+    _lease: WriterLease,
+}
+
+struct WriterLease(File);
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // CLOEXEC closes inherited descriptors on exec, not at fork. Explicitly
+        // unlock on an orderly writer close so an unrelated exec-in-progress
+        // child cannot extend the old writer's lifetime. Never use inherited
+        // SQLite connections in fork children. Crash release still relies on OS
+        // handle closure; an uncertain inherited owner correctly remains busy.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Database {
@@ -25,11 +38,11 @@ impl Database {
         lock(&lease)?;
         let database_path = root.join("authority.sqlite");
         let file = private_file(&database_path, true)?;
-        file.sync_all()?;
+        sync_file(&file)?;
         let mut connection = connect(&database_path)?;
         configure_durability(&connection)?;
         let tx = connection.transaction()?;
-        tx.execute_batch("PRAGMA application_id = 1397966385; PRAGMA user_version = 1; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
+        tx.execute_batch("PRAGMA application_id = 1397966385; PRAGMA user_version = 2; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
         tx.execute("INSERT INTO identity VALUES (?1)", [role])?;
         tx.execute_batch(schema)?;
         tx.commit()?;
@@ -40,7 +53,7 @@ impl Database {
         Ok(Self {
             connection,
             root,
-            _lease: lease,
+            _lease: WriterLease(lease),
         })
     }
 
@@ -53,7 +66,7 @@ impl Database {
         let connection = connect(&path)?;
         let application: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if application != APPLICATION_ID || version != 1 {
+        if application != APPLICATION_ID || version != 2 {
             return Err(Error::Corrupt(
                 "incompatible authority catalog; preserved intact",
             ));
@@ -66,7 +79,7 @@ impl Database {
         Ok(Self {
             connection,
             root,
-            _lease: lease,
+            _lease: WriterLease(lease),
         })
     }
 }
@@ -87,11 +100,11 @@ fn connect(path: &Path) -> Result<Connection> {
 }
 
 fn configure_durability(connection: &Connection) -> Result<()> {
-    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304; PRAGMA max_page_count=262144;")?;
+    connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=4194304; PRAGMA max_page_count=262144;")?;
     Ok(())
 }
 
-fn lock(file: &File) -> Result<()> {
+pub(crate) fn lock(file: &File) -> Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -171,6 +184,19 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
 #[cfg(unix)]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn sync_file(file: &File) -> Result<()> {
+    file.sync_all()?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: F_FULLFSYNC operates on this live owned file without pointer arguments.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     Ok(())
 }
 

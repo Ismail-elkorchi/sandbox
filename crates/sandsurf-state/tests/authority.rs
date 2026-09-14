@@ -67,6 +67,9 @@ fn runtime_limits() -> RuntimeLimits {
         chunks: n(1000),
         pins: n(64),
         output_bytes: n(1000),
+        disks: n(8),
+        disk_bytes: n(1024 * 1024),
+        disk_headroom_bytes: n(1024 * 1024),
     }
 }
 

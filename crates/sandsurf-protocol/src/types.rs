@@ -33,7 +33,8 @@ identifier!(
     GrantId,
     CommitmentId,
     StoreId,
-    PinId
+    PinId,
+    DiskId
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

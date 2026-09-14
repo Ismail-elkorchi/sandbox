@@ -1,7 +1,7 @@
 use crate::{
     Authorization, Error, Result,
     catalog::capacity,
-    database::{Database, private_file, sync_directory},
+    database::{Database, private_file, sync_directory, sync_file},
     decode, encode,
 };
 use rusqlite::{OptionalExtension, params};
@@ -20,6 +20,7 @@ CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INT
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
 CREATE TABLE loss_authorizations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL, approval_digest TEXT NOT NULL) STRICT;
+CREATE TABLE disks(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, request TEXT NOT NULL, request_digest TEXT NOT NULL, phase TEXT NOT NULL, cleanup_digest TEXT) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,9 @@ pub struct RuntimeLimits {
     pub chunks: Counter,
     pub pins: Counter,
     pub output_bytes: Counter,
+    pub disks: Counter,
+    pub disk_bytes: Counter,
+    pub disk_headroom_bytes: Counter,
 }
 
 /// Created only after a guardian journal commit. Host callers cannot construct/deserialise it.
@@ -58,9 +62,9 @@ pub struct OutputPage {
 }
 
 pub struct RuntimeJournal {
-    db: Database,
-    sandbox: SandboxId,
-    limits: RuntimeLimits,
+    pub(crate) db: Database,
+    pub(crate) sandbox: SandboxId,
+    pub(crate) limits: RuntimeLimits,
 }
 
 /// A successful ledger write is not a reusable native-effect permission.
@@ -90,6 +94,8 @@ impl RuntimeJournal {
             limits.chunks,
             limits.pins,
             limits.output_bytes,
+            limits.disks,
+            limits.disk_bytes,
         ]
         .contains(&Counter::ZERO)
         {
@@ -204,6 +210,16 @@ impl RuntimeJournal {
                 return Ok(old);
             }
             return Err(Error::Conflict("runtime operation identity already bound"));
+        }
+        let disk_operation: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
+            [request.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if disk_operation {
+            return Err(Error::Conflict(
+                "operation identity already belongs to disk provisioning",
+            ));
         }
         let observed =
             observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
@@ -447,7 +463,7 @@ impl RuntimeJournal {
         file.set_len(boundary.final_cursor.get())?;
         file.seek(SeekFrom::Start(boundary.final_cursor.get()))?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        sync_file(&file)?;
         sync_directory(&self.db.root)?;
         tx.execute(
             "INSERT INTO chunks VALUES (?1,?2,?3,?4,?5,?6,?7)",
