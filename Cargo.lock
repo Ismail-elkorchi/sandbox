@@ -750,6 +750,7 @@ dependencies = [
  "libc",
  "sandsurf-control",
  "sandsurf-protocol",
+ "sandsurf-state",
  "sha2",
 ]
 

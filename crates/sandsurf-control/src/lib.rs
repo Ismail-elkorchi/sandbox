@@ -80,12 +80,18 @@ pub trait GuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> LifecycleEffect;
+    fn reconcile(&mut self, _journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
+        Ok(())
+    }
 }
 
 /// Guest/workload dispatch is deliberately separate from native VM ownership.
 /// A workload driver cannot report or mutate machine lifecycle state.
 pub trait WorkloadDriver {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome;
+    fn reconcile(&mut self, _journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
+        Ok(())
+    }
 }
 
 /// Standard guardian effect composition. This exposes capabilities without
@@ -124,6 +130,10 @@ impl<M: sandsurf_machine::MachineDriver, W: WorkloadDriver> GuardianEffect
     ) -> LifecycleEffect {
         sandsurf_machine::apply_lifecycle(&mut self.machine, command, current)
     }
+
+    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
+        self.workload.reconcile(journal)
+    }
 }
 
 pub struct Guardian<E> {
@@ -147,6 +157,7 @@ impl<E: GuardianEffect> Guardian<E> {
     }
 
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
+        self.effect.reconcile(&mut self.journal)?;
         match request {
             GuardianRequest::Inspect {
                 sandbox_id,
@@ -184,6 +195,16 @@ impl<E: GuardianEffect> Guardian<E> {
                 let operation_id = authorization.statement.mutation.operation_id.clone();
                 let request_digest = authorization.statement.mutation.request_digest.clone();
                 self.journal.admit(authorization.clone())?;
+                if let WorkloadRequest::Spawn { request } =
+                    &authorization.statement.mutation.request
+                {
+                    self.journal.admit_process(
+                        request.process_id.clone(),
+                        &request.operation_id,
+                        request.output_bytes,
+                        request.stdio == StdioMode::Terminal,
+                    )?;
+                }
                 let operation = match self.journal.begin_dispatch(authorization)? {
                     DispatchDecision::Reconcile(operation) => operation,
                     DispatchDecision::Perform(permit) => {

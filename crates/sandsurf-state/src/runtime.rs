@@ -586,6 +586,31 @@ impl RuntimeJournal {
                 "process reservation does not match the authorized spawn request",
             ));
         }
+        if let Some((old_operation, old_epoch, old_limit, old_terminal)) = tx
+            .query_row(
+                "SELECT operation,epoch,output_limit,terminal_mode FROM processes WHERE id=?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            return if old_operation == operation_id.as_str()
+                && old_epoch == op.request.epoch.get()
+                && old_limit == output_limit.get()
+                && old_terminal == terminal
+            {
+                Ok(())
+            } else {
+                Err(Error::Conflict("process identity already bound"))
+            };
+        }
         if op.delivery != Delivery::Admitted {
             return Err(Error::Conflict("process must be reserved before dispatch"));
         }
@@ -604,6 +629,15 @@ impl RuntimeJournal {
         tx.execute("INSERT INTO processes(id,operation,epoch,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.request.epoch.get(), output_limit.get(), terminal, encode(&boundary)?])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn process_boundary(&self, id: &ProcessId) -> Result<OutputBoundary> {
+        let raw: String = self.db.connection.query_row(
+            "SELECT boundary FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        decode(&raw)
     }
 
     pub fn append_output(

@@ -61,6 +61,9 @@ pub struct ProcessCompletion {
     pub outcome: ProcessOutcome,
     pub output: OutputBoundary,
     pub cleanup_digest: Digest,
+    /// Exact leader wait4 evidence. Group/cgroup attribution is added only by
+    /// a qualified cgroup controller and must not be inferred from this digest.
+    pub accounting_digest: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,9 +490,9 @@ fn start_reader(
     })
 }
 
-fn start_waiter(entry: Arc<ProcessEntry>, mut child: Child, readers: Vec<JoinHandle<()>>) {
+fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<()>>) {
     std::thread::spawn(move || {
-        let waited = child.wait();
+        let waited = wait_child(child);
         if entry.request.lifetime == ProcessLifetime::Job {
             terminate_group(entry.group, PROCESS_EXIT_GRACE);
         } else {
@@ -504,7 +507,7 @@ fn start_waiter(entry: Arc<ProcessEntry>, mut child: Child, readers: Vec<JoinHan
             });
             return;
         }
-        let Ok(status) = waited else {
+        let Ok((status, accounting_digest)) = waited else {
             entry.finish(ProcessState::Unknown {
                 evidence: bytes_digest(b"wait-status-unavailable"),
             });
@@ -524,12 +527,56 @@ fn start_waiter(entry: Arc<ProcessEntry>, mut child: Child, readers: Vec<JoinHan
                 outcome,
                 output,
                 cleanup_digest: bytes_digest(b"process-group-empty"),
+                accounting_digest,
             })),
             Err(_) => entry.finish(ProcessState::Unknown {
                 evidence: bytes_digest(b"output-finalization-failed"),
             }),
         }
     });
+}
+
+fn wait_child(child: Child) -> io::Result<(std::process::ExitStatus, Digest)> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child PID overflow"))?;
+    let mut status = 0_i32;
+    // SAFETY: wait4 initializes status and usage for this exact positive child.
+    let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+    loop {
+        // SAFETY: pointers refer to live writable objects and pid is the direct
+        // child retained by `child`; options zero performs a blocking reap.
+        let result = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if result == pid {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let mut evidence = b"linux-wait4-leader-v1".to_vec();
+    for value in [
+        usage.ru_utime.tv_sec,
+        usage.ru_utime.tv_usec,
+        usage.ru_stime.tv_sec,
+        usage.ru_stime.tv_usec,
+        usage.ru_maxrss,
+        usage.ru_minflt,
+        usage.ru_majflt,
+        usage.ru_inblock,
+        usage.ru_oublock,
+        usage.ru_nvcsw,
+        usage.ru_nivcsw,
+    ] {
+        evidence.extend_from_slice(&(value as i128).to_be_bytes());
+    }
+    drop(child);
+    Ok((
+        std::process::ExitStatus::from_raw(status),
+        bytes_digest(&evidence),
+    ))
 }
 
 struct PtyPair {
