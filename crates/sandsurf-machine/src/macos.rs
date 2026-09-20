@@ -97,7 +97,7 @@ impl AppleConfig {
                 return Err(AppleConfigError::DuplicateDisk);
             }
         }
-        if self.memory_bytes < 256 * 1024 * 1024 || self.memory_bytes % (1024 * 1024) != 0 {
+        if self.memory_bytes < 256 * 1024 * 1024 || !self.memory_bytes.is_multiple_of(1024 * 1024) {
             return Err(AppleConfigError::InvalidMemory);
         }
         if self.vcpus == 0 || self.vcpus > 1024 {

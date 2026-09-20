@@ -11,3 +11,6 @@ sandbox-digest = { path = "../sandbox-digest" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+flate2 = "=1.1.10"
+ruzstd = "=0.9.0"
+tar = "=0.4.46"

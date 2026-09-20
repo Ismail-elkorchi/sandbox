@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+pub mod oci;
+
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sandbox_digest::identity_digest;
 use serde::{Deserialize, Serialize};
