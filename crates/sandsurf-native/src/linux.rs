@@ -120,6 +120,9 @@ pub fn wait_process_exit(process: &File, timeout: Duration) -> io::Result<bool> 
 
 /// Bind the single-threaded launcher to its immediate parent. Installation and
 /// held-identity checks close the parent-exit race around PR_SET_PDEATHSIG.
+/// Linux binds this signal to the creating parent *thread*: the owner must spawn
+/// from a persistent supervision thread, not a short-lived request worker.
+/// Credential-changing confinement may clear it and must re-establish the rule.
 pub fn bind_lifetime_to_parent() -> io::Result<()> {
     // SAFETY: getppid takes no arguments and cannot corrupt memory.
     let parent = unsafe { libc::getppid() };

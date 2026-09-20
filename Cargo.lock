@@ -505,6 +505,7 @@ name = "sandsurf-native"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sandsurf-protocol",
 ]
 
 [[package]]
@@ -523,6 +524,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rusqlite",
+ "sandsurf-native",
  "sandsurf-protocol",
  "serde",
  "serde_json",

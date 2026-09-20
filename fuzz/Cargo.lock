@@ -437,6 +437,7 @@ name = "sandsurf-native"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sandsurf-protocol",
 ]
 
 [[package]]

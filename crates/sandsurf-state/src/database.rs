@@ -128,6 +128,10 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     if before.dev() != after.dev() || before.ino() != after.ino() {
         return Err(Error::Conflict("state directory changed during resolution"));
     }
+    #[cfg(target_os = "macos")]
+    for ancestor in canonical.parent().into_iter().flat_map(Path::ancestors) {
+        sandsurf_native::macos::require_protected_ancestor_acl(ancestor)?;
+    }
     Ok(canonical)
 }
 
@@ -153,6 +157,8 @@ fn validate_directory(path: &Path) -> Result<()> {
             "state root must be an owned private directory, not a symlink",
         ));
     }
+    #[cfg(target_os = "macos")]
+    sandsurf_native::macos::require_private_path_acl(path)?;
     Ok(())
 }
 
@@ -178,6 +184,8 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
             "state file must be private, owned and singly linked",
         ));
     }
+    #[cfg(target_os = "macos")]
+    sandsurf_native::macos::require_private_file_acl(&file)?;
     Ok(file)
 }
 
