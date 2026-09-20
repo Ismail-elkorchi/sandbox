@@ -7,6 +7,8 @@
 //! lifecycle or evidence handoff occurs at the guardian.
 
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 mod driver;
 #[cfg(target_os = "linux")]
 mod filesystem;
@@ -14,6 +16,8 @@ mod filesystem;
 mod process;
 mod spool;
 
+#[cfg(target_os = "linux")]
+pub use cgroup::*;
 #[cfg(target_os = "linux")]
 pub use driver::*;
 #[cfg(target_os = "linux")]

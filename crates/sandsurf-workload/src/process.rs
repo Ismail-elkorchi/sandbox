@@ -1,4 +1,6 @@
-use crate::{OutputSpool, RetainedPage, SpoolError};
+use crate::{
+    CgroupLimits, CgroupManager, CgroupUsage, OutputSpool, ProcessCgroup, RetainedPage, SpoolError,
+};
 use sandsurf_protocol::{
     Counter, Digest, OutputBoundary, ProcessId, ProcessLifetime, ProcessOutcome, SandboxId,
     SpawnRequest, StdioMode, Stream, TerminalSize, bytes_digest,
@@ -7,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -85,6 +87,7 @@ pub struct ProcessSupervisor {
     epoch: Counter,
     root: PathBuf,
     processes: Mutex<BTreeMap<ProcessId, Arc<ProcessEntry>>>,
+    cgroups: Option<(CgroupManager, CgroupLimits)>,
 }
 
 struct ProcessEntry {
@@ -96,6 +99,7 @@ struct ProcessEntry {
     spool: Arc<OutputSpool>,
     state: Mutex<ProcessState>,
     changed: Condvar,
+    cgroup: Option<ProcessCgroup>,
 }
 
 enum Input {
@@ -130,7 +134,20 @@ impl ProcessSupervisor {
             epoch,
             root: root.to_path_buf(),
             processes: Mutex::new(BTreeMap::new()),
+            cgroups: None,
         })
+    }
+
+    pub fn create_with_cgroups(
+        root: &Path,
+        sandbox_id: SandboxId,
+        epoch: Counter,
+        cgroups: CgroupManager,
+        default_limits: CgroupLimits,
+    ) -> Result<Self, ProcessError> {
+        let mut supervisor = Self::create(root, sandbox_id, epoch)?;
+        supervisor.cgroups = Some((cgroups, default_limits));
+        Ok(supervisor)
     }
 
     pub fn spawn(&self, request: SpawnRequest) -> Result<ProcessSnapshot, ProcessError> {
@@ -158,7 +175,21 @@ impl ProcessSupervisor {
             &directory.join("output.ssf"),
             request.output_bytes,
         )?);
-        let mut spawned = spawn_child(&request)?;
+        let cgroup = self
+            .cgroups
+            .as_ref()
+            .map(|(manager, limits)| manager.create_process(&request.process_id, *limits))
+            .transpose()?;
+        let attachment = cgroup.as_ref().map(ProcessCgroup::attachment).transpose()?;
+        let mut spawned = match spawn_child(&request, attachment.as_ref()) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(cgroup) = &cgroup {
+                    let _ = cgroup.cleanup();
+                }
+                return Err(error);
+            }
+        };
         let pid = spawned.child.id();
         let entry = Arc::new(ProcessEntry {
             request: request.clone(),
@@ -169,6 +200,7 @@ impl ProcessSupervisor {
             spool,
             state: Mutex::new(ProcessState::Running),
             changed: Condvar::new(),
+            cgroup,
         });
         processes.insert(request.process_id.clone(), Arc::clone(&entry));
         drop(processes);
@@ -262,15 +294,14 @@ impl ProcessSupervisor {
         if !matches!(entry.state()?, ProcessState::Running) {
             return Ok(());
         }
-        let group = entry.group;
-        send_group_signal(group, libc::SIGTERM)?;
+        send_group_signal(entry.group, libc::SIGTERM)?;
         std::thread::spawn(move || {
             let deadline = Instant::now() + grace;
-            while Instant::now() < deadline && group_exists(group) {
+            while Instant::now() < deadline && entry.owned_processes_exist() {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            if group_exists(group) {
-                let _ = send_group_signal(group, libc::SIGKILL);
+            if entry.owned_processes_exist() {
+                entry.kill_owned();
             }
         });
         Ok(())
@@ -327,6 +358,16 @@ impl ProcessSupervisor {
         Ok(self.entry(id)?.spool.read(after, maximum)?)
     }
 
+    pub fn usage(&self, id: &ProcessId) -> Result<Option<CgroupUsage>, ProcessError> {
+        let entry = self.entry(id)?;
+        entry
+            .cgroup
+            .as_ref()
+            .map(|cgroup| cgroup.usage(!matches!(entry.state(), Ok(ProcessState::Running))))
+            .transpose()
+            .map_err(ProcessError::Io)
+    }
+
     fn entry(&self, id: &ProcessId) -> Result<Arc<ProcessEntry>, ProcessError> {
         self.processes
             .lock()
@@ -341,7 +382,7 @@ impl Drop for ProcessSupervisor {
     fn drop(&mut self) {
         if let Ok(processes) = self.processes.lock() {
             for entry in processes.values() {
-                let _ = send_group_signal(entry.group, libc::SIGKILL);
+                entry.kill_owned();
             }
         }
     }
@@ -369,9 +410,26 @@ impl ProcessEntry {
             self.changed.notify_all();
         }
     }
+
+    fn owned_processes_exist(&self) -> bool {
+        self.cgroup
+            .as_ref()
+            .and_then(|cgroup| cgroup.populated().ok())
+            .unwrap_or_else(|| group_exists(self.group))
+    }
+
+    fn kill_owned(&self) {
+        if self
+            .cgroup
+            .as_ref()
+            .is_none_or(|cgroup| cgroup.kill().is_err())
+        {
+            let _ = send_group_signal(self.group, libc::SIGKILL);
+        }
+    }
 }
 
-fn spawn_child(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
+fn spawn_child(request: &SpawnRequest, attachment: Option<&File>) -> Result<Spawned, ProcessError> {
     let mut command = Command::new(&request.argv[0]);
     command
         .args(&request.argv[1..])
@@ -387,7 +445,9 @@ fn spawn_child(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
             // SAFETY: this closure executes after fork and before exec, invokes
             // only async-signal-safe setpgid, and does not access shared memory.
             unsafe {
-                command.pre_exec(|| {
+                let attachment = attachment.map(AsRawFd::as_raw_fd);
+                command.pre_exec(move || {
+                    attach_current_process(attachment)?;
                     if libc::setpgid(0, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -438,7 +498,9 @@ fn spawn_child(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
             // only async-signal-safe session/ioctl operations, and fd 0 has
             // already been installed from the retained PTY slave.
             unsafe {
-                command.pre_exec(|| {
+                let attachment = attachment.map(AsRawFd::as_raw_fd);
+                command.pre_exec(move || {
+                    attach_current_process(attachment)?;
                     if libc::setsid() < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -459,6 +521,21 @@ fn spawn_child(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
     }
 }
 
+fn attach_current_process(attachment: Option<RawFd>) -> io::Result<()> {
+    let Some(attachment) = attachment else {
+        return Ok(());
+    };
+    let value = b"0";
+    // SAFETY: the retained descriptor is an open cgroup.procs file inherited
+    // across fork, and this async-signal-safe write uses a static one-byte buffer.
+    let written = unsafe { libc::write(attachment, value.as_ptr().cast(), value.len()) };
+    if written == value.len() as isize {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn start_reader(
     entry: Arc<ProcessEntry>,
     mut reader: Box<dyn Read + Send>,
@@ -471,7 +548,7 @@ fn start_reader(
                 Ok(0) => break,
                 Ok(count) => {
                     if entry.spool.append(stream, &buffer[..count]).is_err() {
-                        let _ = send_group_signal(entry.group, libc::SIGKILL);
+                        entry.kill_owned();
                         break;
                     }
                 }
@@ -482,7 +559,7 @@ fn start_reader(
                     break;
                 }
                 Err(_) => {
-                    let _ = send_group_signal(entry.group, libc::SIGKILL);
+                    entry.kill_owned();
                     break;
                 }
             }
@@ -494,9 +571,9 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
     std::thread::spawn(move || {
         let waited = wait_child(child);
         if entry.request.lifetime == ProcessLifetime::Job {
-            terminate_group(entry.group, PROCESS_EXIT_GRACE);
+            terminate_owned(&entry, PROCESS_EXIT_GRACE);
         } else {
-            while group_exists(entry.group) && !entry.spool.has_failed() {
+            while entry.owned_processes_exist() && !entry.spool.has_failed() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -507,11 +584,36 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
             });
             return;
         }
-        let Ok((status, accounting_digest)) = waited else {
+        let Ok((status, leader_accounting)) = waited else {
             entry.finish(ProcessState::Unknown {
                 evidence: bytes_digest(b"wait-status-unavailable"),
             });
             return;
+        };
+        let (accounting_digest, cleanup_digest) = match &entry.cgroup {
+            Some(cgroup) => match cgroup.usage(true) {
+                Ok(usage) => {
+                    let mut evidence = b"sandsurf-process-accounting-v1".to_vec();
+                    evidence.extend_from_slice(leader_accounting.as_str().as_bytes());
+                    evidence.extend_from_slice(usage.digest().as_str().as_bytes());
+                    let cleanup = if cgroup.cleanup().is_ok() {
+                        bytes_digest(b"cgroup-v2-empty-and-removed")
+                    } else {
+                        entry.finish(ProcessState::Unknown {
+                            evidence: bytes_digest(b"cgroup-v2-cleanup-unconfirmed"),
+                        });
+                        return;
+                    };
+                    (bytes_digest(&evidence), cleanup)
+                }
+                Err(_) => {
+                    entry.finish(ProcessState::Unknown {
+                        evidence: bytes_digest(b"cgroup-v2-accounting-unavailable"),
+                    });
+                    return;
+                }
+            },
+            None => (leader_accounting, bytes_digest(b"process-group-empty")),
         };
         let outcome = match (status.code(), status.signal()) {
             (Some(code), _) => ProcessOutcome::Exit { code },
@@ -526,7 +628,7 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
             Ok(output) => entry.finish(ProcessState::Exited(ProcessCompletion {
                 outcome,
                 output,
-                cleanup_digest: bytes_digest(b"process-group-empty"),
+                cleanup_digest,
                 accounting_digest,
             })),
             Err(_) => entry.finish(ProcessState::Unknown {
@@ -663,14 +765,18 @@ fn group_exists(group: i32) -> bool {
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn terminate_group(group: i32, grace: Duration) {
-    let _ = send_group_signal(group, libc::SIGTERM);
+fn terminate_owned(entry: &ProcessEntry, grace: Duration) {
+    let _ = send_group_signal(entry.group, libc::SIGTERM);
     let deadline = Instant::now() + grace;
-    while group_exists(group) && Instant::now() < deadline {
+    while entry.owned_processes_exist() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    if group_exists(group) {
-        let _ = send_group_signal(group, libc::SIGKILL);
+    if entry.owned_processes_exist() {
+        entry.kill_owned();
+        let _ = entry
+            .cgroup
+            .as_ref()
+            .map(|cgroup| cgroup.wait_empty(PROCESS_EXIT_GRACE));
     }
 }
 
