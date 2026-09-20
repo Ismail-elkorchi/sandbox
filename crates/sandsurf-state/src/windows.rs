@@ -8,7 +8,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, DENY_ACCESS,
@@ -21,9 +22,10 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::core::PWSTR;
@@ -122,16 +124,13 @@ impl UserToken {
     }
 }
 
-pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "state root must be an absolute Windows path",
-        ));
-    }
+fn current_user_descriptor(inheritable: bool) -> io::Result<LocalAllocation> {
     let user = UserToken::current()?;
-    let sddl = format!("O:{0}D:P(A;OICI;FA;;;{0})", user.sid_string()?);
-    let sddl = wide(&sddl);
+    let inheritance = if inheritable { "OICI" } else { "" };
+    let sddl = wide(&format!(
+        "O:{0}D:P(A;{inheritance};GA;;;{0})",
+        user.sid_string()?
+    ));
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: SDDL is NUL-terminated and descriptor is a live output slot.
     if unsafe {
@@ -145,10 +144,20 @@ pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    let descriptor_allocation = LocalAllocation(descriptor);
+    Ok(LocalAllocation(descriptor))
+}
+
+pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state root must be an absolute Windows path",
+        ));
+    }
+    let descriptor = current_user_descriptor(true)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
+        lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
     let path_wide = wide_os(path)?;
@@ -156,12 +165,12 @@ pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    drop(descriptor_allocation);
     let result = (|| {
         let directory = open_directory(path)?;
         validate(&directory, true, true)?;
         Ok(())
     })();
+    drop(descriptor);
     if result.is_err() {
         let _ = fs::remove_dir(path);
     }
@@ -189,14 +198,41 @@ pub(crate) fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
 }
 
 pub(crate) fn private_file(path: &Path, create: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create_new(create)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
+    let file = if create {
+        let descriptor = current_user_descriptor(false)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let path = wide_os(path)?;
+        // SAFETY: path and security attributes are initialized for this call;
+        // a successful handle is transferred exactly once into File.
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned one newly owned file-compatible handle.
+        unsafe { File::from_raw_handle(handle.cast()) }
+    } else {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        options.open(path)?
+    };
     validate(&file, false, false)?;
     Ok(file)
 }

@@ -34,10 +34,11 @@ use windows_sys::Win32::Security::{
     TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -308,15 +309,7 @@ struct Lease(File);
 impl Lease {
     fn acquire(root: &Directory) -> io::Result<Self> {
         let path = root.path.join(LEASE);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)?;
-        validate_private(&file, false, false)?;
+        let file = open_or_create_private_file(&path)?;
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => {
                 io::Error::new(io::ErrorKind::WouldBlock, "endpoint already has an owner")
@@ -337,6 +330,43 @@ impl Lease {
         }
         Ok(())
     }
+}
+
+fn open_or_create_private_file(path: &Path) -> io::Result<File> {
+    let descriptor = SecurityDescriptor::current_user(false)?;
+    let attributes = descriptor.attributes();
+    let path_wide = wide_os(path)?;
+    // SAFETY: path and security attributes are initialized; a successful handle
+    // is transferred exactly once to File and is not inheritable.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    let file = if handle == INVALID_HANDLE_VALUE {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    } else {
+        // SAFETY: CreateFileW returned one newly owned file-compatible handle.
+        unsafe { File::from_raw_handle(handle.cast()) }
+    };
+    validate_private(&file, false, false)?;
+    drop(descriptor);
+    Ok(file)
 }
 impl Drop for Lease {
     fn drop(&mut self) {
