@@ -10,6 +10,7 @@ const allowed = new Set([
   "Unicode-3.0",
   "Unlicense",
   "LLVM-exception",
+  "Zlib",
 ]);
 
 for (const manifest of ["Cargo.toml", "fuzz/Cargo.toml"]) {

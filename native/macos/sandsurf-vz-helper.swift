@@ -17,7 +17,7 @@ private struct Request: Decodable {
     let commandLine: String?
     let disks: [Disk]?
     let memoryBytes: UInt64?
-    let vcpus: UInt?
+    let vcpus: Int?
 }
 
 private struct Response: Encodable {
@@ -100,7 +100,15 @@ private final class MachineOwner {
     func stop() throws {
         guard let machine else { return }
         if machine.canStop {
-            try awaitResult { completion in machine.stop(completionHandler: completion) }
+            try awaitResult { completion in
+                machine.stop { error in
+                    if let error {
+                        completion(.failure(error))
+                    } else {
+                        completion(.success(()))
+                    }
+                }
+            }
         }
         guard machine.state == .stopped else { throw OwnerError.unexpectedState }
         self.machine = nil
@@ -152,9 +160,13 @@ private func readExactly(_ count: Int) throws -> Data? {
     var result = Data()
     while result.count < count {
         guard let chunk = try FileHandle.standardInput.read(upToCount: count - result.count) else {
-            return result.isEmpty ? nil : { throw OwnerError.invalidFrame }()
+            if result.isEmpty { return nil }
+            throw OwnerError.invalidFrame
         }
-        if chunk.isEmpty { return result.isEmpty ? nil : { throw OwnerError.invalidFrame }() }
+        if chunk.isEmpty {
+            if result.isEmpty { return nil }
+            throw OwnerError.invalidFrame
+        }
         result.append(chunk)
     }
     return result
@@ -183,7 +195,7 @@ guard CommandLine.arguments == [CommandLine.arguments[0], "--sandsurf-owner-v1"]
     throw OwnerError.invalidInvocation
 }
 
-let owner = MachineOwner()
+private let owner = MachineOwner()
 do {
     while let request = try readRequest() {
         do {

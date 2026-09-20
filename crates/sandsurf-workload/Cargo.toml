@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cap-std = "=4.0.3"
 libc.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 sha2.workspace = true
