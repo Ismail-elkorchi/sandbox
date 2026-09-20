@@ -13,6 +13,7 @@ name = "sandbox-guest"
 path = "src/main.rs"
 
 [dependencies]
+sandsurf-native = { path = "../sandsurf-native" }
 libc.workspace = true
 sandbox-digest = { path = "../sandbox-digest" }
 serde.workspace = true

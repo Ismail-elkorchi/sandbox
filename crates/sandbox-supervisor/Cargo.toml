@@ -10,6 +10,7 @@ name = "sandbox-runtime"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+sandsurf-native = { path = "../sandsurf-native" }
 libc.workspace = true
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
 sandbox-network-broker = { path = "../sandbox-network-broker" }

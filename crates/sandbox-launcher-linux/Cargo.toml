@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sandsurf-native = { path = "../sandsurf-native" }
 libc.workspace = true
 sandbox-policy = { path = "../sandbox-policy" }
 serde.workspace = true

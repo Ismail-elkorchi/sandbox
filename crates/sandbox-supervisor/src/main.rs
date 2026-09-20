@@ -852,7 +852,7 @@ mod linux {
             .spawn()
             .map_err(|error| runtime_os("spawn.launcher", &error, "spawn"))?;
         let mut guard = LaunchGuard::new(child);
-        let launcher = sandbox_launcher_linux::open_pidfd(guard.child_mut().id())
+        let launcher = sandsurf_native::linux::open_pidfd(guard.child_mut().id())
             .map_err(|error| runtime_os("spawn.pidfd", &error, "spawn"))?;
         let launch_result = (|| -> Result<Arc<ProcessState>, ErrorData> {
             send_launch_spec(&mut supervisor_control, &bundle.spec, &bundle.files)
@@ -1520,22 +1520,7 @@ mod linux {
     }
 
     fn force_kill(running: &ProcessState) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        // SAFETY: the retained pidfd identifies only our launcher, including after
-        // exit; a recycled numeric PID can never receive this signal.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                running.launcher.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        sandsurf_native::linux::kill_process(&running.launcher)
     }
 
     fn control_write(result: io::Result<()>, code: &str) -> Result<(), ErrorData> {

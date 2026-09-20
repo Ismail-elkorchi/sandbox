@@ -342,6 +342,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sandbox-digest",
+ "sandsurf-native",
  "serde",
  "serde_json",
  "sha2",
@@ -364,6 +365,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sandbox-policy",
+ "sandsurf-native",
  "serde",
  "serde_json",
  "sha2",
@@ -453,6 +455,7 @@ dependencies = [
  "sandbox-platform-portable",
  "sandbox-policy",
  "sandbox-protocol",
+ "sandsurf-native",
  "serde",
  "serde_json",
 ]
@@ -495,6 +498,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "sandsurf-native"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

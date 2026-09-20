@@ -61,7 +61,7 @@ jobs:
           name: sandsurf-host-macos
           path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
       - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-test-runtime
@@ -85,7 +85,7 @@ jobs:
           name: sandsurf-host-windows
           path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
       - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-test-runtime

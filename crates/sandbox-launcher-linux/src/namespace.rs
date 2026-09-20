@@ -266,27 +266,7 @@ pub fn isolated_main(descriptor: Option<OsString>) -> i32 {
         }
         // SAFETY: the handoff transfers this distinct pidfd exactly once.
         let parent = unsafe { File::from_raw_fd(handoff.parent_process) };
-        // SAFETY: install the signal before checking the retained parent identity,
-        // closing the setup race where the helper died before configuring PDEATHSIG.
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut status = libc::pollfd {
-            fd: parent.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: status is one initialized writable pollfd and a zero timeout never blocks.
-        let polled = unsafe { libc::poll(&mut status, 1, 0) };
-        if polled < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if polled != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "namespace launcher exited during setup",
-            ));
-        }
+        sandsurf_native::linux::bind_to_retained_parent(&parent)?;
         drop(parent);
         validate_spec(&handoff.spec, files.len())?;
         for mount in &handoff.spec.mounts {

@@ -7,6 +7,7 @@ use sandbox_guest::{
     GUEST_SOCKS_PROXY_PORT, GUEST_SOCKS_TUNNEL_PORT, GuestArtifactEntry, GuestLimits, GuestMask,
     GuestMount, GuestPrivateDirectory, GuestRequest, GuestResponse, MAX_GUEST_FRAME,
 };
+use sandsurf_native::linux::pipe_cloexec;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -2668,16 +2669,6 @@ fn mount(
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn pipe_cloexec() -> io::Result<(File, File)> {
-    let mut fds = [0; 2];
-    // SAFETY: fds contains two writable integer slots and O_CLOEXEC is valid.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe2 returned two distinct owned descriptors, transferred once each.
-    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
 
 fn read_frame<T: for<'de> serde::Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {

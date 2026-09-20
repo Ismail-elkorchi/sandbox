@@ -4,6 +4,7 @@ exclude = ["fuzz"]
 members = [
   "crates/sandsurf-protocol",
   "crates/sandsurf-state",
+  "crates/sandsurf-native",
   "crates/sandbox-protocol",
   "crates/sandbox-digest",
   "crates/sandbox-policy",

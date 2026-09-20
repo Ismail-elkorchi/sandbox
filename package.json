@@ -18,7 +18,7 @@
     "check": "tsc -b --pretty false && tsc -p scripts/tsconfig.json --pretty false && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
     "test": "npm run build && node --test packages/sandbox/test/*.test.mjs && cargo test --workspace",
     "test:rust": "cargo test --workspace",
-    "test:sandsurf": "npm run build:ts && cargo test --locked -p sandsurf-protocol -p sandsurf-state && node --test packages/sandbox/test/sandsurf-contracts.test.mjs",
+    "test:sandsurf": "npm run build:ts && cargo test --locked -p sandsurf-protocol -p sandsurf-state -p sandsurf-native && node --test packages/sandbox/test/sandsurf-contracts.test.mjs",
     "test:ts": "node --test packages/sandbox/test/*.test.mjs",
     "verify:native": "node scripts/verify-native.ts",
     "fuzz:smoke": "cargo run -p sandbox-fuzz --release --bin sandbox-fuzz-smoke -- 25000",

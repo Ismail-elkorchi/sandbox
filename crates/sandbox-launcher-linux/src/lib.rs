@@ -6,6 +6,9 @@ mod namespace;
 pub use namespace::{NamespaceLauncher, isolated_main, namespace_probe_main};
 
 use sandbox_policy::{NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
+use sandsurf_native::linux::{
+    bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -406,17 +409,6 @@ pub fn receive_managed_listener_fds(stream: &UnixStream) -> io::Result<Vec<File>
     Ok(files)
 }
 
-/// Retain a process identity independently of numeric PID reuse.
-pub fn open_pidfd(pid: u32) -> io::Result<File> {
-    // SAFETY: pidfd_open takes scalar arguments and returns an owned process descriptor.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the successful syscall returned a new descriptor, transferred once to File.
-    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
-}
-
 /// Receive the gated target's pidfd in the host PID namespace. The target cannot
 /// execute or fork until the supervisor admits it to the requested resource scope.
 pub fn receive_target_pid(stream: &UnixStream) -> io::Result<u32> {
@@ -567,13 +559,7 @@ fn namespace_init(
     drop(exec_status_write);
     if let Some((read, mut write)) = gate {
         drop(read);
-        // SAFETY: target_pid is this process's live, gated child; pidfd_open takes scalar arguments.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target_pid, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: pidfd_open returned a new owned descriptor, transferred once to File.
-        let target = unsafe { File::from_raw_fd(fd as RawFd) };
+        let target = open_pidfd(target_pid as u32)?;
         send_fds(control.as_raw_fd(), 1, &[target])?;
         let mut admitted = [0];
         control.read_exact(&mut admitted)?;
@@ -912,29 +898,6 @@ fn supervise_process(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-}
-
-fn bind_lifetime_to_parent() -> io::Result<()> {
-    // SAFETY: getppid has no arguments or memory-safety preconditions.
-    let parent = unsafe { libc::getppid() };
-    if parent <= 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "launcher has no live supervisor parent",
-        ));
-    }
-    // SAFETY: PR_SET_PDEATHSIG takes scalar values and establishes a monotonic lifecycle restriction.
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: getppid has no arguments or memory-safety preconditions.
-    if unsafe { libc::getppid() } != parent {
-        return Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "supervisor changed while binding launcher lifetime",
-        ));
-    }
-    Ok(())
 }
 
 fn final_status(
@@ -1461,40 +1424,10 @@ const fn jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
     }
 }
 
-fn prepare_descriptors_for_exec() -> io::Result<()> {
-    // SAFETY: close_range with CLOEXEC only marks descriptors above standard I/O;
-    // the qualified Linux kernel supports it and no pointers are passed.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_close_range,
-            3_u32,
-            u32::MAX,
-            libc::CLOSE_RANGE_CLOEXEC,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn c_string_pointers(values: &[CString]) -> Vec<*const libc::c_char> {
     let mut pointers: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
     pointers.push(ptr::null());
     pointers
-}
-
-fn pipe_cloexec() -> io::Result<(File, File)> {
-    let mut fds = [0; 2];
-    // SAFETY: fds points to two writable integers and O_CLOEXEC is a valid pipe2 flag.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe2 returned two distinct owned descriptors, each transferred exactly once.
-    let read = unsafe { File::from_raw_fd(fds[0]) };
-    // SAFETY: pipe2 returned two distinct owned descriptors, each transferred exactly once.
-    let write = unsafe { File::from_raw_fd(fds[1]) };
-    Ok((read, write))
 }
 
 fn open_path(path: &Path, flags: libc::c_int) -> io::Result<File> {
