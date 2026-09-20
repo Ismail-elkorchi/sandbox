@@ -64,6 +64,48 @@ impl Digest {
     }
 }
 
+macro_rules! lowercase_hex {
+    ($name:ident, $bytes:literal, $message:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+        impl TryFrom<String> for $name {
+            type Error = Invalid;
+            fn try_from(value: String) -> Result<Self, Invalid> {
+                if value.len() != $bytes * 2
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(Invalid($message));
+                }
+                Ok(Self(value))
+            }
+        }
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+lowercase_hex!(
+    AuthorityPublicKey,
+    32,
+    "authority public key must be 32-byte lowercase hex"
+);
+lowercase_hex!(
+    AuthoritySignature,
+    64,
+    "authority signature must be 64-byte lowercase hex"
+);
+
 /// The wire representation is exactly representable by both JavaScript and SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "u64", into = "u64")]
@@ -223,6 +265,59 @@ pub struct Mutation {
     pub grant_id: GrantId,
     pub expected_revision: Counter,
     pub request_digest: Digest,
+}
+
+/// The guardian pins this host identity and verification key. It is not a grant set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityBinding {
+    pub host_id: HostId,
+    pub key_id: Digest,
+    pub public_key: AuthorityPublicKey,
+}
+
+/// Exact, immutable authority for one mutation. Only the host service sends this
+/// over its private guardian channel; applications retain operation/grant IDs and
+/// expected revisions, never this envelope as independently exercisable authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedMutationStatement {
+    pub version: u16,
+    pub host_id: HostId,
+    pub key_id: Digest,
+    pub mutation: Mutation,
+    pub capability: Capability,
+    pub scope_digest: Digest,
+    pub grant_revision: Counter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedMutation {
+    pub statement: AuthorizedMutationStatement,
+    pub signature: AuthoritySignature,
+}
+
+/// Host authorization for loss of one complete receipt-bound output scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedLossStatement {
+    pub version: u16,
+    pub host_id: HostId,
+    pub key_id: Digest,
+    pub sandbox_id: SandboxId,
+    pub process_id: ProcessId,
+    pub receipt_digest: Digest,
+    pub output: OutputBoundary,
+    pub approval_id: CommitmentId,
+    pub request_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedLoss {
+    pub statement: AuthorizedLossStatement,
+    pub signature: AuthoritySignature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

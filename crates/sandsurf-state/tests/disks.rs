@@ -23,6 +23,21 @@ fn limits() -> RuntimeLimits {
         disk_headroom_bytes: n(1024 * 1024),
     }
 }
+fn authority() -> AuthorityBinding {
+    let bytes = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+    AuthorityBinding {
+        host_id: "disk-test-host".try_into().unwrap(),
+        key_id: bytes_digest(&bytes),
+        public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+            .to_owned()
+            .try_into()
+            .unwrap(),
+    }
+}
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {
@@ -50,8 +65,13 @@ impl Root {
         file
     }
     fn runtime(&self) -> RuntimeJournal {
-        RuntimeJournal::create(&self.0.join("runtime"), "box".try_into().unwrap(), limits())
-            .unwrap()
+        RuntimeJournal::create(
+            &self.0.join("runtime"),
+            "box".try_into().unwrap(),
+            limits(),
+            authority(),
+        )
+        .unwrap()
     }
 }
 impl Drop for Root {
@@ -268,9 +288,13 @@ fn identity_conflicts_and_impossible_headroom_do_not_publish_or_evict() {
     let source = root.source("base", &bytes);
     let mut bounded = limits();
     bounded.disk_headroom_bytes = n(Counter::MAX);
-    let mut runtime =
-        RuntimeJournal::create(&root.0.join("runtime"), "box".try_into().unwrap(), bounded)
-            .unwrap();
+    let mut runtime = RuntimeJournal::create(
+        &root.0.join("runtime"),
+        "box".try_into().unwrap(),
+        bounded,
+        authority(),
+    )
+    .unwrap();
     let record = runtime
         .prepare_disk_copy(request("reserved", &bytes))
         .unwrap();
@@ -308,8 +332,13 @@ fn abrupt_disk_writer_child() {
     let stage = std::env::var("SANDSURF_DISK_CRASH_STAGE").unwrap();
     let bytes = vec![7; 65536];
     let source = File::open(path.join("base")).unwrap();
-    let mut runtime =
-        RuntimeJournal::create(&path.join("runtime"), "box".try_into().unwrap(), limits()).unwrap();
+    let mut runtime = RuntimeJournal::create(
+        &path.join("runtime"),
+        "box".try_into().unwrap(),
+        limits(),
+        authority(),
+    )
+    .unwrap();
     let record = runtime.prepare_disk_copy(request("crash", &bytes)).unwrap();
     if stage == "intent" {
         std::process::exit(61);

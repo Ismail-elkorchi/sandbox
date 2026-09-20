@@ -125,9 +125,13 @@ impl Fixture {
             },
         )
         .unwrap();
-        let mut runtime =
-            RuntimeJournal::create(&root.0.join("runtime"), sandbox.clone(), runtime_limits())
-                .unwrap();
+        let mut runtime = RuntimeJournal::create(
+            &root.0.join("runtime"),
+            sandbox.clone(),
+            runtime_limits(),
+            host.authority_binding().clone(),
+        )
+        .unwrap();
         runtime
             .observe(MachineObservation {
                 sandbox_id: sandbox.clone(),
@@ -309,6 +313,46 @@ fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
             ..
         })
     ));
+}
+
+#[test]
+fn host_signed_authority_survives_api_restart_and_rejects_tampering() {
+    let mut f = Fixture::new();
+    let mut mutation = f.mutation.clone();
+    mutation.operation_id = "signed-across-restart".try_into().unwrap();
+    let authorized = f
+        .host
+        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+
+    let mut changed_scope = authorized.clone();
+    changed_scope.statement.scope_digest = hash("broader-scope");
+    assert!(f.runtime.admit(changed_scope).is_err());
+
+    let mut changed_signature = authorized.clone();
+    changed_signature.signature = "0".repeat(128).try_into().unwrap();
+    assert!(f.runtime.admit(changed_signature).is_err());
+
+    let host_path = f.root.0.join("host");
+    let binding = f.host.authority_binding().clone();
+    drop(f.host);
+    assert_eq!(f.runtime.authority_binding(), &binding);
+    assert_eq!(
+        f.runtime.admit(authorized).unwrap().delivery,
+        Delivery::Admitted
+    );
+
+    let host = HostCatalog::open(&host_path).unwrap();
+    assert_eq!(host.authority_binding(), &binding);
+    let mut after_restart = mutation;
+    after_restart.operation_id = "signed-after-restart".try_into().unwrap();
+    let authorized = host
+        .authorize(after_restart, Capability::Spawn, &hash("workload"))
+        .unwrap();
+    assert_eq!(
+        f.runtime.admit(authorized).unwrap().delivery,
+        Delivery::Admitted
+    );
 }
 
 #[test]
@@ -851,6 +895,9 @@ fn explicit_loss_is_exactly_scoped_and_recorded() {
             approval,
         )
         .unwrap();
+    let mut incomplete = authorized.clone();
+    incomplete.statement.output.final_cursor = n(1);
+    assert!(f.runtime.record_loss_authorization(incomplete).is_err());
     f.runtime.record_loss_authorization(authorized).unwrap();
     request.disposition = ReleaseDisposition::AuthorizedLoss { authorization };
     let status = f.runtime.release(&f.process, request.clone()).unwrap();

@@ -6,11 +6,13 @@
 //! records facts supplied by its trusted guardian. Opening a journal establishes
 //! storage-writer exclusion, not live VM ownership, confinement, or guest identity.
 //! The VM owner must establish those boundaries before publishing observations.
-//! Borrowed authorization proofs are in-process admission guards, not an RPC
-//! authentication protocol. External capture commitments are trusted consumer
+//! Host-signed exact-operation envelopes cross the private host/guardian boundary;
+//! they are not a guardian-owned grant database or application capability.
+//! External capture commitments are trusted consumer
 //! assertions; pins retain bytes in this store. Native Windows private-state
 //! provisioning is deliberately refused until its ACL/handle implementation exists.
 
+mod authority;
 mod catalog;
 mod database;
 mod disks;

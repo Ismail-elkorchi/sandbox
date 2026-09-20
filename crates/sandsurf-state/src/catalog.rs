@@ -1,11 +1,11 @@
-use crate::{Error, Result, database::Database, decode, encode};
+use crate::{Error, Result, authority::HostAuthority, database::Database, decode, encode};
 use rusqlite::{OptionalExtension, params};
 use sandsurf_protocol::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const SCHEMA: &str = "
-CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL, limits TEXT NOT NULL) STRICT;
+CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
 CREATE TABLE sandboxes(id TEXT PRIMARY KEY, image TEXT NOT NULL, resources TEXT NOT NULL, revision INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE intents(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE grants(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
@@ -40,28 +40,11 @@ pub struct GrantChange {
     pub revoked: bool,
 }
 
-/// A short-lived admission proof. It cannot be deserialized from application caches.
-pub struct Authorization<'host> {
-    pub(crate) mutation: Mutation,
-    pub(crate) capability: Capability,
-    // This borrow prevents host grants changing before the proof is consumed.
-    _host: &'host HostCatalog,
-}
-
-/// Host-committed loss decision, borrowed until the guardian records its delivery.
-pub struct LossAuthorization<'host> {
-    pub(crate) sandbox: SandboxId,
-    pub(crate) process: ProcessId,
-    pub(crate) receipt: Digest,
-    pub(crate) output: OutputBoundary,
-    pub(crate) approval: Approval,
-    _host: &'host HostCatalog,
-}
-
 pub struct HostCatalog {
     db: Database,
     host: HostId,
     limits: CatalogLimits,
+    authority: HostAuthority,
 }
 
 impl HostCatalog {
@@ -78,27 +61,49 @@ impl HostCatalog {
             return Err(Error::Capacity("catalog limits must be positive"));
         }
         let db = Database::create(path, "host", SCHEMA)?;
+        let authority = HostAuthority::create(&db.root, host.clone())?;
         db.connection.execute(
-            "INSERT INTO configuration VALUES (1, ?1, ?2)",
-            params![host.as_str(), encode(&limits)?],
-        )?;
-        Ok(Self { db, host, limits })
-    }
-    pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::open(path, "host")?;
-        let (host, limits): (String, String) = db.connection.query_row(
-            "SELECT host, limits FROM configuration WHERE id=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            "INSERT INTO configuration VALUES (1, ?1, ?2, ?3)",
+            params![
+                host.as_str(),
+                encode(&limits)?,
+                encode(authority.binding())?
+            ],
         )?;
         Ok(Self {
             db,
-            host: host.try_into()?,
+            host,
+            limits,
+            authority,
+        })
+    }
+    pub fn open(path: &Path) -> Result<Self> {
+        let db = Database::open(path, "host")?;
+        let (host, limits, binding): (String, String, String) = db.connection.query_row(
+            "SELECT host, limits, authority FROM configuration WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let host: HostId = host.try_into()?;
+        let binding: AuthorityBinding = decode(&binding)?;
+        if binding.host_id != host {
+            return Err(Error::Corrupt(
+                "authority binding has the wrong host identity",
+            ));
+        }
+        let authority = HostAuthority::open(&db.root, &binding)?;
+        Ok(Self {
+            db,
+            host,
             limits: decode(&limits)?,
+            authority,
         })
     }
     pub fn host_id(&self) -> &HostId {
         &self.host
+    }
+    pub fn authority_binding(&self) -> &AuthorityBinding {
+        self.authority.binding()
     }
 
     pub fn create_sandbox(
@@ -323,7 +328,7 @@ impl HostCatalog {
         mutation: Mutation,
         capability: Capability,
         scope: &Digest,
-    ) -> Result<Authorization<'_>> {
+    ) -> Result<AuthorizedMutation> {
         require_revision(
             &self.db.connection,
             &mutation.sandbox_id,
@@ -351,11 +356,8 @@ impl HostCatalog {
                 "host grant does not authorize this operation",
             ));
         }
-        Ok(Authorization {
-            mutation,
-            capability,
-            _host: self,
-        })
+        self.authority
+            .authorize_mutation(mutation, capability, scope.clone(), grant.revision)
     }
 
     pub fn authorize_output_loss(
@@ -365,7 +367,7 @@ impl HostCatalog {
         receipt: &Digest,
         output: &OutputBoundary,
         approval: Approval,
-    ) -> Result<LossAuthorization<'_>> {
+    ) -> Result<AuthorizedLoss> {
         let binding = digest(
             Domain::Release,
             &(sandbox, process, receipt, output, "loss"),
@@ -401,14 +403,14 @@ impl HostCatalog {
             record_approval(&tx, &approval, self.limits.operations)?;
         }
         tx.commit()?;
-        Ok(LossAuthorization {
-            sandbox: sandbox.clone(),
-            process: process.clone(),
-            receipt: receipt.clone(),
-            output: output.clone(),
-            approval,
-            _host: self,
-        })
+        self.authority.authorize_loss(
+            sandbox.clone(),
+            process.clone(),
+            receipt.clone(),
+            output.clone(),
+            approval.id,
+            approval.request_digest,
+        )
     }
 
     /// Usage IDs survive rollback. Repeated delivery cannot double-charge.

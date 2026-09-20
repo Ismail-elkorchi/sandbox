@@ -1,5 +1,6 @@
 use crate::{
-    Authorization, Error, Result,
+    Error, Result,
+    authority::AuthorityVerifier,
     catalog::capacity,
     database::{Database, private_file, sync_directory, sync_file},
     decode, encode,
@@ -12,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const SCHEMA: &str = "
-CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT NULL, limits TEXT NOT NULL) STRICT;
+CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
@@ -65,28 +66,37 @@ pub struct RuntimeJournal {
     pub(crate) db: Database,
     pub(crate) sandbox: SandboxId,
     pub(crate) limits: RuntimeLimits,
+    authority: AuthorityVerifier,
 }
 
 /// A successful ledger write is not a reusable native-effect permission.
-pub enum DispatchDecision<'guardian, 'host> {
-    Perform(DispatchPermit<'guardian, 'host>),
+pub enum DispatchDecision<'guardian> {
+    Perform(DispatchPermit<'guardian>),
     Reconcile(Operation),
 }
 
-/// One in-process dispatch, holding both owners stable through the native effect.
-/// This is not serializable and must not be used as an inter-service capability.
-pub struct DispatchPermit<'guardian, 'host> {
-    authority: Authorization<'host>,
+/// One dispatch from a verified host envelope. The envelope is exact-operation,
+/// one-way service traffic, not an application-held capability or grant cache.
+pub struct DispatchPermit<'guardian> {
+    authority: AuthorizedMutation,
     _guardian: &'guardian mut RuntimeJournal,
 }
-impl DispatchPermit<'_, '_> {
+impl DispatchPermit<'_> {
     pub fn perform<T>(self, effect: impl FnOnce(&Mutation, &Capability) -> T) -> T {
-        effect(&self.authority.mutation, &self.authority.capability)
+        effect(
+            &self.authority.statement.mutation,
+            &self.authority.statement.capability,
+        )
     }
 }
 
 impl RuntimeJournal {
-    pub fn create(path: &Path, sandbox: SandboxId, limits: RuntimeLimits) -> Result<Self> {
+    pub fn create(
+        path: &Path,
+        sandbox: SandboxId,
+        limits: RuntimeLimits,
+        binding: AuthorityBinding,
+    ) -> Result<Self> {
         if [
             limits.identities,
             limits.operations,
@@ -101,23 +111,29 @@ impl RuntimeJournal {
         {
             return Err(Error::Capacity("runtime limits must be positive"));
         }
+        let authority = AuthorityVerifier::new(binding)?;
         let db = Database::create(path, "guardian", SCHEMA)?;
         db.connection.execute(
-            "INSERT INTO configuration VALUES (1,?1,?2)",
-            params![sandbox.as_str(), encode(&limits)?],
+            "INSERT INTO configuration VALUES (1,?1,?2,?3)",
+            params![
+                sandbox.as_str(),
+                encode(&limits)?,
+                encode(authority.binding())?
+            ],
         )?;
         Ok(Self {
             db,
             sandbox,
             limits,
+            authority,
         })
     }
     pub fn open(path: &Path, sandbox: &SandboxId) -> Result<Self> {
         let db = Database::open(path, "guardian")?;
-        let (identity, limits): (String, String) = db.connection.query_row(
-            "SELECT sandbox,limits FROM configuration WHERE id=1",
+        let (identity, limits, binding): (String, String, String) = db.connection.query_row(
+            "SELECT sandbox,limits,authority FROM configuration WHERE id=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         if identity != sandbox.as_str() {
             return Err(Error::Conflict("guardian sandbox identity mismatch"));
@@ -126,7 +142,11 @@ impl RuntimeJournal {
             db,
             sandbox: sandbox.clone(),
             limits: decode(&limits)?,
+            authority: AuthorityVerifier::new(decode(&binding)?)?,
         })
+    }
+    pub fn authority_binding(&self) -> &AuthorityBinding {
+        self.authority.binding()
     }
     pub fn last_observation(&self) -> Result<Option<CommittedObservation>> {
         Ok(observation(&self.db.connection)?.map(CommittedObservation))
@@ -202,11 +222,13 @@ impl RuntimeJournal {
         operation(&self.db.connection, id)
     }
 
-    pub fn admit(&mut self, authorization: Authorization<'_>) -> Result<Operation> {
-        let request = authorization.mutation;
+    pub fn admit(&mut self, authorization: AuthorizedMutation) -> Result<Operation> {
+        self.authority.verify_mutation(&authorization)?;
+        let statement = authorization.statement;
+        let request = statement.mutation;
         let tx = self.db.connection.transaction()?;
         if let Some(old) = operation(&tx, &request.operation_id)? {
-            if old.request == request && old.capability == authorization.capability {
+            if old.request == request && old.capability == statement.capability {
                 return Ok(old);
             }
             return Err(Error::Conflict("runtime operation identity already bound"));
@@ -235,7 +257,7 @@ impl RuntimeJournal {
         capacity(&tx, "operations", self.limits.operations)?;
         let value = Operation {
             request,
-            capability: authorization.capability,
+            capability: statement.capability,
             delivery: Delivery::Admitted,
             evidence_digest: None,
         };
@@ -249,15 +271,16 @@ impl RuntimeJournal {
 
     /// Recheck current host authority and guardian state, then durably gate one effect.
     /// A crash after this commit requires reconciliation even if no effect took place.
-    pub fn begin_dispatch<'guardian, 'host>(
+    pub fn begin_dispatch<'guardian>(
         &'guardian mut self,
-        authorization: Authorization<'host>,
-    ) -> Result<DispatchDecision<'guardian, 'host>> {
+        authorization: AuthorizedMutation,
+    ) -> Result<DispatchDecision<'guardian>> {
+        self.authority.verify_mutation(&authorization)?;
         let tx = self.db.connection.transaction()?;
-        let request = &authorization.mutation;
+        let request = &authorization.statement.mutation;
         let mut value = operation(&tx, &request.operation_id)?
             .ok_or(Error::Missing("dispatch operation is not admitted"))?;
-        if value.request != *request || value.capability != authorization.capability {
+        if value.request != *request || value.capability != authorization.statement.capability {
             return Err(Error::Conflict("dispatch identity or authority mismatch"));
         }
         if value.delivery != Delivery::Admitted {
@@ -782,21 +805,19 @@ impl RuntimeJournal {
     }
 
     /// Records delivery of a host-owned decision; the guardian cannot mint loss authority.
-    pub fn record_loss_authorization(
-        &mut self,
-        authorized: crate::LossAuthorization<'_>,
-    ) -> Result<()> {
-        let id = &authorized.process;
-        let expected = &authorized.receipt;
-        let approval = &authorized.approval;
+    pub fn record_loss_authorization(&mut self, authorized: AuthorizedLoss) -> Result<()> {
+        self.authority.verify_loss(&authorized)?;
+        let statement = authorized.statement;
+        let id = &statement.process_id;
+        let expected = &statement.receipt_digest;
         let receipt = require_receipt(&self.db.connection, id, expected)?;
         let binding = digest(
             Domain::Release,
             &(&self.sandbox, id, expected, &receipt.output, "loss"),
         )?;
-        if authorized.sandbox != self.sandbox
-            || authorized.output != receipt.output
-            || approval.request_digest != binding
+        if statement.sandbox_id != self.sandbox
+            || statement.output != receipt.output
+            || statement.request_digest != binding
         {
             return Err(Error::Conflict(
                 "loss approval must bind complete deletion scope",
@@ -806,7 +827,7 @@ impl RuntimeJournal {
         if let Some(old) = tx
             .query_row(
                 "SELECT approval_digest FROM loss_authorizations WHERE id=?1",
-                [approval.id.as_str()],
+                [statement.approval_id.as_str()],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
@@ -821,7 +842,7 @@ impl RuntimeJournal {
         tx.execute(
             "INSERT INTO loss_authorizations VALUES (?1,?2,?3,?4)",
             params![
-                approval.id.as_str(),
+                statement.approval_id.as_str(),
                 id.as_str(),
                 expected.as_str(),
                 binding.as_str()

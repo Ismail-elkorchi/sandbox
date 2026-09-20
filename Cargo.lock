@@ -522,6 +522,8 @@ dependencies = [
 name = "sandsurf-state"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "getrandom",
  "libc",
  "rusqlite",
  "sandsurf-native",
@@ -529,6 +531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

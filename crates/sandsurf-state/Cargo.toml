@@ -12,6 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 sha2.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 sandsurf-native = { path = "../sandsurf-native" }
