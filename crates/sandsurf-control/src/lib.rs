@@ -156,6 +156,14 @@ impl<E: GuardianEffect> Guardian<E> {
         }
     }
 
+    /// Pull guest-owned process/output progress into the guardian journal even
+    /// when no host request is arriving.  The guest replay spool remains the
+    /// source until each byte and its terminal evidence have committed here.
+    pub fn reconcile(&mut self) -> Result<()> {
+        self.effect.reconcile(&mut self.journal)?;
+        Ok(())
+    }
+
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
         self.effect.reconcile(&mut self.journal)?;
         match request {
@@ -530,7 +538,10 @@ pub fn serve_guardian<E: GuardianEffect>(
     loop {
         let mut connection = match listener.accept(Duration::from_secs(1)) {
             Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                guardian.reconcile()?;
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
         let frame = match connection.read_frame(REQUEST_TIMEOUT) {
@@ -568,6 +579,7 @@ fn request_frame(request: &GuardianRequest) -> Result<Frame> {
         kind: FrameKind::Control,
         stream: 0,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload,
     })
 }
@@ -582,6 +594,7 @@ fn response_frame(sequence: Counter, response: &GuardianResponse) -> Result<Fram
         kind: FrameKind::Control,
         stream: 0,
         sequence,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload,
     })
 }

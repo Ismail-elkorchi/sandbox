@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use sandsurf_native::local::{LocalConnection, LocalListener, create_private_directory};
-use sandsurf_protocol::{Counter, Frame, FrameKind};
+use sandsurf_protocol::{AUTHENTICATION_BYTES, Counter, Frame, FrameKind};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -47,6 +47,7 @@ fn frame() -> Frame {
         kind: FrameKind::Data,
         stream: 7,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: vec![0, 255, 0, 10, 128],
     }
 }

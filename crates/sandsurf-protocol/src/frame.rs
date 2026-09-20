@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"SSF1";
-pub const VERSION: u16 = 1;
-pub const HEADER_BYTES: usize = 24;
+pub const VERSION: u16 = 2;
+pub const HEADER_BYTES: usize = 56;
+pub const AUTHENTICATION_BYTES: usize = 32;
 pub const MAX_CONTROL_BYTES: usize = 256 * 1024;
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
 pub const MAX_STREAMS: usize = 256;
@@ -24,6 +25,9 @@ pub struct Frame {
     pub kind: FrameKind,
     pub stream: u32,
     pub sequence: Counter,
+    /// Zero only on a separately authenticated private host transport or during
+    /// the guest handshake. Guest session traffic carries an HMAC here.
+    pub authentication: [u8; AUTHENTICATION_BYTES],
     pub payload: Vec<u8>,
 }
 
@@ -64,12 +68,14 @@ impl Frame {
         let length = u32::from_be_bytes(header[20..24].try_into().expect("fixed header")) as usize;
         validate(kind, stream, length)?;
         // Every allocation is preceded by kind-specific length validation.
+        let authentication = header[24..56].try_into().expect("fixed header");
         let mut payload = vec![0; length];
         reader.read_exact(&mut payload)?;
         Ok(Some(Self {
             kind,
             stream,
             sequence,
+            authentication,
             payload,
         }))
     }
@@ -83,6 +89,7 @@ impl Frame {
         header[8..12].copy_from_slice(&self.stream.to_be_bytes());
         header[12..20].copy_from_slice(&self.sequence.get().to_be_bytes());
         header[20..24].copy_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        header[24..56].copy_from_slice(&self.authentication);
         writer.write_all(&header)?;
         writer.write_all(&self.payload)
     }

@@ -10,3 +10,6 @@ sandbox-digest = { path = "../sandbox-digest" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true

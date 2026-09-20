@@ -104,6 +104,7 @@ fn fragmented_binary_frames_roundtrip_and_reject_all_truncations() {
         kind: FrameKind::Data,
         stream: 19,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: vec![0, 255, 128, 10, 13, 0],
     };
     let mut encoded = Vec::new();
@@ -128,6 +129,7 @@ fn reject_oversize_headers_without_reading_payload() {
         kind: FrameKind::Control,
         stream: 0,
         sequence: Counter::ZERO,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: Vec::new(),
     };
     let mut encoded = Vec::new();
@@ -135,7 +137,7 @@ fn reject_oversize_headers_without_reading_payload() {
     encoded[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
     let error = Frame::read(&mut &encoded[..]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    for (offset, value) in [(0, b'X'), (5, 2), (6, 255), (7, 1), (11, 1)] {
+    for (offset, value) in [(0, b'X'), (5, 3), (6, 255), (7, 1), (11, 1)] {
         let mut invalid = Vec::new();
         frame.write(&mut invalid).unwrap();
         invalid[offset] = value;
@@ -164,6 +166,7 @@ fn frame_kind_bounds_and_credit_are_independent() {
         kind: FrameKind::Control,
         stream: 0,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: b"terminate".to_vec(),
     }
     .write(&mut wire)
@@ -181,6 +184,7 @@ fn frame_kind_bounds_and_credit_are_independent() {
                 kind,
                 stream,
                 sequence: Counter::ZERO,
+                authentication: [0; AUTHENTICATION_BYTES],
                 payload
             }
             .write(&mut Vec::new())

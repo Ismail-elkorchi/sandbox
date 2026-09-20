@@ -1,10 +1,12 @@
 #![deny(unsafe_code)]
 
 mod frame;
+mod session;
 mod types;
 
 pub use frame::*;
 pub use sandbox_digest::SandsurfDomain as Domain;
+pub use session::*;
 pub use types::*;
 
 use serde::Serialize;

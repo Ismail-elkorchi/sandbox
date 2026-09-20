@@ -2,7 +2,8 @@
 
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_protocol::{
-    Counter, Frame, FrameKind, HEADER_BYTES, MAX_CONTROL_BYTES, MAX_STREAM_BYTES,
+    AUTHENTICATION_BYTES, Counter, Frame, FrameKind, HEADER_BYTES, MAX_CONTROL_BYTES,
+    MAX_STREAM_BYTES,
 };
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -56,6 +57,7 @@ fn frame() -> Frame {
         kind: FrameKind::Data,
         stream: 7,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: vec![0, 255, 0, 10, 128],
     }
 }
@@ -310,6 +312,7 @@ fn oversized_and_truncated_headers_poison_the_connection_before_payload_read() {
         kind: FrameKind::Control,
         stream: 0,
         sequence: Counter::ONE,
+        authentication: [0; AUTHENTICATION_BYTES],
         payload: vec![],
     }
     .write(&mut header)

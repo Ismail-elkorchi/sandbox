@@ -347,6 +347,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
                 kind: FrameKind::Control,
                 stream: 0,
                 sequence: Counter::ONE,
+                authentication: [0; AUTHENTICATION_BYTES],
                 payload,
             },
             Duration::from_secs(2),

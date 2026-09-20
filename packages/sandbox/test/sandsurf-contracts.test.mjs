@@ -64,7 +64,7 @@ test("release dispositions require a full boundary and explicit evidence fields"
 
 test("binary frame interoperability includes fragmentary input, EOF and zero-length end", () => {
   for (const kind of ["data", "control", "credit", "end"]) {
-    const frame = { kind, stream: kind === "control" ? 0 : 23, sequence: Number.MAX_SAFE_INTEGER, payload: kind === "end" ? Buffer.alloc(0) : kind === "credit" ? Buffer.alloc(8) : Buffer.from([0, 255, 128, 10]) };
+    const frame = { kind, stream: kind === "control" ? 0 : 23, sequence: Number.MAX_SAFE_INTEGER, authentication: Buffer.alloc(32), payload: kind === "end" ? Buffer.alloc(0) : kind === "credit" ? Buffer.alloc(8) : Buffer.from([0, 255, 128, 10]) };
     const bytes = encodeSandsurfFrame(frame);
     const nativeResult = native("frame", bytes);
     assert.equal(nativeResult.status, 0, nativeResult.stderr.toString());
@@ -82,7 +82,7 @@ test("binary frame interoperability includes fragmentary input, EOF and zero-len
 });
 
 test("decoder rejects oversized allocation and remains failed", () => {
-  const bytes = encodeSandsurfFrame({ kind: "control", stream: 0, sequence: 1, payload: Buffer.alloc(0) });
+  const bytes = encodeSandsurfFrame({ kind: "control", stream: 0, sequence: 1, authentication: Buffer.alloc(32), payload: Buffer.alloc(0) });
   bytes.writeUInt32BE(0xffff_ffff, 20);
   const decoder = new SandsurfFrameDecoder();
   assert.throws(() => [...decoder.push(bytes)]);

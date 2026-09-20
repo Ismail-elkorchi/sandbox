@@ -1,7 +1,8 @@
 // Internal Sandsurf wire contract. This does not adapt the prepared-process runtime.
 import { createHash } from "node:crypto";
 
-export const SANDSURF_HEADER_BYTES = 24;
+export const SANDSURF_HEADER_BYTES = 56;
+export const SANDSURF_AUTHENTICATION_BYTES = 32;
 export const SANDSURF_MAX_CONTROL_BYTES = 256 * 1024;
 export const SANDSURF_MAX_STREAM_BYTES = 64 * 1024;
 const MAGIC = Buffer.from("SSF1");
@@ -14,6 +15,7 @@ export interface SandsurfFrame {
   readonly kind: SandsurfFrameKind;
   readonly stream: number;
   readonly sequence: number;
+  readonly authentication: Uint8Array;
   readonly payload: Uint8Array;
 }
 
@@ -212,10 +214,12 @@ function validateFrame(kind: SandsurfFrameKind, stream: number, sequence: number
 
 export function encodeSandsurfFrame(frame: SandsurfFrame): Buffer {
   validateFrame(frame.kind, frame.stream, frame.sequence, frame.payload.byteLength);
+  if (frame.authentication.byteLength !== SANDSURF_AUTHENTICATION_BYTES) throw new Error("invalid Sandsurf frame authentication");
   const header = Buffer.alloc(SANDSURF_HEADER_BYTES);
-  MAGIC.copy(header); header.writeUInt16BE(1, 4); header[6] = kinds.indexOf(frame.kind) + 1;
+  MAGIC.copy(header); header.writeUInt16BE(2, 4); header[6] = kinds.indexOf(frame.kind) + 1;
   header.writeUInt32BE(frame.stream, 8); header.writeBigUInt64BE(BigInt(frame.sequence), 12);
   header.writeUInt32BE(frame.payload.byteLength, 20);
+  header.set(frame.authentication, 24);
   return Buffer.concat([header, frame.payload]);
 }
 
@@ -228,6 +232,7 @@ export class SandsurfFrameDecoder {
   #kind: SandsurfFrameKind = "control";
   #stream = 0;
   #sequence = 0;
+  #authentication = Buffer.alloc(SANDSURF_AUTHENTICATION_BYTES);
   #failed = false;
 
   *push(bytes: Uint8Array): Generator<SandsurfFrame> {
@@ -240,7 +245,7 @@ export class SandsurfFrameDecoder {
           this.#header.set(bytes.subarray(offset, offset + count), this.#headerUsed);
           this.#headerUsed += count; offset += count;
           if (this.#headerUsed < SANDSURF_HEADER_BYTES) continue;
-          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== 1 || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
+          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== 2 || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
           const kind = kinds[(this.#header[6] ?? 0) - 1];
           if (kind === undefined) throw new Error("unknown Sandsurf frame kind");
           const stream = this.#header.readUInt32BE(8);
@@ -248,6 +253,7 @@ export class SandsurfFrameDecoder {
           const length = this.#header.readUInt32BE(20);
           validateFrame(kind, stream, sequence, length);
           this.#kind = kind; this.#stream = stream; this.#sequence = sequence;
+          this.#authentication = Buffer.from(this.#header.subarray(24, 56));
           this.#payload = Buffer.alloc(length); // Header bounds checked before allocation.
           this.#payloadUsed = 0;
         }
@@ -255,7 +261,7 @@ export class SandsurfFrameDecoder {
         this.#payload.set(bytes.subarray(offset, offset + count), this.#payloadUsed);
         this.#payloadUsed += count; offset += count;
         if (this.#payloadUsed !== this.#payload.length) continue;
-        const frame = { kind: this.#kind, stream: this.#stream, sequence: this.#sequence, payload: this.#payload };
+        const frame = { kind: this.#kind, stream: this.#stream, sequence: this.#sequence, authentication: this.#authentication, payload: this.#payload };
         this.#headerUsed = 0; this.#payload = undefined; this.#payloadUsed = 0;
         yield frame;
       }
