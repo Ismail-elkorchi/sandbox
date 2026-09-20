@@ -19,6 +19,38 @@ export interface SandsurfFrame {
   readonly payload: Uint8Array;
 }
 
+export type SandsurfGuestPath = readonly number[];
+
+export function createSandsurfGuestPath(value: string | Uint8Array): SandsurfGuestPath {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+  const result = [...bytes];
+  validateSandsurfGuestPath(result);
+  return result;
+}
+
+export function validateSandsurfGuestPath(value: unknown): asserts value is SandsurfGuestPath {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4096
+    || value.some((byte) => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)
+    || value[0] !== 0x2f || value.includes(0) || (value.length > 1 && value.at(-1) === 0x2f)) {
+    throw new Error("invalid Sandsurf guest path bytes");
+  }
+  const components: number[][] = [[]];
+  for (const byte of value.slice(1)) {
+    if (byte === 0x2f) components.push([]); else components.at(-1)?.push(byte);
+  }
+  if (value.length > 1 && components.some((part) => part.length === 0
+    || (part.length === 1 && part[0] === 0x2e)
+    || (part.length === 2 && part[0] === 0x2e && part[1] === 0x2e))) {
+    throw new Error("Sandsurf guest path is not normalized");
+  }
+}
+
+export function sandsurfGuestPathUtf8(value: SandsurfGuestPath): string | undefined {
+  validateSandsurfGuestPath(value);
+  try { return new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(value)); }
+  catch { return undefined; }
+}
+
 export interface SandsurfMutation {
   readonly sandboxId: string;
   readonly epoch: number;

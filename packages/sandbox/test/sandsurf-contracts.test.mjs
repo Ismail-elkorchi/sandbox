@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { before, test } from "node:test";
-import { createSandsurfMutation, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, validateSandsurfMutation, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
+import { createSandsurfGuestPath, createSandsurfMutation, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfMutation, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = resolve(root, `target/debug/examples/contract_fixture${process.platform === "win32" ? ".exe" : ""}`);
@@ -59,6 +59,19 @@ test("release dispositions require a full boundary and explicit evidence fields"
   for (const value of [{ receiptDigest }, { receiptDigest, output, disposition: { kind: "acknowledged" } }, { receiptDigest, output, disposition: { kind: "complete-capture", reference: "some-url" } }]) {
     assert.throws(() => validateSandsurfRelease(value));
     assert.notEqual(native("release", JSON.stringify(value)).status, 0);
+  }
+});
+
+test("guest paths preserve bytes across Rust and TypeScript", () => {
+  const path = createSandsurfGuestPath(Buffer.from([0x2f, 0x77, 0x2f, 0xff]));
+  validateSandsurfGuestPath(path);
+  assert.equal(sandsurfGuestPathUtf8(path), undefined);
+  const accepted = native("path", JSON.stringify(path));
+  assert.equal(accepted.status, 0, accepted.stderr.toString());
+  assert.deepEqual(JSON.parse(accepted.stdout), path);
+  for (const invalid of [[], [...Buffer.from("relative")], [...Buffer.from("/a/../b")], [0x2f, 0]]) {
+    assert.throws(() => validateSandsurfGuestPath(invalid));
+    assert.notEqual(native("path", JSON.stringify(invalid)).status, 0);
   }
 });
 

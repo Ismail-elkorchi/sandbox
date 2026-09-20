@@ -8,6 +8,7 @@
 
 #[cfg(target_os = "linux")]
 mod driver;
+#[cfg(target_os = "linux")]
 mod filesystem;
 #[cfg(target_os = "linux")]
 mod process;
@@ -15,6 +16,7 @@ mod spool;
 
 #[cfg(target_os = "linux")]
 pub use driver::*;
+#[cfg(target_os = "linux")]
 pub use filesystem::*;
 #[cfg(target_os = "linux")]
 pub use process::*;

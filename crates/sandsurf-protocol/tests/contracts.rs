@@ -21,6 +21,28 @@ fn identifiers_and_counters_are_strict() {
 }
 
 #[test]
+fn guest_paths_preserve_non_utf8_bytes_and_reject_aliases() {
+    let path = GuestPath::try_from(vec![b'/', b'w', b'/', 0xff]).unwrap();
+    assert_eq!(path.as_bytes(), &[b'/', b'w', b'/', 0xff]);
+    assert_eq!(path.to_utf8(), None);
+    assert_eq!(
+        serde_json::from_str::<GuestPath>(&serde_json::to_string(&path).unwrap()).unwrap(),
+        path
+    );
+    for invalid in [
+        Vec::new(),
+        b"relative".to_vec(),
+        b"/trailing/".to_vec(),
+        b"/duplicate//name".to_vec(),
+        b"/dot/./name".to_vec(),
+        b"/parent/../name".to_vec(),
+        b"/nul\0name".to_vec(),
+    ] {
+        assert!(GuestPath::try_from(invalid).is_err());
+    }
+}
+
+#[test]
 fn digest_domains_are_disjoint_and_stable() {
     let domains = [
         Domain::Sandbox,

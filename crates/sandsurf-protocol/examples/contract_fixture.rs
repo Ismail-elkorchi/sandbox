@@ -30,6 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let value: ReleaseRequest = serde_json::from_slice(&bytes)?;
             serde_json::to_writer(std::io::stdout(), &value)?;
         }
+        "path" => {
+            let value: GuestPath = serde_json::from_slice(&bytes)?;
+            serde_json::to_writer(std::io::stdout(), &value)?;
+        }
         "digest" => {
             let domain = match arguments.get(2).map(String::as_str) {
                 Some("sandbox") => Domain::Sandbox,

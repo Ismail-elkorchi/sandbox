@@ -40,8 +40,49 @@ identifier!(
     ExposureId,
     TransferId,
     ImageId,
-    SecretId
+    SecretId,
+    WatcherId
 );
+
+/// Byte-preserving absolute Linux path used at the guest protocol boundary.
+/// TypeScript offers UTF-8 convenience constructors, but no lossy decoding is
+/// performed for directory entries or symlink targets.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
+pub struct GuestPath(Vec<u8>);
+
+impl TryFrom<Vec<u8>> for GuestPath {
+    type Error = Invalid;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        validate_guest_path_bytes(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<&str> for GuestPath {
+    type Error = Invalid;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.as_bytes().to_vec().try_into()
+    }
+}
+
+impl From<GuestPath> for Vec<u8> {
+    fn from(value: GuestPath) -> Self {
+        value.0
+    }
+}
+
+impl GuestPath {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn to_utf8(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -675,6 +716,24 @@ fn validate_guest_path(value: &str) -> Result<(), Invalid> {
     {
         return Err(Invalid(
             "guest path must be absolute, bounded, and normalized",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_guest_path_bytes(value: &[u8]) -> Result<(), Invalid> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value[0] != b'/'
+        || value.contains(&0)
+        || (value.len() > 1 && value.ends_with(b"/"))
+        || value
+            .split(|byte| *byte == b'/')
+            .skip(1)
+            .any(|part| part.is_empty() || matches!(part, b"." | b".."))
+    {
+        return Err(Invalid(
+            "guest path bytes must be absolute, bounded, and normalized",
         ));
     }
     Ok(())
