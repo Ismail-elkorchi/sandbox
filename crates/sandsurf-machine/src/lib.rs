@@ -1,4 +1,4 @@
-#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! Narrow internal hardware-VM lifecycle contract.
 //!
@@ -10,6 +10,9 @@ use sandsurf_protocol::{
     Counter, DesiredState, Digest, LifecycleCommand, MachineObservation, MachineState,
     Qualification, VmEngine,
 };
+
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestArchitecture {
@@ -84,6 +87,11 @@ pub fn apply_lifecycle<D: MachineDriver>(
     command: &LifecycleCommand,
     current: Option<&MachineObservation>,
 ) -> MachineOutcome {
+    if current.is_some_and(|value| value.sandbox_id != command.sandbox_id) {
+        return MachineOutcome::NotApplied(sandsurf_protocol::bytes_digest(
+            b"native-lifecycle-sandbox-mismatch",
+        ));
+    }
     let outcome = match (command.desired, current) {
         (DesiredState::Running, None) => driver.create(command),
         (DesiredState::Running, Some(value)) if value.state == MachineState::Running => {
@@ -345,5 +353,20 @@ mod tests {
             apply_lifecycle(&mut driver, &command(DesiredState::Running), None),
             MachineOutcome::Unknown
         );
+    }
+
+    #[test]
+    fn rejects_cross_sandbox_observations_before_driver_dispatch() {
+        let mut driver = Driver {
+            called: None,
+            output: Some(output(1, MachineState::Stopped)),
+        };
+        let mut current = observation(MachineState::Running, 1);
+        current.sandbox_id = SandboxId::try_from("other").unwrap();
+        assert!(matches!(
+            apply_lifecycle(&mut driver, &command(DesiredState::Stopped), Some(&current)),
+            MachineOutcome::NotApplied(_)
+        ));
+        assert_eq!(driver.called, None);
     }
 }

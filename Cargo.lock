@@ -516,6 +516,9 @@ name = "sandsurf-machine"
 version = "0.1.0"
 dependencies = [
  "sandsurf-protocol",
+ "serde",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]
