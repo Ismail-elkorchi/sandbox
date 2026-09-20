@@ -10,12 +10,11 @@ await verifyManifest(
   resolve(repository, "packages/sandbox/native"),
 );
 await verifyManifest(
-  resolve(repository, "packages/sandbox-hardware-vm/native/manifest.json"),
-  resolve(repository, "packages/sandbox-hardware-vm"),
-  true,
+  resolve(repository, "packages/sandbox/images/manifest.json"),
+  resolve(repository, "packages/sandbox/images"),
 );
 
-const imageRoot = resolve(repository, "packages/sandbox-hardware-vm/images/minimal-x64");
+const imageRoot = resolve(repository, "packages/sandbox/images/minimal-x64");
 const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
 if (!isRecord(imageManifest) || !isRecord(imageManifest.kernel) || !isRecord(imageManifest.rootfs)) {
   throw new Error("VM image manifest has an invalid shape");
@@ -27,14 +26,14 @@ for (const [label, entry] of [["VM kernel", imageManifest.kernel], ["VM rootfs",
   await verifyFile(resolve(imageRoot, entry.path), entry.sha256, label);
 }
 
-async function verifyManifest(manifestPath: string, base: string, vmLayout = false): Promise<void> {
+async function verifyManifest(manifestPath: string, base: string): Promise<void> {
   const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
   if (!isRecord(manifest) || !isRecord(manifest.files)) throw new Error(`${manifestPath} has an invalid shape`);
   for (const [relativePath, expected] of Object.entries(manifest.files)) {
     if (relativePath.startsWith("/") || relativePath.split("/").includes("..")) {
       throw new Error(`${relativePath} is not a safe manifest path`);
     }
-    const path = resolve(base, vmLayout && !relativePath.startsWith("images/") ? "native" : "", relativePath);
+    const path = resolve(base, relativePath);
     await verifyFile(path, expected, relativePath);
   }
 }

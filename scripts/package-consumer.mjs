@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSandbox, openSandboxExecutionRepository } from "@ismail-elkorchi/sandbox";
+import { createSandbox, openSandboxExecutionRepository } from "sandsurf";
 
 const host = (path) => ({ space: "host", path });
 const isolated = (path) => ({ space: "isolated", path });

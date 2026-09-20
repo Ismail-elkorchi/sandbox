@@ -89,8 +89,6 @@ jobs:
             release/*.tgz
             packages/sandbox/SBOM.cdx.json
             packages/sandbox/THIRD-PARTY
-            packages/sandbox-hardware-vm/SBOM.cdx.json
-            packages/sandbox-hardware-vm/THIRD-PARTY
             Cargo.lock
             package-lock.json
           if-no-files-found: error

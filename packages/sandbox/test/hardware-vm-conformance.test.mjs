@@ -10,7 +10,7 @@ import {
   applyHardwareVmChangeSet,
   hardwareVmExtension,
   minimalHardwareVmImage,
-} from "../../sandbox-hardware-vm/dist/index.js";
+} from "../dist/hardware-vm-internal.js";
 
 const targetBinary = process.env.SANDBOX_VM_CONFORMANCE_TARGET
   ?? resolve("target/x86_64-unknown-linux-musl/release/sandbox-conformance-target");

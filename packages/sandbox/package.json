@@ -1,7 +1,7 @@
 {
-  "name": "@ismail-elkorchi/sandbox",
+  "name": "sandsurf",
   "version": "0.1.0",
-  "description": "Fail-closed cross-platform process sandbox with prepared execution and enforcement reports",
+  "description": "Persistent hardware-isolated Linux environments for autonomous agents",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -33,6 +33,7 @@
   "files": [
     "dist",
     "native",
+    "images",
     "LICENSE",
     "SBOM.cdx.json",
     "THIRD-PARTY"

@@ -1,4 +1,4 @@
-# Verifiable sandbox runtime
+# Sandsurf
 
 This repository provides prepared, policy-driven sandbox execution for Node.js. A preparation binds the selected implementation, explicit filesystem resources, resolved hard limits, executable bytes and identity, arguments, working directory, environment, and output requests before authorization.
 
@@ -15,7 +15,7 @@ The runtime fails closed. `probe()` reports observed mechanisms and request elig
 | `linux-firecracker-v1` | hardware virtualized | isolated imports | Experimental extension |
 
 ```ts
-import { createSandbox } from "@ismail-elkorchi/sandbox";
+import { createSandbox } from "sandsurf";
 
 const host = (path: string) => ({ space: "host" as const, path });
 const isolated = (path: string) => ({ space: "isolated" as const, path });

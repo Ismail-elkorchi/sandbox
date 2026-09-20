@@ -6,9 +6,8 @@ import { resolve } from "node:path";
 const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-package-test-"));
 const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
-  const core = await pack("@ismail-elkorchi/sandbox");
-  const vm = await pack("@ismail-elkorchi/sandbox-hardware-vm");
-  for (const tarball of [core, vm]) {
+  const core = await pack("sandsurf");
+  for (const tarball of [core]) {
     const listing = await capture("tar", ["-tzf", tarball]);
     const paths = listing.trim().split("\n");
     if (paths.some((path) => path.includes("node_modules/") || path.includes("/target/") || path.endsWith(".tsbuildinfo"))) {
@@ -22,8 +21,8 @@ try {
   await mkdir(consumer);
   if (originalUmask !== undefined) process.umask(0o002);
   await run("npm", ["init", "--yes"], consumer);
-  await run("npm", ["install", "--ignore-scripts", core, vm], consumer);
-  await run("node", ["--input-type=module", "--eval", "await import('@ismail-elkorchi/sandbox'); await import('@ismail-elkorchi/sandbox-hardware-vm')"], consumer);
+  await run("npm", ["install", "--ignore-scripts", core], consumer);
+  await run("node", ["--input-type=module", "--eval", "await import('sandsurf')"], consumer);
   await copyFile(resolve("scripts/package-consumer.mjs"), resolve(consumer, "package-consumer.mjs"));
   await copyFile(resolve("scripts/package-execution-consumer.mts"), resolve(consumer, "package-execution-consumer.mts"));
   await run(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "--strict", "--noEmit", "--module", "NodeNext", "--target", "ES2024",

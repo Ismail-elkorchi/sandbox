@@ -4,9 +4,7 @@ import { resolve } from "node:path";
 
 const destination = resolve("release");
 await mkdir(destination, { recursive: true });
-for (const workspace of ["@ismail-elkorchi/sandbox", "@ismail-elkorchi/sandbox-hardware-vm"]) {
-  await run("npm", ["pack", "--workspace", workspace, "--pack-destination", destination]);
-}
+await run("npm", ["pack", "--workspace", "sandsurf", "--pack-destination", destination]);
 
 function run(command: string, arguments_: readonly string[]): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {

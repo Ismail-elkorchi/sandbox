@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 if (process.platform !== "linux" || process.arch !== "x64") {
   throw new Error("the initial Firecracker runtime build requires Linux x64");
 }
-const native = resolve("packages/sandbox-hardware-vm/native/linux-x64");
+const native = resolve("packages/sandbox/native/linux-x64");
 const workspace = resolve(native, "empty-workspace.ext4");
 const workspaceDigest = sha256(await readFile(workspace));
 await run("cargo", [
@@ -23,7 +23,7 @@ await copyFile(resolve("target/x86_64-unknown-linux-musl/release/sandbox-vm-runt
 await chmod(runtime, 0o755);
 const firecrackerName = "firecracker-v1.16.1-x86_64";
 const firecracker = resolve(native, firecrackerName);
-const imageManifest = resolve("packages/sandbox-hardware-vm/images/minimal-x64/manifest.json");
+const imageManifest = resolve("packages/sandbox/images/minimal-x64/manifest.json");
 const runtimeDigest = sha256(await readFile(runtime));
 const firecrackerDigest = sha256(await readFile(firecracker));
 if (firecrackerDigest !== "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7") {
@@ -42,19 +42,7 @@ const descriptor = `${JSON.stringify({
 }, null, 2)}\n`;
 const descriptorPath = resolve(native, "extension.json");
 await writeFile(descriptorPath, descriptor, { mode: 0o644 });
-const files: Record<string, string> = {};
-for (const [key, path] of [
-  ["linux-x64/extension.json", descriptorPath],
-  [`linux-x64/${runtimeName}`, runtime],
-  [`linux-x64/${firecrackerName}`, firecracker],
-  ["linux-x64/empty-workspace.ext4", workspace],
-  ["images/minimal-x64/manifest.json", imageManifest],
-] as const) files[key] = sha256(await readFile(path));
-await writeFile(resolve("packages/sandbox-hardware-vm/native/manifest.json"), `${JSON.stringify({
-  formatVersion: 1,
-  buildId: "sandbox-hardware-vm-0.1.0",
-  files,
-}, null, 2)}\n`, { mode: 0o644 });
+await run(process.execPath, ["scripts/rebuild-native-manifest.ts"]);
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");

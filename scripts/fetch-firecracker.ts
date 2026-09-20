@@ -30,7 +30,7 @@ try {
   await run("tar", ["-xzf", archive, "-C", temporary]);
   const release = resolve(temporary, `release-${version}-${architecture}`);
   await run("sha256sum", ["--check", "SHA256SUMS", "--ignore-missing"], release);
-  const destination = resolve("packages/sandbox-hardware-vm/native", `linux-${process.arch}`);
+  const destination = resolve("packages/sandbox/native", `linux-${process.arch}`);
   await mkdir(destination, { recursive: true });
   for (const name of [
     `firecracker-${version}-${architecture}`,

@@ -1,11 +1,11 @@
-# `@ismail-elkorchi/sandbox`
+# `sandsurf`
 
 Fail-closed sandbox execution with prepared authorization, explicit resource manifests, scoped hard limits, structured termination, cleanup reports, and recovery support.
 
 Filesystem and execution paths are tagged as host or isolated coordinates. The library does not add a system runtime: callers authorize every executable, interpreter, loader, library, cache, and data resource needed by the workload.
 
 ```ts
-import { createSandbox } from "@ismail-elkorchi/sandbox";
+import { createSandbox } from "sandsurf";
 
 const sandbox = await createSandbox();
 const support = await sandbox.probe({

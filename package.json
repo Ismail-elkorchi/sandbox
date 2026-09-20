@@ -1,16 +1,14 @@
 {
-  "name": "verifiable-sandbox-runtime",
+  "name": "sandsurf-workspace",
   "private": true,
-  "description": "Fail-closed, policy-driven sandbox runtimes for Node.js",
+  "description": "Persistent hardware-isolated Linux environments for autonomous agents",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Ismail-elkorchi/sandbox.git"
   },
   "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
+  "workspaces": ["packages/sandbox"],
   "scripts": {
     "build": "npm run build:native && npm run build:ts",
     "build:native": "node scripts/build-native.ts",

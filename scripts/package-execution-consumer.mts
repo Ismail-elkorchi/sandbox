@@ -3,7 +3,7 @@ import {
   SandboxExecutionControlError,
   type SandboxExecutionObservation,
   type SandboxExecutionReceipt,
-} from "@ismail-elkorchi/sandbox";
+} from "sandsurf";
 
 async function consume(directory: string, executionId: string): Promise<void> {
   const repository = await openSandboxExecutionRepository({ directory, maxRetainedExecutions: 10, maxTotalMetadataBytes: 128 * 1024 * 1024 });

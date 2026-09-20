@@ -72,7 +72,7 @@ export function hardwareVmExtension(): HardwareVmExtensionRegistration {
   const packageDirectory = dirname(fileURLToPath(import.meta.url));
   const nativeDirectory = resolve(packageDirectory, "../native", `linux-${process.arch}`);
   const descriptorPath = resolve(nativeDirectory, "extension.json");
-  const digestManifestPath = resolve(packageDirectory, "../native/manifest.json");
+  const digestManifestPath = resolve(packageDirectory, "../images/manifest.json");
   const digestManifest: unknown = JSON.parse(readFileSync(digestManifestPath, "utf8"));
   const descriptorDigest = descriptorDigestFromManifest(
     digestManifest,
@@ -91,7 +91,7 @@ export function minimalHardwareVmImage(): HardwareVmImageReference {
   const manifestPath = resolve(packageDirectory, "../images/minimal-x64/manifest.json");
   const digestManifestPath = resolve(packageDirectory, "../native/manifest.json");
   const digestManifest: unknown = JSON.parse(readFileSync(digestManifestPath, "utf8"));
-  const digest = descriptorDigestFromManifest(digestManifest, "images/minimal-x64/manifest.json");
+  const digest = descriptorDigestFromManifest(digestManifest, "minimal-x64/manifest.json");
   const actual = createHash("sha256").update(readFileSync(manifestPath)).digest("hex");
   if (actual !== digest) throw new Error("hardware-VM image manifest digest mismatch");
   return { manifestPath, trust: "bundled", digest };

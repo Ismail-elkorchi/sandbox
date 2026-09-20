@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,35 +75,25 @@ await writeManifest(packageNativeRoot);
 
 async function writeManifest(root: string): Promise<void> {
   const files: Record<string, string> = {};
-  for (const platform of ["linux", "macos", "windows"]) {
-    for (const architecture of ["x64", "arm64"]) {
-      const name = `sandbox-runtime-${platform}-${architecture}${platform === "windows" ? ".exe" : ""}`;
-      const relativePath = `${platform}-${architecture}/${name}`;
-      let bytes: Buffer;
-      try {
-        bytes = await readFile(resolve(root, relativePath));
-      } catch (error) {
-        if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
-        throw error;
-      }
-      files[relativePath] = createHash("sha256").update(bytes).digest("hex");
-      if (platform === "macos") {
-        const helperName = `sandsurf-vz-helper-${architecture}`;
-        const helperPath = `${platform}-${architecture}/${helperName}`;
-        try {
-          const helper = await readFile(resolve(root, helperPath));
-          files[helperPath] = createHash("sha256").update(helper).digest("hex");
-        } catch (error) {
-          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-        }
-      }
-    }
-  }
+  await collect("");
   await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
     formatVersion: 1,
-    buildId: "sandbox-runtime-0.1.0",
-    files,
+    buildId: "sandsurf-native-0.1.0",
+    files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
   }, null, 2)}\n`, { mode: 0o644 });
+
+  async function collect(relative: string): Promise<void> {
+    for (const entry of await readdir(resolve(root, relative), { withFileTypes: true })) {
+      const child = relative === "" ? entry.name : `${relative}/${entry.name}`;
+      if (child === "manifest.json") continue;
+      if (entry.isDirectory()) { await collect(child); continue; }
+      const metadata = await lstat(resolve(root, child));
+      if (!entry.isFile() || !metadata.isFile() || metadata.isSymbolicLink()) {
+        throw new Error(`${child} is not a regular native artifact`);
+      }
+      files[child] = createHash("sha256").update(await readFile(resolve(root, child))).digest("hex");
+    }
+  }
 }
 
 function classifyTarget(target: string): { platform: "linux" | "macos" | "windows"; architecture: "x64" | "arm64" } {

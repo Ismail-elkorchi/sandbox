@@ -110,8 +110,8 @@ try {
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
   if (sha256(await readFile(kernel)) !== kernelSha256) throw new Error("guest kernel digest mismatch");
 
-  const destination = resolve("packages/sandbox-hardware-vm/images/minimal-x64");
-  const native = resolve("packages/sandbox-hardware-vm/native/linux-x64");
+  const destination = resolve("packages/sandbox/images/minimal-x64");
+  const native = resolve("packages/sandbox/native/linux-x64");
   await mkdir(destination, { recursive: true });
   await mkdir(native, { recursive: true });
   await replaceArtifact(kernel, resolve(destination, "vmlinux-6.1.177"));
@@ -148,6 +148,11 @@ try {
   if (derivedPublicKey !== releasePublicKey) throw new Error("the signing seed does not match the embedded release public key");
   const manifest = { ...unsigned, signature: sign(null, Buffer.from(identity, "ascii"), privateKey).toString("hex") };
   await writeFile(resolve(destination, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
+  await writeFile(resolve("packages/sandbox/images/manifest.json"), `${JSON.stringify({
+    formatVersion: 1,
+    buildId: "sandsurf-images-0.1.0",
+    files: { "minimal-x64/manifest.json": sha256(Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`)) },
+  }, null, 2)}\n`, { mode: 0o644 });
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

@@ -31,8 +31,7 @@ const metadata = parseMetadata(metadataValue);
 const packages = new Map(metadata.packages.map((package_) => [package_.id, package_]));
 const nodes = new Map(metadata.nodes.map((node) => [node.id, node]));
 
-await generate("sandbox-supervisor", "@ismail-elkorchi/sandbox", resolve("packages/sandbox"), []);
-await generate("sandbox-vm-runtime", "@ismail-elkorchi/sandbox-hardware-vm", resolve("packages/sandbox-hardware-vm"), [
+await generate(["sandbox-supervisor", "sandbox-vm-runtime", "sandsurf-control"], "sandsurf", resolve("packages/sandbox"), [
   {
     type: "application",
     name: "firecracker",
@@ -42,10 +41,13 @@ await generate("sandbox-vm-runtime", "@ismail-elkorchi/sandbox-hardware-vm", res
   },
 ]);
 
-async function generate(rootName: string, npmName: string, destination: string, additional: readonly Component[]): Promise<void> {
-  const root = metadata.packages.find((package_) => package_.name === rootName);
-  if (root === undefined) throw new Error(`missing cargo package ${rootName}`);
-  const identifiers = closure(root.id);
+async function generate(rootNames: readonly string[], npmName: string, destination: string, additional: readonly Component[]): Promise<void> {
+  const roots = rootNames.map((rootName) => {
+    const root = metadata.packages.find((package_) => package_.name === rootName);
+    if (root === undefined) throw new Error(`missing cargo package ${rootName}`);
+    return root.id;
+  });
+  const identifiers = closure(roots);
   const dependencyComponents: Component[] = [...identifiers]
     .map((identifier) => packages.get(identifier))
     .filter((package_): package_ is CargoPackage => package_?.external === true)
@@ -72,9 +74,9 @@ async function generate(rootName: string, npmName: string, destination: string, 
   await writeFile(resolve(destination, "THIRD-PARTY"), `Third-party components\n\n${notices}\n`, { mode: 0o644 });
 }
 
-function closure(root: string): Set<string> {
+function closure(roots: readonly string[]): Set<string> {
   const visited = new Set<string>();
-  const pending = [root];
+  const pending = [...roots];
   while (pending.length > 0) {
     const identifier = pending.pop();
     if (identifier === undefined || visited.has(identifier)) continue;

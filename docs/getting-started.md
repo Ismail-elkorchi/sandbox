@@ -3,7 +3,7 @@
 Install Node.js 24 or newer and the package:
 
 ```sh
-npm install @ismail-elkorchi/sandbox
+npm install sandsurf
 ```
 
 Build a policy whose resources include every file tree the executable needs. Paths are tagged so host sources cannot be confused with target paths. See [the policy guide](policy.md) for a complete resource example.
