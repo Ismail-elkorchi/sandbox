@@ -437,6 +437,12 @@ impl HostCatalog {
         capability: Capability,
         scope: &Digest,
     ) -> Result<AuthorizedMutation> {
+        mutation.validate()?;
+        if mutation.required_capability() != capability {
+            return Err(Error::Conflict(
+                "mutation request does not match the requested capability",
+            ));
+        }
         require_revision(
             &self.db.connection,
             &mutation.sandbox_id,

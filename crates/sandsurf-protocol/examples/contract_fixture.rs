@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "mutation" => {
             let value: Mutation = serde_json::from_slice(&bytes)?;
+            value.validate()?;
             serde_json::to_writer(std::io::stdout(), &value)?;
         }
         "release" => {

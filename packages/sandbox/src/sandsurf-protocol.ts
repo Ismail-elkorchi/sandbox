@@ -23,8 +23,38 @@ export interface SandsurfMutation {
   readonly operationId: string;
   readonly grantId: string;
   readonly expectedRevision: number;
+  readonly request: SandsurfWorkloadRequest;
   readonly requestDigest: string;
 }
+
+export interface SandsurfSpawnRequest {
+  readonly sandboxId: string;
+  readonly epoch: number;
+  readonly processId: string;
+  readonly operationId: string;
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly user: string | null;
+  readonly stdio: "pipes" | "terminal";
+  readonly terminalSize: SandsurfTerminalSize | null;
+  readonly lifetime: "job" | "sandbox";
+  readonly outputBytes: number;
+}
+
+export interface SandsurfTerminalSize {
+  readonly columns: number;
+  readonly rows: number;
+  readonly pixelWidth: number;
+  readonly pixelHeight: number;
+}
+
+export type SandsurfWorkloadRequest =
+  | { readonly kind: "spawn"; readonly request: SandsurfSpawnRequest }
+  | { readonly kind: "close-input"; readonly processId: string }
+  | { readonly kind: "resize-terminal"; readonly processId: string; readonly size: SandsurfTerminalSize }
+  | { readonly kind: "signal"; readonly processId: string; readonly signal: number; readonly group: boolean }
+  | { readonly kind: "terminate"; readonly processId: string; readonly graceMillis: number };
 
 export interface SandsurfOutputBoundary {
   readonly finalCursor: number;
@@ -64,9 +94,82 @@ function record(value: unknown, keys: readonly string[]): asserts value is Recor
 }
 
 export function validateSandsurfMutation(value: unknown): asserts value is SandsurfMutation {
-  record(value, ["sandboxId", "epoch", "operationId", "grantId", "expectedRevision", "requestDigest"]);
+  record(value, ["sandboxId", "epoch", "operationId", "grantId", "expectedRevision", "request", "requestDigest"]);
   identity(value.sandboxId); identity(value.operationId); identity(value.grantId);
   counter(value.epoch); counter(value.expectedRevision); sha256(value.requestDigest);
+  if (value.epoch === 0 || value.expectedRevision === 0) throw new Error("Sandsurf mutation epoch and revision must be positive");
+  validateWorkloadRequest(value.request);
+  if (value.request.kind === "spawn" && (value.request.request.sandboxId !== value.sandboxId
+    || value.request.request.epoch !== value.epoch || value.request.request.operationId !== value.operationId)) {
+    throw new Error("Sandsurf spawn identity does not match its mutation");
+  }
+  const expected = sandsurfDigest("operation", ["sandsurf-workload-mutation-v1", value.sandboxId,
+    value.epoch, value.operationId, value.grantId, value.expectedRevision, value.request]);
+  if (value.requestDigest !== expected) throw new Error("Sandsurf mutation digest mismatch");
+}
+
+export function createSandsurfMutation(
+  value: Omit<SandsurfMutation, "requestDigest">,
+): SandsurfMutation {
+  const requestDigest = sandsurfDigest("operation", ["sandsurf-workload-mutation-v1", value.sandboxId,
+    value.epoch, value.operationId, value.grantId, value.expectedRevision, value.request]);
+  const mutation = { ...value, requestDigest };
+  validateSandsurfMutation(mutation);
+  return mutation;
+}
+
+function validateWorkloadRequest(value: unknown): asserts value is SandsurfWorkloadRequest {
+  if (value === null || typeof value !== "object" || !("kind" in value)) throw new Error("missing Sandsurf workload kind");
+  const fields = value as Record<string, unknown>;
+  switch (fields.kind) {
+    case "spawn": record(fields, ["kind", "request"]); validateSpawn(fields.request); break;
+    case "close-input": record(fields, ["kind", "processId"]); identity(fields.processId); break;
+    case "resize-terminal": record(fields, ["kind", "processId", "size"]); identity(fields.processId); validateTerminalSize(fields.size); break;
+    case "signal":
+      record(fields, ["kind", "processId", "signal", "group"]); identity(fields.processId); counter(fields.signal);
+      if (fields.signal < 1 || fields.signal > 64 || typeof fields.group !== "boolean") throw new Error("invalid Sandsurf signal");
+      break;
+    case "terminate":
+      record(fields, ["kind", "processId", "graceMillis"]); identity(fields.processId); counter(fields.graceMillis);
+      if (fields.graceMillis > 60_000) throw new Error("invalid Sandsurf termination grace");
+      break;
+    default: throw new Error("unknown Sandsurf workload request");
+  }
+}
+
+function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
+  record(value, ["sandboxId", "epoch", "processId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "lifetime", "outputBytes"]);
+  identity(value.sandboxId); identity(value.processId); identity(value.operationId); counter(value.epoch); counter(value.outputBytes);
+  if (value.epoch === 0 || value.outputBytes === 0 || !Array.isArray(value.argv) || value.argv.length < 1 || value.argv.length > 4096
+    || value.argv.some((item) => typeof item !== "string" || item.length < 1 || item.length > 64 * 1024 || item.includes("\0"))) {
+    throw new Error("invalid Sandsurf spawn arguments");
+  }
+  guestPath(value.cwd);
+  if (value.environment === null || typeof value.environment !== "object" || Array.isArray(value.environment)
+    || Object.keys(value.environment).length > 4096) throw new Error("invalid Sandsurf environment");
+  for (const [name, item] of Object.entries(value.environment)) {
+    if (name.length < 1 || name.length > 4096 || name.includes("=") || name.includes("\0")
+      || typeof item !== "string" || item.length > 64 * 1024 || item.includes("\0")) throw new Error("invalid Sandsurf environment");
+  }
+  if (value.user !== null && (typeof value.user !== "string" || value.user.length < 1 || value.user.length > 4096 || value.user.includes("\0"))) {
+    throw new Error("invalid Sandsurf workload user");
+  }
+  if (value.stdio === "terminal") validateTerminalSize(value.terminalSize);
+  else if (value.stdio !== "pipes" || value.terminalSize !== null) throw new Error("invalid Sandsurf stdio mode");
+  if (value.lifetime !== "job" && value.lifetime !== "sandbox") throw new Error("invalid Sandsurf process lifetime");
+}
+
+function validateTerminalSize(value: unknown): asserts value is SandsurfTerminalSize {
+  record(value, ["columns", "rows", "pixelWidth", "pixelHeight"]);
+  for (const name of ["columns", "rows", "pixelWidth", "pixelHeight"] as const) {
+    counter(value[name]); if (value[name] > 0xffff) throw new Error("invalid Sandsurf terminal dimension");
+  }
+  if (value.columns === 0 || value.rows === 0) throw new Error("invalid Sandsurf terminal size");
+}
+
+function guestPath(value: unknown): asserts value is string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 4096 || !value.startsWith("/")
+    || value.includes("\0") || value.split("/").includes("..")) throw new Error("invalid Sandsurf guest path");
 }
 
 export function validateSandsurfOutputBoundary(value: unknown): asserts value is SandsurfOutputBoundary {

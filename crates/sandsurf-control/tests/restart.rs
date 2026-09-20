@@ -199,14 +199,31 @@ impl Fixture {
             })
             .unwrap();
         drop(runtime);
-        let mutation = Mutation {
-            sandbox_id: sandbox.clone(),
-            epoch: Counter::ONE,
-            operation_id: "dispatch-once".try_into().unwrap(),
-            grant_id: grant,
-            expected_revision: n(2),
-            request_digest: hash("argv-cwd-environment"),
-        };
+        let operation_id: OperationId = "dispatch-once".try_into().unwrap();
+        let mutation = Mutation::new(
+            sandbox.clone(),
+            Counter::ONE,
+            operation_id.clone(),
+            grant,
+            n(2),
+            WorkloadRequest::Spawn {
+                request: Box::new(SpawnRequest {
+                    sandbox_id: sandbox.clone(),
+                    epoch: Counter::ONE,
+                    process_id: "dispatch-process".try_into().unwrap(),
+                    operation_id,
+                    argv: vec!["/bin/true".into()],
+                    cwd: "/workspace".into(),
+                    environment: Default::default(),
+                    user: Some("agent".into()),
+                    stdio: StdioMode::Pipes,
+                    terminal_size: None,
+                    lifetime: ProcessLifetime::Job,
+                    output_bytes: n(1024),
+                }),
+            },
+        )
+        .unwrap();
         Self {
             root,
             host,

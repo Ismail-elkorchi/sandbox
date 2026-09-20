@@ -417,6 +417,12 @@ impl RuntimeJournal {
         self.authority.verify_mutation(&authorization)?;
         let statement = authorization.statement;
         let request = statement.mutation;
+        request.validate()?;
+        if request.required_capability() != statement.capability {
+            return Err(Error::Conflict(
+                "authorized mutation capability does not match its request",
+            ));
+        }
         let tx = self.db.connection.transaction()?;
         if let Some(old) = operation(&tx, &request.operation_id)? {
             if old.request == request && old.capability == statement.capability {
@@ -469,6 +475,12 @@ impl RuntimeJournal {
         self.authority.verify_mutation(&authorization)?;
         let tx = self.db.connection.transaction()?;
         let request = &authorization.statement.mutation;
+        request.validate()?;
+        if request.required_capability() != authorization.statement.capability {
+            return Err(Error::Conflict(
+                "authorized mutation capability does not match its request",
+            ));
+        }
         let mut value = operation(&tx, &request.operation_id)?
             .ok_or(Error::Missing("dispatch operation is not admitted"))?;
         if value.request != *request || value.capability != authorization.statement.capability {
@@ -559,6 +571,20 @@ impl RuntimeJournal {
             operation(&tx, operation_id)?.ok_or(Error::Missing("process operation missing"))?;
         if op.capability != Capability::Spawn {
             return Err(Error::Conflict("process creation requires spawn authority"));
+        }
+        let WorkloadRequest::Spawn { request } = &op.request.request else {
+            return Err(Error::Conflict(
+                "process reservation requires a spawn request",
+            ));
+        };
+        if request.process_id != id
+            || request.operation_id != *operation_id
+            || request.output_bytes != output_limit
+            || (request.stdio == StdioMode::Terminal) != terminal
+        {
+            return Err(Error::Conflict(
+                "process reservation does not match the authorized spawn request",
+            ));
         }
         if op.delivery != Delivery::Admitted {
             return Err(Error::Conflict("process must be reserved before dispatch"));

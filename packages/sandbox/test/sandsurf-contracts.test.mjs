@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { before, test } from "node:test";
-import { encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, validateSandsurfMutation, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
+import { createSandsurfMutation, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, validateSandsurfMutation, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = resolve(root, `target/debug/examples/contract_fixture${process.platform === "win32" ? ".exe" : ""}`);
@@ -24,12 +24,19 @@ test("Rust and TypeScript encode every Sandsurf digest domain identically", () =
 });
 
 test("Rust and TypeScript agree on valid and invalid mutation fields", () => {
-  const value = { sandboxId: "box", epoch: 1, operationId: "op", grantId: "grant", expectedRevision: 2, requestDigest: "a".repeat(64) };
+  const value = createSandsurfMutation({
+    sandboxId: "box", epoch: 1, operationId: "op", grantId: "grant", expectedRevision: 2,
+    request: { kind: "spawn", request: {
+      sandboxId: "box", epoch: 1, processId: "process", operationId: "op",
+      argv: ["/bin/echo", "hello"], cwd: "/workspace", environment: { PATH: "/usr/bin:/bin" },
+      user: "agent", stdio: "pipes", terminalSize: null, lifetime: "job", outputBytes: 1024,
+    } },
+  });
   validateSandsurfMutation(value);
   const accepted = native("mutation", JSON.stringify(value));
   assert.equal(accepted.status, 0, accepted.stderr.toString());
   assert.deepEqual(JSON.parse(accepted.stdout), value);
-  for (const invalid of [{ ...value, epoch: -1 }, { ...value, epoch: 0.5 }, { ...value, sandboxId: "../escape" }, { ...value, epoch: Number.MAX_SAFE_INTEGER + 1 }, { ...value, currentGrants: [] }, { ...value, requestDigest: "A".repeat(64) }]) {
+  for (const invalid of [{ ...value, epoch: -1 }, { ...value, epoch: 0.5 }, { ...value, sandboxId: "../escape" }, { ...value, epoch: Number.MAX_SAFE_INTEGER + 1 }, { ...value, currentGrants: [] }, { ...value, requestDigest: "a".repeat(64) }, { ...value, request: { ...value.request, request: { ...value.request.request, cwd: "/workspace/../host" } } }]) {
     assert.throws(() => validateSandsurfMutation(invalid));
     assert.notEqual(native("mutation", JSON.stringify(invalid)).status, 0);
   }

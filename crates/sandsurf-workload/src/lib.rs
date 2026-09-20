@@ -6,11 +6,15 @@
 //! groups and retained output are owned by the guest supervisor until explicit
 //! lifecycle or evidence handoff occurs at the guardian.
 
+#[cfg(target_os = "linux")]
+mod driver;
 mod filesystem;
 #[cfg(target_os = "linux")]
 mod process;
 mod spool;
 
+#[cfg(target_os = "linux")]
+pub use driver::*;
 pub use filesystem::*;
 #[cfg(target_os = "linux")]
 pub use process::*;

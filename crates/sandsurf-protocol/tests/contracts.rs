@@ -45,7 +45,33 @@ fn digest_domains_are_disjoint_and_stable() {
 
 #[test]
 fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
-    let mutation = json!({"sandboxId":"box","epoch":1,"operationId":"op","grantId":"grant","expectedRevision":1,"requestDigest":"a".repeat(64)});
+    let mutation = serde_json::to_value(
+        Mutation::new(
+            "box".try_into().unwrap(),
+            Counter::ONE,
+            "op".try_into().unwrap(),
+            "grant".try_into().unwrap(),
+            Counter::ONE,
+            WorkloadRequest::Spawn {
+                request: Box::new(SpawnRequest {
+                    sandbox_id: "box".try_into().unwrap(),
+                    epoch: Counter::ONE,
+                    process_id: "process".try_into().unwrap(),
+                    operation_id: "op".try_into().unwrap(),
+                    argv: vec!["/bin/true".into()],
+                    cwd: "/workspace".into(),
+                    environment: Default::default(),
+                    user: Some("agent".into()),
+                    stdio: StdioMode::Pipes,
+                    terminal_size: None,
+                    lifetime: ProcessLifetime::Job,
+                    output_bytes: Counter::ONE,
+                }),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert!(serde_json::from_value::<Mutation>(mutation.clone()).is_ok());
     let mut invalid = mutation;
     invalid["currentGrants"] = json!([]);

@@ -282,7 +282,96 @@ pub struct Mutation {
     pub operation_id: OperationId,
     pub grant_id: GrantId,
     pub expected_revision: Counter,
+    pub request: WorkloadRequest,
     pub request_digest: Digest,
+}
+
+impl Mutation {
+    pub fn new(
+        sandbox_id: SandboxId,
+        epoch: Counter,
+        operation_id: OperationId,
+        grant_id: GrantId,
+        expected_revision: Counter,
+        request: WorkloadRequest,
+    ) -> Result<Self, Invalid> {
+        request.validate()?;
+        let request_digest = mutation_digest(
+            &sandbox_id,
+            epoch,
+            &operation_id,
+            &grant_id,
+            expected_revision,
+            &request,
+        )?;
+        Ok(Self {
+            sandbox_id,
+            epoch,
+            operation_id,
+            grant_id,
+            expected_revision,
+            request,
+            request_digest,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if self.epoch == Counter::ZERO || self.expected_revision == Counter::ZERO {
+            return Err(Invalid("mutation epoch and revision must be positive"));
+        }
+        self.request.validate()?;
+        if let WorkloadRequest::Spawn { request } = &self.request
+            && (request.sandbox_id != self.sandbox_id
+                || request.epoch != self.epoch
+                || request.operation_id != self.operation_id)
+        {
+            return Err(Invalid("spawn identity does not match its mutation"));
+        }
+        let expected = mutation_digest(
+            &self.sandbox_id,
+            self.epoch,
+            &self.operation_id,
+            &self.grant_id,
+            self.expected_revision,
+            &self.request,
+        )?;
+        if self.request_digest != expected {
+            return Err(Invalid("mutation digest does not bind its request"));
+        }
+        Ok(())
+    }
+
+    pub fn required_capability(&self) -> Capability {
+        match &self.request {
+            WorkloadRequest::Spawn { .. }
+            | WorkloadRequest::CloseInput { .. }
+            | WorkloadRequest::ResizeTerminal { .. }
+            | WorkloadRequest::Signal { .. }
+            | WorkloadRequest::Terminate { .. } => Capability::Spawn,
+        }
+    }
+}
+
+fn mutation_digest(
+    sandbox_id: &SandboxId,
+    epoch: Counter,
+    operation_id: &OperationId,
+    grant_id: &GrantId,
+    expected_revision: Counter,
+    request: &WorkloadRequest,
+) -> Result<Digest, Invalid> {
+    crate::digest(
+        crate::Domain::Operation,
+        &(
+            "sandsurf-workload-mutation-v1",
+            sandbox_id,
+            epoch,
+            operation_id,
+            grant_id,
+            expected_revision,
+            request,
+        ),
+    )
 }
 
 /// The guardian pins this host identity and verification key. It is not a grant set.
@@ -482,6 +571,57 @@ pub struct SpawnRequest {
     pub terminal_size: Option<TerminalSize>,
     pub lifetime: ProcessLifetime,
     pub output_bytes: Counter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum WorkloadRequest {
+    Spawn {
+        request: Box<SpawnRequest>,
+    },
+    CloseInput {
+        process_id: ProcessId,
+    },
+    ResizeTerminal {
+        process_id: ProcessId,
+        size: TerminalSize,
+    },
+    Signal {
+        process_id: ProcessId,
+        signal: u8,
+        group: bool,
+    },
+    Terminate {
+        process_id: ProcessId,
+        grace_millis: u32,
+    },
+}
+
+impl WorkloadRequest {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        match self {
+            Self::Spawn { request } => request.validate(),
+            Self::CloseInput { .. } => Ok(()),
+            Self::ResizeTerminal { size, .. } => size.validate(),
+            Self::Signal { signal, .. } => {
+                if !(1..=64).contains(signal) {
+                    return Err(Invalid("signal is outside the supported range"));
+                }
+                Ok(())
+            }
+            Self::Terminate { grace_millis, .. } => {
+                if *grace_millis > 60_000 {
+                    return Err(Invalid("termination grace exceeds 60 seconds"));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl SpawnRequest {

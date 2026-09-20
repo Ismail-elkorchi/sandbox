@@ -182,14 +182,31 @@ impl Fixture {
         observed.applied_revision = n(2);
         observed.evidence_digest = hash("installed-revision");
         runtime.observe(observed).unwrap();
-        let mutation = Mutation {
-            sandbox_id: sandbox.clone(),
-            epoch: n(1),
-            operation_id: "command".try_into().unwrap(),
+        let operation_id: OperationId = "command".try_into().unwrap();
+        let mutation = Mutation::new(
+            sandbox.clone(),
+            n(1),
+            operation_id.clone(),
             grant_id,
-            expected_revision: n(2),
-            request_digest: hash("argv-cwd-env"),
-        };
+            n(2),
+            WorkloadRequest::Spawn {
+                request: Box::new(SpawnRequest {
+                    sandbox_id: sandbox.clone(),
+                    epoch: n(1),
+                    process_id: "process".try_into().unwrap(),
+                    operation_id,
+                    argv: vec!["/bin/true".into()],
+                    cwd: "/workspace".into(),
+                    environment: Default::default(),
+                    user: Some("agent".into()),
+                    stdio: StdioMode::Pipes,
+                    terminal_size: None,
+                    lifetime: ProcessLifetime::Job,
+                    output_bytes: n(100),
+                }),
+            },
+        )
+        .unwrap();
         let authorization = host
             .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
             .unwrap();
@@ -274,11 +291,58 @@ fn dispatch(runtime: &mut RuntimeJournal, host: &HostCatalog, mutation: &Mutatio
     }
 }
 
+fn rebind_mutation(value: &Mutation, identity: &str) -> Mutation {
+    let operation_id: OperationId = identity.try_into().unwrap();
+    let mut request = value.request.clone();
+    if let WorkloadRequest::Spawn { request } = &mut request {
+        request.operation_id = operation_id.clone();
+        request.process_id = identity.try_into().unwrap();
+    }
+    Mutation::new(
+        value.sandbox_id.clone(),
+        value.epoch,
+        operation_id,
+        value.grant_id.clone(),
+        value.expected_revision,
+        request,
+    )
+    .unwrap()
+}
+
+fn process_mutation(
+    value: &Mutation,
+    identity: &str,
+    output_bytes: Counter,
+    stdio: StdioMode,
+) -> Mutation {
+    let rebound = rebind_mutation(value, identity);
+    let mut request = rebound.request.clone();
+    let WorkloadRequest::Spawn { request: spawn } = &mut request else {
+        panic!("fixture mutation is not a spawn");
+    };
+    spawn.output_bytes = output_bytes;
+    spawn.stdio = stdio;
+    spawn.terminal_size = (stdio == StdioMode::Terminal).then_some(TerminalSize {
+        columns: 80,
+        rows: 24,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    Mutation::new(
+        rebound.sandbox_id,
+        rebound.epoch,
+        rebound.operation_id,
+        rebound.grant_id,
+        rebound.expected_revision,
+        request,
+    )
+    .unwrap()
+}
+
 #[test]
 fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "once".try_into().unwrap();
+    let mutation = rebind_mutation(&f.mutation, "once");
     let authorize = || {
         f.host
             .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
@@ -318,8 +382,7 @@ fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
 #[test]
 fn host_signed_authority_survives_api_restart_and_rejects_tampering() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "signed-across-restart".try_into().unwrap();
+    let mutation = rebind_mutation(&f.mutation, "signed-across-restart");
     let authorized = f
         .host
         .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
@@ -344,8 +407,7 @@ fn host_signed_authority_survives_api_restart_and_rejects_tampering() {
 
     let host = HostCatalog::open(&host_path).unwrap();
     assert_eq!(host.authority_binding(), &binding);
-    let mut after_restart = mutation;
-    after_restart.operation_id = "signed-after-restart".try_into().unwrap();
+    let after_restart = rebind_mutation(&mutation, "signed-after-restart");
     let authorized = host
         .authorize(after_restart, Capability::Spawn, &hash("workload"))
         .unwrap();
@@ -358,8 +420,7 @@ fn host_signed_authority_survives_api_restart_and_rejects_tampering() {
 #[test]
 fn dropped_dispatch_permission_preserves_uncertainty_instead_of_retrying() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "interrupted-native-dispatch".try_into().unwrap();
+    let mutation = rebind_mutation(&f.mutation, "interrupted-native-dispatch");
     f.runtime
         .admit(
             f.host
@@ -400,8 +461,7 @@ fn dropped_dispatch_permission_preserves_uncertainty_instead_of_retrying() {
 #[test]
 fn admitted_work_does_not_bypass_a_later_machine_barrier() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "queued".try_into().unwrap();
+    let mutation = rebind_mutation(&f.mutation, "queued");
     f.runtime
         .admit(
             f.host
@@ -1172,8 +1232,7 @@ fn machine_restart_fences_old_epoch_without_rewinding_history() {
     value.sequence = n(6);
     value.state = MachineState::Running;
     f.runtime.observe(value).unwrap();
-    let mut stale = f.mutation.clone();
-    stale.operation_id = "stale-after-boot".try_into().unwrap();
+    let stale = rebind_mutation(&f.mutation, "stale-after-boot");
     let authorization = f
         .host
         .authorize(stale, Capability::Spawn, &hash("workload"))
@@ -1184,8 +1243,7 @@ fn machine_restart_fences_old_epoch_without_rewinding_history() {
 #[test]
 fn independent_jobs_and_pty_streams_have_separate_reservations() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "terminal".try_into().unwrap();
+    let mutation = process_mutation(&f.mutation, "terminal", n(200), StdioMode::Terminal);
     let authorization = f
         .host
         .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
@@ -1315,8 +1373,7 @@ fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
 #[test]
 fn output_pages_bound_record_count_as_well_as_original_bytes() {
     let mut f = Fixture::new();
-    let mut mutation = f.mutation.clone();
-    mutation.operation_id = "many-chunks".try_into().unwrap();
+    let mutation = process_mutation(&f.mutation, "many-chunks", n(400), StdioMode::Pipes);
     let authorization = f
         .host
         .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))

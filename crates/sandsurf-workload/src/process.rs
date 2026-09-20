@@ -237,12 +237,16 @@ impl ProcessSupervisor {
         Ok(())
     }
 
-    pub fn signal(&self, id: &ProcessId, signal: i32) -> Result<(), ProcessError> {
+    pub fn signal(&self, id: &ProcessId, signal: i32, group: bool) -> Result<(), ProcessError> {
         if !(1..=64).contains(&signal) {
             return Err(ProcessError::Invalid("signal is outside supported range"));
         }
         let entry = self.entry(id)?;
-        send_group_signal(entry.group, signal)
+        if group {
+            send_group_signal(entry.group, signal)
+        } else {
+            send_process_signal(entry.pid, signal)
+        }
     }
 
     pub fn terminate(&self, id: &ProcessId, grace: Duration) -> Result<(), ProcessError> {
@@ -584,6 +588,19 @@ fn send_group_signal(group: i32, signal: i32) -> Result<(), ProcessError> {
     // SAFETY: a negative nonzero PID addresses exactly the retained process
     // group; signal range is validated by public callers or is a fixed constant.
     if unsafe { libc::kill(-group, signal) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn send_process_signal(pid: u32, signal: i32) -> Result<(), ProcessError> {
+    let pid = i32::try_from(pid).map_err(|_| ProcessError::Invalid("PID overflow"))?;
+    // SAFETY: pid is the exact positive child identity retained by this entry;
+    // the public method validated the signal range.
+    if unsafe { libc::kill(pid, signal) } != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
             return Err(error.into());

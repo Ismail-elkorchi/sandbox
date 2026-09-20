@@ -23,6 +23,9 @@ pub struct RetainedPage {
     pub after: Counter,
     pub available: Counter,
     pub chunks: Vec<RetainedChunk>,
+    /// Present when the next atomic chunk cannot fit in an otherwise empty
+    /// page. This prevents a client from looping forever at the same cursor.
+    pub required_bytes: Option<Counter>,
 }
 
 #[derive(Debug)]
@@ -172,6 +175,7 @@ impl OutputSpool {
         let mut found = after == Counter::ZERO;
         let mut retained = 0usize;
         let mut chunks = Vec::new();
+        let mut required_bytes = None;
         while file_cursor < expected_file_bytes {
             let mut header = [0u8; HEADER_BYTES];
             file.read_exact(&mut header)?;
@@ -207,6 +211,10 @@ impl OutputSpool {
                 });
                 retained += length;
             } else if found {
+                if chunks.is_empty() {
+                    required_bytes =
+                        Some(Counter::try_from(length as u64).map_err(|_| SpoolError::Capacity)?);
+                }
                 break;
             }
             content_cursor = content_cursor
@@ -223,6 +231,7 @@ impl OutputSpool {
             after,
             available,
             chunks,
+            required_bytes,
         })
     }
 
@@ -321,6 +330,18 @@ mod tests {
         ));
         assert!(spool.has_failed());
         assert!(spool.finalize().is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn undersized_page_reports_the_next_atomic_chunk() {
+        let path = path();
+        let spool = OutputSpool::create(&path, 1024u64.try_into().unwrap()).unwrap();
+        spool.append(Stream::Stdout, b"0123456789").unwrap();
+        let page = spool.read(Counter::ZERO, 4).unwrap();
+        assert!(page.chunks.is_empty());
+        assert_eq!(page.required_bytes.unwrap().get(), 10);
+        assert_eq!(page.available.get(), 10);
         fs::remove_file(path).unwrap();
     }
 }
