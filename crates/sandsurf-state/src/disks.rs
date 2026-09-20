@@ -163,8 +163,10 @@ impl RuntimeJournal {
             &file,
             record.request.bytes.get(),
             self.limits.disk_headroom_bytes.get(),
+            &self.db.root,
         )?;
         let actual = copy(source, &file, record.request.bytes.get())?;
+        ensure_headroom(&file, self.limits.disk_headroom_bytes.get(), &self.db.root)?;
         if actual != record.request.source_digest {
             return Err(Error::Corrupt(
                 "disk copy content does not match the verified source identity",
@@ -320,6 +322,34 @@ fn ensure_distinct(source: &File, destination: &File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_distinct(source: &File, destination: &File) -> Result<()> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    fn identity(file: &File) -> Result<(u32, u64)> {
+        // SAFETY: information is a live output object and the borrowed handle
+        // remains valid for the duration of this synchronous query.
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok((
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        ))
+    }
+
+    if identity(source)? == identity(destination)? {
+        return Err(Error::Conflict("source and destination cannot alias"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn copy(source: &File, destination: &File, length: u64) -> Result<Digest> {
     use sha2::{Digest as _, Sha256};
@@ -353,6 +383,84 @@ fn content_digest(file: &File, length: u64) -> Result<Digest> {
     Ok(format!("{:x}", hash.finalize()).try_into()?)
 }
 
+#[cfg(target_os = "windows")]
+fn copy(source: &File, destination: &File, length: u64) -> Result<Digest> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::windows::fs::FileExt;
+
+    let mut buffer = [0u8; MAX_STREAM_BYTES];
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < length {
+        let count = (length - offset).min(buffer.len() as u64) as usize;
+        read_exact_at(source, &mut buffer[..count], offset)?;
+        write_all_at(destination, &buffer[..count], offset)?;
+        hash.update(&buffer[..count]);
+        offset += count as u64;
+    }
+    fn read_exact_at(file: &File, mut output: &mut [u8], mut offset: u64) -> Result<()> {
+        while !output.is_empty() {
+            let count = file.seek_read(output, offset)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "disk source ended during positional copy",
+                )
+                .into());
+            }
+            offset += count as u64;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+
+    fn write_all_at(file: &File, mut input: &[u8], mut offset: u64) -> Result<()> {
+        while !input.is_empty() {
+            let count = file.seek_write(input, offset)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "disk destination stopped during positional copy",
+                )
+                .into());
+            }
+            offset += count as u64;
+            input = &input[count..];
+        }
+        Ok(())
+    }
+
+    Ok(format!("{:x}", hash.finalize()).try_into()?)
+}
+
+#[cfg(target_os = "windows")]
+fn content_digest(file: &File, length: u64) -> Result<Digest> {
+    use sha2::{Digest as _, Sha256};
+    use std::os::windows::fs::FileExt;
+
+    let mut buffer = [0u8; MAX_STREAM_BYTES];
+    let mut hash = Sha256::new();
+    let mut offset = 0;
+    while offset < length {
+        let count = (length - offset).min(buffer.len() as u64) as usize;
+        let mut filled = 0;
+        while filled < count {
+            let read = file.seek_read(&mut buffer[filled..count], offset + filled as u64)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "disk ended during content verification",
+                )
+                .into());
+            }
+            filled += read;
+        }
+        hash.update(&buffer[..count]);
+        offset += count as u64;
+    }
+    Ok(format!("{:x}", hash.finalize()).try_into()?)
+}
+
 #[cfg(unix)]
 fn free_bytes(file: &File) -> Result<u64> {
     use std::os::fd::AsRawFd;
@@ -369,7 +477,17 @@ fn free_bytes(file: &File) -> Result<u64> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn reserve(file: &File, length: u64, headroom: u64) -> Result<()> {
+fn ensure_headroom(file: &File, headroom: u64, _: &std::path::Path) -> Result<()> {
+    if free_bytes(file)? < headroom {
+        return Err(Error::Capacity(
+            "host headroom changed during disk materialization",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reserve(file: &File, length: u64, headroom: u64, _: &std::path::Path) -> Result<()> {
     use std::os::fd::AsRawFd;
     let required = length
         .checked_add(headroom)
@@ -413,26 +531,76 @@ fn reserve(file: &File, length: u64, headroom: u64) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reserve(_: &File, _: u64, _: u64) -> Result<()> {
+#[cfg(target_os = "windows")]
+fn reserve(file: &File, length: u64, headroom: u64, root: &std::path::Path) -> Result<()> {
+    let required = length
+        .checked_add(headroom)
+        .ok_or(Error::Capacity("disk reservation overflow"))?;
+    if windows_free_bytes(root)? < required {
+        return Err(Error::Capacity(
+            "disk copy would consume host control headroom",
+        ));
+    }
+    file.set_len(length)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_free_bytes(root: &std::path::Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut path: Vec<u16> = root.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return Err(Error::Conflict("disk state path contains NUL"));
+    }
+    path.push(0);
+    let mut available = 0_u64;
+    // SAFETY: path is NUL-terminated and available is a live output pointer;
+    // the optional aggregate outputs are intentionally omitted.
+    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, null_mut(), null_mut()) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(available)
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_headroom(_: &File, headroom: u64, root: &std::path::Path) -> Result<()> {
+    if windows_free_bytes(root)? < headroom {
+        return Err(Error::Capacity(
+            "host headroom changed during disk materialization",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn reserve(_: &File, _: u64, _: u64, _: &std::path::Path) -> Result<()> {
     Err(Error::Unsupported(
         "native physical raw-disk reservation is not implemented on this host",
     ))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
+fn ensure_headroom(_: &File, _: u64, _: &std::path::Path) -> Result<()> {
+    Err(Error::Unsupported(
+        "native disk headroom accounting is not implemented on this host",
+    ))
+}
+#[cfg(not(any(unix, target_os = "windows")))]
 fn ensure_distinct(_: &File, _: &File) -> Result<()> {
     Err(Error::Unsupported(
         "native disk identity is not implemented on this host",
     ))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn copy(_: &File, _: &File, _: u64) -> Result<Digest> {
     Err(Error::Unsupported(
         "native disk copying is not implemented on this host",
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn content_digest(_: &File, _: u64) -> Result<Digest> {
     Err(Error::Unsupported(
         "native disk readback is not implemented on this host",
