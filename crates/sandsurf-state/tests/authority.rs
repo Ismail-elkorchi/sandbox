@@ -1088,6 +1088,69 @@ fn historical_intent_references_resolve_after_new_observations() {
 }
 
 #[test]
+fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observation() {
+    let mut f = Fixture::new();
+    let record = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    assert_eq!(record.id, f.sandbox);
+    assert_eq!(record.configuration_revision, n(2));
+    assert_eq!(record.reservation, ReservationState::Held);
+    assert_eq!(record.latest_intent.desired, DesiredState::Running);
+    assert_eq!(f.host.sandboxes(None, n(10)).unwrap(), vec![record]);
+    assert!(f.host.sandboxes(None, Counter::ZERO).is_err());
+    assert!(f.host.sandboxes(None, n(257)).is_err());
+
+    let operation: OperationId = "destroy-machine".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &operation, n(2), DesiredState::Destroyed),
+    )
+    .unwrap();
+    f.host
+        .request_lifecycle(
+            &f.sandbox,
+            operation.clone(),
+            n(2),
+            DesiredState::Destroyed,
+            Approval {
+                id: "approve-destroy".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    let pending = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    assert_eq!(pending.reservation, ReservationState::Held);
+    assert_eq!(pending.latest_intent.desired, DesiredState::Destroyed);
+    assert_eq!(pending.latest_intent.completion, None);
+
+    let mut observation = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    observation.sequence = n(4);
+    observation.state = MachineState::Destroying;
+    observation.applied_revision = n(3);
+    observation.operation_id = operation.clone();
+    observation.evidence_digest = hash("destroying");
+    f.runtime.observe(observation.clone()).unwrap();
+    assert_eq!(
+        f.host.sandbox(&f.sandbox).unwrap().unwrap().reservation,
+        ReservationState::Held
+    );
+    observation.sequence = n(5);
+    observation.state = MachineState::Destroyed;
+    observation.evidence_digest = hash("runtime-and-disks-cleaned");
+    let destroyed = f.runtime.observe(observation).unwrap();
+    f.host.complete_intent(&destroyed).unwrap();
+    let retired = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    assert_eq!(retired.reservation, ReservationState::Released);
+    assert!(retired.latest_intent.completion.is_some());
+    assert!(f.host.revision(&f.sandbox).is_err());
+}
+
+#[test]
 fn machine_restart_fences_old_epoch_without_rewinding_history() {
     let mut f = Fixture::new();
     let mut value = f

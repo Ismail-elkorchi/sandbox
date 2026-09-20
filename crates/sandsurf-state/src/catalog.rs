@@ -40,6 +40,26 @@ pub struct GrantChange {
     pub revoked: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReservationState {
+    Held,
+    Released,
+}
+
+/// Host-owned identity, configuration, and reservation facts. Machine state is
+/// deliberately absent: callers obtain that separately from the guardian.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxRecord {
+    pub id: SandboxId,
+    pub image_digest: Digest,
+    pub resources: Resources,
+    pub configuration_revision: Counter,
+    pub reservation: ReservationState,
+    pub latest_intent: LifecycleIntent,
+}
+
 pub struct HostCatalog {
     db: Database,
     host: HostId,
@@ -104,6 +124,39 @@ impl HostCatalog {
     }
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
+    }
+
+    pub fn sandbox(&self, id: &SandboxId) -> Result<Option<SandboxRecord>> {
+        sandbox_record(&self.db.connection, id)
+    }
+
+    /// Stable identity pagination. The bounded result is an observation of the
+    /// host catalog, not an ownership token or a cache of machine state.
+    pub fn sandboxes(
+        &self,
+        after: Option<&SandboxId>,
+        limit: Counter,
+    ) -> Result<Vec<SandboxRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("sandbox page limit must be in 1..=256"));
+        }
+        let after = after.map_or("", SandboxId::as_str);
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT id FROM sandboxes WHERE id>?1 ORDER BY id ASC LIMIT ?2")?;
+        let identities = statement
+            .query_map(params![after, limit.get()], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|id| {
+                let id: SandboxId = id.try_into()?;
+                sandbox_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
+                    "listed sandbox disappeared from the host transaction view",
+                ))
+            })
+            .collect()
     }
 
     pub fn create_sandbox(
@@ -287,6 +340,15 @@ impl HostCatalog {
             "UPDATE intents SET value=?2 WHERE id=?1",
             params![value.operation_id.as_str(), encode(&value)?],
         )?;
+        if value.desired == DesiredState::Destroyed {
+            // A Destroyed guardian observation is the lifecycle postcondition
+            // that releases this machine reservation. Runtime receipts and
+            // other retained evidence remain governed by their own ledgers.
+            tx.execute(
+                "UPDATE sandboxes SET released=1 WHERE id=?1",
+                [value.sandbox_id.as_str()],
+            )?;
+        }
         tx.commit()?;
         Ok(value)
     }
@@ -510,6 +572,44 @@ impl HostCatalog {
         )?;
         Ok((cpu.try_into()?, network.try_into()?))
     }
+}
+
+fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Option<SandboxRecord>> {
+    let row = db
+        .query_row(
+            "SELECT image,resources,revision,released FROM sandboxes WHERE id=?1",
+            [sandbox.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((image, resources, revision, released)) = row else {
+        return Ok(None);
+    };
+    let latest: String = db.query_row(
+        "SELECT value FROM intents WHERE sandbox=?1 ORDER BY rowid DESC LIMIT 1",
+        [sandbox.as_str()],
+        |row| row.get(0),
+    )?;
+    let reservation = match released {
+        0 => ReservationState::Held,
+        1 => ReservationState::Released,
+        _ => return Err(Error::Corrupt("sandbox reservation flag is invalid")),
+    };
+    Ok(Some(SandboxRecord {
+        id: sandbox.clone(),
+        image_digest: image.try_into()?,
+        resources: decode(&resources)?,
+        configuration_revision: revision.try_into()?,
+        reservation,
+        latest_intent: decode(&latest)?,
+    }))
 }
 
 fn revision(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Counter> {
