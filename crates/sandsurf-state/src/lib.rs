@@ -9,14 +9,16 @@
 //! Host-signed exact-operation envelopes cross the private host/guardian boundary;
 //! they are not a guardian-owned grant database or application capability.
 //! External capture commitments are trusted consumer
-//! assertions; pins retain bytes in this store. Native Windows private-state
-//! provisioning is deliberately refused until its ACL/handle implementation exists.
+//! assertions; pins retain bytes in this store. Native state admission validates
+//! owner-only POSIX modes/ACLs or protected Windows DACLs and held handles.
 
 mod authority;
 mod catalog;
 mod database;
 mod disks;
 mod runtime;
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub use catalog::*;
 pub use disks::*;

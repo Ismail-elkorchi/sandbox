@@ -206,27 +206,44 @@ pub(crate) fn sync_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-// Windows must receive native ACL/handle qualification before a store can be admitted.
-// A POSIX mode argument on Windows would silently fail to establish this boundary.
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
+    crate::windows::create_private_directory(path)?;
+    Ok(())
+}
+#[cfg(target_os = "windows")]
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    Ok(crate::windows::canonical_directory(path)?)
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
+    Ok(crate::windows::private_file(path, create)?)
+}
+#[cfg(target_os = "windows")]
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    crate::windows::sync_directory(path)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 pub(crate) fn create_private_directory(_: &Path) -> Result<()> {
     Err(Error::Unsupported(
         "native private-state provisioning is not implemented on this host",
     ))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 fn canonical_directory(_: &Path) -> Result<PathBuf> {
     Err(Error::Unsupported(
         "native private-state provisioning is not implemented on this host",
     ))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub(crate) fn private_file(_: &Path, _: bool) -> Result<File> {
     Err(Error::Unsupported(
         "native private-state file handles are not implemented on this host",
     ))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "windows")))]
 pub(crate) fn sync_directory(_: &Path) -> Result<()> {
     Err(Error::Unsupported(
         "native state publication is not implemented on this host",
