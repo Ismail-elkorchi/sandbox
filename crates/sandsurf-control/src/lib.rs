@@ -71,19 +71,7 @@ pub enum EffectOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MachineTransition {
-    pub epoch: Counter,
-    pub state: MachineState,
-    pub evidence_digest: Digest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LifecycleEffect {
-    Observed(Vec<MachineTransition>),
-    NotApplied(Digest),
-    Unknown,
-}
+pub use sandsurf_machine::{MachineOutcome as LifecycleEffect, MachineTransition};
 
 pub trait GuardianEffect {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome;
@@ -92,6 +80,50 @@ pub trait GuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> LifecycleEffect;
+}
+
+/// Guest/workload dispatch is deliberately separate from native VM ownership.
+/// A workload driver cannot report or mutate machine lifecycle state.
+pub trait WorkloadDriver {
+    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome;
+}
+
+/// Standard guardian effect composition. This exposes capabilities without
+/// imposing an application workflow: lifecycle and workload operations remain
+/// independently addressable through their own durable operation identities.
+pub struct NativeGuardianEffect<M, W> {
+    machine: M,
+    workload: W,
+}
+
+impl<M, W> NativeGuardianEffect<M, W> {
+    pub fn new(machine: M, workload: W) -> Self {
+        Self { machine, workload }
+    }
+
+    pub fn machine(&self) -> &M {
+        &self.machine
+    }
+
+    pub fn workload(&self) -> &W {
+        &self.workload
+    }
+}
+
+impl<M: sandsurf_machine::MachineDriver, W: WorkloadDriver> GuardianEffect
+    for NativeGuardianEffect<M, W>
+{
+    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
+        self.workload.dispatch(mutation, capability)
+    }
+
+    fn transition(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> LifecycleEffect {
+        sandsurf_machine::apply_lifecycle(&mut self.machine, command, current)
+    }
 }
 
 pub struct Guardian<E> {

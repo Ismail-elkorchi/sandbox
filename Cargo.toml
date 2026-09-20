@@ -5,6 +5,7 @@ members = [
   "crates/sandsurf-protocol",
   "crates/sandsurf-state",
   "crates/sandsurf-native",
+  "crates/sandsurf-machine",
   "crates/sandsurf-control",
   "crates/sandbox-protocol",
   "crates/sandbox-digest",

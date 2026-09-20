@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-state = { path = "../sandsurf-state" }
+sandsurf-machine = { path = "../sandsurf-machine" }
 serde_json.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]

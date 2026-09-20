@@ -504,10 +504,18 @@ dependencies = [
 name = "sandsurf-control"
 version = "0.1.0"
 dependencies = [
+ "sandsurf-machine",
  "sandsurf-native",
  "sandsurf-protocol",
  "sandsurf-state",
  "serde_json",
+]
+
+[[package]]
+name = "sandsurf-machine"
+version = "0.1.0"
+dependencies = [
+ "sandsurf-protocol",
 ]
 
 [[package]]
