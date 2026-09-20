@@ -34,7 +34,13 @@ identifier!(
     CommitmentId,
     StoreId,
     PinId,
-    DiskId
+    DiskId,
+    TerminalId,
+    CheckpointId,
+    ExposureId,
+    TransferId,
+    ImageId,
+    SecretId
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +433,111 @@ pub struct Resources {
     pub disk_bytes: Counter,
     pub output_bytes: Counter,
     pub processes: Counter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProcessLifetime {
+    Job,
+    Sandbox,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StdioMode {
+    Pipes,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+impl TerminalSize {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if self.columns == 0 || self.rows == 0 {
+            return Err(Invalid("terminal rows and columns must be positive"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SpawnRequest {
+    pub sandbox_id: SandboxId,
+    pub epoch: Counter,
+    pub process_id: ProcessId,
+    pub operation_id: OperationId,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub user: Option<String>,
+    pub stdio: StdioMode,
+    pub terminal_size: Option<TerminalSize>,
+    pub lifetime: ProcessLifetime,
+    pub output_bytes: Counter,
+}
+
+impl SpawnRequest {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if self.argv.is_empty()
+            || self.argv.len() > 4096
+            || self
+                .argv
+                .iter()
+                .any(|value| value.is_empty() || value.len() > 64 * 1024 || value.contains('\0'))
+        {
+            return Err(Invalid("argv is empty, oversized, or contains NUL"));
+        }
+        validate_guest_path(&self.cwd)?;
+        if self.environment.len() > 4096
+            || self.environment.iter().any(|(name, value)| {
+                name.is_empty()
+                    || name.len() > 4096
+                    || value.len() > 64 * 1024
+                    || name.contains(['=', '\0'])
+                    || value.contains('\0')
+            })
+        {
+            return Err(Invalid("environment is oversized or malformed"));
+        }
+        if self
+            .user
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 4096 || value.contains('\0'))
+        {
+            return Err(Invalid("user is empty, oversized, or contains NUL"));
+        }
+        match (self.stdio, self.terminal_size) {
+            (StdioMode::Pipes, None) => {}
+            (StdioMode::Terminal, Some(size)) => size.validate()?,
+            _ => return Err(Invalid("terminal size does not match stdio mode")),
+        }
+        if self.output_bytes == Counter::ZERO {
+            return Err(Invalid("process output reservation must be positive"));
+        }
+        Ok(())
+    }
+}
+
+fn validate_guest_path(value: &str) -> Result<(), Invalid> {
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || !value.starts_with('/')
+        || value.split('/').any(|part| part == "..")
+    {
+        return Err(Invalid(
+            "guest path must be absolute, bounded, and normalized",
+        ));
+    }
+    Ok(())
 }
 impl Resources {
     pub fn validate(&self) -> Result<(), Invalid> {
