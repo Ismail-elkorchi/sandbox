@@ -55,6 +55,21 @@ const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform
 await mkdir(packageDestinationDirectory, { recursive: true });
 await copyFile(destination, resolve(packageDestinationDirectory, destinationName));
 await chmod(resolve(packageDestinationDirectory, destinationName), 0o755);
+if (nativePlatform === "macos") {
+  const helperName = `sandsurf-vz-helper-${architecture}`;
+  const helper = resolve(destinationDirectory, helperName);
+  await run("/usr/bin/swiftc", [
+    resolve(repository, "native/macos/sandsurf-vz-helper.swift"),
+    "-o", helper,
+  ], {});
+  await run("/usr/bin/codesign", [
+    "--force", "--sign", "-", "--options", "runtime",
+    "--entitlements", resolve(repository, "scripts/qualification/apple.entitlements"),
+    helper,
+  ], {});
+  await copyFile(helper, resolve(packageDestinationDirectory, helperName));
+  await chmod(resolve(packageDestinationDirectory, helperName), 0o755);
+}
 await writeManifest(resolve(repository, "native"));
 await writeManifest(packageNativeRoot);
 
@@ -72,6 +87,16 @@ async function writeManifest(root: string): Promise<void> {
         throw error;
       }
       files[relativePath] = createHash("sha256").update(bytes).digest("hex");
+      if (platform === "macos") {
+        const helperName = `sandsurf-vz-helper-${architecture}`;
+        const helperPath = `${platform}-${architecture}/${helperName}`;
+        try {
+          const helper = await readFile(resolve(root, helperPath));
+          files[helperPath] = createHash("sha256").update(helper).digest("hex");
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        }
+      }
     }
   }
   await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
