@@ -10,5 +10,5 @@ sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-state = { path = "../sandsurf-state" }
 serde_json.workspace = true
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 sandsurf-native = { path = "../sandsurf-native" }

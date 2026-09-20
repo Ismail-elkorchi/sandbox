@@ -11,12 +11,12 @@ use sandsurf_protocol::*;
 use sandsurf_state::{DispatchDecision, HostCatalog, RuntimeJournal};
 use std::fmt;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SERVICE_VERSION: u16 = 1;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -446,7 +446,7 @@ impl GuardianClient {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn call(&self, request: GuardianRequest) -> Result<GuardianResponse> {
         use sandsurf_native::local::LocalConnection;
         let mut connection = LocalConnection::connect(&self.endpoint, REQUEST_TIMEOUT)?;
@@ -458,7 +458,7 @@ impl GuardianClient {
         parse_response(response)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn call(&self, _: GuardianRequest) -> Result<GuardianResponse> {
         let _ = &self.endpoint;
         Err(Error::Unsupported(
@@ -467,7 +467,7 @@ impl GuardianClient {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn serve_guardian<E: GuardianEffect>(
     endpoint: &Path,
     guardian: &mut Guardian<E>,
@@ -498,14 +498,14 @@ pub fn serve_guardian<E: GuardianEffect>(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn serve_guardian<E: GuardianEffect>(_: &Path, _: &mut Guardian<E>) -> Result<()> {
     Err(Error::Unsupported(
         "native guardian control transport is not implemented on this host",
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn request_frame(request: &GuardianRequest) -> Result<Frame> {
     let payload = serde_json::to_vec(&(SERVICE_VERSION, request))?;
     if payload.len() > MAX_CONTROL_BYTES {
@@ -519,7 +519,7 @@ fn request_frame(request: &GuardianRequest) -> Result<Frame> {
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn response_frame(sequence: Counter, response: &GuardianResponse) -> Result<Frame> {
     let payload = serde_json::to_vec(&(SERVICE_VERSION, response))?;
     if payload.len() > MAX_CONTROL_BYTES {
@@ -533,7 +533,7 @@ fn response_frame(sequence: Counter, response: &GuardianResponse) -> Result<Fram
     })
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn parse_request(frame: Frame) -> Result<GuardianRequest> {
     require_control_frame(&frame)?;
     let (version, request): (u16, GuardianRequest) = serde_json::from_slice(&frame.payload)?;
@@ -543,7 +543,7 @@ fn parse_request(frame: Frame) -> Result<GuardianRequest> {
     Ok(request)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn parse_response(frame: Frame) -> Result<GuardianResponse> {
     require_control_frame(&frame)?;
     if frame.sequence != Counter::ONE {
@@ -556,7 +556,7 @@ fn parse_response(frame: Frame) -> Result<GuardianResponse> {
     Ok(response)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn require_control_frame(frame: &Frame) -> Result<()> {
     if frame.kind != FrameKind::Control || frame.stream != 0 || frame.sequence == Counter::ZERO {
         return Err(Error::Protocol("invalid guardian control frame"));

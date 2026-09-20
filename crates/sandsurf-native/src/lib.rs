@@ -9,6 +9,10 @@ pub mod linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod local;
 
+#[cfg(target_os = "windows")]
+#[path = "local_windows.rs"]
+pub mod local;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod filesystem;
 

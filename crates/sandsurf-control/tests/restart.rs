@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use sandsurf_control::*;
 use sandsurf_native::local::LocalConnection;
@@ -6,6 +6,7 @@ use sandsurf_protocol::*;
 use sandsurf_state::*;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,7 +31,10 @@ impl Root {
                 .as_nanos(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         ));
+        #[cfg(unix)]
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        #[cfg(windows)]
+        sandsurf_native::local::create_private_directory(&path).unwrap();
         Self(path)
     }
 }
@@ -289,7 +293,10 @@ fn guardian_process_fixture() {
 fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let fixture = Fixture::new();
     let endpoint = fixture.root.0.join("endpoint");
+    #[cfg(unix)]
     fs::DirBuilder::new().mode(0o700).create(&endpoint).unwrap();
+    #[cfg(windows)]
+    sandsurf_native::local::create_private_directory(&endpoint).unwrap();
     let child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("guardian_process_fixture")
@@ -301,8 +308,6 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         .spawn()
         .unwrap();
     let _child = ChildGuard(child);
-    wait_for(&endpoint.join("control.sock"));
-
     let authorization = fixture
         .host
         .authorize(
@@ -318,7 +323,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         },
     ))
     .unwrap();
-    let mut connection = LocalConnection::connect(&endpoint, Duration::from_secs(2)).unwrap();
+    let mut connection = wait_for_guardian(&endpoint);
     connection
         .write_frame(
             &Frame {
@@ -330,8 +335,8 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
             Duration::from_secs(2),
         )
         .unwrap();
-    drop(connection); // The effect may commit, but its reply is deliberately lost.
     wait_for(&fixture.root.0.join("effects.log"));
+    drop(connection); // The effect committed, but its reply is deliberately lost.
 
     let host_path = fixture.root.0.join("host");
     drop(fixture.host);
@@ -415,5 +420,16 @@ fn wait_for(path: &Path) {
     while !path.exists() {
         assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_guardian(endpoint: &Path) -> LocalConnection {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match LocalConnection::connect(endpoint, Duration::from_millis(100)) {
+            Ok(connection) => return connection,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("timed out waiting for guardian at {endpoint:?}: {error}"),
+        }
     }
 }

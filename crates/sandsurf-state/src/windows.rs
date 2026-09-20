@@ -260,6 +260,8 @@ fn validate(file: &File, directory: bool, protected: bool) -> io::Result<(u32, u
 }
 
 fn information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain output storage initialized by
+    // GetFileInformationByHandle before any field is observed.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
     // SAFETY: information is writable and file owns a live kernel handle.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
