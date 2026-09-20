@@ -17,3 +17,6 @@ windows-sys = { workspace = true, features = [
   "Win32_System_HostComputeSystem",
   "Win32_System_Memory",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandbox-vm = { path = "../sandbox-vm" }

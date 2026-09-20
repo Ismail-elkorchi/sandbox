@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -235,6 +235,52 @@ impl FirecrackerProcess {
 
     pub fn terminate(&mut self) -> Result<(), FirecrackerError> {
         send_launcher_terminate(&mut self.control)?;
+        Ok(())
+    }
+
+    /// Pause vCPUs through the private Firecracker API and wait for the API's
+    /// committed response. This retains the VMM and guest memory.
+    pub fn pause(&self) -> Result<(), FirecrackerError> {
+        self.patch_vm_state("Paused")
+    }
+
+    /// Resume a VM previously paused through the same private API socket.
+    pub fn resume(&self) -> Result<(), FirecrackerError> {
+        self.patch_vm_state("Resumed")
+    }
+
+    fn patch_vm_state(&self, state: &str) -> Result<(), FirecrackerError> {
+        let body = serde_json::to_vec(&serde_json::json!({ "state": state }))
+            .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+        let mut connection = UnixStream::connect(&self.api_socket_path)?;
+        connection.set_read_timeout(Some(Duration::from_secs(10)))?;
+        connection.set_write_timeout(Some(Duration::from_secs(10)))?;
+        write!(
+            connection,
+            "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        connection.write_all(&body)?;
+        connection.flush()?;
+        let mut response = Vec::new();
+        connection.take(64 * 1024 + 1).read_to_end(&mut response)?;
+        if response.len() > 64 * 1024 {
+            return Err(FirecrackerError::Setup(
+                "Firecracker API response exceeds 64 KiB".into(),
+            ));
+        }
+        let Some(line_end) = response.windows(2).position(|value| value == b"\r\n") else {
+            return Err(FirecrackerError::Setup(
+                "Firecracker API response has no status line".into(),
+            ));
+        };
+        let status = std::str::from_utf8(&response[..line_end])
+            .map_err(|_| FirecrackerError::Setup("Firecracker API status is not UTF-8".into()))?;
+        if status != "HTTP/1.1 204 No Content" && status != "HTTP/1.0 204 No Content" {
+            return Err(FirecrackerError::Setup(format!(
+                "Firecracker API rejected VM state change: {status}"
+            )));
+        }
         Ok(())
     }
 

@@ -515,6 +515,7 @@ dependencies = [
 name = "sandsurf-machine"
 version = "0.1.0"
 dependencies = [
+ "sandbox-vm",
  "sandsurf-protocol",
  "serde",
  "serde_json",
