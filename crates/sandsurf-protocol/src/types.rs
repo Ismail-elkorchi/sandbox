@@ -193,6 +193,18 @@ pub struct LifecycleIntent {
     pub completion: Option<ObservationRef>,
 }
 
+/// Stable host command material. Completion is deliberately excluded because it
+/// is a later host reference to guardian evidence, not part of dispatch authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleCommand {
+    pub sandbox_id: SandboxId,
+    pub operation_id: OperationId,
+    pub desired: DesiredState,
+    pub revision: Counter,
+    pub request_digest: Digest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationRef {
@@ -298,6 +310,22 @@ pub struct AuthorizedMutation {
     pub signature: AuthoritySignature,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedLifecycleStatement {
+    pub version: u16,
+    pub host_id: HostId,
+    pub key_id: Digest,
+    pub command: LifecycleCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedLifecycle {
+    pub statement: AuthorizedLifecycleStatement,
+    pub signature: AuthoritySignature,
+}
+
 /// Host authorization for loss of one complete receipt-bound output scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -335,6 +363,9 @@ pub enum GuardianRequest {
     Dispatch {
         authorization: AuthorizedMutation,
     },
+    Transition {
+        authorization: AuthorizedLifecycle,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +374,7 @@ pub struct GuardianInspection {
     pub sandbox_id: SandboxId,
     pub observation: Observation<MachineObservation>,
     pub operation: Option<Operation>,
+    pub lifecycle_operation: Option<LifecycleOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,8 +385,9 @@ pub struct GuardianInspection {
     deny_unknown_fields
 )]
 pub enum GuardianResponse {
-    Inspection { value: GuardianInspection },
+    Inspection { value: Box<GuardianInspection> },
     Dispatch { operation: Operation },
+    Lifecycle { operation: LifecycleOperation },
     Rejected { category: String, message: String },
 }
 
@@ -375,6 +408,15 @@ pub struct Operation {
     pub capability: Capability,
     pub delivery: Delivery,
     pub evidence_digest: Option<Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LifecycleOperation {
+    pub command: LifecycleCommand,
+    pub delivery: Delivery,
+    pub evidence_digest: Option<Digest>,
+    pub observation: Option<ObservationRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

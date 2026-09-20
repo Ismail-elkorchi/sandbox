@@ -205,12 +205,64 @@ impl HostCatalog {
         intent(&self.db.connection, operation)
     }
 
+    pub fn authorize_lifecycle(&self, operation: &OperationId) -> Result<AuthorizedLifecycle> {
+        let intent = self
+            .intent(operation)?
+            .ok_or(Error::Missing("lifecycle intent is missing"))?;
+        self.authority.authorize_lifecycle(LifecycleCommand {
+            sandbox_id: intent.sandbox_id,
+            operation_id: intent.operation_id,
+            desired: intent.desired,
+            revision: intent.revision,
+            request_digest: intent.request_digest,
+        })
+    }
+
     /// Called with evidence read from the exclusively owned guardian journal, not client observations.
     pub fn complete_intent(
         &mut self,
         evidence: &crate::CommittedObservation,
     ) -> Result<LifecycleIntent> {
         let observation = evidence.value();
+        let reference = evidence.reference()?;
+        self.complete_intent_observation(observation, reference)
+    }
+
+    /// Commit a host reference to lifecycle evidence received over the trusted
+    /// host/guardian route. The guardian operation and observation are checked
+    /// together; neither an application acknowledgement nor cached state suffices.
+    pub fn complete_lifecycle_operation(
+        &mut self,
+        operation: &LifecycleOperation,
+        observation: &MachineObservation,
+    ) -> Result<LifecycleIntent> {
+        let reference = operation
+            .observation
+            .clone()
+            .ok_or(Error::Conflict("lifecycle operation has no observation"))?;
+        if operation.delivery != Delivery::Applied
+            || operation.evidence_digest.is_none()
+            || operation.command.sandbox_id != observation.sandbox_id
+            || operation.command.operation_id != observation.operation_id
+            || operation.command.revision != observation.applied_revision
+            || !observation.state.satisfies(operation.command.desired)
+            || reference.sandbox_id != observation.sandbox_id
+            || reference.epoch != observation.epoch
+            || reference.sequence != observation.sequence
+            || reference.digest != digest(Domain::Operation, observation)?
+        {
+            return Err(Error::Conflict(
+                "guardian lifecycle evidence does not establish completion",
+            ));
+        }
+        self.complete_intent_observation(observation, reference)
+    }
+
+    fn complete_intent_observation(
+        &mut self,
+        observation: &MachineObservation,
+        reference: ObservationRef,
+    ) -> Result<LifecycleIntent> {
         let tx = self.db.connection.transaction()?;
         let mut value = intent(&tx, &observation.operation_id)?
             .ok_or(Error::Missing("lifecycle intent is missing"))?;
@@ -222,12 +274,6 @@ impl HostCatalog {
                 "guardian evidence does not establish the requested postcondition",
             ));
         }
-        let reference = ObservationRef {
-            sandbox_id: observation.sandbox_id.clone(),
-            epoch: observation.epoch,
-            sequence: observation.sequence,
-            digest: digest(Domain::Operation, observation)?,
-        };
         if let Some(old) = &value.completion {
             if *old != reference {
                 return Err(Error::Conflict(

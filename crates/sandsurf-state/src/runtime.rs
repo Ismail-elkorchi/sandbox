@@ -16,6 +16,7 @@ const SCHEMA: &str = "
 CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
@@ -43,6 +44,14 @@ pub struct CommittedObservation(MachineObservation);
 impl CommittedObservation {
     pub fn value(&self) -> &MachineObservation {
         &self.0
+    }
+    pub fn reference(&self) -> Result<ObservationRef> {
+        Ok(ObservationRef {
+            sandbox_id: self.0.sandbox_id.clone(),
+            epoch: self.0.epoch,
+            sequence: self.0.sequence,
+            digest: digest(Domain::Operation, &self.0)?,
+        })
     }
 }
 
@@ -80,6 +89,21 @@ pub enum DispatchDecision<'guardian> {
 pub struct DispatchPermit<'guardian> {
     authority: AuthorizedMutation,
     _guardian: &'guardian mut RuntimeJournal,
+}
+
+pub enum LifecycleDecision<'guardian> {
+    Perform(LifecyclePermit<'guardian>),
+    Reconcile(LifecycleOperation),
+}
+
+pub struct LifecyclePermit<'guardian> {
+    authority: AuthorizedLifecycle,
+    _guardian: &'guardian mut RuntimeJournal,
+}
+impl LifecyclePermit<'_> {
+    pub fn perform<T>(self, effect: impl FnOnce(&LifecycleCommand) -> T) -> T {
+        effect(&self.authority.statement.command)
+    }
 }
 impl DispatchPermit<'_> {
     pub fn perform<T>(self, effect: impl FnOnce(&Mutation, &Capability) -> T) -> T {
@@ -225,6 +249,170 @@ impl RuntimeJournal {
         operation(&self.db.connection, id)
     }
 
+    pub fn lifecycle_operation(&self, id: &OperationId) -> Result<Option<LifecycleOperation>> {
+        lifecycle_operation(&self.db.connection, id)
+    }
+
+    pub fn admit_lifecycle(
+        &mut self,
+        authorization: AuthorizedLifecycle,
+    ) -> Result<LifecycleOperation> {
+        self.authority.verify_lifecycle(&authorization)?;
+        let command = authorization.statement.command;
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = lifecycle_operation(&tx, &command.operation_id)? {
+            return if old.command == command {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "lifecycle operation identity already bound",
+                ))
+            };
+        }
+        let workload_operation: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
+            [command.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let disk_operation: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
+            [command.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if workload_operation || disk_operation {
+            return Err(Error::Conflict(
+                "operation identity already belongs to another guardian operation",
+            ));
+        }
+        require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
+        operation_capacity(&tx, self.limits.operations)?;
+        let value = LifecycleOperation {
+            command,
+            delivery: Delivery::Admitted,
+            evidence_digest: None,
+            observation: None,
+        };
+        tx.execute(
+            "INSERT INTO lifecycle_operations VALUES (?1,?2)",
+            params![value.command.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn begin_lifecycle<'guardian>(
+        &'guardian mut self,
+        authorization: AuthorizedLifecycle,
+    ) -> Result<LifecycleDecision<'guardian>> {
+        self.authority.verify_lifecycle(&authorization)?;
+        let command = &authorization.statement.command;
+        let tx = self.db.connection.transaction()?;
+        let mut value = lifecycle_operation(&tx, &command.operation_id)?
+            .ok_or(Error::Missing("lifecycle operation is not admitted"))?;
+        if value.command != *command {
+            return Err(Error::Conflict("lifecycle authority mismatch"));
+        }
+        if value.delivery != Delivery::Admitted {
+            return Ok(LifecycleDecision::Reconcile(value));
+        }
+        require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
+        value.delivery = Delivery::Dispatched;
+        tx.execute(
+            "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
+            params![command.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(LifecycleDecision::Perform(LifecyclePermit {
+            authority: authorization,
+            _guardian: self,
+        }))
+    }
+
+    pub fn record_lifecycle_delivery(
+        &mut self,
+        id: &OperationId,
+        request: &Digest,
+        delivery: Delivery,
+        evidence: Option<Digest>,
+        observed: Option<ObservationRef>,
+    ) -> Result<LifecycleOperation> {
+        if matches!(delivery, Delivery::Admitted | Delivery::Dispatched) {
+            return Err(Error::Conflict(
+                "lifecycle admission and dispatch require their dedicated gates",
+            ));
+        }
+        let committed = observed
+            .as_ref()
+            .map(|reference| self.observation_at(reference))
+            .transpose()?;
+        let tx = self.db.connection.transaction()?;
+        let mut value = lifecycle_operation(&tx, id)?
+            .ok_or(Error::Missing("lifecycle operation is missing"))?;
+        if value.command.request_digest != *request {
+            return Err(Error::Conflict("lifecycle request digest mismatch"));
+        }
+        if value.delivery == delivery
+            && value.evidence_digest == evidence
+            && value.observation == observed
+        {
+            return Ok(value);
+        }
+        let allowed = matches!(
+            (value.delivery, delivery),
+            (Delivery::Admitted, Delivery::NotApplied)
+                | (
+                    Delivery::Dispatched,
+                    Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+                )
+                | (Delivery::Unknown, Delivery::Applied | Delivery::NotApplied)
+        );
+        if !allowed {
+            return Err(Error::Conflict("invalid lifecycle delivery transition"));
+        }
+        match delivery {
+            Delivery::Applied => {
+                let observation = committed
+                    .as_ref()
+                    .ok_or(Error::Conflict("applied lifecycle requires an observation"))?
+                    .value();
+                if evidence.is_none()
+                    || observation.operation_id != value.command.operation_id
+                    || observation.sandbox_id != value.command.sandbox_id
+                    || observation.applied_revision != value.command.revision
+                    || !observation.state.satisfies(value.command.desired)
+                {
+                    return Err(Error::Conflict(
+                        "lifecycle observation does not establish its postcondition",
+                    ));
+                }
+            }
+            Delivery::NotApplied => {
+                if evidence.is_none() || observed.is_some() {
+                    return Err(Error::Conflict(
+                        "not-applied lifecycle requires evidence and no observation",
+                    ));
+                }
+            }
+            Delivery::Unknown => {
+                if evidence.is_some() || observed.is_some() {
+                    return Err(Error::Conflict(
+                        "unknown lifecycle delivery cannot claim completion evidence",
+                    ));
+                }
+            }
+            Delivery::Admitted | Delivery::Dispatched => unreachable!(),
+        }
+        value.delivery = delivery;
+        value.evidence_digest = evidence;
+        value.observation = observed;
+        tx.execute(
+            "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
+            params![id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     pub fn admit(&mut self, authorization: AuthorizedMutation) -> Result<Operation> {
         self.authority.verify_mutation(&authorization)?;
         let statement = authorization.statement;
@@ -257,7 +445,7 @@ impl RuntimeJournal {
                 "machine epoch, applied revision or state does not admit work",
             ));
         }
-        capacity(&tx, "operations", self.limits.operations)?;
+        operation_capacity(&tx, self.limits.operations)?;
         let value = Operation {
             request,
             capability: statement.capability,
@@ -999,6 +1187,44 @@ fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool 
             | (Destroying, Destroyed)
     )
 }
+fn require_lifecycle_state(
+    sandbox: &SandboxId,
+    current: Option<&MachineObservation>,
+    command: &LifecycleCommand,
+) -> Result<()> {
+    if &command.sandbox_id != sandbox {
+        return Err(Error::Conflict(
+            "lifecycle command belongs to another sandbox",
+        ));
+    }
+    match current {
+        None if command.revision == Counter::ONE && command.desired == DesiredState::Running => {
+            Ok(())
+        }
+        Some(observed)
+            if observed.state != MachineState::Destroyed
+                && command.revision == observed.applied_revision.next()? =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Conflict(
+            "lifecycle command is stale or incompatible with observed machine state",
+        )),
+    }
+}
+fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
+    let count: u64 = db.query_row(
+        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations)",
+        [],
+        |row| row.get(0),
+    )?;
+    if count >= limit.get() {
+        return Err(Error::Capacity(
+            "durable operation capacity exhausted; no evidence evicted",
+        ));
+    }
+    Ok(())
+}
 fn operation(db: &rusqlite::Connection, id: &OperationId) -> Result<Option<Operation>> {
     db.query_row(
         "SELECT value FROM operations WHERE id=?1",
@@ -1007,6 +1233,19 @@ fn operation(db: &rusqlite::Connection, id: &OperationId) -> Result<Option<Opera
     )
     .optional()?
     .map(|s| decode(&s))
+    .transpose()
+}
+fn lifecycle_operation(
+    db: &rusqlite::Connection,
+    id: &OperationId,
+) -> Result<Option<LifecycleOperation>> {
+    db.query_row(
+        "SELECT value FROM lifecycle_operations WHERE id=?1",
+        [id.as_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| decode(&value))
     .transpose()
 }
 fn receipt(db: &rusqlite::Connection, id: &ProcessId) -> Result<Option<(Receipt, Digest)>> {

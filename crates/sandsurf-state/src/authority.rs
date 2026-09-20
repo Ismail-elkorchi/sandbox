@@ -89,6 +89,23 @@ impl HostAuthority {
         })
     }
 
+    pub(crate) fn authorize_lifecycle(
+        &self,
+        command: LifecycleCommand,
+    ) -> Result<AuthorizedLifecycle> {
+        let statement = AuthorizedLifecycleStatement {
+            version: AUTHORITY_VERSION,
+            host_id: self.binding.host_id.clone(),
+            key_id: self.binding.key_id.clone(),
+            command,
+        };
+        let signature = self.sign("host-authorized-lifecycle-v1", &statement)?;
+        Ok(AuthorizedLifecycle {
+            statement,
+            signature,
+        })
+    }
+
     pub(crate) fn authorize_loss(
         &self,
         sandbox_id: SandboxId,
@@ -154,6 +171,17 @@ impl AuthorityVerifier {
             &value.statement.host_id,
             &value.statement.key_id,
             "host-authorized-mutation-v1",
+            &value.statement,
+            &value.signature,
+        )
+    }
+
+    pub(crate) fn verify_lifecycle(&self, value: &AuthorizedLifecycle) -> Result<()> {
+        self.verify_statement(
+            value.statement.version,
+            &value.statement.host_id,
+            &value.statement.key_id,
+            "host-authorized-lifecycle-v1",
             &value.statement,
             &value.signature,
         )

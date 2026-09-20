@@ -71,8 +71,27 @@ pub enum EffectOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineTransition {
+    pub epoch: Counter,
+    pub state: MachineState,
+    pub evidence_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleEffect {
+    Observed(Vec<MachineTransition>),
+    NotApplied(Digest),
+    Unknown,
+}
+
 pub trait GuardianEffect {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome;
+    fn transition(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> LifecycleEffect;
 }
 
 pub struct Guardian<E> {
@@ -115,12 +134,18 @@ impl<E: GuardianEffect> Guardian<E> {
                     .map(|id| self.journal.operation(id))
                     .transpose()?
                     .flatten();
+                let lifecycle_operation = operation_id
+                    .as_ref()
+                    .map(|id| self.journal.lifecycle_operation(id))
+                    .transpose()?
+                    .flatten();
                 Ok(GuardianResponse::Inspection {
-                    value: GuardianInspection {
+                    value: Box::new(GuardianInspection {
                         sandbox_id,
                         observation,
                         operation,
-                    },
+                        lifecycle_operation,
+                    }),
                 })
             }
             GuardianRequest::Dispatch { authorization } => {
@@ -157,7 +182,113 @@ impl<E: GuardianEffect> Guardian<E> {
                 };
                 Ok(GuardianResponse::Dispatch { operation })
             }
+            GuardianRequest::Transition { authorization } => {
+                let command = authorization.statement.command.clone();
+                let current = self
+                    .journal
+                    .last_observation()?
+                    .map(|value| value.value().clone());
+                self.journal.admit_lifecycle(authorization.clone())?;
+                let operation = match self.journal.begin_lifecycle(authorization)? {
+                    sandsurf_state::LifecycleDecision::Reconcile(operation) => {
+                        self.reconcile_lifecycle(operation)?
+                    }
+                    sandsurf_state::LifecycleDecision::Perform(permit) => {
+                        let outcome = permit
+                            .perform(|actual| self.effect.transition(actual, current.as_ref()));
+                        match outcome {
+                            LifecycleEffect::Observed(transitions) => {
+                                if transitions.is_empty() || transitions.len() > 8 {
+                                    return Err(Error::Protocol(
+                                        "native lifecycle returned an invalid observation count",
+                                    ));
+                                }
+                                let mut references = Vec::with_capacity(transitions.len());
+                                for transition in transitions {
+                                    let sequence = match self.journal.last_observation()? {
+                                        Some(value) => {
+                                            value.value().sequence.next().map_err(|_| {
+                                                Error::Protocol(
+                                                    "guardian observation sequence overflow",
+                                                )
+                                            })?
+                                        }
+                                        None => Counter::ONE,
+                                    };
+                                    let committed = self.journal.observe(MachineObservation {
+                                        sandbox_id: command.sandbox_id.clone(),
+                                        epoch: transition.epoch,
+                                        sequence,
+                                        state: transition.state,
+                                        applied_revision: command.revision,
+                                        operation_id: command.operation_id.clone(),
+                                        evidence_digest: transition.evidence_digest,
+                                    })?;
+                                    references.push(committed.reference()?);
+                                }
+                                let final_observation =
+                                    self.journal.last_observation()?.ok_or(Error::Protocol(
+                                        "native lifecycle produced no committed observation",
+                                    ))?;
+                                if !final_observation.value().state.satisfies(command.desired) {
+                                    return Err(Error::Protocol(
+                                        "native lifecycle did not establish the desired state",
+                                    ));
+                                }
+                                let evidence =
+                                    digest(Domain::Operation, &references).map_err(|_| {
+                                        Error::Protocol("lifecycle evidence digest failed")
+                                    })?;
+                                self.journal.record_lifecycle_delivery(
+                                    &command.operation_id,
+                                    &command.request_digest,
+                                    Delivery::Applied,
+                                    Some(evidence),
+                                    Some(final_observation.reference()?),
+                                )?
+                            }
+                            LifecycleEffect::NotApplied(evidence) => {
+                                self.journal.record_lifecycle_delivery(
+                                    &command.operation_id,
+                                    &command.request_digest,
+                                    Delivery::NotApplied,
+                                    Some(evidence),
+                                    None,
+                                )?
+                            }
+                            LifecycleEffect::Unknown => self.journal.record_lifecycle_delivery(
+                                &command.operation_id,
+                                &command.request_digest,
+                                Delivery::Unknown,
+                                None,
+                                None,
+                            )?,
+                        }
+                    }
+                };
+                Ok(GuardianResponse::Lifecycle { operation })
+            }
         }
+    }
+
+    fn reconcile_lifecycle(&mut self, operation: LifecycleOperation) -> Result<LifecycleOperation> {
+        if matches!(operation.delivery, Delivery::Dispatched | Delivery::Unknown)
+            && let Some(observed) = self.journal.last_observation()?
+            && observed.value().operation_id == operation.command.operation_id
+            && observed.value().state.satisfies(operation.command.desired)
+        {
+            let reference = observed.reference()?;
+            let evidence = digest(Domain::Operation, &("reconciled-lifecycle-v1", &reference))
+                .map_err(|_| Error::Protocol("lifecycle evidence digest failed"))?;
+            return Ok(self.journal.record_lifecycle_delivery(
+                &operation.command.operation_id,
+                &operation.command.request_digest,
+                Delivery::Applied,
+                Some(evidence),
+                Some(reference),
+            )?);
+        }
+        Ok(operation)
     }
 }
 
@@ -184,6 +315,51 @@ pub struct HostGuardianLink<'host> {
     guardian: GuardianClient,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLifecycleResult {
+    pub guardian_operation: LifecycleOperation,
+    pub completed_intent: Option<LifecycleIntent>,
+}
+
+/// Route one already-authorized host intent, then commit only guardian evidence
+/// that establishes its postcondition. Ambiguous/not-applied delivery leaves the
+/// host intent pending and returns the guardian operation unchanged.
+pub fn apply_lifecycle(
+    catalog: &mut HostCatalog,
+    endpoint: PathBuf,
+    operation_id: &OperationId,
+) -> Result<HostLifecycleResult> {
+    let authorization = catalog.authorize_lifecycle(operation_id)?;
+    let client = GuardianClient::new(endpoint);
+    let operation = client.transition(authorization)?;
+    let completed_intent = if operation.delivery == Delivery::Applied {
+        let inspection = client.inspect(
+            operation.command.sandbox_id.clone(),
+            Some(operation.command.operation_id.clone()),
+        )?;
+        let observation = match inspection.observation {
+            Observation::Current { value } => value,
+            Observation::Unavailable { .. } => {
+                return Err(Error::Protocol(
+                    "applied lifecycle observation is unavailable",
+                ));
+            }
+        };
+        if inspection.lifecycle_operation.as_ref() != Some(&operation) {
+            return Err(Error::Protocol(
+                "guardian lifecycle inspection changed during completion",
+            ));
+        }
+        Some(catalog.complete_lifecycle_operation(&operation, &observation)?)
+    } else {
+        None
+    };
+    Ok(HostLifecycleResult {
+        guardian_operation: operation,
+        completed_intent,
+    })
+}
+
 impl<'host> HostGuardianLink<'host> {
     pub fn new(catalog: &'host HostCatalog, endpoint: PathBuf) -> Self {
         Self {
@@ -200,6 +376,11 @@ impl<'host> HostGuardianLink<'host> {
     ) -> Result<Operation> {
         let authorization = self.catalog.authorize(mutation, capability, scope_digest)?;
         self.guardian.dispatch(authorization)
+    }
+
+    pub fn transition(&self, operation_id: &OperationId) -> Result<LifecycleOperation> {
+        let authorization = self.catalog.authorize_lifecycle(operation_id)?;
+        self.guardian.transition(authorization)
     }
 
     pub fn inspect(
@@ -225,8 +406,11 @@ impl GuardianClient {
             sandbox_id,
             operation_id,
         })? {
-            GuardianResponse::Inspection { value } => Ok(value),
+            GuardianResponse::Inspection { value } => Ok(*value),
             GuardianResponse::Dispatch { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
+            GuardianResponse::Lifecycle { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
             GuardianResponse::Rejected { category, message } => {
@@ -239,6 +423,21 @@ impl GuardianClient {
         match self.call(GuardianRequest::Dispatch { authorization })? {
             GuardianResponse::Dispatch { operation } => Ok(operation),
             GuardianResponse::Inspection { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
+            GuardianResponse::Lifecycle { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
+            GuardianResponse::Rejected { category, message } => {
+                Err(Error::Rejected { category, message })
+            }
+        }
+    }
+
+    pub fn transition(&self, authorization: AuthorizedLifecycle) -> Result<LifecycleOperation> {
+        match self.call(GuardianRequest::Transition { authorization })? {
+            GuardianResponse::Lifecycle { operation } => Ok(operation),
+            GuardianResponse::Inspection { .. } | GuardianResponse::Dispatch { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
             GuardianResponse::Rejected { category, message } => {
@@ -261,6 +460,7 @@ impl GuardianClient {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn call(&self, _: GuardianRequest) -> Result<GuardianResponse> {
+        let _ = &self.endpoint;
         Err(Error::Unsupported(
             "native guardian control transport is not implemented on this host",
         ))

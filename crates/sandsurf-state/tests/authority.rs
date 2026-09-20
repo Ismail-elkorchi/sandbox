@@ -500,6 +500,21 @@ fn stop_intent_is_not_stopped_observation() {
         )
         .unwrap();
     assert_eq!(intent.completion, None);
+    let authorization = f.host.authorize_lifecycle(&operation).unwrap();
+    assert_eq!(
+        f.runtime
+            .admit_lifecycle(authorization.clone())
+            .unwrap()
+            .delivery,
+        Delivery::Admitted
+    );
+    match f.runtime.begin_lifecycle(authorization).unwrap() {
+        LifecycleDecision::Perform(permit) => permit.perform(|command| {
+            assert_eq!(command.operation_id, operation);
+            assert_eq!(command.desired, DesiredState::Stopped);
+        }),
+        LifecycleDecision::Reconcile(_) => panic!("first lifecycle dispatch must be new"),
+    }
     let mut fresh = f.mutation.clone();
     fresh.expected_revision = n(3);
     assert!(
@@ -518,9 +533,21 @@ fn stop_intent_is_not_stopped_observation() {
     observation.sequence = n(5);
     observation.state = MachineState::Stopped;
     let evidence = f.runtime.observe(observation).unwrap();
+    let reference = evidence.reference().unwrap();
+    let lifecycle = f
+        .runtime
+        .record_lifecycle_delivery(
+            &operation,
+            &intent.request_digest,
+            Delivery::Applied,
+            Some(hash("native-stop")),
+            Some(reference),
+        )
+        .unwrap();
+    assert_eq!(lifecycle.delivery, Delivery::Applied);
     assert!(
         f.host
-            .complete_intent(&evidence)
+            .complete_lifecycle_operation(&lifecycle, evidence.value())
             .unwrap()
             .completion
             .is_some()
@@ -529,6 +556,43 @@ fn stop_intent_is_not_stopped_observation() {
         f.host.intent(&operation).unwrap().unwrap().desired,
         DesiredState::Stopped
     );
+}
+
+#[test]
+fn interrupted_lifecycle_dispatch_is_reconciled_without_replay() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "pause-with-lost-response".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &operation, n(2), DesiredState::Paused),
+    )
+    .unwrap();
+    f.host
+        .request_lifecycle(
+            &f.sandbox,
+            operation.clone(),
+            n(2),
+            DesiredState::Paused,
+            Approval {
+                id: "approve-pause".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    let authorization = f.host.authorize_lifecycle(&operation).unwrap();
+    f.runtime.admit_lifecycle(authorization.clone()).unwrap();
+    drop(f.runtime.begin_lifecycle(authorization.clone()).unwrap());
+    assert!(matches!(
+        f.runtime.begin_lifecycle(authorization).unwrap(),
+        LifecycleDecision::Reconcile(LifecycleOperation {
+            delivery: Delivery::Dispatched,
+            ..
+        })
+    ));
+
+    let mut tampered = f.host.authorize_lifecycle(&operation).unwrap();
+    tampered.statement.command.desired = DesiredState::Destroyed;
+    assert!(f.runtime.admit_lifecycle(tampered).is_err());
 }
 
 #[test]

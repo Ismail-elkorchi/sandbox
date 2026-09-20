@@ -17,8 +17,12 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "sandsurf-guardian-test-{}-{}-{}",
+        #[cfg(target_os = "macos")]
+        let temporary = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let temporary = std::env::temp_dir();
+        let path = temporary.join(format!(
+            "ssf-g-{}-{:x}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -228,6 +232,40 @@ impl GuardianEffect for FileEffect {
             .unwrap(),
         )
     }
+
+    fn transition(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> LifecycleEffect {
+        let epoch = current.map_or(Counter::ONE, |value| value.epoch);
+        let transition = |state| MachineTransition {
+            epoch,
+            state,
+            evidence_digest: digest(
+                Domain::Operation,
+                &(&command.operation_id, state, "mock-machine-observation"),
+            )
+            .unwrap(),
+        };
+        let states = match command.desired {
+            DesiredState::Running if current.is_none() => {
+                vec![
+                    transition(MachineState::Creating),
+                    transition(MachineState::Running),
+                ]
+            }
+            DesiredState::Running => vec![transition(MachineState::Running)],
+            DesiredState::Paused => vec![transition(MachineState::Paused)],
+            DesiredState::Stopped => vec![transition(MachineState::Stopped)],
+            DesiredState::Suspended => vec![transition(MachineState::Suspended)],
+            DesiredState::Destroyed => vec![
+                transition(MachineState::Destroying),
+                transition(MachineState::Destroyed),
+            ],
+        };
+        LifecycleEffect::Observed(states)
+    }
 }
 
 #[test]
@@ -297,7 +335,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
 
     let host_path = fixture.root.0.join("host");
     drop(fixture.host);
-    let host = HostCatalog::open(&host_path).unwrap();
+    let mut host = HostCatalog::open(&host_path).unwrap();
     let link = HostGuardianLink::new(&host, endpoint.clone());
     let operation = link
         .dispatch(
@@ -330,6 +368,46 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         }
     ));
     assert_eq!(inspection.operation, Some(operation));
+    assert_eq!(inspection.lifecycle_operation, None);
+    drop(link);
+
+    let pause: OperationId = "pause-machine".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&fixture.sandbox, &pause, n(2), DesiredState::Paused),
+    )
+    .unwrap();
+    host.request_lifecycle(
+        &fixture.sandbox,
+        pause.clone(),
+        n(2),
+        DesiredState::Paused,
+        Approval {
+            id: "approve-pause-machine".try_into().unwrap(),
+            request_digest,
+        },
+    )
+    .unwrap();
+    assert_eq!(host.intent(&pause).unwrap().unwrap().completion, None);
+    let result = apply_lifecycle(&mut host, endpoint.clone(), &pause).unwrap();
+    let lifecycle = result.guardian_operation;
+    assert_eq!(lifecycle.delivery, Delivery::Applied);
+    assert!(result.completed_intent.unwrap().completion.is_some());
+    let link = HostGuardianLink::new(&host, endpoint);
+    let inspection = link
+        .inspect(fixture.sandbox.clone(), Some(pause.clone()))
+        .unwrap();
+    assert!(matches!(
+        inspection.observation,
+        Observation::Current {
+            value: MachineObservation {
+                state: MachineState::Paused,
+                ..
+            }
+        }
+    ));
+    assert_eq!(inspection.lifecycle_operation, Some(lifecycle));
+    assert!(host.intent(&pause).unwrap().unwrap().completion.is_some());
 }
 
 fn wait_for(path: &Path) {
