@@ -148,6 +148,9 @@ impl RuntimeJournal {
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
     }
+    pub fn sandbox_id(&self) -> &SandboxId {
+        &self.sandbox
+    }
     pub fn last_observation(&self) -> Result<Option<CommittedObservation>> {
         Ok(observation(&self.db.connection)?.map(CommittedObservation))
     }

@@ -501,6 +501,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandsurf-control"
+version = "0.1.0"
+dependencies = [
+ "sandsurf-native",
+ "sandsurf-protocol",
+ "sandsurf-state",
+ "serde_json",
+]
+
+[[package]]
 name = "sandsurf-native"
 version = "0.1.0"
 dependencies = [

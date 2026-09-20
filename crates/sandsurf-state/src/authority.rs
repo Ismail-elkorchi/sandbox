@@ -208,8 +208,10 @@ fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
         return Err(Error::Corrupt("authority hex value has an invalid length"));
     }
     let mut output = [0_u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    let bytes = value.as_bytes();
+    for (index, byte) in output.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = (nibble(bytes[offset])? << 4) | nibble(bytes[offset + 1])?;
     }
     Ok(output)
 }

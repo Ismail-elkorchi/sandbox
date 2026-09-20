@@ -320,6 +320,44 @@ pub struct AuthorizedLoss {
     pub signature: AuthoritySignature,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum GuardianRequest {
+    Inspect {
+        sandbox_id: SandboxId,
+        operation_id: Option<OperationId>,
+    },
+    Dispatch {
+        authorization: AuthorizedMutation,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuardianInspection {
+    pub sandbox_id: SandboxId,
+    pub observation: Observation<MachineObservation>,
+    pub operation: Option<Operation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum GuardianResponse {
+    Inspection { value: GuardianInspection },
+    Dispatch { operation: Operation },
+    Rejected { category: String, message: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Delivery {

@@ -56,6 +56,23 @@ fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
 }
 
 #[test]
+fn authority_and_guardian_messages_are_strict_and_bounded() {
+    assert!(AuthorityPublicKey::try_from("a".repeat(64)).is_ok());
+    assert!(AuthorityPublicKey::try_from("A".repeat(64)).is_err());
+    assert!(AuthoritySignature::try_from("b".repeat(128)).is_ok());
+    assert!(AuthoritySignature::try_from("b".repeat(127)).is_err());
+    assert!(
+        serde_json::from_value::<GuardianRequest>(json!({
+            "kind": "inspect",
+            "sandboxId": "box",
+            "operationId": null,
+            "currentGrants": []
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn fragmented_binary_frames_roundtrip_and_reject_all_truncations() {
     let frame = Frame {
         kind: FrameKind::Data,
