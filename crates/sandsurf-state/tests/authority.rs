@@ -59,6 +59,25 @@ fn catalog_limits() -> CatalogLimits {
         },
     }
 }
+
+#[test]
+fn private_catalog_cannot_be_admitted_below_replaceable_ancestry() {
+    let root = TempRoot::new();
+    let catalog = root.0.join("catalog");
+    drop(HostCatalog::create(&catalog, "ancestry".try_into().unwrap(), catalog_limits()).unwrap());
+    let before = fs::read(catalog.join("authority.sqlite")).unwrap();
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
+    let reopened = HostCatalog::open(&catalog);
+    let fresh = root.0.join("new-catalog");
+    let created = HostCatalog::create(&fresh, "new".try_into().unwrap(), catalog_limits());
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(reopened.is_err());
+    assert!(created.is_err());
+    assert_eq!(fs::read(catalog.join("authority.sqlite")).unwrap(), before);
+    assert!(!fresh.join("writer.lock").exists());
+    assert!(!fresh.join("authority.sqlite").exists());
+    drop(HostCatalog::open(&catalog).unwrap());
+}
 fn runtime_limits() -> RuntimeLimits {
     RuntimeLimits {
         identities: n(16),

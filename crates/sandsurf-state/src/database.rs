@@ -128,10 +128,8 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     if before.dev() != after.dev() || before.ino() != after.ino() {
         return Err(Error::Conflict("state directory changed during resolution"));
     }
-    #[cfg(target_os = "macos")]
-    for ancestor in canonical.parent().into_iter().flat_map(Path::ancestors) {
-        sandsurf_native::macos::require_protected_ancestor_acl(ancestor)?;
-    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    sandsurf_native::filesystem::require_protected_ancestors(&canonical)?;
     Ok(canonical)
 }
 

@@ -9,5 +9,8 @@ pub mod linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod local;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod filesystem;
+
 #[cfg(target_os = "macos")]
 pub mod macos;

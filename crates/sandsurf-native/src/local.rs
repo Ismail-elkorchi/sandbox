@@ -53,25 +53,6 @@ fn private(metadata: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
-fn protected_ancestors(path: &Path) -> io::Result<()> {
-    for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
-        let metadata = fs::symlink_metadata(ancestor)?;
-        // A private final directory is insufficient if another account can
-        // rename an ancestor between validation and native socket operations.
-        // Root/account-owned sticky directories allow /tmp without permitting
-        // another account to replace entries owned by this account or root.
-        if !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != uid())
-            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-        {
-            return Err(denied("endpoint ancestor permits foreign path replacement"));
-        }
-        #[cfg(target_os = "macos")]
-        crate::macos::require_protected_ancestor_acl(ancestor)?;
-    }
-    Ok(())
-}
-
 struct Directory {
     path: PathBuf,
     held: File,
@@ -100,7 +81,7 @@ impl Directory {
         Ok(root)
     }
     fn check(&self) -> io::Result<()> {
-        protected_ancestors(&self.path)?;
+        crate::filesystem::require_protected_ancestors(&self.path)?;
         #[cfg(target_os = "macos")]
         crate::macos::require_private_file_acl(&self.held)?;
         let actual = fs::symlink_metadata(&self.path)?;
@@ -319,7 +300,7 @@ impl LocalConnection {
                 return Err(io::Error::last_os_error());
             }
         }
-        stream.set_nonblocking(false)?;
+        stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
             peer,
@@ -414,21 +395,39 @@ impl Deadline {
     }
 }
 struct DeadlineIo<'a> {
+    // Keep the socket nonblocking and wait with poll. Darwin rejects setsockopt
+    // after peer shutdown, so per-read SO_RCVTIMEO updates can hide a real EOF.
     stream: &'a mut UnixStream,
     deadline: Deadline,
 }
 impl Read for DeadlineIo<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream
-            .set_read_timeout(Some(self.deadline.remaining()?))?;
-        self.stream.read(bytes)
+        loop {
+            self.deadline.remaining()?;
+            match self.stream.read(bytes) {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.deadline.poll(self.stream.as_raw_fd(), libc::POLLIN)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 impl Write for DeadlineIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream
-            .set_write_timeout(Some(self.deadline.remaining()?))?;
-        self.stream.write(bytes)
+        loop {
+            self.deadline.remaining()?;
+            match self.stream.write(bytes) {
+                Ok(count) => return Ok(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.deadline.poll(self.stream.as_raw_fd(), libc::POLLOUT)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(()) // Unix streams have no userspace buffering here.
