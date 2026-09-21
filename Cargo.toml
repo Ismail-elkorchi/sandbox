@@ -44,6 +44,7 @@ getrandom = { version = "=0.2.17", default-features = false, features = ["std"] 
 hmac = { version = "=0.12.1", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false }
 idna = { version = "=1.1.0", default-features = false, features = ["std", "compiled_data"] }
+unicode-normalization = "=0.1.25"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "limits", "fallible_uint"] }
 
 [profile.release]

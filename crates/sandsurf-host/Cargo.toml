@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 getrandom.workspace = true
+cap-std = "=4.0.3"
+libc.workspace = true
 sandsurf-control = { path = "../sandsurf-control" }
 sandsurf-machine = { path = "../sandsurf-machine" }
 sandsurf-native = { path = "../sandsurf-native" }
@@ -14,13 +16,14 @@ sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-state = { path = "../sandsurf-state" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+unicode-normalization.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sandbox-guest = { path = "../sandbox-guest" }
 sandbox-image = { path = "../sandbox-image" }
 sandbox-vm = { path = "../sandbox-vm" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
-sha2.workspace = true
 
 [[bin]]
 name = "sandsurf-host"

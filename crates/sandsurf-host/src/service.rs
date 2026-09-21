@@ -34,6 +34,7 @@ pub enum HostError {
     State(sandsurf_state::Error),
     Control(sandsurf_control::Error),
     Contract(sandsurf_protocol::Invalid),
+    Workspace(crate::workspace::WorkspaceError),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
     Invalid(&'static str),
@@ -47,6 +48,7 @@ impl fmt::Display for HostError {
             Self::State(error) => write!(output, "host catalog: {error}"),
             Self::Control(error) => write!(output, "host/guardian: {error}"),
             Self::Contract(error) => write!(output, "host contract: {error}"),
+            Self::Workspace(error) => error.fmt(output),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
@@ -79,6 +81,11 @@ impl From<sandsurf_protocol::Invalid> for HostError {
         Self::Contract(value)
     }
 }
+impl From<crate::workspace::WorkspaceError> for HostError {
+    fn from(value: crate::workspace::WorkspaceError) -> Self {
+        Self::Workspace(value)
+    }
+}
 #[cfg(target_os = "linux")]
 impl From<crate::linux::LinuxError> for HostError {
     fn from(value: crate::linux::LinuxError) -> Self {
@@ -93,6 +100,7 @@ pub struct HostService {
     catalog: HostCatalog,
     executable: PathBuf,
     verified_guardians: BTreeSet<SandboxId>,
+    workspace: crate::workspace::WorkspaceAuthority,
 }
 
 impl HostService {
@@ -112,11 +120,13 @@ impl HostService {
         prepare_directory(&root.join("images"))?;
         prepare_directory(&root.join("checkpoints"))?;
         prepare_directory(&root.join("transfers"))?;
+        let workspace = crate::workspace::WorkspaceAuthority::open(&root.join("transfers"))?;
         Ok(Self {
             root: root.to_path_buf(),
             catalog,
             executable,
             verified_guardians: BTreeSet::new(),
+            workspace,
         })
     }
 
@@ -214,6 +224,144 @@ impl HostService {
                         &operation_id,
                         &request_digest,
                         image,
+                    )?,
+                })
+            }
+            HostRequest::CaptureHostTree {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                scope_digest,
+                source,
+                exclusions,
+                maximum_bytes,
+                approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::WriteFiles,
+                    &scope_digest,
+                )?;
+                Ok(HostResponse::HostTreeCapture {
+                    capture: self.workspace.capture(
+                        sandbox_id,
+                        operation_id,
+                        &source,
+                        &exclusions,
+                        maximum_bytes,
+                        approval_id,
+                    )?,
+                })
+            }
+            HostRequest::ListHostTree {
+                sandbox_id,
+                operation_id,
+                after,
+                maximum,
+            } => {
+                let (capture, entries, next) =
+                    self.workspace
+                        .capture_entries(&sandbox_id, &operation_id, after, maximum)?;
+                Ok(HostResponse::HostTreeEntries {
+                    capture,
+                    entries,
+                    next,
+                })
+            }
+            HostRequest::ReadHostTreeBlob {
+                sandbox_id,
+                operation_id,
+                digest,
+                offset,
+                maximum,
+            } => {
+                let (bytes, eof) = self.workspace.read_capture_blob(
+                    &sandbox_id,
+                    &operation_id,
+                    &digest,
+                    offset,
+                    maximum,
+                )?;
+                Ok(HostResponse::HostBlob {
+                    offset,
+                    bytes,
+                    eof,
+                    digest,
+                })
+            }
+            HostRequest::BeginHostBlob {
+                sandbox_id,
+                expected_revision,
+                scope_digest,
+                transfer,
+                approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ApplyToHost,
+                    &scope_digest,
+                )?;
+                self.workspace
+                    .begin_upload(sandbox_id, transfer, approval_id)?;
+                Ok(HostResponse::Complete)
+            }
+            HostRequest::WriteHostBlob {
+                sandbox_id,
+                expected_revision,
+                scope_digest,
+                transfer,
+                offset,
+                bytes,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ApplyToHost,
+                    &scope_digest,
+                )?;
+                self.workspace
+                    .write_upload(&sandbox_id, &transfer, offset, &bytes)?;
+                Ok(HostResponse::Complete)
+            }
+            HostRequest::CommitHostBlob {
+                sandbox_id,
+                expected_revision,
+                scope_digest,
+                transfer,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ApplyToHost,
+                    &scope_digest,
+                )?;
+                self.workspace.commit_upload(&sandbox_id, &transfer)?;
+                Ok(HostResponse::Complete)
+            }
+            HostRequest::ApplyHostWorkspace {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                scope_digest,
+                destination,
+                change_set,
+                approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ApplyToHost,
+                    &scope_digest,
+                )?;
+                Ok(HostResponse::HostApply {
+                    report: self.workspace.apply(
+                        sandbox_id,
+                        operation_id,
+                        &destination,
+                        change_set,
+                        approval_id,
                     )?,
                 })
             }
@@ -981,6 +1129,9 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Linux(_) => "native",
         HostError::State(_) => "state",
         HostError::Control(_) => "guardian",
+        HostError::Workspace(crate::workspace::WorkspaceError::Conflict(_)) => "conflict",
+        HostError::Workspace(crate::workspace::WorkspaceError::Capacity(_)) => "capacity",
+        HostError::Workspace(_) => "workspace",
     }
 }
 

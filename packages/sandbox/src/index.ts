@@ -41,6 +41,11 @@ export type {
   TerminalSize,
   WorkloadDefaults,
   WorkspaceImportOptions,
+  WorkspaceApplyOptions,
+  WorkspaceApplyReport,
+  WorkspaceChange,
+  WorkspaceChangeSet,
+  WorkspaceExportOptions,
   WorkspaceManifest,
   WorkspaceManifestEntry,
 } from "./sandsurf.js";

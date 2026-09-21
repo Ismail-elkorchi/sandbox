@@ -897,7 +897,7 @@ fn file_stat(metadata: cap_std::fs::Metadata) -> FileStat {
         size: metadata.len(),
         readonly: metadata.permissions().readonly(),
         modified_millis,
-        mode: metadata.mode(),
+        mode: metadata.mode() & 0o7777,
         device: metadata.dev(),
         inode: metadata.ino(),
     }
