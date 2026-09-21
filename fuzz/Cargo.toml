@@ -12,7 +12,6 @@ cargo-fuzz = true
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.145"
 sandbox-digest = { path = "../crates/sandbox-digest" }
-sandbox-guest = { path = "../crates/sandbox-guest" }
 sandbox-image = { path = "../crates/sandbox-image" }
 sandbox-launcher-windows = { path = "../crates/sandbox-launcher-windows" }
 sandbox-network-broker = { path = "../crates/sandbox-network-broker" }
