@@ -33,10 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CONFIG_VERSION: u16 = 1;
-const RELEASE_PUBLIC_KEY: [u8; 32] = [
-    0x49, 0x5b, 0x4a, 0x26, 0xa6, 0x5d, 0xf6, 0x6f, 0x70, 0x90, 0x06, 0x5e, 0xd2, 0x3a, 0x30, 0xa2,
-    0x9a, 0xd3, 0xb5, 0x3e, 0x0e, 0xd9, 0x0d, 0x65, 0x06, 0xa2, 0xd6, 0xc8, 0xc0, 0xab, 0xa6, 0x84,
-];
+const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
+    option_env!("SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST");
 
 #[derive(Debug)]
 pub enum LinuxError {
@@ -208,12 +206,21 @@ pub(crate) fn resolve_source_bundle(
             .get("minimal-x64/manifest.json")
             .ok_or_else(|| LinuxError::Invalid("packaged boot manifest is absent".into()))?
             .clone();
+        let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
+            LinuxError::Invalid(
+                "native host was built without a bundled image trust identity".into(),
+            )
+        })?;
+        if expected != pinned {
+            return Err(LinuxError::Invalid(
+                "packaged image index differs from the native trust identity".into(),
+            ));
+        }
         Ok((
             verify_image(
                 &manifest,
-                ImageTrust::Bundled {
-                    manifest_digest: &expected,
-                    release_public_key: &RELEASE_PUBLIC_KEY,
+                ImageTrust::Pinned {
+                    manifest_digest: pinned,
                 },
             )?,
             executable

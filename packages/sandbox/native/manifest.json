@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "buildId": "sandsurf-native-0.1.0",
   "files": {
-    "linux-x64/empty-workspace.ext4": "b8dfaaeb837dd7d51eee06ebbb953615cbb3ebdb7b5f5356843a77905f39c0ae",
+    "linux-x64/empty-workspace.ext4": "2f7e0573474c7e091f6e6e8fbc1fa2e0f164ed3cbb81abd0039cd6e34912e282",
     "linux-x64/firecracker-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "linux-x64/firecracker-NOTICE": "0f443af83ca8226c7ec44e2ade3a09fa3eed8c9b923b6c014b6d439816b6f1c2",
     "linux-x64/firecracker-THIRD-PARTY": "a6d3ebd1c2f37d4fd83d0676621f695fc0cc2d8c6e646cdbb831b46e0650c208",
     "linux-x64/firecracker-v1.17.0-x86_64": "99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5",
-    "linux-x64/sandsurf-host-linux-x64": "437d7c431322e01f272d3f0560780947d216cb7eca4b96163da4e428ad760298"
+    "linux-x64/sandsurf-host-linux-x64": "85e69efbfc37f8b978ec43860a8e9f6d7935f471858440b3efdc6da70e1fbca5"
   }
 }

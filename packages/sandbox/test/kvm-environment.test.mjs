@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 
 import { Sandsurf } from "../dist/index.js";
@@ -12,8 +12,8 @@ import { NativeHostClient } from "../dist/native-host.js";
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
 
 test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 1_200_000 }, async () => {
-  const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
-  assert.ok(manifestPath, "SANDSURF_LOCAL_IMAGE_MANIFEST is required");
+  const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ??
+    resolve("packages/sandbox/images/minimal-x64/manifest.json");
   const state = process.env.SANDSURF_TEST_STATE ?? await mkdtemp(join(tmpdir(), "sandsurf-kvm-environment-"));
   const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
   const upstream = createServer((_request, response) => response.end("network-ok\n"));

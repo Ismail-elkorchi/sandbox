@@ -134,6 +134,11 @@ pub struct ImageCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageTrust<'a> {
     ExplicitLocal,
+    /// The exact manifest bytes are pinned into the native host binary that
+    /// consumes the package. Artifact digests remain part of that manifest.
+    Pinned {
+        manifest_digest: &'a str,
+    },
     Bundled {
         manifest_digest: &'a str,
         release_public_key: &'a [u8; 32],
@@ -190,6 +195,13 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
     validate_image_manifest(&manifest)?;
     match trust {
         ImageTrust::ExplicitLocal => {}
+        ImageTrust::Pinned {
+            manifest_digest: expected,
+        } => {
+            if expected != manifest_digest {
+                return Err(ImageError::DigestMismatch("manifest"));
+            }
+        }
         ImageTrust::Bundled {
             manifest_digest: expected,
             release_public_key,
@@ -619,6 +631,34 @@ mod tests {
                 },
             ),
             Err(ImageError::Signature)
+        ));
+    }
+
+    #[test]
+    fn pinned_image_needs_exact_manifest_bytes_without_a_signature() {
+        let temporary = TempDirectory::new();
+        let manifest = test_manifest(b"kernel", b"rootfs");
+        let path = write_image(&temporary.0, &manifest, b"kernel", b"rootfs");
+        let digest = hex_sha256(&fs::read(&path).unwrap());
+        verify_image(
+            &path,
+            ImageTrust::Pinned {
+                manifest_digest: &digest,
+            },
+        )
+        .unwrap();
+
+        let mut changed = manifest;
+        changed.version = "changed".into();
+        fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            verify_image(
+                &path,
+                ImageTrust::Pinned {
+                    manifest_digest: &digest,
+                },
+            ),
+            Err(ImageError::DigestMismatch("manifest"))
         ));
     }
 

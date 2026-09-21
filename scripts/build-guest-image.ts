@@ -109,14 +109,17 @@ try {
   );
   await normalizeExt4(rootfs, 8192, "33333333-3333-4333-8333-333333333333", temporary, true);
   const workload = resolve(temporary, "minimal-workload.ext4");
-  await createSparse(workload, 128 * 1024 * 1024);
+  // Keep the distributable raw image below common source-hosting blob limits.
+  // The immutable minimal workload occupies only a few MiB; mutable package
+  // installations and caches live on the separately sized state disk.
+  await createSparse(workload, 96 * 1024 * 1024);
   await run(
     "mkfs.ext4",
     ["-F", "-q", "-O", "^has_journal", "-U", "55555555-5555-4555-8555-555555555555", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", workloadRoot, workload],
     process.cwd(),
     { E2FSPROGS_FAKE_TIME: "1700000000" },
   );
-  await normalizeExt4(workload, 32768, "66666666-6666-4666-8666-666666666666", temporary, true);
+  await normalizeExt4(workload, 24576, "66666666-6666-4666-8666-666666666666", temporary, true);
   const workspace = resolve(temporary, "empty-workspace.ext4");
   const empty = resolve(temporary, "empty");
   await mkdir(empty);
@@ -151,6 +154,9 @@ try {
   const native = explicitOutput ?? resolve("packages/sandbox/native/linux-x64");
   await mkdir(destination, { recursive: true });
   await mkdir(native, { recursive: true });
+  for (const retired of ["minimal-rootfs.ext4", "vmlinux-6.1.177"]) {
+    await rm(resolve(destination, retired), { force: true });
+  }
   await replaceArtifact(kernel, resolve(destination, kernelName));
   await replaceArtifact(rootfs, resolve(destination, "minimal-bootstrap.ext4"));
   await replaceArtifact(workload, resolve(destination, "minimal-workload.ext4"));

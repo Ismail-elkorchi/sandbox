@@ -16,10 +16,18 @@ await verifyManifest(
 
 const imageRoot = resolve(repository, "packages/sandbox/images/minimal-x64");
 const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
-if (!isRecord(imageManifest) || !isRecord(imageManifest.kernel) || !isRecord(imageManifest.rootfs)) {
+if (!isRecord(imageManifest) || imageManifest.formatVersion !== 2 ||
+    !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
+    !isRecord(imageManifest.bootBundle.bootstrap) || !isRecord(imageManifest.workload) ||
+    !isRecord(imageManifest.workload.rootfs) || !isRecord(imageManifest.workload.stateTemplate)) {
   throw new Error("VM image manifest has an invalid shape");
 }
-for (const [label, entry] of [["VM kernel", imageManifest.kernel], ["VM rootfs", imageManifest.rootfs]] as const) {
+for (const [label, entry] of [
+  ["VM kernel", imageManifest.bootBundle.kernel],
+  ["trusted VM bootstrap", imageManifest.bootBundle.bootstrap],
+  ["VM workload root", imageManifest.workload.rootfs],
+  ["VM writable-state template", imageManifest.workload.stateTemplate],
+] as const) {
   if (typeof entry.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(entry.path)) {
     throw new Error(`${label} path is invalid`);
   }

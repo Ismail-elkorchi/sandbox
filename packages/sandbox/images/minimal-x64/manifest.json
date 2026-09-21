@@ -1,28 +1,57 @@
 {
-  "formatVersion": 1,
+  "formatVersion": 2,
   "id": "sandbox-minimal",
   "version": "0.1.0",
   "architecture": "x64",
-  "kernel": {
-    "path": "vmlinux-6.1.177",
-    "sha256": "18beee8e4b355140e637f5d2360cdf23b11a8979edbefacb3941b1ad28158f34"
+  "bootBundle": {
+    "kernel": {
+      "path": "vmlinux-6.18.41",
+      "sha256": "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5"
+    },
+    "bootstrap": {
+      "path": "minimal-bootstrap.ext4",
+      "sha256": "c315e446656b7761a80604597d038158c08ba704a25bf48962658da87c1fad2d",
+      "format": "ext4"
+    },
+    "guestAgent": {
+      "version": "0.1.0",
+      "protocolMajor": 2,
+      "protocolMinor": 0,
+      "sha256": "9d759b14d79e3d413474d9972284a5a534414074843a3eff01c996c448aded18"
+    },
+    "capabilities": {
+      "overlayfs": true,
+      "vsock": true,
+      "seccomp": true,
+      "cgroupV2": true,
+      "devpts": true
+    }
   },
-  "rootfs": {
-    "path": "minimal-rootfs.ext4",
-    "sha256": "783423a7b7da79d9da9eeee5c1df5f62583b7681c8f26c01b69ea944908b7d11",
-    "format": "ext4"
+  "workload": {
+    "rootfs": {
+      "path": "minimal-workload.ext4",
+      "sha256": "fb4b1041282d4b7c186fb77fb8af43953f8deda720cfa7722f9f72938a5706df",
+      "format": "ext4"
+    },
+    "stateTemplate": {
+      "path": "empty-workspace.ext4",
+      "sha256": "2f7e0573474c7e091f6e6e8fbc1fa2e0f164ed3cbb81abd0039cd6e34912e282",
+      "format": "ext4"
+    },
+    "defaults": {
+      "environment": {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "user": "agent",
+      "workingDirectory": "/workspace",
+      "entrypoint": [],
+      "command": []
+    },
+    "provenance": {
+      "kind": "source-built",
+      "sourceDigest": "f24ff3fff6c7c276021701331dd44eb282b4896f4dd15d52c56f7dfd1c8636b0"
+    },
+    "compatibleProtocolMajor": 2
   },
-  "guestAgent": {
-    "version": "0.1.0",
-    "protocolMajor": 1,
-    "protocolMinor": 6,
-    "sha256": "2b976f8beebfa465cbaa13d8ab21e13866f5a8928d96345c825ef024073b4a1d"
-  },
-  "capabilities": {
-    "overlayfs": false,
-    "vsock": true,
-    "seccomp": true,
-    "cgroupV2": true
-  },
-  "signature": "e89dc08853c6932e6c3f53374e7548aebe8b8d521b52e9b378c1684669c1d231cc892b7cf648eecdba01edf7f2476da5b263ec9c1ea7e6d94da3e1b6a973e209"
+  "signature": null
 }

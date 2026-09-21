@@ -16,6 +16,19 @@ try {
     if (!paths.includes("package/package.json") || !paths.includes("package/dist/index.js") || !paths.includes("package/README.md") || !paths.includes("package/LICENSE")) {
       throw new Error(`${tarball} is missing package entry points`);
     }
+    for (const imagePath of [
+      "package/images/manifest.json",
+      "package/images/minimal-x64/manifest.json",
+      "package/images/minimal-x64/vmlinux-6.18.41",
+      "package/images/minimal-x64/minimal-bootstrap.ext4",
+      "package/images/minimal-x64/minimal-workload.ext4",
+      "package/images/minimal-x64/empty-workspace.ext4",
+    ]) {
+      if (!paths.includes(imagePath)) throw new Error(`${tarball} is missing ${imagePath}`);
+    }
+    if (paths.some((path) => path.endsWith("minimal-rootfs.ext4") || path.endsWith("vmlinux-6.1.177"))) {
+      throw new Error(`${tarball} contains a retired guest image artifact`);
+    }
   }
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);

@@ -31,6 +31,7 @@ const buildArguments = [
 const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
   ? { [`CARGO_TARGET_${target.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" }
   : {};
+buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest();
 if (nativePlatform === "linux" && !debugBuild && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
   const linuxTarget = target ?? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
   buildEnvironment[`CARGO_TARGET_${linuxTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`] = "-C target-feature=+crt-static";
@@ -100,11 +101,30 @@ async function writeManifest(root: string): Promise<void> {
   }
 }
 
+async function bundledImageManifestDigest(): Promise<string> {
+  const images = resolve(repository, "packages/sandbox/images");
+  const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
+  if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
+  const expected = index.files["minimal-x64/manifest.json"];
+  if (typeof expected !== "string" || !/^[a-f0-9]{64}$/u.test(expected)) {
+    throw new Error("bundled image identity is absent from the image index");
+  }
+  const actual = createHash("sha256")
+    .update(await readFile(resolve(images, "minimal-x64/manifest.json")))
+    .digest("hex");
+  if (actual !== expected) throw new Error("bundled image manifest differs from its image index");
+  return actual;
+}
+
 function classifyTarget(target: string): { platform: "linux" | "macos" | "windows"; architecture: "x64" | "arm64" } {
   const architecture = target.startsWith("x86_64-") ? "x64" : target.startsWith("aarch64-") ? "arm64" : undefined;
   const platform = target.includes("linux") ? "linux" : target.includes("apple-darwin") ? "macos" : target.includes("windows") ? "windows" : undefined;
   if (architecture === undefined || platform === undefined) throw new Error(`unsupported Rust target ${target}`);
   return { platform, architecture };
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function replaceArtifact(source: string, destination: string): Promise<void> {
