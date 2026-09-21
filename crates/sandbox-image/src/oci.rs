@@ -18,6 +18,11 @@ const OCI_CONFIG_MEDIA: &str = "application/vnd.oci.image.config.v1+json";
 const OCI_LAYER_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 const OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 const OCI_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+const DOCKER_INDEX_MEDIA: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
+const DOCKER_MANIFEST_MEDIA: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const DOCKER_CONFIG_MEDIA: &str = "application/vnd.docker.container.image.v1+json";
+const DOCKER_LAYER_TAR: &str = "application/vnd.docker.image.rootfs.diff.tar";
+const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConversionLimits {
@@ -366,7 +371,7 @@ impl OciLayout {
             return Err(OciError::Limit("descriptor count"));
         }
         let descriptor = select_platform(&index.manifests, platform)?;
-        let manifest_descriptor = if descriptor.media_type == OCI_INDEX_MEDIA {
+        let manifest_descriptor = if is_index_media(&descriptor.media_type) {
             let nested: Index = self.read_descriptor_json(descriptor)?;
             validate_schema(nested.schema_version, "nested index")?;
             if nested.manifests.is_empty() || nested.manifests.len() > self.limits.descriptors {
@@ -376,10 +381,13 @@ impl OciLayout {
         } else {
             descriptor.clone()
         };
-        require_media(&manifest_descriptor, OCI_MANIFEST_MEDIA)?;
+        require_media_one_of(
+            &manifest_descriptor,
+            &[OCI_MANIFEST_MEDIA, DOCKER_MANIFEST_MEDIA],
+        )?;
         let manifest: Manifest = self.read_descriptor_json(&manifest_descriptor)?;
         validate_schema(manifest.schema_version, "manifest")?;
-        require_media(&manifest.config, OCI_CONFIG_MEDIA)?;
+        require_media_one_of(&manifest.config, &[OCI_CONFIG_MEDIA, DOCKER_CONFIG_MEDIA])?;
         if manifest.layers.is_empty() || manifest.layers.len() > self.limits.layers {
             return Err(OciError::Limit("layer count"));
         }
@@ -408,7 +416,11 @@ impl OciLayout {
         for layer in &manifest.layers {
             if !matches!(
                 layer.media_type.as_str(),
-                OCI_LAYER_TAR | OCI_LAYER_GZIP | OCI_LAYER_ZSTD
+                OCI_LAYER_TAR
+                    | OCI_LAYER_GZIP
+                    | OCI_LAYER_ZSTD
+                    | DOCKER_LAYER_TAR
+                    | DOCKER_LAYER_GZIP
             ) {
                 return Err(OciError::Unsupported(format!(
                     "layer media type {}",
@@ -487,12 +499,12 @@ impl OciLayout {
     fn find_manifest_descriptor(&self, digest: &str) -> Result<Descriptor, OciError> {
         let index: Index = read_json(&self.root.join("index.json"), self.limits.json_bytes)?;
         for descriptor in index.manifests {
-            if descriptor.media_type == OCI_MANIFEST_MEDIA && descriptor.digest == digest {
+            if is_manifest_media(&descriptor.media_type) && descriptor.digest == digest {
                 return Ok(descriptor);
-            } else if descriptor.media_type == OCI_INDEX_MEDIA {
+            } else if is_index_media(&descriptor.media_type) {
                 let nested: Index = self.read_descriptor_json(&descriptor)?;
                 for candidate in nested.manifests {
-                    if candidate.media_type == OCI_MANIFEST_MEDIA && candidate.digest == digest {
+                    if is_manifest_media(&candidate.media_type) && candidate.digest == digest {
                         return Ok(candidate);
                     }
                 }
@@ -514,8 +526,8 @@ impl OciLayout {
         self.validate_descriptor(descriptor)?;
         let file = File::open(self.blob_path(&descriptor.digest)?)?;
         let decoder: Box<dyn Read> = match descriptor.media_type.as_str() {
-            OCI_LAYER_TAR => Box::new(file),
-            OCI_LAYER_GZIP => Box::new(GzDecoder::new(file)),
+            OCI_LAYER_TAR | DOCKER_LAYER_TAR => Box::new(file),
+            OCI_LAYER_GZIP | DOCKER_LAYER_GZIP => Box::new(GzDecoder::new(file)),
             OCI_LAYER_ZSTD => Box::new(
                 StreamingDecoder::new(file)
                     .map_err(|error| OciError::Invalid(format!("zstd layer: {error}")))?,
@@ -781,14 +793,22 @@ fn select_platform<'a>(
     }
 }
 
-fn require_media(descriptor: &Descriptor, expected: &str) -> Result<(), OciError> {
-    if descriptor.media_type != expected {
+fn require_media_one_of(descriptor: &Descriptor, expected: &[&str]) -> Result<(), OciError> {
+    if !expected.contains(&descriptor.media_type.as_str()) {
         return Err(OciError::Invalid(format!(
-            "expected media type {expected}, got {}",
+            "unexpected media type {}",
             descriptor.media_type
         )));
     }
     Ok(())
+}
+
+fn is_index_media(value: &str) -> bool {
+    matches!(value, OCI_INDEX_MEDIA | DOCKER_INDEX_MEDIA)
+}
+
+fn is_manifest_media(value: &str) -> bool {
+    matches!(value, OCI_MANIFEST_MEDIA | DOCKER_MANIFEST_MEDIA)
 }
 
 fn validate_schema(value: u32, name: &str) -> Result<(), OciError> {

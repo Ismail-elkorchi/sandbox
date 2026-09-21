@@ -54,6 +54,7 @@ pub fn import_oci(
     platform: &str,
     operation: &OperationId,
     request_digest: &Digest,
+    registry_credential: Option<&[u8]>,
 ) -> Result<ImageRecord, LinuxError> {
     let requested = parse_platform(platform)?;
     let expected_architecture = match crate::service::native_guest_architecture() {
@@ -104,10 +105,18 @@ pub fn import_oci(
                 .map_err(|error| LinuxError::Invalid(error.to_string()))?;
             layout
         }
-        OciSource::Registry { .. } => {
-            return Err(LinuxError::Invalid(
-                "registry OCI import requires the qualified host credential/fetch service".into(),
-            ));
+        OciSource::Registry { reference, .. } => {
+            let layout = stage.join("layout");
+            crate::registry::fetch_layout(
+                &host_root.join("images/blobs"),
+                &layout,
+                reference,
+                &requested,
+                registry_credential,
+                ConversionLimits::default(),
+            )
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+            layout
         }
     };
     let layout = OciLayout::open(&layout_path, ConversionLimits::default())

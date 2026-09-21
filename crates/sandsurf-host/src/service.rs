@@ -1,5 +1,6 @@
 use crate::api::{
-    HOST_API_VERSION, HostInspection, HostRequest, HostResponse, ReservationView, SandboxView,
+    HOST_API_VERSION, HostInspection, HostRequest, HostResponse, OciSource, ReservationView,
+    SandboxView,
 };
 #[cfg(not(target_os = "linux"))]
 use sandsurf_control::{EffectOutcome, GuardianEffect, LifecycleEffect, Result as ControlResult};
@@ -25,6 +26,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 // Full-state capture/restore includes bounded memory and disk persistence plus
 // native recovery probes. Transport waits must cover that operation without
@@ -406,6 +408,21 @@ impl HostService {
                         operation: admitted,
                     });
                 }
+                let registry_credential = match &source {
+                    OciSource::Registry {
+                        credential: Some(secret),
+                        ..
+                    } => {
+                        let bytes = self.secrets.read(&secret.id, &secret.version)?;
+                        if Counter::try_from(bytes.len() as u64)? != secret.bytes {
+                            return Err(HostError::Invalid(
+                                "registry credential length differs from its approved version",
+                            ));
+                        }
+                        Some(Zeroizing::new(bytes))
+                    }
+                    _ => None,
+                };
                 #[cfg(target_os = "linux")]
                 let image = crate::images::import_oci(
                     &self.root,
@@ -414,6 +431,7 @@ impl HostService {
                     &platform,
                     &operation_id,
                     &request_digest,
+                    registry_credential.as_ref().map(|value| value.as_slice()),
                 )?;
                 #[cfg(not(target_os = "linux"))]
                 return Err(HostError::Invalid(

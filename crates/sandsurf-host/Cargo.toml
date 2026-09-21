@@ -14,14 +14,16 @@ sandsurf-machine = { path = "../sandsurf-machine" }
 sandsurf-native = { path = "../sandsurf-native" }
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-state = { path = "../sandsurf-state" }
+sandbox-image = { path = "../sandbox-image" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
+reqwest.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sandbox-guest = { path = "../sandbox-guest" }
-sandbox-image = { path = "../sandbox-image" }
 sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-vm = { path = "../sandbox-vm" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }

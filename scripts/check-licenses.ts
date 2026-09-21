@@ -7,6 +7,9 @@ const allowed = new Set([
   "BSD-1-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT-0",
   "Unicode-3.0",
   "Unlicense",
   "LLVM-exception",
@@ -30,7 +33,9 @@ for (const manifest of ["Cargo.toml", "fuzz/Cargo.toml"]) {
 }
 
 function approvedExpression(expression: string): boolean {
-  const normalized = expression.replaceAll("MIT/Apache-2.0", "MIT OR Apache-2.0");
+  const normalized = expression
+    .replaceAll("MIT/Apache-2.0", "MIT OR Apache-2.0")
+    .replaceAll("Unlicense/MIT", "Unlicense OR MIT");
   const tokens = normalized.match(/\(|\)|AND|OR|WITH|[A-Za-z][A-Za-z0-9.+-]*/gu) ?? [];
   if (tokens.join(" ").replaceAll("( ", "(").replaceAll(" )", ")") === "") return false;
   let index = 0;

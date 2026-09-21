@@ -41,7 +41,7 @@ pub enum OciSource {
     },
     Registry {
         reference: String,
-        credential: Option<sandsurf_protocol::SecretId>,
+        credential: Option<sandsurf_protocol::SecretVersion>,
     },
 }
 

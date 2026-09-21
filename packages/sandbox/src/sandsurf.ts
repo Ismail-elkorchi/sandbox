@@ -31,7 +31,7 @@ export interface LiveResourceLimits { readonly workloadMemoryBytes: number; read
 export interface RuntimeConfiguration { readonly network: NetworkPolicy; readonly exposures: readonly Exposure[]; readonly resources: LiveResourceLimits; }
 export interface ResourceUsage { readonly cpuMicros: number; readonly memoryCurrent: number; readonly memoryPeak: number; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number; readonly ioWriteBytes: number; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly processesCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
-export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: string };
+export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: SecretVersion };
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface Receipt { readonly sandboxId: string; readonly epoch: number; readonly processId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
@@ -359,7 +359,8 @@ export class SandboxProcess {
   async inspect(): Promise<ProcessObservation> { const response = await this.#sandbox.hostRequest({ kind: "get-process", sandboxId: this.#sandbox.id, processId: this.id }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response"); if (response.response.process === null) throw new SandsurfHostError("missing", `Process ${this.id} does not exist`); return parseProcessObservation(response.response.process); }
   async wait(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ProcessInspection> { for (;;) { if (options.signal?.aborted === true) throw options.signal.reason; const observed = await this.inspect(); if (observed.kind !== "current") throw new SandsurfHostError("unavailable", `Process ${this.id} is not currently observable`); if (observed.value.state.kind !== "running") return observed.value; await new Promise((done) => setTimeout(done, options.pollMs ?? 50)); } }
   async readOutput(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> {
-    const response = await this.#sandbox.hostRequest({ kind: "read-evidence", sandboxId: this.#sandbox.id, processId: this.id, after: options.after ?? 0, maximum: options.maximum ?? 64 * 1024 });
+    const { after, maximum } = normalizeOutputRead(options);
+    const response = await this.#sandbox.hostRequest({ kind: "read-evidence", sandboxId: this.#sandbox.id, processId: this.id, after, maximum });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page) || !Array.isArray(response.response.page.chunks)) throw protocol("output response");
     return parseEvidencePage(response.response.page);
   }
@@ -418,7 +419,8 @@ export class PinnedOutput {
   readonly id: string; readonly #sandbox: Sandbox;
   constructor(sandbox: Sandbox, id: string) { this.#sandbox = sandbox; this.id = id; }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> {
-    const response = await this.#sandbox.hostRequest({ kind: "read-pinned-evidence", sandboxId: this.#sandbox.id, pinId: this.id, after: options.after ?? 0, maximum: options.maximum ?? 64 * 1024 });
+    const { after, maximum } = normalizeOutputRead(options);
+    const response = await this.#sandbox.hostRequest({ kind: "read-pinned-evidence", sandboxId: this.#sandbox.id, pinId: this.id, after, maximum });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page)) throw protocol("pinned output response");
     return parseEvidencePage(response.response.page);
   }
@@ -633,6 +635,7 @@ function currentMachine(view: SandboxInspection): { readonly epoch: number } { i
 function parseProcess(value: unknown): ProcessInspection { if (!record(value) || !record(value.request) || !record(value.state) || (value.lineage !== null && !record(value.lineage))) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state, lineage: value.lineage }; }
 function parseProcessObservation(value: unknown): ProcessObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseProcess(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseProcess(value.lastKnown) }; }
 function parseEvidencePage(value: Record<string, unknown>): OutputPage { if (!Array.isArray(value.chunks)) throw protocol("output page"); const chunks = value.chunks as unknown[]; return { after: integer(value.cursor), available: integer(value.available), chunks: chunks.map((chunk) => { if (!record(chunk) || !Array.isArray(chunk.bytes)) throw protocol("output chunk"); return { cursor: integer(chunk.offset), stream: text(chunk.stream) as OutputChunk["stream"], bytes: Uint8Array.from(chunk.bytes as number[]), digest: text(chunk.bytesDigest) }; }) }; }
+function normalizeOutputRead(options: { readonly after?: number; readonly maximum?: number }): { readonly after: number; readonly maximum: number } { const after = options.after ?? 0; const maximum = options.maximum ?? 64 * 1024; if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("output cursor must be a nonnegative safe integer"); if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256 * 1024) throw new TypeError("output page size must be 1 through 256 KiB"); return { after, maximum }; }
 function capabilityScope(sandboxId: string, capability: SandsurfCapability): string { return sandsurfDigest("grant", ["sandsurf-sandbox-capability-v1", sandboxId, capability]); }
 function normalizeNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   if (!Array.isArray(value.rules) || value.rules.length > 4096) throw new TypeError("network policy exceeds its rule bound");
@@ -661,7 +664,8 @@ function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string
     return { kind: source.kind, path: resolve(source.path) };
   }
   if (source.reference.length === 0 || source.reference.length > 4096) throw new TypeError("OCI registry reference is malformed");
-  return { kind: "registry", reference: source.reference, credential: source.credential ?? null };
+  const credential = source.credential === undefined ? null : parseSecret(source.credential as unknown as Record<string, unknown>);
+  return { kind: "registry", reference: source.reference, credential };
 }
 function parseImage(value: unknown): ImageInspection {
   if (!record(value)) throw protocol("image record");
