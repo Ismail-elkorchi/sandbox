@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "trusted-bootstrap.ext4",
-      "sha256": "c1c35fb367a6e1e13ead6cbb17d791650fad1467fffd949acddd816be71e69e6",
+      "sha256": "f56bb3362b5dfe02cc256acbe44d244aeddb6581d6f635789e3ef2b2903f870a",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
       "protocolMajor": 2,
       "protocolMinor": 0,
-      "sha256": "76c88c92e8749e45ca0d398c1ca9b0ac706e487dbab59eec04c64fea12e796f0"
+      "sha256": "b71067e5945b6d8355f1f69dab22ce0be728744383741ce0395dc465759dcfcd"
     },
     "capabilities": {
       "overlayfs": true,
@@ -30,7 +30,7 @@
   "workload": {
     "rootfs": {
       "path": "development-workload.ext4",
-      "sha256": "82bcb9165501abd3676f7f0a481c5d812076b3294e17acee5979ebf125ed26f3",
+      "sha256": "95c38f769a25c26e77993d279c19d4d264b5e4b43d8fb01f73d925582b00e130",
       "format": "ext4"
     },
     "stateTemplate": {

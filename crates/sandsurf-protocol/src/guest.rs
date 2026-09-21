@@ -255,6 +255,9 @@ pub enum FilesystemRequest {
     AbortWrite {
         transfer: FileTransfer,
     },
+    Transaction {
+        transaction: FileTransaction,
+    },
     Mkdir {
         path: GuestPath,
         recursive: bool,
@@ -335,6 +338,9 @@ impl FilesystemRequest {
             {
                 return Err(crate::Invalid("filesystem transfer chunk is invalid"));
             }
+            Self::Transaction { transaction } if transaction.validate().is_err() => {
+                return Err(crate::Invalid("filesystem transaction is invalid"));
+            }
             Self::Chmod { mode, .. } if mode & !0o7777 != 0 => {
                 return Err(crate::Invalid("filesystem mode is invalid"));
             }
@@ -362,6 +368,7 @@ impl FilesystemRequest {
             | Self::WriteChunk { .. }
             | Self::CommitWrite { .. }
             | Self::AbortWrite { .. }
+            | Self::Transaction { .. }
             | Self::Mkdir { .. }
             | Self::Rename { .. }
             | Self::Remove { .. }
@@ -369,6 +376,73 @@ impl FilesystemRequest {
             | Self::Symlink { .. } => Capability::WriteFiles,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileTransaction {
+    pub id: OperationId,
+    pub mutations: Vec<FileMutation>,
+}
+
+impl FileTransaction {
+    pub fn validate(&self) -> Result<(), crate::Invalid> {
+        if self.mutations.is_empty() || self.mutations.len() > 1024 {
+            return Err(crate::Invalid(
+                "filesystem transaction mutation count is invalid",
+            ));
+        }
+        let mut bytes = 0_usize;
+        let mut paths = std::collections::BTreeSet::new();
+        for mutation in &self.mutations {
+            let path = match mutation {
+                FileMutation::Write {
+                    path,
+                    bytes: value,
+                    mode,
+                    ..
+                } => {
+                    bytes = bytes
+                        .checked_add(value.len())
+                        .ok_or(crate::Invalid("filesystem transaction is oversized"))?;
+                    if *mode & !0o7777 != 0 {
+                        return Err(crate::Invalid("filesystem transaction mode is invalid"));
+                    }
+                    path
+                }
+                FileMutation::Remove { path, .. } => path,
+            };
+            if !paths.insert(path.as_bytes()) {
+                return Err(crate::Invalid(
+                    "filesystem transaction repeats a destination",
+                ));
+            }
+        }
+        if bytes > crate::MAX_STREAM_BYTES {
+            return Err(crate::Invalid("filesystem transaction is oversized"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum FileMutation {
+    Write {
+        path: GuestPath,
+        bytes: Vec<u8>,
+        mode: u32,
+        expected: FileExpectation,
+    },
+    Remove {
+        path: GuestPath,
+        expected: FileExpectation,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

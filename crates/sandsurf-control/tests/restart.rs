@@ -73,6 +73,7 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(64),
         grants: n(64),
         usage_records: n(64),
+        image_bytes: n(400_000),
         resources: Resources {
             vcpus: n(8),
             memory_mib: n(8192),
@@ -219,6 +220,7 @@ impl Fixture {
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
                     lifetime: ProcessLifetime::Job,
+                    deadline_millis: None,
                     output_bytes: n(1024),
                 }),
             },

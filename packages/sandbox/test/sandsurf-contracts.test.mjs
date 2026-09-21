@@ -29,7 +29,7 @@ test("Rust and TypeScript agree on valid and invalid mutation fields", () => {
     request: { kind: "spawn", request: {
       sandboxId: "box", epoch: 1, processId: "process", operationId: "op",
       argv: ["/bin/echo", "hello"], cwd: "/workspace", environment: { PATH: "/usr/bin:/bin" },
-      user: "agent", stdio: "pipes", terminalSize: null, lifetime: "job", outputBytes: 1024,
+      user: "agent", stdio: "pipes", terminalSize: null, lifetime: "job", deadlineMillis: null, outputBytes: 1024,
     } },
   });
   validateSandsurfMutation(value);

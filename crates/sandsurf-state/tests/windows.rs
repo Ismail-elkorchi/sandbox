@@ -22,6 +22,7 @@ fn windows_private_state_is_owner_only_reopenable_and_writer_exclusive() {
             operations: one,
             grants: one,
             usage_records: one,
+            image_bytes: one,
             resources: Resources {
                 vcpus: one,
                 memory_mib: one,

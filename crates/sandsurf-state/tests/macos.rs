@@ -24,6 +24,7 @@ fn macos_acl_grants_make_authority_unavailable_without_repair_or_deletion() {
         operations: one,
         grants: one,
         usage_records: one,
+        image_bytes: one,
         resources: Resources {
             vcpus: one,
             memory_mib: one,

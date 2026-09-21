@@ -4,7 +4,7 @@ use sandsurf_protocol::{
     MachineObservation, Observation, Operation, OperationId, PinId, ProcessId, Qualification,
     ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, TransferId, VmEngine,
 };
-use sandsurf_state::{ImageImportRecord, ImageRecord, SecretRevocationRecord};
+use sandsurf_state::{ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,6 +23,9 @@ pub struct HostInspection {
     pub full_state: Qualification,
     pub images: Qualification,
     pub guest_platform: String,
+    /// Verified workload image packaged for this host architecture. Source
+    /// builds without packaged artifacts report `None` explicitly.
+    pub default_image_digest: Option<Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +181,11 @@ pub enum HostRequest {
     },
     GetImageImport {
         operation_id: OperationId,
+    },
+    ReleaseImage {
+        digest: Digest,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
     },
     ListCheckpoints {
         after: Option<CheckpointId>,
@@ -441,6 +449,9 @@ pub enum HostResponse {
     },
     ImageImport {
         operation: ImageImportRecord,
+    },
+    ImageRelease {
+        operation: ImageReleaseRecord,
     },
     Checkpoints {
         values: Vec<Checkpoint>,

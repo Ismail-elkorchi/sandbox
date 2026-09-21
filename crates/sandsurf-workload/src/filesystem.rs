@@ -2,16 +2,18 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt};
 use cap_std::time::SystemClock;
 use sandsurf_protocol::{
-    Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind, FileRange,
-    FileRevision, FileStat, FileTransfer, GuestPath, OperationId, WatchEvent, WatchEventKind,
-    WatcherId,
+    Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind, FileMutation,
+    FileRange, FileRevision, FileStat, FileTransaction, FileTransfer, GuestPath, OperationId,
+    WatchEvent, WatchEventKind, WatcherId,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{OpenOptionsExt as StdOpenOptionsExt, PermissionsExt as StdPermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -21,6 +23,8 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_PAGE_ENTRIES: usize = 4096;
 const MAX_WATCHERS: usize = 1024;
 const MAX_WATCH_EVENTS: usize = 4096;
+const TRANSACTION_JOURNAL_VERSION: u16 = 1;
+const MAX_TRANSACTION_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum FilesystemError {
@@ -79,6 +83,32 @@ struct Watcher {
     recursive: bool,
     sequence: Counter,
     snapshot: BTreeMap<Vec<u8>, WatchFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TransactionPhase {
+    Staging,
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransactionJournal {
+    version: u16,
+    id: OperationId,
+    phase: TransactionPhase,
+    entries: Vec<TransactionJournalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TransactionJournalEntry {
+    path: GuestPath,
+    temporary: Option<String>,
+    backup: String,
+    original_present: bool,
 }
 
 /// A real implementation freezes or fences workload writers for the duration
@@ -463,6 +493,279 @@ impl FilesystemService {
         }
     }
 
+    /// Install a bounded set of file replacements/removals behind one writer
+    /// barrier. A control-state journal is committed before workload paths are
+    /// changed, allowing cold-start recovery to roll an interrupted install
+    /// back or finish cleanup after commitment.
+    pub fn apply_transaction<B: WriterBarrier>(
+        &self,
+        transaction: &FileTransaction,
+        operation_id: &OperationId,
+        journal_root: &Path,
+        barrier: &B,
+    ) -> Result<(), FilesystemError> {
+        transaction
+            .validate()
+            .map_err(|_| FilesystemError::Invalid("transaction is malformed"))?;
+        if transaction.id != *operation_id || !journal_root.is_absolute() {
+            return Err(FilesystemError::Invalid(
+                "transaction identity or journal root is invalid",
+            ));
+        }
+        ensure_journal_root(journal_root)?;
+        let _transaction = self
+            .transactions
+            .lock()
+            .map_err(|_| FilesystemError::Barrier)?;
+        let journal_path = transaction_journal_path(journal_root, &transaction.id);
+        if journal_path.exists() {
+            return Err(FilesystemError::Conflict);
+        }
+        let mut journal = TransactionJournal {
+            version: TRANSACTION_JOURNAL_VERSION,
+            id: transaction.id.clone(),
+            phase: TransactionPhase::Staging,
+            entries: transaction
+                .mutations
+                .iter()
+                .enumerate()
+                .map(|(index, mutation)| {
+                    let path = match mutation {
+                        FileMutation::Write { path, .. } | FileMutation::Remove { path, .. } => {
+                            path.clone()
+                        }
+                    };
+                    TransactionJournalEntry {
+                        path,
+                        temporary: matches!(mutation, FileMutation::Write { .. }).then(|| {
+                            format!(
+                                ".sandsurf-transaction-{}-{index}.new",
+                                transaction.id.as_str()
+                            )
+                        }),
+                        backup: format!(
+                            ".sandsurf-transaction-{}-{index}.old",
+                            transaction.id.as_str()
+                        ),
+                        original_present: false,
+                    }
+                })
+                .collect(),
+        };
+        persist_transaction_journal(&journal_path, &journal)?;
+
+        let staged = (|| {
+            for (mutation, entry) in transaction.mutations.iter().zip(&journal.entries) {
+                let FileMutation::Write {
+                    bytes, mode, path, ..
+                } = mutation
+                else {
+                    continue;
+                };
+                let relative = self.relative_path(path, false)?;
+                let (parent_path, _) = split_parent(&relative)?;
+                let parent = self.root.open_dir(parent_path)?;
+                let temporary = entry
+                    .temporary
+                    .as_deref()
+                    .ok_or(FilesystemError::Invalid("write staging name is absent"))?;
+                ensure_cap_absent(&parent, temporary)?;
+                ensure_cap_absent(&parent, &entry.backup)?;
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true).mode(*mode);
+                let mut file = parent.open_with(temporary, &options)?;
+                file.write_all(bytes)?;
+                file.set_permissions(Permissions::from_mode(*mode))?;
+                file.sync_all()?;
+                sync_cap_directory(&parent)?;
+            }
+            Ok::<(), FilesystemError>(())
+        })();
+        if let Err(error) = staged {
+            let _ = self.cleanup_staging(&journal);
+            let _ = remove_transaction_journal(&journal_path);
+            return Err(error);
+        }
+
+        let _writer_barrier = match barrier.acquire() {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.cleanup_staging(&journal);
+                let _ = remove_transaction_journal(&journal_path);
+                return Err(error);
+            }
+        };
+        let validated = (|| {
+            for ((mutation, entry), index) in transaction
+                .mutations
+                .iter()
+                .zip(journal.entries.iter_mut())
+                .zip(0_usize..)
+            {
+                let (path, expected) = match mutation {
+                    FileMutation::Write { path, expected, .. }
+                    | FileMutation::Remove { path, expected } => (path, expected),
+                };
+                let relative = self.relative_path(path, false)?;
+                let (parent_path, destination) = split_parent(&relative)?;
+                let parent = self.root.open_dir(parent_path)?;
+                ensure_cap_absent(&parent, &entry.backup)?;
+                entry.original_present = cap_entry_exists(&parent, Path::new(&destination))?;
+                check_expected(
+                    &parent,
+                    Path::new(&destination),
+                    &protocol_expectation(expected),
+                )?;
+                if matches!(mutation, FileMutation::Remove { .. }) && !entry.original_present {
+                    return Err(FilesystemError::Conflict);
+                }
+                if let Some(temporary) = &entry.temporary
+                    && !cap_entry_exists(&parent, Path::new(temporary))?
+                {
+                    return Err(FilesystemError::Conflict);
+                }
+                if index >= 1024 {
+                    return Err(FilesystemError::Capacity);
+                }
+            }
+            Ok::<(), FilesystemError>(())
+        })();
+        if let Err(error) = validated {
+            let _ = self.cleanup_staging(&journal);
+            let _ = remove_transaction_journal(&journal_path);
+            return Err(error);
+        }
+        journal.phase = TransactionPhase::Prepared;
+        persist_transaction_journal(&journal_path, &journal)?;
+
+        let installed = (|| {
+            for entry in &journal.entries {
+                let relative = self.relative_path(&entry.path, false)?;
+                let (parent_path, destination) = split_parent(&relative)?;
+                let parent = self.root.open_dir(parent_path)?;
+                if entry.original_present {
+                    parent.rename(&destination, &parent, &entry.backup)?;
+                    sync_cap_directory(&parent)?;
+                }
+                if let Some(temporary) = &entry.temporary {
+                    parent.rename(temporary, &parent, &destination)?;
+                    sync_cap_directory(&parent)?;
+                }
+            }
+            Ok::<(), FilesystemError>(())
+        })();
+        if let Err(error) = installed {
+            if self.rollback_transaction(&journal).is_ok() {
+                let _ = remove_transaction_journal(&journal_path);
+                return Err(error);
+            }
+            return Err(FilesystemError::Barrier);
+        }
+        journal.phase = TransactionPhase::Committed;
+        if let Err(error) = persist_transaction_journal(&journal_path, &journal) {
+            if self.rollback_transaction(&journal).is_ok() {
+                let _ = remove_transaction_journal(&journal_path);
+                return Err(error);
+            }
+            return Err(FilesystemError::Barrier);
+        }
+        self.cleanup_committed(&journal)?;
+        remove_transaction_journal(&journal_path)
+    }
+
+    pub fn recover_transactions(&self, journal_root: &Path) -> Result<(), FilesystemError> {
+        if !journal_root.is_absolute() {
+            return Err(FilesystemError::Invalid(
+                "transaction journal root is invalid",
+            ));
+        }
+        ensure_journal_root(journal_root)?;
+        let mut entries = std::fs::read_dir(journal_root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        if entries.len() > 2048 {
+            return Err(FilesystemError::Capacity);
+        }
+        for entry in entries {
+            let metadata = entry.file_type()?;
+            let path = entry.path();
+            if !metadata.is_file() || metadata.is_symlink() {
+                return Err(FilesystemError::Invalid(
+                    "transaction journal contains a non-file",
+                ));
+            }
+            if path.extension().and_then(|value| value.to_str()) == Some("new") {
+                std::fs::remove_file(path)?;
+                continue;
+            }
+            let journal = read_transaction_journal(&path)?;
+            let expected = transaction_journal_path(journal_root, &journal.id);
+            if path != expected || journal.version != TRANSACTION_JOURNAL_VERSION {
+                return Err(FilesystemError::Invalid(
+                    "transaction journal identity is invalid",
+                ));
+            }
+            match journal.phase {
+                TransactionPhase::Staging => self.cleanup_staging(&journal)?,
+                TransactionPhase::Prepared => self.rollback_transaction(&journal)?,
+                TransactionPhase::Committed => self.cleanup_committed(&journal)?,
+            }
+            remove_transaction_journal(&path)?;
+        }
+        sync_std_directory(journal_root)
+    }
+
+    fn cleanup_staging(&self, journal: &TransactionJournal) -> Result<(), FilesystemError> {
+        for entry in &journal.entries {
+            let relative = self.relative_path(&entry.path, false)?;
+            let (parent_path, _) = split_parent(&relative)?;
+            let parent = self.root.open_dir(parent_path)?;
+            if let Some(temporary) = &entry.temporary {
+                remove_cap_entry_if_present(&parent, temporary)?;
+            }
+            remove_cap_entry_if_present(&parent, &entry.backup)?;
+            sync_cap_directory(&parent)?;
+        }
+        Ok(())
+    }
+
+    fn rollback_transaction(&self, journal: &TransactionJournal) -> Result<(), FilesystemError> {
+        for entry in journal.entries.iter().rev() {
+            let relative = self.relative_path(&entry.path, false)?;
+            let (parent_path, destination) = split_parent(&relative)?;
+            let parent = self.root.open_dir(parent_path)?;
+            let backup_present = cap_entry_exists(&parent, Path::new(&entry.backup))?;
+            let installed_new = match &entry.temporary {
+                Some(temporary) => !cap_entry_exists(&parent, Path::new(temporary))?,
+                None => false,
+            };
+            if backup_present {
+                remove_cap_entry_if_present(&parent, &destination)?;
+                parent.rename(&entry.backup, &parent, &destination)?;
+            } else if !entry.original_present && installed_new {
+                remove_cap_entry_if_present(&parent, &destination)?;
+            }
+            if let Some(temporary) = &entry.temporary {
+                remove_cap_entry_if_present(&parent, temporary)?;
+            }
+            sync_cap_directory(&parent)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_committed(&self, journal: &TransactionJournal) -> Result<(), FilesystemError> {
+        for entry in &journal.entries {
+            let relative = self.relative_path(&entry.path, false)?;
+            let (parent_path, _) = split_parent(&relative)?;
+            let parent = self.root.open_dir(parent_path)?;
+            remove_cap_entry_if_present(&parent, &entry.backup)?;
+            if let Some(temporary) = &entry.temporary {
+                remove_cap_entry_if_present(&parent, temporary)?;
+            }
+            sync_cap_directory(&parent)?;
+        }
+        Ok(())
+    }
+
     fn transfer_paths(
         &self,
         transfer: &FileTransfer,
@@ -731,6 +1034,125 @@ impl FilesystemService {
             Ok(PathBuf::from(OsString::from_vec(suffix.to_vec())))
         }
     }
+}
+
+fn ensure_cap_absent(parent: &Dir, name: &str) -> Result<(), FilesystemError> {
+    if cap_entry_exists(parent, Path::new(name))? {
+        Err(FilesystemError::Conflict)
+    } else {
+        Ok(())
+    }
+}
+
+fn cap_entry_exists(parent: &Dir, name: &Path) -> Result<bool, FilesystemError> {
+    match parent.symlink_metadata(name) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_cap_entry_if_present(
+    parent: &Dir,
+    name: impl AsRef<Path>,
+) -> Result<(), FilesystemError> {
+    let name = name.as_ref();
+    let metadata = match parent.symlink_metadata(name) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        parent.remove_dir_all(name)?;
+    } else {
+        parent.remove_file(name)?;
+    }
+    Ok(())
+}
+
+fn ensure_journal_root(root: &Path) -> Result<(), FilesystemError> {
+    std::fs::create_dir_all(root)?;
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(FilesystemError::Invalid(
+            "transaction journal root is not a directory",
+        ));
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn transaction_journal_path(root: &Path, id: &OperationId) -> PathBuf {
+    root.join(format!("{}.json", id.as_str()))
+}
+
+fn persist_transaction_journal(
+    path: &Path,
+    journal: &TransactionJournal,
+) -> Result<(), FilesystemError> {
+    let bytes = serde_json::to_vec(journal)
+        .map_err(|_| FilesystemError::Invalid("transaction journal cannot be encoded"))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_TRANSACTION_JOURNAL_BYTES {
+        return Err(FilesystemError::Capacity);
+    }
+    let temporary = path.with_extension("json.new");
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    sync_std_directory(path.parent().ok_or(FilesystemError::Invalid(
+        "transaction journal has no parent",
+    ))?)
+}
+
+fn read_transaction_journal(path: &Path) -> Result<TransactionJournal, FilesystemError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_TRANSACTION_JOURNAL_BYTES
+    {
+        return Err(FilesystemError::Invalid(
+            "transaction journal is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_TRANSACTION_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let value: TransactionJournal = serde_json::from_slice(&bytes)
+        .map_err(|_| FilesystemError::Invalid("transaction journal is malformed"))?;
+    if value.entries.is_empty() || value.entries.len() > 1024 {
+        return Err(FilesystemError::Invalid(
+            "transaction journal entry count is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+fn remove_transaction_journal(path: &Path) -> Result<(), FilesystemError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    sync_std_directory(path.parent().ok_or(FilesystemError::Invalid(
+        "transaction journal has no parent",
+    ))?)
+}
+
+fn sync_std_directory(path: &Path) -> Result<(), FilesystemError> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 fn scan_watch(
@@ -1083,5 +1505,73 @@ mod tests {
         assert_eq!(events[0].path, None);
         service.unwatch(&watcher, Counter::ONE).unwrap();
         assert!(service.poll_watcher(&watcher, Counter::ONE, 1).is_err());
+    }
+
+    #[test]
+    fn multi_file_transaction_is_preconditioned_and_recovers_interruption() {
+        let root = Temp::new();
+        let files = root.0.join("files");
+        let journals = root.0.join("journals");
+        fs::create_dir(&files).unwrap();
+        fs::write(files.join("one"), b"old-one").unwrap();
+        fs::write(files.join("two"), b"old-two").unwrap();
+        let service = FilesystemService::open(&files, "/workspace").unwrap();
+        let one = service.revision("/workspace/one").unwrap().unwrap();
+        let two = service.revision("/workspace/two").unwrap().unwrap();
+        let operation_id = OperationId::try_from("transaction").unwrap();
+        let transaction = FileTransaction {
+            id: operation_id.clone(),
+            mutations: vec![
+                FileMutation::Write {
+                    path: GuestPath::try_from("/workspace/one").unwrap(),
+                    bytes: b"new-one".to_vec(),
+                    mode: 0o640,
+                    expected: FileExpectation::Matches {
+                        size: one.size,
+                        digest: one.digest,
+                    },
+                },
+                FileMutation::Remove {
+                    path: GuestPath::try_from("/workspace/two").unwrap(),
+                    expected: FileExpectation::Matches {
+                        size: two.size,
+                        digest: two.digest,
+                    },
+                },
+            ],
+        };
+        service
+            .apply_transaction(&transaction, &operation_id, &journals, &Barrier)
+            .unwrap();
+        assert_eq!(fs::read(files.join("one")).unwrap(), b"new-one");
+        assert!(!files.join("two").exists());
+        assert!(fs::read_dir(&journals).unwrap().next().is_none());
+
+        fs::write(files.join("recover"), b"original").unwrap();
+        fs::rename(
+            files.join("recover"),
+            files.join(".sandsurf-transaction-recovery-0.old"),
+        )
+        .unwrap();
+        fs::write(files.join("recover"), b"partial").unwrap();
+        let recovery = TransactionJournal {
+            version: TRANSACTION_JOURNAL_VERSION,
+            id: OperationId::try_from("recovery").unwrap(),
+            phase: TransactionPhase::Prepared,
+            entries: vec![TransactionJournalEntry {
+                path: GuestPath::try_from("/workspace/recover").unwrap(),
+                temporary: Some(".sandsurf-transaction-recovery-0.new".into()),
+                backup: ".sandsurf-transaction-recovery-0.old".into(),
+                original_present: true,
+            }],
+        };
+        persist_transaction_journal(
+            &transaction_journal_path(&journals, &recovery.id),
+            &recovery,
+        )
+        .unwrap();
+        service.recover_transactions(&journals).unwrap();
+        assert_eq!(fs::read(files.join("recover")).unwrap(), b"original");
+        assert!(fs::read_dir(&journals).unwrap().next().is_none());
     }
 }

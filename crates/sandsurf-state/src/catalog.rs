@@ -12,7 +12,8 @@ CREATE TABLE grants(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandbo
 CREATE TABLE usage(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
-CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFERENCES images(digest), request_digest TEXT NOT NULL, cleanup_pending INTEGER NOT NULL) STRICT;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, enforced INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE checkpoints(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
@@ -28,6 +29,7 @@ pub struct CatalogLimits {
     pub operations: Counter,
     pub grants: Counter,
     pub usage_records: Counter,
+    pub image_bytes: Counter,
     pub resources: Resources,
 }
 
@@ -70,8 +72,18 @@ pub struct ImageRecord {
     pub platform: String,
     pub architecture: String,
     pub logical_bytes: Counter,
+    pub storage_bytes: Counter,
     pub provenance_digest: Digest,
     pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageReleaseRecord {
+    pub operation_id: OperationId,
+    pub image_digest: Digest,
+    pub request_digest: Digest,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +167,7 @@ impl HostCatalog {
             limits.operations,
             limits.grants,
             limits.usage_records,
+            limits.image_bytes,
         ]
         .contains(&Counter::ZERO)
         {
@@ -522,16 +535,38 @@ impl HostCatalog {
                 ))
             };
         }
-        if let Some(existing) = image_record(&tx, &image.digest)? {
-            if existing != image {
+        let existing = image_state(&tx, &image.digest)?;
+        if let Some((existing, retired, cleanup_pending)) = &existing {
+            if existing != &image {
                 return Err(Error::Conflict(
                     "image digest is bound to different metadata",
                 ));
             }
+            if *retired && *cleanup_pending {
+                return Err(Error::Conflict(
+                    "retired image cleanup must finish before re-import",
+                ));
+            }
         } else {
             capacity(&tx, "images", self.limits.identities)?;
+        }
+        if existing.as_ref().is_none_or(|(_, retired, _)| *retired) {
+            let mut reserved = image_storage_bytes(&tx)?;
+            reserved = reserved
+                .checked_add(image.storage_bytes.get())
+                .ok_or(Error::Capacity("image storage reservation overflow"))?;
+            if reserved > self.limits.image_bytes.get() {
+                return Err(Error::Capacity("image storage reservation exhausted"));
+            }
+        }
+        if existing.is_some() {
             tx.execute(
-                "INSERT INTO images VALUES (?1,?2)",
+                "UPDATE images SET retired=0,cleanup_pending=0 WHERE digest=?1",
+                [image.digest.as_str()],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO images VALUES (?1,?2,0,0)",
                 params![image.digest.as_str(), encode(&image)?],
             )?;
         }
@@ -557,23 +592,141 @@ impl HostCatalog {
     }
 
     pub fn image(&self, digest: &Digest) -> Result<Option<ImageRecord>> {
-        image_record(&self.db.connection, digest)
+        Ok(image_state(&self.db.connection, digest)?
+            .filter(|(_, retired, _)| !retired)
+            .map(|(image, _, _)| image))
     }
 
     pub fn images(&self, after: Option<&Digest>, limit: Counter) -> Result<Vec<ImageRecord>> {
         if limit == Counter::ZERO || limit.get() > 256 {
             return Err(Error::Capacity("image page limit must be in 1..=256"));
         }
-        let mut statement = self
-            .db
-            .connection
-            .prepare("SELECT value FROM images WHERE digest>?1 ORDER BY digest ASC LIMIT ?2")?;
+        let mut statement = self.db.connection.prepare(
+            "SELECT value FROM images WHERE retired=0 AND digest>?1 ORDER BY digest ASC LIMIT ?2",
+        )?;
         statement
             .query_map(
                 params![after.map_or("", Digest::as_str), limit.get()],
                 |row| row.get::<_, String>(0),
             )?
             .map(|value| decode(&value?))
+            .collect()
+    }
+
+    pub fn release_image(
+        &mut self,
+        operation_id: OperationId,
+        image_digest: Digest,
+        approval: Approval,
+    ) -> Result<ImageReleaseRecord> {
+        let request_digest = digest(
+            Domain::Image,
+            &("sandsurf-release-image-v1", &operation_id, &image_digest),
+        )?;
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("image release approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = image_release(&tx, &operation_id)? {
+            return if old.image_digest == image_digest && old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("image release operation identity conflict"))
+            };
+        }
+        let (_, retired, _) =
+            image_state(&tx, &image_digest)?.ok_or(Error::Missing("image does not exist"))?;
+        if retired {
+            return Err(Error::Conflict("image is already retired"));
+        }
+        let sandbox_references: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandboxes WHERE image=?1 AND released=0)",
+            [image_digest.as_str()],
+            |row| row.get(0),
+        )?;
+        if sandbox_references {
+            return Err(Error::Conflict("active sandboxes pin this image"));
+        }
+        let mut statement = tx.prepare("SELECT value FROM checkpoints")?;
+        let checkpoints = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for checkpoint in checkpoints {
+            if decode::<Checkpoint>(&checkpoint)?.image_digest == image_digest {
+                return Err(Error::Conflict("retained checkpoints pin this image"));
+            }
+        }
+        capacity(&tx, "image_releases", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let value = ImageReleaseRecord {
+            operation_id,
+            image_digest,
+            request_digest,
+            cleanup_pending: true,
+        };
+        tx.execute(
+            "INSERT INTO image_releases VALUES (?1,?2,?3,1)",
+            params![
+                value.operation_id.as_str(),
+                value.image_digest.as_str(),
+                value.request_digest.as_str()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE images SET retired=1,cleanup_pending=1 WHERE digest=?1",
+            [value.image_digest.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn complete_image_release(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<ImageReleaseRecord> {
+        let tx = self.db.connection.transaction()?;
+        let mut value = image_release(&tx, operation_id)?
+            .ok_or(Error::Missing("image release operation does not exist"))?;
+        if &value.request_digest != request_digest {
+            return Err(Error::Conflict("image release request digest changed"));
+        }
+        tx.execute(
+            "UPDATE image_releases SET cleanup_pending=0 WHERE operation=?1",
+            [operation_id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE images SET cleanup_pending=0 WHERE digest=?1",
+            [value.image_digest.as_str()],
+        )?;
+        tx.commit()?;
+        value.cleanup_pending = false;
+        Ok(value)
+    }
+
+    pub fn pending_image_releases(&self) -> Result<Vec<ImageReleaseRecord>> {
+        let mut statement = self.db.connection.prepare(
+            "SELECT operation,image,request_digest,cleanup_pending FROM image_releases WHERE cleanup_pending=1 ORDER BY operation",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (operation, image, request, cleanup_pending) = row?;
+                Ok(ImageReleaseRecord {
+                    operation_id: operation.try_into()?,
+                    image_digest: image.try_into()?,
+                    request_digest: request.try_into()?,
+                    cleanup_pending,
+                })
+            })
             .collect()
     }
 
@@ -1020,6 +1173,9 @@ impl HostCatalog {
         }
         capacity(&tx, "sandboxes", self.limits.identities)?;
         capacity(&tx, "intents", self.limits.operations)?;
+        if image_state(&tx, &image)?.is_some_and(|(_, retired, _)| retired) {
+            return Err(Error::Conflict("sandbox image is retired"));
+        }
         let mut total = resources.clone();
         {
             let mut statement = tx.prepare("SELECT resources FROM sandboxes WHERE released=0")?;
@@ -2051,13 +2207,70 @@ fn get_grant(db: &rusqlite::Connection, id: &GrantId) -> Result<Option<Grant>> {
 }
 
 fn image_record(db: &rusqlite::Connection, digest: &Digest) -> Result<Option<ImageRecord>> {
+    Ok(image_state(db, digest)?.map(|(image, _, _)| image))
+}
+
+fn image_state(
+    db: &rusqlite::Connection,
+    digest: &Digest,
+) -> Result<Option<(ImageRecord, bool, bool)>> {
     db.query_row(
-        "SELECT value FROM images WHERE digest=?1",
+        "SELECT value,retired,cleanup_pending FROM images WHERE digest=?1",
         [digest.as_str()],
-        |row| row.get::<_, String>(0),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        },
     )
     .optional()?
-    .map(|value| decode(&value))
+    .map(|(value, retired, cleanup)| Ok((decode(&value)?, retired, cleanup)))
+    .transpose()
+}
+
+fn image_storage_bytes(db: &rusqlite::Connection) -> Result<u64> {
+    // Retirement gates new attachments immediately, but its storage remains
+    // reserved until exact artifact cleanup is durably complete.
+    let mut statement =
+        db.prepare("SELECT value FROM images WHERE retired=0 OR cleanup_pending=1")?;
+    let values = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut total = 0_u64;
+    for value in values {
+        total = total
+            .checked_add(decode::<ImageRecord>(&value)?.storage_bytes.get())
+            .ok_or(Error::Capacity("image storage reservation overflow"))?;
+    }
+    Ok(total)
+}
+
+fn image_release(
+    db: &rusqlite::Connection,
+    operation: &OperationId,
+) -> Result<Option<ImageReleaseRecord>> {
+    db.query_row(
+        "SELECT image,request_digest,cleanup_pending FROM image_releases WHERE operation=?1",
+        [operation.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|(image, request, cleanup_pending)| {
+        Ok(ImageReleaseRecord {
+            operation_id: operation.clone(),
+            image_digest: image.try_into()?,
+            request_digest: request.try_into()?,
+            cleanup_pending,
+        })
+    })
     .transpose()
 }
 

@@ -24,12 +24,16 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
     option_env!("SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST");
+
+pub fn bundled_image_digest() -> Option<Digest> {
+    BUNDLED_IMAGE_MANIFEST_DIGEST.and_then(|value| value.to_owned().try_into().ok())
+}
 
 #[derive(Debug)]
 pub enum ImageBuildError {
@@ -279,6 +283,8 @@ pub fn import_oci(
         architecture: requested.architecture,
         logical_bytes: Counter::try_from(rootfs_bytes)
             .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
         provenance_digest: conversion_digest,
         sensitive: false,
     };
@@ -459,6 +465,8 @@ pub fn publish_checkpoint(
         platform: "linux".into(),
         architecture: architecture.into(),
         logical_bytes: Counter::try_from(logical_bytes)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
             .map_err(|error| LinuxError::Invalid(error.to_string()))?,
         provenance_digest,
         sensitive: checkpoint.sensitive,
@@ -757,6 +765,84 @@ fn copy_regular(source: &Path, destination: &Path) -> Result<(), LinuxError> {
     io::copy(&mut input, &mut output)?;
     output.sync_all()?;
     Ok(())
+}
+
+pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError> {
+    let images = host_root.join("images");
+    let target = images.join(digest.as_str());
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(ImageBuildError::Invalid(
+                    "retired image target is not an owned directory".into(),
+                ));
+            }
+            fs::remove_dir_all(&target)?;
+            File::open(images)?.sync_all()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn artifact_storage_bytes(root: &Path) -> Result<u64, LinuxError> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(LinuxError::Invalid(
+            "image artifact root is not a directory".into(),
+        ));
+    }
+    let mut total = allocated_bytes(&metadata)?;
+    let mut entries = 0_usize;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            entries = entries
+                .checked_add(1)
+                .ok_or_else(|| LinuxError::Invalid("image artifact count overflow".into()))?;
+            if entries > 1_000_000 {
+                return Err(LinuxError::Invalid(
+                    "image artifact count exceeds its bound".into(),
+                ));
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                return Err(LinuxError::Invalid(
+                    "image artifact contains a symbolic link".into(),
+                ));
+            }
+            total = total
+                .checked_add(allocated_bytes(&metadata)?)
+                .ok_or_else(|| LinuxError::Invalid("image storage size overflow".into()))?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if !metadata.is_file() {
+                return Err(LinuxError::Invalid(
+                    "image artifact contains a special file".into(),
+                ));
+            }
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(unix)]
+fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, LinuxError> {
+    metadata
+        .blocks()
+        .checked_mul(512)
+        .ok_or_else(|| LinuxError::Invalid("image allocated size overflow".into()))
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, LinuxError> {
+    // The Windows artifacts are dynamic VHDX files; their file length is the
+    // portable lower bound available without opening another authority-bearing
+    // filesystem handle. Quota admission remains conservative for ordinary
+    // files and is reconciled from the artifact tree at publication.
+    Ok(metadata.len())
 }
 
 fn bare_digest(value: &str) -> Result<&str, LinuxError> {

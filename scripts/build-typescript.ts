@@ -4,8 +4,9 @@ import { resolve } from "node:path";
 
 await rm(resolve("packages/sandbox/dist"), { recursive: true, force: true });
 await rm(resolve("packages/sandbox/tsconfig.tsbuildinfo"), { force: true });
-await run("tsc", ["-b"]);
-await run("tsc", ["-p", "scripts/tsconfig.json"]);
+const compiler = resolve("node_modules/typescript/bin/tsc");
+await run(process.execPath, [compiler, "-b"]);
+await run(process.execPath, [compiler, "-p", "scripts/tsconfig.json"]);
 
 function run(command: string, arguments_: readonly string[]): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {

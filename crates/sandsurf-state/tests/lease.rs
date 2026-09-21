@@ -21,6 +21,7 @@ fn intentional_writer_close_releases_a_fork_inherited_lease() {
         operations: Counter::ONE,
         grants: Counter::ONE,
         usage_records: Counter::ONE,
+        image_bytes: Counter::ONE,
         resources: Resources {
             vcpus: Counter::ONE,
             memory_mib: Counter::ONE,

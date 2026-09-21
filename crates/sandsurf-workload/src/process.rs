@@ -2,7 +2,7 @@ use crate::{CgroupLimits, CgroupManager, CgroupUsage, OutputSpool, ProcessCgroup
 use sandsurf_protocol::{
     CheckpointId, Counter, Digest, ProcessCompletion, ProcessId, ProcessLifetime, ProcessLineage,
     ProcessOutcome, ProcessSnapshot, ProcessState, RetainedPage, SandboxId, SpawnRequest,
-    StdioMode, Stream, TerminalSize, bytes_digest,
+    StdioMode, Stream, TerminalId, TerminalSize, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,12 +14,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{
+    Arc, Condvar, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const READ_BUFFER: usize = sandsurf_protocol::MAX_STREAM_BYTES;
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(500);
+const DEADLINE_TERMINATION_GRACE: Duration = Duration::from_secs(1);
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
 const PROCESS_RECORD_VERSION: u16 = 1;
 const MAX_PROCESS_RECORD_BYTES: u64 = 1024 * 1024;
@@ -76,10 +80,12 @@ struct ProcessEntry {
     pid: u32,
     group: i32,
     input: Mutex<Option<Input>>,
+    input_lease: Mutex<Option<TerminalId>>,
     terminal: Option<File>,
     spool: Arc<OutputSpool>,
     state: Mutex<ProcessState>,
     changed: Condvar,
+    deadline_exceeded: AtomicBool,
     cgroup: Option<ProcessCgroup>,
     record_path: PathBuf,
 }
@@ -312,10 +318,12 @@ impl ProcessSupervisor {
             pid,
             group: i32::try_from(pid).map_err(|_| ProcessError::Invalid("PID overflow"))?,
             input: Mutex::new(Some(spawned.input)),
+            input_lease: Mutex::new(None),
             terminal: spawned.terminal,
             spool,
             state: Mutex::new(initial_state),
             changed: Condvar::new(),
+            deadline_exceeded: AtomicBool::new(false),
             cgroup,
             record_path,
         });
@@ -327,6 +335,9 @@ impl ProcessSupervisor {
             readers.push(start_reader(Arc::clone(&entry), reader, stream));
         }
         start_waiter(Arc::clone(&entry), spawned.child, readers);
+        if let Some(deadline) = request.deadline_millis {
+            start_deadline(Arc::clone(&entry), Duration::from_millis(deadline.get()));
+        }
         entry.snapshot()
     }
 
@@ -420,7 +431,61 @@ impl ProcessSupervisor {
         entries.into_iter().map(|entry| entry.snapshot()).collect()
     }
 
-    pub fn write_input(&self, id: &ProcessId, bytes: &[u8]) -> Result<(), ProcessError> {
+    pub fn acquire_terminal_input(
+        &self,
+        id: &ProcessId,
+        lease_id: &TerminalId,
+    ) -> Result<(), ProcessError> {
+        let entry = self.entry(id)?;
+        if !matches!(entry.state()?, ProcessState::Running)
+            || entry
+                .request
+                .read()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?
+                .stdio
+                != StdioMode::Terminal
+        {
+            return Err(ProcessError::Conflict(
+                "terminal input lease requires a running terminal",
+            ));
+        }
+        let mut lease = entry
+            .input_lease
+            .lock()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-input-lease-poisoned")))?;
+        match lease.as_ref() {
+            Some(current) if current == lease_id => Ok(()),
+            Some(_) => Err(ProcessError::Conflict("terminal input is already leased")),
+            None => {
+                *lease = Some(lease_id.clone());
+                Ok(())
+            }
+        }
+    }
+
+    pub fn release_terminal_input(
+        &self,
+        id: &ProcessId,
+        lease_id: &TerminalId,
+    ) -> Result<(), ProcessError> {
+        let entry = self.entry(id)?;
+        let mut lease = entry
+            .input_lease
+            .lock()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-input-lease-poisoned")))?;
+        if lease.as_ref() != Some(lease_id) {
+            return Err(ProcessError::Conflict("terminal input lease is stale"));
+        }
+        *lease = None;
+        Ok(())
+    }
+
+    pub fn write_input(
+        &self,
+        id: &ProcessId,
+        terminal_lease_id: Option<&TerminalId>,
+        bytes: &[u8],
+    ) -> Result<(), ProcessError> {
         if bytes.is_empty() || bytes.len() > sandsurf_protocol::MAX_STREAM_BYTES {
             return Err(ProcessError::Invalid("input chunk is outside frame bounds"));
         }
@@ -428,6 +493,7 @@ impl ProcessSupervisor {
         if !matches!(entry.state()?, ProcessState::Running) {
             return Err(ProcessError::Conflict("process is not running"));
         }
+        entry.check_input_lease(terminal_lease_id)?;
         let mut input = entry
             .input
             .lock()
@@ -442,8 +508,13 @@ impl ProcessSupervisor {
         Ok(())
     }
 
-    pub fn close_input(&self, id: &ProcessId) -> Result<(), ProcessError> {
+    pub fn close_input(
+        &self,
+        id: &ProcessId,
+        terminal_lease_id: Option<&TerminalId>,
+    ) -> Result<(), ProcessError> {
         let entry = self.entry(id)?;
+        entry.check_input_lease(terminal_lease_id)?;
         entry
             .input
             .lock()
@@ -674,10 +745,12 @@ impl ProcessSupervisor {
                     pid: record.guest_pid,
                     group: 0,
                     input: Mutex::new(None),
+                    input_lease: Mutex::new(None),
                     terminal: None,
                     spool,
                     state: Mutex::new(record.state),
                     changed: Condvar::new(),
+                    deadline_exceeded: AtomicBool::new(false),
                     cgroup: None,
                     record_path,
                 }),
@@ -756,6 +829,31 @@ impl ProcessEntry {
             .lock()
             .map(|value| value.clone())
             .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-state-poisoned")))
+    }
+
+    fn check_input_lease(
+        &self,
+        terminal_lease_id: Option<&TerminalId>,
+    ) -> Result<(), ProcessError> {
+        let stdio = self
+            .request
+            .read()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?
+            .stdio;
+        let lease = self
+            .input_lease
+            .lock()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-input-lease-poisoned")))?;
+        match (stdio, terminal_lease_id, lease.as_ref()) {
+            (StdioMode::Pipes, None, None) => Ok(()),
+            (StdioMode::Terminal, Some(supplied), Some(current)) if supplied == current => Ok(()),
+            (StdioMode::Pipes, _, _) => Err(ProcessError::Invalid(
+                "pipe input cannot use a terminal lease",
+            )),
+            (StdioMode::Terminal, _, _) => Err(ProcessError::Conflict(
+                "terminal input lease is absent or stale",
+            )),
+        }
     }
 
     fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError> {
@@ -1191,6 +1289,32 @@ fn start_reader(
     })
 }
 
+fn start_deadline(entry: Arc<ProcessEntry>, deadline: Duration) {
+    std::thread::spawn(move || {
+        let Ok(state) = entry.state.lock() else {
+            return;
+        };
+        let Ok((state, timeout)) = entry.changed.wait_timeout_while(state, deadline, |state| {
+            matches!(state, ProcessState::Running)
+        }) else {
+            return;
+        };
+        if !timeout.timed_out() || !matches!(*state, ProcessState::Running) {
+            return;
+        }
+        entry.deadline_exceeded.store(true, Ordering::Release);
+        drop(state);
+        let _ = send_group_signal(entry.group, libc::SIGTERM);
+        let grace_deadline = Instant::now() + DEADLINE_TERMINATION_GRACE;
+        while entry.owned_processes_exist() && Instant::now() < grace_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if entry.owned_processes_exist() {
+            entry.kill_owned();
+        }
+    });
+}
+
 fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<()>>) {
     std::thread::spawn(move || {
         let waited = wait_child(child);
@@ -1249,14 +1373,18 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
             },
             None => (leader_accounting, bytes_digest(b"process-group-empty")),
         };
-        let outcome = match (status.code(), status.signal()) {
-            (Some(code), _) => ProcessOutcome::Exit { code },
-            (None, Some(signal)) => ProcessOutcome::Signal {
-                signal: signal as u32,
-            },
-            _ => ProcessOutcome::Interrupted {
-                evidence: bytes_digest(b"exit-status-unclassified"),
-            },
+        let outcome = if entry.deadline_exceeded.load(Ordering::Acquire) {
+            ProcessOutcome::DeadlineExceeded
+        } else {
+            match (status.code(), status.signal()) {
+                (Some(code), _) => ProcessOutcome::Exit { code },
+                (None, Some(signal)) => ProcessOutcome::Signal {
+                    signal: signal as u32,
+                },
+                _ => ProcessOutcome::Interrupted {
+                    evidence: bytes_digest(b"exit-status-unclassified"),
+                },
+            }
         };
         match entry.spool.finalize() {
             Ok(output) => entry.finish(ProcessState::Exited(ProcessCompletion {
@@ -1528,6 +1656,7 @@ mod tests {
                 pixel_height: 0,
             }),
             lifetime: ProcessLifetime::Job,
+            deadline_millis: None,
             output_bytes: (1024 * 1024u64).try_into().unwrap(),
         }
     }
@@ -1596,7 +1725,20 @@ mod tests {
                 },
             )
             .unwrap();
-        supervisor.write_input(&id, b"hello\n").unwrap();
+        let lease = TerminalId::try_from("writer").unwrap();
+        let competing = TerminalId::try_from("competing").unwrap();
+        supervisor.acquire_terminal_input(&id, &lease).unwrap();
+        assert!(matches!(
+            supervisor.acquire_terminal_input(&id, &competing),
+            Err(ProcessError::Conflict(_))
+        ));
+        assert!(matches!(
+            supervisor.write_input(&id, Some(&competing), b"wrong\n"),
+            Err(ProcessError::Conflict(_))
+        ));
+        supervisor
+            .write_input(&id, Some(&lease), b"hello\n")
+            .unwrap();
         let completion = supervisor.wait(&id, Some(Duration::from_secs(5))).unwrap();
         assert!(completion.output.terminal_bytes.get() > 0);
         assert_eq!(completion.output.stdout_bytes, Counter::ZERO);
@@ -1646,6 +1788,33 @@ mod tests {
             ProcessState::Running
         ));
         supervisor.wait(&id, Some(Duration::from_secs(5))).unwrap();
+    }
+
+    #[test]
+    fn workload_deadline_terminates_only_its_process_group() {
+        let root = Temp::new();
+        let supervisor =
+            ProcessSupervisor::create(&root.0, SandboxId::try_from("box").unwrap(), Counter::ONE)
+                .unwrap();
+        let timed = ProcessId::try_from("timed").unwrap();
+        let sibling = ProcessId::try_from("sibling").unwrap();
+        let mut timed_request = request("timed", "sleep 30", StdioMode::Pipes);
+        timed_request.deadline_millis = Some(Counter::try_from(30).unwrap());
+        supervisor.spawn(timed_request).unwrap();
+        supervisor
+            .spawn(request("sibling", "sleep 0.2", StdioMode::Pipes))
+            .unwrap();
+        let completion = supervisor
+            .wait(&timed, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(completion.outcome, ProcessOutcome::DeadlineExceeded);
+        assert!(matches!(
+            supervisor.get(&sibling).unwrap().state,
+            ProcessState::Running
+        ));
+        supervisor
+            .wait(&sibling, Some(Duration::from_secs(5)))
+            .unwrap();
     }
 
     #[test]

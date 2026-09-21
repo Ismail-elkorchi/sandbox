@@ -73,6 +73,7 @@ export interface SandsurfSpawnRequest {
   readonly stdio: "pipes" | "terminal";
   readonly terminalSize: SandsurfTerminalSize | null;
   readonly lifetime: "job" | "sandbox";
+  readonly deadlineMillis: number | null;
   readonly outputBytes: number;
 }
 
@@ -85,8 +86,10 @@ export interface SandsurfTerminalSize {
 
 export type SandsurfWorkloadRequest =
   | { readonly kind: "spawn"; readonly request: SandsurfSpawnRequest }
-  | { readonly kind: "write-input"; readonly processId: string; readonly bytes: readonly number[] }
-  | { readonly kind: "close-input"; readonly processId: string }
+  | { readonly kind: "write-input"; readonly processId: string; readonly terminalLeaseId: string | null; readonly bytes: readonly number[] }
+  | { readonly kind: "close-input"; readonly processId: string; readonly terminalLeaseId: string | null }
+  | { readonly kind: "acquire-terminal-input"; readonly processId: string; readonly terminalLeaseId: string }
+  | { readonly kind: "release-terminal-input"; readonly processId: string; readonly terminalLeaseId: string }
   | { readonly kind: "resize-terminal"; readonly processId: string; readonly size: SandsurfTerminalSize }
   | { readonly kind: "signal"; readonly processId: string; readonly signal: number; readonly group: boolean }
   | { readonly kind: "terminate"; readonly processId: string; readonly graceMillis: number }
@@ -160,13 +163,20 @@ function validateWorkloadRequest(value: unknown): asserts value is SandsurfWorkl
   switch (fields.kind) {
     case "spawn": record(fields, ["kind", "request"]); validateSpawn(fields.request); break;
     case "write-input":
-      record(fields, ["kind", "processId", "bytes"]); identity(fields.processId);
+      record(fields, ["kind", "processId", "terminalLeaseId", "bytes"]); identity(fields.processId);
+      if (fields.terminalLeaseId !== null) identity(fields.terminalLeaseId);
       if (!Array.isArray(fields.bytes) || fields.bytes.length < 1 || fields.bytes.length > SANDSURF_MAX_STREAM_BYTES
         || fields.bytes.some((byte) => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
         throw new Error("invalid Sandsurf input bytes");
       }
       break;
-    case "close-input": record(fields, ["kind", "processId"]); identity(fields.processId); break;
+    case "close-input":
+      record(fields, ["kind", "processId", "terminalLeaseId"]); identity(fields.processId);
+      if (fields.terminalLeaseId !== null) identity(fields.terminalLeaseId);
+      break;
+    case "acquire-terminal-input":
+    case "release-terminal-input":
+      record(fields, ["kind", "processId", "terminalLeaseId"]); identity(fields.processId); identity(fields.terminalLeaseId); break;
     case "resize-terminal": record(fields, ["kind", "processId", "size"]); identity(fields.processId); validateTerminalSize(fields.size); break;
     case "signal":
       record(fields, ["kind", "processId", "signal", "group"]); identity(fields.processId); counter(fields.signal);
@@ -189,7 +199,7 @@ function recordValue(value: unknown): value is Record<string, unknown> {
 }
 
 function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
-  record(value, ["sandboxId", "epoch", "processId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "lifetime", "outputBytes"]);
+  record(value, ["sandboxId", "epoch", "processId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "lifetime", "deadlineMillis", "outputBytes"]);
   identity(value.sandboxId); identity(value.processId); identity(value.operationId); counter(value.epoch); counter(value.outputBytes);
   if (value.epoch === 0 || value.outputBytes === 0 || !Array.isArray(value.argv) || value.argv.length < 1 || value.argv.length > 4096
     || value.argv.some((item) => typeof item !== "string" || item.length < 1 || item.length > 64 * 1024 || item.includes("\0"))) {
@@ -208,6 +218,10 @@ function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
   if (value.stdio === "terminal") validateTerminalSize(value.terminalSize);
   else if (value.stdio !== "pipes" || value.terminalSize !== null) throw new Error("invalid Sandsurf stdio mode");
   if (value.lifetime !== "job" && value.lifetime !== "sandbox") throw new Error("invalid Sandsurf process lifetime");
+  if (value.deadlineMillis !== null) {
+    counter(value.deadlineMillis);
+    if (value.deadlineMillis === 0 || value.deadlineMillis > 30 * 24 * 60 * 60 * 1000) throw new Error("invalid Sandsurf process deadline");
+  }
 }
 
 function validateTerminalSize(value: unknown): asserts value is SandsurfTerminalSize {

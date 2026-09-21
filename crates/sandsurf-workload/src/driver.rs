@@ -31,10 +31,31 @@ impl WorkloadDriver for WorkloadService {
             WorkloadRequest::Spawn { request } => {
                 self.processes.spawn((**request).clone()).map(drop)
             }
-            WorkloadRequest::WriteInput { process_id, bytes } => {
-                self.processes.write_input(process_id, bytes)
-            }
-            WorkloadRequest::CloseInput { process_id } => self.processes.close_input(process_id),
+            WorkloadRequest::WriteInput {
+                process_id,
+                terminal_lease_id,
+                bytes,
+            } => self
+                .processes
+                .write_input(process_id, terminal_lease_id.as_ref(), bytes),
+            WorkloadRequest::CloseInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .close_input(process_id, terminal_lease_id.as_ref()),
+            WorkloadRequest::AcquireTerminalInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .acquire_terminal_input(process_id, terminal_lease_id),
+            WorkloadRequest::ReleaseTerminalInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .release_terminal_input(process_id, terminal_lease_id),
             WorkloadRequest::ResizeTerminal { process_id, size } => {
                 self.processes.resize_terminal(process_id, *size)
             }
@@ -213,6 +234,7 @@ mod tests {
                 operations: n(64),
                 grants: n(16),
                 usage_records: n(64),
+                image_bytes: n(16 * 1024 * 1024),
                 resources: Resources {
                     vcpus: n(8),
                     memory_mib: n(8192),
@@ -333,6 +355,7 @@ mod tests {
             stdio: StdioMode::Pipes,
             terminal_size: None,
             lifetime: ProcessLifetime::Job,
+            deadline_millis: None,
             output_bytes: n(1024),
         };
         let mutation = Mutation::new(

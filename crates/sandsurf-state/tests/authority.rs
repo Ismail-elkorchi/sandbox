@@ -50,6 +50,7 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(100),
         grants: n(100),
         usage_records: n(100),
+        image_bytes: n(400_000),
         resources: Resources {
             vcpus: n(8),
             memory_mib: n(16384),
@@ -183,6 +184,7 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
         platform: "linux".into(),
         architecture: "amd64".into(),
         logical_bytes: n(4096),
+        storage_bytes: n(2048),
         provenance_digest: hash("conversion"),
         sensitive: false,
     };
@@ -193,12 +195,132 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
     assert_eq!(published.image, Some(image.clone()));
     assert_eq!(host.images(None, n(10)).unwrap(), vec![image.clone()]);
     drop(host);
-    let host = HostCatalog::open(&path).unwrap();
+    let mut host = HostCatalog::open(&path).unwrap();
     assert_eq!(host.image(&image.digest).unwrap(), Some(image.clone()));
     assert_eq!(
         host.image_import(&operation).unwrap().unwrap().image,
-        Some(image)
+        Some(image.clone())
     );
+    let release_operation: OperationId = "release-image".try_into().unwrap();
+    let release_digest = digest(
+        Domain::Image,
+        &(
+            "sandsurf-release-image-v1",
+            &release_operation,
+            &image.digest,
+        ),
+    )
+    .unwrap();
+    let release = host
+        .release_image(
+            release_operation.clone(),
+            image.digest.clone(),
+            Approval {
+                id: "approve-release-image".try_into().unwrap(),
+                request_digest: release_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert!(release.cleanup_pending);
+    assert!(host.image(&image.digest).unwrap().is_none());
+    assert!(host.images(None, n(10)).unwrap().is_empty());
+    assert_eq!(host.pending_image_releases().unwrap(), vec![release]);
+    assert!(
+        !host
+            .complete_image_release(&release_operation, &release_digest)
+            .unwrap()
+            .cleanup_pending
+    );
+}
+
+#[test]
+fn retired_image_storage_remains_reserved_until_cleanup_completion() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut limits = catalog_limits();
+    limits.image_bytes = n(3_000);
+    let mut host =
+        HostCatalog::create(&path, "image-quota-host".try_into().unwrap(), limits).unwrap();
+    let first = publish_image(&mut host, "import-first", "first-image", 2_000);
+    let release_operation: OperationId = "release-first".try_into().unwrap();
+    let release_digest = digest(
+        Domain::Image,
+        &(
+            "sandsurf-release-image-v1",
+            &release_operation,
+            &first.digest,
+        ),
+    )
+    .unwrap();
+    host.release_image(
+        release_operation.clone(),
+        first.digest,
+        Approval {
+            id: "approve-release-first".try_into().unwrap(),
+            request_digest: release_digest.clone(),
+        },
+    )
+    .unwrap();
+
+    let second_operation: OperationId = "import-second".try_into().unwrap();
+    let second_request = hash("second-request");
+    host.admit_image_import(
+        second_operation.clone(),
+        second_request.clone(),
+        Approval {
+            id: "approve-second".try_into().unwrap(),
+            request_digest: second_request.clone(),
+        },
+    )
+    .unwrap();
+    let second = image("second-image", 2_000);
+    assert!(
+        host.complete_image_import(&second_operation, &second_request, second.clone())
+            .is_err()
+    );
+
+    host.complete_image_release(&release_operation, &release_digest)
+        .unwrap();
+    assert!(
+        host.complete_image_import(&second_operation, &second_request, second)
+            .is_ok()
+    );
+}
+
+fn publish_image(
+    host: &mut HostCatalog,
+    operation: &str,
+    label: &str,
+    storage_bytes: u64,
+) -> ImageRecord {
+    let operation: OperationId = operation.try_into().unwrap();
+    let request = hash(&format!("{label}-request"));
+    host.admit_image_import(
+        operation.clone(),
+        request.clone(),
+        Approval {
+            id: format!("approve-{label}").try_into().unwrap(),
+            request_digest: request.clone(),
+        },
+    )
+    .unwrap();
+    let image = image(label, storage_bytes);
+    host.complete_image_import(&operation, &request, image.clone())
+        .unwrap();
+    image
+}
+
+fn image(label: &str, storage_bytes: u64) -> ImageRecord {
+    ImageRecord {
+        digest: hash(label),
+        source_digest: hash(&format!("{label}-source")),
+        platform: "linux".into(),
+        architecture: "amd64".into(),
+        logical_bytes: n(storage_bytes),
+        storage_bytes: n(storage_bytes),
+        provenance_digest: hash(&format!("{label}-provenance")),
+        sensitive: false,
+    }
 }
 
 #[test]
@@ -343,6 +465,7 @@ impl Fixture {
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
                     lifetime: ProcessLifetime::Job,
+                    deadline_millis: None,
                     output_bytes: n(100),
                 }),
             },

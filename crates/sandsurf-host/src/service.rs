@@ -183,6 +183,7 @@ impl HostService {
         };
         service.recover_checkpoint_barriers();
         service.recover_secret_authority();
+        service.recover_image_releases();
         Ok(service)
     }
 
@@ -238,6 +239,32 @@ impl HostService {
                     .image_import(&operation_id)?
                     .ok_or(HostError::Invalid("image import operation does not exist"))?,
             }),
+            HostRequest::ReleaseImage {
+                digest: image_digest,
+                operation_id,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Image,
+                    &("sandsurf-release-image-v1", &operation_id, &image_digest),
+                )?;
+                let release = self.catalog.release_image(
+                    operation_id.clone(),
+                    image_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                let operation = if release.cleanup_pending {
+                    crate::images::cleanup(&self.root, &image_digest)?;
+                    self.catalog
+                        .complete_image_release(&operation_id, &request_digest)?
+                } else {
+                    release
+                };
+                Ok(HostResponse::ImageRelease { operation })
+            }
             HostRequest::ListCheckpoints { after, maximum } => Ok(HostResponse::Checkpoints {
                 values: self.catalog.checkpoints(after.as_ref(), maximum)?,
             }),
@@ -1582,6 +1609,7 @@ impl HostService {
                     GuestArchitecture::Arm64 => "arm64",
                 }
             ),
+            default_image_digest: crate::images::bundled_image_digest(),
         }
     }
 
@@ -1868,6 +1896,19 @@ impl HostService {
                 return;
             }
             after = values.last().map(|value| value.id.clone());
+        }
+    }
+
+    fn recover_image_releases(&mut self) {
+        let Ok(releases) = self.catalog.pending_image_releases() else {
+            return;
+        };
+        for release in releases {
+            if crate::images::cleanup(&self.root, &release.image_digest).is_ok() {
+                let _ = self
+                    .catalog
+                    .complete_image_release(&release.operation_id, &release.request_digest);
+            }
         }
     }
 
@@ -2295,6 +2336,7 @@ fn catalog_limits() -> CatalogLimits {
         operations: counter(1_000_000),
         grants: counter(100_000),
         usage_records: counter(1_000_000),
+        image_bytes: counter(16 * 1024 * 1024 * 1024 * 1024),
         resources: Resources {
             vcpus: counter(4096),
             memory_mib: counter(4 * 1024 * 1024),

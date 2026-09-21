@@ -1284,7 +1284,9 @@ impl RuntimeJournal {
             return Ok((receipt, receipt_digest));
         }
         let delivery = match receipt.outcome {
-            ProcessOutcome::Exit { .. } | ProcessOutcome::Signal { .. } => Delivery::Applied,
+            ProcessOutcome::Exit { .. }
+            | ProcessOutcome::Signal { .. }
+            | ProcessOutcome::DeadlineExceeded => Delivery::Applied,
             ProcessOutcome::SpawnFailed { .. } => Delivery::NotApplied,
             ProcessOutcome::Interrupted { .. } => op.delivery,
         };

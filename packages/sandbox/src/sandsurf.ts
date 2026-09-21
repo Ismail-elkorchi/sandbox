@@ -6,7 +6,7 @@ import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js"
 
 export type SandsurfCapability = "spawn" | "read-files" | "write-files" | "workload-admin" | "network" | "expose-port" | "deliver-secret" | "apply-to-host" | "increase-resources" | "checkpoint" | "fork" | "release-evidence";
 export type DesiredSandboxState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
-export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "image-publish" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery" | "secret-revocation"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
+export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "image-publish" | "image-release" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery" | "secret-revocation"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 export type SandsurfAuthorizer = (change: AuthorityChange) => AuthorityDecision | Promise<AuthorityDecision>;
 export interface SandsurfOpenOptions { readonly directory: string; readonly authorizer?: SandsurfAuthorizer; }
@@ -19,7 +19,7 @@ export interface CheckpointCreateOptions { readonly id?: string; readonly operat
 export interface DerivedImagePublishOptions { readonly operationId?: string; readonly includeWorkspace?: boolean; readonly includeHome?: boolean; readonly includeSecrets?: boolean; }
 export interface SandboxForkOptions { readonly id?: string; readonly operationId?: string; readonly resources?: ResourceEnvelope; readonly capabilities?: Partial<Record<SandsurfCapability, boolean>>; }
 export type Qualification = { readonly kind: "qualified"; readonly evidence: string } | { readonly kind: "unqualified"; readonly reasons: readonly string[] };
-export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; }
+export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly defaultImageDigest: string | null; }
 export interface WorkloadDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; readonly entrypoint: readonly string[]; readonly command: readonly string[]; }
 export interface SandboxInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: Readonly<Record<string, unknown>>; readonly workloadDefaults: WorkloadDefaults; }
 export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
@@ -48,7 +48,8 @@ export interface SecretRevocation {
 }
 export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: SecretVersion };
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
-export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
+export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
+export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
 export interface Receipt { readonly sandboxId: string; readonly epoch: number; readonly processId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
 export interface ReceiptView { readonly receipt: Receipt; readonly digest: string; }
 export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: Readonly<Record<string, unknown>>; }
@@ -119,6 +120,13 @@ export class ImageCollection {
     const response = await this.#host.request({ kind: "list-images", after: options.after === undefined ? null : digest(options.after), maximum: options.maximum ?? 100 });
     if (response.kind !== "images" || !Array.isArray(response.values)) throw protocol("image list response");
     return response.values.map((value) => new SandsurfImage(parseImage(value)));
+  }
+  async release(image: string | SandsurfImage, options: { readonly operationId?: string } = {}): Promise<ImageReleaseInspection> {
+    const imageDigest = digest(typeof image === "string" ? image : image.id); const operationId = validateIdentity(options.operationId ?? identity("release-image"));
+    const approvalId = await this.#host.approve({ kind: "image-release", sandboxId: "host", operationId, request: { imageDigest } });
+    const response = await this.#host.request({ kind: "release-image", digest: imageDigest, operationId, approvalId });
+    if (response.kind !== "image-release" || !record(response.operation)) throw protocol("image release response");
+    return { operationId: text(response.operation.operationId), imageDigest: digest(text(response.operation.imageDigest)), requestDigest: digest(text(response.operation.requestDigest)), cleanupPending: response.operation.cleanupPending === true };
   }
 }
 
@@ -193,6 +201,7 @@ export class SandboxCollection {
 export class Sandbox {
   readonly id: string;
   readonly processes: ProcessCollection;
+  readonly terminals: TerminalCollection;
   readonly fs: SandboxFilesystem;
   readonly workspace: SandboxWorkspace;
   readonly operations: SandboxOperations;
@@ -203,7 +212,7 @@ export class Sandbox {
   readonly checkpoints: SandboxCheckpoints;
   readonly #host: Sandsurf;
   #view: SandboxInspection;
-  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); this.checkpoints = new SandboxCheckpoints(this, host); }
+  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.terminals = new TerminalCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); this.checkpoints = new SandboxCheckpoints(this, host); }
   get revision(): number { return this.#view.configurationRevision; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
   async inspect(): Promise<SandboxInspection> { this.#view = sandboxViewFrom(await this.#host.request({ kind: "get-sandbox", sandboxId: this.id })); return this.#view; }
@@ -348,7 +357,9 @@ export class SandboxOperations {
 }
 
 export interface TerminalSize { readonly columns: number; readonly rows: number; readonly pixelWidth?: number; readonly pixelHeight?: number; }
-export interface SpawnOptions { readonly operationId?: string; readonly processId?: string; readonly argv: readonly string[]; readonly cwd?: string; readonly environment?: Readonly<Record<string, string>>; readonly user?: string; readonly stdio?: "pipes" | "terminal"; readonly terminalSize?: TerminalSize; readonly lifetime?: "job" | "sandbox"; readonly outputBytes?: number; }
+export interface SpawnOptions { readonly operationId?: string; readonly processId?: string; readonly argv: readonly string[]; readonly cwd?: string; readonly environment?: Readonly<Record<string, string>>; readonly user?: string; readonly stdio?: "pipes" | "terminal"; readonly terminalSize?: TerminalSize; readonly lifetime?: "job" | "sandbox"; readonly deadlineMs?: number; readonly outputBytes?: number; }
+export type ExecOptions = Omit<SpawnOptions, "lifetime"> & { readonly signal?: AbortSignal; readonly pollMs?: number };
+export interface ExecResult { readonly process: SandboxProcess; readonly inspection: ProcessInspection; }
 export interface ProcessInspection { readonly request: Readonly<Record<string, unknown>>; readonly guestPid: number; readonly state: Readonly<Record<string, unknown>>; readonly lineage: Readonly<Record<string, unknown>> | null; }
 export type ProcessObservation = { readonly kind: "current"; readonly value: ProcessInspection } | { readonly kind: "unavailable"; readonly lastKnown: ProcessInspection | null };
 
@@ -360,9 +371,15 @@ export class ProcessCollection {
     const view = await this.#sandbox.inspect(); const machine = currentMachine(view); const stdio = options.stdio ?? "pipes";
     const terminalSize = stdio === "terminal" ? { columns: options.terminalSize?.columns ?? 80, rows: options.terminalSize?.rows ?? 24, pixelWidth: options.terminalSize?.pixelWidth ?? 0, pixelHeight: options.terminalSize?.pixelHeight ?? 0 } : null;
     const user = options.user ?? view.workloadDefaults.user ?? "root"; const proxy = view.runtimeConfiguration.network.rules.some((rule) => rule.plane === "named-proxy") ? { HTTP_PROXY: "http://127.0.0.1:3128", HTTPS_PROXY: "http://127.0.0.1:3128", http_proxy: "http://127.0.0.1:3128", https_proxy: "http://127.0.0.1:3128", ALL_PROXY: "socks5h://127.0.0.1:1080", all_proxy: "socks5h://127.0.0.1:1080", NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" } : {};
-    const operation = await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: machine.epoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...proxy, ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", outputBytes: options.outputBytes ?? 64 * 1024 * 1024 } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId);
+    const deadlineMillis = options.deadlineMs ?? null; if (deadlineMillis !== null && (!Number.isSafeInteger(deadlineMillis) || deadlineMillis <= 0 || deadlineMillis > 30 * 24 * 60 * 60 * 1000)) throw new TypeError("process deadline must be a positive safe integer no greater than 30 days");
+    const operation = await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: machine.epoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...proxy, ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", deadlineMillis, outputBytes: options.outputBytes ?? 64 * 1024 * 1024 } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId);
     if (operation.delivery === "not-applied") throw new SandsurfHostError("workload", `Process ${processId} was not applied`);
     return new SandboxProcess(this.#sandbox, processId);
+  }
+  async exec(options: ExecOptions): Promise<ExecResult> {
+    const { signal, pollMs, ...spawn } = options;
+    const process = await this.spawn({ ...spawn, lifetime: "job" });
+    return { process, inspection: await process.wait({ ...(signal === undefined ? {} : { signal }), ...(pollMs === undefined ? {} : { pollMs }) }) };
   }
   async get(id: string): Promise<SandboxProcess> { const process = new SandboxProcess(this.#sandbox, validateIdentity(id)); await process.inspect(); return process; }
   async list(): Promise<readonly ProcessObservation[]> {
@@ -370,6 +387,46 @@ export class ProcessCollection {
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "processes" || !Array.isArray(response.response.processes)) throw protocol("process list response");
     return response.response.processes.map(parseProcessObservation);
   }
+}
+
+export type TerminalOpenOptions = Omit<SpawnOptions, "stdio" | "terminalSize"> & { readonly terminalSize?: TerminalSize; readonly inputLeaseId?: string };
+
+export class TerminalCollection {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async open(options: TerminalOpenOptions): Promise<SandboxTerminal> {
+    const { inputLeaseId, ...spawn } = options;
+    const process = await this.#sandbox.processes.spawn({ ...spawn, stdio: "terminal", ...(options.terminalSize === undefined ? {} : { terminalSize: options.terminalSize }) });
+    const terminal = new SandboxTerminal(process);
+    await terminal.acquireInput(inputLeaseId);
+    return terminal;
+  }
+  async get(id: string): Promise<SandboxTerminal> {
+    const process = await this.#sandbox.processes.get(id);
+    const observed = await process.inspect();
+    if (observed.kind !== "current" || observed.value.request.stdio !== "terminal") throw new SandsurfHostError("conflict", `Process ${process.id} is not a terminal`);
+    return new SandboxTerminal(process);
+  }
+}
+
+export class SandboxTerminal {
+  readonly id: string;
+  readonly output: ProcessOutput;
+  readonly process: SandboxProcess;
+  #attached = true;
+  #inputLeaseId: string | undefined;
+  constructor(process: SandboxProcess) { this.process = process; this.id = process.id; this.output = process.output; }
+  async acquireInput(leaseId = identity("terminal-input")): Promise<string> { this.#requireAttached(); const id = validateIdentity(leaseId); await this.process.acquireTerminalInput(id); this.#inputLeaseId = id; return id; }
+  async releaseInput(): Promise<void> { this.#requireAttached(); if (this.#inputLeaseId !== undefined) { const lease = this.#inputLeaseId; await this.process.releaseTerminalInput(lease); this.#inputLeaseId = undefined; } }
+  async detach(): Promise<void> { if (this.#attached) { await this.releaseInput(); this.#attached = false; } }
+  inspect(): Promise<ProcessObservation> { this.#requireAttached(); return this.process.inspect(); }
+  wait(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ProcessInspection> { this.#requireAttached(); return this.process.wait(options); }
+  write(bytes: Uint8Array, operationId?: string): Promise<void> { this.#requireAttached(); if (this.#inputLeaseId === undefined) throw new SandsurfHostError("conflict", `Terminal ${this.id} has no input lease`); return this.process.write(bytes, operationId, this.#inputLeaseId); }
+  closeInput(operationId?: string): Promise<void> { this.#requireAttached(); if (this.#inputLeaseId === undefined) throw new SandsurfHostError("conflict", `Terminal ${this.id} has no input lease`); return this.process.closeInput(operationId, this.#inputLeaseId); }
+  resize(size: TerminalSize, operationId?: string): Promise<void> { this.#requireAttached(); return this.process.resize(size, operationId); }
+  signal(signal: number, group = true, operationId?: string): Promise<void> { this.#requireAttached(); return this.process.signal(signal, group, operationId); }
+  terminate(graceMillis = 1000, operationId?: string): Promise<void> { this.#requireAttached(); return this.process.terminate(graceMillis, operationId); }
+  #requireAttached(): void { if (!this.#attached) throw new SandsurfHostError("client", `Terminal ${this.id} is detached`); }
 }
 
 export interface OutputChunk { readonly cursor: number; readonly stream: "stdout" | "stderr" | "terminal"; readonly bytes: Uint8Array; readonly digest: string; }
@@ -409,8 +466,10 @@ export class SandboxProcess {
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "release" || !record(response.response.status)) throw protocol("release cleanup response");
     return parseReleaseStatus(response.response.status);
   }
-  async write(bytes: Uint8Array, operationId = identity("input")): Promise<void> { await this.#sandbox.workload({ kind: "write-input", processId: this.id, bytes: [...bytes] }, "spawn", operationId); }
-  async closeInput(operationId = identity("close")): Promise<void> { await this.#sandbox.workload({ kind: "close-input", processId: this.id }, "spawn", operationId); }
+  async acquireTerminalInput(terminalLeaseId: string, operationId = identity("acquire-input")): Promise<void> { await this.#sandbox.workload({ kind: "acquire-terminal-input", processId: this.id, terminalLeaseId: validateIdentity(terminalLeaseId) }, "spawn", operationId); }
+  async releaseTerminalInput(terminalLeaseId: string, operationId = identity("release-input")): Promise<void> { await this.#sandbox.workload({ kind: "release-terminal-input", processId: this.id, terminalLeaseId: validateIdentity(terminalLeaseId) }, "spawn", operationId); }
+  async write(bytes: Uint8Array, operationId = identity("input"), terminalLeaseId: string | null = null): Promise<void> { await this.#sandbox.workload({ kind: "write-input", processId: this.id, terminalLeaseId: terminalLeaseId === null ? null : validateIdentity(terminalLeaseId), bytes: [...bytes] }, "spawn", operationId); }
+  async closeInput(operationId = identity("close"), terminalLeaseId: string | null = null): Promise<void> { await this.#sandbox.workload({ kind: "close-input", processId: this.id, terminalLeaseId: terminalLeaseId === null ? null : validateIdentity(terminalLeaseId) }, "spawn", operationId); }
   async signal(signal: number, group = true, operationId = identity("signal")): Promise<void> { await this.#sandbox.workload({ kind: "signal", processId: this.id, signal, group }, "spawn", operationId); }
   async terminate(graceMillis = 1000, operationId = identity("terminate")): Promise<void> { await this.#sandbox.workload({ kind: "terminate", processId: this.id, graceMillis }, "spawn", operationId); }
   async resize(size: TerminalSize, operationId = identity("resize")): Promise<void> { await this.#sandbox.workload({ kind: "resize-terminal", processId: this.id, size: { columns: size.columns, rows: size.rows, pixelWidth: size.pixelWidth ?? 0, pixelHeight: size.pixelHeight ?? 0 } }, "spawn", operationId); }
@@ -449,6 +508,9 @@ export class PinnedOutput {
 }
 
 export type FileExpectation = { readonly kind: "any" } | { readonly kind: "absent" } | { readonly kind: "matches"; readonly size: number; readonly digest: string };
+export type FileTransactionMutation =
+  | { readonly kind: "write"; readonly path: string | Uint8Array; readonly bytes: string | Uint8Array; readonly mode?: number; readonly expected?: FileExpectation }
+  | { readonly kind: "remove"; readonly path: string | Uint8Array; readonly expected?: FileExpectation };
 export class SandboxFilesystem {
   readonly #sandbox: Sandbox; constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
   stat(path: string | Uint8Array, follow = true): Promise<Record<string, unknown>> { return this.#operation({ kind: "stat", path: [...createSandsurfGuestPath(path)], follow }, "read-files"); }
@@ -463,6 +525,13 @@ export class SandboxFilesystem {
   async writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: { readonly mode?: number; readonly expected?: FileExpectation } = {}): Promise<Record<string, unknown>> {
     const value = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     return this.writeStream(path, [value], { length: value.byteLength, digest: createHash("sha256").update(value).digest("hex"), ...options });
+  }
+  async transaction(mutations: readonly FileTransactionMutation[], options: { readonly operationId?: string } = {}): Promise<void> {
+    const operationId = validateIdentity(options.operationId ?? identity("file-transaction"));
+    const normalized = mutations.map((mutation) => mutation.kind === "write"
+      ? { kind: "write", path: [...createSandsurfGuestPath(mutation.path)], bytes: [...(typeof mutation.bytes === "string" ? new TextEncoder().encode(mutation.bytes) : mutation.bytes)], mode: mutation.mode ?? 0o644, expected: mutation.expected ?? { kind: "any" } }
+      : { kind: "remove", path: [...createSandsurfGuestPath(mutation.path)], expected: mutation.expected ?? { kind: "any" } });
+    await this.#operation({ kind: "transaction", transaction: { id: operationId, mutations: normalized } }, "write-files", operationId);
   }
   async writeStream(path: string | Uint8Array, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, options: { readonly length: number; readonly digest: string; readonly mode?: number; readonly expected?: FileExpectation }): Promise<Record<string, unknown>> {
     if (!Number.isSafeInteger(options.length) || options.length < 0 || options.length > 128 * 1024 ** 3) throw new TypeError("stream length is invalid");
@@ -705,7 +774,7 @@ function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string
 }
 function parseImage(value: unknown): ImageInspection {
   if (!record(value)) throw protocol("image record");
-  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), provenanceDigest: digest(text(value.provenanceDigest)), sensitive: value.sensitive === true };
+  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), storageBytes: integer(value.storageBytes), provenanceDigest: digest(text(value.provenanceDigest)), sensitive: value.sensitive === true };
 }
 function parseCheckpoint(value: unknown): CheckpointInspection {
   if (!record(value) || !record(value.request) || !record(value.resources)) throw protocol("checkpoint record");

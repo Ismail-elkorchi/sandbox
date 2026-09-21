@@ -416,6 +416,8 @@ impl WorkloadRequest {
             WorkloadRequest::Spawn { .. }
             | WorkloadRequest::WriteInput { .. }
             | WorkloadRequest::CloseInput { .. }
+            | WorkloadRequest::AcquireTerminalInput { .. }
+            | WorkloadRequest::ReleaseTerminalInput { .. }
             | WorkloadRequest::ResizeTerminal { .. }
             | WorkloadRequest::Signal { .. }
             | WorkloadRequest::Terminate { .. } => Capability::Spawn,
@@ -808,6 +810,10 @@ pub struct SpawnRequest {
     pub stdio: StdioMode,
     pub terminal_size: Option<TerminalSize>,
     pub lifetime: ProcessLifetime,
+    /// Elapsed workload time after which the supervisor terminates this
+    /// process group. This is part of execution semantics, not a client wait
+    /// timeout, and therefore survives client disconnects.
+    pub deadline_millis: Option<Counter>,
     pub output_bytes: Counter,
 }
 
@@ -824,10 +830,20 @@ pub enum WorkloadRequest {
     },
     CloseInput {
         process_id: ProcessId,
+        terminal_lease_id: Option<TerminalId>,
     },
     WriteInput {
         process_id: ProcessId,
+        terminal_lease_id: Option<TerminalId>,
         bytes: Vec<u8>,
+    },
+    AcquireTerminalInput {
+        process_id: ProcessId,
+        terminal_lease_id: TerminalId,
+    },
+    ReleaseTerminalInput {
+        process_id: ProcessId,
+        terminal_lease_id: TerminalId,
     },
     ResizeTerminal {
         process_id: ProcessId,
@@ -851,7 +867,9 @@ impl WorkloadRequest {
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {
             Self::Spawn { request } => request.validate(),
-            Self::CloseInput { .. } => Ok(()),
+            Self::CloseInput { .. }
+            | Self::AcquireTerminalInput { .. }
+            | Self::ReleaseTerminalInput { .. } => Ok(()),
             Self::WriteInput { bytes, .. } => {
                 if bytes.is_empty() || bytes.len() > crate::MAX_STREAM_BYTES {
                     return Err(Invalid("input chunk is outside stream bounds"));
@@ -913,6 +931,14 @@ impl SpawnRequest {
         }
         if self.output_bytes == Counter::ZERO {
             return Err(Invalid("process output reservation must be positive"));
+        }
+        if self
+            .deadline_millis
+            .is_some_and(|value| value == Counter::ZERO || value.get() > 30 * 24 * 60 * 60 * 1000)
+        {
+            return Err(Invalid(
+                "process deadline must be positive and no more than 30 days",
+            ));
         }
         Ok(())
     }
@@ -1016,6 +1042,7 @@ pub struct OutputBoundary {
 pub enum ProcessOutcome {
     Exit { code: i32 },
     Signal { signal: u32 },
+    DeadlineExceeded,
     SpawnFailed { reason: Digest },
     Interrupted { evidence: Digest },
 }

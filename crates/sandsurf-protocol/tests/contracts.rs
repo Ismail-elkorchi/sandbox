@@ -87,6 +87,7 @@ fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
                     lifetime: ProcessLifetime::Job,
+                    deadline_millis: None,
                     output_bytes: Counter::ONE,
                 }),
             },

@@ -107,6 +107,9 @@ impl PersistentWorkloadService {
         cgroups: Option<CgroupManager>,
     ) -> io::Result<Self> {
         fs::create_dir_all(ledger_root)?;
+        filesystem
+            .recover_transactions(&filesystem_transaction_root(ledger_root))
+            .map_err(io::Error::other)?;
         let operations = load_operations(ledger_root)?;
         Ok(Self {
             processes,
@@ -422,10 +425,31 @@ impl PersistentWorkloadService {
                     .spawn_with_environment(request, &secrets)
                     .and_then(|_| self.arm_process_secret_cleanup(&process_id))
             }
-            WorkloadRequest::WriteInput { process_id, bytes } => {
-                self.processes.write_input(process_id, bytes)
-            }
-            WorkloadRequest::CloseInput { process_id } => self.processes.close_input(process_id),
+            WorkloadRequest::WriteInput {
+                process_id,
+                terminal_lease_id,
+                bytes,
+            } => self
+                .processes
+                .write_input(process_id, terminal_lease_id.as_ref(), bytes),
+            WorkloadRequest::CloseInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .close_input(process_id, terminal_lease_id.as_ref()),
+            WorkloadRequest::AcquireTerminalInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .acquire_terminal_input(process_id, terminal_lease_id),
+            WorkloadRequest::ReleaseTerminalInput {
+                process_id,
+                terminal_lease_id,
+            } => self
+                .processes
+                .release_terminal_input(process_id, terminal_lease_id),
             WorkloadRequest::ResizeTerminal { process_id, size } => {
                 self.processes.resize_terminal(process_id, *size)
             }
@@ -953,6 +977,22 @@ impl PersistentWorkloadService {
                 self.filesystem.abort_write_transfer(&transfer)?;
                 FilesystemResponse::Complete
             }
+            FilesystemRequest::Transaction { transaction } => {
+                if transaction.id != operation_id {
+                    return Err((
+                        "request.invalid",
+                        "filesystem transaction identity does not match its operation".into(),
+                    )
+                        .into());
+                }
+                self.filesystem.apply_transaction(
+                    &transaction,
+                    &operation_id,
+                    &filesystem_transaction_root(&self.ledger_root),
+                    &self.processes,
+                )?;
+                FilesystemResponse::Complete
+            }
             FilesystemRequest::Mkdir { path, recursive } => {
                 self.filesystem.mkdir_path(&path, recursive)?;
                 FilesystemResponse::Complete
@@ -1114,6 +1154,13 @@ impl PersistentWorkloadService {
         record.response = Some(response.clone());
         Ok(response)
     }
+}
+
+fn filesystem_transaction_root(ledger_root: &Path) -> PathBuf {
+    ledger_root
+        .parent()
+        .unwrap_or(ledger_root)
+        .join("filesystem-transactions")
 }
 
 fn load_operations(root: &Path) -> io::Result<BTreeMap<OperationId, OperationRecord>> {
@@ -1345,6 +1392,7 @@ mod tests {
             stdio: StdioMode::Pipes,
             terminal_size: None,
             lifetime: ProcessLifetime::Job,
+            deadline_millis: None,
             output_bytes: Counter::try_from(1024 * 1024).unwrap(),
         }
     }
