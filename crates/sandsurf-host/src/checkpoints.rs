@@ -690,6 +690,11 @@ fn materialized_digest(path: &Path, bytes: u64, container: DiskContainer) -> Res
     }
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn current_disk_digest(path: &Path, bytes: u64) -> Result<Digest> {
+    materialized_digest(path, bytes, disk_container(path)?)
+}
+
 pub(crate) fn copy_and_verify(
     source_path: &Path,
     destination_path: &Path,
@@ -980,16 +985,7 @@ mod tests {
 }
 
 #[cfg(windows)]
-fn private_directory(path: &Path) -> Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    if !fs::symlink_metadata(path)?.is_dir() {
-        return Err(CheckpointError::Invalid(
-            "checkpoint path is not a directory",
-        ));
-    }
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
+    sandsurf_native::local::create_private_directory(path)?;
     Ok(())
 }

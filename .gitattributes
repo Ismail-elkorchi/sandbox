@@ -1,5 +1,6 @@
 *.ext4 binary
 *.vhdx binary
+packages/sandbox/images/**/*.json text eol=lf
 packages/**/vmlinux-* binary
 packages/**/sandbox-runtime-* binary
 packages/**/sandbox-vm-runtime-* binary

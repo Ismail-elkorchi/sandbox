@@ -312,7 +312,11 @@ mod windows {
                     size_of::<SOCKADDR_HV>() as i32,
                 )
             } == SOCKET_ERROR
-                || unsafe { listen(raw, SOMAXCONN as i32) } == SOCKET_ERROR
+                || {
+                    // SAFETY: raw is still uniquely owned and live after a
+                    // successful bind; the backlog is within the WinSock ABI.
+                    unsafe { listen(raw, SOMAXCONN as i32) }
+                } == SOCKET_ERROR
             {
                 let error = last_socket_error();
                 // SAFETY: raw is uniquely owned until successful construction.
