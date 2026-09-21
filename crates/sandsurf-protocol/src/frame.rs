@@ -10,6 +10,10 @@ pub const MAX_CONTROL_BYTES: usize = 256 * 1024;
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
 pub const MAX_STREAMS: usize = 256;
 pub const MAX_CREDIT: u64 = 1024 * 1024;
+/// Authenticated terminal payload for one request/response control exchange.
+/// This acknowledges protocol completion; it is intentionally distinct from
+/// application acceptance, which is expressed by the response itself.
+pub const CONTROL_COMPLETE: &[u8] = b"sandsurf-control-complete-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

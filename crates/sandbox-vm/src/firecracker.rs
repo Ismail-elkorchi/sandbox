@@ -13,7 +13,25 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const API_HEADER_LIMIT: usize = 64 * 1024;
+const API_BODY_LIMIT: usize = 1024 * 1024;
+const API_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+pub struct FirecrackerRestore {
+    pub snapshot_state: PathBuf,
+    pub snapshot_memory: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirecrackerSnapshot {
+    pub snapshot_state: PathBuf,
+    pub snapshot_memory: PathBuf,
+    pub state_bytes: u64,
+    pub memory_bytes: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerConfig {
@@ -50,6 +68,31 @@ pub struct FirecrackerProcess {
 
 impl FirecrackerProcess {
     pub fn spawn(config: &FirecrackerConfig) -> Result<Self, FirecrackerError> {
+        Self::spawn_inner(config, None)
+    }
+
+    /// Start a fresh VMM, load exactly the supplied Firecracker state and
+    /// memory files, and leave the machine paused. A restore failure tears down
+    /// the new VMM and is never substituted with a cold boot.
+    pub fn spawn_restore(
+        config: &FirecrackerConfig,
+        restore: &FirecrackerRestore,
+    ) -> Result<Self, FirecrackerError> {
+        for path in [&restore.snapshot_state, &restore.snapshot_memory] {
+            if !path.is_absolute() || !path.is_file() {
+                return Err(FirecrackerError::Invalid(format!(
+                    "missing snapshot input {}",
+                    path.display()
+                )));
+            }
+        }
+        Self::spawn_inner(config, Some(restore))
+    }
+
+    fn spawn_inner(
+        config: &FirecrackerConfig,
+        restore: Option<&FirecrackerRestore>,
+    ) -> Result<Self, FirecrackerError> {
         validate_config(config)?;
         fs::DirBuilder::new()
             .mode(0o700)
@@ -129,6 +172,12 @@ impl FirecrackerProcess {
         let control_state_fd_index = add_file(&mut files, &config.control_image)?;
         let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
         let configuration_fd_index = add_file(&mut files, &config_path)?;
+        let snapshot_state_fd_index = restore
+            .map(|value| add_file(&mut files, &value.snapshot_state))
+            .transpose()?;
+        let snapshot_memory_fd_index = restore
+            .map(|value| add_file(&mut files, &value.snapshot_memory))
+            .transpose()?;
 
         let mut firecracker = File::open(&config.firecracker_executable)?;
         let actual_digest = hash_reader(&mut firecracker)?;
@@ -162,6 +211,8 @@ impl FirecrackerProcess {
             control_state_fd_index,
             authentication_fd_index,
             configuration_fd_index,
+            snapshot_state_fd_index,
+            snapshot_memory_fd_index,
             state_directory_fd_index,
             state_directory_identity: cwd_identity,
             kvm_fd_index,
@@ -228,14 +279,31 @@ impl FirecrackerProcess {
         .into_iter()
         .filter_map(|(input, path)| input.map(|input| drain_diagnostic(input, path)))
         .collect();
-        Ok(Self {
+        let process = Self {
             child,
             control,
             diagnostics,
             vsock_path,
             api_socket_path,
             final_status: None,
-        })
+        };
+        if restore.is_some() {
+            process.wait_for_api()?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "snapshot_path": "/vm/snapshot-state",
+                "mem_backend": {
+                    "backend_type": "File",
+                    "backend_path": "/vm/snapshot-memory"
+                },
+                "track_dirty_pages": true,
+                "resume_vm": false,
+                "vsock_override": { "uds_path": "/vm/state/guest.vsock" },
+                "clock_realtime": true
+            }))
+            .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+            process.api_request("PUT", "/snapshot/load", &body, 204)?;
+        }
+        Ok(process)
     }
 
     pub fn terminate(&mut self) -> Result<(), FirecrackerError> {
@@ -254,9 +322,81 @@ impl FirecrackerProcess {
         self.patch_vm_state("Resumed")
     }
 
+    /// Create a full snapshot while the VM is paused. Files are produced in
+    /// the already confined private state directory and synchronized before
+    /// their paths are returned to the guardian.
+    pub fn create_full_snapshot(
+        &self,
+        identity: &str,
+    ) -> Result<FirecrackerSnapshot, FirecrackerError> {
+        if identity.is_empty()
+            || identity.len() > 128
+            || !identity
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+        {
+            return Err(FirecrackerError::Invalid(
+                "snapshot identity is malformed".into(),
+            ));
+        }
+        let state_name = format!("snapshot-{identity}.vmstate");
+        let memory_name = format!("snapshot-{identity}.memory");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "snapshot_type": "Full",
+            "snapshot_path": format!("/vm/state/{state_name}"),
+            "mem_file_path": format!("/vm/state/{memory_name}")
+        }))
+        .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+        self.api_request("PUT", "/snapshot/create", &body, 204)?;
+        let directory = self
+            .api_socket_path
+            .parent()
+            .ok_or_else(|| FirecrackerError::Invalid("API socket has no parent".into()))?;
+        let snapshot_state = directory.join(state_name);
+        let snapshot_memory = directory.join(memory_name);
+        let state = sync_regular_file(&snapshot_state)?;
+        let memory = sync_regular_file(&snapshot_memory)?;
+        File::open(directory)?.sync_all()?;
+        Ok(FirecrackerSnapshot {
+            snapshot_state,
+            snapshot_memory,
+            state_bytes: state,
+            memory_bytes: memory,
+        })
+    }
+
     fn patch_vm_state(&self, state: &str) -> Result<(), FirecrackerError> {
         let body = serde_json::to_vec(&serde_json::json!({ "state": state }))
             .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+        self.api_request("PATCH", "/vm", &body, 204).map(drop)
+    }
+
+    fn wait_for_api(&self) -> Result<(), FirecrackerError> {
+        let deadline = Instant::now() + API_TIMEOUT;
+        loop {
+            match self.api_connection() {
+                Ok(_) => return Ok(()),
+                Err(error) if Instant::now() < deadline => {
+                    if !matches!(
+                        &error,
+                        FirecrackerError::Io(value)
+                            if matches!(
+                                value.kind(),
+                                io::ErrorKind::NotFound
+                                    | io::ErrorKind::ConnectionRefused
+                                    | io::ErrorKind::WouldBlock
+                            )
+                    ) {
+                        return Err(error);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn api_connection(&self) -> Result<UnixStream, FirecrackerError> {
         // Persistent Sandbox roots can exceed AF_UNIX's 108-byte pathname
         // bound. Resolve the already-owned state directory through a short
         // proc-fd path rather than requiring callers to choose a short root.
@@ -271,20 +411,40 @@ impl FirecrackerProcess {
             "/proc/self/fd/{}/firecracker.socket",
             api_directory.as_raw_fd()
         ));
-        let mut connection = UnixStream::connect(short_api_path)?;
-        connection.set_read_timeout(Some(Duration::from_secs(10)))?;
-        connection.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let connection = UnixStream::connect(short_api_path)?;
+        connection.set_read_timeout(Some(API_TIMEOUT))?;
+        connection.set_write_timeout(Some(API_TIMEOUT))?;
+        Ok(connection)
+    }
+
+    fn api_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        expected_status: u16,
+    ) -> Result<Vec<u8>, FirecrackerError> {
+        if !matches!(method, "GET" | "PUT" | "PATCH")
+            || !path.starts_with('/')
+            || path.bytes().any(|value| value.is_ascii_control())
+            || body.len() > API_BODY_LIMIT
+        {
+            return Err(FirecrackerError::Invalid(
+                "Firecracker API request is malformed".into(),
+            ));
+        }
+        let mut connection = self.api_connection()?;
         write!(
             connection,
-            "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )?;
-        connection.write_all(&body)?;
+        connection.write_all(body)?;
         connection.flush()?;
         let mut response = Vec::new();
         let mut byte = [0_u8; 1];
         while !response.ends_with(b"\r\n\r\n") {
-            if response.len() == 64 * 1024 {
+            if response.len() == API_HEADER_LIMIT {
                 return Err(FirecrackerError::Setup(
                     "Firecracker API response headers exceed 64 KiB".into(),
                 ));
@@ -303,12 +463,41 @@ impl FirecrackerProcess {
             .split_ascii_whitespace()
             .nth(1)
             .and_then(|value| value.parse::<u16>().ok());
-        if status_code != Some(204) {
+        let mut content_length = 0usize;
+        for line in response[..response.len() - 4]
+            .split(|value| *value == b'\n')
+            .skip(1)
+        {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+                return Err(FirecrackerError::Setup(
+                    "Firecracker API response header is malformed".into(),
+                ));
+            };
+            let (name, value) = (&line[..separator], &line[separator + 1..]);
+            if name.eq_ignore_ascii_case(b"content-length") {
+                let value = std::str::from_utf8(value)
+                    .map_err(|_| FirecrackerError::Setup("invalid content length".into()))?
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| FirecrackerError::Setup("invalid content length".into()))?;
+                if value > API_BODY_LIMIT {
+                    return Err(FirecrackerError::Setup(
+                        "Firecracker API response body exceeds 1 MiB".into(),
+                    ));
+                }
+                content_length = value;
+            }
+        }
+        let mut response_body = vec![0_u8; content_length];
+        connection.read_exact(&mut response_body)?;
+        if status_code != Some(expected_status) {
             return Err(FirecrackerError::Setup(format!(
-                "Firecracker API rejected VM state change: {status}"
+                "Firecracker API rejected {method} {path}: {status}: {}",
+                String::from_utf8_lossy(&response_body)
             )));
         }
-        Ok(())
+        Ok(response_body)
     }
 
     #[must_use]
@@ -537,6 +726,21 @@ fn add_file(files: &mut Vec<File>, path: &Path) -> io::Result<usize> {
     let index = files.len();
     files.push(file);
     Ok(index)
+}
+
+fn sync_regular_file(path: &Path) -> Result<u64, FirecrackerError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(FirecrackerError::Setup(
+            "Firecracker produced an empty or non-regular snapshot artifact".into(),
+        ));
+    }
+    file.sync_all()?;
+    Ok(metadata.len())
 }
 
 fn hash_reader(reader: &mut impl Read) -> io::Result<String> {

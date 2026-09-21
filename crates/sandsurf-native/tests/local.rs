@@ -387,7 +387,7 @@ fn accept_and_frame_waits_require_bounded_deadlines() {
     assert!(LocalConnection::connect(&root.0, Duration::ZERO).is_err());
     let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();
     let mut server = listener.accept(WAIT).unwrap();
-    for timeout in [Duration::ZERO, Duration::from_secs(61)] {
+    for timeout in [Duration::ZERO, Duration::from_secs(301)] {
         assert_eq!(
             server.read_frame(timeout).unwrap_err().kind(),
             io::ErrorKind::InvalidInput

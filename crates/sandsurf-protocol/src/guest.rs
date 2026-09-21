@@ -1,6 +1,6 @@
 use crate::{
-    Capability, Counter, Digest, GuestPath, Mutation, OperationId, OutputBoundary, ProcessId,
-    ProcessOutcome, SpawnRequest, Stream, TransferId, WatcherId,
+    Capability, CheckpointId, Counter, Digest, GuestPath, Mutation, OperationId, OutputBoundary,
+    ProcessId, ProcessOutcome, SandboxId, SpawnRequest, Stream, TransferId, WatcherId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,16 @@ pub struct ProcessSnapshot {
     pub request: SpawnRequest,
     pub guest_pid: u32,
     pub state: ProcessState,
+    #[serde(default)]
+    pub lineage: Option<ProcessLineage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProcessLineage {
+    pub source_sandbox_id: SandboxId,
+    pub source_epoch: Counter,
+    pub checkpoint_id: CheckpointId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +158,24 @@ pub enum GuestServiceRequest {
     FinishFilesystemCapture {
         operation_id: OperationId,
     },
+    /// Guardian-only restore handshake sent over the captured boot capability.
+    /// The response is sealed under that old session; all later connections
+    /// require the new epoch and capability.
+    RebindEpoch {
+        checkpoint_id: CheckpointId,
+        capture_operation_id: OperationId,
+        sandbox_id: SandboxId,
+        previous_epoch: Counter,
+        epoch: Counter,
+        boot_identity: Digest,
+        capability: [u8; 32],
+        network_capability: [u8; 32],
+        generation_seed: [u8; 32],
+    },
+    /// Guardian-only proof that a fresh authenticated transport is bound to
+    /// the expected guest identity. This remains available while ordinary
+    /// workload operations are fenced for capture/restore.
+    ProbeIdentity,
     /// Guardian-only secret installation. Raw bytes are never accepted by the
     /// application guest-query route or persisted in ordinary operation logs.
     InstallSecret {
@@ -381,18 +409,51 @@ pub enum FileExpectation {
     deny_unknown_fields
 )]
 pub enum GuestServiceResponse {
-    ReadyToStop { evidence: Digest },
-    FilesystemCapturePrepared { evidence: Digest },
-    FilesystemCaptureFinished { evidence: Digest },
-    SecretInstalled { evidence: Digest },
-    ResourcesApplied { evidence: Digest },
-    ResourceUsage { usage: crate::ResourceUsage },
-    Effect { outcome: GuestEffectOutcome },
-    Process { process: Box<ProcessSnapshot> },
-    Processes { processes: Vec<ProcessSnapshot> },
-    Output { page: RetainedPage },
-    File { response: FilesystemResponse },
-    Error { code: String, message: String },
+    ReadyToStop {
+        evidence: Digest,
+    },
+    FilesystemCapturePrepared {
+        evidence: Digest,
+    },
+    FilesystemCaptureFinished {
+        evidence: Digest,
+    },
+    EpochRebound {
+        evidence: Digest,
+    },
+    Identity {
+        sandbox_id: SandboxId,
+        epoch: Counter,
+        boot_identity: Digest,
+    },
+    SecretInstalled {
+        evidence: Digest,
+    },
+    ResourcesApplied {
+        evidence: Digest,
+    },
+    ResourceUsage {
+        usage: crate::ResourceUsage,
+    },
+    Effect {
+        outcome: GuestEffectOutcome,
+    },
+    Process {
+        process: Box<ProcessSnapshot>,
+    },
+    Processes {
+        processes: Vec<ProcessSnapshot>,
+    },
+    Output {
+        page: RetainedPage,
+    },
+    File {
+        response: FilesystemResponse,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -183,12 +183,17 @@ impl GuestHandshake {
         hello: &GuestHello,
         nonce: [u8; NONCE_BYTES],
     ) -> Result<(Self, GuestChallenge), Invalid> {
-        if hello.version != HANDSHAKE_VERSION
-            || &hello.sandbox_id != expected_sandbox
-            || hello.epoch != expected_epoch
-            || &hello.boot_identity != expected_boot
-        {
-            return Err(Invalid("guest handshake identity mismatch"));
+        if hello.version != HANDSHAKE_VERSION {
+            return Err(Invalid("guest handshake version mismatch"));
+        }
+        if &hello.sandbox_id != expected_sandbox {
+            return Err(Invalid("guest handshake sandbox identity mismatch"));
+        }
+        if hello.epoch != expected_epoch {
+            return Err(Invalid("guest handshake epoch mismatch"));
+        }
+        if &hello.boot_identity != expected_boot {
+            return Err(Invalid("guest handshake boot identity mismatch"));
         }
         validate_bytes(
             &hello.client_nonce,

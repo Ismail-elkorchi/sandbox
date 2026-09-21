@@ -250,6 +250,9 @@ pub struct LifecycleCommand {
     pub desired: DesiredState,
     pub revision: Counter,
     pub request_digest: Digest,
+    /// Exact host-owned configuration for the target revision. Drivers do not
+    /// reconstruct grants from cached application or captured guest state.
+    pub configuration: crate::RuntimeConfiguration,
 }
 
 /// Host-issued installation of one authoritative configuration revision. This
@@ -566,6 +569,10 @@ pub enum GuardianRequest {
         sandbox_id: SandboxId,
         request: crate::GuestServiceRequest,
     },
+    NativeCheckpoint {
+        sandbox_id: SandboxId,
+        request: crate::NativeCheckpointRequest,
+    },
     Runtime {
         sandbox_id: SandboxId,
         request: RuntimeRequest,
@@ -703,6 +710,9 @@ pub enum GuardianResponse {
     },
     Guest {
         response: crate::GuestServiceResponse,
+    },
+    NativeCheckpoint {
+        response: crate::NativeCheckpointResponse,
     },
     Runtime {
         response: RuntimeResponse,

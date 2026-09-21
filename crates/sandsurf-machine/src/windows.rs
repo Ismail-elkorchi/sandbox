@@ -854,6 +854,7 @@ mod tests {
             desired: sandsurf_protocol::DesiredState::Running,
             revision: Counter::ONE,
             request_digest: bytes_digest(b"request"),
+            configuration: sandsurf_protocol::RuntimeConfiguration::default(),
         };
         assert!(matches!(
             driver.create(&command),

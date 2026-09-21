@@ -259,6 +259,7 @@ mod tests {
             desired,
             revision: Counter::ONE,
             request_digest: hash("request"),
+            configuration: sandsurf_protocol::RuntimeConfiguration::default(),
         }
     }
     fn observation(state: MachineState, epoch: u64) -> MachineObservation {

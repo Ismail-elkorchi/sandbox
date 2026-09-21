@@ -3,8 +3,9 @@ use sandsurf_control::{
     EffectOutcome, Error as ControlError, Result as ControlResult, WorkloadDriver,
 };
 use sandsurf_protocol::{
-    AUTHENTICATION_BYTES, BootCapability, Counter, Frame, FrameKind, GuestChallenge,
-    GuestServiceRequest, GuestServiceResponse, HostHandshake, Mutation, ProcessState,
+    AUTHENTICATION_BYTES, BootCapability, CONTROL_COMPLETE, Counter, Frame, FrameKind,
+    GuestChallenge, GuestServiceRequest, GuestServiceResponse, HostHandshake, Mutation,
+    ProcessState,
 };
 use sandsurf_protocol::{Capability, Digest, SandboxId};
 use sandsurf_state::RuntimeJournal;
@@ -123,7 +124,20 @@ impl<C: GuestChannel> GuestClient<C> {
                 "guest returned a non-control response",
             ));
         }
-        Ok(serde_json::from_slice(&response.payload)?)
+        let response = serde_json::from_slice(&response.payload)?;
+        let completion = Frame::read(&mut *connection)?.ok_or(GuestClientError::Protocol(
+            "guest closed without protocol completion",
+        ))?;
+        let completion = codec.open(completion)?;
+        if completion.kind != FrameKind::Control
+            || completion.stream != 0
+            || completion.payload != CONTROL_COMPLETE
+        {
+            return Err(GuestClientError::Protocol(
+                "guest returned an invalid protocol completion",
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -158,7 +172,14 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
             Ok(GuestServiceResponse::Error { .. }) => EffectOutcome::NotApplied(
                 sandsurf_protocol::bytes_digest(b"guest-rejected-workload-operation"),
             ),
-            Ok(_) | Err(_) => EffectOutcome::Unknown,
+            Ok(other) => {
+                eprintln!("sandsurf guest mutation returned an unexpected response: {other:?}");
+                EffectOutcome::Unknown
+            }
+            Err(error) => {
+                eprintln!("sandsurf guest mutation transport failed: {error}");
+                EffectOutcome::Unknown
+            }
         }
     }
 
@@ -244,11 +265,11 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+        let error = last.expect("guest query is attempted at least once");
+        eprintln!("sandsurf guest query transport failed: {error}");
         Err(ControlError::Rejected {
             category: "guest".into(),
-            message: last
-                .expect("guest query is attempted at least once")
-                .to_string(),
+            message: error.to_string(),
         })
     }
 }

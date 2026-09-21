@@ -53,7 +53,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::core::PWSTR;
 
 const LEASE: &str = "control.lock";
-const MAX_DEADLINE: Duration = Duration::from_secs(60);
+const MAX_DEADLINE: Duration = Duration::from_secs(300);
 const PIPE_BUFFER_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -73,6 +73,11 @@ pub struct VmmLaunchSpec {
     pub control_state_fd_index: usize,
     pub authentication_fd_index: usize,
     pub configuration_fd_index: usize,
+    /// Present only when a fresh Firecracker process is started for snapshot
+    /// loading. These files are mounted read-only at fixed paths and remain
+    /// pinned for the VMM lifetime; Firecracker maps the memory file lazily.
+    pub snapshot_state_fd_index: Option<usize>,
+    pub snapshot_memory_fd_index: Option<usize>,
     pub state_directory_fd_index: usize,
     pub state_directory_identity: FileIdentity,
     pub kvm_fd_index: usize,
@@ -547,7 +552,7 @@ fn run_vmm_launcher() -> io::Result<i32> {
 }
 
 fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Result<()> {
-    let indexes = [
+    let mut indexes = vec![
         spec.namespace_launcher_fd_index,
         spec.firecracker_fd_index,
         spec.kernel_fd_index,
@@ -560,6 +565,19 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
         spec.state_directory_fd_index,
         spec.kvm_fd_index,
     ];
+    match (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index) {
+        (Some(state), Some(memory)) => {
+            indexes.push(state);
+            indexes.push(memory);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VMM snapshot descriptors must be supplied as a pair",
+            ));
+        }
+    }
     if indexes.iter().any(|index| *index >= descriptor_count) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -589,7 +607,7 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
 }
 
 fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
-    let mounts = [
+    let mut mounts = vec![
         (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
         (
             spec.bootstrap_fd_index,
@@ -646,7 +664,34 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
             executable,
         },
     )
-    .collect();
+    .collect::<Vec<_>>();
+    if let (Some(state), Some(memory)) =
+        (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index)
+    {
+        mounts.push(MountSpec {
+            fd_index: state,
+            target_path: "/vm/snapshot-state".into(),
+            kind: "file".into(),
+            read_only: true,
+            executable: false,
+        });
+        mounts.push(MountSpec {
+            fd_index: memory,
+            target_path: "/vm/snapshot-memory".into(),
+            kind: "file".into(),
+            read_only: true,
+            executable: false,
+        });
+    }
+    let mut args = vec![
+        "--enable-pci".into(),
+        "--api-sock".into(),
+        "/vm/state/firecracker.socket".into(),
+    ];
+    if spec.snapshot_state_fd_index.is_none() {
+        args.push("--config-file".into());
+        args.push("/vm/state/firecracker.json".into());
+    }
     LaunchSpec {
         filesystem_kind: "isolated".into(),
         launcher_fd_index: spec.namespace_launcher_fd_index,
@@ -664,13 +709,7 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
             target_path: "/vm/state".into(),
         },
         executable: "/.sandbox-runtime/firecracker".into(),
-        args: vec![
-            "--enable-pci".into(),
-            "--api-sock".into(),
-            "/vm/state/firecracker.socket".into(),
-            "--config-file".into(),
-            "/vm/state/firecracker.json".into(),
-        ],
+        args,
         environment: BTreeMap::new(),
         resources: ResourceLimits {
             // The generic launcher does not interpret these two legacy fields;

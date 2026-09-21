@@ -244,6 +244,20 @@ pub struct RuntimeConfiguration {
     pub resources: LiveResourceLimits,
 }
 
+impl Default for RuntimeConfiguration {
+    fn default() -> Self {
+        Self {
+            network: NetworkPolicy { rules: Vec::new() },
+            exposures: Vec::new(),
+            resources: LiveResourceLimits {
+                workload_memory_bytes: Counter::ONE,
+                workload_processes: Counter::ONE,
+                cpu_max: None,
+            },
+        }
+    }
+}
+
 impl RuntimeConfiguration {
     pub fn validate(&self) -> Result<(), Invalid> {
         self.network.validate()?;

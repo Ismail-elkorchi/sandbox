@@ -18,7 +18,7 @@ CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STR
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_origin_epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
@@ -808,7 +808,7 @@ impl RuntimeJournal {
             return Err(Error::Capacity("output reservations exhausted"));
         }
         let boundary = empty_boundary(&self.sandbox, &id, op.request.epoch)?;
-        tx.execute("INSERT INTO processes(id,operation,epoch,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.request.epoch.get(), output_limit.get(), terminal, encode(&boundary)?])?;
+        tx.execute("INSERT INTO processes(id,operation,epoch,output_origin_epoch,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.request.epoch.get(), output_limit.get(), terminal, encode(&boundary)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -836,10 +836,19 @@ impl RuntimeJournal {
         let WorkloadRequest::Spawn { request } = &admitted.request.request else {
             return Err(Error::Corrupt("process operation is not a spawn"));
         };
-        if **request != snapshot.request
-            || snapshot.request.epoch.get() != epoch
-            || snapshot.guest_pid == 0
-        {
+        let admitted_matches = if **request == snapshot.request {
+            true
+        } else if let Some(lineage) = &snapshot.lineage {
+            let mut restored = (**request).clone();
+            restored.sandbox_id = snapshot.request.sandbox_id.clone();
+            restored.epoch = snapshot.request.epoch;
+            lineage.source_sandbox_id == request.sandbox_id
+                && lineage.source_epoch == request.epoch
+                && restored == snapshot.request
+        } else {
+            false
+        };
+        if !admitted_matches || snapshot.request.epoch.get() != epoch || snapshot.guest_pid == 0 {
             return Err(Error::Conflict(
                 "process observation does not match admitted spawn",
             ));
@@ -899,6 +908,72 @@ impl RuntimeJournal {
             values.push(decode(&row?)?);
         }
         Ok(values)
+    }
+
+    /// Rebind process observations after a trusted full-state restore. Host
+    /// operations and receipts remain historical; only the current process
+    /// handle epoch and explicit checkpoint lineage move forward.
+    pub fn rebind_processes(
+        &mut self,
+        checkpoint_id: &CheckpointId,
+        source_sandbox_id: &SandboxId,
+        source_epoch: Counter,
+        epoch: Counter,
+    ) -> Result<()> {
+        if epoch == Counter::ZERO || epoch == source_epoch {
+            return Err(Error::Conflict("restored process epoch is invalid"));
+        }
+        let tx = self.db.connection.transaction()?;
+        let mut statement = tx.prepare("SELECT id,epoch,snapshot FROM processes ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, old_epoch, snapshot) = row?;
+            if Counter::try_from(old_epoch)? != source_epoch {
+                // Historical processes from earlier cold-boot epochs are not
+                // live in this captured VM and retain their original identity.
+                continue;
+            }
+            let snapshot = snapshot
+                .map(|value| decode::<ProcessSnapshot>(&value))
+                .transpose()?;
+            let Some(mut snapshot) = snapshot else {
+                return Err(Error::Corrupt(
+                    "captured process reservation has no observation",
+                ));
+            };
+            if snapshot.request.sandbox_id != *source_sandbox_id
+                || snapshot.request.epoch != source_epoch
+                || snapshot.request.process_id.as_str() != id
+            {
+                return Err(Error::Conflict(
+                    "captured process identity does not match restore lineage",
+                ));
+            }
+            snapshot.request.sandbox_id = self.sandbox.clone();
+            snapshot.request.epoch = epoch;
+            snapshot.lineage = Some(ProcessLineage {
+                source_sandbox_id: source_sandbox_id.clone(),
+                source_epoch,
+                checkpoint_id: checkpoint_id.clone(),
+            });
+            updates.push((id, encode(&snapshot)?));
+        }
+        drop(statement);
+        for (id, snapshot) in updates {
+            tx.execute(
+                "UPDATE processes SET epoch=?2,snapshot=?3 WHERE id=?1",
+                params![id, epoch.get(), snapshot],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Bytes whose complete payload is still durably retained by this guardian.
@@ -1112,7 +1187,7 @@ impl RuntimeJournal {
             let stream: Stream = decode(&stream)?;
             let previous = if sequence == 1 {
                 let epoch: u64 = self.db.connection.query_row(
-                    "SELECT epoch FROM processes WHERE id=?1",
+                    "SELECT output_origin_epoch FROM processes WHERE id=?1",
                     [id.as_str()],
                     |r| r.get(0),
                 )?;

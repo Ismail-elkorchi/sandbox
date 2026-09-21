@@ -1,5 +1,7 @@
 use sandsurf_protocol::{
-    Checkpoint, CheckpointConsistency, CheckpointId, Digest, Domain, OperationId, digest,
+    Checkpoint, CheckpointArtifact, CheckpointConsistency, CheckpointId, CheckpointKind,
+    CheckpointProcessWatermark, Digest, Domain, FullCheckpointMetadata, NativeFullCapture,
+    OperationId, digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -52,7 +54,7 @@ pub type Result<T> = std::result::Result<T, CheckpointError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FilesystemManifest {
+struct CheckpointManifest {
     format_version: u16,
     checkpoint_id: CheckpointId,
     request_digest: Digest,
@@ -63,11 +65,14 @@ struct FilesystemManifest {
     workload_disk_bytes: sandsurf_protocol::Counter,
     consistency: CheckpointConsistency,
     sensitive: bool,
+    kind: CheckpointKind,
+    full: Option<FullCheckpointMetadata>,
 }
 
 pub struct CaptureResult {
     pub disk_digest: Digest,
     pub manifest_digest: Digest,
+    pub full: Option<FullCheckpointMetadata>,
 }
 
 pub fn published_filesystem(root: &Path, checkpoint: &Checkpoint) -> Result<Option<CaptureResult>> {
@@ -101,8 +106,8 @@ pub fn capture_filesystem(
         checkpoint.workload_disk_bytes.get(),
         None,
     )?;
-    let manifest = FilesystemManifest {
-        format_version: 1,
+    let manifest = CheckpointManifest {
+        format_version: 2,
         checkpoint_id: checkpoint.request.id.clone(),
         request_digest: checkpoint.request_digest.clone(),
         image_digest: checkpoint.image_digest.clone(),
@@ -112,6 +117,8 @@ pub fn capture_filesystem(
         workload_disk_bytes: checkpoint.workload_disk_bytes,
         consistency: CheckpointConsistency::Filesystem,
         sensitive: checkpoint.sensitive,
+        kind: CheckpointKind::Filesystem,
+        full: None,
     };
     let manifest_digest = digest(Domain::Checkpoint, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
@@ -127,6 +134,134 @@ pub fn capture_filesystem(
     Ok(CaptureResult {
         disk_digest,
         manifest_digest,
+        full: None,
+    })
+}
+
+pub fn capture_full(
+    root: &Path,
+    checkpoint: &Checkpoint,
+    workload_disk: &Path,
+    control_disk: &Path,
+    native_directory: &Path,
+    native: NativeFullCapture,
+    processes: Vec<CheckpointProcessWatermark>,
+) -> Result<CaptureResult> {
+    if checkpoint.request.kind != CheckpointKind::Full || !checkpoint.sensitive {
+        return Err(CheckpointError::Invalid(
+            "full capture requires a sensitive full checkpoint admission",
+        ));
+    }
+    private_directory(root)?;
+    let final_directory = root.join(checkpoint.request.id.as_str());
+    if final_directory.exists() {
+        return verify_published(&final_directory, checkpoint);
+    }
+    let stage = root.join(format!(
+        ".{}.{}.capture",
+        checkpoint.request.id.as_str(),
+        checkpoint.request.operation_id.as_str()
+    ));
+    private_directory(&stage)?;
+    let disk_digest = copy_and_verify(
+        workload_disk,
+        &stage.join("workload-state.ext4"),
+        checkpoint.workload_disk_bytes.get(),
+        None,
+    )?;
+    let control_bytes = control_disk.metadata()?.len();
+    if control_bytes == 0 || control_bytes > 8 * 1024 * 1024 * 1024 {
+        return Err(CheckpointError::Invalid(
+            "full checkpoint control disk geometry is invalid",
+        ));
+    }
+    let control_digest = copy_and_verify(
+        control_disk,
+        &stage.join("control-state.ext4"),
+        control_bytes,
+        None,
+    )?;
+    let memory_bound = checkpoint
+        .resources
+        .memory_mib
+        .get()
+        .checked_mul(1024 * 1024)
+        .ok_or(CheckpointError::Invalid("checkpoint memory bound overflow"))?;
+    if native.memory.bytes.get() == 0
+        || native.memory.bytes.get() > memory_bound
+        || native.snapshot_state.bytes.get() == 0
+        || native.snapshot_state.bytes.get() > 1024 * 1024 * 1024
+        || native.reconnect_state.bytes.get() == 0
+        || native.reconnect_state.bytes.get() > 1024 * 1024
+    {
+        return Err(CheckpointError::Invalid(
+            "native full checkpoint artifact exceeds its bound",
+        ));
+    }
+    for (name, artifact) in [
+        ("snapshot.vmstate", &native.snapshot_state),
+        ("memory", &native.memory),
+        ("reconnect.json", &native.reconnect_state),
+    ] {
+        copy_and_verify(
+            &native_directory.join(name),
+            &stage.join(name),
+            artifact.bytes.get(),
+            Some(&artifact.digest),
+        )?;
+    }
+    if processes.len() > 65_536 {
+        return Err(CheckpointError::Invalid(
+            "full checkpoint process inventory exceeds its bound",
+        ));
+    }
+    let full = FullCheckpointMetadata {
+        engine: native.engine,
+        engine_version: native.engine_version,
+        architecture: native.architecture,
+        configuration_digest: native.configuration_digest,
+        snapshot_state: native.snapshot_state,
+        memory: native.memory,
+        control_disk: CheckpointArtifact {
+            digest: control_digest,
+            bytes: control_bytes.try_into()?,
+        },
+        reconnect_state: native.reconnect_state,
+        processes,
+        generation: native.generation,
+        // A capture can only become fork-safe through an explicit, separately
+        // admitted workload contract. Ordinary full checkpoints default closed.
+        fork_safe: false,
+    };
+    let manifest = CheckpointManifest {
+        format_version: 2,
+        checkpoint_id: checkpoint.request.id.clone(),
+        request_digest: checkpoint.request_digest.clone(),
+        image_digest: checkpoint.image_digest.clone(),
+        source_epoch: checkpoint.request.expected_epoch,
+        source_revision: checkpoint.request.expected_revision,
+        workload_disk_digest: disk_digest.clone(),
+        workload_disk_bytes: checkpoint.workload_disk_bytes,
+        consistency: CheckpointConsistency::Filesystem,
+        sensitive: true,
+        kind: CheckpointKind::Full,
+        full: Some(full.clone()),
+    };
+    let manifest_digest = digest(Domain::Checkpoint, &manifest)?;
+    write_manifest(&stage.join("manifest.json"), &manifest)?;
+    sync_directory(&stage)?;
+    match fs::rename(&stage, &final_directory) {
+        Ok(()) => sync_directory(root)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            remove_stage(&stage)?;
+            return verify_published(&final_directory, checkpoint);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(CaptureResult {
+        disk_digest,
+        manifest_digest,
+        full: Some(full),
     })
 }
 
@@ -257,9 +392,9 @@ fn checkpoint_disk(root: &Path, checkpoint: &Checkpoint) -> Result<PathBuf> {
 
 fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<CaptureResult> {
     private_directory(directory)?;
-    let manifest: FilesystemManifest =
+    let manifest: CheckpointManifest =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
-    if manifest.format_version != 1
+    if manifest.format_version != 2
         || manifest.checkpoint_id != checkpoint.request.id
         || manifest.request_digest != checkpoint.request_digest
         || manifest.image_digest != checkpoint.image_digest
@@ -267,6 +402,11 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
         || manifest.source_revision != checkpoint.request.expected_revision
         || manifest.workload_disk_bytes != checkpoint.workload_disk_bytes
         || manifest.sensitive != checkpoint.sensitive
+        || manifest.kind != checkpoint.request.kind
+        || checkpoint
+            .full
+            .as_ref()
+            .is_some_and(|full| manifest.full.as_ref() != Some(full))
     {
         return Err(CheckpointError::Invalid(
             "checkpoint manifest does not match its admitted request",
@@ -281,9 +421,28 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
             "checkpoint workload disk digest mismatch",
         ));
     }
+    if let Some(full) = &manifest.full {
+        for (name, artifact) in [
+            ("control-state.ext4", &full.control_disk),
+            ("snapshot.vmstate", &full.snapshot_state),
+            ("memory", &full.memory),
+            ("reconnect.json", &full.reconnect_state),
+        ] {
+            if file_digest(&directory.join(name), artifact.bytes.get())? != artifact.digest {
+                return Err(CheckpointError::Invalid(
+                    "full checkpoint artifact digest mismatch",
+                ));
+            }
+        }
+    } else if manifest.kind != CheckpointKind::Filesystem {
+        return Err(CheckpointError::Invalid(
+            "full checkpoint manifest has no engine material",
+        ));
+    }
     Ok(CaptureResult {
         disk_digest: actual,
         manifest_digest: digest(Domain::Checkpoint, &manifest)?,
+        full: manifest.full,
     })
 }
 
@@ -299,7 +458,7 @@ fn rollback_evidence(checkpoint: &Checkpoint, operation: &OperationId) -> Result
     )?)
 }
 
-fn copy_and_verify(
+pub(crate) fn copy_and_verify(
     source_path: &Path,
     destination_path: &Path,
     length: u64,
@@ -346,7 +505,7 @@ fn copy_and_verify(
     Ok(actual)
 }
 
-fn file_digest(path: &Path, length: u64) -> Result<Digest> {
+pub(crate) fn file_digest(path: &Path, length: u64) -> Result<Digest> {
     let mut file = open_read(path)?;
     if file.metadata()?.len() != length {
         return Err(CheckpointError::Invalid("disk geometry mismatch"));
@@ -364,7 +523,7 @@ fn file_digest(path: &Path, length: u64) -> Result<Digest> {
     Ok(format!("{:x}", hash.finalize()).try_into()?)
 }
 
-fn write_manifest(path: &Path, manifest: &FilesystemManifest) -> Result<()> {
+fn write_manifest(path: &Path, manifest: &CheckpointManifest) -> Result<()> {
     let mut file = open_write(path)?;
     file.set_len(0)?;
     serde_json::to_writer(&mut file, manifest)?;
@@ -399,8 +558,16 @@ fn try_clone(_: &File, _: &File) -> bool {
 }
 
 fn remove_stage(stage: &Path) -> Result<()> {
-    remove_file_if_present(&stage.join("manifest.json"))?;
-    remove_file_if_present(&stage.join("workload-state.ext4"))?;
+    for name in [
+        "manifest.json",
+        "workload-state.ext4",
+        "control-state.ext4",
+        "snapshot.vmstate",
+        "memory",
+        "reconnect.json",
+    ] {
+        remove_file_if_present(&stage.join(name))?;
+    }
     match fs::remove_dir(stage) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -416,13 +583,13 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
@@ -507,6 +674,7 @@ mod tests {
             workload_disk_bytes: n(4096),
             manifest_digest: None,
             sensitive: false,
+            full: None,
         }
     }
 

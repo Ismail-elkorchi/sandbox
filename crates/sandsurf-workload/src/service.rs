@@ -3,9 +3,10 @@ use crate::{
     ProcessError, ProcessSupervisor,
 };
 use sandsurf_protocol::{
-    Capability, Digest, FileExpectation, FileRevision, FilesystemRequest, FilesystemResponse,
-    GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation, OperationId,
-    ProcessId, ResourceUsage, SecretDestination, SecretId, WorkloadRequest, bytes_digest,
+    Capability, CheckpointId, Counter, Digest, FileExpectation, FileRevision, FilesystemRequest,
+    FilesystemResponse, GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation,
+    OperationId, ProcessId, ResourceUsage, SandboxId, SecretDestination, SecretId, WorkloadRequest,
+    bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -148,6 +149,28 @@ impl PersistentWorkloadService {
         }
     }
 
+    /// Apply the guardian-owned workload resource envelope even while a
+    /// capture fence is active. This changes no workload data and is required
+    /// before a restored machine may be published or unfrozen.
+    pub fn apply_guardian_resources(
+        &self,
+        resources: sandsurf_protocol::LiveResourceLimits,
+    ) -> GuestServiceResponse {
+        let Ok(_guard) = self.mutation_barrier.read() else {
+            return GuestServiceResponse::Error {
+                code: "service.unavailable".into(),
+                message: "workload mutation barrier is unavailable".into(),
+            };
+        };
+        match self.apply_resources(resources) {
+            Ok(value) => value,
+            Err(error) => GuestServiceResponse::Error {
+                code: error.code.to_owned(),
+                message: error.message,
+            },
+        }
+    }
+
     /// Fence all ordinary guest requests while the machine owner stops jobs
     /// and establishes the persistent filesystem boundary.
     pub fn prepare_stop(
@@ -245,6 +268,37 @@ impl PersistentWorkloadService {
         ))
     }
 
+    /// Rebind captured in-memory workload state to a fresh machine epoch while
+    /// the exact capture barrier remains held. Old authenticated connections
+    /// are rotated by the guest supervisor after this method commits.
+    pub fn rebind_epoch(
+        &self,
+        checkpoint_id: &CheckpointId,
+        capture_operation_id: &OperationId,
+        sandbox_id: SandboxId,
+        previous_epoch: Counter,
+        epoch: Counter,
+    ) -> io::Result<Digest> {
+        let _guard = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| io::Error::other("workload mutation barrier is unavailable"))?;
+        let capture = self
+            .capture
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capture state is unavailable"))?;
+        if capture.as_ref() != Some(capture_operation_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "restore does not match the captured workload barrier",
+            ));
+        }
+        self.processes
+            .rebind_epoch(checkpoint_id, sandbox_id, previous_epoch, epoch)
+            .map_err(io::Error::other)?;
+        Ok(bytes_digest(b"guest-workload-epoch-rebound-v1"))
+    }
+
     fn handle_inner(&self, request: GuestServiceRequest) -> ServiceResult<GuestServiceResponse> {
         match request {
             GuestServiceRequest::PrepareStop => Err((
@@ -253,7 +307,9 @@ impl PersistentWorkloadService {
             )
                 .into()),
             GuestServiceRequest::PrepareFilesystemCapture { .. }
-            | GuestServiceRequest::FinishFilesystemCapture { .. } => Err((
+            | GuestServiceRequest::FinishFilesystemCapture { .. }
+            | GuestServiceRequest::RebindEpoch { .. }
+            | GuestServiceRequest::ProbeIdentity => Err((
                 "request.internal",
                 "filesystem capture barriers are owned by the guest supervisor".into(),
             )
@@ -321,6 +377,14 @@ impl PersistentWorkloadService {
             return Err((
                 "authority.invalid",
                 "workload authority does not match request".into(),
+            )
+                .into());
+        }
+        let (sandbox_id, epoch) = self.processes.identity().map_err(process_error)?;
+        if mutation.sandbox_id != sandbox_id || mutation.epoch != epoch {
+            return Err((
+                "authority.stale-epoch",
+                "workload authority targets a stale machine epoch".into(),
             )
                 .into());
         }

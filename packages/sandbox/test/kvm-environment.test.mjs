@@ -11,7 +11,7 @@ import { NativeHostClient } from "../dist/native-host.js";
 
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
 
-test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 300_000 }, async () => {
+test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 1_200_000 }, async () => {
   const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
   assert.ok(manifestPath, "SANDSURF_LOCAL_IMAGE_MANIFEST is required");
   const state = process.env.SANDSURF_TEST_STATE ?? await mkdtemp(join(tmpdir(), "sandsurf-kvm-environment-"));
@@ -107,7 +107,37 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     await sandbox.resume("resume-before-checkpoint");
     assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/index.html")).toString(), "exposure-ok\n");
 
+    const restoredProcess = await sandbox.processes.spawn({
+      processId: "full-state-service",
+      operationId: "start-full-state-service",
+      argv: ["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do printf tick; sleep 1; done"],
+      user: "root",
+      lifetime: "sandbox",
+    });
+    await waitForOutput(restoredProcess, 4);
+    const suspended = await sandbox.suspend("suspend-full-state");
+    assert.equal(suspended.machine.value.state, "suspended");
+    const restored = await sandbox.resume("restore-full-state");
+    assert.equal(restored.machine.value.state, "running");
+    const reboundProcess = await sandbox.processes.get("full-state-service");
+    const reboundObservation = await reboundProcess.inspect();
+    assert.equal(reboundObservation.kind, "current");
+    assert.equal(reboundObservation.value.state.kind, "running");
+    assert.equal(reboundObservation.value.request.epoch, restored.machine.value.epoch);
+    assert.equal(reboundObservation.value.lineage.checkpointId.startsWith("suspend-"), true);
+    await waitForOutput(reboundProcess, 8);
+    await reboundProcess.terminate();
+    await reboundProcess.wait();
+
     await sandbox.fs.writeFile("/workspace/checkpoint-value", "captured\n");
+    const fullCheckpoint = await sandbox.checkpoints.create({
+      id: "full-checkpoint",
+      operationId: "capture-full-checkpoint",
+      kind: "full",
+    });
+    assert.equal(fullCheckpoint.inspection.phase, "ready");
+    assert.equal(fullCheckpoint.inspection.kind, "full");
+    assert.equal(fullCheckpoint.inspection.sensitive, true);
     const checkpoint = await sandbox.checkpoints.create({ id: "filesystem-checkpoint" });
     assert.equal(checkpoint.inspection.phase, "ready");
     await assert.rejects(checkpoint.publishImage({ operationId: "reject-implicit-sensitive-publication" }));
@@ -158,4 +188,15 @@ async function runResult(sandbox, argv, options = {}) {
 function exitCode(state) {
   assert.equal(state.kind, "exited");
   return state.outcome.kind === "exit" ? state.outcome.code : null;
+}
+
+async function waitForOutput(process, minimum) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    const page = await process.readOutput({ maximum: 64 * 1024 });
+    const bytes = page.chunks.reduce((total, chunk) => total + chunk.bytes.byteLength, 0);
+    if (bytes >= minimum) return;
+    if (Date.now() >= deadline) throw new Error(`process ${process.id} produced fewer than ${minimum} bytes`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }

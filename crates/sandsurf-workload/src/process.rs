@@ -1,8 +1,8 @@
 use crate::{CgroupLimits, CgroupManager, CgroupUsage, OutputSpool, ProcessCgroup, SpoolError};
 use sandsurf_protocol::{
-    Counter, Digest, ProcessCompletion, ProcessId, ProcessLifetime, ProcessOutcome,
-    ProcessSnapshot, ProcessState, RetainedPage, SandboxId, SpawnRequest, StdioMode, Stream,
-    TerminalSize, bytes_digest,
+    CheckpointId, Counter, Digest, ProcessCompletion, ProcessId, ProcessLifetime, ProcessLineage,
+    ProcessOutcome, ProcessSnapshot, ProcessState, RetainedPage, SandboxId, SpawnRequest,
+    StdioMode, Stream, TerminalSize, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -63,8 +63,7 @@ impl From<SpoolError> for ProcessError {
 }
 
 pub struct ProcessSupervisor {
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    identity: RwLock<SupervisorIdentity>,
     root: PathBuf,
     workload_root: Option<PathBuf>,
     processes: Mutex<BTreeMap<ProcessId, Arc<ProcessEntry>>>,
@@ -72,7 +71,8 @@ pub struct ProcessSupervisor {
 }
 
 struct ProcessEntry {
-    request: SpawnRequest,
+    request: RwLock<SpawnRequest>,
+    lineage: RwLock<Option<ProcessLineage>>,
     pid: u32,
     group: i32,
     input: Mutex<Option<Input>>,
@@ -91,6 +91,14 @@ struct ProcessRecord {
     request: SpawnRequest,
     guest_pid: u32,
     state: ProcessState,
+    #[serde(default)]
+    lineage: Option<ProcessLineage>,
+}
+
+#[derive(Clone)]
+struct SupervisorIdentity {
+    sandbox_id: SandboxId,
+    epoch: Counter,
 }
 
 enum Input {
@@ -121,8 +129,7 @@ impl ProcessSupervisor {
             return Err(ProcessError::Invalid("supervisor root is not a directory"));
         }
         let mut value = Self {
-            sandbox_id,
-            epoch,
+            identity: RwLock::new(SupervisorIdentity { sandbox_id, epoch }),
             root: root.to_path_buf(),
             workload_root: None,
             processes: Mutex::new(BTreeMap::new()),
@@ -191,7 +198,12 @@ impl ProcessSupervisor {
         request
             .validate()
             .map_err(|_| ProcessError::Invalid("spawn validation failed"))?;
-        if request.sandbox_id != self.sandbox_id || request.epoch != self.epoch {
+        let identity = self
+            .identity
+            .read()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-identity-poisoned")))?
+            .clone();
+        if request.sandbox_id != identity.sandbox_id || request.epoch != identity.epoch {
             return Err(ProcessError::Conflict("sandbox epoch mismatch"));
         }
         let mut processes = self
@@ -199,7 +211,12 @@ impl ProcessSupervisor {
             .lock()
             .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))?;
         if let Some(existing) = processes.get(&request.process_id) {
-            if existing.request != request {
+            if *existing
+                .request
+                .read()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?
+                != request
+            {
                 return Err(ProcessError::Conflict(
                     "process identity is already bound to another request",
                 ));
@@ -211,9 +228,9 @@ impl ProcessSupervisor {
         let spool = Arc::new(OutputSpool::create(
             &directory.join("output.ssf"),
             request.output_bytes,
-            &self.sandbox_id,
+            &identity.sandbox_id,
             &request.process_id,
-            self.epoch,
+            identity.epoch,
         )?);
         let record_path = directory.join("process.json");
         write_process_record(
@@ -225,6 +242,7 @@ impl ProcessSupervisor {
                 state: ProcessState::Unknown {
                     evidence: bytes_digest(b"process-spawn-dispatch-in-progress"),
                 },
+                lineage: None,
             },
             true,
         )?;
@@ -271,6 +289,7 @@ impl ProcessSupervisor {
                 request: request.clone(),
                 guest_pid: pid,
                 state: initial_state.clone(),
+                lineage: None,
             },
             false,
         ) {
@@ -284,7 +303,8 @@ impl ProcessSupervisor {
             return Err(error);
         }
         let entry = Arc::new(ProcessEntry {
-            request: request.clone(),
+            request: RwLock::new(request.clone()),
+            lineage: RwLock::new(None),
             pid,
             group: i32::try_from(pid).map_err(|_| ProcessError::Invalid("PID overflow"))?,
             input: Mutex::new(Some(spawned.input)),
@@ -304,6 +324,72 @@ impl ProcessSupervisor {
         }
         start_waiter(Arc::clone(&entry), spawned.child, readers);
         entry.snapshot()
+    }
+
+    pub fn identity(&self) -> Result<(SandboxId, Counter), ProcessError> {
+        self.identity
+            .read()
+            .map(|value| (value.sandbox_id.clone(), value.epoch))
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-identity-poisoned")))
+    }
+
+    pub fn rebind_epoch(
+        &self,
+        checkpoint_id: &CheckpointId,
+        sandbox_id: SandboxId,
+        previous_epoch: Counter,
+        epoch: Counter,
+    ) -> Result<(), ProcessError> {
+        if epoch == Counter::ZERO {
+            return Err(ProcessError::Invalid("restored epoch must be positive"));
+        }
+        let mut identity = self
+            .identity
+            .write()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-identity-poisoned")))?;
+        if identity.epoch != previous_epoch {
+            return Err(ProcessError::Conflict("restored source epoch mismatch"));
+        }
+        let source_sandbox_id = identity.sandbox_id.clone();
+        let processes = self
+            .processes
+            .lock()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))?;
+        for entry in processes.values() {
+            let mut request = entry
+                .request
+                .write()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?;
+            if request.epoch != previous_epoch {
+                continue;
+            }
+            request.sandbox_id = sandbox_id.clone();
+            request.epoch = epoch;
+            let lineage = ProcessLineage {
+                source_sandbox_id: source_sandbox_id.clone(),
+                source_epoch: previous_epoch,
+                checkpoint_id: checkpoint_id.clone(),
+            };
+            *entry
+                .lineage
+                .write()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-lineage-poisoned")))? =
+                Some(lineage.clone());
+            write_process_record(
+                &entry.record_path,
+                &ProcessRecord {
+                    version: PROCESS_RECORD_VERSION,
+                    request: request.clone(),
+                    guest_pid: entry.pid,
+                    state: entry.state()?,
+                    lineage: Some(lineage),
+                },
+                false,
+            )?;
+        }
+        identity.sandbox_id = sandbox_id;
+        identity.epoch = epoch;
+        Ok(())
     }
 
     pub fn get(&self, id: &ProcessId) -> Result<ProcessSnapshot, ProcessError> {
@@ -540,7 +626,14 @@ impl ProcessSupervisor {
             let mut record = read_process_record(&record_path)?;
             if record.version != PROCESS_RECORD_VERSION
                 || record.request.process_id != process_id
-                || record.request.sandbox_id != self.sandbox_id
+                || record.request.sandbox_id
+                    != self
+                        .identity
+                        .read()
+                        .map_err(|_| {
+                            ProcessError::Unknown(bytes_digest(b"process-identity-poisoned"))
+                        })?
+                        .sandbox_id
             {
                 return Err(ProcessError::Invalid(
                     "retained process record identity is invalid",
@@ -555,7 +648,7 @@ impl ProcessSupervisor {
             let spool = Arc::new(OutputSpool::open(
                 &directory.path().join("output.ssf"),
                 record.request.output_bytes,
-                &self.sandbox_id,
+                &record.request.sandbox_id,
                 &process_id,
                 record.request.epoch,
                 true,
@@ -563,7 +656,8 @@ impl ProcessSupervisor {
             recovered.insert(
                 process_id,
                 Arc::new(ProcessEntry {
-                    request: record.request,
+                    request: RwLock::new(record.request),
+                    lineage: RwLock::new(record.lineage),
                     pid: record.guest_pid,
                     group: 0,
                     input: Mutex::new(None),
@@ -639,18 +733,37 @@ impl ProcessEntry {
 
     fn snapshot(&self) -> Result<ProcessSnapshot, ProcessError> {
         Ok(ProcessSnapshot {
-            request: self.request.clone(),
+            request: self
+                .request
+                .read()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?
+                .clone(),
             guest_pid: self.pid,
             state: self.state()?,
+            lineage: self
+                .lineage
+                .read()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-lineage-poisoned")))?
+                .clone(),
         })
     }
 
     fn finish(&self, value: ProcessState) {
+        let (Ok(request), Ok(lineage)) = (self.request.read(), self.lineage.read()) else {
+            if let Ok(mut state) = self.state.lock() {
+                *state = ProcessState::Unknown {
+                    evidence: bytes_digest(b"process-terminal-identity-unavailable"),
+                };
+                self.changed.notify_all();
+            }
+            return;
+        };
         let record = ProcessRecord {
             version: PROCESS_RECORD_VERSION,
-            request: self.request.clone(),
+            request: request.clone(),
             guest_pid: self.pid,
             state: value.clone(),
+            lineage: lineage.clone(),
         };
         let value = match write_process_record(&self.record_path, &record, false) {
             Ok(()) => value,
@@ -1054,7 +1167,12 @@ fn start_reader(
 fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<()>>) {
     std::thread::spawn(move || {
         let waited = wait_child(child);
-        if entry.request.lifetime == ProcessLifetime::Job {
+        if entry
+            .request
+            .read()
+            .map_or(ProcessLifetime::Job, |request| request.lifetime)
+            == ProcessLifetime::Job
+        {
             terminate_owned(&entry, PROCESS_EXIT_GRACE);
             reap_group_children(entry.group);
         } else {

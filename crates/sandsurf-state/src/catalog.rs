@@ -17,6 +17,7 @@ CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL
 CREATE TABLE checkpoints(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage_observations(sandbox TEXT PRIMARY KEY REFERENCES sandboxes(id), epoch INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
+CREATE TABLE suspensions(sandbox TEXT PRIMARY KEY REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +104,15 @@ pub struct SandboxRecord {
     pub configuration_revision: Counter,
     pub reservation: ReservationState,
     pub latest_intent: LifecycleIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SuspensionRecord {
+    pub sandbox_id: SandboxId,
+    pub lifecycle_operation_id: OperationId,
+    pub checkpoint_id: CheckpointId,
+    pub manifest_digest: Digest,
 }
 
 pub struct HostCatalog {
@@ -372,6 +382,103 @@ impl HostCatalog {
         checkpoint_record(&self.db.connection, id)
     }
 
+    pub fn suspension(&self, sandbox: &SandboxId) -> Result<Option<SuspensionRecord>> {
+        self.db
+            .connection
+            .query_row(
+                "SELECT value FROM suspensions WHERE sandbox=?1",
+                [sandbox.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| decode(&value))
+            .transpose()
+    }
+
+    pub fn record_suspension(
+        &mut self,
+        sandbox: &SandboxId,
+        lifecycle_operation: &OperationId,
+        checkpoint_id: &CheckpointId,
+        manifest_digest: &Digest,
+    ) -> Result<SuspensionRecord> {
+        let tx = self.db.connection.transaction()?;
+        let checkpoint = checkpoint_record(&tx, checkpoint_id)?
+            .ok_or(Error::Missing("suspension checkpoint is missing"))?;
+        let lifecycle = intent(&tx, lifecycle_operation)?
+            .ok_or(Error::Missing("suspension lifecycle intent is missing"))?;
+        if checkpoint.request.sandbox_id != *sandbox
+            || checkpoint.request.kind != CheckpointKind::Full
+            || checkpoint.phase != CheckpointPhase::Ready
+            || checkpoint.manifest_digest.as_ref() != Some(manifest_digest)
+            || checkpoint.full.is_none()
+            || lifecycle.sandbox_id != *sandbox
+            || lifecycle.desired != DesiredState::Suspended
+            || lifecycle.completion.is_none()
+        {
+            return Err(Error::Conflict(
+                "suspension association lacks checkpoint or lifecycle completion",
+            ));
+        }
+        let value = SuspensionRecord {
+            sandbox_id: sandbox.clone(),
+            lifecycle_operation_id: lifecycle_operation.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            manifest_digest: manifest_digest.clone(),
+        };
+        if let Some(old) = tx
+            .query_row(
+                "SELECT value FROM suspensions WHERE sandbox=?1",
+                [sandbox.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|encoded| decode::<SuspensionRecord>(&encoded))
+            .transpose()?
+        {
+            return if old == value {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "sandbox is already bound to another suspension checkpoint",
+                ))
+            };
+        }
+        tx.execute(
+            "INSERT INTO suspensions VALUES (?1,?2)",
+            params![sandbox.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn clear_suspension(
+        &mut self,
+        sandbox: &SandboxId,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        let value = tx
+            .query_row(
+                "SELECT value FROM suspensions WHERE sandbox=?1",
+                [sandbox.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|encoded| decode::<SuspensionRecord>(&encoded))
+            .transpose()?
+            .ok_or(Error::Missing("suspension association is missing"))?;
+        if value.checkpoint_id != *checkpoint_id {
+            return Err(Error::Conflict("suspension checkpoint identity changed"));
+        }
+        tx.execute(
+            "DELETE FROM suspensions WHERE sandbox=?1",
+            [sandbox.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn checkpoints(
         &self,
         after: Option<&CheckpointId>,
@@ -405,11 +512,6 @@ impl HostCatalog {
         request: CheckpointRequest,
         approval: Approval,
     ) -> Result<Checkpoint> {
-        if request.kind != CheckpointKind::Filesystem {
-            return Err(Error::Unsupported(
-                "full-state checkpoint admission is not qualified",
-            ));
-        }
         let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request))?;
         if approval.request_digest != request_digest {
             return Err(Error::Conflict("checkpoint approval mismatch"));
@@ -447,6 +549,7 @@ impl HostCatalog {
         )?;
         capacity(&tx, "checkpoints", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
+        let full = request.kind == CheckpointKind::Full;
         let value = Checkpoint {
             request,
             request_digest,
@@ -457,7 +560,87 @@ impl HostCatalog {
             consistency: None,
             workload_disk_digest: None,
             manifest_digest: None,
-            sensitive,
+            // Reconnect credentials and process memory make a full capture
+            // protected even when no workload secret has been delivered.
+            sensitive: sensitive || full,
+            full: None,
+        };
+        tx.execute(
+            "INSERT INTO checkpoints VALUES (?1,?2,?3,?4)",
+            params![
+                value.request.id.as_str(),
+                value.request.operation_id.as_str(),
+                value.request.sandbox_id.as_str(),
+                encode(&value)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Admit the full checkpoint implied by an already committed suspend
+    /// intent. This is a host-owned suboperation of that lifecycle authority,
+    /// not a second application approval or a synthetic checkpoint grant.
+    pub fn admit_suspension_checkpoint(
+        &mut self,
+        request: CheckpointRequest,
+        lifecycle_operation: &OperationId,
+    ) -> Result<Checkpoint> {
+        if request.kind != CheckpointKind::Full || request.parent.is_some() {
+            return Err(Error::Conflict(
+                "suspension requires a root full checkpoint",
+            ));
+        }
+        let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request))?;
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = checkpoint_record(&tx, &request.id)? {
+            return if old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("suspension checkpoint identity conflict"))
+            };
+        }
+        let lifecycle = intent(&tx, lifecycle_operation)?
+            .ok_or(Error::Missing("suspend lifecycle intent is missing"))?;
+        if lifecycle.sandbox_id != request.sandbox_id
+            || lifecycle.desired != DesiredState::Suspended
+            || lifecycle.completion.is_some()
+            || request.expected_revision.next()? != lifecycle.revision
+        {
+            return Err(Error::Conflict(
+                "suspension checkpoint does not match its lifecycle intent",
+            ));
+        }
+        let operation_used: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE operation=?1 UNION ALL SELECT 1 FROM intents WHERE id=?1 UNION ALL SELECT 1 FROM rollbacks WHERE operation=?1)",
+            [request.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if operation_used {
+            return Err(Error::Conflict(
+                "suspension checkpoint operation identity conflict",
+            ));
+        }
+        let sandbox = sandbox_record(&tx, &request.sandbox_id)?
+            .ok_or(Error::Missing("suspension sandbox is missing"))?;
+        if sandbox.configuration_revision != lifecycle.revision {
+            return Err(Error::Conflict(
+                "suspension lifecycle is no longer the current host intent",
+            ));
+        }
+        capacity(&tx, "checkpoints", self.limits.operations)?;
+        let value = Checkpoint {
+            request,
+            request_digest,
+            phase: CheckpointPhase::Admitted,
+            image_digest: sandbox.image_digest,
+            workload_disk_bytes: sandbox.resources.disk_bytes,
+            resources: sandbox.resources,
+            consistency: None,
+            workload_disk_digest: None,
+            manifest_digest: None,
+            sensitive: true,
+            full: None,
         };
         tx.execute(
             "INSERT INTO checkpoints VALUES (?1,?2,?3,?4)",
@@ -501,15 +684,59 @@ impl HostCatalog {
         manifest_digest: Digest,
         consistency: CheckpointConsistency,
     ) -> Result<Checkpoint> {
+        self.complete_checkpoint_inner(
+            id,
+            request_digest,
+            disk_digest,
+            manifest_digest,
+            consistency,
+            None,
+        )
+    }
+
+    pub fn complete_full_checkpoint(
+        &mut self,
+        id: &CheckpointId,
+        request_digest: &Digest,
+        disk_digest: Digest,
+        manifest_digest: Digest,
+        consistency: CheckpointConsistency,
+        full: FullCheckpointMetadata,
+    ) -> Result<Checkpoint> {
+        self.complete_checkpoint_inner(
+            id,
+            request_digest,
+            disk_digest,
+            manifest_digest,
+            consistency,
+            Some(full),
+        )
+    }
+
+    fn complete_checkpoint_inner(
+        &mut self,
+        id: &CheckpointId,
+        request_digest: &Digest,
+        disk_digest: Digest,
+        manifest_digest: Digest,
+        consistency: CheckpointConsistency,
+        full: Option<FullCheckpointMetadata>,
+    ) -> Result<Checkpoint> {
         let mut value = checkpoint_record(&self.db.connection, id)?
             .ok_or(Error::Missing("checkpoint is missing"))?;
         if value.request_digest != *request_digest {
             return Err(Error::Conflict("checkpoint request digest mismatch"));
         }
+        if (value.request.kind == CheckpointKind::Full) != full.is_some() {
+            return Err(Error::Conflict(
+                "checkpoint kind does not match its completion material",
+            ));
+        }
         if value.phase == CheckpointPhase::Ready {
             return if value.workload_disk_digest.as_ref() == Some(&disk_digest)
                 && value.manifest_digest.as_ref() == Some(&manifest_digest)
                 && value.consistency == Some(consistency)
+                && value.full == full
             {
                 Ok(value)
             } else {
@@ -523,6 +750,7 @@ impl HostCatalog {
         value.workload_disk_digest = Some(disk_digest);
         value.manifest_digest = Some(manifest_digest);
         value.consistency = Some(consistency);
+        value.full = full;
         self.db.connection.execute(
             "UPDATE checkpoints SET value=?2 WHERE id=?1",
             params![id.as_str(), encode(&value)?],
@@ -856,12 +1084,20 @@ impl HostCatalog {
         let intent = self
             .intent(operation)?
             .ok_or(Error::Missing("lifecycle intent is missing"))?;
+        let sandbox = sandbox_record(&self.db.connection, &intent.sandbox_id)?
+            .ok_or(Error::Missing("lifecycle sandbox is missing"))?;
+        if sandbox.configuration_revision != intent.revision {
+            return Err(Error::Conflict(
+                "lifecycle intent is no longer the current configuration revision",
+            ));
+        }
         self.authority.authorize_lifecycle(LifecycleCommand {
             sandbox_id: intent.sandbox_id,
             operation_id: intent.operation_id,
             desired: intent.desired,
             revision: intent.revision,
             request_digest: intent.request_digest,
+            configuration: sandbox.runtime_configuration,
         })
     }
 

@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 
-const version = "v1.16.2";
+const version = "v1.17.0";
 const architecture = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : undefined;
 if (process.platform !== "linux" || architecture === undefined) {
   throw new Error("Firecracker artifacts are available only for Linux x64 and arm64");
 }
 const archives: Readonly<Record<string, string>> = {
-  x86_64: "32e3cdcd4081f91fe2b024a266f57dcb3b4e5fec5033e0cb22467ad7f7820bda",
+  x86_64: "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558",
 };
 const expectedArchive = archives[architecture];
 if (expectedArchive === undefined) throw new Error(`no reviewed ${version} archive digest for ${architecture}`);

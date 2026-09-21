@@ -8,16 +8,30 @@ use crate::{
     ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
     MachineTransition,
 };
-use sandbox_vm::{FirecrackerConfig, FirecrackerProcess};
+use sandbox_vm::{FirecrackerConfig, FirecrackerProcess, FirecrackerRestore, FirecrackerSnapshot};
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand, MachineObservation,
-    MachineState, Qualification, SandboxId, VmEngine, bytes_digest, digest,
+    CheckpointId, ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand,
+    MachineObservation, MachineState, OperationId, Qualification, SandboxId, VmEngine,
+    bytes_digest, digest,
 };
+use std::fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirecrackerQualification {
     pub lifecycle: Option<Digest>,
     pub full_state: Option<Digest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FirecrackerRestoreSource {
+    pub checkpoint_id: CheckpointId,
+    pub capture_operation_id: OperationId,
+    pub source_sandbox_id: SandboxId,
+    pub source_epoch: Counter,
+    pub manifest_digest: Digest,
+    pub snapshot_state: std::path::PathBuf,
+    pub snapshot_memory: std::path::PathBuf,
+    pub reconnect_state: std::path::PathBuf,
 }
 
 /// Supplies one fresh, already verified epoch configuration and authenticates
@@ -40,6 +54,20 @@ pub trait FirecrackerEpochFactory {
     /// Establishes the guest's durable stop boundary before VMM termination.
     /// Returning an error leaves the live machine owned by this driver.
     fn prepare_stop(&mut self, sandbox_id: &SandboxId, epoch: Counter) -> Result<Digest, Digest>;
+
+    fn restore_configuration(
+        &mut self,
+        sandbox_id: &SandboxId,
+        epoch: Counter,
+        source: &FirecrackerRestoreSource,
+    ) -> Result<(FirecrackerConfig, FirecrackerRestore), Digest>;
+
+    fn authenticate_restore(
+        &mut self,
+        sandbox_id: &SandboxId,
+        epoch: Counter,
+        process: &mut FirecrackerProcess,
+    ) -> Result<Digest, Digest>;
 }
 
 pub struct FirecrackerDriver<F> {
@@ -50,6 +78,10 @@ pub struct FirecrackerDriver<F> {
     process: Option<FirecrackerProcess>,
     applied_revision: Option<Counter>,
     capture_paused: bool,
+    full_capture_operation: Option<OperationId>,
+    full_snapshot: Option<FirecrackerSnapshot>,
+    committed_suspend: Option<(OperationId, Digest)>,
+    staged_restore: Option<FirecrackerRestoreSource>,
 }
 
 impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
@@ -67,6 +99,10 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             process: None,
             applied_revision: None,
             capture_paused: false,
+            full_capture_operation: None,
+            full_snapshot: None,
+            committed_suspend: None,
+            staged_restore: None,
         }
     }
 
@@ -109,6 +145,10 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         };
         self.process = Some(process);
         self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.full_snapshot = None;
+        self.committed_suspend = None;
+        self.staged_restore = None;
         self.applied_revision = Some(command.revision);
         let booting = if epoch == Counter::ONE {
             MachineState::Creating
@@ -161,6 +201,11 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             return MachineOutcome::Unknown;
         }
         self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        if self.remove_full_snapshot().is_err() {
+            return MachineOutcome::Unknown;
+        }
         let quiesce = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
             Ok(value) => value,
             Err(_) => return MachineOutcome::Unknown,
@@ -198,6 +243,91 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         Ok(())
     }
 
+    /// Temporarily run a machine whose published lifecycle state is paused so
+    /// the trusted guest can establish a capture barrier. The guardian does
+    /// not publish this internal coordination step.
+    pub fn resume_public_pause_for_capture(&mut self) -> Result<(), Digest> {
+        if self.capture_paused || self.process.is_none() {
+            return Err(bytes_digest(b"firecracker-public-pause-capture-state"));
+        }
+        self.process
+            .as_ref()
+            .expect("process checked above")
+            .resume()
+            .map_err(|_| bytes_digest(b"firecracker-public-pause-capture-resume"))
+    }
+
+    /// Restore the published paused state after an ordinary checkpoint has
+    /// released its guest barrier.
+    pub fn restore_public_pause_after_capture(&mut self) -> Result<(), Digest> {
+        if self.capture_paused || self.process.is_none() {
+            return Err(bytes_digest(b"firecracker-public-pause-restore-state"));
+        }
+        self.process
+            .as_ref()
+            .expect("process checked above")
+            .pause()
+            .map_err(|_| bytes_digest(b"firecracker-public-pause-restore"))
+    }
+
+    /// Create engine state for the exact already-frozen workload boundary.
+    /// Repeating the same operation is safe; a different capture cannot replace
+    /// an active paused transaction.
+    pub fn create_full_snapshot(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Result<FirecrackerSnapshot, Digest> {
+        if self
+            .full_capture_operation
+            .as_ref()
+            .is_some_and(|value| value != operation_id)
+        {
+            return Err(bytes_digest(b"firecracker-full-capture-conflict"));
+        }
+        self.pause_for_capture()?;
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| bytes_digest(b"firecracker-capture-owner-unavailable"))?;
+        let snapshot = process
+            .create_full_snapshot(operation_id.as_str())
+            .map_err(|_| bytes_digest(b"firecracker-full-snapshot-failed"))?;
+        self.full_capture_operation = Some(operation_id.clone());
+        self.full_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn commit_suspend(
+        &mut self,
+        operation_id: &OperationId,
+        manifest_digest: Digest,
+    ) -> Result<(), Digest> {
+        if !self.capture_paused
+            || self.full_capture_operation.as_ref() != Some(operation_id)
+            || self
+                .committed_suspend
+                .as_ref()
+                .is_some_and(|(old, digest)| old != operation_id || digest != &manifest_digest)
+        {
+            return Err(bytes_digest(b"firecracker-suspend-capture-mismatch"));
+        }
+        self.committed_suspend = Some((operation_id.clone(), manifest_digest));
+        Ok(())
+    }
+
+    pub fn stage_restore(&mut self, source: FirecrackerRestoreSource) -> Result<(), Digest> {
+        if self.process.is_some()
+            || self
+                .staged_restore
+                .as_ref()
+                .is_some_and(|old| old.manifest_digest != source.manifest_digest)
+        {
+            return Err(bytes_digest(b"firecracker-restore-stage-conflict"));
+        }
+        self.staged_restore = Some(source);
+        Ok(())
+    }
+
     pub fn resume_after_capture(&mut self) -> Result<(), Digest> {
         if !self.capture_paused {
             return Ok(());
@@ -210,12 +340,44 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             .resume()
             .map_err(|_| bytes_digest(b"firecracker-capture-resume-failed"))?;
         self.capture_paused = false;
-        Ok(())
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        self.remove_full_snapshot()
     }
 
     #[must_use]
     pub fn capture_is_paused(&self) -> bool {
         self.capture_paused
+    }
+
+    /// Fail closed when a higher-level transaction cannot publish a machine
+    /// that this driver has already started or restored. No observation is
+    /// manufactured here; the guardian retains its previous observation and
+    /// reports the attempted operation as indeterminate.
+    pub fn contain_unobserved(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            contain(&mut process);
+        }
+        self.applied_revision = None;
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.full_snapshot = None;
+        self.committed_suspend = None;
+        self.staged_restore = None;
+    }
+
+    fn remove_full_snapshot(&mut self) -> Result<(), Digest> {
+        let Some(snapshot) = self.full_snapshot.take() else {
+            return Ok(());
+        };
+        for path in [snapshot.snapshot_state, snapshot.snapshot_memory] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(bytes_digest(b"firecracker-snapshot-cleanup-failed")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -367,18 +529,108 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
 
     fn suspend(
         &mut self,
-        _command: &LifecycleCommand,
-        _current: &MachineObservation,
+        command: &LifecycleCommand,
+        current: &MachineObservation,
     ) -> MachineOutcome {
-        Self::unavailable(b"firecracker-full-state-capture-not-implemented")
+        if !self.identity_matches(command)
+            || !self.capture_paused
+            || self.committed_suspend.is_none()
+            || self.process.is_none()
+        {
+            return Self::unavailable(b"firecracker-suspend-capture-not-committed");
+        }
+        let (_, manifest) = self
+            .committed_suspend
+            .take()
+            .expect("committed suspend checked above");
+        let Some(mut process) = self.process.take() else {
+            return MachineOutcome::Unknown;
+        };
+        if process.terminate().is_err() || process.wait().is_err() {
+            contain(&mut process);
+            return MachineOutcome::Unknown;
+        }
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        if self.remove_full_snapshot().is_err() {
+            return MachineOutcome::Unknown;
+        }
+        MachineOutcome::Observed(vec![transition_with_digest(
+            command,
+            current.epoch,
+            MachineState::Suspended,
+            b"firecracker-snapshot-committed-and-vmm-released",
+            &manifest,
+        )])
     }
 
     fn restore(
         &mut self,
-        _command: &LifecycleCommand,
-        _current: &MachineObservation,
+        command: &LifecycleCommand,
+        current: &MachineObservation,
     ) -> MachineOutcome {
-        Self::unavailable(b"firecracker-full-state-restore-not-implemented")
+        if !self.identity_matches(command) || self.process.is_some() {
+            return Self::unavailable(b"firecracker-restore-state-mismatch");
+        }
+        let Some(source) = self.staged_restore.take() else {
+            return Self::unavailable(b"firecracker-restore-not-staged");
+        };
+        let Ok(epoch) = current.epoch.next() else {
+            return MachineOutcome::Unknown;
+        };
+        let (configuration, restore) =
+            match self
+                .factory
+                .restore_configuration(&self.sandbox_id, epoch, &source)
+            {
+                Ok(value) => value,
+                Err(evidence) => return MachineOutcome::NotApplied(evidence),
+            };
+        let mut process = match FirecrackerProcess::spawn_restore(&configuration, &restore) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("sandsurf Firecracker restore failed: {error}");
+                return MachineOutcome::Unknown;
+            }
+        };
+        if process.resume().is_err() {
+            contain(&mut process);
+            return MachineOutcome::Unknown;
+        }
+        let authentication =
+            match self
+                .factory
+                .authenticate_restore(&self.sandbox_id, epoch, &mut process)
+            {
+                Ok(value) => value,
+                Err(evidence) => {
+                    eprintln!("sandsurf restored guest rebind failed: {evidence:?}");
+                    contain(&mut process);
+                    return MachineOutcome::Unknown;
+                }
+            };
+        self.process = Some(process);
+        self.applied_revision = Some(command.revision);
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.full_snapshot = None;
+        self.committed_suspend = None;
+        MachineOutcome::Observed(vec![
+            transition_with_digest(
+                command,
+                epoch,
+                MachineState::Restoring,
+                b"firecracker-snapshot-loaded-paused",
+                &source.manifest_digest,
+            ),
+            transition_with_digest(
+                command,
+                epoch,
+                MachineState::Running,
+                b"firecracker-restored-guest-rebound",
+                &authentication,
+            ),
+        ])
     }
 
     fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {

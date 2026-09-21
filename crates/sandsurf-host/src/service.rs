@@ -4,7 +4,8 @@ use crate::api::{
 #[cfg(not(target_os = "linux"))]
 use sandsurf_control::{EffectOutcome, GuardianEffect, LifecycleEffect, Result as ControlResult};
 use sandsurf_control::{
-    Guardian, GuardianClient, HostGuardianLink, apply_lifecycle, serve_guardian,
+    Guardian, GuardianClient, HostGuardianLink, HostLifecycleResult, apply_lifecycle,
+    serve_guardian,
 };
 use sandsurf_machine::GuestArchitecture;
 #[cfg(not(target_os = "linux"))]
@@ -15,7 +16,7 @@ use sandsurf_state::{
     Approval, CatalogLimits, GrantChange, HostCatalog, ReservationState, RuntimeJournal,
     RuntimeLimits, SandboxRecord,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -25,7 +26,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const API_TIMEOUT: Duration = Duration::from_secs(60);
+// Full-state capture/restore includes bounded memory and disk persistence plus
+// native recovery probes. Transport waits must cover that operation without
+// converting a still-running, identity-bound mutation into a client timeout.
+const API_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub enum HostError {
@@ -114,6 +118,7 @@ pub struct HostService {
     catalog: HostCatalog,
     executable: PathBuf,
     verified_guardians: BTreeSet<SandboxId>,
+    verified_workload_defaults: BTreeMap<String, crate::api::WorkloadDefaultsView>,
     workspace: crate::workspace::WorkspaceAuthority,
     secrets: crate::secrets::SecretAuthority,
 }
@@ -142,6 +147,7 @@ impl HostService {
             catalog,
             executable,
             verified_guardians: BTreeSet::new(),
+            verified_workload_defaults: BTreeMap::new(),
             workspace,
             secrets,
         };
@@ -171,10 +177,10 @@ impl HostService {
             HostRequest::StopService => Ok(HostResponse::Complete),
             HostRequest::ListSandboxes { after, maximum } => {
                 let records = self.catalog.sandboxes(after.as_ref(), maximum)?;
-                let values = records
-                    .into_iter()
-                    .map(|record| self.view(record))
-                    .collect::<Result<Vec<_>>>()?;
+                let mut values = Vec::with_capacity(records.len());
+                for record in records {
+                    values.push(self.view(record)?);
+                }
                 Ok(HostResponse::Sandboxes { values })
             }
             HostRequest::GetSandbox { sandbox_id } => {
@@ -251,12 +257,25 @@ impl HostService {
                 }
                 let capture_root = self.root.join("checkpoints");
                 if admitted.phase == CheckpointPhase::Capturing {
-                    GuardianClient::new(self.guardian_endpoint(&request.sandbox_id)).guest(
-                        request.sandbox_id.clone(),
-                        GuestServiceRequest::FinishFilesystemCapture {
-                            operation_id: request.operation_id.clone(),
-                        },
-                    )?;
+                    let client = GuardianClient::new(self.guardian_endpoint(&request.sandbox_id));
+                    match request.kind {
+                        CheckpointKind::Filesystem => {
+                            client.guest(
+                                request.sandbox_id.clone(),
+                                GuestServiceRequest::FinishFilesystemCapture {
+                                    operation_id: request.operation_id.clone(),
+                                },
+                            )?;
+                        }
+                        CheckpointKind::Full => {
+                            client.native_checkpoint(
+                                request.sandbox_id.clone(),
+                                NativeCheckpointRequest::FinishFull {
+                                    operation_id: request.operation_id.clone(),
+                                },
+                            )?;
+                        }
+                    }
                 }
                 let capturing = self
                     .catalog
@@ -265,59 +284,102 @@ impl HostService {
                     crate::checkpoints::published_filesystem(&capture_root, &capturing)?
                 {
                     return Ok(HostResponse::Checkpoint {
-                        value: self.catalog.complete_checkpoint(
+                        value: complete_checkpoint_capture(
+                            &mut self.catalog,
                             &request.id,
                             &request_digest,
-                            captured.disk_digest,
-                            captured.manifest_digest,
-                            CheckpointConsistency::Filesystem,
+                            captured,
                         )?,
                     });
                 }
                 let client = GuardianClient::new(self.guardian_endpoint(&request.sandbox_id));
-                let prepared = client.guest(
-                    request.sandbox_id.clone(),
-                    GuestServiceRequest::PrepareFilesystemCapture {
-                        operation_id: request.operation_id.clone(),
-                    },
-                )?;
-                if !matches!(
-                    prepared,
-                    GuestServiceResponse::FilesystemCapturePrepared { .. }
-                ) {
-                    return Err(HostError::Invalid(
-                        "guest did not establish a filesystem capture boundary",
-                    ));
-                }
-                let captured = crate::checkpoints::capture_filesystem(
-                    &capture_root,
-                    &capturing,
-                    &self
-                        .sandbox_root(&request.sandbox_id)
-                        .join("disks/workload-state.ext4"),
-                );
-                let finished = client.guest(
-                    request.sandbox_id.clone(),
-                    GuestServiceRequest::FinishFilesystemCapture {
-                        operation_id: request.operation_id.clone(),
-                    },
-                );
+                let sandbox_root = self.sandbox_root(&request.sandbox_id);
+                let (captured, finished) = match request.kind {
+                    CheckpointKind::Filesystem => {
+                        let prepared = client.guest(
+                            request.sandbox_id.clone(),
+                            GuestServiceRequest::PrepareFilesystemCapture {
+                                operation_id: request.operation_id.clone(),
+                            },
+                        )?;
+                        if !matches!(
+                            prepared,
+                            GuestServiceResponse::FilesystemCapturePrepared { .. }
+                        ) {
+                            return Err(HostError::Invalid(
+                                "guest did not establish a filesystem capture boundary",
+                            ));
+                        }
+                        let captured = crate::checkpoints::capture_filesystem(
+                            &capture_root,
+                            &capturing,
+                            &sandbox_root.join("disks/workload-state.ext4"),
+                        );
+                        let finished = client
+                            .guest(
+                                request.sandbox_id.clone(),
+                                GuestServiceRequest::FinishFilesystemCapture {
+                                    operation_id: request.operation_id.clone(),
+                                },
+                            )
+                            .map(|response| {
+                                matches!(
+                                    response,
+                                    GuestServiceResponse::FilesystemCaptureFinished { .. }
+                                )
+                            });
+                        (captured, finished)
+                    }
+                    CheckpointKind::Full => {
+                        let prepared = client.native_checkpoint(
+                            request.sandbox_id.clone(),
+                            NativeCheckpointRequest::PrepareFull {
+                                checkpoint_id: request.id.clone(),
+                                operation_id: request.operation_id.clone(),
+                            },
+                        )?;
+                        let NativeCheckpointResponse::Prepared { capture, processes } = prepared
+                        else {
+                            return Err(HostError::Invalid(
+                                "guardian did not establish a full capture boundary",
+                            ));
+                        };
+                        let captured = crate::checkpoints::capture_full(
+                            &capture_root,
+                            &capturing,
+                            &sandbox_root.join("disks/workload-state.ext4"),
+                            &sandbox_root.join("disks/control-state.ext4"),
+                            &sandbox_root
+                                .join("guardian/full-captures")
+                                .join(request.operation_id.as_str()),
+                            capture,
+                            processes,
+                        );
+                        let finished = client
+                            .native_checkpoint(
+                                request.sandbox_id.clone(),
+                                NativeCheckpointRequest::FinishFull {
+                                    operation_id: request.operation_id.clone(),
+                                },
+                            )
+                            .map(|response| {
+                                matches!(response, NativeCheckpointResponse::Complete { .. })
+                            });
+                        (captured, finished)
+                    }
+                };
                 let captured = captured?;
-                if !matches!(
-                    finished?,
-                    GuestServiceResponse::FilesystemCaptureFinished { .. }
-                ) {
+                if !finished? {
                     return Err(HostError::Invalid(
-                        "guest did not release the filesystem capture boundary",
+                        "guardian did not release the checkpoint capture boundary",
                     ));
                 }
                 Ok(HostResponse::Checkpoint {
-                    value: self.catalog.complete_checkpoint(
+                    value: complete_checkpoint_capture(
+                        &mut self.catalog,
                         &request.id,
                         &request_digest,
-                        captured.disk_digest,
-                        captured.manifest_digest,
-                        CheckpointConsistency::Filesystem,
+                        captured,
                     )?,
                 })
             }
@@ -756,7 +818,7 @@ impl HostService {
                         &(&sandbox_id, &operation_id, expected_revision, desired),
                     )?,
                 };
-                self.catalog.request_lifecycle(
+                let intent = self.catalog.request_lifecycle(
                     &sandbox_id,
                     operation_id.clone(),
                     expected_revision,
@@ -765,7 +827,7 @@ impl HostService {
                 )?;
                 self.provision_guardian(&sandbox_id)?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
-                let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
+                let lifecycle = self.apply_lifecycle_intent(&intent, endpoint)?;
                 let record = self
                     .catalog
                     .sandbox(&sandbox_id)?
@@ -1142,6 +1204,8 @@ impl HostService {
                         | GuestServiceRequest::PrepareStop
                         | GuestServiceRequest::PrepareFilesystemCapture { .. }
                         | GuestServiceRequest::FinishFilesystemCapture { .. }
+                        | GuestServiceRequest::RebindEpoch { .. }
+                        | GuestServiceRequest::ProbeIdentity
                         | GuestServiceRequest::InstallSecret { .. }
                         | GuestServiceRequest::RevokeSecret { .. }
                         | GuestServiceRequest::ApplyResources { .. }
@@ -1426,6 +1490,222 @@ impl HostService {
         }
     }
 
+    fn apply_lifecycle_intent(
+        &mut self,
+        intent: &LifecycleIntent,
+        endpoint: PathBuf,
+    ) -> Result<HostLifecycleResult> {
+        let client = GuardianClient::new(endpoint.clone());
+        let inspection = client.inspect(intent.sandbox_id.clone(), None)?;
+        let current = match inspection.observation {
+            Observation::Current { value } => Some(value),
+            Observation::Unavailable { .. } => None,
+        };
+        match (intent.desired, current.as_ref().map(|value| value.state)) {
+            (DesiredState::Suspended, Some(_)) => {
+                self.suspend_with_full_checkpoint(intent, endpoint, current.as_ref().unwrap())
+            }
+            (DesiredState::Running, Some(MachineState::Suspended)) => {
+                self.restore_suspended_checkpoint(intent, endpoint, current.as_ref().unwrap())
+            }
+            _ => Ok(apply_lifecycle(
+                &mut self.catalog,
+                endpoint,
+                &intent.operation_id,
+            )?),
+        }
+    }
+
+    fn suspend_with_full_checkpoint(
+        &mut self,
+        intent: &LifecycleIntent,
+        endpoint: PathBuf,
+        current: &MachineObservation,
+    ) -> Result<HostLifecycleResult> {
+        let (checkpoint_id, capture_operation_id) = suspension_identities(intent)?;
+        if current.state == MachineState::Suspended {
+            let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
+            if lifecycle.completed_intent.is_some() {
+                let checkpoint =
+                    self.catalog
+                        .checkpoint(&checkpoint_id)?
+                        .ok_or(HostError::Invalid(
+                            "suspended machine has no lifecycle checkpoint",
+                        ))?;
+                let manifest = checkpoint
+                    .manifest_digest
+                    .as_ref()
+                    .ok_or(HostError::Invalid(
+                        "suspension checkpoint has no committed manifest",
+                    ))?;
+                self.catalog.record_suspension(
+                    &intent.sandbox_id,
+                    &intent.operation_id,
+                    &checkpoint_id,
+                    manifest,
+                )?;
+            }
+            return Ok(lifecycle);
+        }
+        if !matches!(current.state, MachineState::Running | MachineState::Paused)
+            || current.applied_revision.next()? != intent.revision
+        {
+            return Err(HostError::Invalid(
+                "suspend requires the current running or paused revision",
+            ));
+        }
+        let request = CheckpointRequest {
+            id: checkpoint_id.clone(),
+            operation_id: capture_operation_id.clone(),
+            sandbox_id: intent.sandbox_id.clone(),
+            expected_epoch: current.epoch,
+            expected_revision: current.applied_revision,
+            kind: CheckpointKind::Full,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request))?;
+        let admitted = self
+            .catalog
+            .admit_suspension_checkpoint(request.clone(), &intent.operation_id)?;
+        let checkpoint = if admitted.phase == CheckpointPhase::Ready {
+            admitted
+        } else {
+            let capturing = self
+                .catalog
+                .begin_checkpoint(&checkpoint_id, &request_digest)?;
+            if let Some(captured) = crate::checkpoints::published_filesystem(
+                &self.root.join("checkpoints"),
+                &capturing,
+            )? {
+                complete_checkpoint_capture(
+                    &mut self.catalog,
+                    &checkpoint_id,
+                    &request_digest,
+                    captured,
+                )?
+            } else {
+                let client = GuardianClient::new(endpoint.clone());
+                let prepared = client.native_checkpoint(
+                    intent.sandbox_id.clone(),
+                    NativeCheckpointRequest::PrepareFull {
+                        checkpoint_id: checkpoint_id.clone(),
+                        operation_id: capture_operation_id.clone(),
+                    },
+                )?;
+                let NativeCheckpointResponse::Prepared { capture, processes } = prepared else {
+                    return Err(HostError::Invalid(
+                        "guardian did not establish the suspension capture boundary",
+                    ));
+                };
+                let sandbox_root = self.sandbox_root(&intent.sandbox_id);
+                let captured = crate::checkpoints::capture_full(
+                    &self.root.join("checkpoints"),
+                    &capturing,
+                    &sandbox_root.join("disks/workload-state.ext4"),
+                    &sandbox_root.join("disks/control-state.ext4"),
+                    &sandbox_root
+                        .join("guardian/full-captures")
+                        .join(capture_operation_id.as_str()),
+                    capture,
+                    processes,
+                )?;
+                complete_checkpoint_capture(
+                    &mut self.catalog,
+                    &checkpoint_id,
+                    &request_digest,
+                    captured,
+                )?
+            }
+        };
+        let manifest_digest = checkpoint
+            .manifest_digest
+            .clone()
+            .ok_or(HostError::Invalid(
+                "suspension checkpoint has no committed manifest",
+            ))?;
+        if !matches!(
+            GuardianClient::new(endpoint.clone()).native_checkpoint(
+                intent.sandbox_id.clone(),
+                NativeCheckpointRequest::CommitSuspend {
+                    operation_id: capture_operation_id,
+                    manifest_digest: manifest_digest.clone(),
+                },
+            )?,
+            NativeCheckpointResponse::Complete { .. }
+        ) {
+            return Err(HostError::Invalid(
+                "guardian did not commit the suspension checkpoint",
+            ));
+        }
+        let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
+        if lifecycle.completed_intent.is_some() {
+            self.catalog.record_suspension(
+                &intent.sandbox_id,
+                &intent.operation_id,
+                &checkpoint_id,
+                &manifest_digest,
+            )?;
+        }
+        Ok(lifecycle)
+    }
+
+    fn restore_suspended_checkpoint(
+        &mut self,
+        intent: &LifecycleIntent,
+        endpoint: PathBuf,
+        current: &MachineObservation,
+    ) -> Result<HostLifecycleResult> {
+        let suspension = self
+            .catalog
+            .suspension(&intent.sandbox_id)?
+            .ok_or(HostError::Invalid(
+                "suspended machine has no committed restore checkpoint",
+            ))?;
+        let checkpoint = self
+            .catalog
+            .checkpoint(&suspension.checkpoint_id)?
+            .ok_or(HostError::Invalid("restore checkpoint does not exist"))?;
+        let full = checkpoint.full.clone().ok_or(HostError::Invalid(
+            "restore checkpoint has no machine state",
+        ))?;
+        let workload_disk = CheckpointArtifact {
+            digest: checkpoint
+                .workload_disk_digest
+                .clone()
+                .ok_or(HostError::Invalid(
+                    "restore checkpoint has no workload disk",
+                ))?,
+            bytes: checkpoint.workload_disk_bytes,
+        };
+        if current.applied_revision.next()? != intent.revision {
+            return Err(HostError::Invalid(
+                "restore does not follow the suspended configuration revision",
+            ));
+        }
+        if !matches!(
+            GuardianClient::new(endpoint.clone()).native_checkpoint(
+                intent.sandbox_id.clone(),
+                NativeCheckpointRequest::StageRestore {
+                    checkpoint_id: suspension.checkpoint_id.clone(),
+                    manifest_digest: suspension.manifest_digest.clone(),
+                    workload_disk,
+                    expected: Box::new(full),
+                },
+            )?,
+            NativeCheckpointResponse::Complete { .. }
+        ) {
+            return Err(HostError::Invalid(
+                "guardian did not stage the suspended machine restore",
+            ));
+        }
+        let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
+        if lifecycle.completed_intent.is_some() {
+            self.catalog
+                .clear_suspension(&intent.sandbox_id, &suspension.checkpoint_id)?;
+        }
+        Ok(lifecycle)
+    }
+
     fn recover_checkpoint_barriers(&mut self) {
         let mut after = None;
         loop {
@@ -1439,7 +1719,9 @@ impl HostService {
                 return;
             }
             for checkpoint in &values {
-                if checkpoint.phase != CheckpointPhase::Capturing {
+                if checkpoint.phase != CheckpointPhase::Capturing
+                    || checkpoint.request.kind != CheckpointKind::Filesystem
+                {
                     continue;
                 }
                 let sandbox = checkpoint.request.sandbox_id.clone();
@@ -1534,16 +1816,29 @@ impl HostService {
         }
     }
 
-    fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
+    fn view(&mut self, record: SandboxRecord) -> Result<SandboxView> {
         let machine = match GuardianClient::new(self.guardian_endpoint(&record.id))
             .inspect(record.id.clone(), None)
         {
             Ok(value) => value.observation,
             Err(_) => Observation::Unavailable { last_known: None },
         };
+        #[cfg(target_os = "linux")]
+        let workload_defaults = if let Some(value) = self
+            .verified_workload_defaults
+            .get(record.image_digest.as_str())
+            .cloned()
+        {
+            value
+        } else {
+            let value = crate::linux::workload_defaults(&self.root, &record.image_digest)?;
+            self.verified_workload_defaults
+                .insert(record.image_digest.as_str().to_owned(), value.clone());
+            value
+        };
         Ok(SandboxView {
             #[cfg(target_os = "linux")]
-            workload_defaults: crate::linux::workload_defaults(&self.root, &record.image_digest)?,
+            workload_defaults,
             #[cfg(not(target_os = "linux"))]
             workload_defaults: crate::api::WorkloadDefaultsView {
                 environment: Default::default(),
@@ -1758,6 +2053,49 @@ fn runtime_limits() -> RuntimeLimits {
 
 fn counter(value: u64) -> Counter {
     Counter::try_from(value).expect("static host bound is a safe integer")
+}
+
+fn complete_checkpoint_capture(
+    catalog: &mut HostCatalog,
+    id: &CheckpointId,
+    request_digest: &Digest,
+    captured: crate::checkpoints::CaptureResult,
+) -> Result<Checkpoint> {
+    match captured.full {
+        Some(full) => Ok(catalog.complete_full_checkpoint(
+            id,
+            request_digest,
+            captured.disk_digest,
+            captured.manifest_digest,
+            CheckpointConsistency::Filesystem,
+            full,
+        )?),
+        None => Ok(catalog.complete_checkpoint(
+            id,
+            request_digest,
+            captured.disk_digest,
+            captured.manifest_digest,
+            CheckpointConsistency::Filesystem,
+        )?),
+    }
+}
+
+fn suspension_identities(intent: &LifecycleIntent) -> Result<(CheckpointId, OperationId)> {
+    let identity = digest(
+        Domain::Checkpoint,
+        &(
+            "sandsurf-suspension-identities-v1",
+            &intent.sandbox_id,
+            &intent.operation_id,
+            intent.revision,
+            &intent.request_digest,
+        ),
+    )?;
+    let suffix = &identity.as_str()[..40];
+    Ok((
+        format!("suspend-{suffix}").try_into()?,
+        format!("suspend-capture-{suffix}").try_into()?,
+    ))
 }
 
 fn reserve_ephemeral_port(address: &str) -> Result<u16> {

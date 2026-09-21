@@ -17,7 +17,11 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SERVICE_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// Full-state VM capture/restore is synchronous at this private ownership
+// boundary and can include bounded hashing of memory plus multiple disks.
+// Match the host's operation bound so transport timeout never implies that an
+// exact identity-bound operation stopped running.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub enum Error {
@@ -92,6 +96,22 @@ pub trait GuardianEffect {
     }
     fn query(&mut self, _request: GuestServiceRequest) -> Result<GuestServiceResponse> {
         Err(Error::Unsupported("guest query is not implemented"))
+    }
+    fn native_checkpoint(
+        &mut self,
+        _request: NativeCheckpointRequest,
+        _journal: &mut RuntimeJournal,
+    ) -> Result<NativeCheckpointResponse> {
+        Err(Error::Unsupported(
+            "native full-state checkpointing is not implemented",
+        ))
+    }
+    fn rebind_restored_runtime(
+        &mut self,
+        _journal: &mut RuntimeJournal,
+        _epoch: Counter,
+    ) -> sandsurf_state::Result<()> {
+        Ok(())
     }
     /// Reports whether a last committed live-machine observation is currently
     /// backed by this guardian's exclusive native owner. It is not a lifecycle
@@ -322,6 +342,20 @@ impl<E: GuardianEffect> Guardian<E> {
                                         "native lifecycle returned an invalid observation count",
                                     ));
                                 }
+                                if current
+                                    .as_ref()
+                                    .is_some_and(|value| value.state == MachineState::Suspended)
+                                    && transitions
+                                        .last()
+                                        .is_some_and(|value| value.state == MachineState::Running)
+                                {
+                                    let epoch = transitions
+                                        .last()
+                                        .expect("restored transition checked above")
+                                        .epoch;
+                                    self.effect
+                                        .rebind_restored_runtime(&mut self.journal, epoch)?;
+                                }
                                 let mut references = Vec::with_capacity(transitions.len());
                                 for transition in transitions {
                                     let sequence = match self.journal.last_observation()? {
@@ -460,6 +494,16 @@ impl<E: GuardianEffect> Guardian<E> {
                     usage.output_retained_bytes = self.journal.retained_output_bytes()?;
                 }
                 Ok(GuardianResponse::Guest { response })
+            }
+            GuardianRequest::NativeCheckpoint {
+                sandbox_id,
+                request,
+            } => {
+                if &sandbox_id != self.journal.sandbox_id() {
+                    return Err(Error::Protocol("guardian sandbox identity mismatch"));
+                }
+                let response = self.effect.native_checkpoint(request, &mut self.journal)?;
+                Ok(GuardianResponse::NativeCheckpoint { response })
             }
             GuardianRequest::Runtime {
                 sandbox_id,
@@ -771,6 +815,9 @@ impl GuardianClient {
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::NativeCheckpoint { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -795,6 +842,9 @@ impl GuardianClient {
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::NativeCheckpoint { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -811,6 +861,7 @@ impl GuardianClient {
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Configuration { .. }
             | GuardianResponse::Guest { .. }
+            | GuardianResponse::NativeCheckpoint { .. }
             | GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -833,6 +884,7 @@ impl GuardianClient {
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Lifecycle { .. }
             | GuardianResponse::Guest { .. }
+            | GuardianResponse::NativeCheckpoint { .. }
             | GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -856,6 +908,31 @@ impl GuardianClient {
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Lifecycle { .. }
             | GuardianResponse::Configuration { .. }
+            | GuardianResponse::NativeCheckpoint { .. }
+            | GuardianResponse::Runtime { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
+        }
+    }
+
+    pub fn native_checkpoint(
+        &self,
+        sandbox_id: SandboxId,
+        request: NativeCheckpointRequest,
+    ) -> Result<NativeCheckpointResponse> {
+        match self.call(GuardianRequest::NativeCheckpoint {
+            sandbox_id,
+            request,
+        })? {
+            GuardianResponse::NativeCheckpoint { response } => Ok(response),
+            GuardianResponse::Rejected { category, message } => {
+                Err(Error::Rejected { category, message })
+            }
+            GuardianResponse::Inspection { .. }
+            | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Lifecycle { .. }
+            | GuardianResponse::Configuration { .. }
+            | GuardianResponse::Guest { .. }
             | GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -879,7 +956,8 @@ impl GuardianClient {
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Lifecycle { .. }
             | GuardianResponse::Configuration { .. }
-            | GuardianResponse::Guest { .. } => {
+            | GuardianResponse::Guest { .. }
+            | GuardianResponse::NativeCheckpoint { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }

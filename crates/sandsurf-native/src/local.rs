@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 const SOCKET: &str = "control.sock";
 const LEASE: &str = "control.lock";
-const MAX_DEADLINE: Duration = Duration::from_secs(60);
+const MAX_DEADLINE: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIdentity {
