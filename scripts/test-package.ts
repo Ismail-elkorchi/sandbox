@@ -7,6 +7,7 @@ const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-package-test-"));
 const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
   const core = await pack("sandsurf");
+  const expectedImages = await packagedImagePaths();
   for (const tarball of [core]) {
     const listing = await capture("tar", ["-tzf", tarball]);
     const paths = listing.trim().split("\n");
@@ -16,14 +17,7 @@ try {
     if (!paths.includes("package/package.json") || !paths.includes("package/dist/index.js") || !paths.includes("package/README.md") || !paths.includes("package/LICENSE")) {
       throw new Error(`${tarball} is missing package entry points`);
     }
-    for (const imagePath of [
-      "package/images/manifest.json",
-      "package/images/minimal-x64/manifest.json",
-      "package/images/minimal-x64/vmlinux-6.18.41",
-      "package/images/minimal-x64/minimal-bootstrap.ext4",
-      "package/images/minimal-x64/minimal-workload.ext4",
-      "package/images/minimal-x64/empty-workspace.ext4",
-    ]) {
+    for (const imagePath of expectedImages) {
       if (!paths.includes(imagePath)) throw new Error(`${tarball} is missing ${imagePath}`);
     }
     if (paths.some((path) => path.endsWith("minimal-rootfs.ext4") || path.endsWith("vmlinux-6.1.177"))) {
@@ -44,6 +38,36 @@ try {
 } finally {
   if (originalUmask !== undefined) process.umask(originalUmask);
   await rm(temporary, { recursive: true, force: true });
+}
+
+async function packagedImagePaths(): Promise<readonly string[]> {
+  const root = resolve("packages/sandbox/images");
+  const index: unknown = JSON.parse(await readFile(resolve(root, "manifest.json"), "utf8"));
+  if (!record(index) || !record(index.files)) throw new Error("guest image index is malformed");
+  const paths = ["package/images/manifest.json"];
+  const required = new Set((process.env.SANDSURF_REQUIRED_IMAGE_ARCHITECTURES ?? "").split(",").filter(Boolean));
+  for (const relative of Object.keys(index.files).sort()) {
+    const match = /^(minimal-(x64|arm64))\/manifest\.json$/u.exec(relative);
+    if (match === null) throw new Error(`unsupported guest image index entry ${relative}`);
+    required.delete(match[2]!);
+    const manifest: unknown = JSON.parse(await readFile(resolve(root, relative), "utf8"));
+    if (!record(manifest) || !record(manifest.bootBundle) || !record(manifest.bootBundle.kernel) ||
+        !record(manifest.bootBundle.bootstrap) || !record(manifest.workload) ||
+        !record(manifest.workload.rootfs) || !record(manifest.workload.stateTemplate)) {
+      throw new Error(`${relative} is malformed`);
+    }
+    paths.push(`package/images/${relative}`);
+    for (const artifact of [manifest.bootBundle.kernel, manifest.bootBundle.bootstrap, manifest.workload.rootfs, manifest.workload.stateTemplate]) {
+      if (typeof artifact.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(artifact.path)) throw new Error(`${relative} has an unsafe artifact path`);
+      paths.push(`package/images/${match[1]}/${artifact.path}`);
+    }
+  }
+  if (required.size !== 0) throw new Error(`required packaged guest images are absent: ${[...required].join(", ")}`);
+  return paths;
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function pack(workspace: string): Promise<string> {

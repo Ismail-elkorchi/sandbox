@@ -23,6 +23,7 @@
     "fuzz:smoke": "cargo run -p sandbox-fuzz --release --bin sandbox-fuzz-smoke -- 25000",
     "fetch:firecracker": "node scripts/fetch-firecracker.ts",
     "build:guest-image": "node scripts/build-guest-image.ts",
+    "manifest:images": "node scripts/rebuild-image-manifest.ts",
     "package": "node scripts/package.ts",
     "test:package": "node scripts/test-package.ts",
     "audit:licenses": "node scripts/check-licenses.ts",

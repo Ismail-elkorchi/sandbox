@@ -2,7 +2,7 @@
 
 use crate::guest::{GuestClient, RemoteWorkloadDriver};
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
-use sandbox_image::{ImageTrust, RootfsFormat, VerifiedImage, verify_image};
+use sandbox_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
 use sandbox_vm::{
     FirecrackerConfig, FirecrackerProcess, FirecrackerRestore, UnixVsockChannel, VmNetworkBridge,
     VmPortGateway,
@@ -116,17 +116,22 @@ pub fn prepare_config(
     }
     let installed_root = host_root.join("images").join(image_digest.as_str());
     let (verified, source_template) = if installed_root.exists() {
-        (
-            verify_image(
-                &installed_root.join("manifest.json"),
-                ImageTrust::ExplicitLocal,
-            )?,
-            installed_root.join("empty-workspace.ext4"),
-        )
+        let verified = verify_image(
+            &installed_root.join("manifest.json"),
+            ImageTrust::ExplicitLocal,
+        )?;
+        let template = state_template_path(&verified)?;
+        (verified, template)
     } else {
         resolve_source_bundle(executable)?
     };
     if verified.manifest_digest != image_digest.as_str()
+        || verified.manifest.architecture
+            != if cfg!(target_arch = "aarch64") {
+                Architecture::Arm64
+            } else {
+                Architecture::X64
+            }
         || verified.manifest.boot_bundle.bootstrap.format != RootfsFormat::Ext4
         || verified.manifest.workload.rootfs.format != RootfsFormat::Ext4
         || !verified.manifest.boot_bundle.capabilities.overlayfs
@@ -146,7 +151,11 @@ pub fn prepare_config(
             executable
                 .parent()
                 .unwrap_or(Path::new("/"))
-                .join("firecracker-v1.17.0-x86_64")
+                .join(if cfg!(target_arch = "aarch64") {
+                    "firecracker-v1.17.0-aarch64"
+                } else {
+                    "firecracker-v1.17.0-x86_64"
+                })
         });
     require_regular(&firecracker, 256 * 1024 * 1024)?;
     if resources.vcpus.get() > 32
@@ -185,25 +194,26 @@ pub(crate) fn resolve_source_bundle(
                 "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
             ));
         }
-        let template = std::env::var_os("SANDSURF_EMPTY_DISK_IMAGE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                path.parent()
-                    .unwrap_or(Path::new("/"))
-                    .join("empty-workspace.ext4")
-            });
-        Ok((verify_image(&path, ImageTrust::ExplicitLocal)?, template))
+        let verified = verify_image(&path, ImageTrust::ExplicitLocal)?;
+        let template = state_template_path(&verified)?;
+        Ok((verified, template))
     } else {
         let package = executable
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
             .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
-        let manifest = package.join("images/minimal-x64/manifest.json");
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let relative_manifest = format!("minimal-{architecture}/manifest.json");
+        let manifest = package.join("images").join(&relative_manifest);
         let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
         let expected = index
             .files
-            .get("minimal-x64/manifest.json")
+            .get(&relative_manifest)
             .ok_or_else(|| LinuxError::Invalid("packaged boot manifest is absent".into()))?
             .clone();
         let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
@@ -216,19 +226,29 @@ pub(crate) fn resolve_source_bundle(
                 "packaged image index differs from the native trust identity".into(),
             ));
         }
-        Ok((
-            verify_image(
-                &manifest,
-                ImageTrust::Pinned {
-                    manifest_digest: pinned,
-                },
-            )?,
-            executable
-                .parent()
-                .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?
-                .join("empty-workspace.ext4"),
-        ))
+        let verified = verify_image(
+            &manifest,
+            ImageTrust::Pinned {
+                manifest_digest: pinned,
+            },
+        )?;
+        let template = state_template_path(&verified)?;
+        Ok((verified, template))
     }
+}
+
+fn state_template_path(image: &VerifiedImage) -> Result<PathBuf, LinuxError> {
+    let template = image
+        .manifest
+        .workload
+        .state_template
+        .as_ref()
+        .ok_or_else(|| LinuxError::Invalid("image has no writable-state template".into()))?;
+    Ok(image
+        .manifest_path
+        .parent()
+        .ok_or_else(|| LinuxError::Invalid("image manifest has no parent".into()))?
+        .join(&template.path))
 }
 
 pub fn write_config(path: &Path, config: &LinuxGuardianConfig) -> Result<(), LinuxError> {

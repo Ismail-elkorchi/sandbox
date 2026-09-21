@@ -5,12 +5,15 @@ import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 
 const version = "v1.17.0";
-const architecture = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : undefined;
+const requestedArchitecture = process.env.SANDSURF_ARTIFACT_ARCHITECTURE
+  ?? (process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : undefined);
+const architecture = requestedArchitecture === "x64" ? "x86_64" : requestedArchitecture === "arm64" ? "aarch64" : undefined;
 if (process.platform !== "linux" || architecture === undefined) {
   throw new Error("Firecracker artifacts are available only for Linux x64 and arm64");
 }
 const archives: Readonly<Record<string, string>> = {
   x86_64: "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558",
+  aarch64: "e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256",
 };
 const expectedArchive = archives[architecture];
 if (expectedArchive === undefined) throw new Error(`no reviewed ${version} archive digest for ${architecture}`);
@@ -30,7 +33,7 @@ try {
   await run("tar", ["-xzf", archive, "-C", temporary]);
   const release = resolve(temporary, `release-${version}-${architecture}`);
   await run("sha256sum", ["--check", "SHA256SUMS", "--ignore-missing"], release);
-  const destination = resolve("packages/sandbox/native", `linux-${process.arch}`);
+  const destination = resolve("packages/sandbox/native", `linux-${requestedArchitecture}`);
   await mkdir(destination, { recursive: true });
   for (const [source, name] of [
     [`firecracker-${version}-${architecture}`, `firecracker-${version}-${architecture}`],

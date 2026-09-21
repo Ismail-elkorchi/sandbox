@@ -1,6 +1,6 @@
 {
   "formatVersion": 2,
-  "id": "sandbox-minimal",
+  "id": "sandsurf-minimal",
   "version": "0.1.0",
   "architecture": "x64",
   "bootBundle": {

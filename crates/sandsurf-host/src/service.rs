@@ -1,6 +1,7 @@
+#[cfg(target_os = "linux")]
+use crate::api::OciSource;
 use crate::api::{
-    HOST_API_VERSION, HostInspection, HostRequest, HostResponse, OciSource, ReservationView,
-    SandboxView,
+    HOST_API_VERSION, HostInspection, HostRequest, HostResponse, ReservationView, SandboxView,
 };
 #[cfg(not(target_os = "linux"))]
 use sandsurf_control::{EffectOutcome, GuardianEffect, LifecycleEffect, Result as ControlResult};

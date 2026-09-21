@@ -23,9 +23,10 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: test -r /dev/kvm && test -w /dev/kvm
       - run: test -x /usr/bin/busybox && test -x /usr/sbin/mkfs.ext4
+      - run: SANDSURF_LOCAL_IMAGE=1 npm run build:guest-image
+      - run: npm run fetch:firecracker
       - run: npm run build:native
       - run: npm run build:ts
       - run: npm run verify:native
-      - run: SANDSURF_LOCAL_IMAGE=1 SANDSURF_IMAGE_OUTPUT_DIRECTORY="$RUNNER_TEMP/sandsurf-image" npm run build:guest-image
       - run: cargo test --locked -p sandbox-vm -p sandbox-guest -p sandsurf-workload -p sandsurf-state -p sandsurf-control -p sandsurf-host
-      - run: SANDSURF_KVM_TEST=1 SANDSURF_LOCAL_IMAGE_MANIFEST="$RUNNER_TEMP/sandsurf-image/manifest.json" node --test packages/sandbox/test/kvm-environment.test.mjs
+      - run: SANDSURF_KVM_TEST=1 node --test packages/sandbox/test/kvm-environment.test.mjs

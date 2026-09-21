@@ -9,7 +9,40 @@ permissions:
   contents: read
 
 jobs:
+  images:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            architecture: x64
+            rust_target: x86_64-unknown-linux-musl
+          - runner: ubuntu-26.04-arm
+            architecture: arm64
+            rust_target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static e2fsprogs musl-tools
+      - run: npm ci
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add ${{ matrix.rust_target }}
+      - run: npm run build:guest-image
+        env:
+          SANDSURF_LOCAL_IMAGE: "1"
+          SANDSURF_IMAGE_ARCHITECTURE: ${{ matrix.architecture }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-image-${{ matrix.architecture }}
+          path: packages/sandbox/images/minimal-${{ matrix.architecture }}
+          if-no-files-found: error
+
   native:
+    needs: images
     strategy:
       fail-fast: false
       matrix:
@@ -36,11 +69,16 @@ jobs:
       - run: npm ci
       - run: rustup toolchain install stable --profile minimal
       - if: startsWith(matrix.artifact, 'linux-')
-        run: rustup target add ${{ matrix.artifact == 'linux-x64' && 'x86_64-unknown-linux-musl' || 'aarch64-unknown-linux-musl' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: guest-image-${{ matrix.artifact == 'linux-x64' && 'x64' || 'arm64' }}
+          path: packages/sandbox/images/minimal-${{ matrix.artifact == 'linux-x64' && 'x64' || 'arm64' }}
+      - if: startsWith(matrix.artifact, 'linux-')
+        run: npm run manifest:images
+      - if: startsWith(matrix.artifact, 'linux-')
+        run: npm run fetch:firecracker
       - run: npm run build:ts
       - run: npm run build:native
-        env:
-          SANDBOX_NATIVE_TARGET: ${{ matrix.artifact == 'linux-x64' && 'x86_64-unknown-linux-musl' || matrix.artifact == 'linux-arm64' && 'aarch64-unknown-linux-musl' || '' }}
       - run: node --test packages/sandbox/test/*.test.mjs
       - if: startsWith(matrix.artifact, 'linux-')
         run: node scripts/qualify-linux-backend.ts
@@ -51,7 +89,7 @@ jobs:
           if-no-files-found: error
 
   assemble:
-    needs: native
+    needs: [images, native]
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,6 +104,14 @@ jobs:
         with:
           pattern: runtime-*
           path: staged-runtimes
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: guest-image-x64
+          path: packages/sandbox/images/minimal-x64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: guest-image-arm64
+          path: packages/sandbox/images/minimal-arm64
       - name: Assemble platform directories
         shell: bash
         run: |
@@ -75,10 +121,17 @@ jobs:
             cp -a "$directory/." "packages/sandbox/native/$platform/"
           done
       - run: node scripts/rebuild-native-manifest.ts
+      - run: npm run manifest:images
+        env:
+          SANDSURF_REQUIRED_IMAGE_ARCHITECTURES: x64,arm64
       - run: npm run build:ts
       - run: npm run verify:native
+        env:
+          SANDSURF_REQUIRED_IMAGE_ARCHITECTURES: x64,arm64
       - run: npm run supply-chain
       - run: npm run test:package
+        env:
+          SANDSURF_REQUIRED_IMAGE_ARCHITECTURES: x64,arm64
       - run: npm run package
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

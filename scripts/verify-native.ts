@@ -9,30 +9,38 @@ await verifyManifest(
   resolve(repository, "packages/sandbox/native/manifest.json"),
   resolve(repository, "packages/sandbox/native"),
 );
-await verifyManifest(
-  resolve(repository, "packages/sandbox/images/manifest.json"),
-  resolve(repository, "packages/sandbox/images"),
-);
-
-const imageRoot = resolve(repository, "packages/sandbox/images/minimal-x64");
-const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
-if (!isRecord(imageManifest) || imageManifest.formatVersion !== 2 ||
-    !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
-    !isRecord(imageManifest.bootBundle.bootstrap) || !isRecord(imageManifest.workload) ||
-    !isRecord(imageManifest.workload.rootfs) || !isRecord(imageManifest.workload.stateTemplate)) {
-  throw new Error("VM image manifest has an invalid shape");
-}
-for (const [label, entry] of [
-  ["VM kernel", imageManifest.bootBundle.kernel],
-  ["trusted VM bootstrap", imageManifest.bootBundle.bootstrap],
-  ["VM workload root", imageManifest.workload.rootfs],
-  ["VM writable-state template", imageManifest.workload.stateTemplate],
-] as const) {
-  if (typeof entry.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(entry.path)) {
-    throw new Error(`${label} path is invalid`);
+const imagesRoot = resolve(repository, "packages/sandbox/images");
+const imageIndexPath = resolve(imagesRoot, "manifest.json");
+await verifyManifest(imageIndexPath, imagesRoot);
+const imageIndex: unknown = JSON.parse(await readFile(imageIndexPath, "utf8"));
+if (!isRecord(imageIndex) || !isRecord(imageIndex.files)) throw new Error("VM image index has an invalid shape");
+const required = new Set((process.env.SANDSURF_REQUIRED_IMAGE_ARCHITECTURES ?? "").split(",").filter(Boolean));
+for (const relative of Object.keys(imageIndex.files).sort()) {
+  const match = /^minimal-(x64|arm64)\/manifest\.json$/u.exec(relative);
+  if (match === null) throw new Error(`unsupported VM image index entry ${relative}`);
+  const architecture = match[1]!;
+  required.delete(architecture);
+  const imageRoot = resolve(imagesRoot, `minimal-${architecture}`);
+  const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
+  if (!isRecord(imageManifest) || imageManifest.formatVersion !== 2 || imageManifest.architecture !== architecture ||
+      !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
+      !isRecord(imageManifest.bootBundle.bootstrap) || !isRecord(imageManifest.workload) ||
+      !isRecord(imageManifest.workload.rootfs) || !isRecord(imageManifest.workload.stateTemplate)) {
+    throw new Error(`${architecture} VM image manifest has an invalid shape`);
   }
-  await verifyFile(resolve(imageRoot, entry.path), entry.sha256, label);
+  for (const [label, entry] of [
+    ["VM kernel", imageManifest.bootBundle.kernel],
+    ["trusted VM bootstrap", imageManifest.bootBundle.bootstrap],
+    ["VM workload root", imageManifest.workload.rootfs],
+    ["VM writable-state template", imageManifest.workload.stateTemplate],
+  ] as const) {
+    if (typeof entry.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(entry.path)) {
+      throw new Error(`${architecture} ${label} path is invalid`);
+    }
+    await verifyFile(resolve(imageRoot, entry.path), entry.sha256, `${architecture} ${label}`);
+  }
 }
+if (required.size !== 0) throw new Error(`required VM images are absent: ${[...required].join(", ")}`);
 
 async function verifyManifest(manifestPath: string, base: string): Promise<void> {
   const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"));

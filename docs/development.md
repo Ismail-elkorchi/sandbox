@@ -30,7 +30,7 @@ SANDSURF_IMAGE_OUTPUT_DIRECTORY=/absolute/output \
 npm run build:guest-image
 ```
 
-Release images require the private signing seed through `SANDBOX_IMAGE_SIGNING_KEY_FILE`; the seed must never enter the repository or logs. Firecracker downloads are digest-verified by `npm run fetch:firecracker` and never occur during package installation or workload execution.
+Release images require the private signing seed through `SANDSURF_IMAGE_SIGNING_KEY_FILE`; the seed must never enter the repository or logs. Firecracker downloads are digest-verified by `npm run fetch:firecracker` and never occur during package installation or workload execution.
 
 Real VM qualification is separate:
 

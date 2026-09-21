@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-const debugBuild = process.env.SANDBOX_NATIVE_PROFILE === "debug";
-const requestedTarget = process.env.SANDBOX_NATIVE_TARGET || undefined;
+const debugBuild = process.env.SANDSURF_NATIVE_PROFILE === "debug";
+const requestedTarget = process.env.SANDSURF_NATIVE_TARGET || undefined;
 // An explicit Linux target keeps target-only static-link flags away from host
 // build scripts and proc macros.
 const defaultTarget = process.platform === "linux"
@@ -31,7 +31,9 @@ const buildArguments = [
 const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
   ? { [`CARGO_TARGET_${target.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" }
   : {};
-buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest();
+if (nativePlatform === "linux") {
+  buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest(architecture);
+}
 if (nativePlatform === "linux" && !debugBuild && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
   const linuxTarget = target ?? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
   buildEnvironment[`CARGO_TARGET_${linuxTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`] = "-C target-feature=+crt-static";
@@ -101,16 +103,17 @@ async function writeManifest(root: string): Promise<void> {
   }
 }
 
-async function bundledImageManifestDigest(): Promise<string> {
+async function bundledImageManifestDigest(guestArchitecture: "x64" | "arm64"): Promise<string> {
   const images = resolve(repository, "packages/sandbox/images");
   const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
   if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
-  const expected = index.files["minimal-x64/manifest.json"];
+  const relative = `minimal-${guestArchitecture}/manifest.json`;
+  const expected = index.files[relative];
   if (typeof expected !== "string" || !/^[a-f0-9]{64}$/u.test(expected)) {
-    throw new Error("bundled image identity is absent from the image index");
+    throw new Error(`bundled ${guestArchitecture} image identity is absent from the image index`);
   }
   const actual = createHash("sha256")
-    .update(await readFile(resolve(images, "minimal-x64/manifest.json")))
+    .update(await readFile(resolve(images, relative)))
     .digest("hex");
   if (actual !== expected) throw new Error("bundled image manifest differs from its image index");
   return actual;
