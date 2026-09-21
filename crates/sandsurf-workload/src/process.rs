@@ -5,11 +5,12 @@ use sandsurf_protocol::{
     Counter, Digest, OutputBoundary, ProcessId, ProcessLifetime, ProcessOutcome, SandboxId,
     SpawnRequest, StdioMode, Stream, TerminalSize, bytes_digest,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -58,7 +59,8 @@ impl From<SpoolError> for ProcessError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessCompletion {
     pub outcome: ProcessOutcome,
     pub output: OutputBoundary,
@@ -68,14 +70,20 @@ pub struct ProcessCompletion {
     pub accounting_digest: Digest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ProcessState {
     Running,
     Exited(ProcessCompletion),
     Unknown { evidence: Digest },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessSnapshot {
     pub request: SpawnRequest,
     pub guest_pid: u32,
@@ -86,6 +94,7 @@ pub struct ProcessSupervisor {
     sandbox_id: SandboxId,
     epoch: Counter,
     root: PathBuf,
+    workload_root: Option<PathBuf>,
     processes: Mutex<BTreeMap<ProcessId, Arc<ProcessEntry>>>,
     cgroups: Option<(CgroupManager, CgroupLimits)>,
 }
@@ -133,9 +142,29 @@ impl ProcessSupervisor {
             sandbox_id,
             epoch,
             root: root.to_path_buf(),
+            workload_root: None,
             processes: Mutex::new(BTreeMap::new()),
             cgroups: None,
         })
+    }
+
+    /// Construct a supervisor whose children execute inside one persistent
+    /// workload tree. The trusted supervisor and its spool remain outside this
+    /// root; every process in the Sandbox sees the same Linux filesystem.
+    pub fn create_in_workload(
+        root: &Path,
+        workload_root: &Path,
+        sandbox_id: SandboxId,
+        epoch: Counter,
+    ) -> Result<Self, ProcessError> {
+        if !workload_root.is_absolute() || !workload_root.is_dir() {
+            return Err(ProcessError::Invalid(
+                "workload root must be an existing absolute directory",
+            ));
+        }
+        let mut supervisor = Self::create(root, sandbox_id, epoch)?;
+        supervisor.workload_root = Some(workload_root.to_path_buf());
+        Ok(supervisor)
     }
 
     pub fn create_with_cgroups(
@@ -146,6 +175,19 @@ impl ProcessSupervisor {
         default_limits: CgroupLimits,
     ) -> Result<Self, ProcessError> {
         let mut supervisor = Self::create(root, sandbox_id, epoch)?;
+        supervisor.cgroups = Some((cgroups, default_limits));
+        Ok(supervisor)
+    }
+
+    pub fn create_in_workload_with_cgroups(
+        root: &Path,
+        workload_root: &Path,
+        sandbox_id: SandboxId,
+        epoch: Counter,
+        cgroups: CgroupManager,
+        default_limits: CgroupLimits,
+    ) -> Result<Self, ProcessError> {
+        let mut supervisor = Self::create_in_workload(root, workload_root, sandbox_id, epoch)?;
         supervisor.cgroups = Some((cgroups, default_limits));
         Ok(supervisor)
     }
@@ -181,15 +223,16 @@ impl ProcessSupervisor {
             .map(|(manager, limits)| manager.create_process(&request.process_id, *limits))
             .transpose()?;
         let attachment = cgroup.as_ref().map(ProcessCgroup::attachment).transpose()?;
-        let mut spawned = match spawn_child(&request, attachment.as_ref()) {
-            Ok(value) => value,
-            Err(error) => {
-                if let Some(cgroup) = &cgroup {
-                    let _ = cgroup.cleanup();
+        let mut spawned =
+            match spawn_child(&request, attachment.as_ref(), self.workload_root.as_deref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Some(cgroup) = &cgroup {
+                        let _ = cgroup.cleanup();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let pid = spawned.child.id();
         let entry = Arc::new(ProcessEntry {
             request: request.clone(),
@@ -388,6 +431,41 @@ impl Drop for ProcessSupervisor {
     }
 }
 
+/// Stops all currently admitted workload groups while a trusted filesystem
+/// worker verifies and installs a conditional mutation. New spawns are fenced
+/// by the process-table lock used to take this snapshot.
+pub struct ProcessWriterGuard {
+    groups: Vec<i32>,
+}
+
+impl crate::WriterBarrier for ProcessSupervisor {
+    type Guard = ProcessWriterGuard;
+
+    fn acquire(&self) -> Result<Self::Guard, crate::FilesystemError> {
+        let processes = self
+            .processes
+            .lock()
+            .map_err(|_| crate::FilesystemError::Barrier)?;
+        let mut groups = Vec::new();
+        for entry in processes.values() {
+            if matches!(entry.state(), Ok(ProcessState::Running)) {
+                send_group_signal(entry.group, libc::SIGSTOP)
+                    .map_err(|_| crate::FilesystemError::Barrier)?;
+                groups.push(entry.group);
+            }
+        }
+        Ok(ProcessWriterGuard { groups })
+    }
+}
+
+impl Drop for ProcessWriterGuard {
+    fn drop(&mut self) {
+        for group in &self.groups {
+            let _ = send_group_signal(*group, libc::SIGCONT);
+        }
+    }
+}
+
 impl ProcessEntry {
     fn state(&self) -> Result<ProcessState, ProcessError> {
         self.state
@@ -429,28 +507,56 @@ impl ProcessEntry {
     }
 }
 
-fn spawn_child(request: &SpawnRequest, attachment: Option<&File>) -> Result<Spawned, ProcessError> {
+fn reap_group_children(group: i32) {
+    loop {
+        let mut status = 0_i32;
+        // SAFETY: a negative process-group id restricts reaping to adopted
+        // workload descendants in this owned group. WNOHANG never blocks the
+        // trusted supervisor.
+        let result = unsafe { libc::waitpid(-group, &mut status, libc::WNOHANG) };
+        if result > 0 {
+            continue;
+        }
+        if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+}
+
+fn spawn_child(
+    request: &SpawnRequest,
+    attachment: Option<&File>,
+    workload_root: Option<&Path>,
+) -> Result<Spawned, ProcessError> {
     let mut command = Command::new(&request.argv[0]);
+    let cwd = match workload_root {
+        Some(root) => root.join(request.cwd.trim_start_matches('/')),
+        None => PathBuf::from(&request.cwd),
+    };
     command
         .args(&request.argv[1..])
-        .current_dir(&request.cwd)
+        .current_dir(cwd)
         .env_clear()
         .envs(&request.environment);
-    if let Some(user) = &request.user {
-        let (uid, gid) = resolve_user(user)?;
-        command.uid(uid).gid(gid);
-    }
+    let credentials = request
+        .user
+        .as_deref()
+        .map(|user| resolve_user(workload_root, user))
+        .transpose()?;
     match request.stdio {
         StdioMode::Pipes => {
             // SAFETY: this closure executes after fork and before exec, invokes
             // only async-signal-safe setpgid, and does not access shared memory.
             unsafe {
                 let attachment = attachment.map(AsRawFd::as_raw_fd);
+                let workload_root = open_workload_root(workload_root)?;
                 command.pre_exec(move || {
                     attach_current_process(attachment)?;
                     if libc::setpgid(0, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
+                    enter_workload(workload_root, credentials)?;
                     Ok(())
                 });
             }
@@ -499,6 +605,7 @@ fn spawn_child(request: &SpawnRequest, attachment: Option<&File>) -> Result<Spaw
             // already been installed from the retained PTY slave.
             unsafe {
                 let attachment = attachment.map(AsRawFd::as_raw_fd);
+                let workload_root = open_workload_root(workload_root)?;
                 command.pre_exec(move || {
                     attach_current_process(attachment)?;
                     if libc::setsid() < 0 {
@@ -507,6 +614,7 @@ fn spawn_child(request: &SpawnRequest, attachment: Option<&File>) -> Result<Spaw
                     if libc::ioctl(0, libc::TIOCSCTTY as _, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
+                    enter_workload(workload_root, credentials)?;
                     Ok(())
                 });
             }
@@ -519,6 +627,106 @@ fn spawn_child(request: &SpawnRequest, attachment: Option<&File>) -> Result<Spaw
             })
         }
     }
+}
+
+fn open_workload_root(root: Option<&Path>) -> Result<Option<RawFd>, ProcessError> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let file = File::open(root)?;
+    Ok(Some(file.into_raw_fd()))
+}
+
+fn enter_workload(root: Option<RawFd>, credentials: Option<(u32, u32)>) -> io::Result<()> {
+    let confined = root.is_some();
+    if let Some(root) = root {
+        // SAFETY: root is a retained descriptor opened by the trusted
+        // supervisor. fchdir/chroot operate on that exact directory and the
+        // descriptor is closed in this child immediately afterwards.
+        let changed = unsafe { libc::fchdir(root) };
+        if changed != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: "." is a static NUL-terminated path and this child still has
+        // the guest supervisor's privilege at this point.
+        if unsafe { libc::chroot(c".".as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the inherited descriptor is no longer needed after chroot.
+        unsafe { libc::close(root) };
+    }
+    if confined {
+        restrict_workload_capabilities()?;
+    }
+    if let Some((uid, gid)) = credentials {
+        // SAFETY: fixed scalar credentials were resolved by the trusted
+        // supervisor before fork. Supplementary groups are removed before the
+        // permanent gid/uid drop.
+        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+            // SAFETY: gid is a trusted scalar resolved before fork.
+            || unsafe { libc::setgid(gid) } != 0
+            // SAFETY: uid is a trusted scalar resolved before fork.
+            || unsafe { libc::setuid(uid) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn restrict_workload_capabilities() -> io::Result<()> {
+    const ALLOWED: &[libc::c_int] = &[
+        0,  // CAP_CHOWN
+        1,  // CAP_DAC_OVERRIDE
+        2,  // CAP_DAC_READ_SEARCH
+        3,  // CAP_FOWNER
+        4,  // CAP_FSETID
+        5,  // CAP_KILL
+        6,  // CAP_SETGID
+        7,  // CAP_SETUID
+        8,  // CAP_SETPCAP
+        10, // CAP_NET_BIND_SERVICE
+        18, // CAP_SYS_CHROOT
+    ];
+    for capability in 0..64 {
+        if ALLOWED.contains(&capability) {
+            continue;
+        }
+        // SAFETY: PR_CAPBSET_READ/DROP take a scalar capability and perform a
+        // monotonic restriction in this workload child.
+        let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+        if present == 0 {
+            continue;
+        }
+        if present < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                break;
+            }
+            return Err(error);
+        }
+        // SAFETY: PR_CAPBSET_DROP takes the supported scalar capability read above.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: both prctl operations monotonically prevent ambient or setuid
+    // escalation after this trusted pre-exec boundary.
+    if unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+        // SAFETY: PR_SET_NO_NEW_PRIVS with scalar one is a monotonic restriction.
+        || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn attach_current_process(attachment: Option<RawFd>) -> io::Result<()> {
@@ -572,8 +780,13 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
         let waited = wait_child(child);
         if entry.request.lifetime == ProcessLifetime::Job {
             terminate_owned(&entry, PROCESS_EXIT_GRACE);
+            reap_group_children(entry.group);
         } else {
-            while entry.owned_processes_exist() && !entry.spool.has_failed() {
+            loop {
+                reap_group_children(entry.group);
+                if !entry.owned_processes_exist() || entry.spool.has_failed() {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -780,7 +993,7 @@ fn terminate_owned(entry: &ProcessEntry, grace: Duration) {
     }
 }
 
-fn resolve_user(value: &str) -> Result<(u32, u32), ProcessError> {
+fn resolve_user(workload_root: Option<&Path>, value: &str) -> Result<(u32, u32), ProcessError> {
     if let Some((uid, gid)) = value.split_once(':')
         && let (Ok(uid), Ok(gid)) = (uid.parse(), gid.parse())
     {
@@ -790,7 +1003,11 @@ fn resolve_user(value: &str) -> Result<(u32, u32), ProcessError> {
         return Ok((uid, uid));
     }
     let mut bytes = Vec::new();
-    File::open("/etc/passwd")?
+    let passwd = workload_root.map_or_else(
+        || PathBuf::from("/etc/passwd"),
+        |root| root.join("etc/passwd"),
+    );
+    File::open(passwd)?
         .take(MAX_PASSWD_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_PASSWD_BYTES {

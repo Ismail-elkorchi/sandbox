@@ -56,7 +56,7 @@ try {
 
   const root = resolve(temporary, "root");
   for (const path of [
-    "bin", "dev", "etc/ssl/certs", "home/sandbox", "proc", "run", "sbin", "sys/fs/cgroup", "tmp", "workspace",
+    "bin", "dev", "etc/ssl/certs", "home/agent", "proc", "run", "sbin", "sys/fs/cgroup", "tmp", "workspace",
   ]) {
     await mkdir(resolve(root, path), { recursive: true });
   }
@@ -80,8 +80,8 @@ try {
   await symlink("certs/ca-certificates.crt", resolve(root, "etc/ssl/cert.pem"));
   await copyFile(guestAgent, resolve(root, "sbin/sandbox-guest"));
   await chmod(resolve(root, "sbin/sandbox-guest"), 0o755);
-  await writeFile(resolve(root, "etc/passwd"), "root:x:0:0:root:/root:/sbin/nologin\nsandbox:x:1000:1000:sandbox:/home/sandbox:/sbin/nologin\n", { mode: 0o644 });
-  await writeFile(resolve(root, "etc/group"), "root:x:0:\nsandbox:x:1000:\n", { mode: 0o644 });
+  await writeFile(resolve(root, "etc/passwd"), "root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000:agent:/home/agent:/bin/sh\n", { mode: 0o644 });
+  await writeFile(resolve(root, "etc/group"), "root:x:0:\nagent:x:1000:\n", { mode: 0o644 });
   await normalizeTimestamps(root);
 
   const rootfs = resolve(temporary, "minimal-rootfs.ext4");
@@ -135,7 +135,7 @@ try {
       protocolMinor: guestProtocolMinor,
       sha256: sha256(guestBytes),
     },
-    capabilities: { overlayfs: false, vsock: true, seccomp: true, cgroupV2: true },
+    capabilities: { overlayfs: true, vsock: true, seccomp: true, cgroupV2: true, devpts: true },
   } as const;
   // Rust serializes the cleared optional signature as JSON null before canonical hashing.
   const identity = identityDigest({ ...unsigned, signature: null });

@@ -30,6 +30,12 @@ impl BootCapability {
     pub fn from_bytes(value: [u8; 32]) -> Self {
         Self(value)
     }
+
+    /// Copy the capability only at the trusted boot-disk/channel boundary.
+    /// Callers must not serialize it into catalogs, logs, or application APIs.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for BootCapability {

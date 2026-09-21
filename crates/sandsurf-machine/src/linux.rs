@@ -179,9 +179,16 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
         }
-        if self.process.is_none() || self.applied_revision != Some(command.revision) {
+        if self.process.is_none()
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+        {
             return Self::unavailable(b"firecracker-live-reconfiguration-not-supported");
         }
+        // Grant policy is enforced by host/guardian services. The VM shape is
+        // unchanged, so applying a newer authority revision is a control-plane
+        // rebind rather than a reboot or unsupported resource hotplug.
+        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.epoch,

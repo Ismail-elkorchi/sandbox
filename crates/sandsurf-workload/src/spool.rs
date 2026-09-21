@@ -1,4 +1,5 @@
 use sandsurf_protocol::{Counter, Digest, OutputBoundary, Stream, bytes_digest};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -10,7 +11,8 @@ const MAGIC: &[u8; 4] = b"SSO1";
 const HEADER_BYTES: usize = 4 + 8 + 1 + 4 + 32;
 const MAX_READ_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetainedChunk {
     pub cursor: Counter,
     pub stream: Stream,
@@ -18,7 +20,8 @@ pub struct RetainedChunk {
     pub digest: Digest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetainedPage {
     pub after: Counter,
     pub available: Counter,

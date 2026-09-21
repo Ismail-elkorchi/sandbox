@@ -72,6 +72,8 @@ pub struct ImageCapabilities {
     pub vsock: bool,
     pub seccomp: bool,
     pub cgroup_v2: bool,
+    #[serde(default)]
+    pub devpts: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +360,7 @@ mod tests {
                 vsock: true,
                 seccomp: true,
                 cgroup_v2: true,
+                devpts: true,
             },
             signature: None,
         }

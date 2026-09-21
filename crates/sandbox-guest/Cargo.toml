@@ -13,9 +13,9 @@ name = "sandbox-guest"
 path = "src/main.rs"
 
 [dependencies]
-sandsurf-native = { path = "../sandsurf-native" }
 libc.workspace = true
-sandbox-digest = { path = "../sandbox-digest" }
+sandsurf-protocol = { path = "../sandsurf-protocol" }
+sandsurf-workload = { path = "../sandsurf-workload", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

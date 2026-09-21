@@ -282,9 +282,13 @@ impl MachineDriver for AppleDriver {
         if command.sandbox_id != self.config.sandbox_id {
             return Self::unavailable(b"apple-sandbox-identity-mismatch");
         }
-        if self.owner.is_none() || self.applied_revision != Some(command.revision) {
+        if self.owner.is_none()
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+        {
             return Self::unavailable(b"apple-live-reconfiguration-not-supported");
         }
+        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.epoch,

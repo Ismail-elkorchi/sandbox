@@ -24,6 +24,9 @@ pub struct FirecrackerConfig {
     pub state_directory: PathBuf,
     pub kernel_image: PathBuf,
     pub rootfs_image: PathBuf,
+    /// Immutable distribution/workload root. The trusted bootstrap rootfs is
+    /// always separate and remains the only source of the supervisor.
+    pub workload_image: Option<PathBuf>,
     pub workspace_image: PathBuf,
     pub authentication_image: PathBuf,
     pub owner_token: String,
@@ -52,6 +55,34 @@ impl FirecrackerProcess {
         let vsock_path = vm_state.join("guest.vsock");
         let api_socket_path = vm_state.join("firecracker.socket");
         let config_path = vm_state.join("firecracker.json");
+        let mut drives = vec![
+            Drive {
+                drive_id: "bootstrap".into(),
+                path_on_host: "/vm/bootstrap".into(),
+                is_root_device: true,
+                is_read_only: true,
+            },
+            Drive {
+                drive_id: "state".into(),
+                path_on_host: "/vm/state-disk".into(),
+                is_root_device: false,
+                is_read_only: false,
+            },
+            Drive {
+                drive_id: "auth".into(),
+                path_on_host: "/vm/auth".into(),
+                is_root_device: false,
+                is_read_only: true,
+            },
+        ];
+        if config.workload_image.is_some() {
+            drives.push(Drive {
+                drive_id: "workload".into(),
+                path_on_host: "/vm/workload".into(),
+                is_root_device: false,
+                is_read_only: true,
+            });
+        }
         let firecracker_json = FirecrackerJson {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
@@ -59,31 +90,12 @@ impl FirecrackerProcess {
                     "console=ttyS0 reboot=k panic=1 root=/dev/vda ro init=/sbin/sandbox-guest"
                         .into(),
             },
-            drives: vec![
-                Drive {
-                    drive_id: "rootfs".into(),
-                    path_on_host: "/vm/rootfs".into(),
-                    is_root_device: true,
-                    is_read_only: true,
-                },
-                Drive {
-                    drive_id: "workspace".into(),
-                    path_on_host: "/vm/workspace".into(),
-                    is_root_device: false,
-                    is_read_only: false,
-                },
-                Drive {
-                    drive_id: "auth".into(),
-                    path_on_host: "/vm/auth".into(),
-                    is_root_device: false,
-                    is_read_only: true,
-                },
-            ],
+            drives,
             machine_config: MachineConfig {
                 vcpu_count: config.vcpu_count,
                 mem_size_mib: config.memory_mib,
                 smt: false,
-                track_dirty_pages: false,
+                track_dirty_pages: true,
             },
             vsock: Vsock {
                 guest_cid: config.guest_cid,
@@ -100,12 +112,22 @@ impl FirecrackerProcess {
         let mut mounts = Vec::new();
         for (path, target, read_only, executable) in [
             (&config.kernel_image, "/vm/kernel", true, false),
-            (&config.rootfs_image, "/vm/rootfs", true, false),
-            (&config.workspace_image, "/vm/workspace", false, false),
+            (&config.rootfs_image, "/vm/bootstrap", true, false),
+            (&config.workspace_image, "/vm/state-disk", false, false),
             (&config.authentication_image, "/vm/auth", true, false),
             (&config_path, "/vm/state/firecracker.json", true, false),
         ] {
             add_mount(&mut files, &mut mounts, path, target, read_only, executable)?;
+        }
+        if let Some(workload) = &config.workload_image {
+            add_mount(
+                &mut files,
+                &mut mounts,
+                workload,
+                "/vm/workload",
+                true,
+                false,
+            )?;
         }
         add_mount(
             &mut files,
@@ -441,6 +463,13 @@ fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
                 path.display()
             )));
         }
+    }
+    if let Some(path) = &config.workload_image
+        && (!path.is_absolute() || !path.is_file())
+    {
+        return Err(FirecrackerError::Invalid(
+            "missing immutable workload image".into(),
+        ));
     }
     Ok(())
 }

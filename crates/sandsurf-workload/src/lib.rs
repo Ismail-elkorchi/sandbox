@@ -8,20 +8,24 @@
 
 #[cfg(target_os = "linux")]
 mod cgroup;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "guardian"))]
 mod driver;
 #[cfg(target_os = "linux")]
 mod filesystem;
 #[cfg(target_os = "linux")]
 mod process;
+#[cfg(target_os = "linux")]
+mod service;
 mod spool;
 
 #[cfg(target_os = "linux")]
 pub use cgroup::*;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "guardian"))]
 pub use driver::*;
 #[cfg(target_os = "linux")]
 pub use filesystem::*;
 #[cfg(target_os = "linux")]
 pub use process::*;
+#[cfg(target_os = "linux")]
+pub use service::*;
 pub use spool::*;

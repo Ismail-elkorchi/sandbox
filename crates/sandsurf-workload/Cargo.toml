@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["guardian"]
+guardian = ["dep:sandsurf-control", "dep:sandsurf-state"]
+
 [dependencies]
 cap-std = "=4.0.3"
 libc.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }
-sandsurf-control = { path = "../sandsurf-control" }
-sandsurf-state = { path = "../sandsurf-state" }
+sandsurf-control = { path = "../sandsurf-control", optional = true }
+sandsurf-state = { path = "../sandsurf-state", optional = true }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true

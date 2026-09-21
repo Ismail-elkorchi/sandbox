@@ -31,7 +31,7 @@ const metadata = parseMetadata(metadataValue);
 const packages = new Map(metadata.packages.map((package_) => [package_.id, package_]));
 const nodes = new Map(metadata.nodes.map((node) => [node.id, node]));
 
-await generate(["sandbox-supervisor", "sandbox-vm-runtime", "sandsurf-control"], "sandsurf", resolve("packages/sandbox"), [
+await generate(["sandbox-supervisor", "sandbox-guest", "sandsurf-control"], "sandsurf", resolve("packages/sandbox"), [
   {
     type: "application",
     name: "firecracker",

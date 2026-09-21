@@ -73,7 +73,6 @@ The minimal guest build requires `mkfs.ext4`, `debugfs`, `curl`, `readelf`, a st
 
 ```sh
 SANDBOX_IMAGE_SIGNING_KEY_FILE=/absolute/private/release-seed npm run build:guest-image
-npm run build:vm-native
 npm run verify:native
 ```
 

@@ -392,9 +392,13 @@ impl MachineDriver for HyperVDriver {
         if command.sandbox_id != self.config.sandbox_id {
             return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
         }
-        if self.system.is_none() || self.applied_revision != Some(command.revision) {
+        if self.system.is_none()
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+        {
             return self.unavailable(b"hyper-v-live-reconfiguration-not-supported");
         }
+        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.epoch,

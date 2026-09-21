@@ -1,9 +1,12 @@
 Third-party components
 
 adler2 2.0.1	0BSD OR MIT OR Apache-2.0
+ambient-authority 0.0.2	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 base64ct 1.8.3	Apache-2.0 OR MIT
 bitflags 2.13.2	MIT OR Apache-2.0
 block-buffer 0.10.4	MIT OR Apache-2.0
+cap-primitives 4.0.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+cap-std 4.0.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 cc 1.4.6	MIT OR Apache-2.0
 cfg-if 1.0.4	MIT OR Apache-2.0
 const-oid 0.9.6	Apache-2.0 OR MIT
@@ -24,18 +27,25 @@ filetime 0.2.29	MIT/Apache-2.0
 find-msvc-tools 0.1.12	MIT OR Apache-2.0
 firecracker 1.16.1	Apache-2.0
 flate2 1.1.10	MIT OR Apache-2.0
+fs-set-times 0.20.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 generic-array 0.14.7	MIT
 getrandom 0.2.17	MIT OR Apache-2.0
 hmac 0.12.1	MIT OR Apache-2.0
 idna 1.1.0	MIT OR Apache-2.0
 idna_adapter 1.1.0	Apache-2.0 OR MIT
 idna_mapping 1.1.0	(Apache-2.0 OR MIT) AND Unicode-3.0
+io-extras 0.19.0	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+io-lifetimes 3.0.1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+io-lifetimes 2.0.4	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+ipnet 2.12.2	MIT OR Apache-2.0
 itoa 1.0.18	MIT OR Apache-2.0
 libc 0.2.177	MIT OR Apache-2.0
 libsqlite3-sys 0.38.2	MIT
 linux-raw-sys 0.11.0	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+maybe-owned 0.3.4	MIT OR Apache-2.0
 memchr 2.8.3	Unlicense OR MIT
 miniz_oxide 0.9.1	MIT OR Zlib OR Apache-2.0
+once_cell 1.21.4	MIT OR Apache-2.0
 pkcs8 0.10.2	Apache-2.0 OR MIT
 pkg-config 0.3.34	MIT OR Apache-2.0
 proc-macro2 1.0.107	MIT OR Apache-2.0
@@ -44,6 +54,7 @@ rand_core 0.6.4	MIT OR Apache-2.0
 rusqlite 0.40.2	MIT
 rustc_version 0.4.1	MIT OR Apache-2.0
 rustix 1.1.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+rustix-linux-procfs 0.1.1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 ruzstd 0.9.0	MIT
 ryu 1.0.23	Apache-2.0 OR BSL-1.0
 semver 1.0.28	MIT OR Apache-2.0
@@ -72,8 +83,29 @@ utf8_iter 1.0.4	Apache-2.0 OR MIT
 vcpkg 0.2.15	MIT/Apache-2.0
 version_check 0.9.5	MIT/Apache-2.0
 wasi 0.11.1+wasi-snapshot-preview1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+windows_aarch64_gnullvm 0.53.1	MIT OR Apache-2.0
+windows_aarch64_gnullvm 0.52.6	MIT OR Apache-2.0
+windows_aarch64_msvc 0.53.1	MIT OR Apache-2.0
+windows_aarch64_msvc 0.52.6	MIT OR Apache-2.0
+windows_i686_gnu 0.53.1	MIT OR Apache-2.0
+windows_i686_gnu 0.52.6	MIT OR Apache-2.0
+windows_i686_gnullvm 0.53.1	MIT OR Apache-2.0
+windows_i686_gnullvm 0.52.6	MIT OR Apache-2.0
+windows_i686_msvc 0.53.1	MIT OR Apache-2.0
+windows_i686_msvc 0.52.6	MIT OR Apache-2.0
+windows_x86_64_gnu 0.53.1	MIT OR Apache-2.0
+windows_x86_64_gnu 0.52.6	MIT OR Apache-2.0
+windows_x86_64_gnullvm 0.53.1	MIT OR Apache-2.0
+windows_x86_64_gnullvm 0.52.6	MIT OR Apache-2.0
+windows_x86_64_msvc 0.53.1	MIT OR Apache-2.0
+windows_x86_64_msvc 0.52.6	MIT OR Apache-2.0
 windows-link 0.2.1	MIT OR Apache-2.0
 windows-sys 0.61.2	MIT OR Apache-2.0
+windows-sys 0.60.2	MIT OR Apache-2.0
+windows-sys 0.59.0	MIT OR Apache-2.0
+windows-targets 0.53.5	MIT OR Apache-2.0
+windows-targets 0.52.6	MIT OR Apache-2.0
+winx 0.36.4	Apache-2.0 WITH LLVM-exception
 xattr 1.6.1	MIT OR Apache-2.0
 zeroize 1.9.0	Apache-2.0 OR MIT
 zlib-rs 0.6.8	Zlib

@@ -532,8 +532,8 @@ name = "sandbox-guest"
 version = "0.1.0"
 dependencies = [
  "libc",
- "sandbox-digest",
- "sandsurf-native",
+ "sandsurf-protocol",
+ "sandsurf-workload",
  "serde",
  "serde_json",
  "sha2",
@@ -678,23 +678,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-vm-runtime"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-digest",
- "sandbox-guest",
- "sandbox-image",
- "sandbox-launcher-linux",
- "sandbox-policy",
- "sandbox-protocol",
- "sandbox-vm",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "sandsurf-control"
 version = "0.1.0"
 dependencies = [
@@ -764,6 +747,8 @@ dependencies = [
  "sandsurf-control",
  "sandsurf-protocol",
  "sandsurf-state",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

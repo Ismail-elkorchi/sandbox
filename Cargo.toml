@@ -23,7 +23,6 @@ members = [
   "crates/sandbox-image",
   "crates/sandbox-vm",
   "crates/sandbox-guest",
-  "crates/sandbox-vm-runtime",
   "crates/sandbox-conformance-target",
 ]
 

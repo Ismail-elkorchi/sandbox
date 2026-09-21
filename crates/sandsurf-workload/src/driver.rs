@@ -31,6 +31,9 @@ impl WorkloadDriver for WorkloadService {
             WorkloadRequest::Spawn { request } => {
                 self.processes.spawn((**request).clone()).map(drop)
             }
+            WorkloadRequest::WriteInput { process_id, bytes } => {
+                self.processes.write_input(process_id, bytes)
+            }
             WorkloadRequest::CloseInput { process_id } => self.processes.close_input(process_id),
             WorkloadRequest::ResizeTerminal { process_id, size } => {
                 self.processes.resize_terminal(process_id, *size)

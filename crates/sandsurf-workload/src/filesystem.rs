@@ -2,6 +2,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt, OpenOptions, Permissions, PermissionsExt};
 use cap_std::time::SystemClock;
 use sandsurf_protocol::{Counter, Digest, GuestPath, OperationId, WatcherId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -45,7 +46,8 @@ impl From<io::Error> for FilesystemError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FileKind {
     Regular,
     Directory,
@@ -53,7 +55,8 @@ pub enum FileKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileStat {
     pub kind: FileKind,
     pub size: u64,
@@ -64,7 +67,8 @@ pub struct FileStat {
     pub inode: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectoryEntry {
     pub name: Vec<u8>,
     pub stat: FileStat,
@@ -76,13 +80,15 @@ impl DirectoryEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectoryPage {
     pub entries: Vec<DirectoryEntry>,
     pub next: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileRange {
     pub offset: u64,
     pub bytes: Vec<u8>,
@@ -90,7 +96,8 @@ pub struct FileRange {
     pub revision: FileRevision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileRevision {
     pub size: u64,
     pub digest: Digest,
@@ -111,7 +118,8 @@ pub struct WriteOptions<'a> {
     pub expected: &'a ExpectedRevision,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WatchEventKind {
     Created,
     Modified,
@@ -119,7 +127,8 @@ pub enum WatchEventKind {
     Overflow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WatchEvent {
     pub watcher_id: WatcherId,
     pub epoch: Counter,

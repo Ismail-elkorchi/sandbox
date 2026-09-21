@@ -384,13 +384,23 @@ impl Mutation {
 
     pub fn required_capability(&self) -> Capability {
         match &self.request {
+            WorkloadRequest::Spawn { request }
+                if request.user.as_deref().is_some_and(is_root_user) =>
+            {
+                Capability::WorkloadAdmin
+            }
             WorkloadRequest::Spawn { .. }
+            | WorkloadRequest::WriteInput { .. }
             | WorkloadRequest::CloseInput { .. }
             | WorkloadRequest::ResizeTerminal { .. }
             | WorkloadRequest::Signal { .. }
             | WorkloadRequest::Terminate { .. } => Capability::Spawn,
         }
     }
+}
+
+fn is_root_user(value: &str) -> bool {
+    value == "root" || value == "0" || value.starts_with("0:")
 }
 
 fn mutation_digest(
@@ -628,6 +638,10 @@ pub enum WorkloadRequest {
     CloseInput {
         process_id: ProcessId,
     },
+    WriteInput {
+        process_id: ProcessId,
+        bytes: Vec<u8>,
+    },
     ResizeTerminal {
         process_id: ProcessId,
         size: TerminalSize,
@@ -648,6 +662,12 @@ impl WorkloadRequest {
         match self {
             Self::Spawn { request } => request.validate(),
             Self::CloseInput { .. } => Ok(()),
+            Self::WriteInput { bytes, .. } => {
+                if bytes.is_empty() || bytes.len() > crate::MAX_STREAM_BYTES {
+                    return Err(Invalid("input chunk is outside stream bounds"));
+                }
+                Ok(())
+            }
             Self::ResizeTerminal { size, .. } => size.validate(),
             Self::Signal { signal, .. } => {
                 if !(1..=64).contains(signal) {

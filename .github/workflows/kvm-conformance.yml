@@ -25,6 +25,4 @@ jobs:
       - run: npm run build:ts
       - run: npm run verify:native
       - run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --release -p sandbox-conformance-target --target x86_64-unknown-linux-musl
-      - run: node --test packages/sandbox/test/hardware-vm-conformance.test.mjs
-        env:
-          SANDBOX_VM_CONFORMANCE_TARGET: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/sandbox-conformance-target
+      - run: cargo test --locked -p sandbox-vm -p sandbox-guest -p sandsurf-workload
