@@ -3,8 +3,9 @@
 mod direct_network;
 
 use sandbox_guest::{
-    AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT, NETWORK_AUTH_MAGIC,
-    NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
+    AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
+    NETWORK_AUTH_MAGIC, NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT,
+    NETWORK_SOCKS_PORT,
 };
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, Counter, Digest, Frame, FrameKind, GuestChallenge,
@@ -481,6 +482,9 @@ fn mount_control_filesystems() -> io::Result<()> {
 }
 
 fn prepare_persistent_workload() -> io::Result<()> {
+    let state_device = attached_disk(2)?;
+    let workload_device = attached_disk(1)?;
+    let control_device = attached_disk(3)?;
     for directory in [
         "/sandsurf/state",
         "/sandsurf/lower",
@@ -490,28 +494,28 @@ fn prepare_persistent_workload() -> io::Result<()> {
         fs::create_dir_all(directory)?;
     }
     mount(
-        Some("/dev/vdc"),
+        Some(&state_device),
         "/sandsurf/state",
         Some("ext4"),
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("errors=remount-ro"),
     )?;
-    grow_ext4_to_device("/dev/vdc", "/sandsurf/state")?;
+    grow_ext4_to_device(&state_device, "/sandsurf/state")?;
     mount(
-        Some("/dev/vdb"),
+        Some(&workload_device),
         "/sandsurf/lower",
         Some("ext4"),
         libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
         Some("errors=remount-ro"),
     )?;
     mount(
-        Some("/dev/vdd"),
+        Some(&control_device),
         CONTROL_ROOT,
         Some("ext4"),
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         Some("errors=remount-ro"),
     )?;
-    grow_ext4_to_device("/dev/vdd", CONTROL_ROOT)?;
+    grow_ext4_to_device(&control_device, CONTROL_ROOT)?;
     fs::create_dir_all("/sandsurf/state/upper")?;
     fs::create_dir_all("/sandsurf/state/work")?;
     mount(
@@ -655,13 +659,28 @@ fn bind_device(name: &str) -> io::Result<()> {
 }
 
 fn read_boot_identity() -> io::Result<BootIdentity> {
-    let mut file = File::open("/dev/vde")?;
-    if file.metadata()?.len() > MAX_AUTHENTICATION_DISK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authentication disk exceeds bound",
-        ));
+    if let Ok(path) = attached_disk(4) {
+        let mut file = File::open(path)?;
+        if file.metadata()?.len() > MAX_AUTHENTICATION_DISK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authentication disk exceeds bound",
+            ));
+        }
+        return parse_boot_identity(&mut file);
     }
+    // Hyper-V direct boot has no safe host-side raw block update path. HCS
+    // confines this one-shot service to the VM-specific owner SDDL, after
+    // which the same capability-bound control protocol is used everywhere.
+    let listener = listen_vsock(GUEST_BOOTSTRAP_PORT)?;
+    let connection = accept_connection(listener.as_raw_fd())?;
+    // SAFETY: this accepted descriptor is uniquely owned by the bootstrap
+    // exchange and is closed after the bounded identity record is consumed.
+    let mut connection = unsafe { File::from_raw_fd(connection) };
+    parse_boot_identity(&mut connection)
+}
+
+fn parse_boot_identity(file: &mut impl Read) -> io::Result<BootIdentity> {
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
     if &magic != AUTHENTICATION_MAGIC {
@@ -707,6 +726,27 @@ fn read_boot_identity() -> io::Result<BootIdentity> {
         capability: BootCapability::from_bytes(capability),
         network_capability,
     })
+}
+
+/// Resolve the stable attachment slot across virtio-blk and Hyper-V SCSI.
+/// Sandsurf owns the complete VM device model, so an attachment index is an
+/// authenticated boot-bundle fact rather than guest discovery of arbitrary
+/// host storage.
+fn attached_disk(index: u8) -> io::Result<String> {
+    let suffix = char::from(
+        b'a'.checked_add(index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "disk index overflow"))?,
+    );
+    for prefix in ["vd", "sd"] {
+        let path = format!("/dev/{prefix}{suffix}");
+        if Path::new(&path).exists() {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Sandsurf disk attachment {index} is absent"),
+    ))
 }
 
 fn start_network_relays(capability: Arc<RwLock<[u8; 32]>>) -> io::Result<()> {

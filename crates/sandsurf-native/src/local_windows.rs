@@ -199,6 +199,16 @@ fn require_current_user(process_id: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// SDDL granting generic-all only to LocalSystem and the current account.
+/// HCS uses this for the per-VM Hyper-V socket service table; guest protocol
+/// authentication remains a separate, epoch-bound boundary.
+pub fn current_user_sddl() -> io::Result<String> {
+    Ok(format!(
+        "D:P(A;;GA;;;SY)(A;;GA;;;{})",
+        UserToken::current()?.sid_string()?
+    ))
+}
+
 struct SecurityDescriptor {
     allocation: LocalAllocation,
 }

@@ -3,22 +3,18 @@ use crate::api::OciSource;
 use crate::api::{
     HOST_API_VERSION, HostInspection, HostRequest, HostResponse, ReservationView, SandboxView,
 };
-#[cfg(target_os = "windows")]
-use sandsurf_control::{EffectOutcome, GuardianEffect, LifecycleEffect, Result as ControlResult};
 use sandsurf_control::{
     Guardian, GuardianClient, HostGuardianLink, HostLifecycleResult, apply_lifecycle,
     serve_guardian,
 };
 use sandsurf_machine::GuestArchitecture;
-#[cfg(target_os = "windows")]
-use sandsurf_machine::MachineOutcome;
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_protocol::*;
 use sandsurf_state::{
     Approval, CatalogLimits, GrantChange, HostCatalog, ReservationState, RuntimeJournal,
     RuntimeLimits, SandboxRecord,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -50,6 +46,8 @@ pub enum HostError {
     Linux(crate::linux::LinuxError),
     #[cfg(target_os = "macos")]
     Apple(crate::apple::AppleError),
+    #[cfg(target_os = "windows")]
+    Windows(crate::windows::WindowsError),
     Invalid(&'static str),
 }
 
@@ -68,6 +66,8 @@ impl fmt::Display for HostError {
             Self::Linux(error) => error.fmt(output),
             #[cfg(target_os = "macos")]
             Self::Apple(error) => error.fmt(output),
+            #[cfg(target_os = "windows")]
+            Self::Windows(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
         }
     }
@@ -125,6 +125,12 @@ impl From<crate::apple::AppleError> for HostError {
         Self::Apple(value)
     }
 }
+#[cfg(target_os = "windows")]
+impl From<crate::windows::WindowsError> for HostError {
+    fn from(value: crate::windows::WindowsError) -> Self {
+        Self::Windows(value)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, HostError>;
 
@@ -132,9 +138,9 @@ pub struct HostService {
     root: PathBuf,
     catalog: HostCatalog,
     executable: PathBuf,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     verified_guardians: BTreeSet<SandboxId>,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     verified_workload_defaults: BTreeMap<String, crate::api::WorkloadDefaultsView>,
     workspace: crate::workspace::WorkspaceAuthority,
     secrets: crate::secrets::SecretAuthority,
@@ -163,9 +169,9 @@ impl HostService {
             root: root.to_path_buf(),
             catalog,
             executable,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             verified_guardians: BTreeSet::new(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             verified_workload_defaults: BTreeMap::new(),
             workspace,
             secrets,
@@ -680,6 +686,14 @@ impl HostService {
                     &image_digest,
                     &resources,
                 )?;
+                #[cfg(target_os = "windows")]
+                let native_config = crate::windows::prepare_config(
+                    &self.root,
+                    &self.executable,
+                    &sandbox_id,
+                    &image_digest,
+                    &resources,
+                )?;
                 let approval = Approval {
                     id: approval_id,
                     request_digest: digest(
@@ -694,10 +708,8 @@ impl HostService {
                     operation_id.clone(),
                     approval,
                 )?;
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
-                #[cfg(target_os = "windows")]
-                self.provision_guardian(&sandbox_id)?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
                 let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
                 let record = self
@@ -741,6 +753,14 @@ impl HostService {
                     &checkpoint.image_digest,
                     &resources,
                 )?;
+                #[cfg(target_os = "windows")]
+                let native_config = crate::windows::prepare_config(
+                    &self.root,
+                    &self.executable,
+                    &sandbox_id,
+                    &checkpoint.image_digest,
+                    &resources,
+                )?;
                 let request_digest = digest(
                     Domain::Checkpoint,
                     &(
@@ -770,10 +790,8 @@ impl HostService {
                     &checkpoint,
                     &disks.join("workload-state.ext4"),
                 )?;
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
-                #[cfg(target_os = "windows")]
-                self.provision_guardian(&sandbox_id)?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
                 let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
                 let record = self
@@ -1971,7 +1989,7 @@ impl HostService {
         #[cfg(target_os = "macos")]
         return self.provision_guardian_with_config(sandbox, None);
         #[cfg(target_os = "windows")]
-        self.provision_guardian_inner(sandbox)
+        return self.provision_guardian_with_config(sandbox, None);
     }
 
     #[cfg(target_os = "linux")]
@@ -2009,6 +2027,26 @@ impl HostService {
             self.verified_guardians.insert(sandbox.clone());
         } else if !self.verified_guardians.contains(sandbox) {
             crate::apple::read_config(&config_path, sandbox)?;
+            self.verified_guardians.insert(sandbox.clone());
+        }
+        self.provision_guardian_inner(sandbox)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn provision_guardian_with_config(
+        &mut self,
+        sandbox: &SandboxId,
+        config: Option<&crate::windows::WindowsGuardianConfig>,
+    ) -> Result<()> {
+        let root = self.sandbox_root(sandbox);
+        prepare_directory(&root)?;
+        prepare_directory(&root.join("guardian"))?;
+        let config_path = root.join("guardian/config.json");
+        if let Some(config) = config {
+            crate::windows::write_config(&config_path, config)?;
+            self.verified_guardians.insert(sandbox.clone());
+        } else if !self.verified_guardians.contains(sandbox) {
+            crate::windows::read_config(&config_path, sandbox)?;
             self.verified_guardians.insert(sandbox.clone());
         }
         self.provision_guardian_inner(sandbox)
@@ -2095,17 +2133,21 @@ impl HostService {
                 .insert(record.image_digest.as_str().to_owned(), value.clone());
             value
         };
+        #[cfg(target_os = "windows")]
+        let workload_defaults = if let Some(value) = self
+            .verified_workload_defaults
+            .get(record.image_digest.as_str())
+            .cloned()
+        {
+            value
+        } else {
+            let value = crate::windows::workload_defaults(&self.root, &record.image_digest)?;
+            self.verified_workload_defaults
+                .insert(record.image_digest.as_str().to_owned(), value.clone());
+            value
+        };
         Ok(SandboxView {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             workload_defaults,
-            #[cfg(target_os = "windows")]
-            workload_defaults: crate::api::WorkloadDefaultsView {
-                environment: Default::default(),
-                user: Some("agent".into()),
-                working_directory: Some("/workspace".into()),
-                entrypoint: Vec::new(),
-                command: Vec::new(),
-            },
             id: record.id,
             image_digest: record.image_digest,
             resources: record.resources,
@@ -2191,9 +2233,13 @@ pub fn serve_sandbox_guardian(root: &Path, sandbox: SandboxId) -> Result<()> {
         serve_guardian(&sandbox_root.join("guardian"), &mut guardian)?;
     }
     #[cfg(target_os = "windows")]
-    let mut guardian = Guardian::new(journal, UnqualifiedEffect);
-    #[cfg(target_os = "windows")]
-    serve_guardian(&sandbox_root.join("guardian"), &mut guardian)?;
+    {
+        let config =
+            crate::windows::read_config(&sandbox_root.join("guardian/config.json"), &sandbox)?;
+        let effect = crate::windows::WindowsGuardianEffect::open(&sandbox_root, config)?;
+        let mut guardian = Guardian::new(journal, effect);
+        serve_guardian(&sandbox_root.join("guardian"), &mut guardian)?;
+    }
     Ok(())
 }
 
@@ -2217,29 +2263,6 @@ pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
         .read_frame(API_TIMEOUT)?
         .ok_or(HostError::Invalid("host closed without a response"))?;
     parse_host_response(frame)
-}
-
-#[cfg(target_os = "windows")]
-struct UnqualifiedEffect;
-#[cfg(target_os = "windows")]
-impl GuardianEffect for UnqualifiedEffect {
-    fn dispatch(&mut self, _: &Mutation, _: Capability) -> EffectOutcome {
-        EffectOutcome::NotApplied(bytes_digest(b"native-guest-driver-unqualified"))
-    }
-
-    fn transition(
-        &mut self,
-        _: &LifecycleCommand,
-        _: Option<&MachineObservation>,
-    ) -> LifecycleEffect {
-        MachineOutcome::NotApplied(bytes_digest(b"native-machine-driver-unqualified"))
-    }
-
-    fn query(&mut self, _: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        Err(sandsurf_control::Error::Unsupported(
-            "guest is unavailable because this native configuration is unqualified",
-        ))
-    }
 }
 
 fn parse_host_request(frame: Frame) -> Result<HostRequest> {
@@ -2430,6 +2453,10 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Json(_) | HostError::Contract(_) | HostError::Invalid(_) => "protocol",
         #[cfg(target_os = "linux")]
         HostError::Linux(_) => "native",
+        #[cfg(target_os = "macos")]
+        HostError::Apple(_) => "native",
+        #[cfg(target_os = "windows")]
+        HostError::Windows(_) => "native",
         HostError::State(_) => "state",
         HostError::Control(_) => "guardian",
         HostError::Workspace(crate::workspace::WorkspaceError::Conflict(_)) => "conflict",

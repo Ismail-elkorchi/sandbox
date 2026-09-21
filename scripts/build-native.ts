@@ -31,7 +31,7 @@ const buildArguments = [
 const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
   ? { [`CARGO_TARGET_${target.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" }
   : {};
-if (nativePlatform === "linux") {
+if (["linux", "macos", "windows"].includes(nativePlatform)) {
   buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest(architecture);
 }
 if (nativePlatform === "linux" && !debugBuild && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {

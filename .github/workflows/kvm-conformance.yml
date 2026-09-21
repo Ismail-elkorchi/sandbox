@@ -22,7 +22,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: rustup target add x86_64-unknown-linux-musl
       - run: test -r /dev/kvm && test -w /dev/kvm
-      - run: test -x /usr/bin/busybox && test -x /usr/sbin/mkfs.ext4
+      - run: test -x /usr/bin/busybox && test -x /usr/sbin/mkfs.ext4 && command -v qemu-img
       - run: SANDSURF_LOCAL_IMAGE=1 npm run build:guest-image
       - run: npm run fetch:firecracker
       - run: npm run build:native

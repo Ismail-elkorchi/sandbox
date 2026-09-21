@@ -1,4 +1,5 @@
 *.ext4 binary
+*.vhdx binary
 packages/**/vmlinux-* binary
 packages/**/sandbox-runtime-* binary
 packages/**/sandbox-vm-runtime-* binary

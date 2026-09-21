@@ -13,6 +13,7 @@ use sandsurf_protocol::{
     Qualification, SandboxId, VmEngine, bytes_digest,
 };
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
@@ -53,9 +54,17 @@ pub struct HyperVConfig {
     pub guest_architecture: GuestArchitecture,
     pub memory_mib: u64,
     pub vcpus: u32,
-    /// The first disk is the UEFI boot disk. Further disks use stable SCSI
-    /// attachment numbers and are never host-mounted by this driver.
+    /// Direct-boot bzImage containing built-in Hyper-V storage and vsock
+    /// drivers. HCS, not the workload, receives this host path.
+    pub kernel: PathBuf,
+    pub command_line: String,
+    /// Disks use stable SCSI attachment numbers and are never host-mounted by
+    /// this driver. Each path names a verified VHDX artifact.
     pub disks: Vec<HyperVDisk>,
+    /// Owner-only SDDL installed on this VM's Hyper-V socket service table.
+    pub hvsock_security_descriptor: String,
+    /// Linux AF_VSOCK ports translated through HV_GUID_VSOCK_TEMPLATE.
+    pub hvsock_ports: Vec<u32>,
     pub operation_timeout: Duration,
     pub qualification: HyperVQualification,
 }
@@ -66,6 +75,10 @@ pub enum HyperVConfigError {
     InvalidMemory,
     InvalidCpuCount,
     MissingBootDisk,
+    RelativeKernelPath,
+    InvalidCommandLine,
+    InvalidSocketSecurity,
+    InvalidSocketPort,
     RelativeDiskPath,
     DuplicateDisk,
     TimeoutOutOfRange,
@@ -82,13 +95,7 @@ pub struct HyperVDriver {
 
 impl HyperVConfig {
     pub fn validate(&self) -> Result<(), HyperVConfigError> {
-        if self.vm_id.is_empty()
-            || self.vm_id.len() > 128
-            || !self
-                .vm_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !valid_guid(&self.vm_id) {
             return Err(HyperVConfigError::InvalidVmId);
         }
         if self.memory_mib < 256 || self.memory_mib > 1_048_576 {
@@ -99,6 +106,27 @@ impl HyperVConfig {
         }
         if self.disks.is_empty() {
             return Err(HyperVConfigError::MissingBootDisk);
+        }
+        if !self.kernel.is_absolute() {
+            return Err(HyperVConfigError::RelativeKernelPath);
+        }
+        if self.command_line.is_empty()
+            || self.command_line.len() > 4096
+            || self.command_line.contains(['\0', '\r', '\n'])
+        {
+            return Err(HyperVConfigError::InvalidCommandLine);
+        }
+        if self.hvsock_security_descriptor.is_empty()
+            || self.hvsock_security_descriptor.len() > 4096
+            || self.hvsock_security_descriptor.contains(['\0', '\r', '\n'])
+        {
+            return Err(HyperVConfigError::InvalidSocketSecurity);
+        }
+        let mut ports = BTreeSet::new();
+        for port in &self.hvsock_ports {
+            if !(1024..=0x7fff_ffff).contains(port) || !ports.insert(*port) {
+                return Err(HyperVConfigError::InvalidSocketPort);
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for disk in &self.disks {
@@ -135,8 +163,36 @@ impl HyperVDriver {
         DEFAULT_OPERATION_TIMEOUT
     }
 
-    fn is_lifecycle_qualified(&self) -> bool {
-        self.config.qualification.lifecycle.is_some()
+    #[must_use]
+    pub fn vm_id(&self) -> &str {
+        &self.config.vm_id
+    }
+
+    #[must_use]
+    pub fn has_live_owner(&self) -> bool {
+        self.system.is_some()
+    }
+
+    pub fn contain_unobserved(&mut self) {
+        self.contain_uncertain_machine();
+    }
+
+    pub fn pause_for_capture(&mut self) -> Result<(), ()> {
+        self.run_operation("hcs-capture-pause", |system, operation| {
+            // SAFETY: live owned handles and a bounded empty options document.
+            unsafe { HcsPauseComputeSystem(system, operation, wide("{}").as_ptr()) }
+        })
+        .map(drop)
+        .map_err(|_| ())
+    }
+
+    pub fn resume_after_capture(&mut self) -> Result<(), ()> {
+        self.run_operation("hcs-capture-resume", |system, operation| {
+            // SAFETY: live owned handles and a bounded empty options document.
+            unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }
+        })
+        .map(drop)
+        .map_err(|_| ())
     }
 
     fn unavailable(&self, reason: &'static [u8]) -> MachineOutcome {
@@ -146,9 +202,6 @@ impl HyperVDriver {
     fn create_and_start(&mut self, command: &LifecycleCommand, epoch: Counter) -> MachineOutcome {
         if command.sandbox_id != self.config.sandbox_id {
             return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
-        }
-        if !self.is_lifecycle_qualified() {
-            return self.unavailable(b"hyper-v-configuration-not-qualified");
         }
         if self.system.is_some() {
             return MachineOutcome::Unknown;
@@ -243,8 +296,12 @@ impl HyperVDriver {
 
     fn grant_disk_access(&mut self) -> Result<(), MachineOutcome> {
         let vm_id = wide(&self.config.vm_id);
-        for disk in &self.config.disks {
-            let path = wide_path(&disk.path);
+        let paths = std::iter::once(&self.config.kernel)
+            .chain(self.config.disks.iter().map(|disk| &disk.path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for disk in paths {
+            let path = wide_path(&disk);
             // SAFETY: the VM ID and path buffers are NUL terminated and live for
             // this synchronous HCS access-control call.
             let result = unsafe { HcsGrantVmAccess(vm_id.as_ptr(), path.as_ptr()) };
@@ -252,7 +309,7 @@ impl HyperVDriver {
                 let disposition = not_applied_hresult("hcs-grant-vm-access", result);
                 return Err(self.rollback_grants_or(disposition));
             }
-            self.granted_disks.push(disk.path.clone());
+            self.granted_disks.push(disk);
         }
         Ok(())
     }
@@ -332,24 +389,37 @@ impl HyperVDriver {
                 )
             })
             .collect();
+        let services = self
+            .config
+            .hvsock_ports
+            .iter()
+            .map(|port| {
+                (
+                    service_id(*port),
+                    HvSocketService {
+                        allow_wildcard_binds: false,
+                        bind_security_descriptor: &self.config.hvsock_security_descriptor,
+                        connect_security_descriptor: &self.config.hvsock_security_descriptor,
+                    },
+                )
+            })
+            .collect();
         HcsConfiguration {
-            schema_version: SchemaVersion { major: 2, minor: 1 },
+            schema_version: SchemaVersion { major: 2, minor: 2 },
             owner: OWNER,
             should_terminate_on_last_handle_closed: true,
             virtual_machine: VirtualMachine {
+                stop_on_reset: true,
                 chipset: Chipset {
-                    uefi: Uefi {
-                        boot_this: BootDevice {
-                            device_path: "Primary disk",
-                            disk_number: 0,
-                            device_type: "ScsiDrive",
-                        },
+                    linux_kernel_direct: LinuxKernelDirect {
+                        kernel_file_path: self.config.kernel.to_string_lossy(),
+                        kernel_cmd_line: &self.config.command_line,
                     },
                 },
                 compute_topology: ComputeTopology {
                     memory: Memory {
-                        backing: "Virtual",
                         size_in_mb: self.config.memory_mib,
+                        allow_overcommit: false,
                     },
                     processor: Processor {
                         count: self.config.vcpus,
@@ -358,6 +428,17 @@ impl HyperVDriver {
                 devices: Devices {
                     scsi: Scsi {
                         primary_disk: Controller { attachments },
+                    },
+                    hv_socket: HvSocket {
+                        config: HvSocketConfig {
+                            default_bind_security_descriptor: &self
+                                .config
+                                .hvsock_security_descriptor,
+                            default_connect_security_descriptor: &self
+                                .config
+                                .hvsock_security_descriptor,
+                            service_table: services,
+                        },
                     },
                 },
             },
@@ -455,9 +536,6 @@ impl MachineDriver for HyperVDriver {
         if command.sandbox_id != self.config.sandbox_id {
             return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
         }
-        if !self.is_lifecycle_qualified() {
-            return self.unavailable(b"hyper-v-configuration-not-qualified");
-        }
         match self.run_operation("hcs-pause", |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
             // options object is accepted by the HCS pause contract.
@@ -483,9 +561,6 @@ impl MachineDriver for HyperVDriver {
     ) -> MachineOutcome {
         if command.sandbox_id != self.config.sandbox_id {
             return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
-        }
-        if !self.is_lifecycle_qualified() {
-            return self.unavailable(b"hyper-v-configuration-not-qualified");
         }
         match self.run_operation("hcs-resume", |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
@@ -705,43 +780,37 @@ struct SchemaVersion {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct VirtualMachine<'a> {
+    stop_on_reset: bool,
     chipset: Chipset<'a>,
-    compute_topology: ComputeTopology<'a>,
+    compute_topology: ComputeTopology,
     devices: Devices<'a>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct Chipset<'a> {
-    uefi: Uefi<'a>,
+    linux_kernel_direct: LinuxKernelDirect<'a>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct Uefi<'a> {
-    boot_this: BootDevice<'a>,
+struct LinuxKernelDirect<'a> {
+    kernel_file_path: std::borrow::Cow<'a, str>,
+    kernel_cmd_line: &'a str,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct BootDevice<'a> {
-    device_path: &'a str,
-    disk_number: u8,
-    device_type: &'a str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct ComputeTopology<'a> {
-    memory: Memory<'a>,
+struct ComputeTopology {
+    memory: Memory,
     processor: Processor,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct Memory<'a> {
-    backing: &'a str,
+struct Memory {
     size_in_mb: u64,
+    allow_overcommit: bool,
 }
 
 #[derive(Serialize)]
@@ -754,12 +823,48 @@ struct Processor {
 #[serde(rename_all = "PascalCase")]
 struct Devices<'a> {
     scsi: Scsi<'a>,
+    #[serde(rename = "HvSocket")]
+    hv_socket: HvSocket<'a>,
 }
 
 #[derive(Serialize)]
 struct Scsi<'a> {
-    #[serde(rename = "Primary disk")]
+    #[serde(rename = "Primary SCSI Controller")]
     primary_disk: Controller<'a>,
+}
+
+#[derive(Serialize)]
+struct HvSocket<'a> {
+    #[serde(rename = "HvSocketConfig")]
+    config: HvSocketConfig<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct HvSocketConfig<'a> {
+    default_bind_security_descriptor: &'a str,
+    default_connect_security_descriptor: &'a str,
+    service_table: BTreeMap<String, HvSocketService<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct HvSocketService<'a> {
+    allow_wildcard_binds: bool,
+    bind_security_descriptor: &'a str,
+    connect_security_descriptor: &'a str,
+}
+
+fn service_id(port: u32) -> String {
+    format!("{port:08x}-facb-11e6-bd58-64006a7986d3")
+}
+
+fn valid_guid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 #[derive(Serialize)]
@@ -786,14 +891,18 @@ mod tests {
     fn config() -> HyperVConfig {
         HyperVConfig {
             sandbox_id: SandboxId::try_from("box").unwrap(),
-            vm_id: "sandsurf-store-box".to_owned(),
+            vm_id: "da57a1f0-3ca8-4f20-9802-21e8df32a9b1".to_owned(),
             guest_architecture: GuestArchitecture::Amd64,
             memory_mib: 2048,
             vcpus: 2,
+            kernel: PathBuf::from(r"C:\Sandsurf\kernel"),
+            command_line: "console=ttyS0 root=/dev/sda ro init=/sbin/sandbox-guest".into(),
             disks: vec![HyperVDisk {
                 path: PathBuf::from(r"C:\Sandsurf\box\boot.vhdx"),
                 read_only: false,
             }],
+            hvsock_security_descriptor: "D:P(A;;GA;;;SY)".into(),
+            hvsock_ports: vec![10_789],
             operation_timeout: Duration::from_secs(30),
             qualification: HyperVQualification {
                 lifecycle: None,
@@ -809,7 +918,8 @@ mod tests {
         assert_eq!(value["SchemaVersion"]["Major"], 2);
         assert_eq!(value["ShouldTerminateOnLastHandleClosed"], true);
         assert_eq!(
-            value["VirtualMachine"]["Devices"]["Scsi"]["Primary disk"]["Attachments"]["0"]["Path"],
+            value["VirtualMachine"]["Devices"]["Scsi"]["Primary SCSI Controller"]["Attachments"]["0"]
+                ["Path"],
             r"C:\Sandsurf\box\boot.vhdx"
         );
         assert!(
@@ -846,20 +956,18 @@ mod tests {
     }
 
     #[test]
-    fn unqualified_driver_never_touches_hcs() {
-        let mut driver = HyperVDriver::new(config()).unwrap();
-        let command = LifecycleCommand {
-            sandbox_id: SandboxId::try_from("box").unwrap(),
-            operation_id: "operation".try_into().unwrap(),
-            desired: sandsurf_protocol::DesiredState::Running,
-            revision: Counter::ONE,
-            request_digest: bytes_digest(b"request"),
-            configuration: sandsurf_protocol::RuntimeConfiguration::default(),
-        };
-        assert!(matches!(
-            driver.create(&command),
-            MachineOutcome::NotApplied(_)
-        ));
+    fn emits_linux_direct_boot_and_vsock_services() {
+        let driver = HyperVDriver::new(config()).unwrap();
+        let value = serde_json::to_value(driver.hcs_configuration()).unwrap();
+        assert_eq!(
+            value["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelFilePath"],
+            r"C:\Sandsurf\kernel"
+        );
+        assert!(
+            value["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]["ServiceTable"]
+                .get("00002a25-facb-11e6-bd58-64006a7986d3")
+                .is_some()
+        );
     }
 
     #[test]

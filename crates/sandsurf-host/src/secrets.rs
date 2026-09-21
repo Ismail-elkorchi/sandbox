@@ -129,16 +129,12 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    // Windows requires backup-semantics when opening a directory handle. A
-    // successful sync is the publication barrier for the version file.
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(0x0200_0000)
-        .open(path)?
-        .sync_all()
+fn sync_directory(_: &Path) -> io::Result<()> {
+    // FlushFileBuffers rejects directory handles on supported Windows hosts.
+    // The newly created secret file itself is flushed before this boundary;
+    // publication never replaces an existing name, so there is no second
+    // mutable copy whose ordering could make the authority ambiguous.
+    Ok(())
 }
 
 #[cfg(test)]

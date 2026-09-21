@@ -896,6 +896,22 @@ fn install_image(
         ] {
             copy_artifact(source, &destination)?;
         }
+        if let Some(windows) = &image.windows_x64 {
+            let manifest = image
+                .manifest
+                .platform_artifacts
+                .windows_x64
+                .as_ref()
+                .ok_or_else(|| AppleError::Invalid("Windows artifact metadata is absent".into()))?;
+            for (source, relative) in [
+                (&windows.kernel_path, &manifest.kernel.path),
+                (&windows.bootstrap_path, &manifest.bootstrap.path),
+                (&windows.workload_path, &manifest.workload.path),
+                (&windows.state_template_path, &manifest.state_template.path),
+            ] {
+                copy_artifact(source, &staging.join(relative))?;
+            }
+        }
         let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;
         if copied.manifest_digest != image.manifest_digest {
             return Err(AppleError::Invalid("copied image identity changed".into()));

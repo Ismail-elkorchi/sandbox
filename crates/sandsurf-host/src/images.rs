@@ -195,6 +195,7 @@ pub fn import_oci(
             },
             compatible_protocol_major: base.manifest.workload.compatible_protocol_major,
         },
+        platform_artifacts: Default::default(),
         signature: None,
     };
     manifest.boot_bundle.kernel.path = kernel_name.into();

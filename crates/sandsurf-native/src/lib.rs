@@ -7,9 +7,14 @@ pub mod guest_channel;
 
 #[cfg(unix)]
 pub use guest_channel::DirectUnixChannel;
+#[cfg(target_os = "windows")]
+pub use guest_channel::HyperVChannel;
 #[cfg(unix)]
 pub use guest_channel::UnixVsockChannel;
 pub use guest_channel::{GuestChannel, GuestChannelError, GuestConnection};
+
+#[cfg(target_os = "windows")]
+pub mod virtual_disk;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

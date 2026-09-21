@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "buildId": "sandsurf-images-0.1.0",
   "files": {
-    "minimal-arm64/manifest.json": "546900ea59d49b1704e2c81549471a5c35f887e8c40a98dfab89190452a94b2e",
-    "minimal-x64/manifest.json": "123672fad0e5458c7d21713943c89cd3529cf24792c66f7da4c21c531e6e0ab1"
+    "minimal-arm64/manifest.json": "05d7590a0f4e871ea0aaa5bc07c1a6048b8f0dcf063e23d4605eea11e7724322",
+    "minimal-x64/manifest.json": "4bef1983e3f631b6135890c3684b87661b41883d1264e4457948a017cfd73d02"
   }
 }

@@ -622,6 +622,7 @@ mod tests {
         CheckpointKind, CheckpointPhase, CheckpointRequest, Counter, Resources, bytes_digest,
     };
     use std::os::unix::fs::DirBuilderExt;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 

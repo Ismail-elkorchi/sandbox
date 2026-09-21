@@ -36,6 +36,9 @@ sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-policy = { path = "../sandbox-policy" }
 sandbox-vm = { path = "../sandbox-vm" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+sandbox-guest = { path = "../sandbox-guest" }
+
 [[bin]]
 name = "sandsurf-host"
 path = "src/main.rs"

@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "minimal-bootstrap.ext4",
-      "sha256": "3bb4f8b89054c96d03a6627c6dc9c492ac12c78a188832005988703b33c408bb",
+      "sha256": "b170a862eb9221aee444c120137e16abe7a013b1713b23a31de2bc232888082d",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
       "protocolMajor": 2,
       "protocolMinor": 0,
-      "sha256": "20c87ea5c6aa5533990fc1773ac4129257bd53350b460f33f9dadae5d44ba4e6"
+      "sha256": "01449b533aa9da4016f8201e08405cfb9ab3b75548cdcc69b158fb4b9ac93d37"
     },
     "capabilities": {
       "overlayfs": true,
@@ -53,5 +53,6 @@
     },
     "compatibleProtocolMajor": 2
   },
+  "platformArtifacts": {},
   "signature": null
 }

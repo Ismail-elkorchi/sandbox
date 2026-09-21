@@ -1121,17 +1121,10 @@ fn sync_cap_parent(root: &Dir, path: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_cap_parent(root: &Dir, path: &str) -> Result<()> {
-    use cap_std::fs::OpenOptionsExt;
-
-    let parent = Path::new(path)
-        .parent()
-        .filter(|value| !value.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let directory = root.open_dir(parent)?;
-    let mut options = CapOpenOptions::new();
-    options.read(true).custom_flags(0x0200_0000);
-    directory.open_with(".", &options)?.sync_all()?;
+fn sync_cap_parent(_: &Dir, _: &str) -> Result<()> {
+    // FlushFileBuffers does not provide a Windows directory-flush primitive.
+    // Every installed regular file is flushed before its capability-relative
+    // rename and the journal remains pending until all replacements complete.
     Ok(())
 }
 

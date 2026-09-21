@@ -238,3 +238,125 @@ mod unix {
 pub use unix::DirectUnixChannel;
 #[cfg(unix)]
 pub use unix::UnixVsockChannel;
+
+#[cfg(windows)]
+mod windows {
+    use super::{GuestChannel, GuestChannelError, GuestConnection};
+    use std::io;
+    use std::mem::size_of;
+    use std::net::TcpStream;
+    use std::os::windows::io::{FromRawSocket, RawSocket};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_HYPERV, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, WSADATA, WSAGetLastError, WSAStartup,
+        closesocket, connect, socket,
+    };
+    use windows_sys::Win32::System::Hypervisor::{
+        HV_GUID_VSOCK_TEMPLATE, HV_PROTOCOL_RAW, SOCKADDR_HV,
+    };
+    use windows_sys::core::GUID;
+
+    static WINSOCK: OnceLock<Result<(), i32>> = OnceLock::new();
+
+    impl GuestConnection for TcpStream {
+        fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.set_read_timeout(timeout)?;
+            self.set_write_timeout(timeout)
+        }
+    }
+
+    /// Host-initiated Hyper-V socket connection to a Linux AF_VSOCK listener.
+    #[derive(Debug, Clone)]
+    pub struct HyperVChannel {
+        pub vm_id: String,
+        pub guest_port: u32,
+        pub timeout: Duration,
+    }
+
+    impl GuestChannel for HyperVChannel {
+        fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
+            let vm_id = parse_guid(&self.vm_id)
+                .ok_or_else(|| GuestChannelError::Protocol("invalid Hyper-V VM identity".into()))?;
+            if !(1024..=0x7fff_ffff).contains(&self.guest_port) {
+                return Err(GuestChannelError::Protocol(
+                    "invalid Hyper-V vsock port".into(),
+                ));
+            }
+            initialize_winsock()?;
+            // SAFETY: scalar arguments select the documented Hyper-V stream
+            // protocol and return a newly owned socket or INVALID_SOCKET.
+            let raw = unsafe { socket(AF_HYPERV as i32, SOCK_STREAM, HV_PROTOCOL_RAW as i32) };
+            if raw == INVALID_SOCKET {
+                return Err(last_socket_error().into());
+            }
+            let address = SOCKADDR_HV {
+                Family: AF_HYPERV,
+                Reserved: 0,
+                VmId: vm_id,
+                ServiceId: service_id(self.guest_port),
+            };
+            // SAFETY: address has the exact SOCKADDR_HV layout and remains live
+            // for this synchronous connect call.
+            if unsafe {
+                connect(
+                    raw,
+                    (&raw const address).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_HV>() as i32,
+                )
+            } != 0
+            {
+                let error = last_socket_error();
+                // SAFETY: raw is still uniquely owned after failed connect.
+                unsafe { closesocket(raw) };
+                return Err(error.into());
+            }
+            // SAFETY: a connected Winsock SOCKET is representation-compatible
+            // with RawSocket and ownership transfers exactly once.
+            let stream = unsafe { TcpStream::from_raw_socket(raw as RawSocket) };
+            stream.set_read_timeout(Some(self.timeout))?;
+            stream.set_write_timeout(Some(self.timeout))?;
+            Ok(Box::new(stream))
+        }
+    }
+
+    fn initialize_winsock() -> Result<(), GuestChannelError> {
+        match WINSOCK.get_or_init(|| {
+            let mut data = WSADATA::default();
+            // SAFETY: data is a valid writable WSADATA and version 2.2 is the
+            // platform socket contract used by Hyper-V sockets.
+            let result = unsafe { WSAStartup(0x0202, &mut data) };
+            if result == 0 { Ok(()) } else { Err(result) }
+        }) {
+            Ok(()) => Ok(()),
+            Err(code) => Err(GuestChannelError::Io(io::Error::from_raw_os_error(*code))),
+        }
+    }
+
+    fn last_socket_error() -> io::Error {
+        // SAFETY: WSAGetLastError has no pointer or ownership preconditions.
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    fn service_id(port: u32) -> GUID {
+        GUID {
+            data1: port,
+            ..HV_GUID_VSOCK_TEMPLATE
+        }
+    }
+
+    fn parse_guid(value: &str) -> Option<GUID> {
+        let compact: String = value
+            .chars()
+            .filter(|character| *character != '-')
+            .collect();
+        if compact.len() != 32 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let raw = u128::from_str_radix(&compact, 16).ok()?;
+        Some(GUID::from_u128(raw))
+    }
+}
+
+#[cfg(windows)]
+pub use windows::HyperVChannel;

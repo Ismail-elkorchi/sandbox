@@ -23,7 +23,24 @@ pub struct ImageManifest {
     pub architecture: Architecture,
     pub boot_bundle: BootBundleManifest,
     pub workload: WorkloadImageManifest,
+    #[serde(default)]
+    pub platform_artifacts: PlatformArtifacts,
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlatformArtifacts {
+    pub windows_x64: Option<WindowsArtifacts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WindowsArtifacts {
+    pub kernel: ImageArtifact,
+    pub bootstrap: ImageArtifact,
+    pub workload: ImageArtifact,
+    pub state_template: ImageArtifact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +170,15 @@ pub struct VerifiedImage {
     pub kernel_path: PathBuf,
     pub bootstrap_path: PathBuf,
     pub workload_path: PathBuf,
+    pub windows_x64: Option<VerifiedWindowsArtifacts>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedWindowsArtifacts {
+    pub kernel_path: PathBuf,
+    pub bootstrap_path: PathBuf,
+    pub workload_path: PathBuf,
+    pub state_template_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -229,6 +255,39 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
         let template_path = resolve_beneath(directory, &template.path)?;
         verify_artifact(&template_path, &template.sha256, "workload state template")?;
     }
+    let windows_x64 = manifest
+        .platform_artifacts
+        .windows_x64
+        .as_ref()
+        .map(|artifacts| {
+            let kernel_path = resolve_beneath(directory, &artifacts.kernel.path)?;
+            let bootstrap_path = resolve_beneath(directory, &artifacts.bootstrap.path)?;
+            let workload_path = resolve_beneath(directory, &artifacts.workload.path)?;
+            let state_template_path = resolve_beneath(directory, &artifacts.state_template.path)?;
+            verify_artifact(&kernel_path, &artifacts.kernel.sha256, "Windows kernel")?;
+            verify_artifact(
+                &bootstrap_path,
+                &artifacts.bootstrap.sha256,
+                "Windows bootstrap",
+            )?;
+            verify_artifact(
+                &workload_path,
+                &artifacts.workload.sha256,
+                "Windows workload",
+            )?;
+            verify_artifact(
+                &state_template_path,
+                &artifacts.state_template.sha256,
+                "Windows state template",
+            )?;
+            Ok::<_, ImageError>(VerifiedWindowsArtifacts {
+                kernel_path,
+                bootstrap_path,
+                workload_path,
+                state_template_path,
+            })
+        })
+        .transpose()?;
     Ok(VerifiedImage {
         manifest,
         manifest_path: path.to_path_buf(),
@@ -236,6 +295,7 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
         kernel_path,
         bootstrap_path,
         workload_path,
+        windows_x64,
     })
 }
 
@@ -270,6 +330,20 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
             .state_template
             .as_ref()
             .map(|value| &value.sha256),
+    )
+    .chain(
+        manifest
+            .platform_artifacts
+            .windows_x64
+            .iter()
+            .flat_map(|value| {
+                [
+                    &value.kernel.sha256,
+                    &value.bootstrap.sha256,
+                    &value.workload.sha256,
+                    &value.state_template.sha256,
+                ]
+            }),
     ) {
         if digest.len() != 64
             || !digest
@@ -540,6 +614,7 @@ mod tests {
                 },
                 compatible_protocol_major: 2,
             },
+            platform_artifacts: PlatformArtifacts::default(),
             signature: None,
         }
     }
