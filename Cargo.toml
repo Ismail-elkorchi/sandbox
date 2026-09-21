@@ -9,22 +9,14 @@ members = [
   "crates/sandsurf-control",
   "crates/sandsurf-workload",
   "crates/sandsurf-host",
-  "crates/sandbox-protocol",
   "crates/sandbox-digest",
   "crates/sandbox-policy",
-  "crates/sandbox-platform",
   "crates/sandbox-launcher-linux",
-  "crates/sandbox-supervisor",
-  "crates/sandbox-test-runtime",
   "crates/sandbox-network-broker",
   "crates/sandbox-fuzz",
-  "crates/sandbox-launcher-windows",
-  "crates/sandbox-launcher-macos",
-  "crates/sandbox-platform-portable",
   "crates/sandbox-image",
   "crates/sandbox-vm",
   "crates/sandbox-guest",
-  "crates/sandbox-conformance-target",
 ]
 
 [workspace.package]

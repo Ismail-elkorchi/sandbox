@@ -1337,13 +1337,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-conformance-target"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "sandbox-digest"
 version = "0.1.0"
 dependencies = [
@@ -1357,7 +1350,7 @@ name = "sandbox-fuzz"
 version = "0.1.0"
 dependencies = [
  "sandbox-policy",
- "sandbox-protocol",
+ "sandsurf-protocol",
  "serde_json",
 ]
 
@@ -1403,58 +1396,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-launcher-macos"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "sandbox-launcher-windows"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "sandbox-network-broker"
 version = "0.1.0"
 dependencies = [
  "sandbox-policy",
-]
-
-[[package]]
-name = "sandbox-platform"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-digest",
- "sandbox-launcher-linux",
- "sandbox-policy",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "sandbox-platform-portable"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-digest",
- "sandbox-launcher-macos",
- "sandbox-launcher-windows",
- "sandbox-policy",
- "sandbox-protocol",
- "serde",
- "serde_json",
- "sha2",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1464,38 +1409,6 @@ dependencies = [
  "idna",
  "sandbox-digest",
  "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-supervisor"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-launcher-linux",
- "sandbox-network-broker",
- "sandbox-platform",
- "sandbox-platform-portable",
- "sandbox-policy",
- "sandbox-protocol",
- "sandsurf-native",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-test-runtime"
-version = "0.1.0"
-dependencies = [
- "sandbox-protocol",
  "serde_json",
 ]
 

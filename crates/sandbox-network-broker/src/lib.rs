@@ -125,7 +125,7 @@ fn shutdown_active_streams(streams: &ActiveStreams) {
 }
 
 impl BrokerHandle {
-    /// Compatibility entry point for the retired prepared-execution runtime.
+    /// Starts all broker planes for one already normalized Sandbox policy.
     /// DNS destinations retain its historical proxy-plus-resolver semantics;
     /// IP destinations are direct TCP only.
     pub fn start(

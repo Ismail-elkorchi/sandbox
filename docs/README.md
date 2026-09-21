@@ -1,28 +1,7 @@
-# Documentation
+# Sandsurf documentation
 
-Use this directory for operational and architectural details that would interrupt the README's installation path.
+- [Getting started](getting-started.md) covers host inspection, OCI image import, persistent Sandboxes, processes, files, and reconnect.
+- [Development and qualification](development.md) covers source checks, package verification, fuzzing, and real-VM qualification.
+- [macOS VM evidence](macos-hardware-vm-feasibility.md) and [Windows VM evidence](windows-hardware-vm-feasibility.md) record the native platform constraints still enforced by qualification.
 
-## Use the sandbox
-
-- [Getting started](getting-started.md): probing, prepared runs, sessions, cancellation, streams, and results.
-- [Execution repository](execution-repository.md): caller-process recovery, exact execution identity, retained output, and terminal receipts.
-- [Policies and requirements](policy.md): filesystem, environment, network, process, resources, and guarantee matching.
-- [Implementation support](backends.md): platform matrix, stability, availability, and implementation-specific limitations.
-- [Managed networking](managed-networking.md): supported proxy protocols, rule semantics, DNS, and limitations.
-- [Hardware VMs](hardware-vm.md): Firecracker installation, imports, artifacts, change sets, and cleanup.
-
-## Understand and maintain the runtime
-
-- [Threat model](threat-model.md): trust boundary, protected assets, assumptions, non-goals, and security claims.
-- [Linux implementation internals](linux-backend.md): setup order, enforcement layers, probing, and operational caveats.
-- [Runtime protocol](protocol.md): framing, lifecycle, flow control, and compatibility rules.
-- [Development](development.md): toolchains, tests, fuzzing, generated artifacts, and release checks.
-
-## Feasibility evidence
-
-These reports document viable platform designs and the evidence still required before registering another hardware-VM implementation:
-
-- [macOS Virtualization.framework feasibility](macos-hardware-vm-feasibility.md)
-- [Windows HCS feasibility](windows-hardware-vm-feasibility.md)
-
-These reports are not implementation or availability claims.
+The public runtime is the unscoped `sandsurf` package. Historical prepared-process, host-process backend, and detached execution-repository contracts are not part of Sandsurf.

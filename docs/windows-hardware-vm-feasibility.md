@@ -1,8 +1,8 @@
 # Windows hardware-VM feasibility evidence
 
-Status: feasibility established; no public implementation is registered. Evidence reviewed 2026-08-26.
+Status: the source tree contains an HCS lifecycle/containment driver, but the complete guest-control/image path has no retained real-hardware qualification. Evidence reviewed 2026-09-21.
 
-This report records the platform design and the proof still required before a Windows hardware-VM extension may be exposed. For registered implementations, see the [support matrix](backends.md); for the working Linux VM extension, see [hardware VMs](hardware-vm.md).
+This report records the platform constraints and the proof still required before `Sandsurf.inspect()` can report a qualified Hyper-V engine. Windows is a native host target of the one `sandsurf` package, not an AppContainer workload backend or optional extension.
 
 ## Required platform path
 
@@ -18,8 +18,8 @@ This report records the platform design and the proof still required before a Wi
 
 ## Proposed implementation boundary
 
-The extension owns the HCS system and operation handles, the verified base image, per-session VM state and differencing disk, Hyper-V socket listener, and cleanup journal. Inputs and outputs retain the current bounded import/artifact/change-set protocol. No host path is directly mounted into the guest.
+The per-Sandbox guardian owns the HCS system and operation handles, verified VM-native images, persistent writable disks, Hyper-V socket listener, and cleanup journal. Inputs and outputs use the bounded Sandsurf guest and transfer protocols. No host path is directly mounted into the guest.
 
 ## Release blockers
 
-This report does not claim implementation or availability. A future implementation remains unavailable until Windows 11 and Windows Server hosts pass feature probing, Linux image boot, no-adapter bypass, authenticated control-plane denial, HCS-owner crash recovery, forced termination, disk/ACL cleanup, artifacts/change sets, stream backpressure, and packed-install tests. Administrator-only service registration must be an explicit install action, never an implicit runtime mutation.
+The engine remains unqualified until Windows 11 and Windows Server hosts pass feature probing, Linux image boot, no-adapter bypass, authenticated control-plane denial, HCS-owner crash recovery, forced termination, disk/ACL cleanup, concurrent process/PTY replay, filesystem transfer, checkpoints, installed-package, and packed-install tests. Administrator-only Hyper-V socket service registration must be an explicit setup action, never an implicit runtime mutation.

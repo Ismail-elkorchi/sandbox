@@ -1,8 +1,7 @@
 #![deny(unsafe_code)]
 
 use sandbox_policy::{SessionOptions, normalize_session, normalize_target_path};
-use sandbox_protocol::{HEADER_LEN, MAGIC, MAX_CONTROL_PAYLOAD, MessageType, read_frame};
-use std::io::Cursor;
+use sandsurf_protocol::{Frame, MAX_CONTROL_BYTES};
 
 fn main() {
     let iterations = std::env::args()
@@ -20,24 +19,19 @@ fn main() {
 }
 
 fn fuzz_protocol(random: &mut XorShift64, index: usize) {
-    let mut bytes = vec![0_u8; random.length(4096)];
+    let mut bytes = vec![0_u8; random.length(MAX_CONTROL_BYTES.saturating_add(256))];
     random.fill(&mut bytes);
-    if index.is_multiple_of(3) {
-        bytes.resize(HEADER_LEN, 0);
-        bytes[..4].copy_from_slice(&MAGIC);
-        bytes[4] = if index.is_multiple_of(2) {
-            MessageType::Hello as u8
-        } else {
-            MessageType::Stdin as u8
-        };
-        let declared = if index.is_multiple_of(5) {
-            MAX_CONTROL_PAYLOAD as u32 + random.next_u32()
-        } else {
-            random.next_u32()
-        };
-        bytes[8..12].copy_from_slice(&declared.to_be_bytes());
+    if index.is_multiple_of(3) && bytes.len() >= 8 {
+        bytes[..4].copy_from_slice(b"SNDS");
+        bytes[4..8].copy_from_slice(&random.next_u32().to_be_bytes());
     }
-    let _ = read_frame(&mut Cursor::new(bytes));
+    let mut input = bytes.as_slice();
+    for _ in 0..64 {
+        match Frame::read(&mut input) {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 fn fuzz_policy(random: &mut XorShift64, index: usize) {

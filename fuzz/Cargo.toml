@@ -13,24 +13,14 @@ libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.145"
 sandbox-digest = { path = "../crates/sandbox-digest" }
 sandbox-image = { path = "../crates/sandbox-image" }
-sandbox-launcher-windows = { path = "../crates/sandbox-launcher-windows" }
 sandbox-network-broker = { path = "../crates/sandbox-network-broker" }
-sandbox-platform = { path = "../crates/sandbox-platform" }
 sandbox-policy = { path = "../crates/sandbox-policy" }
-sandbox-protocol = { path = "../crates/sandbox-protocol" }
 sandsurf-protocol = { path = "../crates/sandsurf-protocol" }
 sandbox-vm = { path = "../crates/sandbox-vm" }
 
 [[bin]]
 name = "sandsurf_protocol"
 path = "fuzz_targets/sandsurf_protocol.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "protocol"
-path = "fuzz_targets/protocol.rs"
 test = false
 doc = false
 bench = false
@@ -57,36 +47,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "control_messages"
-path = "fuzz_targets/control_messages.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "canonical_digest"
 path = "fuzz_targets/canonical_digest.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "host_paths"
-path = "fuzz_targets/host_paths.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "environment_block"
-path = "fuzz_targets/environment_block.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "windows_arguments"
-path = "fuzz_targets/windows_arguments.rs"
 test = false
 doc = false
 bench = false

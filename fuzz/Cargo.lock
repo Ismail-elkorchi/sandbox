@@ -514,11 +514,8 @@ dependencies = [
  "libfuzzer-sys",
  "sandbox-digest",
  "sandbox-image",
- "sandbox-launcher-windows",
  "sandbox-network-broker",
- "sandbox-platform",
  "sandbox-policy",
- "sandbox-protocol",
  "sandbox-vm",
  "sandsurf-protocol",
  "serde_json",
@@ -560,32 +557,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-launcher-windows"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "windows-sys",
-]
-
-[[package]]
 name = "sandbox-network-broker"
 version = "0.1.0"
 dependencies = [
  "sandbox-policy",
-]
-
-[[package]]
-name = "sandbox-platform"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-digest",
- "sandbox-launcher-linux",
- "sandbox-policy",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -594,14 +569,6 @@ version = "0.1.0"
 dependencies = [
  "idna",
  "sandbox-digest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-protocol"
-version = "0.1.0"
-dependencies = [
  "serde",
  "serde_json",
 ]

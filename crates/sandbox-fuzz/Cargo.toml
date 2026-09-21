@@ -11,5 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 sandbox-policy = { path = "../sandbox-policy" }
-sandbox-protocol = { path = "../sandbox-protocol" }
+sandsurf-protocol = { path = "../sandsurf-protocol" }
 serde_json.workspace = true
