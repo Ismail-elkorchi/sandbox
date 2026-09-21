@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-package-test-"));
+const npmCli = requiredEnvironment("npm_execpath");
 const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
   const core = await pack("sandsurf");
@@ -27,8 +28,8 @@ try {
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);
   if (originalUmask !== undefined) process.umask(0o002);
-  await run("npm", ["init", "--yes"], consumer);
-  await run("npm", ["install", "--ignore-scripts", core], consumer);
+  await run(process.execPath, [npmCli, "init", "--yes"], consumer);
+  await run(process.execPath, [npmCli, "install", "--ignore-scripts", core], consumer);
   await run("node", ["--input-type=module", "--eval", "await import('sandsurf')"], consumer);
   await copyFile(resolve("scripts/package-consumer.mts"), resolve(consumer, "package-consumer.mts"));
   await run(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "--strict", "--noEmit", "--module", "NodeNext", "--target", "ES2024",
@@ -73,12 +74,18 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 async function pack(workspace: string): Promise<string> {
-  const output = await capture("npm", ["pack", "--json", "--workspace", workspace, "--pack-destination", temporary]);
+  const output = await capture(process.execPath, [npmCli, "pack", "--json", "--workspace", workspace, "--pack-destination", temporary]);
   const parsed: unknown = JSON.parse(output);
   if (!Array.isArray(parsed) || parsed.length !== 1 || typeof parsed[0]?.filename !== "string") {
     throw new Error(`npm pack returned an invalid result for ${workspace}`);
   }
   return resolve(temporary, parsed[0].filename);
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined) throw new Error(`${name} is required for package verification`);
+  return value;
 }
 
 function run(command: string, arguments_: readonly string[], cwd = process.cwd()): Promise<void> {

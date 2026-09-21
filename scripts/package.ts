@@ -4,7 +4,14 @@ import { resolve } from "node:path";
 
 const destination = resolve("release");
 await mkdir(destination, { recursive: true });
-await run("npm", ["pack", "--workspace", "sandsurf", "--pack-destination", destination]);
+const npmCli = requiredEnvironment("npm_execpath");
+await run(process.execPath, [npmCli, "pack", "--workspace", "sandsurf", "--pack-destination", destination]);
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (value === undefined) throw new Error(`${name} is required for package creation`);
+  return value;
+}
 
 function run(command: string, arguments_: readonly string[]): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
