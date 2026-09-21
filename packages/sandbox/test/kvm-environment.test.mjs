@@ -11,7 +11,7 @@ import { NativeHostClient } from "../dist/native-host.js";
 
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
 
-test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 180_000 }, async () => {
+test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 300_000 }, async () => {
   const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
   assert.ok(manifestPath, "SANDSURF_LOCAL_IMAGE_MANIFEST is required");
   const state = process.env.SANDSURF_TEST_STATE ?? await mkdtemp(join(tmpdir(), "sandsurf-kvm-environment-"));
@@ -24,6 +24,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
   const upstreamPort = upstream.address().port;
   const host = await Sandsurf.open({ directory: state, authorizer: () => true });
   let sandbox;
+  let forkSandbox;
   try {
     const secret = await host.secrets.put("integration-secret", "environment-secret");
     sandbox = await host.sandboxes.create({
@@ -43,7 +44,8 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
         network: true,
         "expose-port": true,
         "deliver-secret": true,
-        "increase-resources": true,
+      "increase-resources": true,
+      checkpoint: true,
       },
     });
 
@@ -85,7 +87,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
 
     const before = await sandbox.resources.usage();
     assert.equal(before.complete, false);
-    assert.equal(before.source, "guest-cgroup-v2");
+    assert.equal(before.source, "host-catalog-cumulative(guest-cgroup-v2)");
     const view = await sandbox.inspect();
     await sandbox.resources.update(view.resources, {
       workloadMemoryBytes: 384 * 1024 * 1024,
@@ -100,8 +102,38 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.ok(after.networkRxBytes > 0);
     assert.ok(after.networkTxBytes > 0);
     assert.ok(after.networkConnections > 0);
+
+    await sandbox.pause("pause-before-checkpoint");
+    await sandbox.resume("resume-before-checkpoint");
+    assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/index.html")).toString(), "exposure-ok\n");
+
+    await sandbox.fs.writeFile("/workspace/checkpoint-value", "captured\n");
+    const checkpoint = await sandbox.checkpoints.create({ id: "filesystem-checkpoint" });
+    assert.equal(checkpoint.inspection.phase, "ready");
+    await assert.rejects(checkpoint.publishImage({ operationId: "reject-implicit-sensitive-publication" }));
+    const derived = await checkpoint.publishImage({
+      operationId: "publish-derived-image",
+      includeWorkspace: true,
+      includeHome: true,
+      includeSecrets: true,
+    });
+    assert.equal(derived.inspection.sensitive, true);
+    await sandbox.fs.writeFile("/workspace/checkpoint-value", "changed\n");
+    forkSandbox = await checkpoint.fork({
+      id: "checkpoint-fork",
+      capabilities: { spawn: true, "read-files": true, "write-files": true },
+    });
+    assert.equal(Buffer.from(await forkSandbox.fs.readFile("/workspace/checkpoint-value")).toString(), "captured\n");
+    await forkSandbox.stop("stop-checkpoint-fork");
+    await sandbox.stop("stop-before-rollback");
+    await sandbox.checkpoints.rollback(checkpoint.id, { operationId: "rollback-filesystem-checkpoint" });
+    await sandbox.start("start-after-rollback");
+    assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/checkpoint-value")).toString(), "captured\n");
   } finally {
     upstream.close();
+    if (forkSandbox !== undefined) {
+      try { await forkSandbox.stop("cleanup-checkpoint-fork"); } catch { /* Preserve the primary assertion. */ }
+    }
     if (sandbox !== undefined) {
       try { await sandbox.stop("stop-kvm-environment"); } catch { /* Preserve the primary assertion. */ }
     }

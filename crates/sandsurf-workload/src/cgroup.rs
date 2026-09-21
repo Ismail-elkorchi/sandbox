@@ -148,6 +148,34 @@ impl CgroupManager {
     pub fn aggregate_usage(&self) -> io::Result<CgroupUsage> {
         usage_at(&self.root, false)
     }
+
+    /// Freeze or thaw every workload process while leaving the protected
+    /// supervisor in its sibling cgroup. Completion is observed through
+    /// `cgroup.events`, not inferred from a successful write.
+    pub fn freeze(&self, frozen: bool, timeout: Duration) -> io::Result<()> {
+        write_control(
+            &self.root.join("cgroup.freeze"),
+            if frozen { "1" } else { "0" },
+        )?;
+        let expected = if frozen { "1" } else { "0" };
+        let deadline = Instant::now() + timeout;
+        loop {
+            let events = read_bounded(&self.root.join("cgroup.events"))?;
+            if events
+                .lines()
+                .any(|line| line == format!("frozen {expected}"))
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "workload cgroup did not reach the requested freeze state",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl ProcessCgroup {

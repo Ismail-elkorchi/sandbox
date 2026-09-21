@@ -139,6 +139,15 @@ pub enum GuestServiceRequest {
     /// Guardian-only machine shutdown barrier. The host API never forwards
     /// this request from an application.
     PrepareStop,
+    /// Guardian-only capture barrier. The workload cgroup is frozen and its
+    /// persistent filesystem is synchronized before this request completes.
+    PrepareFilesystemCapture {
+        operation_id: OperationId,
+    },
+    /// Guardian-only release of an exact capture barrier.
+    FinishFilesystemCapture {
+        operation_id: OperationId,
+    },
     /// Guardian-only secret installation. Raw bytes are never accepted by the
     /// application guest-query route or persisted in ordinary operation logs.
     InstallSecret {
@@ -373,6 +382,8 @@ pub enum FileExpectation {
 )]
 pub enum GuestServiceResponse {
     ReadyToStop { evidence: Digest },
+    FilesystemCapturePrepared { evidence: Digest },
+    FilesystemCaptureFinished { evidence: Digest },
     SecretInstalled { evidence: Digest },
     ResourcesApplied { evidence: Digest },
     ResourceUsage { usage: crate::ResourceUsage },

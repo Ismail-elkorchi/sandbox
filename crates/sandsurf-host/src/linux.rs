@@ -145,7 +145,7 @@ pub fn prepare_config(
             executable
                 .parent()
                 .unwrap_or(Path::new("/"))
-                .join("firecracker-v1.16.1-x86_64")
+                .join("firecracker-v1.16.2-x86_64")
         });
     require_regular(&firecracker, 256 * 1024 * 1024)?;
     if resources.vcpus.get() > 32
@@ -377,6 +377,28 @@ impl LinuxGuardianEffect {
             exposures,
         })
     }
+
+    fn finish_filesystem_capture(
+        &mut self,
+        operation_id: sandsurf_protocol::OperationId,
+    ) -> ControlResult<GuestServiceResponse> {
+        let request = GuestServiceRequest::FinishFilesystemCapture { operation_id };
+        let mut last = None;
+        // A Firecracker vsock connection opened concurrently with vCPU resume
+        // can time out without ever reaching the guest. The finish operation is
+        // identity-bound and idempotent, so reconnect it without replaying any
+        // workload mutation.
+        for attempt in 0..3 {
+            match self.workload.query(request.clone()) {
+                Ok(response) => return Ok(response),
+                Err(error) => last = Some(error),
+            }
+            if attempt != 2 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(last.expect("capture finish is attempted at least once"))
+    }
 }
 
 impl GuardianEffect for LinuxGuardianEffect {
@@ -512,10 +534,49 @@ impl GuardianEffect for LinuxGuardianEffect {
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
+        let running = journal
+            .last_observation()?
+            .is_some_and(|value| value.value().state == MachineState::Running);
+        // Opening a new Firecracker vsock connection while vCPUs are paused
+        // leaves a local-init connection that cannot be completed by the guest
+        // and can poison the transport after resume. Runtime evidence remains
+        // retained in the guest spool until the machine is running again.
+        if !running || self.machine.capture_is_paused() {
+            return Ok(());
+        }
         self.workload.reconcile(journal)
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
+        if let GuestServiceRequest::PrepareFilesystemCapture { operation_id } = &request {
+            let operation_id = operation_id.clone();
+            let response = self.workload.query(request)?;
+            if !matches!(
+                response,
+                GuestServiceResponse::FilesystemCapturePrepared { .. }
+            ) {
+                return Ok(response);
+            }
+            if self.machine.pause_for_capture().is_err() {
+                let _ = self.machine.resume_after_capture();
+                let _ = self.finish_filesystem_capture(operation_id);
+                return Err(sandsurf_control::Error::Unsupported(
+                    "native VM could not establish the filesystem capture pause",
+                ));
+            }
+            return Ok(response);
+        }
+        if matches!(request, GuestServiceRequest::FinishFilesystemCapture { .. }) {
+            let GuestServiceRequest::FinishFilesystemCapture { operation_id } = request else {
+                unreachable!("matched capture finish request")
+            };
+            self.machine.resume_after_capture().map_err(|_| {
+                sandsurf_control::Error::Unsupported(
+                    "native VM could not leave the filesystem capture pause",
+                )
+            })?;
+            return self.finish_filesystem_capture(operation_id);
+        }
         let usage_requested = matches!(request, GuestServiceRequest::ResourceUsage);
         let mut response = self.workload.query(request)?;
         if usage_requested && let GuestServiceResponse::ResourceUsage { usage } = &mut response {

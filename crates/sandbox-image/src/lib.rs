@@ -39,6 +39,8 @@ pub struct BootBundleManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkloadImageManifest {
     pub rootfs: RootfsArtifact,
+    #[serde(default)]
+    pub state_template: Option<RootfsArtifact>,
     pub defaults: WorkloadDefaults,
     pub provenance: WorkloadProvenance,
     pub compatible_protocol_major: u16,
@@ -70,6 +72,13 @@ pub enum WorkloadProvenance {
         manifest_digest: String,
         config_digest: String,
         conversion_digest: String,
+    },
+    Derived {
+        source_image_digest: String,
+        checkpoint_manifest_digest: String,
+        include_workspace: bool,
+        include_home: bool,
+        include_secrets: bool,
     },
 }
 
@@ -204,6 +213,10 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
         "bootstrap",
     )?;
     verify_artifact(&workload_path, &manifest.workload.rootfs.sha256, "workload")?;
+    if let Some(template) = &manifest.workload.state_template {
+        let template_path = resolve_beneath(directory, &template.path)?;
+        verify_artifact(&template_path, &template.sha256, "workload state template")?;
+    }
     Ok(VerifiedImage {
         manifest,
         manifest_path: path.to_path_buf(),
@@ -237,7 +250,15 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
         &manifest.boot_bundle.bootstrap.sha256,
         &manifest.boot_bundle.guest_agent.sha256,
         &manifest.workload.rootfs.sha256,
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        manifest
+            .workload
+            .state_template
+            .as_ref()
+            .map(|value| &value.sha256),
+    ) {
         if digest.len() != 64
             || !digest
                 .bytes()
@@ -289,6 +310,14 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
                 let value = value.strip_prefix("sha256:").unwrap_or(value);
                 validate_digest(value)?;
             }
+        }
+        WorkloadProvenance::Derived {
+            source_image_digest,
+            checkpoint_manifest_digest,
+            ..
+        } => {
+            validate_digest(source_image_digest)?;
+            validate_digest(checkpoint_manifest_digest)?;
         }
     }
     Ok(())
@@ -483,6 +512,7 @@ mod tests {
                     sha256: hex_sha256(rootfs),
                     format: RootfsFormat::Ext4,
                 },
+                state_template: None,
                 defaults: WorkloadDefaults {
                     environment: BTreeMap::from([(
                         "PATH".into(),

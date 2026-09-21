@@ -36,6 +36,7 @@ pub enum HostError {
     Contract(sandsurf_protocol::Invalid),
     Workspace(crate::workspace::WorkspaceError),
     Secret(crate::secrets::SecretError),
+    Checkpoint(crate::checkpoints::CheckpointError),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
     Invalid(&'static str),
@@ -51,6 +52,7 @@ impl fmt::Display for HostError {
             Self::Contract(error) => write!(output, "host contract: {error}"),
             Self::Workspace(error) => error.fmt(output),
             Self::Secret(error) => error.fmt(output),
+            Self::Checkpoint(error) => error.fmt(output),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
@@ -93,6 +95,11 @@ impl From<crate::secrets::SecretError> for HostError {
         Self::Secret(value)
     }
 }
+impl From<crate::checkpoints::CheckpointError> for HostError {
+    fn from(value: crate::checkpoints::CheckpointError) -> Self {
+        Self::Checkpoint(value)
+    }
+}
 #[cfg(target_os = "linux")]
 impl From<crate::linux::LinuxError> for HostError {
     fn from(value: crate::linux::LinuxError) -> Self {
@@ -130,14 +137,16 @@ impl HostService {
         prepare_directory(&root.join("transfers"))?;
         let workspace = crate::workspace::WorkspaceAuthority::open(&root.join("transfers"))?;
         let secrets = crate::secrets::SecretAuthority::open(&root.join("secrets"))?;
-        Ok(Self {
+        let mut service = Self {
             root: root.to_path_buf(),
             catalog,
             executable,
             verified_guardians: BTreeSet::new(),
             workspace,
             secrets,
-        })
+        };
+        service.recover_checkpoint_barriers();
+        Ok(service)
     }
 
     pub fn endpoint(&self) -> PathBuf {
@@ -192,6 +201,126 @@ impl HostService {
                     .image_import(&operation_id)?
                     .ok_or(HostError::Invalid("image import operation does not exist"))?,
             }),
+            HostRequest::ListCheckpoints { after, maximum } => Ok(HostResponse::Checkpoints {
+                values: self.catalog.checkpoints(after.as_ref(), maximum)?,
+            }),
+            HostRequest::GetCheckpoint { checkpoint_id } => Ok(HostResponse::Checkpoint {
+                value: self
+                    .catalog
+                    .checkpoint(&checkpoint_id)?
+                    .ok_or(HostError::Invalid("checkpoint does not exist"))?,
+            }),
+            HostRequest::CreateCheckpoint {
+                request,
+                scope_digest,
+                approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &request.sandbox_id,
+                    request.expected_revision,
+                    Capability::Checkpoint,
+                    &scope_digest,
+                )?;
+                self.provision_guardian(&request.sandbox_id)?;
+                let inspection = GuardianClient::new(self.guardian_endpoint(&request.sandbox_id))
+                    .inspect(request.sandbox_id.clone(), None)?;
+                let Observation::Current { value: machine } = inspection.observation else {
+                    return Err(HostError::Invalid(
+                        "checkpoint requires a current machine observation",
+                    ));
+                };
+                if machine.epoch != request.expected_epoch
+                    || machine.applied_revision != request.expected_revision
+                    || machine.state != MachineState::Running
+                {
+                    return Err(HostError::Invalid(
+                        "checkpoint requires the expected running epoch and revision",
+                    ));
+                }
+                let request_digest =
+                    digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request))?;
+                let admitted = self.catalog.admit_checkpoint(
+                    request.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == CheckpointPhase::Ready {
+                    return Ok(HostResponse::Checkpoint { value: admitted });
+                }
+                let capture_root = self.root.join("checkpoints");
+                if admitted.phase == CheckpointPhase::Capturing {
+                    GuardianClient::new(self.guardian_endpoint(&request.sandbox_id)).guest(
+                        request.sandbox_id.clone(),
+                        GuestServiceRequest::FinishFilesystemCapture {
+                            operation_id: request.operation_id.clone(),
+                        },
+                    )?;
+                }
+                let capturing = self
+                    .catalog
+                    .begin_checkpoint(&request.id, &request_digest)?;
+                if let Some(captured) =
+                    crate::checkpoints::published_filesystem(&capture_root, &capturing)?
+                {
+                    return Ok(HostResponse::Checkpoint {
+                        value: self.catalog.complete_checkpoint(
+                            &request.id,
+                            &request_digest,
+                            captured.disk_digest,
+                            captured.manifest_digest,
+                            CheckpointConsistency::Filesystem,
+                        )?,
+                    });
+                }
+                let client = GuardianClient::new(self.guardian_endpoint(&request.sandbox_id));
+                let prepared = client.guest(
+                    request.sandbox_id.clone(),
+                    GuestServiceRequest::PrepareFilesystemCapture {
+                        operation_id: request.operation_id.clone(),
+                    },
+                )?;
+                if !matches!(
+                    prepared,
+                    GuestServiceResponse::FilesystemCapturePrepared { .. }
+                ) {
+                    return Err(HostError::Invalid(
+                        "guest did not establish a filesystem capture boundary",
+                    ));
+                }
+                let captured = crate::checkpoints::capture_filesystem(
+                    &capture_root,
+                    &capturing,
+                    &self
+                        .sandbox_root(&request.sandbox_id)
+                        .join("disks/workload-state.ext4"),
+                );
+                let finished = client.guest(
+                    request.sandbox_id.clone(),
+                    GuestServiceRequest::FinishFilesystemCapture {
+                        operation_id: request.operation_id.clone(),
+                    },
+                );
+                let captured = captured?;
+                if !matches!(
+                    finished?,
+                    GuestServiceResponse::FilesystemCaptureFinished { .. }
+                ) {
+                    return Err(HostError::Invalid(
+                        "guest did not release the filesystem capture boundary",
+                    ));
+                }
+                Ok(HostResponse::Checkpoint {
+                    value: self.catalog.complete_checkpoint(
+                        &request.id,
+                        &request_digest,
+                        captured.disk_digest,
+                        captured.manifest_digest,
+                        CheckpointConsistency::Filesystem,
+                    )?,
+                })
+            }
             HostRequest::ImportOci {
                 source,
                 platform,
@@ -227,6 +356,59 @@ impl HostService {
                 #[cfg(not(target_os = "linux"))]
                 return Err(HostError::Invalid(
                     "OCI VM-image materialization is unqualified on this host build",
+                ));
+                #[cfg(target_os = "linux")]
+                Ok(HostResponse::ImageImport {
+                    operation: self.catalog.complete_image_import(
+                        &operation_id,
+                        &request_digest,
+                        image,
+                    )?,
+                })
+            }
+            HostRequest::PublishCheckpointImage {
+                checkpoint_id,
+                inclusion,
+                operation_id,
+                approval_id,
+            } => {
+                let checkpoint = self
+                    .catalog
+                    .checkpoint(&checkpoint_id)?
+                    .ok_or(HostError::Invalid("image checkpoint does not exist"))?;
+                let request_digest = digest(
+                    Domain::Image,
+                    &(
+                        "sandsurf-publish-checkpoint-image-v1",
+                        &checkpoint_id,
+                        inclusion,
+                        &operation_id,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostResponse::ImageImport {
+                        operation: admitted,
+                    });
+                }
+                #[cfg(target_os = "linux")]
+                let image = crate::images::publish_checkpoint(
+                    &self.root,
+                    &checkpoint,
+                    inclusion,
+                    &operation_id,
+                    &request_digest,
+                )?;
+                #[cfg(not(target_os = "linux"))]
+                return Err(HostError::Invalid(
+                    "derived VM-image publication is unqualified on this host build",
                 ));
                 #[cfg(target_os = "linux")]
                 Ok(HostResponse::ImageImport {
@@ -419,6 +601,145 @@ impl HostService {
                 Ok(HostResponse::Lifecycle {
                     operation: lifecycle.guardian_operation,
                     sandbox: self.view(record)?,
+                })
+            }
+            HostRequest::ForkSandbox {
+                sandbox_id,
+                checkpoint_id,
+                resources,
+                operation_id,
+                approval_id,
+            } => {
+                let checkpoint = self
+                    .catalog
+                    .checkpoint(&checkpoint_id)?
+                    .ok_or(HostError::Invalid("fork checkpoint does not exist"))?;
+                if checkpoint.phase != CheckpointPhase::Ready {
+                    return Err(HostError::Invalid("fork checkpoint is not ready"));
+                }
+                #[cfg(target_os = "linux")]
+                let native_config = crate::linux::prepare_config(
+                    &self.root,
+                    &self.executable,
+                    &sandbox_id,
+                    &checkpoint.image_digest,
+                    &resources,
+                )?;
+                let request_digest = digest(
+                    Domain::Checkpoint,
+                    &(
+                        "sandsurf-filesystem-fork-v1",
+                        &checkpoint_id,
+                        &sandbox_id,
+                        &resources,
+                        &operation_id,
+                    ),
+                )?;
+                self.catalog.create_sandbox_from_checkpoint(
+                    sandbox_id.clone(),
+                    &checkpoint_id,
+                    resources,
+                    operation_id.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                let sandbox_root = self.sandbox_root(&sandbox_id);
+                prepare_directory(&sandbox_root)?;
+                let disks = sandbox_root.join("disks");
+                prepare_directory(&disks)?;
+                crate::checkpoints::materialize_fork(
+                    &self.root.join("checkpoints"),
+                    &checkpoint,
+                    &disks.join("workload-state.ext4"),
+                )?;
+                #[cfg(target_os = "linux")]
+                self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
+                #[cfg(not(target_os = "linux"))]
+                self.provision_guardian(&sandbox_id)?;
+                let endpoint = self.guardian_endpoint(&sandbox_id);
+                let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
+                let record = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("forked sandbox disappeared"))?;
+                Ok(HostResponse::Lifecycle {
+                    operation: lifecycle.guardian_operation,
+                    sandbox: self.view(record)?,
+                })
+            }
+            HostRequest::RollbackFilesystem {
+                sandbox_id,
+                checkpoint_id,
+                operation_id,
+                expected_revision,
+                scope_digest,
+                approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::Checkpoint,
+                    &scope_digest,
+                )?;
+                self.provision_guardian(&sandbox_id)?;
+                let inspection = GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                    .inspect(sandbox_id.clone(), None)?;
+                if !matches!(
+                    inspection.observation,
+                    Observation::Current {
+                        value: MachineObservation {
+                            state: MachineState::Stopped,
+                            ..
+                        }
+                    }
+                ) {
+                    return Err(HostError::Invalid(
+                        "filesystem rollback requires a confirmed stopped machine",
+                    ));
+                }
+                let request_digest = digest(
+                    Domain::Checkpoint,
+                    &(
+                        "sandsurf-filesystem-rollback-v1",
+                        &sandbox_id,
+                        &checkpoint_id,
+                        &operation_id,
+                        expected_revision,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_rollback(
+                    &sandbox_id,
+                    &checkpoint_id,
+                    operation_id.clone(),
+                    expected_revision,
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == RollbackPhase::Applied {
+                    return Ok(HostResponse::Rollback { value: admitted });
+                }
+                let checkpoint = self
+                    .catalog
+                    .checkpoint(&checkpoint_id)?
+                    .ok_or(HostError::Invalid("rollback checkpoint disappeared"))?;
+                let evidence = crate::checkpoints::rollback(
+                    &self.root.join("checkpoints"),
+                    &checkpoint,
+                    &self
+                        .sandbox_root(&sandbox_id)
+                        .join("disks/workload-state.ext4"),
+                    &operation_id,
+                )?;
+                Ok(HostResponse::Rollback {
+                    value: self.catalog.complete_rollback(
+                        &operation_id,
+                        &request_digest,
+                        evidence,
+                    )?,
                 })
             }
             HostRequest::Lifecycle {
@@ -755,8 +1076,15 @@ impl HostService {
             }
             HostRequest::GetUsage { sandbox_id } => {
                 self.provision_guardian(&sandbox_id)?;
-                let response = GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                    .guest(sandbox_id.clone(), GuestServiceRequest::ResourceUsage)?;
+                let client = GuardianClient::new(self.guardian_endpoint(&sandbox_id));
+                let inspection = client.inspect(sandbox_id.clone(), None)?;
+                let Observation::Current { value: machine } = inspection.observation else {
+                    return Err(HostError::Invalid(
+                        "resource usage requires a current machine observation",
+                    ));
+                };
+                let response =
+                    client.guest(sandbox_id.clone(), GuestServiceRequest::ResourceUsage)?;
                 let GuestServiceResponse::ResourceUsage { mut usage } = response else {
                     return Err(HostError::Invalid(
                         "guest resource accounting is unavailable",
@@ -765,7 +1093,11 @@ impl HostService {
                 let (logical, allocated) = directory_usage(&self.sandbox_root(&sandbox_id))?;
                 usage.disk_logical_bytes = logical;
                 usage.disk_allocated_bytes = allocated;
-                Ok(HostResponse::Usage { usage })
+                Ok(HostResponse::Usage {
+                    usage: self
+                        .catalog
+                        .observe_usage(&sandbox_id, machine.epoch, usage)?,
+                })
             }
             HostRequest::Workload {
                 sandbox_id,
@@ -808,6 +1140,8 @@ impl HostService {
                     request,
                     GuestServiceRequest::Dispatch { .. }
                         | GuestServiceRequest::PrepareStop
+                        | GuestServiceRequest::PrepareFilesystemCapture { .. }
+                        | GuestServiceRequest::FinishFilesystemCapture { .. }
                         | GuestServiceRequest::InstallSecret { .. }
                         | GuestServiceRequest::RevokeSecret { .. }
                         | GuestServiceRequest::ApplyResources { .. }
@@ -1089,6 +1423,39 @@ impl HostService {
                     GuestArchitecture::Arm64 => "arm64",
                 }
             ),
+        }
+    }
+
+    fn recover_checkpoint_barriers(&mut self) {
+        let mut after = None;
+        loop {
+            let Ok(values) = self.catalog.checkpoints(
+                after.as_ref(),
+                Counter::try_from(256).expect("constant is positive"),
+            ) else {
+                return;
+            };
+            if values.is_empty() {
+                return;
+            }
+            for checkpoint in &values {
+                if checkpoint.phase != CheckpointPhase::Capturing {
+                    continue;
+                }
+                let sandbox = checkpoint.request.sandbox_id.clone();
+                if self.provision_guardian(&sandbox).is_ok() {
+                    let _ = GuardianClient::new(self.guardian_endpoint(&sandbox)).guest(
+                        sandbox,
+                        GuestServiceRequest::FinishFilesystemCapture {
+                            operation_id: checkpoint.request.operation_id.clone(),
+                        },
+                    );
+                }
+            }
+            if values.len() < 256 {
+                return;
+            }
+            after = values.last().map(|value| value.request.id.clone());
         }
     }
 
@@ -1466,6 +1833,8 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Secret(crate::secrets::SecretError::Conflict(_)) => "conflict",
         HostError::Secret(crate::secrets::SecretError::Invalid(_)) => "protocol",
         HostError::Secret(_) => "secret",
+        HostError::Checkpoint(crate::checkpoints::CheckpointError::Invalid(_)) => "conflict",
+        HostError::Checkpoint(_) => "checkpoint",
     }
 }
 

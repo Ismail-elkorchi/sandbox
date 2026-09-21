@@ -6,12 +6,18 @@ import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js"
 
 export type SandsurfCapability = "spawn" | "read-files" | "write-files" | "workload-admin" | "network" | "expose-port" | "deliver-secret" | "apply-to-host" | "increase-resources" | "checkpoint" | "fork" | "release-evidence";
 export type DesiredSandboxState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
-export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
+export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "image-publish" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 export type SandsurfAuthorizer = (change: AuthorityChange) => AuthorityDecision | Promise<AuthorityDecision>;
 export interface SandsurfOpenOptions { readonly directory: string; readonly authorizer?: SandsurfAuthorizer; }
 export interface ResourceEnvelope { readonly vcpus: number; readonly memoryMiB: number; readonly diskBytes: number; readonly outputBytes?: number; readonly processes?: number; }
 export interface SandboxCreateOptions { readonly id?: string; readonly operationId?: string; readonly image: string; readonly resources: ResourceEnvelope; readonly capabilities?: Partial<Record<SandsurfCapability, boolean>>; }
+export type CheckpointKind = "filesystem" | "full";
+export type CheckpointConsistency = "crash" | "filesystem" | "application";
+export interface CheckpointInspection { readonly id: string; readonly operationId: string; readonly sandboxId: string; readonly expectedEpoch: number; readonly expectedRevision: number; readonly kind: CheckpointKind; readonly parent: string | null; readonly requestDigest: string; readonly phase: "admitted" | "capturing" | "ready"; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly consistency: CheckpointConsistency | null; readonly workloadDiskDigest: string | null; readonly workloadDiskBytes: number; readonly manifestDigest: string | null; readonly sensitive: boolean; }
+export interface CheckpointCreateOptions { readonly id?: string; readonly operationId?: string; readonly kind?: CheckpointKind; readonly parent?: string; }
+export interface DerivedImagePublishOptions { readonly operationId?: string; readonly includeWorkspace?: boolean; readonly includeHome?: boolean; readonly includeSecrets?: boolean; }
+export interface SandboxForkOptions { readonly id?: string; readonly operationId?: string; readonly resources?: ResourceEnvelope; readonly capabilities?: Partial<Record<SandsurfCapability, boolean>>; }
 export type Qualification = { readonly kind: "qualified"; readonly evidence: string } | { readonly kind: "unqualified"; readonly reasons: readonly string[] };
 export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; }
 export interface WorkloadDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; readonly entrypoint: readonly string[]; readonly command: readonly string[]; }
@@ -27,7 +33,7 @@ export interface ResourceUsage { readonly cpuMicros: number; readonly memoryCurr
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
 export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: string };
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
-export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; }
+export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface Receipt { readonly sandboxId: string; readonly epoch: number; readonly processId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
 export interface ReceiptView { readonly receipt: Receipt; readonly digest: string; }
 export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: Readonly<Record<string, unknown>>; }
@@ -37,11 +43,12 @@ export interface ReleaseStatus { readonly requestDigest: string; readonly cleanu
 export class Sandsurf {
   readonly sandboxes: SandboxCollection;
   readonly images: ImageCollection;
+  readonly checkpoints: CheckpointCollection;
   readonly secrets: SecretCollection;
   readonly #client: NativeHostClient;
   readonly #authorizer: SandsurfAuthorizer | undefined;
   #closed = false;
-  private constructor(client: NativeHostClient, authorizer: SandsurfAuthorizer | undefined) { this.#client = client; this.#authorizer = authorizer; this.sandboxes = new SandboxCollection(this); this.images = new ImageCollection(this); this.secrets = new SecretCollection(this); }
+  private constructor(client: NativeHostClient, authorizer: SandsurfAuthorizer | undefined) { this.#client = client; this.#authorizer = authorizer; this.sandboxes = new SandboxCollection(this); this.images = new ImageCollection(this); this.checkpoints = new CheckpointCollection(this); this.secrets = new SecretCollection(this); }
   static async open(options: SandsurfOpenOptions): Promise<Sandsurf> { return new Sandsurf(await NativeHostClient.open(resolve(options.directory)), options.authorizer); }
   async inspect(): Promise<HostInspection> {
     this.#open(); const response = await this.#client.request({ kind: "inspect" });
@@ -106,6 +113,46 @@ export class SandsurfImage {
   constructor(inspection: ImageInspection) { this.id = inspection.digest; this.inspection = inspection; }
 }
 
+export class CheckpointCollection {
+  readonly #host: Sandsurf;
+  constructor(host: Sandsurf) { this.#host = host; }
+  async get(id: string): Promise<SandsurfCheckpoint> {
+    const response = await this.#host.request({ kind: "get-checkpoint", checkpointId: validateIdentity(id) });
+    if (response.kind !== "checkpoint" || !record(response.value)) throw protocol("checkpoint response");
+    return new SandsurfCheckpoint(this.#host, parseCheckpoint(response.value));
+  }
+  async list(options: { readonly after?: string; readonly maximum?: number } = {}): Promise<readonly SandsurfCheckpoint[]> {
+    const response = await this.#host.request({ kind: "list-checkpoints", after: options.after === undefined ? null : validateIdentity(options.after), maximum: options.maximum ?? 100 });
+    if (response.kind !== "checkpoints" || !Array.isArray(response.values)) throw protocol("checkpoint list response");
+    return response.values.map((value) => new SandsurfCheckpoint(this.#host, parseCheckpoint(value)));
+  }
+}
+
+export class SandsurfCheckpoint {
+  readonly id: string;
+  readonly inspection: CheckpointInspection;
+  readonly #host: Sandsurf;
+  constructor(host: Sandsurf, inspection: CheckpointInspection) { this.#host = host; this.inspection = inspection; this.id = inspection.id; }
+  async fork(options: SandboxForkOptions = {}): Promise<Sandbox> {
+    if (this.inspection.phase !== "ready" || this.inspection.kind !== "filesystem") throw new SandsurfHostError("conflict", "Only a ready filesystem checkpoint can be forked");
+    const sandboxId = validateIdentity(options.id ?? identity("sandbox")); const operationId = validateIdentity(options.operationId ?? identity("fork")); const resources = normalizeResources(options.resources ?? this.inspection.resources);
+    const approvalId = await this.#host.approve({ kind: "fork", sandboxId, operationId, request: { checkpointId: this.id, sourceSandboxId: this.inspection.sandboxId, resources } });
+    const response = await this.#host.request({ kind: "fork-sandbox", sandboxId, checkpointId: this.id, resources, operationId, approvalId });
+    const sandbox = new Sandbox(this.#host, sandboxViewFrom(response));
+    for (const capability of Object.keys(options.capabilities ?? {}).sort() as SandsurfCapability[]) if (options.capabilities?.[capability] === true) await sandbox.grant(capability);
+    return sandbox;
+  }
+  async publishImage(options: DerivedImagePublishOptions = {}): Promise<SandsurfImage> {
+    if (this.inspection.phase !== "ready" || this.inspection.kind !== "filesystem") throw new SandsurfHostError("conflict", "Only a ready filesystem checkpoint can be published");
+    const operationId = validateIdentity(options.operationId ?? identity("publish-image"));
+    const inclusion = { workspace: options.includeWorkspace ?? false, home: options.includeHome ?? false, secrets: options.includeSecrets ?? false };
+    const approvalId = await this.#host.approve({ kind: "image-publish", sandboxId: this.inspection.sandboxId, operationId, request: { checkpointId: this.id, inclusion } });
+    const response = await this.#host.request({ kind: "publish-checkpoint-image", checkpointId: this.id, inclusion, operationId, approvalId });
+    if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("derived image response");
+    return new SandsurfImage(parseImage(response.operation.image));
+  }
+}
+
 export class SandboxCollection {
   readonly #host: Sandsurf;
   constructor(host: Sandsurf) { this.#host = host; }
@@ -138,9 +185,10 @@ export class Sandbox {
   readonly ports: SandboxPorts;
   readonly resources: SandboxResources;
   readonly secrets: SandboxSecrets;
+  readonly checkpoints: SandboxCheckpoints;
   readonly #host: Sandsurf;
   #view: SandboxInspection;
-  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); }
+  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); this.checkpoints = new SandboxCheckpoints(this, host); }
   get revision(): number { return this.#view.configurationRevision; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
   async inspect(): Promise<SandboxInspection> { this.#view = sandboxViewFrom(await this.#host.request({ kind: "get-sandbox", sandboxId: this.id })); return this.#view; }
@@ -151,9 +199,9 @@ export class Sandbox {
   async suspend(operationId = identity("suspend")): Promise<SandboxInspection> { return this.#lifecycle("suspended", operationId); }
   async destroy(operationId = identity("destroy")): Promise<SandboxInspection> { return this.#lifecycle("destroyed", operationId); }
   async grant(capability: SandsurfCapability, options: { readonly scopeDigest?: string; readonly operationId?: string } = {}): Promise<void> {
-    const scopeDigest = options.scopeDigest ?? capabilityScope(this.id, capability); const operationId = validateIdentity(options.operationId ?? identity("grant"));
-    const approvalId = await this.#host.approve({ kind: "grant", sandboxId: this.id, operationId, request: { capability, scopeDigest, expectedRevision: this.revision } });
-    const response = await this.#host.request({ kind: "set-grant", sandboxId: this.id, grantId: identity("grant"), expectedRevision: this.revision, capability, scopeDigest, revoked: false, approvalId });
+    const scopeDigest = options.scopeDigest ?? capabilityScope(this.id, capability); const operationId = validateIdentity(options.operationId ?? identity("grant")); const view = await this.inspect();
+    const approvalId = await this.#host.approve({ kind: "grant", sandboxId: this.id, operationId, request: { capability, scopeDigest, expectedRevision: view.configurationRevision } });
+    const response = await this.#host.request({ kind: "set-grant", sandboxId: this.id, grantId: identity("grant"), expectedRevision: view.configurationRevision, capability, scopeDigest, revoked: false, approvalId });
     if (response.kind !== "grant" || !record(response.grant)) throw protocol("grant response");
     this.#view = { ...this.#view, configurationRevision: integer(response.grant.revision) };
   }
@@ -172,8 +220,30 @@ export class Sandbox {
   async hostRequest(request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { return this.#host.request(request); }
   async approve(change: AuthorityChange): Promise<string> { return this.#host.approve(change); }
   async #lifecycle(desired: DesiredSandboxState, operationId: string): Promise<SandboxInspection> {
-    validateIdentity(operationId); const approvalId = await this.#host.approve({ kind: "lifecycle", sandboxId: this.id, operationId, request: { desired, expectedRevision: this.revision } });
-    this.#view = sandboxViewFrom(await this.#host.request({ kind: "lifecycle", sandboxId: this.id, operationId, expectedRevision: this.revision, desired, approvalId })); return this.#view;
+    validateIdentity(operationId); const view = await this.inspect(); const approvalId = await this.#host.approve({ kind: "lifecycle", sandboxId: this.id, operationId, request: { desired, expectedRevision: view.configurationRevision } });
+    this.#view = sandboxViewFrom(await this.#host.request({ kind: "lifecycle", sandboxId: this.id, operationId, expectedRevision: view.configurationRevision, desired, approvalId })); return this.#view;
+  }
+}
+
+export class SandboxCheckpoints {
+  readonly #sandbox: Sandbox;
+  readonly #host: Sandsurf;
+  constructor(sandbox: Sandbox, host: Sandsurf) { this.#sandbox = sandbox; this.#host = host; }
+  async create(options: CheckpointCreateOptions = {}): Promise<SandsurfCheckpoint> {
+    const id = validateIdentity(options.id ?? identity("checkpoint")); const operationId = validateIdentity(options.operationId ?? identity("checkpoint")); const view = await this.#sandbox.inspect(); const machine = currentMachine(view); const kind = options.kind ?? "filesystem";
+    if (kind !== "filesystem" && kind !== "full") throw new TypeError("checkpoint kind is invalid");
+    const parent = options.parent === undefined ? null : validateIdentity(options.parent); const request = { id, operationId, sandboxId: this.#sandbox.id, expectedEpoch: machine.epoch, expectedRevision: view.configurationRevision, kind, parent };
+    const approvalId = await this.#sandbox.approve({ kind: "checkpoint", sandboxId: this.#sandbox.id, operationId, request });
+    const response = await this.#sandbox.hostRequest({ kind: "create-checkpoint", request, scopeDigest: capabilityScope(this.#sandbox.id, "checkpoint"), approvalId });
+    if (response.kind !== "checkpoint" || !record(response.value)) throw protocol("checkpoint response");
+    return new SandsurfCheckpoint(this.#host, parseCheckpoint(response.value));
+  }
+  async rollback(checkpointId: string, options: { readonly operationId?: string } = {}): Promise<Readonly<Record<string, unknown>>> {
+    const id = validateIdentity(checkpointId); const operationId = validateIdentity(options.operationId ?? identity("rollback")); const view = await this.#sandbox.inspect();
+    const approvalId = await this.#sandbox.approve({ kind: "checkpoint", sandboxId: this.#sandbox.id, operationId, request: { action: "rollback", checkpointId: id, expectedRevision: view.configurationRevision } });
+    const response = await this.#sandbox.hostRequest({ kind: "rollback-filesystem", sandboxId: this.#sandbox.id, checkpointId: id, operationId, expectedRevision: view.configurationRevision, scopeDigest: capabilityScope(this.#sandbox.id, "checkpoint"), approvalId });
+    if (response.kind !== "rollback" || !record(response.value)) throw protocol("rollback response");
+    return response.value;
   }
 }
 
@@ -595,7 +665,15 @@ function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string
 }
 function parseImage(value: unknown): ImageInspection {
   if (!record(value)) throw protocol("image record");
-  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), provenanceDigest: digest(text(value.provenanceDigest)) };
+  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), provenanceDigest: digest(text(value.provenanceDigest)), sensitive: value.sensitive === true };
+}
+function parseCheckpoint(value: unknown): CheckpointInspection {
+  if (!record(value) || !record(value.request) || !record(value.resources)) throw protocol("checkpoint record");
+  const consistency = value.consistency === null ? null : text(value.consistency) as CheckpointConsistency;
+  if (consistency !== null && !["crash", "filesystem", "application"].includes(consistency)) throw protocol("checkpoint consistency");
+  const kind = text(value.request.kind) as CheckpointKind; if (kind !== "filesystem" && kind !== "full") throw protocol("checkpoint kind");
+  const phase = text(value.phase) as CheckpointInspection["phase"]; if (!["admitted", "capturing", "ready"].includes(phase)) throw protocol("checkpoint phase");
+  return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), sandboxId: validateIdentity(text(value.request.sandboxId)), expectedEpoch: integer(value.request.expectedEpoch), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: normalizeResources(value.resources as unknown as ResourceEnvelope), consistency, workloadDiskDigest: value.workloadDiskDigest === null ? null : digest(text(value.workloadDiskDigest)), workloadDiskBytes: integer(value.workloadDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: value.sensitive === true };
 }
 function parseReleaseStatus(value: Record<string, unknown>): ReleaseStatus { return { requestDigest: digest(text(value.requestDigest)), cleanupPending: value.cleanupPending === true }; }
 function workspacePath(value: string | Uint8Array): Uint8Array {

@@ -31,6 +31,7 @@ pub struct PersistentWorkloadService {
     mutation_barrier: RwLock<()>,
     cgroups: Option<CgroupManager>,
     installed_secrets: Mutex<BTreeMap<OperationId, InstalledSecret>>,
+    capture: Mutex<Option<OperationId>>,
 }
 
 #[derive(Clone)]
@@ -113,6 +114,7 @@ impl PersistentWorkloadService {
             mutation_barrier: RwLock::new(()),
             cgroups,
             installed_secrets: Mutex::new(BTreeMap::new()),
+            capture: Mutex::new(None),
         })
     }
 
@@ -127,6 +129,16 @@ impl PersistentWorkloadService {
                 message: "workload mutation barrier is unavailable".into(),
             };
         };
+        if self
+            .capture
+            .lock()
+            .map_or(true, |capture| capture.is_some())
+        {
+            return GuestServiceResponse::Error {
+                code: "service.capture-active".into(),
+                message: "workload operations are fenced by a filesystem capture".into(),
+            };
+        }
         match self.handle_inner(request) {
             Ok(value) => value,
             Err(error) => GuestServiceResponse::Error {
@@ -151,11 +163,99 @@ impl PersistentWorkloadService {
         flush()
     }
 
+    /// Establish a durable filesystem capture boundary without stopping jobs.
+    /// The frozen state persists after this call until the exact operation is
+    /// finished, so the host can pause the VM and copy its backing disk.
+    pub fn prepare_filesystem_capture(
+        &self,
+        operation_id: &OperationId,
+        flush: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<Digest> {
+        let _guard = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| io::Error::other("workload mutation barrier is unavailable"))?;
+        let mut capture = self
+            .capture
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capture state is unavailable"))?;
+        if let Some(active) = capture.as_ref() {
+            if active == operation_id {
+                return Ok(bytes_digest(
+                    b"guest-workload-frozen-and-filesystems-synced-v1",
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "another filesystem capture is active",
+            ));
+        }
+        let cgroups = self.cgroups.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workload cgroup freezing is unavailable",
+            )
+        })?;
+        cgroups.freeze(true, Duration::from_secs(5))?;
+        if let Err(error) = flush() {
+            let _ = cgroups.freeze(false, Duration::from_secs(5));
+            return Err(error);
+        }
+        *capture = Some(operation_id.clone());
+        Ok(bytes_digest(
+            b"guest-workload-frozen-and-filesystems-synced-v1",
+        ))
+    }
+
+    pub fn finish_filesystem_capture(&self, operation_id: &OperationId) -> io::Result<Digest> {
+        let _guard = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| io::Error::other("workload mutation barrier is unavailable"))?;
+        let mut capture = self
+            .capture
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capture state is unavailable"))?;
+        match capture.as_ref() {
+            None => {
+                return Ok(bytes_digest(
+                    b"guest-workload-filesystem-capture-finished-v1",
+                ));
+            }
+            Some(active) if active == operation_id => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "filesystem capture operation identity mismatch",
+                ));
+            }
+        }
+        self.cgroups
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "workload cgroup freezing is unavailable",
+                )
+            })?
+            .freeze(false, Duration::from_secs(5))?;
+        *capture = None;
+        Ok(bytes_digest(
+            b"guest-workload-filesystem-capture-finished-v1",
+        ))
+    }
+
     fn handle_inner(&self, request: GuestServiceRequest) -> ServiceResult<GuestServiceResponse> {
         match request {
             GuestServiceRequest::PrepareStop => Err((
                 "request.internal",
                 "the machine shutdown barrier is owned by the guest supervisor".into(),
+            )
+                .into()),
+            GuestServiceRequest::PrepareFilesystemCapture { .. }
+            | GuestServiceRequest::FinishFilesystemCapture { .. } => Err((
+                "request.internal",
+                "filesystem capture barriers are owned by the guest supervisor".into(),
             )
                 .into()),
             GuestServiceRequest::InstallSecret {

@@ -6,7 +6,7 @@
     "linux-x64/firecracker-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "linux-x64/firecracker-NOTICE": "0f443af83ca8226c7ec44e2ade3a09fa3eed8c9b923b6c014b6d439816b6f1c2",
     "linux-x64/firecracker-THIRD-PARTY": "a6d3ebd1c2f37d4fd83d0676621f695fc0cc2d8c6e646cdbb831b46e0650c208",
-    "linux-x64/firecracker-v1.16.1-x86_64": "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7",
-    "linux-x64/sandsurf-host-linux-x64": "446814ad5a8eb1131069e1f1bc03fb47e4841164e8e7f35f9f9394df76c4853e"
+    "linux-x64/firecracker-v1.16.2-x86_64": "8227875ceda44177a4d501052dae4a2f9d7837362f5399f02cf0748e68418377",
+    "linux-x64/sandsurf-host-linux-x64": "52ba1d8507eb24757cd9e5aa561ba54ab20fbbde3d70dd15c90e2125bd998c12"
   }
 }

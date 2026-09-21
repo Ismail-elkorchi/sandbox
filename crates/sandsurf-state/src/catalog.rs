@@ -14,6 +14,9 @@ CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE checkpoints(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
+CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
+CREATE TABLE usage_observations(sandbox TEXT PRIMARY KEY REFERENCES sandboxes(id), epoch INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +69,7 @@ pub struct ImageRecord {
     pub architecture: String,
     pub logical_bytes: Counter,
     pub provenance_digest: Digest,
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +367,169 @@ impl HostCatalog {
             .map(|value| decode(&value?))
             .collect()
     }
+
+    pub fn checkpoint(&self, id: &CheckpointId) -> Result<Option<Checkpoint>> {
+        checkpoint_record(&self.db.connection, id)
+    }
+
+    pub fn checkpoints(
+        &self,
+        after: Option<&CheckpointId>,
+        limit: Counter,
+    ) -> Result<Vec<Checkpoint>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("checkpoint page limit must be in 1..=256"));
+        }
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT id FROM checkpoints WHERE id>?1 ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(
+            params![after.map_or("", CheckpointId::as_str), limit.get()],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut values = Vec::new();
+        for row in rows {
+            let id: CheckpointId = row?.try_into()?;
+            values.push(
+                checkpoint_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
+                    "listed checkpoint disappeared from the catalog",
+                ))?,
+            );
+        }
+        Ok(values)
+    }
+
+    pub fn admit_checkpoint(
+        &mut self,
+        request: CheckpointRequest,
+        approval: Approval,
+    ) -> Result<Checkpoint> {
+        if request.kind != CheckpointKind::Filesystem {
+            return Err(Error::Unsupported(
+                "full-state checkpoint admission is not qualified",
+            ));
+        }
+        let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request))?;
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("checkpoint approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = checkpoint_record(&tx, &request.id)? {
+            return if old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("checkpoint identity conflict"))
+            };
+        }
+        let operation_used: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE operation=?1 UNION ALL SELECT 1 FROM intents WHERE id=?1 UNION ALL SELECT 1 FROM rollbacks WHERE operation=?1)",
+            [request.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if operation_used {
+            return Err(Error::Conflict("checkpoint operation identity conflict"));
+        }
+        require_revision(&tx, &request.sandbox_id, request.expected_revision)?;
+        if let Some(parent) = request.parent.as_ref() {
+            let parent = checkpoint_record(&tx, parent)?
+                .ok_or(Error::Missing("parent checkpoint is missing"))?;
+            if parent.phase != CheckpointPhase::Ready {
+                return Err(Error::Conflict("parent checkpoint is not ready"));
+            }
+        }
+        let sandbox = sandbox_record(&tx, &request.sandbox_id)?
+            .ok_or(Error::Missing("checkpoint sandbox is missing"))?;
+        let sensitive: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM secret_deliveries WHERE sandbox=?1 AND applied=1)",
+            [request.sandbox_id.as_str()],
+            |row| row.get(0),
+        )?;
+        capacity(&tx, "checkpoints", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let value = Checkpoint {
+            request,
+            request_digest,
+            phase: CheckpointPhase::Admitted,
+            image_digest: sandbox.image_digest,
+            workload_disk_bytes: sandbox.resources.disk_bytes,
+            resources: sandbox.resources,
+            consistency: None,
+            workload_disk_digest: None,
+            manifest_digest: None,
+            sensitive,
+        };
+        tx.execute(
+            "INSERT INTO checkpoints VALUES (?1,?2,?3,?4)",
+            params![
+                value.request.id.as_str(),
+                value.request.operation_id.as_str(),
+                value.request.sandbox_id.as_str(),
+                encode(&value)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn begin_checkpoint(
+        &mut self,
+        id: &CheckpointId,
+        request_digest: &Digest,
+    ) -> Result<Checkpoint> {
+        let mut value = checkpoint_record(&self.db.connection, id)?
+            .ok_or(Error::Missing("checkpoint is missing"))?;
+        if value.request_digest != *request_digest {
+            return Err(Error::Conflict("checkpoint request digest mismatch"));
+        }
+        if value.phase == CheckpointPhase::Ready {
+            return Ok(value);
+        }
+        value.phase = CheckpointPhase::Capturing;
+        self.db.connection.execute(
+            "UPDATE checkpoints SET value=?2 WHERE id=?1",
+            params![id.as_str(), encode(&value)?],
+        )?;
+        Ok(value)
+    }
+
+    pub fn complete_checkpoint(
+        &mut self,
+        id: &CheckpointId,
+        request_digest: &Digest,
+        disk_digest: Digest,
+        manifest_digest: Digest,
+        consistency: CheckpointConsistency,
+    ) -> Result<Checkpoint> {
+        let mut value = checkpoint_record(&self.db.connection, id)?
+            .ok_or(Error::Missing("checkpoint is missing"))?;
+        if value.request_digest != *request_digest {
+            return Err(Error::Conflict("checkpoint request digest mismatch"));
+        }
+        if value.phase == CheckpointPhase::Ready {
+            return if value.workload_disk_digest.as_ref() == Some(&disk_digest)
+                && value.manifest_digest.as_ref() == Some(&manifest_digest)
+                && value.consistency == Some(consistency)
+            {
+                Ok(value)
+            } else {
+                Err(Error::Conflict("checkpoint result identity conflict"))
+            };
+        }
+        if value.phase != CheckpointPhase::Capturing {
+            return Err(Error::Conflict("checkpoint capture has not begun"));
+        }
+        value.phase = CheckpointPhase::Ready;
+        value.workload_disk_digest = Some(disk_digest);
+        value.manifest_digest = Some(manifest_digest);
+        value.consistency = Some(consistency);
+        self.db.connection.execute(
+            "UPDATE checkpoints SET value=?2 WHERE id=?1",
+            params![id.as_str(), encode(&value)?],
+        )?;
+        Ok(value)
+    }
+
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
     }
@@ -458,6 +625,186 @@ impl HostCatalog {
         };
         save_intent(&tx, &value)?;
         tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn create_sandbox_from_checkpoint(
+        &mut self,
+        id: SandboxId,
+        checkpoint_id: &CheckpointId,
+        resources: Resources,
+        operation: OperationId,
+        approval: Approval,
+    ) -> Result<LifecycleIntent> {
+        resources.validate()?;
+        let request = digest(
+            Domain::Checkpoint,
+            &(
+                "sandsurf-filesystem-fork-v1",
+                checkpoint_id,
+                &id,
+                &resources,
+                &operation,
+            ),
+        )?;
+        if request != approval.request_digest {
+            return Err(Error::Conflict("fork approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = intent(&tx, &operation)? {
+            return if old.request_digest == request {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("fork operation identity conflict"))
+            };
+        }
+        let checkpoint = checkpoint_record(&tx, checkpoint_id)?
+            .ok_or(Error::Missing("fork checkpoint is missing"))?;
+        if checkpoint.phase != CheckpointPhase::Ready
+            || checkpoint.request.kind != CheckpointKind::Filesystem
+            || resources.disk_bytes != checkpoint.workload_disk_bytes
+        {
+            return Err(Error::Conflict(
+                "fork requires a ready filesystem checkpoint with matching disk geometry",
+            ));
+        }
+        capacity(&tx, "sandboxes", self.limits.identities)?;
+        capacity(&tx, "intents", self.limits.operations)?;
+        let mut total = resources.clone();
+        let mut statement = tx.prepare("SELECT resources FROM sandboxes WHERE released=0")?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            total = total.checked_add(&decode::<Resources>(&row?)?)?;
+        }
+        drop(statement);
+        if !total.within(&self.limits.resources) {
+            return Err(Error::Capacity("host resource reservations exhausted"));
+        }
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let configuration = initial_runtime_configuration(&resources)?;
+        tx.execute(
+            "INSERT INTO sandboxes(id,image,resources,configuration,revision) VALUES (?1,?2,?3,?4,1)",
+            params![
+                id.as_str(),
+                checkpoint.image_digest.as_str(),
+                encode(&resources)?,
+                encode(&configuration)?
+            ],
+        )?;
+        let value = LifecycleIntent {
+            sandbox_id: id,
+            operation_id: operation,
+            desired: DesiredState::Running,
+            revision: Counter::ONE,
+            request_digest: request,
+            completion: None,
+        };
+        save_intent(&tx, &value)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn admit_rollback(
+        &mut self,
+        sandbox: &SandboxId,
+        checkpoint_id: &CheckpointId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        approval: Approval,
+    ) -> Result<RollbackRecord> {
+        let request_digest = digest(
+            Domain::Checkpoint,
+            &(
+                "sandsurf-filesystem-rollback-v1",
+                sandbox,
+                checkpoint_id,
+                &operation_id,
+                expected_revision,
+            ),
+        )?;
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("rollback approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT value FROM rollbacks WHERE operation=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: RollbackRecord = decode(&raw)?;
+            return if old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("rollback operation identity conflict"))
+            };
+        }
+        require_revision(&tx, sandbox, expected_revision)?;
+        let source = checkpoint_record(&tx, checkpoint_id)?
+            .ok_or(Error::Missing("rollback checkpoint is missing"))?;
+        let target =
+            sandbox_record(&tx, sandbox)?.ok_or(Error::Missing("rollback sandbox is missing"))?;
+        if source.phase != CheckpointPhase::Ready
+            || source.request.kind != CheckpointKind::Filesystem
+            || source.image_digest != target.image_digest
+            || source.workload_disk_bytes != target.resources.disk_bytes
+        {
+            return Err(Error::Conflict(
+                "rollback checkpoint is incompatible with the target Sandbox",
+            ));
+        }
+        capacity(&tx, "rollbacks", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let value = RollbackRecord {
+            operation_id,
+            sandbox_id: sandbox.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            expected_revision,
+            request_digest,
+            phase: RollbackPhase::Admitted,
+            evidence_digest: None,
+        };
+        tx.execute(
+            "INSERT INTO rollbacks VALUES (?1,?2,?3)",
+            params![
+                value.operation_id.as_str(),
+                value.sandbox_id.as_str(),
+                encode(&value)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn complete_rollback(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+        evidence_digest: Digest,
+    ) -> Result<RollbackRecord> {
+        let raw: String = self.db.connection.query_row(
+            "SELECT value FROM rollbacks WHERE operation=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut value: RollbackRecord = decode(&raw)?;
+        if value.request_digest != *request_digest {
+            return Err(Error::Conflict("rollback request digest mismatch"));
+        }
+        if value.phase == RollbackPhase::Applied {
+            return if value.evidence_digest.as_ref() == Some(&evidence_digest) {
+                Ok(value)
+            } else {
+                Err(Error::Conflict("rollback evidence identity conflict"))
+            };
+        }
+        value.phase = RollbackPhase::Applied;
+        value.evidence_digest = Some(evidence_digest);
+        self.db.connection.execute(
+            "UPDATE rollbacks SET value=?2 WHERE operation=?1",
+            params![operation_id.as_str(), encode(&value)?],
+        )?;
         Ok(value)
     }
 
@@ -982,6 +1329,105 @@ impl HostCatalog {
         )
     }
 
+    /// Convert guardian/guest counters into host-owned monotonic consumption.
+    /// Live gauges remain observations and may fall; consumed counters do not.
+    pub fn observe_usage(
+        &mut self,
+        sandbox: &SandboxId,
+        epoch: Counter,
+        raw: ResourceUsage,
+    ) -> Result<ResourceUsage> {
+        let tx = self.db.connection.transaction()?;
+        let old = tx
+            .query_row(
+                "SELECT epoch,raw,cumulative FROM usage_observations WHERE sandbox=?1",
+                [sandbox.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let cumulative = if let Some((old_epoch, old_raw, old_cumulative)) = old {
+            let old_epoch: Counter = old_epoch.try_into()?;
+            if epoch < old_epoch {
+                return Err(Error::Conflict("resource usage epoch moved backwards"));
+            }
+            let old_raw: ResourceUsage = decode(&old_raw)?;
+            let mut value: ResourceUsage = decode(&old_cumulative)?;
+            if epoch == old_epoch
+                && [
+                    (raw.cpu_micros, old_raw.cpu_micros),
+                    (raw.io_read_bytes, old_raw.io_read_bytes),
+                    (raw.io_write_bytes, old_raw.io_write_bytes),
+                    (raw.network_rx_bytes, old_raw.network_rx_bytes),
+                    (raw.network_tx_bytes, old_raw.network_tx_bytes),
+                    (raw.network_connections, old_raw.network_connections),
+                ]
+                .iter()
+                .any(|(current, previous)| current < previous)
+            {
+                return Err(Error::Conflict(
+                    "resource usage rewound within one machine epoch",
+                ));
+            }
+            value.cpu_micros = add_observed(value.cpu_micros, raw.cpu_micros, old_raw.cpu_micros)?;
+            value.io_read_bytes = add_observed(
+                value.io_read_bytes,
+                raw.io_read_bytes,
+                old_raw.io_read_bytes,
+            )?;
+            value.io_write_bytes = add_observed(
+                value.io_write_bytes,
+                raw.io_write_bytes,
+                old_raw.io_write_bytes,
+            )?;
+            value.network_rx_bytes = add_observed(
+                value.network_rx_bytes,
+                raw.network_rx_bytes,
+                old_raw.network_rx_bytes,
+            )?;
+            value.network_tx_bytes = add_observed(
+                value.network_tx_bytes,
+                raw.network_tx_bytes,
+                old_raw.network_tx_bytes,
+            )?;
+            value.network_connections = add_observed(
+                value.network_connections,
+                raw.network_connections,
+                old_raw.network_connections,
+            )?;
+            value.memory_current = raw.memory_current;
+            value.memory_peak = value.memory_peak.max(raw.memory_peak);
+            value.disk_logical_bytes = raw.disk_logical_bytes;
+            value.disk_allocated_bytes = raw.disk_allocated_bytes;
+            value.output_retained_bytes = raw.output_retained_bytes;
+            value.processes_current = raw.processes_current;
+            value.complete = value.complete && raw.complete;
+            value.source = format!("host-catalog-cumulative({})", raw.source);
+            value.observed_unix_millis = raw.observed_unix_millis;
+            value
+        } else {
+            let mut value = raw.clone();
+            value.source = format!("host-catalog-cumulative({})", raw.source);
+            value
+        };
+        tx.execute(
+            "INSERT INTO usage_observations VALUES (?1,?2,?3,?4) ON CONFLICT(sandbox) DO UPDATE SET epoch=excluded.epoch,raw=excluded.raw,cumulative=excluded.cumulative",
+            params![
+                sandbox.as_str(),
+                epoch.get(),
+                encode(&raw)?,
+                encode(&cumulative)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(cumulative)
+    }
+
     /// Usage IDs survive rollback. Repeated delivery cannot double-charge.
     pub fn account(
         &mut self,
@@ -1035,6 +1481,15 @@ impl HostCatalog {
     }
 }
 
+fn add_observed(total: Counter, current: Counter, previous: Counter) -> Result<Counter> {
+    let delta = if current >= previous {
+        current.get() - previous.get()
+    } else {
+        current.get()
+    };
+    Ok(total.checked_add(delta)?)
+}
+
 fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Option<SandboxRecord>> {
     let row = db
         .query_row(
@@ -1073,6 +1528,34 @@ fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Opti
         reservation,
         latest_intent: decode(&latest)?,
     }))
+}
+
+fn checkpoint_record(db: &rusqlite::Connection, id: &CheckpointId) -> Result<Option<Checkpoint>> {
+    let raw = db
+        .query_row(
+            "SELECT value FROM checkpoints WHERE id=?1",
+            [id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    raw.map(|raw| {
+        let value: Checkpoint = decode(&raw)?;
+        let expected = digest(
+            Domain::Checkpoint,
+            &("sandsurf-checkpoint-v1", &value.request),
+        )?;
+        if value.request.id != *id
+            || value.request_digest != expected
+            || (value.phase == CheckpointPhase::Ready)
+                != (value.consistency.is_some()
+                    && value.workload_disk_digest.is_some()
+                    && value.manifest_digest.is_some())
+        {
+            return Err(Error::Corrupt("checkpoint record is inconsistent"));
+        }
+        Ok(value)
+    })
+    .transpose()
 }
 
 fn initial_runtime_configuration(resources: &Resources) -> Result<RuntimeConfiguration> {

@@ -192,6 +192,15 @@ fn serve_connection(
                     evidence: bytes_digest(b"guest-processes-quiesced-and-filesystems-synced-v1"),
                 }
             }
+            GuestServiceRequest::PrepareFilesystemCapture { operation_id } => {
+                let evidence = service
+                    .prepare_filesystem_capture(&operation_id, sync_persistent_filesystems)?;
+                GuestServiceResponse::FilesystemCapturePrepared { evidence }
+            }
+            GuestServiceRequest::FinishFilesystemCapture { operation_id } => {
+                let evidence = service.finish_filesystem_capture(&operation_id)?;
+                GuestServiceResponse::FilesystemCaptureFinished { evidence }
+            }
             request => service.handle(request),
         };
         let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;

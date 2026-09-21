@@ -4,13 +4,13 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 
-const version = "v1.16.1";
+const version = "v1.16.2";
 const architecture = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : undefined;
 if (process.platform !== "linux" || architecture === undefined) {
   throw new Error("Firecracker artifacts are available only for Linux x64 and arm64");
 }
 const archives: Readonly<Record<string, string>> = {
-  x86_64: "382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6",
+  x86_64: "32e3cdcd4081f91fe2b024a266f57dcb3b4e5fec5033e0cb22467ad7f7820bda",
 };
 const expectedArchive = archives[architecture];
 if (expectedArchive === undefined) throw new Error(`no reviewed ${version} archive digest for ${architecture}`);
@@ -32,13 +32,13 @@ try {
   await run("sha256sum", ["--check", "SHA256SUMS", "--ignore-missing"], release);
   const destination = resolve("packages/sandbox/native", `linux-${process.arch}`);
   await mkdir(destination, { recursive: true });
-  for (const name of [
-    `firecracker-${version}-${architecture}`,
-    "LICENSE",
-    "NOTICE",
-    "THIRD-PARTY",
-  ]) {
-    await copyFile(resolve(release, name), resolve(destination, name));
+  for (const [source, name] of [
+    [`firecracker-${version}-${architecture}`, `firecracker-${version}-${architecture}`],
+    ["LICENSE", "firecracker-LICENSE"],
+    ["NOTICE", "firecracker-NOTICE"],
+    ["THIRD-PARTY", "firecracker-THIRD-PARTY"],
+  ] as const) {
+    await copyFile(resolve(release, source), resolve(destination, name));
   }
   await chmod(resolve(destination, `firecracker-${version}-${architecture}`), 0o755);
 } finally {

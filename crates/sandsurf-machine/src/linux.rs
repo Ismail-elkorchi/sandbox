@@ -49,6 +49,7 @@ pub struct FirecrackerDriver<F> {
     factory: F,
     process: Option<FirecrackerProcess>,
     applied_revision: Option<Counter>,
+    capture_paused: bool,
 }
 
 impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
@@ -65,6 +66,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             factory,
             process: None,
             applied_revision: None,
+            capture_paused: false,
         }
     }
 
@@ -106,6 +108,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             }
         };
         self.process = Some(process);
+        self.capture_paused = false;
         self.applied_revision = Some(command.revision);
         let booting = if epoch == Counter::ONE {
             MachineState::Creating
@@ -152,9 +155,12 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
                 MachineOutcome::Unknown
             };
         };
-        if current.state == MachineState::Paused && process.resume().is_err() {
+        if (current.state == MachineState::Paused || self.capture_paused)
+            && process.resume().is_err()
+        {
             return MachineOutcome::Unknown;
         }
+        self.capture_paused = false;
         let quiesce = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
             Ok(value) => value,
             Err(_) => return MachineOutcome::Unknown,
@@ -173,6 +179,43 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             b"firecracker-exit-confirmed",
             &quiesce,
         )])
+    }
+
+    /// A checkpoint pause is internal to one capture transaction. It does not
+    /// manufacture a host lifecycle intent or guardian machine observation.
+    pub fn pause_for_capture(&mut self) -> Result<(), Digest> {
+        if self.capture_paused {
+            return Ok(());
+        }
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| bytes_digest(b"firecracker-capture-owner-unavailable"))?;
+        process
+            .pause()
+            .map_err(|_| bytes_digest(b"firecracker-capture-pause-failed"))?;
+        self.capture_paused = true;
+        Ok(())
+    }
+
+    pub fn resume_after_capture(&mut self) -> Result<(), Digest> {
+        if !self.capture_paused {
+            return Ok(());
+        }
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| bytes_digest(b"firecracker-capture-owner-unavailable"))?;
+        process
+            .resume()
+            .map_err(|_| bytes_digest(b"firecracker-capture-resume-failed"))?;
+        self.capture_paused = false;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn capture_is_paused(&self) -> bool {
+        self.capture_paused
     }
 }
 
@@ -280,6 +323,9 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
         }
+        if self.capture_paused {
+            return Self::unavailable(b"firecracker-filesystem-capture-active");
+        }
         let Some(process) = self.process.as_ref() else {
             return Self::unavailable(b"firecracker-owner-unavailable");
         };
@@ -301,6 +347,9 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+        }
+        if self.capture_paused {
+            return Self::unavailable(b"firecracker-filesystem-capture-active");
         }
         let Some(process) = self.process.as_ref() else {
             return Self::unavailable(b"firecracker-owner-unavailable");

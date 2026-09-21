@@ -1,7 +1,7 @@
 //! Linux OCI-to-VM image publication. The conversion never mounts the source
 //! tree or generated filesystem in the host kernel.
 
-use crate::api::OciSource;
+use crate::api::{DerivedImageInclusion, OciSource};
 use crate::linux::{LinuxError, resolve_source_bundle};
 use sandbox_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
@@ -11,7 +11,9 @@ use sandbox_image::{
     Architecture, ImageManifest, ImageTrust, RootfsArtifact, RootfsFormat, WorkloadDefaults,
     WorkloadImageManifest, WorkloadProvenance, verify_image,
 };
-use sandsurf_protocol::{Counter, Digest, Domain, OperationId, Qualification, digest};
+use sandsurf_protocol::{
+    Checkpoint, CheckpointPhase, Counter, Digest, Domain, OperationId, Qualification, digest,
+};
 use sandsurf_state::ImageRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -164,6 +166,11 @@ pub fn import_oci(
                 sha256: sha256_file(&workload_path, MAX_ROOTFS_BYTES)?,
                 format: RootfsFormat::Ext4,
             },
+            state_template: Some(RootfsArtifact {
+                path: "empty-workspace.ext4".into(),
+                sha256: sha256_file(&artifact.join("empty-workspace.ext4"), MAX_ROOTFS_BYTES)?,
+                format: RootfsFormat::Ext4,
+            }),
             defaults: WorkloadDefaults {
                 environment,
                 user: tree.source.defaults.user.clone(),
@@ -218,6 +225,7 @@ pub fn import_oci(
         logical_bytes: Counter::try_from(rootfs_bytes)
             .map_err(|error| LinuxError::Invalid(error.to_string()))?,
         provenance_digest: conversion_digest,
+        sensitive: false,
     };
     let result = ImportResult {
         request_digest: request_digest.clone(),
@@ -226,6 +234,205 @@ pub fn import_oci(
     write_json(&result_path, &result)?;
     File::open(&stage)?.sync_all()?;
     Ok(image)
+}
+
+pub fn publish_checkpoint(
+    host_root: &Path,
+    checkpoint: &Checkpoint,
+    inclusion: DerivedImageInclusion,
+    operation: &OperationId,
+    request_digest: &Digest,
+) -> Result<ImageRecord, LinuxError> {
+    if checkpoint.phase != CheckpointPhase::Ready
+        || checkpoint.workload_disk_digest.is_none()
+        || checkpoint.manifest_digest.is_none()
+    {
+        return Err(LinuxError::Invalid(
+            "derived image requires a ready filesystem checkpoint".into(),
+        ));
+    }
+    if !inclusion.workspace || !inclusion.home {
+        return Err(LinuxError::Invalid(
+            "the current VM-native publisher requires explicit workspace and home inclusion".into(),
+        ));
+    }
+    if checkpoint.sensitive && !inclusion.secrets {
+        return Err(LinuxError::Invalid(
+            "a secret-tainted checkpoint requires explicit secret inclusion".into(),
+        ));
+    }
+
+    let imports = host_root.join("images/imports");
+    fs::create_dir_all(&imports)?;
+    fs::set_permissions(&imports, fs::Permissions::from_mode(0o700))?;
+    let stage = imports.join(operation.as_str());
+    let result_path = stage.join("result.json");
+    if result_path.exists() {
+        let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
+        if old.request_digest != *request_digest {
+            return Err(LinuxError::Invalid(
+                "derived image staging identity conflicts with the request".into(),
+            ));
+        }
+        verify_published(host_root, &old.image)?;
+        return Ok(old.image);
+    }
+    if stage.exists() {
+        let quarantine = imports.join(format!(
+            "quarantine-{}-{}",
+            operation.as_str(),
+            short_nonce()?
+        ));
+        fs::rename(&stage, quarantine)?;
+    }
+    fs::DirBuilder::new().mode(0o700).create(&stage)?;
+
+    let source_root = host_root
+        .join("images")
+        .join(checkpoint.image_digest.as_str());
+    let source = verify_image(
+        &source_root.join("manifest.json"),
+        ImageTrust::ExplicitLocal,
+    )?;
+    if source.manifest_digest != checkpoint.image_digest.as_str() {
+        return Err(LinuxError::Invalid(
+            "checkpoint source image identity changed".into(),
+        ));
+    }
+    let artifact = stage.join("artifact");
+    fs::DirBuilder::new().mode(0o700).create(&artifact)?;
+    let kernel = artifact.join("boot-kernel");
+    let bootstrap = artifact.join("trusted-bootstrap.ext4");
+    let workload = artifact.join("derived-workload.ext4");
+    let template = artifact.join("empty-workspace.ext4");
+    copy_regular(&source.kernel_path, &kernel)?;
+    copy_regular(&source.bootstrap_path, &bootstrap)?;
+    copy_regular(&source.workload_path, &workload)?;
+    crate::checkpoints::materialize_image_template(
+        &host_root.join("checkpoints"),
+        checkpoint,
+        &template,
+    )
+    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+
+    let checkpoint_manifest = checkpoint
+        .manifest_digest
+        .as_ref()
+        .expect("ready checkpoint manifest was checked");
+    let provenance_digest = digest(
+        Domain::Image,
+        &(
+            "sandsurf-derived-image-v1",
+            &checkpoint.image_digest,
+            checkpoint_manifest,
+            checkpoint
+                .workload_disk_digest
+                .as_ref()
+                .expect("ready checkpoint disk was checked"),
+            inclusion.workspace,
+            inclusion.home,
+            inclusion.secrets,
+        ),
+    )
+    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    let mut manifest = source.manifest;
+    manifest.id = format!("derived-{}", &provenance_digest.as_str()[..16]);
+    manifest.version = checkpoint_manifest.as_str()[..16].to_owned();
+    manifest.boot_bundle.kernel.path = "boot-kernel".into();
+    manifest.boot_bundle.kernel.sha256 = sha256_file(&kernel, MAX_ROOTFS_BYTES)?;
+    manifest.boot_bundle.bootstrap.path = "trusted-bootstrap.ext4".into();
+    manifest.boot_bundle.bootstrap.sha256 = sha256_file(&bootstrap, MAX_ROOTFS_BYTES)?;
+    manifest.workload.rootfs.path = "derived-workload.ext4".into();
+    manifest.workload.rootfs.sha256 = sha256_file(&workload, MAX_ROOTFS_BYTES)?;
+    manifest.workload.state_template = Some(RootfsArtifact {
+        path: "empty-workspace.ext4".into(),
+        sha256: sha256_file(&template, MAX_ROOTFS_BYTES)?,
+        format: RootfsFormat::Ext4,
+    });
+    manifest.workload.provenance = WorkloadProvenance::Derived {
+        source_image_digest: checkpoint.image_digest.as_str().to_owned(),
+        checkpoint_manifest_digest: checkpoint_manifest.as_str().to_owned(),
+        include_workspace: inclusion.workspace,
+        include_home: inclusion.home,
+        include_secrets: inclusion.secrets,
+    };
+    manifest.signature = None;
+    let manifest_path = artifact.join("manifest.json");
+    let mut manifest_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&manifest_path)?;
+    manifest_file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+    manifest_file.write_all(b"\n")?;
+    manifest_file.sync_all()?;
+    let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
+    let workload_bytes = fs::metadata(&workload)?.len();
+    let final_root = host_root.join("images").join(&verified.manifest_digest);
+    if final_root.exists() {
+        let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
+        if existing.manifest_digest != verified.manifest_digest {
+            return Err(LinuxError::Invalid(
+                "derived image directory conflicts with its digest".into(),
+            ));
+        }
+        remove_derived_artifact(&artifact)?;
+    } else {
+        File::open(&artifact)?.sync_all()?;
+        fs::rename(&artifact, &final_root)?;
+        File::open(host_root.join("images"))?.sync_all()?;
+    }
+    let architecture = match manifest.architecture {
+        Architecture::X64 => "amd64",
+        Architecture::Arm64 => "arm64",
+    };
+    let logical_bytes = checkpoint
+        .workload_disk_bytes
+        .get()
+        .checked_add(workload_bytes)
+        .ok_or_else(|| LinuxError::Invalid("derived image size overflow".into()))?;
+    let image = ImageRecord {
+        digest: Digest::try_from(verified.manifest_digest)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        source_digest: checkpoint
+            .workload_disk_digest
+            .as_ref()
+            .expect("ready checkpoint disk was checked")
+            .clone(),
+        platform: "linux".into(),
+        architecture: architecture.into(),
+        logical_bytes: Counter::try_from(logical_bytes)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        provenance_digest,
+        sensitive: checkpoint.sensitive,
+    };
+    write_json(
+        &result_path,
+        &ImportResult {
+            request_digest: request_digest.clone(),
+            image: image.clone(),
+        },
+    )?;
+    File::open(&stage)?.sync_all()?;
+    Ok(image)
+}
+
+fn remove_derived_artifact(path: &Path) -> Result<(), LinuxError> {
+    for name in [
+        "manifest.json",
+        "empty-workspace.ext4",
+        "derived-workload.ext4",
+        "trusted-bootstrap.ext4",
+        "boot-kernel",
+    ] {
+        match fs::remove_file(path.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    fs::remove_dir(path)?;
+    Ok(())
 }
 
 fn parse_platform(value: &str) -> Result<GuestPlatform, LinuxError> {

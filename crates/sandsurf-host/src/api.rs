@@ -1,8 +1,8 @@
 use sandsurf_protocol::{
-    Capability, CommitmentId, Counter, Digest, Grant, GrantId, GuestServiceRequest,
-    GuestServiceResponse, LifecycleIntent, LifecycleOperation, MachineObservation, Observation,
-    Operation, OperationId, PinId, ProcessId, Qualification, ReleaseRequest, Resources,
-    RuntimeResponse, SandboxId, TransferId, VmEngine,
+    Capability, Checkpoint, CheckpointId, CheckpointRequest, CommitmentId, Counter, Digest, Grant,
+    GrantId, GuestServiceRequest, GuestServiceResponse, LifecycleIntent, LifecycleOperation,
+    MachineObservation, Observation, Operation, OperationId, PinId, ProcessId, Qualification,
+    ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, TransferId, VmEngine,
 };
 use sandsurf_state::{ImageImportRecord, ImageRecord};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,14 @@ pub enum OciSource {
         reference: String,
         credential: Option<sandsurf_protocol::SecretId>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DerivedImageInclusion {
+    pub workspace: bool,
+    pub home: bool,
+    pub secrets: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,9 +179,27 @@ pub enum HostRequest {
     GetImageImport {
         operation_id: OperationId,
     },
+    ListCheckpoints {
+        after: Option<CheckpointId>,
+        maximum: Counter,
+    },
+    GetCheckpoint {
+        checkpoint_id: CheckpointId,
+    },
+    CreateCheckpoint {
+        request: CheckpointRequest,
+        scope_digest: Digest,
+        approval_id: CommitmentId,
+    },
     ImportOci {
         source: OciSource,
         platform: String,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
+    PublishCheckpointImage {
+        checkpoint_id: CheckpointId,
+        inclusion: DerivedImageInclusion,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
@@ -235,6 +261,21 @@ pub enum HostRequest {
         image_digest: Digest,
         resources: Resources,
         operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
+    ForkSandbox {
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        resources: Resources,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
+    RollbackFilesystem {
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        scope_digest: Digest,
         approval_id: CommitmentId,
     },
     Lifecycle {
@@ -392,6 +433,15 @@ pub enum HostResponse {
     },
     ImageImport {
         operation: ImageImportRecord,
+    },
+    Checkpoints {
+        values: Vec<Checkpoint>,
+    },
+    Checkpoint {
+        value: Checkpoint,
+    },
+    Rollback {
+        value: RollbackRecord,
     },
     HostTreeCapture {
         capture: HostTreeCapture,

@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod api;
+mod checkpoints;
 #[cfg(target_os = "linux")]
 pub mod guest;
 #[cfg(target_os = "linux")]

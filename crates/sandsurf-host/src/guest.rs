@@ -180,11 +180,10 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
                     maximum,
                 }) {
                     Ok(GuestServiceResponse::Output { page }) => page,
-                    _ => {
-                        return Err(sandsurf_state::Error::Corrupt(
-                            "guest output replay is unavailable",
-                        ));
-                    }
+                    // Transport unavailability is not evidence corruption. The
+                    // bytes remain in the guest spool and reconciliation resumes
+                    // at the last committed cursor on the next pass.
+                    _ => return Ok(()),
                 };
                 if page.required_bytes.is_some() {
                     return Err(sandsurf_state::Error::Corrupt(
@@ -231,12 +230,26 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        self.client
-            .call(&request)
-            .map_err(|error| ControlError::Rejected {
-                category: "guest".into(),
-                message: error.to_string(),
-            })
+        let mut last = None;
+        // Query requests are either observations or exact identity-bound,
+        // idempotent supervisor operations. A Firecracker local-init vsock
+        // connection can fail before guest delivery, so reconnect without
+        // changing the request identity.
+        for attempt in 0..3 {
+            match self.client.call(&request) {
+                Ok(response) => return Ok(response),
+                Err(error) => last = Some(error),
+            }
+            if attempt != 2 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Err(ControlError::Rejected {
+            category: "guest".into(),
+            message: last
+                .expect("guest query is attempted at least once")
+                .to_string(),
+        })
     }
 }
 

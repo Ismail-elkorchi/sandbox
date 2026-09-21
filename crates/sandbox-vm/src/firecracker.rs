@@ -257,7 +257,21 @@ impl FirecrackerProcess {
     fn patch_vm_state(&self, state: &str) -> Result<(), FirecrackerError> {
         let body = serde_json::to_vec(&serde_json::json!({ "state": state }))
             .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
-        let mut connection = UnixStream::connect(&self.api_socket_path)?;
+        // Persistent Sandbox roots can exceed AF_UNIX's 108-byte pathname
+        // bound. Resolve the already-owned state directory through a short
+        // proc-fd path rather than requiring callers to choose a short root.
+        let api_directory =
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(self.api_socket_path.parent().ok_or_else(|| {
+                    FirecrackerError::Invalid("API socket has no parent".into())
+                })?)?;
+        let short_api_path = PathBuf::from(format!(
+            "/proc/self/fd/{}/firecracker.socket",
+            api_directory.as_raw_fd()
+        ));
+        let mut connection = UnixStream::connect(short_api_path)?;
         connection.set_read_timeout(Some(Duration::from_secs(10)))?;
         connection.set_write_timeout(Some(Duration::from_secs(10)))?;
         write!(
@@ -268,11 +282,15 @@ impl FirecrackerProcess {
         connection.write_all(&body)?;
         connection.flush()?;
         let mut response = Vec::new();
-        connection.take(64 * 1024 + 1).read_to_end(&mut response)?;
-        if response.len() > 64 * 1024 {
-            return Err(FirecrackerError::Setup(
-                "Firecracker API response exceeds 64 KiB".into(),
-            ));
+        let mut byte = [0_u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            if response.len() == 64 * 1024 {
+                return Err(FirecrackerError::Setup(
+                    "Firecracker API response headers exceed 64 KiB".into(),
+                ));
+            }
+            connection.read_exact(&mut byte)?;
+            response.push(byte[0]);
         }
         let Some(line_end) = response.windows(2).position(|value| value == b"\r\n") else {
             return Err(FirecrackerError::Setup(
@@ -281,7 +299,11 @@ impl FirecrackerProcess {
         };
         let status = std::str::from_utf8(&response[..line_end])
             .map_err(|_| FirecrackerError::Setup("Firecracker API status is not UTF-8".into()))?;
-        if status != "HTTP/1.1 204 No Content" && status != "HTTP/1.0 204 No Content" {
+        let status_code = status
+            .split_ascii_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok());
+        if status_code != Some(204) {
             return Err(FirecrackerError::Setup(format!(
                 "Firecracker API rejected VM state change: {status}"
             )));

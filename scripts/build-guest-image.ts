@@ -139,7 +139,8 @@ try {
   await replaceArtifact(kernel, resolve(destination, "vmlinux-6.1.177"));
   await replaceArtifact(rootfs, resolve(destination, "minimal-bootstrap.ext4"));
   await replaceArtifact(workload, resolve(destination, "minimal-workload.ext4"));
-  await replaceArtifact(workspace, resolve(native, "empty-workspace.ext4"));
+  await replaceArtifact(workspace, resolve(destination, "empty-workspace.ext4"));
+  if (native !== destination) await replaceArtifact(workspace, resolve(native, "empty-workspace.ext4"));
 
   const unsigned = {
     formatVersion: 2,
@@ -165,6 +166,11 @@ try {
       rootfs: {
         path: "minimal-workload.ext4",
         sha256: sha256(await readFile(workload)),
+        format: "ext4",
+      },
+      stateTemplate: {
+        path: "empty-workspace.ext4",
+        sha256: sha256(await readFile(workspace)),
         format: "ext4",
       },
       defaults: {

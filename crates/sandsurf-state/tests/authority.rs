@@ -87,6 +87,7 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
         architecture: "amd64".into(),
         logical_bytes: n(4096),
         provenance_digest: hash("conversion"),
+        sensitive: false,
     };
     let published = host
         .complete_image_import(&operation, &request, image.clone())
@@ -332,6 +333,173 @@ fn dispatch(runtime: &mut RuntimeJournal, host: &HostCatalog, mutation: &Mutatio
         }),
         DispatchDecision::Reconcile(_) => panic!("first dispatch unexpectedly reconciled"),
     }
+}
+
+#[test]
+fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
+    let mut fixture = Fixture::new();
+    let checkpoint_id: CheckpointId = "checkpoint-one".try_into().unwrap();
+    let checkpoint_operation: OperationId = "capture-filesystem".try_into().unwrap();
+    let request = CheckpointRequest {
+        id: checkpoint_id.clone(),
+        operation_id: checkpoint_operation,
+        sandbox_id: fixture.sandbox.clone(),
+        expected_epoch: n(1),
+        expected_revision: n(2),
+        kind: CheckpointKind::Filesystem,
+        parent: None,
+    };
+    let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request)).unwrap();
+    let admitted = fixture
+        .host
+        .admit_checkpoint(
+            request,
+            Approval {
+                id: "approve-checkpoint".try_into().unwrap(),
+                request_digest: request_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(admitted.phase, CheckpointPhase::Admitted);
+    fixture
+        .host
+        .begin_checkpoint(&checkpoint_id, &request_digest)
+        .unwrap();
+    let ready = fixture
+        .host
+        .complete_checkpoint(
+            &checkpoint_id,
+            &request_digest,
+            hash("captured-disk"),
+            hash("checkpoint-manifest"),
+            CheckpointConsistency::Filesystem,
+        )
+        .unwrap();
+    assert_eq!(ready.phase, CheckpointPhase::Ready);
+
+    let fork_id: SandboxId = "forked-box".try_into().unwrap();
+    let fork_operation: OperationId = "fork-checkpoint".try_into().unwrap();
+    let fork_digest = digest(
+        Domain::Checkpoint,
+        &(
+            "sandsurf-filesystem-fork-v1",
+            &checkpoint_id,
+            &fork_id,
+            resources(),
+            &fork_operation,
+        ),
+    )
+    .unwrap();
+    fixture
+        .host
+        .create_sandbox_from_checkpoint(
+            fork_id.clone(),
+            &checkpoint_id,
+            resources(),
+            fork_operation,
+            Approval {
+                id: "approve-fork".try_into().unwrap(),
+                request_digest: fork_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .host
+            .sandbox(&fork_id)
+            .unwrap()
+            .unwrap()
+            .image_digest,
+        ready.image_digest
+    );
+    assert!(
+        fixture
+            .host
+            .active_grant(&fork_id, n(1), Capability::Spawn, &hash("workload"))
+            .is_err()
+    );
+
+    let rollback_operation: OperationId = "rollback-checkpoint".try_into().unwrap();
+    let rollback_digest = digest(
+        Domain::Checkpoint,
+        &(
+            "sandsurf-filesystem-rollback-v1",
+            &fixture.sandbox,
+            &checkpoint_id,
+            &rollback_operation,
+            n(2),
+        ),
+    )
+    .unwrap();
+    let rollback = fixture
+        .host
+        .admit_rollback(
+            &fixture.sandbox,
+            &checkpoint_id,
+            rollback_operation.clone(),
+            n(2),
+            Approval {
+                id: "approve-rollback".try_into().unwrap(),
+                request_digest: rollback_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(rollback.phase, RollbackPhase::Admitted);
+    let applied = fixture
+        .host
+        .complete_rollback(&rollback_operation, &rollback_digest, hash("installed"))
+        .unwrap();
+    assert_eq!(applied.phase, RollbackPhase::Applied);
+    assert_eq!(
+        fixture
+            .host
+            .sandbox(&fixture.sandbox)
+            .unwrap()
+            .unwrap()
+            .configuration_revision,
+        n(2)
+    );
+}
+
+#[test]
+fn live_usage_stays_monotonic_across_a_new_machine_epoch() {
+    let mut fixture = Fixture::new();
+    let sample = |cpu, network, peak| ResourceUsage {
+        cpu_micros: n(cpu),
+        memory_current: n(10),
+        memory_peak: n(peak),
+        disk_logical_bytes: n(100),
+        disk_allocated_bytes: n(80),
+        io_read_bytes: n(cpu),
+        io_write_bytes: n(cpu * 2),
+        output_retained_bytes: n(5),
+        network_rx_bytes: n(network),
+        network_tx_bytes: n(network * 2),
+        network_connections: n(network),
+        processes_current: n(1),
+        complete: false,
+        source: "guest".into(),
+        observed_unix_millis: n(1000 + cpu),
+    };
+    let first = fixture
+        .host
+        .observe_usage(&fixture.sandbox, n(1), sample(10, 20, 30))
+        .unwrap();
+    assert_eq!(first.cpu_micros, n(10));
+    let same_epoch = fixture
+        .host
+        .observe_usage(&fixture.sandbox, n(1), sample(15, 24, 40))
+        .unwrap();
+    assert_eq!(same_epoch.cpu_micros, n(15));
+    assert_eq!(same_epoch.network_rx_bytes, n(24));
+    let next_epoch = fixture
+        .host
+        .observe_usage(&fixture.sandbox, n(2), sample(3, 25, 12))
+        .unwrap();
+    assert_eq!(next_epoch.cpu_micros, n(18));
+    assert_eq!(next_epoch.io_write_bytes, n(36));
+    assert_eq!(next_epoch.network_rx_bytes, n(25));
+    assert_eq!(next_epoch.memory_peak, n(40));
 }
 
 fn rebind_mutation(value: &Mutation, identity: &str) -> Mutation {

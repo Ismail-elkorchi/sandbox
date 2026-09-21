@@ -1,11 +1,13 @@
 #![deny(unsafe_code)]
 
+mod checkpoint;
 mod environment;
 mod frame;
 mod guest;
 mod session;
 mod types;
 
+pub use checkpoint::*;
 pub use environment::*;
 pub use frame::*;
 pub use guest::*;
