@@ -8,6 +8,7 @@ members = [
   "crates/sandsurf-machine",
   "crates/sandsurf-control",
   "crates/sandsurf-workload",
+  "crates/sandsurf-host",
   "crates/sandbox-protocol",
   "crates/sandbox-digest",
   "crates/sandbox-policy",

@@ -83,6 +83,9 @@ pub trait GuardianEffect {
     fn reconcile(&mut self, _journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
         Ok(())
     }
+    fn query(&mut self, _request: GuestServiceRequest) -> Result<GuestServiceResponse> {
+        Err(Error::Unsupported("guest query is not implemented"))
+    }
 }
 
 /// Guest/workload dispatch is deliberately separate from native VM ownership.
@@ -91,6 +94,9 @@ pub trait WorkloadDriver {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome;
     fn reconcile(&mut self, _journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
         Ok(())
+    }
+    fn query(&mut self, _request: GuestServiceRequest) -> Result<GuestServiceResponse> {
+        Err(Error::Unsupported("guest query is not implemented"))
     }
 }
 
@@ -133,6 +139,10 @@ impl<M: sandsurf_machine::MachineDriver, W: WorkloadDriver> GuardianEffect
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
         self.workload.reconcile(journal)
+    }
+
+    fn query(&mut self, request: GuestServiceRequest) -> Result<GuestServiceResponse> {
+        self.workload.query(request)
     }
 }
 
@@ -329,6 +339,19 @@ impl<E: GuardianEffect> Guardian<E> {
                 };
                 Ok(GuardianResponse::Lifecycle { operation })
             }
+            GuardianRequest::Guest {
+                sandbox_id,
+                request,
+            } => {
+                if &sandbox_id != self.journal.sandbox_id()
+                    || matches!(request, GuestServiceRequest::Dispatch { .. })
+                {
+                    return Err(Error::Protocol("unauthorized guardian guest request"));
+                }
+                Ok(GuardianResponse::Guest {
+                    response: self.effect.query(request)?,
+                })
+            }
         }
     }
 
@@ -474,6 +497,9 @@ impl GuardianClient {
             GuardianResponse::Lifecycle { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Guest { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
             }
@@ -489,6 +515,9 @@ impl GuardianClient {
             GuardianResponse::Lifecycle { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Guest { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
             }
@@ -498,11 +527,34 @@ impl GuardianClient {
     pub fn transition(&self, authorization: AuthorizedLifecycle) -> Result<LifecycleOperation> {
         match self.call(GuardianRequest::Transition { authorization })? {
             GuardianResponse::Lifecycle { operation } => Ok(operation),
-            GuardianResponse::Inspection { .. } | GuardianResponse::Dispatch { .. } => {
+            GuardianResponse::Inspection { .. }
+            | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
+            }
+        }
+    }
+
+    pub fn guest(
+        &self,
+        sandbox_id: SandboxId,
+        request: GuestServiceRequest,
+    ) -> Result<GuestServiceResponse> {
+        match self.call(GuardianRequest::Guest {
+            sandbox_id,
+            request,
+        })? {
+            GuardianResponse::Guest { response } => Ok(response),
+            GuardianResponse::Rejected { category, message } => {
+                Err(Error::Rejected { category, message })
+            }
+            GuardianResponse::Inspection { .. }
+            | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Lifecycle { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }
     }

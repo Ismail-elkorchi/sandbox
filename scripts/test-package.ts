@@ -23,11 +23,9 @@ try {
   await run("npm", ["init", "--yes"], consumer);
   await run("npm", ["install", "--ignore-scripts", core], consumer);
   await run("node", ["--input-type=module", "--eval", "await import('sandsurf')"], consumer);
-  await copyFile(resolve("scripts/package-consumer.mjs"), resolve(consumer, "package-consumer.mjs"));
-  await copyFile(resolve("scripts/package-execution-consumer.mts"), resolve(consumer, "package-execution-consumer.mts"));
+  await copyFile(resolve("scripts/package-consumer.mts"), resolve(consumer, "package-consumer.mts"));
   await run(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "--strict", "--noEmit", "--module", "NodeNext", "--target", "ES2024",
-    "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-execution-consumer.mts"], consumer);
-  await run("node", ["package-consumer.mjs"], consumer);
+    "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer);
   const lock = await readFile(resolve(consumer, "package-lock.json"), "utf8");
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
 } finally {

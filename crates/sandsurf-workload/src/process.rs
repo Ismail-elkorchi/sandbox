@@ -1,11 +1,9 @@
-use crate::{
-    CgroupLimits, CgroupManager, CgroupUsage, OutputSpool, ProcessCgroup, RetainedPage, SpoolError,
-};
+use crate::{CgroupLimits, CgroupManager, CgroupUsage, OutputSpool, ProcessCgroup, SpoolError};
 use sandsurf_protocol::{
-    Counter, Digest, OutputBoundary, ProcessId, ProcessLifetime, ProcessOutcome, SandboxId,
-    SpawnRequest, StdioMode, Stream, TerminalSize, bytes_digest,
+    Counter, Digest, ProcessCompletion, ProcessId, ProcessLifetime, ProcessOutcome,
+    ProcessSnapshot, ProcessState, RetainedPage, SandboxId, SpawnRequest, StdioMode, Stream,
+    TerminalSize, bytes_digest,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
@@ -57,37 +55,6 @@ impl From<SpoolError> for ProcessError {
     fn from(value: SpoolError) -> Self {
         Self::Spool(value)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessCompletion {
-    pub outcome: ProcessOutcome,
-    pub output: OutputBoundary,
-    pub cleanup_digest: Digest,
-    /// Exact leader wait4 evidence. Group/cgroup attribution is added only by
-    /// a qualified cgroup controller and must not be inferred from this digest.
-    pub accounting_digest: Digest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase"
-)]
-pub enum ProcessState {
-    Running,
-    Exited(ProcessCompletion),
-    Unknown { evidence: Digest },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessSnapshot {
-    pub request: SpawnRequest,
-    pub guest_pid: u32,
-    pub state: ProcessState,
 }
 
 pub struct ProcessSupervisor {

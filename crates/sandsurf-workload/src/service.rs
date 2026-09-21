@@ -1,190 +1,14 @@
 use crate::{
-    DirectoryPage, ExpectedRevision, FileRange, FileRevision, FileStat, FilesystemError,
-    FilesystemService, ProcessError, ProcessSnapshot, ProcessSupervisor, RetainedPage, WatchEvent,
+    ExpectedRevision, FilesystemError, FilesystemService, ProcessError, ProcessSupervisor,
 };
 use sandsurf_protocol::{
-    Capability, Counter, Digest, Domain, GuestPath, Mutation, OperationId, ProcessId, WatcherId,
-    WorkloadRequest, bytes_digest, digest,
+    Capability, Digest, FileExpectation, FileRevision, FilesystemRequest, FilesystemResponse,
+    GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation, OperationId,
+    WorkloadRequest, bytes_digest,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
-
-/// Guest-control request after the boot-capability handshake. Control requests
-/// remain bounded by `sandsurf-protocol`; bulk streams use separate data frames.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum GuestServiceRequest {
-    Dispatch {
-        mutation: Mutation,
-        capability: Capability,
-    },
-    Process {
-        process_id: ProcessId,
-    },
-    Processes,
-    ReadOutput {
-        process_id: ProcessId,
-        after: Counter,
-        maximum: u32,
-    },
-    Filesystem {
-        operation_id: OperationId,
-        capability: Capability,
-        request_digest: Digest,
-        request: FilesystemRequest,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum FilesystemRequest {
-    Stat {
-        path: GuestPath,
-        follow: bool,
-    },
-    List {
-        path: GuestPath,
-        after: Option<Vec<u8>>,
-        maximum: u16,
-    },
-    Read {
-        path: GuestPath,
-        offset: u64,
-        maximum: u32,
-    },
-    Write {
-        path: GuestPath,
-        bytes: Vec<u8>,
-        mode: u32,
-        expected: FileExpectation,
-    },
-    Mkdir {
-        path: GuestPath,
-        recursive: bool,
-    },
-    Rename {
-        from: GuestPath,
-        to: GuestPath,
-    },
-    Remove {
-        path: GuestPath,
-        recursive: bool,
-    },
-    Chmod {
-        path: GuestPath,
-        mode: u32,
-    },
-    Readlink {
-        path: GuestPath,
-    },
-    Symlink {
-        path: GuestPath,
-        target: Vec<u8>,
-    },
-    Watch {
-        watcher_id: WatcherId,
-        epoch: Counter,
-        path: GuestPath,
-        recursive: bool,
-    },
-    PollWatch {
-        watcher_id: WatcherId,
-        epoch: Counter,
-        maximum: u16,
-    },
-    Unwatch {
-        watcher_id: WatcherId,
-        epoch: Counter,
-    },
-}
-
-impl FilesystemRequest {
-    pub fn required_capability(&self) -> Capability {
-        match self {
-            Self::Stat { .. }
-            | Self::List { .. }
-            | Self::Read { .. }
-            | Self::Readlink { .. }
-            | Self::Watch { .. }
-            | Self::PollWatch { .. }
-            | Self::Unwatch { .. } => Capability::ReadFiles,
-            Self::Write { .. }
-            | Self::Mkdir { .. }
-            | Self::Rename { .. }
-            | Self::Remove { .. }
-            | Self::Chmod { .. }
-            | Self::Symlink { .. } => Capability::WriteFiles,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase"
-)]
-pub enum FileExpectation {
-    Any,
-    Absent,
-    Matches { size: u64, digest: Digest },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum GuestServiceResponse {
-    Effect { outcome: GuestEffectOutcome },
-    Process { process: Box<ProcessSnapshot> },
-    Processes { processes: Vec<ProcessSnapshot> },
-    Output { page: RetainedPage },
-    File { response: FilesystemResponse },
-    Error { code: String, message: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase"
-)]
-pub enum GuestEffectOutcome {
-    Applied { evidence: Digest },
-    NotApplied { evidence: Digest },
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase"
-)]
-pub enum FilesystemResponse {
-    Stat { value: FileStat },
-    List { page: DirectoryPage },
-    Read { range: FileRange },
-    Written { revision: FileRevision },
-    Link { target: Vec<u8> },
-    Watch { events: Vec<WatchEvent> },
-    Complete,
-}
 
 /// The protected guest supervisor owns this service for one machine epoch.
 /// Client connections do not own it. Exact operation outcomes remain available
@@ -262,12 +86,18 @@ impl PersistentWorkloadService {
                     .map(|page| GuestServiceResponse::Output { page })
                     .map_err(process_error)
             }
-            GuestServiceRequest::Filesystem {
+            GuestServiceRequest::Operation {
                 operation_id,
-                capability,
                 request_digest,
-                request,
-            } => self.filesystem(operation_id, capability, request_digest, request),
+            } => self
+                .reconcile(&operation_id, &request_digest)?
+                .ok_or_else(|| {
+                    (
+                        "operation.missing",
+                        "guest operation is not retained".into(),
+                    )
+                        .into()
+                }),
         }
     }
 
@@ -314,6 +144,14 @@ impl PersistentWorkloadService {
             } => self
                 .processes
                 .terminate(process_id, Duration::from_millis(u64::from(*grace_millis))),
+            WorkloadRequest::Filesystem { request } => {
+                return self.filesystem(
+                    mutation.operation_id.clone(),
+                    capability,
+                    mutation.request_digest.clone(),
+                    (**request).clone(),
+                );
+            }
         };
         let outcome = match result {
             Ok(()) => GuestEffectOutcome::Applied {
@@ -342,15 +180,7 @@ impl PersistentWorkloadService {
         request_digest: Digest,
         request: FilesystemRequest,
     ) -> ServiceResult<GuestServiceResponse> {
-        let expected_digest = digest(
-            Domain::Operation,
-            &("sandsurf-filesystem-operation-v1", &operation_id, &request),
-        )
-        .map_err(|error| ServiceFailure {
-            code: "request.invalid",
-            message: error.to_string(),
-        })?;
-        if capability != request.required_capability() || request_digest != expected_digest {
+        if capability != request.required_capability() || request.validate().is_err() {
             return Err((
                 "authority.invalid",
                 "filesystem authority does not bind request".into(),
@@ -558,7 +388,7 @@ impl From<FilesystemError> for ServiceFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandsurf_protocol::{SandboxId, bytes_digest};
+    use sandsurf_protocol::{Counter, GuestPath, SandboxId, bytes_digest};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -601,28 +431,36 @@ mod tests {
             path: GuestPath::try_from("/created").unwrap(),
             recursive: false,
         };
-        let request_digest = digest(
-            Domain::Operation,
-            &("sandsurf-filesystem-operation-v1", &operation, &request),
+        let mutation = Mutation::new(
+            SandboxId::try_from("box").unwrap(),
+            Counter::ONE,
+            operation.clone(),
+            "write".try_into().unwrap(),
+            Counter::ONE,
+            WorkloadRequest::Filesystem {
+                request: Box::new(request),
+            },
         )
         .unwrap();
-        let call = || GuestServiceRequest::Filesystem {
-            operation_id: operation.clone(),
+        let first = service.handle(GuestServiceRequest::Dispatch {
+            mutation: mutation.clone(),
             capability: Capability::WriteFiles,
-            request_digest: request_digest.clone(),
-            request: request.clone(),
-        };
-        assert_eq!(service.handle(call()), service.handle(call()));
+        });
+        assert_eq!(
+            first,
+            service.handle(GuestServiceRequest::Operation {
+                operation_id: operation.clone(),
+                request_digest: mutation.request_digest.clone(),
+            })
+        );
         assert!(files.join("created").is_dir());
 
-        let conflict = service.handle(GuestServiceRequest::Filesystem {
+        let conflict = service.handle(GuestServiceRequest::Operation {
             operation_id: operation,
-            capability: Capability::WriteFiles,
             request_digest: bytes_digest(b"different"),
-            request,
         });
         assert!(
-            matches!(conflict, GuestServiceResponse::Error { code, .. } if code == "authority.invalid")
+            matches!(conflict, GuestServiceResponse::Error { code, .. } if code == "operation.conflict")
         );
     }
 }

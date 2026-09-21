@@ -16,7 +16,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: npm ci
       - name: Native virtualization prerequisites (not VM qualification)
         run: node scripts/probe-sandsurf-host.ts sandsurf-host.json
@@ -28,8 +28,6 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p sandbox-supervisor --target x86_64-unknown-linux-musl -- -D warnings
-      - run: cargo clippy -p sandbox-supervisor --target aarch64-unknown-linux-musl -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
       - name: Report and exercise Linux implementation eligibility
@@ -61,11 +59,11 @@ jobs:
           name: sandsurf-host-macos
           path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
-      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-macos -p sandbox-platform-portable -p sandbox-test-runtime
-      - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/macos-conformance.test.mjs packages/sandbox/test/execution-reliability.test.mjs packages/sandbox/test/execution-output.test.mjs
+      - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host
+      - run: node --test packages/sandbox/test/*.test.mjs
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: npm run test:sandsurf
 
@@ -85,11 +83,11 @@ jobs:
           name: sandsurf-host-windows
           path: sandsurf-host.json
       - run: rustup toolchain install stable --profile minimal
-      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-supervisor -p sandbox-test-runtime --all-targets -- -D warnings
+      - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
-      - run: cargo test -p sandbox-protocol -p sandbox-digest -p sandbox-policy -p sandbox-launcher-windows -p sandbox-platform-portable -p sandbox-test-runtime
-      - run: node --test packages/sandbox/test/protocol.test.mjs packages/sandbox/test/windows-conformance.test.mjs packages/sandbox/test/execution-reliability.test.mjs packages/sandbox/test/execution-output.test.mjs
+      - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host
+      - run: node --test packages/sandbox/test/*.test.mjs
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: npm run test:sandsurf
 

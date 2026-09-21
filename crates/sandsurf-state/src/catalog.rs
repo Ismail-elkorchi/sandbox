@@ -431,6 +431,61 @@ impl HostCatalog {
         get_grant(&self.db.connection, id)
     }
 
+    /// Validate an application precondition against the host's authoritative
+    /// grant record. Returning the grant does not delegate it or create a
+    /// second authority store.
+    pub fn require_grant(
+        &self,
+        sandbox: &SandboxId,
+        expected_revision: Counter,
+        id: &GrantId,
+        capability: Capability,
+        scope: &Digest,
+    ) -> Result<Grant> {
+        require_revision(&self.db.connection, sandbox, expected_revision)?;
+        let grant = self
+            .grant(id)?
+            .ok_or(Error::Missing("host grant is missing"))?;
+        if grant.revoked
+            || &grant.sandbox_id != sandbox
+            || grant.capability != capability
+            || &grant.scope_digest != scope
+            || grant.revision > expected_revision
+        {
+            return Err(Error::Conflict(
+                "host grant does not authorize this observation",
+            ));
+        }
+        Ok(grant)
+    }
+
+    pub fn active_grant(
+        &self,
+        sandbox: &SandboxId,
+        expected_revision: Counter,
+        capability: Capability,
+        scope: &Digest,
+    ) -> Result<Grant> {
+        require_revision(&self.db.connection, sandbox, expected_revision)?;
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT value FROM grants WHERE sandbox=?1 ORDER BY id ASC")?;
+        let mut matched = None;
+        for value in statement.query_map([sandbox.as_str()], |row| row.get::<_, String>(0))? {
+            let grant: Grant = decode(&value?)?;
+            if !grant.revoked && grant.capability == capability && &grant.scope_digest == scope {
+                if matched.is_some() {
+                    return Err(Error::Conflict(
+                        "multiple active grants match the requested authority",
+                    ));
+                }
+                matched = Some(grant);
+            }
+        }
+        matched.ok_or(Error::Missing("matching host grant is missing"))
+    }
+
     pub fn authorize(
         &self,
         mutation: Mutation,

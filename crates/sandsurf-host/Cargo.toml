@@ -1,0 +1,24 @@
+[package]
+name = "sandsurf-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+sandsurf-control = { path = "../sandsurf-control" }
+sandsurf-machine = { path = "../sandsurf-machine" }
+sandsurf-native = { path = "../sandsurf-native" }
+sandsurf-protocol = { path = "../sandsurf-protocol" }
+sandsurf-state = { path = "../sandsurf-state" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandbox-vm = { path = "../sandbox-vm" }
+sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
+
+[[bin]]
+name = "sandsurf-host"
+path = "src/main.rs"

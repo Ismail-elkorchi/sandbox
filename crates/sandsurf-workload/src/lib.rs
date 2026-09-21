@@ -26,6 +26,10 @@ pub use driver::*;
 pub use filesystem::*;
 #[cfg(target_os = "linux")]
 pub use process::*;
+pub use sandsurf_protocol::{
+    DirectoryEntry, DirectoryPage, FileKind, FileRange, FileRevision, FileStat, ProcessCompletion,
+    ProcessSnapshot, ProcessState, RetainedChunk, RetainedPage, WatchEvent, WatchEventKind,
+};
 #[cfg(target_os = "linux")]
 pub use service::*;
 pub use spool::*;

@@ -1,75 +1,23 @@
 # Sandsurf
 
-This repository provides prepared, policy-driven sandbox execution for Node.js. A preparation binds the selected implementation, explicit filesystem resources, resolved hard limits, executable bytes and identity, arguments, working directory, environment, and output requests before authorization.
+Sandsurf is the persistent hardware-isolated Linux environment underlying autonomous agents. A Sandbox owns a Linux machine, writable filesystem, processes, terminals, network authority, resource envelope, durable identity, and lifecycle. Executions happen inside that environment; they do not define its lifetime.
 
-Linux isolated execution uses system bubblewrap. Linux host-layout execution uses Landlock and seccomp without a user namespace; see [Linux requirements](docs/linux-backend.md).
+The public distribution is the unscoped npm package `sandsurf`. Its TypeScript API connects to an independently running native host service. The host owns grants, reservations, and lifecycle intent. A separately supervised guardian per Sandbox owns observed machine state, guest control, runtime evidence, and retained output.
 
-The runtime fails closed. `probe()` reports observed mechanisms and request eligibility, while preparation opens and verifies the concrete resources. It never changes the requested filesystem layout or isolation boundary to find a fallback.
-
-| Implementation | Boundary | Filesystem | Status |
-| --- | --- | --- | --- |
-| `linux-namespace-v1` | OS process | isolated | Stable when requested guarantees are supported |
-| `linux-landlock-v1` | OS process | host | Stable when requested guarantees are supported |
-| `windows-appcontainer-v1` | OS process | host | Stable; path identity limitations are reported |
-| `darwin-seatbelt-v1` | OS process | host | Stable; path identity limitations are reported |
-| `linux-firecracker-v1` | hardware virtualized | isolated imports | Experimental extension |
+Native engines are Firecracker/KVM on Linux, Virtualization.framework on macOS, and Hyper-V/HCS on Windows. Unsupported or unqualified configurations fail explicitly—Sandsurf never falls back to running the workload as a host process.
 
 ```ts
-import { createSandbox } from "sandsurf";
+import { Sandsurf } from "sandsurf";
 
-const host = (path: string) => ({ space: "host" as const, path });
-const isolated = (path: string) => ({ space: "isolated" as const, path });
-const readExecute = {
-  content: "read" as const,
-  directoryEntries: "read" as const,
-  metadata: "read" as const,
-  execution: "allow" as const,
-};
+const host = await Sandsurf.open({
+  directory: "/private/application-state/sandsurf",
+  authorizer: async (change) => approve(change),
+});
 
-const sandbox = await createSandbox();
-try {
-  const options = {
-    isolation: { kind: "process" as const },
-    policy: {
-      filesystem: {
-        kind: "isolated" as const,
-        resources: [
-          {
-            id: "shell",
-            source: host("/bin"),
-            target: isolated("/bin"),
-            access: readExecute,
-            purposes: ["executable" as const, "interpreter" as const],
-          },
-          // Dynamic executables also need explicit loader and library resources.
-        ],
-      },
-      network: { mode: "none" as const },
-      process: {
-        visibility: "session" as const,
-        control: "session" as const,
-        termination: { scope: "descendant-tree" as const, graceMs: 100 },
-      },
-      ipc: { visibility: "session" as const },
-    },
-    requirements: {},
-    process: {
-      executable: isolated("/bin/sh"),
-      args: ["-c", "printf hello"],
-      cwd: isolated("/"),
-    },
-  };
-  const support = await sandbox.probe(options);
-  console.dir(support, { depth: null });
-  if (support.implementations.some((value) => value.eligibility.state === "eligible")) {
-    const result = await sandbox.run(options);
-    console.log(result.stdout?.toString());
-  }
-} finally {
-  await sandbox.dispose();
-}
+const support = await host.inspect();
+console.dir(support);
 ```
 
-See [getting started](docs/getting-started.md), [policy](docs/policy.md), [implementation support](docs/backends.md), and the [threat model](docs/threat-model.md).
+See [`packages/sandbox`](packages/sandbox) for the package and [`docs`](docs) for architecture, security, and qualification details.
 
 Licensed under Apache-2.0.

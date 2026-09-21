@@ -7,10 +7,8 @@ import { fileURLToPath } from "node:url";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const debugBuild = process.env.SANDBOX_NATIVE_PROFILE === "debug";
-const requestedTarget = process.env.SANDBOX_NATIVE_TARGET;
-const defaultTarget = process.platform === "linux"
-  ? `${process.arch === "arm64" ? "aarch64" : "x86_64"}-unknown-linux-musl`
-  : undefined;
+const requestedTarget = process.env.SANDBOX_NATIVE_TARGET || undefined;
+const defaultTarget = undefined;
 const target = requestedTarget ?? defaultTarget;
 const targetHost = target === undefined ? undefined : classifyTarget(target);
 const architecture = targetHost?.architecture ?? process.arch;
@@ -22,8 +20,8 @@ if ((architecture !== "x64" && architecture !== "arm64") || !["linux", "macos", 
 const buildArguments = [
   "build",
   ...(debugBuild ? [] : ["--release"]),
-  "-p", "sandbox-supervisor",
-  "--bin", "sandbox-runtime",
+  "-p", "sandsurf-host",
+  "--bin", "sandsurf-host",
   ...(target === undefined ? [] : ["--target", target]),
 ];
 const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
@@ -36,7 +34,7 @@ await run("cargo", buildArguments, buildEnvironment);
 
 const executableSuffix = nativePlatform === "windows" ? ".exe" : "";
 const destinationDirectory = resolve(repository, "native", `${nativePlatform}-${architecture}`);
-const destinationName = `sandbox-runtime-${nativePlatform}-${architecture}${executableSuffix}`;
+const destinationName = `sandsurf-host-${nativePlatform}-${architecture}${executableSuffix}`;
 const destination = resolve(destinationDirectory, destinationName);
 await mkdir(destinationDirectory, { recursive: true });
 await copyFile(resolve(
@@ -44,7 +42,7 @@ await copyFile(resolve(
   "target",
   ...(target === undefined ? [] : [target]),
   debugBuild ? "debug" : "release",
-  `sandbox-runtime${executableSuffix}`,
+  `sandsurf-host${executableSuffix}`,
 ), destination);
 await chmod(destination, 0o755);
 if (nativePlatform === "macos") {

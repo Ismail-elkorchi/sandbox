@@ -383,7 +383,13 @@ impl Mutation {
     }
 
     pub fn required_capability(&self) -> Capability {
-        match &self.request {
+        self.request.required_capability()
+    }
+}
+
+impl WorkloadRequest {
+    pub fn required_capability(&self) -> Capability {
+        match self {
             WorkloadRequest::Spawn { request }
                 if request.user.as_deref().is_some_and(is_root_user) =>
             {
@@ -395,6 +401,7 @@ impl Mutation {
             | WorkloadRequest::ResizeTerminal { .. }
             | WorkloadRequest::Signal { .. }
             | WorkloadRequest::Terminate { .. } => Capability::Spawn,
+            WorkloadRequest::Filesystem { request } => request.required_capability(),
         }
     }
 }
@@ -512,6 +519,10 @@ pub enum GuardianRequest {
     Transition {
         authorization: AuthorizedLifecycle,
     },
+    Guest {
+        sandbox_id: SandboxId,
+        request: crate::GuestServiceRequest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,10 +542,22 @@ pub struct GuardianInspection {
     deny_unknown_fields
 )]
 pub enum GuardianResponse {
-    Inspection { value: Box<GuardianInspection> },
-    Dispatch { operation: Operation },
-    Lifecycle { operation: LifecycleOperation },
-    Rejected { category: String, message: String },
+    Inspection {
+        value: Box<GuardianInspection>,
+    },
+    Dispatch {
+        operation: Operation,
+    },
+    Lifecycle {
+        operation: LifecycleOperation,
+    },
+    Guest {
+        response: crate::GuestServiceResponse,
+    },
+    Rejected {
+        category: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -655,6 +678,9 @@ pub enum WorkloadRequest {
         process_id: ProcessId,
         grace_millis: u32,
     },
+    Filesystem {
+        request: Box<crate::FilesystemRequest>,
+    },
 }
 
 impl WorkloadRequest {
@@ -681,6 +707,7 @@ impl WorkloadRequest {
                 }
                 Ok(())
             }
+            Self::Filesystem { request } => request.validate(),
         }
     }
 }

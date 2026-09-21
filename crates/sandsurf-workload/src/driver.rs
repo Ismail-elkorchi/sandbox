@@ -51,6 +51,12 @@ impl WorkloadDriver for WorkloadService {
             } => self
                 .processes
                 .terminate(process_id, Duration::from_millis(u64::from(*grace_millis))),
+            WorkloadRequest::Filesystem { .. } => {
+                return EffectOutcome::NotApplied(effect_digest(
+                    mutation,
+                    b"in-process-filesystem-driver-retired",
+                ));
+            }
         };
         match result {
             Ok(()) => EffectOutcome::Applied(effect_digest(mutation, b"workload-effect-applied")),

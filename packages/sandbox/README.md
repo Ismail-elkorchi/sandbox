@@ -1,43 +1,32 @@
 # `sandsurf`
 
-Fail-closed sandbox execution with prepared authorization, explicit resource manifests, scoped hard limits, structured termination, cleanup reports, and recovery support.
-
-Filesystem and execution paths are tagged as host or isolated coordinates. The library does not add a system runtime: callers authorize every executable, interpreter, loader, library, cache, and data resource needed by the workload.
+Persistent hardware-isolated Linux environments for autonomous agents.
 
 ```ts
-import { createSandbox } from "sandsurf";
+import { Sandsurf } from "sandsurf";
 
-const sandbox = await createSandbox();
-const support = await sandbox.probe({
-  isolation: { kind: "process" },
-  policy,
-  requirements: {},
-  resources,
+const host = await Sandsurf.open({
+  directory: "/private/application-state/sandsurf",
+  authorizer: async (change) => approve(change),
 });
 
-if (support.implementations.some((value) => value.eligibility.state === "eligible")) {
-  const prepared = await sandbox.prepareRun({
-    isolation: { kind: "process" },
-    policy,
-    requirements: {},
-    resources,
-    process: {
-      executable: { space: "isolated", path: "/tools/program" },
-      cwd: { space: "isolated", path: "/workspace" },
-    },
-  });
-  const process = await prepared.start({
-    policyDigest: prepared.policyDigest,
-    executionDigest: prepared.executionDigest,
-  });
-  console.log(await process.wait());
-}
+const support = await host.inspect();
+const box = await host.sandboxes.create({
+  image: "<verified-image-sha256>",
+  resources: { vcpus: 2, memoryMiB: 4096, diskBytes: 20 * 1024 ** 3 },
+  capabilities: { spawn: true, "read-files": true, "write-files": true },
+});
 
-await sandbox.dispose();
+const process = await box.processes.spawn({
+  argv: ["npm", "test"],
+  cwd: "/workspace",
+  lifetime: "job",
+});
+const completion = await process.wait();
+
+await host.close(); // The Sandbox and its services remain owned by the native host.
 ```
 
-See the repository [policy guide](../../docs/policy.md) and [getting started guide](../../docs/getting-started.md).
+Sandsurf uses one unscoped npm package and a native host service. Linux uses Firecracker/KVM, macOS uses Virtualization.framework, and Windows uses Hyper-V/HCS. `inspect()` reports qualification honestly; no host-process or cloud fallback is selected when hardware virtualization is unavailable.
 
-Detached executions use an explicitly bounded repository, retain terminal receipts and original output until digest-bound release, and survive client termination. Status inspection does not load output by default; request output pages and check their availability separately. See the [execution repository contract](../../docs/execution-repository.md) for preparation authority, quotas, control diagnostics, and receipt consumption.
-
-Linux isolated process execution requires system bubblewrap at `/usr/bin/bwrap`, Landlock ABI 3 or later, and seccomp. A host-layout policy can use Landlock and seccomp when user namespaces or bubblewrap are unavailable. `probe()` reports host support for the supplied policy. Explicit memory and process-count limits additionally require writable cgroup delegation.
+The host is the sole grant and lifecycle-intent authority. Per-Sandbox guardians own observed machine state, guest control, output retention, and runtime evidence. SDK handles retain identities and expected revisions, not a second grant database.

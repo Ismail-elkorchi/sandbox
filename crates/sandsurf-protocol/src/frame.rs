@@ -36,7 +36,7 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 impl Frame {
-    pub fn read(reader: &mut impl Read) -> io::Result<Option<Self>> {
+    pub fn read(reader: &mut (impl Read + ?Sized)) -> io::Result<Option<Self>> {
         let mut header = [0; HEADER_BYTES];
         loop {
             match reader.read(&mut header[..1]) {
@@ -80,7 +80,7 @@ impl Frame {
         }))
     }
 
-    pub fn write(&self, writer: &mut impl Write) -> io::Result<()> {
+    pub fn write(&self, writer: &mut (impl Write + ?Sized)) -> io::Result<()> {
         validate(self.kind, self.stream, self.payload.len())?;
         let mut header = [0; HEADER_BYTES];
         header[..4].copy_from_slice(MAGIC);

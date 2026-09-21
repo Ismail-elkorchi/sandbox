@@ -1,13 +1,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
+use sandsurf_protocol::GuestServiceRequest;
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, Counter, Digest, Frame, FrameKind, GuestChallenge,
     GuestFinish, GuestHandshake, GuestHello, SandboxId,
 };
 use sandsurf_workload::{
-    CgroupLimits, CgroupManager, FilesystemService, GuestServiceRequest, PersistentWorkloadService,
-    ProcessSupervisor,
+    CgroupLimits, CgroupManager, FilesystemService, PersistentWorkloadService, ProcessSupervisor,
 };
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};

@@ -689,6 +689,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandsurf-host"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "sandbox-launcher-linux",
+ "sandbox-vm",
+ "sandsurf-control",
+ "sandsurf-machine",
+ "sandsurf-native",
+ "sandsurf-protocol",
+ "sandsurf-state",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sandsurf-machine"
 version = "0.1.0"
 dependencies = [

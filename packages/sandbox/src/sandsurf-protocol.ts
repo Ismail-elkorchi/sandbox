@@ -85,10 +85,12 @@ export interface SandsurfTerminalSize {
 
 export type SandsurfWorkloadRequest =
   | { readonly kind: "spawn"; readonly request: SandsurfSpawnRequest }
+  | { readonly kind: "write-input"; readonly processId: string; readonly bytes: readonly number[] }
   | { readonly kind: "close-input"; readonly processId: string }
   | { readonly kind: "resize-terminal"; readonly processId: string; readonly size: SandsurfTerminalSize }
   | { readonly kind: "signal"; readonly processId: string; readonly signal: number; readonly group: boolean }
-  | { readonly kind: "terminate"; readonly processId: string; readonly graceMillis: number };
+  | { readonly kind: "terminate"; readonly processId: string; readonly graceMillis: number }
+  | { readonly kind: "filesystem"; readonly request: Readonly<Record<string, unknown>> };
 
 export interface SandsurfOutputBoundary {
   readonly finalCursor: number;
@@ -157,6 +159,13 @@ function validateWorkloadRequest(value: unknown): asserts value is SandsurfWorkl
   const fields = value as Record<string, unknown>;
   switch (fields.kind) {
     case "spawn": record(fields, ["kind", "request"]); validateSpawn(fields.request); break;
+    case "write-input":
+      record(fields, ["kind", "processId", "bytes"]); identity(fields.processId);
+      if (!Array.isArray(fields.bytes) || fields.bytes.length < 1 || fields.bytes.length > SANDSURF_MAX_STREAM_BYTES
+        || fields.bytes.some((byte) => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+        throw new Error("invalid Sandsurf input bytes");
+      }
+      break;
     case "close-input": record(fields, ["kind", "processId"]); identity(fields.processId); break;
     case "resize-terminal": record(fields, ["kind", "processId", "size"]); identity(fields.processId); validateTerminalSize(fields.size); break;
     case "signal":
@@ -167,8 +176,16 @@ function validateWorkloadRequest(value: unknown): asserts value is SandsurfWorkl
       record(fields, ["kind", "processId", "graceMillis"]); identity(fields.processId); counter(fields.graceMillis);
       if (fields.graceMillis > 60_000) throw new Error("invalid Sandsurf termination grace");
       break;
+    case "filesystem":
+      record(fields, ["kind", "request"]);
+      if (!recordValue(fields.request) || typeof fields.request.kind !== "string") throw new Error("invalid Sandsurf filesystem request");
+      break;
     default: throw new Error("unknown Sandsurf workload request");
   }
+}
+
+function recordValue(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
