@@ -56,7 +56,11 @@ fn supervisor_main() -> io::Result<()> {
     let filesystem = FilesystemService::open(Path::new(WORKLOAD_ROOT), "/")
         .map_err(io::Error::other)
         .map_err(|error| stage("open filesystem service", error))?;
-    let service = PersistentWorkloadService::new(processes, filesystem);
+    let service = PersistentWorkloadService::open(
+        processes,
+        filesystem,
+        &Path::new(CONTROL_ROOT).join("operations"),
+    )?;
 
     loop {
         let Ok(connection) = accept_connection(listener.as_raw_fd()) else {

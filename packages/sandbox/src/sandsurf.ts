@@ -173,8 +173,8 @@ export class SandboxFilesystem {
 
 export class SandboxWorkspace {
   readonly #fs: SandboxFilesystem; constructor(fs: SandboxFilesystem) { this.#fs = fs; }
-  readFile(path: string | Uint8Array): Promise<Uint8Array> { return this.#fs.readFile(path); }
-  writeFile(path: string | Uint8Array, bytes: string | Uint8Array): Promise<Record<string, unknown>> { return this.#fs.writeFile(path, bytes); }
+  readFile(path: string | Uint8Array): Promise<Uint8Array> { return this.#fs.readFile(workspacePath(path)); }
+  writeFile(path: string | Uint8Array, bytes: string | Uint8Array): Promise<Record<string, unknown>> { return this.#fs.writeFile(workspacePath(path), bytes); }
 }
 
 function normalizeResources(value: ResourceEnvelope): Required<ResourceEnvelope> {
@@ -187,6 +187,14 @@ function parseView(value: unknown): SandboxInspection { if (!record(value) || !r
 function currentMachine(view: SandboxInspection): { readonly epoch: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Sandbox machine observation is unavailable"); return { epoch: integer(view.machine.value.epoch) }; }
 function parseProcess(value: unknown): ProcessInspection { if (!record(value) || !record(value.request) || !record(value.state)) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state }; }
 function capabilityScope(sandboxId: string, capability: SandsurfCapability): string { return sandsurfDigest("grant", ["sandsurf-sandbox-capability-v1", sandboxId, capability]); }
+function workspacePath(value: string | Uint8Array): Uint8Array {
+  const relative = typeof value === "string" ? new TextEncoder().encode(value) : value;
+  if (relative.byteLength === 0 || relative[0] === 0x2f) throw new TypeError("Workspace paths must be non-empty relative paths");
+  const prefix = new TextEncoder().encode("/workspace/");
+  const path = new Uint8Array(prefix.byteLength + relative.byteLength);
+  path.set(prefix); path.set(relative, prefix.byteLength);
+  return Uint8Array.from(createSandsurfGuestPath(path));
+}
 function identity(prefix: string): string { return `${prefix}-${randomUUID()}`; }
 function validateIdentity(value: string): string { if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value)) throw new TypeError("Sandsurf identity is malformed"); return value; }
 function digest(value: string): string { if (!/^[a-f0-9]{64}$/u.test(value)) throw new TypeError("Sandsurf digest is malformed"); return value; }

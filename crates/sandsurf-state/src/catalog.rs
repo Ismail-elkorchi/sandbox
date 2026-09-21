@@ -278,20 +278,20 @@ impl HostCatalog {
         &self,
         sandbox: &SandboxId,
         revision: Counter,
-    ) -> Result<AuthorizedLifecycle> {
+    ) -> Result<AuthorizedConfiguration> {
         require_revision(&self.db.connection, sandbox, revision)?;
         let operation_id: OperationId = format!("configuration-{}", revision.get()).try_into()?;
         let request_digest = digest(
             Domain::Grant,
             &("sandsurf-apply-configuration-v1", sandbox, revision),
         )?;
-        self.authority.authorize_lifecycle(LifecycleCommand {
-            sandbox_id: sandbox.clone(),
-            operation_id,
-            desired: DesiredState::Running,
-            revision,
-            request_digest,
-        })
+        self.authority
+            .authorize_configuration(ConfigurationCommand {
+                sandbox_id: sandbox.clone(),
+                operation_id,
+                revision,
+                request_digest,
+            })
     }
 
     /// Called with evidence read from the exclusively owned guardian journal, not client observations.

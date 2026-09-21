@@ -5,7 +5,7 @@ mod namespace;
 
 pub use namespace::{NamespaceLauncher, isolated_main, namespace_probe_main};
 
-use sandbox_policy::{NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
+use sandbox_policy::{HardLimit, NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
 use sandsurf_native::linux::{
     bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
 };
@@ -53,6 +53,32 @@ pub struct LaunchSpec {
     pub resources: ResourceLimits,
     pub termination_grace_ms: u64,
     pub network_mode: String,
+}
+
+/// Fixed launch contract for one Firecracker VMM. Unlike `LaunchSpec`, callers
+/// cannot select arbitrary executable arguments, environment, mount targets,
+/// network modes, or host paths. Descriptor identities are revalidated inside
+/// the confined launcher immediately before exec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VmmLaunchSpec {
+    pub namespace_launcher_fd_index: usize,
+    pub firecracker_fd_index: usize,
+    pub firecracker_identity: FileIdentity,
+    pub firecracker_sha256: String,
+    pub kernel_fd_index: usize,
+    pub bootstrap_fd_index: usize,
+    pub workload_fd_index: usize,
+    pub workload_state_fd_index: usize,
+    pub control_state_fd_index: usize,
+    pub authentication_fd_index: usize,
+    pub configuration_fd_index: usize,
+    pub state_directory_fd_index: usize,
+    pub state_directory_identity: FileIdentity,
+    pub kvm_fd_index: usize,
+    pub open_files_limit: u64,
+    pub file_size_limit: u64,
+    pub termination_grace_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +375,26 @@ pub fn send_launch_spec(
     stream.write_all(&payload)
 }
 
+pub fn send_vmm_launch_spec(
+    stream: &mut UnixStream,
+    spec: &VmmLaunchSpec,
+    files: &[File],
+) -> io::Result<()> {
+    let payload = serde_json::to_vec(spec).map_err(invalid_data)?;
+    if payload.len() > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VMM launcher request is too large",
+        ));
+    }
+    send_fds(
+        stream.as_raw_fd(),
+        u32::try_from(payload.len()).map_err(invalid_data)?,
+        files,
+    )?;
+    stream.write_all(&payload)
+}
+
 pub fn send_launcher_stdin(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
     write_internal(stream, INTERNAL_STDIN, payload)
 }
@@ -455,6 +501,206 @@ pub fn launcher_main() -> i32 {
             }
             125
         }
+    }
+}
+
+pub fn vmm_launcher_main() -> i32 {
+    // Keep an independent failure channel because the launcher takes ownership
+    // of descriptor zero after startup.
+    // SAFETY: fd 0 is the trusted Unix socket in VMM launcher mode.
+    let failure_fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    match run_vmm_launcher() {
+        Ok(code) => code,
+        Err(error) => {
+            let failure = LauncherSetupError {
+                code: "setup.vmm-launcher".into(),
+                message: bounded_error(&error),
+            };
+            let payload = serde_json::to_vec(&failure).unwrap_or_else(|_| b"{}".to_vec());
+            if failure_fd >= 0 {
+                // SAFETY: fcntl returned an independent owned Unix-domain descriptor.
+                let mut control = unsafe { UnixStream::from_raw_fd(failure_fd) };
+                let _ = write_internal(&mut control, INTERNAL_SETUP_ERROR, &payload);
+            }
+            125
+        }
+    }
+}
+
+fn run_vmm_launcher() -> io::Result<i32> {
+    bind_lifetime_to_parent()?;
+    // SAFETY: VMM launcher mode exclusively transfers ownership of stdin.
+    let mut control = unsafe { UnixStream::from_raw_fd(0) };
+    let (length, files) = receive_fds(control.as_raw_fd())?;
+    if length as usize > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM launcher request exceeds limit",
+        ));
+    }
+    let mut payload = vec![0_u8; length as usize];
+    control.read_exact(&mut payload)?;
+    let vmm: VmmLaunchSpec = serde_json::from_slice(&payload).map_err(invalid_data)?;
+    validate_vmm_spec(&vmm, files.len())?;
+    let spec = vmm_launch_spec(&vmm);
+    namespace::launch(&spec, &files)
+}
+
+fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Result<()> {
+    let indexes = [
+        spec.namespace_launcher_fd_index,
+        spec.firecracker_fd_index,
+        spec.kernel_fd_index,
+        spec.bootstrap_fd_index,
+        spec.workload_fd_index,
+        spec.workload_state_fd_index,
+        spec.control_state_fd_index,
+        spec.authentication_fd_index,
+        spec.configuration_fd_index,
+        spec.state_directory_fd_index,
+        spec.kvm_fd_index,
+    ];
+    if indexes.iter().any(|index| *index >= descriptor_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM descriptor index is outside the received set",
+        ));
+    }
+    let distinct = indexes
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() != indexes.len()
+        || spec.firecracker_sha256.len() != 64
+        || !spec
+            .firecracker_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())
+        || spec.open_files_limit < 64
+        || spec.file_size_limit == 0
+        || spec.termination_grace_ms > 60_000
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM launcher contract is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
+    let mounts = [
+        (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
+        (
+            spec.bootstrap_fd_index,
+            "/vm/bootstrap",
+            "file",
+            true,
+            false,
+        ),
+        (spec.workload_fd_index, "/vm/workload", "file", true, false),
+        (
+            spec.workload_state_fd_index,
+            "/vm/workload-state",
+            "file",
+            false,
+            false,
+        ),
+        (
+            spec.control_state_fd_index,
+            "/vm/control-state",
+            "file",
+            false,
+            false,
+        ),
+        (
+            spec.authentication_fd_index,
+            "/vm/auth",
+            "file",
+            true,
+            false,
+        ),
+        (
+            spec.configuration_fd_index,
+            "/vm/state/firecracker.json",
+            "file",
+            true,
+            false,
+        ),
+        (
+            spec.state_directory_fd_index,
+            "/vm/state",
+            "directory",
+            false,
+            false,
+        ),
+        (spec.kvm_fd_index, "/dev/kvm", "file", false, true),
+    ]
+    .into_iter()
+    .map(
+        |(fd_index, target_path, kind, read_only, executable)| MountSpec {
+            fd_index,
+            target_path: target_path.into(),
+            kind: kind.into(),
+            read_only,
+            executable,
+        },
+    )
+    .collect();
+    LaunchSpec {
+        filesystem_kind: "isolated".into(),
+        launcher_fd_index: spec.namespace_launcher_fd_index,
+        mounts,
+        masks: Vec::new(),
+        private_home: None,
+        temporary: None,
+        executable_fd_index: spec.firecracker_fd_index,
+        executable_identity: spec.firecracker_identity,
+        executable_content_sha256: spec.firecracker_sha256.clone(),
+        executable_snapshot_path: "/.sandbox-runtime/firecracker".into(),
+        cwd: PreparedCwd::Bound {
+            fd_index: spec.state_directory_fd_index,
+            identity: spec.state_directory_identity,
+            target_path: "/vm/state".into(),
+        },
+        executable: "/.sandbox-runtime/firecracker".into(),
+        args: vec![
+            "--enable-pci".into(),
+            "--api-sock".into(),
+            "/vm/state/firecracker.socket".into(),
+            "--config-file".into(),
+            "/vm/state/firecracker.json".into(),
+        ],
+        environment: BTreeMap::new(),
+        resources: ResourceLimits {
+            // The generic launcher does not interpret these two legacy fields;
+            // VMM lifetime and diagnostics belong to the guardian.
+            wall_time: HardLimit {
+                enforcement: "guardian".into(),
+                scope: "sandbox".into(),
+                value: u64::MAX,
+            },
+            cpu_time: None,
+            memory: None,
+            process_count: None,
+            open_files: Some(HardLimit {
+                enforcement: "hard".into(),
+                scope: "vmm".into(),
+                value: spec.open_files_limit,
+            }),
+            single_file_size: Some(HardLimit {
+                enforcement: "hard".into(),
+                scope: "vmm".into(),
+                value: spec.file_size_limit,
+            }),
+            output: HardLimit {
+                enforcement: "guardian".into(),
+                scope: "diagnostics".into(),
+                value: 64 * 1024 * 1024,
+            },
+        },
+        termination_grace_ms: spec.termination_grace_ms,
+        network_mode: "none".into(),
     }
 }
 

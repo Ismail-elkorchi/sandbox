@@ -80,6 +80,13 @@ pub trait GuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> LifecycleEffect;
+    fn configure(
+        &mut self,
+        _command: &ConfigurationCommand,
+        _current: &MachineObservation,
+    ) -> EffectOutcome {
+        EffectOutcome::NotApplied(bytes_digest(b"configuration-installation-unsupported"))
+    }
     fn reconcile(&mut self, _journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
         Ok(())
     }
@@ -141,6 +148,14 @@ impl<M: sandsurf_machine::MachineDriver, W: WorkloadDriver> GuardianEffect
         current: Option<&MachineObservation>,
     ) -> LifecycleEffect {
         sandsurf_machine::apply_lifecycle(&mut self.machine, command, current)
+    }
+
+    fn configure(
+        &mut self,
+        _command: &ConfigurationCommand,
+        _current: &MachineObservation,
+    ) -> EffectOutcome {
+        EffectOutcome::Applied(bytes_digest(b"native-configuration-installed"))
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
@@ -216,12 +231,18 @@ impl<E: GuardianEffect> Guardian<E> {
                     .map(|id| self.journal.lifecycle_operation(id))
                     .transpose()?
                     .flatten();
+                let configuration_operation = operation_id
+                    .as_ref()
+                    .map(|id| self.journal.configuration_operation(id))
+                    .transpose()?
+                    .flatten();
                 Ok(GuardianResponse::Inspection {
                     value: Box::new(GuardianInspection {
                         sandbox_id,
                         observation,
                         operation,
                         lifecycle_operation,
+                        configuration_operation,
                     }),
                 })
             }
@@ -355,6 +376,65 @@ impl<E: GuardianEffect> Guardian<E> {
                 };
                 Ok(GuardianResponse::Lifecycle { operation })
             }
+            GuardianRequest::Configure { authorization } => {
+                let command = authorization.statement.command.clone();
+                let current = self
+                    .journal
+                    .last_observation()?
+                    .ok_or(Error::Protocol("configuration has no machine observation"))?
+                    .value()
+                    .clone();
+                self.journal.admit_configuration(authorization.clone())?;
+                let operation = match self.journal.begin_configuration(authorization)? {
+                    sandsurf_state::ConfigurationDecision::Reconcile(operation) => {
+                        self.reconcile_configuration(operation)?
+                    }
+                    sandsurf_state::ConfigurationDecision::Perform(permit) => {
+                        let outcome =
+                            permit.perform(|actual| self.effect.configure(actual, &current));
+                        match outcome {
+                            EffectOutcome::Applied(evidence) => {
+                                let sequence = current.sequence.next().map_err(|_| {
+                                    Error::Protocol("observation sequence overflow")
+                                })?;
+                                let committed = self.journal.observe(MachineObservation {
+                                    sandbox_id: command.sandbox_id.clone(),
+                                    epoch: current.epoch,
+                                    sequence,
+                                    state: current.state,
+                                    applied_revision: command.revision,
+                                    operation_id: command.operation_id.clone(),
+                                    evidence_digest: evidence.clone(),
+                                })?;
+                                self.journal.record_configuration_delivery(
+                                    &command.operation_id,
+                                    &command.request_digest,
+                                    Delivery::Applied,
+                                    Some(evidence),
+                                    Some(committed.reference()?),
+                                )?
+                            }
+                            EffectOutcome::NotApplied(evidence) => {
+                                self.journal.record_configuration_delivery(
+                                    &command.operation_id,
+                                    &command.request_digest,
+                                    Delivery::NotApplied,
+                                    Some(evidence),
+                                    None,
+                                )?
+                            }
+                            EffectOutcome::Unknown => self.journal.record_configuration_delivery(
+                                &command.operation_id,
+                                &command.request_digest,
+                                Delivery::Unknown,
+                                None,
+                                None,
+                            )?,
+                        }
+                    }
+                };
+                Ok(GuardianResponse::Configuration { operation })
+            }
             GuardianRequest::Guest {
                 sandbox_id,
                 request,
@@ -381,6 +461,32 @@ impl<E: GuardianEffect> Guardian<E> {
             let evidence = digest(Domain::Operation, &("reconciled-lifecycle-v1", &reference))
                 .map_err(|_| Error::Protocol("lifecycle evidence digest failed"))?;
             return Ok(self.journal.record_lifecycle_delivery(
+                &operation.command.operation_id,
+                &operation.command.request_digest,
+                Delivery::Applied,
+                Some(evidence),
+                Some(reference),
+            )?);
+        }
+        Ok(operation)
+    }
+
+    fn reconcile_configuration(
+        &mut self,
+        operation: ConfigurationOperation,
+    ) -> Result<ConfigurationOperation> {
+        if matches!(operation.delivery, Delivery::Dispatched | Delivery::Unknown)
+            && let Some(observed) = self.journal.last_observation()?
+            && observed.value().operation_id == operation.command.operation_id
+            && observed.value().applied_revision == operation.command.revision
+        {
+            let reference = observed.reference()?;
+            let evidence = digest(
+                Domain::Operation,
+                &("reconciled-configuration-v1", &reference),
+            )
+            .map_err(|_| Error::Protocol("configuration evidence digest failed"))?;
+            return Ok(self.journal.record_configuration_delivery(
                 &operation.command.operation_id,
                 &operation.command.request_digest,
                 Delivery::Applied,
@@ -513,6 +619,9 @@ impl GuardianClient {
             GuardianResponse::Lifecycle { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Configuration { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -531,6 +640,9 @@ impl GuardianClient {
             GuardianResponse::Lifecycle { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Configuration { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
@@ -545,11 +657,30 @@ impl GuardianClient {
             GuardianResponse::Lifecycle { operation } => Ok(operation),
             GuardianResponse::Inspection { .. }
             | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Configuration { .. }
             | GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
+            }
+        }
+    }
+
+    pub fn configure(
+        &self,
+        authorization: AuthorizedConfiguration,
+    ) -> Result<ConfigurationOperation> {
+        match self.call(GuardianRequest::Configure { authorization })? {
+            GuardianResponse::Configuration { operation } => Ok(operation),
+            GuardianResponse::Rejected { category, message } => {
+                Err(Error::Rejected { category, message })
+            }
+            GuardianResponse::Inspection { .. }
+            | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Lifecycle { .. }
+            | GuardianResponse::Guest { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }
     }
@@ -569,7 +700,8 @@ impl GuardianClient {
             }
             GuardianResponse::Inspection { .. }
             | GuardianResponse::Dispatch { .. }
-            | GuardianResponse::Lifecycle { .. } => {
+            | GuardianResponse::Lifecycle { .. }
+            | GuardianResponse::Configuration { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }

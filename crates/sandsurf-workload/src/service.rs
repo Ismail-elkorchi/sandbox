@@ -6,9 +6,18 @@ use sandsurf_protocol::{
     GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation, OperationId,
     WorkloadRequest, bytes_digest,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
+
+const LEDGER_VERSION: u16 = 1;
+const MAX_OPERATIONS: usize = 65_536;
+const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 
 /// The protected guest supervisor owns this service for one machine epoch.
 /// Client connections do not own it. Exact operation outcomes remain available
@@ -16,7 +25,31 @@ use std::time::Duration;
 pub struct PersistentWorkloadService {
     processes: ProcessSupervisor,
     filesystem: FilesystemService,
-    operations: Mutex<BTreeMap<OperationId, (Digest, GuestServiceResponse)>>,
+    ledger_root: PathBuf,
+    operations: Mutex<BTreeMap<OperationId, OperationRecord>>,
+}
+
+#[derive(Clone)]
+struct OperationRecord {
+    request_digest: Digest,
+    response: Option<GuestServiceResponse>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AdmissionRecord {
+    version: u16,
+    operation_id: OperationId,
+    request_digest: Digest,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompletionRecord {
+    version: u16,
+    operation_id: OperationId,
+    request_digest: Digest,
+    response: GuestServiceResponse,
 }
 
 struct ServiceFailure {
@@ -33,12 +66,19 @@ impl From<(&'static str, String)> for ServiceFailure {
 }
 
 impl PersistentWorkloadService {
-    pub fn new(processes: ProcessSupervisor, filesystem: FilesystemService) -> Self {
-        Self {
+    pub fn open(
+        processes: ProcessSupervisor,
+        filesystem: FilesystemService,
+        ledger_root: &Path,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(ledger_root)?;
+        let operations = load_operations(ledger_root)?;
+        Ok(Self {
             processes,
             filesystem,
-            operations: Mutex::new(BTreeMap::new()),
-        }
+            ledger_root: ledger_root.to_path_buf(),
+            operations: Mutex::new(operations),
+        })
     }
 
     pub fn processes(&self) -> &ProcessSupervisor {
@@ -118,7 +158,15 @@ impl PersistentWorkloadService {
             )
                 .into());
         }
-        if let Some(value) = self.reconcile(&mutation.operation_id, &mutation.request_digest)? {
+        if let WorkloadRequest::Filesystem { request } = &mutation.request {
+            return self.filesystem(
+                mutation.operation_id.clone(),
+                capability,
+                mutation.request_digest.clone(),
+                (**request).clone(),
+            );
+        }
+        if let Some(value) = self.admit(&mutation.operation_id, &mutation.request_digest)? {
             return Ok(value);
         }
         let result = match &mutation.request {
@@ -149,14 +197,7 @@ impl PersistentWorkloadService {
             } => self
                 .processes
                 .terminate(process_id, Duration::from_millis(u64::from(*grace_millis))),
-            WorkloadRequest::Filesystem { request } => {
-                return self.filesystem(
-                    mutation.operation_id.clone(),
-                    capability,
-                    mutation.request_digest.clone(),
-                    (**request).clone(),
-                );
-            }
+            WorkloadRequest::Filesystem { .. } => unreachable!("filesystem requests branch above"),
         };
         if let Err(error) = &result {
             eprintln!(
@@ -198,7 +239,7 @@ impl PersistentWorkloadService {
             )
                 .into());
         }
-        if let Some(value) = self.reconcile(&operation_id, &request_digest)? {
+        if let Some(value) = self.admit(&operation_id, &request_digest)? {
             return Ok(value);
         }
         let response = match request {
@@ -318,8 +359,12 @@ impl PersistentWorkloadService {
             message: "operation ledger is unavailable".into(),
         })?;
         match operations.get(operation_id) {
-            Some((old_digest, response)) if old_digest == request_digest => {
-                Ok(Some(response.clone()))
+            Some(record) if &record.request_digest == request_digest => {
+                Ok(Some(record.response.clone().unwrap_or(
+                    GuestServiceResponse::Effect {
+                        outcome: GuestEffectOutcome::Unknown,
+                    },
+                )))
             }
             Some(_) => Err((
                 "operation.conflict",
@@ -328,6 +373,44 @@ impl PersistentWorkloadService {
                 .into()),
             None => Ok(None),
         }
+    }
+
+    /// Persist admission before dispatch. An admitted operation without a
+    /// completion is never replayed after reconnect or guest restart.
+    fn admit(
+        &self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+    ) -> ServiceResult<Option<GuestServiceResponse>> {
+        if let Some(value) = self.reconcile(operation_id, request_digest)? {
+            return Ok(Some(value));
+        }
+        let mut operations = self.operations.lock().map_err(|_| ServiceFailure {
+            code: "service.unavailable",
+            message: "operation ledger is unavailable".into(),
+        })?;
+        if operations.len() >= MAX_OPERATIONS {
+            return Err(("service.capacity", "operation ledger is full".into()).into());
+        }
+        let record = AdmissionRecord {
+            version: LEDGER_VERSION,
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+        };
+        write_new_record(&admission_path(&self.ledger_root, operation_id), &record).map_err(
+            |error| ServiceFailure {
+                code: "service.unavailable",
+                message: format!("operation admission could not be retained: {error}"),
+            },
+        )?;
+        operations.insert(
+            operation_id.clone(),
+            OperationRecord {
+                request_digest: request_digest.clone(),
+                response: None,
+            },
+        );
+        Ok(None)
     }
 
     fn commit(
@@ -340,11 +423,177 @@ impl PersistentWorkloadService {
             code: "service.unavailable",
             message: "operation ledger is unavailable".into(),
         })?;
-        if operations.len() >= 65_536 {
-            return Err(("service.capacity", "operation ledger is full".into()).into());
+        let Some(record) = operations.get_mut(&operation_id) else {
+            return Err(("service.unavailable", "operation was not admitted".into()).into());
+        };
+        if record.request_digest != request_digest {
+            return Err((
+                "operation.conflict",
+                "operation identity is bound to another request".into(),
+            )
+                .into());
         }
-        operations.insert(operation_id, (request_digest, response.clone()));
+        if let Some(existing) = &record.response {
+            return Ok(existing.clone());
+        }
+        let completion = CompletionRecord {
+            version: LEDGER_VERSION,
+            operation_id: operation_id.clone(),
+            request_digest,
+            response: response.clone(),
+        };
+        if let Err(error) = write_new_record(
+            &completion_path(&self.ledger_root, &operation_id),
+            &completion,
+        ) {
+            eprintln!(
+                "sandsurf operation completion retention failed: {}",
+                error.to_string().chars().take(1024).collect::<String>()
+            );
+            return Ok(GuestServiceResponse::Effect {
+                outcome: GuestEffectOutcome::Unknown,
+            });
+        }
+        record.response = Some(response.clone());
         Ok(response)
+    }
+}
+
+fn load_operations(root: &Path) -> io::Result<BTreeMap<OperationId, OperationRecord>> {
+    let mut admissions = BTreeMap::new();
+    let mut completions = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation ledger contains an invalid object",
+            ));
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ledger name is not UTF-8"))?;
+        if name.ends_with(".admitted.json") {
+            let record: AdmissionRecord = read_record(&entry.path())?;
+            validate_record_name(&name, &record.operation_id, ".admitted.json")?;
+            if record.version != LEDGER_VERSION
+                || admissions
+                    .insert(
+                        record.operation_id,
+                        OperationRecord {
+                            request_digest: record.request_digest,
+                            response: None,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "operation admission is invalid or duplicated",
+                ));
+            }
+        } else if name.ends_with(".completed.json") {
+            let record: CompletionRecord = read_record(&entry.path())?;
+            validate_record_name(&name, &record.operation_id, ".completed.json")?;
+            completions.push(record);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation ledger contains an unknown record",
+            ));
+        }
+    }
+    if admissions.len() > MAX_OPERATIONS || completions.len() > MAX_OPERATIONS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation ledger exceeds its retained identity bound",
+        ));
+    }
+    for completion in completions {
+        if completion.version != LEDGER_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation completion version is unsupported",
+            ));
+        }
+        let admission = admissions
+            .get_mut(&completion.operation_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "operation completion has no durable admission",
+                )
+            })?;
+        if admission.request_digest != completion.request_digest || admission.response.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operation completion conflicts with its admission",
+            ));
+        }
+        admission.response = Some(completion.response);
+    }
+    Ok(admissions)
+}
+
+fn write_new_record(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operation record exceeds bound",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    File::open(path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operation record has no parent",
+        )
+    })?)?
+    .sync_all()
+}
+
+fn read_record<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<T> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let size = file.metadata()?.len();
+    if size == 0 || size > MAX_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation record size is invalid",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes).map_err(io::Error::other)
+}
+
+fn admission_path(root: &Path, operation_id: &OperationId) -> PathBuf {
+    root.join(format!("{}.admitted.json", operation_id.as_str()))
+}
+
+fn completion_path(root: &Path, operation_id: &OperationId) -> PathBuf {
+    root.join(format!("{}.completed.json", operation_id.as_str()))
+}
+
+fn validate_record_name(name: &str, operation_id: &OperationId, suffix: &str) -> io::Result<()> {
+    if name == format!("{}{}", operation_id.as_str(), suffix) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation record name does not bind its identity",
+        ))
     }
 }
 
@@ -433,10 +682,12 @@ mod tests {
         let processes =
             ProcessSupervisor::create(&spool, SandboxId::try_from("box").unwrap(), Counter::ONE)
                 .unwrap();
-        let service = PersistentWorkloadService::new(
+        let service = PersistentWorkloadService::open(
             processes,
             FilesystemService::open(&files, "/").unwrap(),
-        );
+            &root.0.join("operations"),
+        )
+        .unwrap();
         let operation = OperationId::try_from("mkdir").unwrap();
         let request = FilesystemRequest::Mkdir {
             path: GuestPath::try_from("/created").unwrap(),
@@ -466,7 +717,23 @@ mod tests {
         );
         assert!(files.join("created").is_dir());
 
-        let conflict = service.handle(GuestServiceRequest::Operation {
+        drop(service);
+        let reopened = PersistentWorkloadService::open(
+            ProcessSupervisor::create(&spool, SandboxId::try_from("box").unwrap(), Counter::ONE)
+                .unwrap(),
+            FilesystemService::open(&files, "/").unwrap(),
+            &root.0.join("operations"),
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            reopened.handle(GuestServiceRequest::Operation {
+                operation_id: operation.clone(),
+                request_digest: mutation.request_digest.clone(),
+            })
+        );
+
+        let conflict = reopened.handle(GuestServiceRequest::Operation {
             operation_id: operation,
             request_digest: bytes_digest(b"different"),
         });

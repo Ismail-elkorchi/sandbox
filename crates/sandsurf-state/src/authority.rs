@@ -106,6 +106,23 @@ impl HostAuthority {
         })
     }
 
+    pub(crate) fn authorize_configuration(
+        &self,
+        command: ConfigurationCommand,
+    ) -> Result<AuthorizedConfiguration> {
+        let statement = AuthorizedConfigurationStatement {
+            version: AUTHORITY_VERSION,
+            host_id: self.binding.host_id.clone(),
+            key_id: self.binding.key_id.clone(),
+            command,
+        };
+        let signature = self.sign("host-authorized-configuration-v1", &statement)?;
+        Ok(AuthorizedConfiguration {
+            statement,
+            signature,
+        })
+    }
+
     pub(crate) fn authorize_loss(
         &self,
         sandbox_id: SandboxId,
@@ -182,6 +199,17 @@ impl AuthorityVerifier {
             &value.statement.host_id,
             &value.statement.key_id,
             "host-authorized-lifecycle-v1",
+            &value.statement,
+            &value.signature,
+        )
+    }
+
+    pub(crate) fn verify_configuration(&self, value: &AuthorizedConfiguration) -> Result<()> {
+        self.verify_statement(
+            value.statement.version,
+            &value.statement.host_id,
+            &value.statement.key_id,
+            "host-authorized-configuration-v1",
             &value.statement,
             &value.signature,
         )

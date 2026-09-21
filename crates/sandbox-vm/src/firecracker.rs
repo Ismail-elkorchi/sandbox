@@ -1,11 +1,9 @@
 use sandbox_launcher_linux::{
-    LaunchSpec, LauncherEvent, LauncherStatus, MountSpec, PreparedCwd, file_identity,
-    read_launcher_event, read_launcher_status, send_launch_spec, send_launcher_terminate,
+    LauncherEvent, LauncherStatus, VmmLaunchSpec, file_identity, read_launcher_event,
+    read_launcher_status, send_launcher_terminate, send_vmm_launch_spec,
 };
-use sandbox_policy::{HardLimit, NormalizedMask, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -124,34 +122,13 @@ impl FirecrackerProcess {
         config_file.sync_all()?;
 
         let mut files = Vec::new();
-        let mut mounts = Vec::new();
-        for (path, target, read_only, executable) in [
-            (&config.kernel_image, "/vm/kernel", true, false),
-            (&config.rootfs_image, "/vm/bootstrap", true, false),
-            (&config.workload_image, "/vm/workload", true, false),
-            (&config.workspace_image, "/vm/workload-state", false, false),
-            (&config.control_image, "/vm/control-state", false, false),
-            (&config.authentication_image, "/vm/auth", true, false),
-            (&config_path, "/vm/state/firecracker.json", true, false),
-        ] {
-            add_mount(&mut files, &mut mounts, path, target, read_only, executable)?;
-        }
-        add_mount(
-            &mut files,
-            &mut mounts,
-            &vm_state,
-            "/vm/state",
-            false,
-            false,
-        )?;
-        add_mount(
-            &mut files,
-            &mut mounts,
-            Path::new("/dev/kvm"),
-            "/dev/kvm",
-            false,
-            true,
-        )?;
+        let kernel_fd_index = add_file(&mut files, &config.kernel_image)?;
+        let bootstrap_fd_index = add_file(&mut files, &config.rootfs_image)?;
+        let workload_fd_index = add_file(&mut files, &config.workload_image)?;
+        let workload_state_fd_index = add_file(&mut files, &config.workspace_image)?;
+        let control_state_fd_index = add_file(&mut files, &config.control_image)?;
+        let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
+        let configuration_fd_index = add_file(&mut files, &config_path)?;
 
         let mut firecracker = File::open(&config.firecracker_executable)?;
         let actual_digest = hash_reader(&mut firecracker)?;
@@ -161,58 +138,41 @@ impl FirecrackerProcess {
             ));
         }
         let executable_identity = file_identity(firecracker.as_raw_fd())?;
-        let executable_fd_index = files.len();
+        let firecracker_fd_index = files.len();
         files.push(firecracker);
-        let cwd_index = files.len();
+        let state_directory_fd_index = files.len();
         let cwd = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(&vm_state)?;
         let cwd_identity = file_identity(cwd.as_raw_fd())?;
         files.push(cwd);
-        let launcher_fd_index = files.len();
+        let namespace_launcher_fd_index = files.len();
         files.push(sandbox_launcher_linux::NamespaceLauncher::open()?.file);
-        let spec = LaunchSpec {
-            filesystem_kind: "isolated".into(),
-            launcher_fd_index,
-            mounts,
-            masks: Vec::<NormalizedMask>::new(),
-            private_home: None,
-            temporary: None,
-            executable_fd_index,
-            executable_identity,
-            executable_content_sha256: actual_digest,
-            executable_snapshot_path: "/.sandbox-runtime/firecracker".into(),
-            cwd: PreparedCwd::Bound {
-                fd_index: cwd_index,
-                identity: cwd_identity,
-                target_path: "/vm/state".into(),
-            },
-            executable: "/.sandbox-runtime/firecracker".into(),
-            args: vec![
-                "--enable-pci".into(),
-                "--api-sock".into(),
-                "/vm/state/firecracker.socket".into(),
-                "--config-file".into(),
-                "/vm/state/firecracker.json".into(),
-            ],
-            environment: BTreeMap::new(),
-            resources: ResourceLimits {
-                wall_time: hard_limit("process", 24 * 60 * 60 * 1000),
-                cpu_time: None,
-                memory: None,
-                process_count: None,
-                open_files: Some(hard_limit("process", 1024)),
-                single_file_size: Some(hard_limit("process", 16 * 1024 * 1024 * 1024)),
-                output: hard_limit("process", 64 * 1024 * 1024),
-            },
+        let kvm_fd_index = add_file(&mut files, Path::new("/dev/kvm"))?;
+        let spec = VmmLaunchSpec {
+            namespace_launcher_fd_index,
+            firecracker_fd_index,
+            firecracker_identity: executable_identity,
+            firecracker_sha256: actual_digest,
+            kernel_fd_index,
+            bootstrap_fd_index,
+            workload_fd_index,
+            workload_state_fd_index,
+            control_state_fd_index,
+            authentication_fd_index,
+            configuration_fd_index,
+            state_directory_fd_index,
+            state_directory_identity: cwd_identity,
+            kvm_fd_index,
+            open_files_limit: 1024,
+            file_size_limit: 16 * 1024 * 1024 * 1024,
             termination_grace_ms: 1_000,
-            network_mode: "none".into(),
         };
         let (mut control, launcher_control) = UnixStream::pair()?;
         let launcher_input: OwnedFd = launcher_control.into();
         let child = Command::new(&config.launcher_executable)
-            .arg("--linux-launcher")
+            .arg("--linux-vmm-launcher")
             .env_clear()
             .env("TMPDIR", &config.state_directory)
             .env("SANDBOX_VM_OWNER_TOKEN", &config.owner_token)
@@ -222,7 +182,7 @@ impl FirecrackerProcess {
             .spawn()?;
         let mut guard = ChildLaunchGuard::new(child);
         let setup = (|| -> Result<(), FirecrackerError> {
-            send_launch_spec(&mut control, &spec, &files)?;
+            send_vmm_launch_spec(&mut control, &spec, &files)?;
             drop(files);
             control.set_read_timeout(Some(Duration::from_secs(30)))?;
             match read_launcher_status(&mut control)? {
@@ -371,14 +331,6 @@ impl FirecrackerProcess {
         for thread in self.diagnostics.drain(..) {
             let _ = thread.join();
         }
-    }
-}
-
-fn hard_limit(scope: &str, value: u64) -> HardLimit {
-    HardLimit {
-        enforcement: "hard".into(),
-        scope: scope.into(),
-        value,
     }
 }
 
@@ -545,14 +497,7 @@ fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
     Ok(())
 }
 
-fn add_mount(
-    files: &mut Vec<File>,
-    mounts: &mut Vec<MountSpec>,
-    path: &Path,
-    target: &str,
-    read_only: bool,
-    executable: bool,
-) -> io::Result<()> {
+fn add_file(files: &mut Vec<File>, path: &Path) -> io::Result<usize> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
@@ -560,7 +505,7 @@ fn add_mount(
     let metadata = file.metadata()?;
     if !metadata.is_dir() && !metadata.is_file() {
         let identity = file_identity(file.as_raw_fd())?;
-        if target != "/dev/kvm" || identity.mode & libc::S_IFMT != libc::S_IFCHR {
+        if path != Path::new("/dev/kvm") || identity.mode & libc::S_IFMT != libc::S_IFCHR {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "VMM mount source has an unsupported object type",
@@ -569,19 +514,7 @@ fn add_mount(
     }
     let index = files.len();
     files.push(file);
-    mounts.push(MountSpec {
-        fd_index: index,
-        target_path: target.into(),
-        kind: if metadata.is_dir() {
-            "directory"
-        } else {
-            "file"
-        }
-        .into(),
-        read_only,
-        executable,
-    });
-    Ok(())
+    Ok(index)
 }
 
 fn hash_reader(reader: &mut impl Read) -> io::Result<String> {

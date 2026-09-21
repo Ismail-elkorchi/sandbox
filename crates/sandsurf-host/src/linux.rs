@@ -154,10 +154,11 @@ pub fn prepare_config(
         )
     };
     if verified.manifest_digest != image_digest.as_str()
-        || verified.manifest.rootfs.format != RootfsFormat::Ext4
-        || !verified.manifest.capabilities.overlayfs
-        || !verified.manifest.capabilities.cgroup_v2
-        || !verified.manifest.capabilities.devpts
+        || verified.manifest.boot_bundle.bootstrap.format != RootfsFormat::Ext4
+        || verified.manifest.workload.rootfs.format != RootfsFormat::Ext4
+        || !verified.manifest.boot_bundle.capabilities.overlayfs
+        || !verified.manifest.boot_bundle.capabilities.cgroup_v2
+        || !verified.manifest.boot_bundle.capabilities.devpts
     {
         return Err(LinuxError::Invalid(
             "image identity or required guest features do not match".into(),
@@ -267,8 +268,8 @@ impl LinuxGuardianEffect {
             config: config.clone(),
             sandbox_root: sandbox_root.to_path_buf(),
             kernel: image.kernel_path,
-            bootstrap: image.rootfs_path.clone(),
-            workload: image.rootfs_path,
+            bootstrap: image.bootstrap_path,
+            workload: image.workload_path,
             workload_state,
             control_state,
             active: Arc::clone(&active),
@@ -310,6 +311,23 @@ impl GuardianEffect for LinuxGuardianEffect {
             *active = None;
         }
         outcome
+    }
+
+    fn configure(
+        &mut self,
+        command: &sandsurf_protocol::ConfigurationCommand,
+        current: &MachineObservation,
+    ) -> EffectOutcome {
+        if command.sandbox_id != current.sandbox_id || command.revision <= current.applied_revision
+        {
+            return EffectOutcome::NotApplied(bytes_digest(
+                b"linux-configuration-revision-invalid",
+            ));
+        }
+        // Exact host-signed mutations carry process/file grant authority. The
+        // guardian records the required host revision without maintaining a
+        // second independently mutable grant set.
+        EffectOutcome::Applied(bytes_digest(b"linux-configuration-revision-installed"))
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
@@ -572,11 +590,15 @@ fn install_image(
         copy_artifact(&image.manifest_path, &staging.join("manifest.json"))?;
         copy_artifact(
             &image.kernel_path,
-            &staging.join(&image.manifest.kernel.path),
+            &staging.join(&image.manifest.boot_bundle.kernel.path),
         )?;
         copy_artifact(
-            &image.rootfs_path,
-            &staging.join(&image.manifest.rootfs.path),
+            &image.bootstrap_path,
+            &staging.join(&image.manifest.boot_bundle.bootstrap.path),
+        )?;
+        copy_artifact(
+            &image.workload_path,
+            &staging.join(&image.manifest.workload.rootfs.path),
         )?;
         copy_artifact(template, &staging.join("empty-workspace.ext4"))?;
         let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;

@@ -252,6 +252,18 @@ pub struct LifecycleCommand {
     pub request_digest: Digest,
 }
 
+/// Host-issued installation of one authoritative configuration revision. This
+/// is deliberately not a lifecycle request: applying a grant while stopped or
+/// paused must not start, resume, or stop the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigurationCommand {
+    pub sandbox_id: SandboxId,
+    pub operation_id: OperationId,
+    pub revision: Counter,
+    pub request_digest: Digest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationRef {
@@ -479,6 +491,31 @@ pub struct AuthorizedLifecycle {
     pub signature: AuthoritySignature,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedConfigurationStatement {
+    pub version: u16,
+    pub host_id: HostId,
+    pub key_id: Digest,
+    pub command: ConfigurationCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizedConfiguration {
+    pub statement: AuthorizedConfigurationStatement,
+    pub signature: AuthoritySignature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfigurationOperation {
+    pub command: ConfigurationCommand,
+    pub delivery: Delivery,
+    pub evidence_digest: Option<Digest>,
+    pub observation: Option<ObservationRef>,
+}
+
 /// Host authorization for loss of one complete receipt-bound output scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -519,6 +556,9 @@ pub enum GuardianRequest {
     Transition {
         authorization: AuthorizedLifecycle,
     },
+    Configure {
+        authorization: AuthorizedConfiguration,
+    },
     Guest {
         sandbox_id: SandboxId,
         request: crate::GuestServiceRequest,
@@ -532,6 +572,7 @@ pub struct GuardianInspection {
     pub observation: Observation<MachineObservation>,
     pub operation: Option<Operation>,
     pub lifecycle_operation: Option<LifecycleOperation>,
+    pub configuration_operation: Option<ConfigurationOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,6 +591,9 @@ pub enum GuardianResponse {
     },
     Lifecycle {
         operation: LifecycleOperation,
+    },
+    Configuration {
+        operation: ConfigurationOperation,
     },
     Guest {
         response: crate::GuestServiceResponse,

@@ -17,6 +17,7 @@ CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT 
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
@@ -99,6 +100,22 @@ pub enum LifecycleDecision<'guardian> {
 pub struct LifecyclePermit<'guardian> {
     authority: AuthorizedLifecycle,
     _guardian: &'guardian mut RuntimeJournal,
+}
+
+pub enum ConfigurationDecision<'guardian> {
+    Perform(ConfigurationPermit<'guardian>),
+    Reconcile(ConfigurationOperation),
+}
+
+pub struct ConfigurationPermit<'guardian> {
+    authority: AuthorizedConfiguration,
+    _guardian: &'guardian mut RuntimeJournal,
+}
+
+impl ConfigurationPermit<'_> {
+    pub fn perform<T>(self, effect: impl FnOnce(&ConfigurationCommand) -> T) -> T {
+        effect(&self.authority.statement.command)
+    }
 }
 impl LifecyclePermit<'_> {
     pub fn perform<T>(self, effect: impl FnOnce(&LifecycleCommand) -> T) -> T {
@@ -251,6 +268,13 @@ impl RuntimeJournal {
 
     pub fn lifecycle_operation(&self, id: &OperationId) -> Result<Option<LifecycleOperation>> {
         lifecycle_operation(&self.db.connection, id)
+    }
+
+    pub fn configuration_operation(
+        &self,
+        id: &OperationId,
+    ) -> Result<Option<ConfigurationOperation>> {
+        configuration_operation(&self.db.connection, id)
     }
 
     pub fn admit_lifecycle(
@@ -407,6 +431,162 @@ impl RuntimeJournal {
         value.observation = observed;
         tx.execute(
             "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
+            params![id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn admit_configuration(
+        &mut self,
+        authorization: AuthorizedConfiguration,
+    ) -> Result<ConfigurationOperation> {
+        self.authority.verify_configuration(&authorization)?;
+        let command = authorization.statement.command;
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = configuration_operation(&tx, &command.operation_id)? {
+            return if old.command == command {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "configuration operation identity already bound",
+                ))
+            };
+        }
+        let conflicting: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
+            [command.operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if conflicting {
+            return Err(Error::Conflict(
+                "operation identity already belongs to another guardian operation",
+            ));
+        }
+        require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
+        operation_capacity(&tx, self.limits.operations)?;
+        let value = ConfigurationOperation {
+            command,
+            delivery: Delivery::Admitted,
+            evidence_digest: None,
+            observation: None,
+        };
+        tx.execute(
+            "INSERT INTO configuration_operations VALUES (?1,?2)",
+            params![value.command.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn begin_configuration<'guardian>(
+        &'guardian mut self,
+        authorization: AuthorizedConfiguration,
+    ) -> Result<ConfigurationDecision<'guardian>> {
+        self.authority.verify_configuration(&authorization)?;
+        let command = &authorization.statement.command;
+        let tx = self.db.connection.transaction()?;
+        let mut value = configuration_operation(&tx, &command.operation_id)?
+            .ok_or(Error::Missing("configuration operation is not admitted"))?;
+        if value.command != *command {
+            return Err(Error::Conflict("configuration authority mismatch"));
+        }
+        if value.delivery != Delivery::Admitted {
+            return Ok(ConfigurationDecision::Reconcile(value));
+        }
+        require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
+        value.delivery = Delivery::Dispatched;
+        tx.execute(
+            "UPDATE configuration_operations SET value=?2 WHERE id=?1",
+            params![command.operation_id.as_str(), encode(&value)?],
+        )?;
+        tx.commit()?;
+        Ok(ConfigurationDecision::Perform(ConfigurationPermit {
+            authority: authorization,
+            _guardian: self,
+        }))
+    }
+
+    pub fn record_configuration_delivery(
+        &mut self,
+        id: &OperationId,
+        request: &Digest,
+        delivery: Delivery,
+        evidence: Option<Digest>,
+        observed: Option<ObservationRef>,
+    ) -> Result<ConfigurationOperation> {
+        if matches!(delivery, Delivery::Admitted | Delivery::Dispatched) {
+            return Err(Error::Conflict(
+                "configuration admission and dispatch require their dedicated gates",
+            ));
+        }
+        let committed = observed
+            .as_ref()
+            .map(|reference| self.observation_at(reference))
+            .transpose()?;
+        let tx = self.db.connection.transaction()?;
+        let mut value = configuration_operation(&tx, id)?
+            .ok_or(Error::Missing("configuration operation is missing"))?;
+        if value.command.request_digest != *request {
+            return Err(Error::Conflict("configuration request digest mismatch"));
+        }
+        if value.delivery == delivery
+            && value.evidence_digest == evidence
+            && value.observation == observed
+        {
+            return Ok(value);
+        }
+        let allowed = matches!(
+            (value.delivery, delivery),
+            (Delivery::Admitted, Delivery::NotApplied)
+                | (
+                    Delivery::Dispatched,
+                    Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+                )
+                | (Delivery::Unknown, Delivery::Applied | Delivery::NotApplied)
+        );
+        if !allowed {
+            return Err(Error::Conflict("invalid configuration delivery transition"));
+        }
+        match delivery {
+            Delivery::Applied => {
+                let observation = committed
+                    .as_ref()
+                    .ok_or(Error::Conflict(
+                        "applied configuration requires an observation",
+                    ))?
+                    .value();
+                if evidence.is_none()
+                    || observation.operation_id != value.command.operation_id
+                    || observation.sandbox_id != value.command.sandbox_id
+                    || observation.applied_revision != value.command.revision
+                {
+                    return Err(Error::Conflict(
+                        "configuration observation does not establish its postcondition",
+                    ));
+                }
+            }
+            Delivery::NotApplied => {
+                if evidence.is_none() || observed.is_some() {
+                    return Err(Error::Conflict(
+                        "not-applied configuration requires evidence and no observation",
+                    ));
+                }
+            }
+            Delivery::Unknown => {
+                if evidence.is_some() || observed.is_some() {
+                    return Err(Error::Conflict(
+                        "unknown configuration cannot claim completion evidence",
+                    ));
+                }
+            }
+            Delivery::Admitted | Delivery::Dispatched => unreachable!(),
+        }
+        value.delivery = delivery;
+        value.evidence_digest = evidence;
+        value.observation = observed;
+        tx.execute(
+            "UPDATE configuration_operations SET value=?2 WHERE id=?1",
             params![id.as_str(), encode(&value)?],
         )?;
         tx.commit()?;
@@ -1249,9 +1429,31 @@ fn require_lifecycle_state(
         )),
     }
 }
+fn require_configuration_state(
+    sandbox: &SandboxId,
+    current: Option<&MachineObservation>,
+    command: &ConfigurationCommand,
+) -> Result<()> {
+    if &command.sandbox_id != sandbox {
+        return Err(Error::Conflict(
+            "configuration command belongs to another sandbox",
+        ));
+    }
+    match current {
+        Some(observed)
+            if observed.state != MachineState::Destroyed
+                && command.revision == observed.applied_revision.next()? =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Conflict(
+            "configuration command is stale or has no machine identity",
+        )),
+    }
+}
 fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
     let count: u64 = db.query_row(
-        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations)",
+        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations) + (SELECT count(*) FROM configuration_operations)",
         [],
         |row| row.get(0),
     )?;
@@ -1278,6 +1480,19 @@ fn lifecycle_operation(
 ) -> Result<Option<LifecycleOperation>> {
     db.query_row(
         "SELECT value FROM lifecycle_operations WHERE id=?1",
+        [id.as_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| decode(&value))
+    .transpose()
+}
+fn configuration_operation(
+    db: &rusqlite::Connection,
+    id: &OperationId,
+) -> Result<Option<ConfigurationOperation>> {
+    db.query_row(
+        "SELECT value FROM configuration_operations WHERE id=?1",
         [id.as_str()],
         |row| row.get::<_, String>(0),
     )

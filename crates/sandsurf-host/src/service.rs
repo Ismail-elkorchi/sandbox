@@ -275,7 +275,7 @@ impl HostService {
                     .catalog
                     .authorize_configuration(&sandbox_id, grant.revision)?;
                 let operation = GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                    .transition(authorization)?;
+                    .configure(authorization)?;
                 if operation.delivery != Delivery::Applied
                     || operation.command.revision != grant.revision
                 {

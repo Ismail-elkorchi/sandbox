@@ -59,38 +59,43 @@ try {
   const guestBytes = await readFile(guestAgent);
   if (!isElf(guestBytes)) throw new Error("guest agent is not an ELF executable");
 
-  const root = resolve(temporary, "root");
+  const root = resolve(temporary, "bootstrap");
   for (const path of [
-    "bin", "dev", "etc/ssl/certs", "home/agent", "proc", "run", "sandsurf/control",
-    "sandsurf/lower", "sandsurf/state", "sandsurf/workload", "sbin", "sys/fs/cgroup", "tmp", "workspace",
+    "dev", "proc", "run", "sandsurf/control", "sandsurf/lower", "sandsurf/state",
+    "sandsurf/workload", "sbin", "sys/fs/cgroup", "tmp",
   ]) {
     await mkdir(resolve(root, path), { recursive: true });
+  }
+  const workloadRoot = resolve(temporary, "workload");
+  for (const path of ["bin", "etc/ssl/certs", "home/agent", "run", "tmp", "workspace"]) {
+    await mkdir(resolve(workloadRoot, path), { recursive: true });
   }
   const busyboxBytes = await boundedRegularFile(busyboxPath, 64 * 1024 * 1024, "BusyBox");
   if (!isElf(busyboxBytes)) throw new Error("BusyBox is not an ELF executable");
   await assertStaticElf(busyboxPath, "BusyBox");
-  await copyFile(busyboxPath, resolve(root, "bin/busybox"));
-  await chmod(resolve(root, "bin/busybox"), 0o755);
+  await copyFile(busyboxPath, resolve(workloadRoot, "bin/busybox"));
+  await chmod(resolve(workloadRoot, "bin/busybox"), 0o755);
   for (const applet of [
     "cat", "chmod", "cp", "env", "false", "ls", "mkdir", "mv", "printf", "rm", "sh",
     "sleep", "test", "touch", "true", "uname",
   ]) {
-    await symlink("busybox", resolve(root, "bin", applet));
+    await symlink("busybox", resolve(workloadRoot, "bin", applet));
   }
   const caBundle = await boundedRegularFile(caBundlePath, 4 * 1024 * 1024, "CA bundle");
   if (caBundle.includes(0) || !caBundle.includes(Buffer.from("-----BEGIN CERTIFICATE-----", "ascii"))) {
     throw new Error("CA bundle is not a PEM certificate bundle");
   }
-  await copyFile(caBundlePath, resolve(root, "etc/ssl/certs/ca-certificates.crt"));
-  await chmod(resolve(root, "etc/ssl/certs/ca-certificates.crt"), 0o644);
-  await symlink("certs/ca-certificates.crt", resolve(root, "etc/ssl/cert.pem"));
+  await copyFile(caBundlePath, resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"));
+  await chmod(resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"), 0o644);
+  await symlink("certs/ca-certificates.crt", resolve(workloadRoot, "etc/ssl/cert.pem"));
   await copyFile(guestAgent, resolve(root, "sbin/sandbox-guest"));
   await chmod(resolve(root, "sbin/sandbox-guest"), 0o755);
-  await writeFile(resolve(root, "etc/passwd"), "root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000:agent:/home/agent:/bin/sh\n", { mode: 0o644 });
-  await writeFile(resolve(root, "etc/group"), "root:x:0:\nagent:x:1000:\n", { mode: 0o644 });
+  await writeFile(resolve(workloadRoot, "etc/passwd"), "root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000:agent:/home/agent:/bin/sh\n", { mode: 0o644 });
+  await writeFile(resolve(workloadRoot, "etc/group"), "root:x:0:\nagent:x:1000:\n", { mode: 0o644 });
   await normalizeTimestamps(root);
+  await normalizeTimestamps(workloadRoot);
 
-  const rootfs = resolve(temporary, "minimal-rootfs.ext4");
+  const rootfs = resolve(temporary, "minimal-bootstrap.ext4");
   await createSparse(rootfs, 32 * 1024 * 1024);
   await run(
     "mkfs.ext4",
@@ -99,6 +104,15 @@ try {
     { E2FSPROGS_FAKE_TIME: "1700000000" },
   );
   await normalizeExt4(rootfs, 8192, "33333333-3333-4333-8333-333333333333", temporary, true);
+  const workload = resolve(temporary, "minimal-workload.ext4");
+  await createSparse(workload, 128 * 1024 * 1024);
+  await run(
+    "mkfs.ext4",
+    ["-F", "-q", "-O", "^has_journal", "-U", "55555555-5555-4555-8555-555555555555", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", workloadRoot, workload],
+    process.cwd(),
+    { E2FSPROGS_FAKE_TIME: "1700000000" },
+  );
+  await normalizeExt4(workload, 32768, "66666666-6666-4666-8666-666666666666", temporary, true);
   const workspace = resolve(temporary, "empty-workspace.ext4");
   const empty = resolve(temporary, "empty");
   await mkdir(empty);
@@ -123,27 +137,49 @@ try {
   await mkdir(destination, { recursive: true });
   await mkdir(native, { recursive: true });
   await replaceArtifact(kernel, resolve(destination, "vmlinux-6.1.177"));
-  await replaceArtifact(rootfs, resolve(destination, "minimal-rootfs.ext4"));
+  await replaceArtifact(rootfs, resolve(destination, "minimal-bootstrap.ext4"));
+  await replaceArtifact(workload, resolve(destination, "minimal-workload.ext4"));
   await replaceArtifact(workspace, resolve(native, "empty-workspace.ext4"));
 
   const unsigned = {
-    formatVersion: 1,
+    formatVersion: 2,
     id: "sandbox-minimal",
     version: "0.1.0",
     architecture: "x64",
-    kernel: { path: "vmlinux-6.1.177", sha256: kernelSha256 },
-    rootfs: {
-      path: "minimal-rootfs.ext4",
-      sha256: sha256(await readFile(rootfs)),
-      format: "ext4",
+    bootBundle: {
+      kernel: { path: "vmlinux-6.1.177", sha256: kernelSha256 },
+      bootstrap: {
+        path: "minimal-bootstrap.ext4",
+        sha256: sha256(await readFile(rootfs)),
+        format: "ext4",
+      },
+      guestAgent: {
+        version: "0.1.0",
+        protocolMajor: guestProtocolMajor,
+        protocolMinor: guestProtocolMinor,
+        sha256: sha256(guestBytes),
+      },
+      capabilities: { overlayfs: true, vsock: true, seccomp: true, cgroupV2: true, devpts: true },
     },
-    guestAgent: {
-      version: "0.1.0",
-      protocolMajor: guestProtocolMajor,
-      protocolMinor: guestProtocolMinor,
-      sha256: sha256(guestBytes),
+    workload: {
+      rootfs: {
+        path: "minimal-workload.ext4",
+        sha256: sha256(await readFile(workload)),
+        format: "ext4",
+      },
+      defaults: {
+        environment: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
+        user: "agent",
+        workingDirectory: "/workspace",
+        entrypoint: [],
+        command: [],
+      },
+      provenance: {
+        kind: "source-built",
+        sourceDigest: sha256(Buffer.concat([busyboxBytes, caBundle])),
+      },
+      compatibleProtocolMajor: guestProtocolMajor,
     },
-    capabilities: { overlayfs: true, vsock: true, seccomp: true, cgroupV2: true, devpts: true },
   } as const;
   // Rust serializes the cleared optional signature as JSON null before canonical hashing.
   const identity = identityDigest({ ...unsigned, signature: null });

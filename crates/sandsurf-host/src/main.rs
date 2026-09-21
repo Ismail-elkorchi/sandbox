@@ -23,6 +23,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(sandbox_launcher_linux::launcher_main());
     }
     #[cfg(target_os = "linux")]
+    if mode == "--linux-vmm-launcher" {
+        std::process::exit(sandbox_launcher_linux::vmm_launcher_main());
+    }
+    #[cfg(target_os = "linux")]
     if mode == "--linux-isolated" {
         std::process::exit(sandbox_launcher_linux::isolated_main(arguments.next()));
     }

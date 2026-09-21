@@ -6,6 +6,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sandbox_digest::identity_digest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, Read};
@@ -20,11 +21,56 @@ pub struct ImageManifest {
     pub id: String,
     pub version: String,
     pub architecture: Architecture,
+    pub boot_bundle: BootBundleManifest,
+    pub workload: WorkloadImageManifest,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootBundleManifest {
     pub kernel: ImageArtifact,
-    pub rootfs: RootfsArtifact,
+    pub bootstrap: RootfsArtifact,
     pub guest_agent: GuestAgentArtifact,
     pub capabilities: ImageCapabilities,
-    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadImageManifest {
+    pub rootfs: RootfsArtifact,
+    pub defaults: WorkloadDefaults,
+    pub provenance: WorkloadProvenance,
+    pub compatible_protocol_major: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadDefaults {
+    pub environment: BTreeMap<String, String>,
+    pub user: Option<String>,
+    pub working_directory: Option<String>,
+    pub entrypoint: Vec<String>,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum WorkloadProvenance {
+    SourceBuilt {
+        source_digest: String,
+    },
+    Oci {
+        index_digest: String,
+        manifest_digest: String,
+        config_digest: String,
+        conversion_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,7 +137,8 @@ pub struct VerifiedImage {
     pub manifest_path: PathBuf,
     pub manifest_digest: String,
     pub kernel_path: PathBuf,
-    pub rootfs_path: PathBuf,
+    pub bootstrap_path: PathBuf,
+    pub workload_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -147,21 +194,28 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
     let directory = path
         .parent()
         .ok_or_else(|| ImageError::Invalid("manifest has no parent directory".into()))?;
-    let kernel_path = resolve_beneath(directory, &manifest.kernel.path)?;
-    let rootfs_path = resolve_beneath(directory, &manifest.rootfs.path)?;
-    verify_artifact(&kernel_path, &manifest.kernel.sha256, "kernel")?;
-    verify_artifact(&rootfs_path, &manifest.rootfs.sha256, "rootfs")?;
+    let kernel_path = resolve_beneath(directory, &manifest.boot_bundle.kernel.path)?;
+    let bootstrap_path = resolve_beneath(directory, &manifest.boot_bundle.bootstrap.path)?;
+    let workload_path = resolve_beneath(directory, &manifest.workload.rootfs.path)?;
+    verify_artifact(&kernel_path, &manifest.boot_bundle.kernel.sha256, "kernel")?;
+    verify_artifact(
+        &bootstrap_path,
+        &manifest.boot_bundle.bootstrap.sha256,
+        "bootstrap",
+    )?;
+    verify_artifact(&workload_path, &manifest.workload.rootfs.sha256, "workload")?;
     Ok(VerifiedImage {
         manifest,
         manifest_path: path.to_path_buf(),
         manifest_digest,
         kernel_path,
-        rootfs_path,
+        bootstrap_path,
+        workload_path,
     })
 }
 
 pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageError> {
-    if manifest.format_version != 1
+    if manifest.format_version != 2
         || manifest.id.is_empty()
         || manifest.id.len() > 128
         || manifest.version.is_empty()
@@ -169,18 +223,20 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
     {
         return Err(ImageError::Invalid("invalid version or identifier".into()));
     }
-    if manifest.guest_agent.protocol_major != 2
-        || !manifest.capabilities.vsock
-        || !manifest.capabilities.seccomp
+    if manifest.boot_bundle.guest_agent.protocol_major != 2
+        || manifest.workload.compatible_protocol_major != 2
+        || !manifest.boot_bundle.capabilities.vsock
+        || !manifest.boot_bundle.capabilities.seccomp
     {
         return Err(ImageError::Invalid(
             "guest must support protocol 2, vsock, and seccomp".into(),
         ));
     }
     for digest in [
-        &manifest.kernel.sha256,
-        &manifest.rootfs.sha256,
-        &manifest.guest_agent.sha256,
+        &manifest.boot_bundle.kernel.sha256,
+        &manifest.boot_bundle.bootstrap.sha256,
+        &manifest.boot_bundle.guest_agent.sha256,
+        &manifest.workload.rootfs.sha256,
     ] {
         if digest.len() != 64
             || !digest
@@ -192,7 +248,64 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
             ));
         }
     }
+    let defaults = &manifest.workload.defaults;
+    if defaults.environment.len() > 4096
+        || defaults.entrypoint.len() > 4096
+        || defaults.command.len() > 4096
+        || defaults.environment.iter().any(|(name, value)| {
+            name.is_empty() || name.contains('=') || name.contains('\0') || value.contains('\0')
+        })
+        || defaults
+            .entrypoint
+            .iter()
+            .chain(&defaults.command)
+            .any(|value| value.len() > 64 * 1024 || value.contains('\0'))
+        || defaults
+            .user
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096 || value.contains('\0'))
+        || defaults.working_directory.as_ref().is_some_and(|value| {
+            value.len() > 4096 || value.contains('\0') || !value.starts_with('/')
+        })
+    {
+        return Err(ImageError::Invalid(
+            "workload defaults are malformed or exceed bounds".into(),
+        ));
+    }
+    match &manifest.workload.provenance {
+        WorkloadProvenance::SourceBuilt { source_digest } => validate_digest(source_digest)?,
+        WorkloadProvenance::Oci {
+            index_digest,
+            manifest_digest,
+            config_digest,
+            conversion_digest,
+        } => {
+            for value in [
+                index_digest,
+                manifest_digest,
+                config_digest,
+                conversion_digest,
+            ] {
+                let value = value.strip_prefix("sha256:").unwrap_or(value);
+                validate_digest(value)?;
+            }
+        }
+    }
     Ok(())
+}
+
+fn validate_digest(value: &str) -> Result<(), ImageError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Err(ImageError::Invalid(
+            "artifact digest is not lowercase SHA-256".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn verify_signature(manifest: &ImageManifest, public_key: &[u8; 32]) -> Result<(), ImageError> {
@@ -336,31 +449,54 @@ mod tests {
 
     fn test_manifest(kernel: &[u8], rootfs: &[u8]) -> ImageManifest {
         ImageManifest {
-            format_version: 1,
+            format_version: 2,
             id: "test-image".into(),
             version: "1".into(),
             architecture: Architecture::X64,
-            kernel: ImageArtifact {
-                path: "kernel".into(),
-                sha256: hex_sha256(kernel),
+            boot_bundle: BootBundleManifest {
+                kernel: ImageArtifact {
+                    path: "kernel".into(),
+                    sha256: hex_sha256(kernel),
+                },
+                bootstrap: RootfsArtifact {
+                    path: "bootstrap".into(),
+                    sha256: hex_sha256(rootfs),
+                    format: RootfsFormat::Ext4,
+                },
+                guest_agent: GuestAgentArtifact {
+                    version: "1".into(),
+                    protocol_major: 2,
+                    protocol_minor: 3,
+                    sha256: hex_sha256(b"guest-agent"),
+                },
+                capabilities: ImageCapabilities {
+                    overlayfs: true,
+                    vsock: true,
+                    seccomp: true,
+                    cgroup_v2: true,
+                    devpts: true,
+                },
             },
-            rootfs: RootfsArtifact {
-                path: "rootfs".into(),
-                sha256: hex_sha256(rootfs),
-                format: RootfsFormat::Ext4,
-            },
-            guest_agent: GuestAgentArtifact {
-                version: "1".into(),
-                protocol_major: 2,
-                protocol_minor: 3,
-                sha256: hex_sha256(b"guest-agent"),
-            },
-            capabilities: ImageCapabilities {
-                overlayfs: false,
-                vsock: true,
-                seccomp: true,
-                cgroup_v2: true,
-                devpts: true,
+            workload: WorkloadImageManifest {
+                rootfs: RootfsArtifact {
+                    path: "rootfs".into(),
+                    sha256: hex_sha256(rootfs),
+                    format: RootfsFormat::Ext4,
+                },
+                defaults: WorkloadDefaults {
+                    environment: BTreeMap::from([(
+                        "PATH".into(),
+                        "/usr/local/bin:/usr/bin:/bin".into(),
+                    )]),
+                    user: Some("agent".into()),
+                    working_directory: Some("/workspace".into()),
+                    entrypoint: Vec::new(),
+                    command: Vec::new(),
+                },
+                provenance: WorkloadProvenance::SourceBuilt {
+                    source_digest: hex_sha256(b"source"),
+                },
+                compatible_protocol_major: 2,
             },
             signature: None,
         }
@@ -373,6 +509,7 @@ mod tests {
         rootfs: &[u8],
     ) -> PathBuf {
         fs::write(directory.join("kernel"), kernel).unwrap();
+        fs::write(directory.join("bootstrap"), rootfs).unwrap();
         fs::write(directory.join("rootfs"), rootfs).unwrap();
         let path = directory.join("manifest.json");
         fs::write(&path, serde_json::to_vec(manifest).unwrap()).unwrap();
@@ -414,7 +551,7 @@ mod tests {
         fs::write(temporary.0.join("rootfs"), b"modified-rootfs").unwrap();
         assert!(matches!(
             verify_image(&path, ImageTrust::ExplicitLocal),
-            Err(ImageError::DigestMismatch("rootfs"))
+            Err(ImageError::DigestMismatch("workload"))
         ));
     }
 
@@ -464,7 +601,8 @@ mod tests {
         ));
         fs::write(&outside, b"outside").unwrap();
         let mut manifest = test_manifest(b"outside", b"rootfs");
-        manifest.kernel.path = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        manifest.boot_bundle.kernel.path =
+            format!("../{}", outside.file_name().unwrap().to_string_lossy());
         let path = write_image(&temporary.0, &manifest, b"unused", b"rootfs");
         assert!(matches!(
             verify_image(&path, ImageTrust::ExplicitLocal),
@@ -473,7 +611,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            manifest.kernel.path = "kernel-link".into();
+            manifest.boot_bundle.kernel.path = "kernel-link".into();
             std::os::unix::fs::symlink(&outside, temporary.0.join("kernel-link")).unwrap();
             fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             assert!(matches!(
