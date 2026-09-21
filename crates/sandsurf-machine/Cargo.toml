@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+apple-source-check = []
+
 [dependencies]
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 serde.workspace = true

@@ -47,6 +47,10 @@ pub struct AppleConfig {
     pub disks: Vec<AppleDisk>,
     pub memory_bytes: u64,
     pub vcpus: u32,
+    /// Private guardian endpoint relayed to the guest's virtio-socket port.
+    pub control_socket: PathBuf,
+    pub host_connect_ports: Vec<u32>,
+    pub guest_listen_ports: Vec<u32>,
     pub operation_timeout: Duration,
     pub qualification: AppleQualification,
 }
@@ -62,6 +66,8 @@ pub enum AppleConfigError {
     InvalidMemory,
     InvalidCpuCount,
     InvalidCommandLine,
+    RelativeControlSocket,
+    InvalidGuestPorts,
     TimeoutOutOfRange,
 }
 
@@ -107,6 +113,29 @@ impl AppleConfig {
         if self.command_line.len() > 16 * 1024 || self.command_line.contains('\0') {
             return Err(AppleConfigError::InvalidCommandLine);
         }
+        if !self.control_socket.is_absolute() {
+            return Err(AppleConfigError::RelativeControlSocket);
+        }
+        if self.host_connect_ports.is_empty()
+            || self
+                .host_connect_ports
+                .iter()
+                .any(|port| *port < 1024 || *port == u32::MAX)
+            || self
+                .host_connect_ports
+                .windows(2)
+                .any(|ports| ports[0] >= ports[1])
+            || self
+                .guest_listen_ports
+                .iter()
+                .any(|port| *port < 1024 || *port == u32::MAX)
+            || self
+                .guest_listen_ports
+                .windows(2)
+                .any(|ports| ports[0] >= ports[1])
+        {
+            return Err(AppleConfigError::InvalidGuestPorts);
+        }
         if self.operation_timeout.is_zero()
             || self.operation_timeout.as_millis() > u128::from(u32::MAX)
         {
@@ -134,16 +163,9 @@ impl AppleDriver {
         MachineOutcome::NotApplied(bytes_digest(reason))
     }
 
-    fn lifecycle_qualified(&self) -> bool {
-        self.config.qualification.lifecycle.is_some()
-    }
-
     fn create_and_start(&mut self, command: &LifecycleCommand, epoch: Counter) -> MachineOutcome {
         if command.sandbox_id != self.config.sandbox_id {
             return Self::unavailable(b"apple-sandbox-identity-mismatch");
-        }
-        if !self.lifecycle_qualified() {
-            return Self::unavailable(b"apple-configuration-not-qualified");
         }
         if self.owner.is_some() {
             return MachineOutcome::Unknown;
@@ -156,7 +178,7 @@ impl AppleDriver {
             Ok(value) => value,
             Err(_) => return Self::unavailable(b"apple-helper-not-started"),
         };
-        let response = owner.request(&HelperRequest::Create {
+        let response = owner.request(&HelperRequest::Create(Box::new(HelperCreate {
             sandbox_id: command.sandbox_id.clone(),
             kernel: self.config.kernel.clone(),
             initial_ramdisk: self.config.initial_ramdisk.clone(),
@@ -164,7 +186,10 @@ impl AppleDriver {
             disks: self.config.disks.clone(),
             memory_bytes: self.config.memory_bytes,
             vcpus: self.config.vcpus,
-        });
+            control_socket: self.config.control_socket.clone(),
+            host_connect_ports: self.config.host_connect_ports.clone(),
+            guest_listen_ports: self.config.guest_listen_ports.clone(),
+        })));
         match response {
             Ok(value)
                 if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
@@ -253,6 +278,55 @@ impl AppleDriver {
             _ => MachineOutcome::Unknown,
         }
     }
+
+    pub fn pause_for_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
+        match owner.request(&HelperRequest::Pause) {
+            Ok(value)
+                if value.kind == ResponseKind::Observed && value.state == MachineState::Paused =>
+            {
+                Ok(())
+            }
+            _ => Err(AppleRuntimeError::TransitionFailed),
+        }
+    }
+
+    pub fn resume_after_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
+        match owner.request(&HelperRequest::Resume) {
+            Ok(value)
+                if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
+            {
+                Ok(())
+            }
+            _ => Err(AppleRuntimeError::TransitionFailed),
+        }
+    }
+
+    pub fn contain_unobserved(&mut self) {
+        if let Some(mut owner) = self.owner.take() {
+            owner.contain();
+        }
+    }
+
+    #[must_use]
+    pub fn has_live_owner(&mut self) -> bool {
+        self.owner
+            .as_mut()
+            .is_some_and(|owner| matches!(owner.child.try_wait(), Ok(None)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppleRuntimeError {
+    OwnerUnavailable,
+    TransitionFailed,
 }
 
 impl MachineDriver for AppleDriver {
@@ -559,18 +633,25 @@ fn read_response(stream: &mut impl Read) -> io::Result<HelperResponse> {
     rename_all_fields = "camelCase"
 )]
 enum HelperRequest {
-    Create {
-        sandbox_id: SandboxId,
-        kernel: PathBuf,
-        initial_ramdisk: Option<PathBuf>,
-        command_line: String,
-        disks: Vec<AppleDisk>,
-        memory_bytes: u64,
-        vcpus: u32,
-    },
+    Create(Box<HelperCreate>),
     Pause,
     Resume,
     Stop,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperCreate {
+    sandbox_id: SandboxId,
+    kernel: PathBuf,
+    initial_ramdisk: Option<PathBuf>,
+    command_line: String,
+    disks: Vec<AppleDisk>,
+    memory_bytes: u64,
+    vcpus: u32,
+    control_socket: PathBuf,
+    host_connect_ports: Vec<u32>,
+    guest_listen_ports: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -640,6 +721,9 @@ mod tests {
             }],
             memory_bytes: 1024 * 1024 * 1024,
             vcpus: 2,
+            control_socket: PathBuf::from("/private/tmp/control.sock"),
+            host_connect_ports: vec![52_001],
+            guest_listen_ports: vec![],
             operation_timeout: Duration::from_secs(30),
             qualification: AppleQualification {
                 lifecycle: None,
@@ -662,6 +746,29 @@ mod tests {
         let mut oversized = ((MAX_HELPER_MESSAGE + 1) as u32).to_be_bytes().to_vec();
         oversized.extend_from_slice(b"{}");
         assert!(read_response(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
+    fn create_request_keeps_the_flat_helper_contract() {
+        let request = HelperRequest::Create(Box::new(HelperCreate {
+            sandbox_id: "box".try_into().unwrap(),
+            kernel: "/kernel".into(),
+            initial_ramdisk: None,
+            command_line: "root=/dev/vda".into(),
+            disks: vec![AppleDisk {
+                path: "/disk".into(),
+                read_only: true,
+            }],
+            memory_bytes: 512 * 1024 * 1024,
+            vcpus: 2,
+            control_socket: "/private/tmp/control.sock".into(),
+            host_connect_ports: vec![10_789],
+            guest_listen_ports: vec![12_080],
+        }));
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["kind"], "create");
+        assert_eq!(value["sandboxId"], "box");
+        assert_eq!(value["hostConnectPorts"][0], 10_789);
     }
 
     #[test]

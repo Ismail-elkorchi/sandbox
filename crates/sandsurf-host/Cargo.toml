@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+apple-source-check = ["sandsurf-machine/apple-source-check"]
+
 [dependencies]
 getrandom.workspace = true
 cap-std = "=4.0.3"
@@ -22,12 +25,16 @@ unicode-normalization.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sandbox-guest = { path = "../sandbox-guest" }
 sandbox-network-broker = { path = "../sandbox-network-broker" }
-sandbox-vm = { path = "../sandbox-vm" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
 sandbox-policy = { path = "../sandbox-policy" }
 reqwest.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+sandbox-guest = { path = "../sandbox-guest" }
+sandbox-network-broker = { path = "../sandbox-network-broker" }
+sandbox-policy = { path = "../sandbox-policy" }
+sandbox-vm = { path = "../sandbox-vm" }
 
 [[bin]]
 name = "sandsurf-host"

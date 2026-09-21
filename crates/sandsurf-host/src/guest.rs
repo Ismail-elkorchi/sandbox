@@ -1,7 +1,7 @@
-use sandbox_vm::{GuestChannel, GuestChannelError, GuestConnection};
 use sandsurf_control::{
     EffectOutcome, Error as ControlError, Result as ControlResult, WorkloadDriver,
 };
+use sandsurf_native::{GuestChannel, GuestChannelError, GuestConnection};
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, CONTROL_COMPLETE, Counter, Frame, FrameKind,
     GuestChallenge, GuestServiceRequest, GuestServiceResponse, HostHandshake, Mutation,

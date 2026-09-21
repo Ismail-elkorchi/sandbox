@@ -4,8 +4,7 @@ use crate::guest::{GuestClient, RemoteWorkloadDriver};
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandbox_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
 use sandbox_vm::{
-    FirecrackerConfig, FirecrackerProcess, FirecrackerRestore, UnixVsockChannel, VmNetworkBridge,
-    VmPortGateway,
+    FirecrackerConfig, FirecrackerProcess, FirecrackerRestore, VmNetworkBridge, VmPortGateway,
 };
 use sandsurf_control::{
     EffectOutcome, Error as ControlError, GuardianEffect, Result as ControlResult, WorkloadDriver,
@@ -14,6 +13,7 @@ use sandsurf_machine::linux::{
     FirecrackerDriver, FirecrackerEpochFactory, FirecrackerQualification, FirecrackerRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
+use sandsurf_native::UnixVsockChannel;
 use sandsurf_protocol::{
     Capability, CheckpointArtifact, CheckpointProcessWatermark, Counter, Digest, Domain,
     GuestServiceRequest, GuestServiceResponse, LifecycleCommand, LiveResourceLimits,

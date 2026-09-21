@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -304,20 +306,27 @@ fn bind_beneath_parent(path: &Path) -> io::Result<UnixListener> {
             "VM network socket path must be absolute",
         ));
     }
-    let parent = path.parent().ok_or_else(|| {
+    let _parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "VM network socket has no parent directory",
         )
     })?;
-    let name = path.file_name().ok_or_else(|| {
+    let _name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "VM network socket has no name")
     })?;
-    let directory = File::open(parent)?;
-    let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
-    let listener = UnixListener::bind(short)?;
-    drop(directory);
-    Ok(listener)
+    #[cfg(target_os = "linux")]
+    {
+        let directory = File::open(_parent)?;
+        let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(_name);
+        let listener = UnixListener::bind(short)?;
+        drop(directory);
+        Ok(listener)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        UnixListener::bind(path)
+    }
 }
 
 fn tunnel_accept_loop(

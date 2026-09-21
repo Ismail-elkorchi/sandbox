@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "minimal-bootstrap.ext4",
-      "sha256": "c315e446656b7761a80604597d038158c08ba704a25bf48962658da87c1fad2d",
+      "sha256": "abe500aafab8becfc36039230539dea9db80cf36e3b9d9aaceff87ab24ce1bbc",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
       "protocolMajor": 2,
       "protocolMinor": 0,
-      "sha256": "9d759b14d79e3d413474d9972284a5a534414074843a3eff01c996c448aded18"
+      "sha256": "c84608dec495a776d5375fd1611e9d1ebdb52f8b7112db6ccfde25496a252cf0"
     },
     "capabilities": {
       "overlayfs": true,

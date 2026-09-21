@@ -730,6 +730,7 @@ mod tests {
         );
         let metadata = destination.metadata().unwrap();
         assert_eq!(metadata.len(), 16 * 1024 * 1024);
+        #[cfg(target_os = "linux")]
         assert!(metadata.blocks() * 512 < metadata.len() / 2);
     }
 }

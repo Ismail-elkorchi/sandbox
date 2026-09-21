@@ -13,7 +13,7 @@ use sandsurf_protocol::{
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "apple-source-check"))]
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;

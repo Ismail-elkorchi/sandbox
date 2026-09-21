@@ -56,7 +56,7 @@ impl SecretAuthority {
             Ok(mut file) => {
                 file.write_all(bytes)?;
                 file.sync_all()?;
-                File::open(&directory)?.sync_all()?;
+                sync_directory(&directory)?;
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = self.read(&id, &version)?;
@@ -121,6 +121,24 @@ fn private_new_file(path: &Path) -> io::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     options.open(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Windows requires backup-semantics when opening a directory handle. A
+    // successful sync is the publication barrier for the version file.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000)
+        .open(path)?
+        .sync_all()
 }
 
 #[cfg(test)]

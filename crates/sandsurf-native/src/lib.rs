@@ -3,6 +3,14 @@
 //! Native ownership mechanisms shared by the host/guardian and guest bootstrap.
 //! They do not admit authority, launch arbitrary programs, or qualify a VM.
 
+pub mod guest_channel;
+
+#[cfg(unix)]
+pub use guest_channel::DirectUnixChannel;
+#[cfg(unix)]
+pub use guest_channel::UnixVsockChannel;
+pub use guest_channel::{GuestChannel, GuestChannelError, GuestConnection};
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 

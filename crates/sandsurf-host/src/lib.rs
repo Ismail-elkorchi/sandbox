@@ -1,8 +1,10 @@
 #![deny(unsafe_code)]
 
 pub mod api;
+#[cfg(any(target_os = "macos", feature = "apple-source-check"))]
+pub mod apple;
 mod checkpoints;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod guest;
 #[cfg(target_os = "linux")]
 pub mod images;

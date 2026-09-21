@@ -16,7 +16,7 @@ use sandsurf_workload::{
 };
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{size_of, zeroed};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -496,6 +496,7 @@ fn prepare_persistent_workload() -> io::Result<()> {
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("errors=remount-ro"),
     )?;
+    grow_ext4_to_device("/dev/vdc", "/sandsurf/state")?;
     mount(
         Some("/dev/vdb"),
         "/sandsurf/lower",
@@ -510,6 +511,7 @@ fn prepare_persistent_workload() -> io::Result<()> {
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         Some("errors=remount-ro"),
     )?;
+    grow_ext4_to_device("/dev/vdd", CONTROL_ROOT)?;
     fs::create_dir_all("/sandsurf/state/upper")?;
     fs::create_dir_all("/sandsurf/state/work")?;
     mount(
@@ -574,6 +576,70 @@ fn prepare_persistent_workload() -> io::Result<()> {
         Path::new(WORKLOAD_ROOT).join("workspace"),
         fs::Permissions::from_mode(0o755),
     )?;
+    Ok(())
+}
+
+/// Grow a mounted ext4 filesystem to its host-provisioned virtual block size.
+/// This keeps raw persistent disks portable to macOS and Windows hosts, which
+/// must not mount guest filesystems or depend on host-installed `resize2fs`.
+fn grow_ext4_to_device(device: &str, mountpoint: &str) -> io::Result<()> {
+    const BLKGETSIZE64: u64 = 0x8008_1272;
+    const EXT4_IOC_RESIZE_FS: u64 = 0x4008_6610;
+
+    let mut device_file = File::open(device)?;
+    let mut device_bytes = 0_u64;
+    // SAFETY: BLKGETSIZE64 writes one u64 to the valid mutable pointer and the
+    // descriptor is a live block-device handle retained for the call.
+    if unsafe {
+        libc::ioctl(
+            device_file.as_raw_fd(),
+            BLKGETSIZE64 as _,
+            &mut device_bytes,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut superblock = [0_u8; 0x154];
+    device_file.seek(SeekFrom::Start(1024))?;
+    device_file.read_exact(&mut superblock)?;
+    if u16::from_le_bytes([superblock[0x38], superblock[0x39]]) != 0xef53 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persistent disk is not ext4",
+        ));
+    }
+    let logarithm = u32::from_le_bytes(superblock[0x18..0x1c].try_into().expect("four bytes"));
+    let block_bytes = 1024_u64
+        .checked_shl(logarithm)
+        .filter(|value| (1024..=65_536).contains(value))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ext4 block size is invalid"))?;
+    if !device_bytes.is_multiple_of(block_bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persistent disk size is not block aligned",
+        ));
+    }
+    let current_low = u32::from_le_bytes(superblock[0x04..0x08].try_into().expect("four bytes"));
+    let current_high = u32::from_le_bytes(superblock[0x150..0x154].try_into().expect("four bytes"));
+    let current_blocks = u64::from(current_low) | (u64::from(current_high) << 32);
+    let target_blocks = device_bytes / block_bytes;
+    if target_blocks <= current_blocks {
+        return Ok(());
+    }
+    let directory = File::open(mountpoint)?;
+    // SAFETY: EXT4_IOC_RESIZE_FS reads one u64 from the valid pointer. The
+    // descriptor names the mounted ext4 root and target fits the backing disk.
+    if unsafe {
+        libc::ioctl(
+            directory.as_raw_fd(),
+            EXT4_IOC_RESIZE_FS as _,
+            &target_blocks,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
