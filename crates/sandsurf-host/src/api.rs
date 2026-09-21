@@ -58,6 +58,7 @@ pub struct SandboxView {
     pub id: SandboxId,
     pub image_digest: Digest,
     pub resources: Resources,
+    pub runtime_configuration: sandsurf_protocol::RuntimeConfiguration,
     pub configuration_revision: Counter,
     pub reservation: ReservationView,
     pub lifecycle_intent: LifecycleIntent,
@@ -252,6 +253,47 @@ pub enum HostRequest {
         revoked: bool,
         approval_id: CommitmentId,
     },
+    SetNetworkPolicy {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        policy: sandsurf_protocol::NetworkPolicy,
+        approval_id: CommitmentId,
+    },
+    SetExposure {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        exposure_id: sandsurf_protocol::ExposureId,
+        spec: sandsurf_protocol::ExposureSpec,
+        active: bool,
+        approval_id: CommitmentId,
+    },
+    PutSecret {
+        secret_id: sandsurf_protocol::SecretId,
+        bytes: Vec<u8>,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
+    DeliverSecret {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        scope_digest: Digest,
+        delivery: sandsurf_protocol::SecretDelivery,
+        approval_id: CommitmentId,
+    },
+    UpdateResources {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        resources: Resources,
+        live: sandsurf_protocol::LiveResourceLimits,
+        approval_id: CommitmentId,
+    },
+    GetUsage {
+        sandbox_id: SandboxId,
+    },
     Workload {
         sandbox_id: SandboxId,
         epoch: Counter,
@@ -374,6 +416,20 @@ pub enum HostResponse {
     },
     Grant {
         grant: Grant,
+    },
+    Configuration {
+        revision: Counter,
+        sandbox: SandboxView,
+    },
+    Exposure {
+        exposure: sandsurf_protocol::Exposure,
+        sandbox: SandboxView,
+    },
+    Secret {
+        secret: sandsurf_protocol::SecretVersion,
+    },
+    Usage {
+        usage: sandsurf_protocol::ResourceUsage,
     },
     Dispatch {
         operation: Operation,

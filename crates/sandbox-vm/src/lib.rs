@@ -2,6 +2,7 @@
 
 mod artifact;
 mod changeset;
+mod exposure;
 mod firecracker;
 mod guest_channel;
 mod network;
@@ -14,6 +15,7 @@ pub use changeset::{
     ApplyError, ApplyReport, BaseEntry, ChangeOperation, ChangeSet, apply_change_set,
     create_change_set, recover_interrupted_apply, validate_change_set,
 };
+pub use exposure::VmPortGateway;
 pub use firecracker::{FirecrackerConfig, FirecrackerError, FirecrackerProcess};
 pub use guest_channel::{GuestChannel, GuestChannelError, GuestConnection, UnixVsockChannel};
 pub use network::VmNetworkBridge;

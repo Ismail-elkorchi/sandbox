@@ -12,6 +12,7 @@ sandbox-image = { path = "../sandbox-image" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
 sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-policy = { path = "../sandbox-policy" }
+sandsurf-protocol = { path = "../sandsurf-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

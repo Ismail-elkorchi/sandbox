@@ -7,7 +7,7 @@ export const SANDSURF_MAX_CONTROL_BYTES = 256 * 1024;
 export const SANDSURF_MAX_STREAM_BYTES = 64 * 1024;
 const MAGIC = Buffer.from("SSF1");
 
-export type SandsurfDigestDomain = "sandbox" | "grant" | "operation" | "receipt" | "output" | "release" | "image" | "checkpoint" | "transfer";
+export type SandsurfDigestDomain = "sandbox" | "grant" | "operation" | "receipt" | "output" | "release" | "image" | "checkpoint" | "transfer" | "network" | "secret" | "resource" | "exposure";
 export type SandsurfFrameKind = "control" | "data" | "credit" | "end";
 const kinds: readonly SandsurfFrameKind[] = ["control", "data", "credit", "end"];
 
@@ -327,7 +327,7 @@ export class SandsurfFrameDecoder {
 
 /** Same domain-separated canonical encoding as sandbox-digest's Sandsurf domains. */
 export function sandsurfDigest(domain: SandsurfDigestDomain, value: unknown): string {
-  if (!["sandbox", "grant", "operation", "receipt", "output", "release", "image", "checkpoint", "transfer"].includes(domain)) throw new Error("unknown digest domain");
+  if (!["sandbox", "grant", "operation", "receipt", "output", "release", "image", "checkpoint", "transfer", "network", "secret", "resource", "exposure"].includes(domain)) throw new Error("unknown digest domain");
   const hash = createHash("sha256");
   let encodedBytes = 0;
   const put = (bytes: Uint8Array): void => {

@@ -177,6 +177,17 @@ impl ProcessSupervisor {
     }
 
     pub fn spawn(&self, request: SpawnRequest) -> Result<ProcessSnapshot, ProcessError> {
+        self.spawn_with_environment(request, &BTreeMap::new())
+    }
+
+    /// Add supervisor-held environment capabilities only to the child launch.
+    /// The retained request and every guardian observation remain the exact
+    /// host-authorized request, so secret bytes never enter process metadata.
+    pub fn spawn_with_environment(
+        &self,
+        request: SpawnRequest,
+        additional_environment: &BTreeMap<String, String>,
+    ) -> Result<ProcessSnapshot, ProcessError> {
         request
             .validate()
             .map_err(|_| ProcessError::Invalid("spawn validation failed"))?;
@@ -223,16 +234,34 @@ impl ProcessSupervisor {
             .map(|(manager, limits)| manager.create_process(&request.process_id, *limits))
             .transpose()?;
         let attachment = cgroup.as_ref().map(ProcessCgroup::attachment).transpose()?;
-        let mut spawned =
-            match spawn_child(&request, attachment.as_ref(), self.workload_root.as_deref()) {
-                Ok(value) => value,
-                Err(error) => {
-                    if let Some(cgroup) = &cgroup {
-                        let _ = cgroup.cleanup();
-                    }
-                    return Err(error);
+        let mut launch_request = request.clone();
+        for (name, value) in additional_environment {
+            if launch_request
+                .environment
+                .insert(name.clone(), value.clone())
+                .is_some()
+            {
+                return Err(ProcessError::Conflict(
+                    "process environment overrides a delivered capability",
+                ));
+            }
+        }
+        launch_request
+            .validate()
+            .map_err(|_| ProcessError::Invalid("effective spawn environment is invalid"))?;
+        let mut spawned = match spawn_child(
+            &launch_request,
+            attachment.as_ref(),
+            self.workload_root.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(cgroup) = &cgroup {
+                    let _ = cgroup.cleanup();
                 }
-            };
+                return Err(error);
+            }
+        };
         let pid = spawned.child.id();
         let initial_state = ProcessState::Running;
         if let Err(error) = write_process_record(

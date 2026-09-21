@@ -22,8 +22,10 @@ unicode-normalization.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 sandbox-guest = { path = "../sandbox-guest" }
 sandbox-image = { path = "../sandbox-image" }
+sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-vm = { path = "../sandbox-vm" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
+sandbox-policy = { path = "../sandbox-policy" }
 
 [[bin]]
 name = "sandsurf-host"

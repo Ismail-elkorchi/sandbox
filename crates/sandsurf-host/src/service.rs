@@ -35,6 +35,7 @@ pub enum HostError {
     Control(sandsurf_control::Error),
     Contract(sandsurf_protocol::Invalid),
     Workspace(crate::workspace::WorkspaceError),
+    Secret(crate::secrets::SecretError),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
     Invalid(&'static str),
@@ -49,6 +50,7 @@ impl fmt::Display for HostError {
             Self::Control(error) => write!(output, "host/guardian: {error}"),
             Self::Contract(error) => write!(output, "host contract: {error}"),
             Self::Workspace(error) => error.fmt(output),
+            Self::Secret(error) => error.fmt(output),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
@@ -86,6 +88,11 @@ impl From<crate::workspace::WorkspaceError> for HostError {
         Self::Workspace(value)
     }
 }
+impl From<crate::secrets::SecretError> for HostError {
+    fn from(value: crate::secrets::SecretError) -> Self {
+        Self::Secret(value)
+    }
+}
 #[cfg(target_os = "linux")]
 impl From<crate::linux::LinuxError> for HostError {
     fn from(value: crate::linux::LinuxError) -> Self {
@@ -101,6 +108,7 @@ pub struct HostService {
     executable: PathBuf,
     verified_guardians: BTreeSet<SandboxId>,
     workspace: crate::workspace::WorkspaceAuthority,
+    secrets: crate::secrets::SecretAuthority,
 }
 
 impl HostService {
@@ -121,12 +129,14 @@ impl HostService {
         prepare_directory(&root.join("checkpoints"))?;
         prepare_directory(&root.join("transfers"))?;
         let workspace = crate::workspace::WorkspaceAuthority::open(&root.join("transfers"))?;
+        let secrets = crate::secrets::SecretAuthority::open(&root.join("secrets"))?;
         Ok(Self {
             root: root.to_path_buf(),
             catalog,
             executable,
             verified_guardians: BTreeSet::new(),
             workspace,
+            secrets,
         })
     }
 
@@ -493,6 +503,270 @@ impl HostService {
                 }
                 Ok(HostResponse::Grant { grant })
             }
+            HostRequest::SetNetworkPolicy {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                policy,
+                approval_id,
+            } => {
+                policy.validate()?;
+                let mut configuration = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("sandbox does not exist"))?
+                    .runtime_configuration;
+                configuration.network = policy;
+                let request_digest = digest(
+                    Domain::Grant,
+                    &(
+                        "sandsurf-runtime-configuration-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_revision,
+                        &configuration,
+                    ),
+                )?;
+                let revision = self.catalog.set_runtime_configuration(
+                    &sandbox_id,
+                    &operation_id,
+                    expected_revision,
+                    configuration,
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                self.apply_configuration(&sandbox_id, revision)?;
+                let record = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("sandbox disappeared from catalog"))?;
+                Ok(HostResponse::Configuration {
+                    revision,
+                    sandbox: self.view(record)?,
+                })
+            }
+            HostRequest::SetExposure {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                exposure_id,
+                mut spec,
+                active,
+                approval_id,
+            } => {
+                if active && spec.host_port == 0 {
+                    spec.host_port = reserve_ephemeral_port(&spec.host_address)?;
+                }
+                spec.validate()?;
+                let mut configuration = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("sandbox does not exist"))?
+                    .runtime_configuration;
+                let existing = configuration
+                    .exposures
+                    .iter()
+                    .position(|value| value.id == exposure_id);
+                let grant_id: GrantId = format!("exposure-{}", exposure_id.as_str())
+                    .try_into()
+                    .map_err(HostError::Contract)?;
+                let bound_port = active.then_some(spec.host_port);
+                let exposure = Exposure {
+                    id: exposure_id,
+                    sandbox_id: sandbox_id.clone(),
+                    grant_id,
+                    revision: expected_revision.next()?,
+                    spec,
+                    active,
+                    bound_port,
+                };
+                match existing {
+                    Some(index) => configuration.exposures[index] = exposure.clone(),
+                    None if active => configuration.exposures.push(exposure.clone()),
+                    None => {
+                        return Err(HostError::Invalid("cannot revoke a missing port exposure"));
+                    }
+                }
+                configuration
+                    .exposures
+                    .sort_by(|left, right| left.id.cmp(&right.id));
+                let request_digest = digest(
+                    Domain::Grant,
+                    &(
+                        "sandsurf-runtime-configuration-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_revision,
+                        &configuration,
+                    ),
+                )?;
+                let revision = self.catalog.set_runtime_configuration(
+                    &sandbox_id,
+                    &operation_id,
+                    expected_revision,
+                    configuration,
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                self.apply_configuration(&sandbox_id, revision)?;
+                let record = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("sandbox disappeared from catalog"))?;
+                Ok(HostResponse::Exposure {
+                    exposure,
+                    sandbox: self.view(record)?,
+                })
+            }
+            HostRequest::PutSecret {
+                secret_id,
+                bytes,
+                operation_id,
+                approval_id,
+            } => {
+                let version = bytes_digest(&bytes);
+                let request_digest = digest(
+                    Domain::Secret,
+                    &(
+                        "sandsurf-put-secret-v1",
+                        &secret_id,
+                        &version,
+                        bytes.len(),
+                        &operation_id,
+                    ),
+                )?;
+                self.catalog.record_host_approval(Approval {
+                    id: approval_id,
+                    request_digest,
+                })?;
+                Ok(HostResponse::Secret {
+                    secret: self.secrets.put(secret_id, &bytes)?,
+                })
+            }
+            HostRequest::DeliverSecret {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                scope_digest,
+                delivery,
+                approval_id,
+            } => {
+                delivery.validate()?;
+                let grant = self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::DeliverSecret,
+                    &scope_digest,
+                )?;
+                let request_digest = digest(
+                    Domain::Secret,
+                    &(
+                        "sandsurf-deliver-secret-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_revision,
+                        &grant.id,
+                        &scope_digest,
+                        &delivery,
+                    ),
+                )?;
+                let record = sandsurf_state::SecretDeliveryRecord {
+                    operation_id: operation_id.clone(),
+                    sandbox_id: sandbox_id.clone(),
+                    request_digest: request_digest.clone(),
+                    delivery: delivery.clone(),
+                    applied: false,
+                };
+                let record = self.catalog.admit_secret_delivery(
+                    record,
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if !record.applied {
+                    let bytes = self
+                        .secrets
+                        .read(&delivery.secret.id, &delivery.secret.version)?;
+                    self.provision_guardian(&sandbox_id)?;
+                    let response = GuardianClient::new(self.guardian_endpoint(&sandbox_id)).guest(
+                        sandbox_id.clone(),
+                        GuestServiceRequest::InstallSecret {
+                            operation_id: operation_id.clone(),
+                            delivery: delivery.clone(),
+                            bytes,
+                        },
+                    )?;
+                    if !matches!(response, GuestServiceResponse::SecretInstalled { .. }) {
+                        return Err(HostError::Invalid(
+                            "guest did not establish secret delivery",
+                        ));
+                    }
+                    self.catalog
+                        .complete_secret_delivery(&operation_id, &request_digest)?;
+                }
+                Ok(HostResponse::Secret {
+                    secret: delivery.secret,
+                })
+            }
+            HostRequest::UpdateResources {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                resources,
+                live,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Grant,
+                    &(
+                        "sandsurf-live-resources-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_revision,
+                        &resources,
+                        &live,
+                    ),
+                )?;
+                let revision = self.catalog.update_live_resources(
+                    &sandbox_id,
+                    &operation_id,
+                    expected_revision,
+                    resources,
+                    live,
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                self.apply_configuration(&sandbox_id, revision)?;
+                let record = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("sandbox disappeared from catalog"))?;
+                Ok(HostResponse::Configuration {
+                    revision,
+                    sandbox: self.view(record)?,
+                })
+            }
+            HostRequest::GetUsage { sandbox_id } => {
+                self.provision_guardian(&sandbox_id)?;
+                let response = GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                    .guest(sandbox_id.clone(), GuestServiceRequest::ResourceUsage)?;
+                let GuestServiceResponse::ResourceUsage { mut usage } = response else {
+                    return Err(HostError::Invalid(
+                        "guest resource accounting is unavailable",
+                    ));
+                };
+                let (logical, allocated) = directory_usage(&self.sandbox_root(&sandbox_id))?;
+                usage.disk_logical_bytes = logical;
+                usage.disk_allocated_bytes = allocated;
+                Ok(HostResponse::Usage { usage })
+            }
             HostRequest::Workload {
                 sandbox_id,
                 epoch,
@@ -532,7 +806,12 @@ impl HostService {
             } => {
                 if matches!(
                     request,
-                    GuestServiceRequest::Dispatch { .. } | GuestServiceRequest::PrepareStop
+                    GuestServiceRequest::Dispatch { .. }
+                        | GuestServiceRequest::PrepareStop
+                        | GuestServiceRequest::InstallSecret { .. }
+                        | GuestServiceRequest::RevokeSecret { .. }
+                        | GuestServiceRequest::ApplyResources { .. }
+                        | GuestServiceRequest::ResourceUsage
                 ) {
                     return Err(HostError::Invalid(
                         "internal guest control requests cannot use the application route",
@@ -909,6 +1188,7 @@ impl HostService {
             id: record.id,
             image_digest: record.image_digest,
             resources: record.resources,
+            runtime_configuration: record.runtime_configuration,
             configuration_revision: record.configuration_revision,
             reservation: match record.reservation {
                 ReservationState::Held => ReservationView::Held,
@@ -917,6 +1197,19 @@ impl HostService {
             lifecycle_intent: record.latest_intent,
             machine,
         })
+    }
+
+    fn apply_configuration(&mut self, sandbox: &SandboxId, revision: Counter) -> Result<()> {
+        self.provision_guardian(sandbox)?;
+        let authorization = self.catalog.authorize_configuration(sandbox, revision)?;
+        let operation =
+            GuardianClient::new(self.guardian_endpoint(sandbox)).configure(authorization)?;
+        if operation.delivery != Delivery::Applied || operation.command.revision != revision {
+            return Err(HostError::Invalid(
+                "guardian did not apply the host configuration revision",
+            ));
+        }
+        Ok(())
     }
 
     fn sandbox_root(&self, sandbox: &SandboxId) -> PathBuf {
@@ -1100,6 +1393,44 @@ fn counter(value: u64) -> Counter {
     Counter::try_from(value).expect("static host bound is a safe integer")
 }
 
+fn reserve_ephemeral_port(address: &str) -> Result<u16> {
+    let listener = std::net::TcpListener::bind((address, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn directory_usage(root: &Path) -> Result<(Counter, Counter)> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let mut logical = 0_u64;
+    let mut allocated = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        } else if metadata.is_file() {
+            logical = logical
+                .checked_add(metadata.len())
+                .ok_or(HostError::Invalid("disk usage overflow"))?;
+            #[cfg(unix)]
+            {
+                allocated = allocated
+                    .checked_add(metadata.blocks().saturating_mul(512))
+                    .ok_or(HostError::Invalid("allocated disk usage overflow"))?;
+            }
+            #[cfg(not(unix))]
+            {
+                allocated = allocated
+                    .checked_add(metadata.len())
+                    .ok_or(HostError::Invalid("allocated disk usage overflow"))?;
+            }
+        }
+    }
+    Ok((Counter::try_from(logical)?, Counter::try_from(allocated)?))
+}
+
 fn random_id(prefix: &str) -> Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|_| HostError::Invalid("host entropy unavailable"))?;
@@ -1132,6 +1463,9 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Workspace(crate::workspace::WorkspaceError::Conflict(_)) => "conflict",
         HostError::Workspace(crate::workspace::WorkspaceError::Capacity(_)) => "capacity",
         HostError::Workspace(_) => "workspace",
+        HostError::Secret(crate::secrets::SecretError::Conflict(_)) => "conflict",
+        HostError::Secret(crate::secrets::SecretError::Invalid(_)) => "protocol",
+        HostError::Secret(_) => "secret",
     }
 }
 

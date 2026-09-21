@@ -188,10 +188,13 @@ impl<E: GuardianEffect> Guardian<E> {
     pub fn handle(&mut self, request: GuardianRequest) -> GuardianResponse {
         match self.handle_inner(request) {
             Ok(response) => response,
-            Err(error) => GuardianResponse::Rejected {
-                category: error_category(&error).to_owned(),
-                message: error.to_string(),
-            },
+            Err(error) => {
+                eprintln!("sandsurf guardian request rejected: {error}");
+                GuardianResponse::Rejected {
+                    category: error_category(&error).to_owned(),
+                    message: error.to_string(),
+                }
+            }
         }
     }
 
@@ -452,9 +455,11 @@ impl<E: GuardianEffect> Guardian<E> {
                 {
                     return Err(Error::Protocol("unauthorized guardian guest request"));
                 }
-                Ok(GuardianResponse::Guest {
-                    response: self.effect.query(request)?,
-                })
+                let mut response = self.effect.query(request)?;
+                if let GuestServiceResponse::ResourceUsage { usage } = &mut response {
+                    usage.output_retained_bytes = self.journal.retained_output_bytes()?;
+                }
+                Ok(GuardianResponse::Guest { response })
             }
             GuardianRequest::Runtime {
                 sandbox_id,

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
+import { isIP } from "node:net";
 import { NativeHostClient, SandsurfHostError, integer, record, text } from "./native-host.js";
 import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js";
 
@@ -14,7 +15,16 @@ export interface SandboxCreateOptions { readonly id?: string; readonly operation
 export type Qualification = { readonly kind: "qualified"; readonly evidence: string } | { readonly kind: "unqualified"; readonly reasons: readonly string[] };
 export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; }
 export interface WorkloadDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; readonly entrypoint: readonly string[]; readonly command: readonly string[]; }
-export interface SandboxInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: Readonly<Record<string, unknown>>; readonly workloadDefaults: WorkloadDefaults; }
+export interface SandboxInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: Readonly<Record<string, unknown>>; readonly workloadDefaults: WorkloadDefaults; }
+export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
+export interface NetworkRule { readonly plane: "named-proxy" | "direct-tcp" | "dns"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
+export interface NetworkPolicy { readonly rules: readonly NetworkRule[]; }
+export interface ExposureSpec { readonly guestAddress?: string; readonly guestPort: number; readonly hostAddress?: string; readonly hostPort?: number; readonly public?: boolean; }
+export interface Exposure { readonly id: string; readonly sandboxId: string; readonly grantId: string; readonly revision: number; readonly spec: { readonly guestAddress: string; readonly guestPort: number; readonly hostAddress: string; readonly hostPort: number; readonly public: boolean }; readonly active: boolean; readonly boundPort: number | null; }
+export interface LiveResourceLimits { readonly workloadMemoryBytes: number; readonly workloadProcesses: number; readonly cpuMax?: readonly [number, number]; }
+export interface RuntimeConfiguration { readonly network: NetworkPolicy; readonly exposures: readonly Exposure[]; readonly resources: LiveResourceLimits; }
+export interface ResourceUsage { readonly cpuMicros: number; readonly memoryCurrent: number; readonly memoryPeak: number; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number; readonly ioWriteBytes: number; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly processesCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
+export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
 export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: string };
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; }
@@ -27,10 +37,11 @@ export interface ReleaseStatus { readonly requestDigest: string; readonly cleanu
 export class Sandsurf {
   readonly sandboxes: SandboxCollection;
   readonly images: ImageCollection;
+  readonly secrets: SecretCollection;
   readonly #client: NativeHostClient;
   readonly #authorizer: SandsurfAuthorizer | undefined;
   #closed = false;
-  private constructor(client: NativeHostClient, authorizer: SandsurfAuthorizer | undefined) { this.#client = client; this.#authorizer = authorizer; this.sandboxes = new SandboxCollection(this); this.images = new ImageCollection(this); }
+  private constructor(client: NativeHostClient, authorizer: SandsurfAuthorizer | undefined) { this.#client = client; this.#authorizer = authorizer; this.sandboxes = new SandboxCollection(this); this.images = new ImageCollection(this); this.secrets = new SecretCollection(this); }
   static async open(options: SandsurfOpenOptions): Promise<Sandsurf> { return new Sandsurf(await NativeHostClient.open(resolve(options.directory)), options.authorizer); }
   async inspect(): Promise<HostInspection> {
     this.#open(); const response = await this.#client.request({ kind: "inspect" });
@@ -48,6 +59,20 @@ export class Sandsurf {
     return validateIdentity(decision.approvalId);
   }
   #open(): void { if (this.#closed) throw new SandsurfHostError("client", "Sandsurf client is closed"); }
+}
+
+export class SecretCollection {
+  readonly #host: Sandsurf;
+  constructor(host: Sandsurf) { this.#host = host; }
+  async put(id: string, bytes: string | Uint8Array, options: { readonly operationId?: string } = {}): Promise<SecretVersion> {
+    const secretId = validateIdentity(id); const operationId = validateIdentity(options.operationId ?? identity("secret")); const value = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    if (!(value instanceof Uint8Array) || value.byteLength === 0 || value.byteLength > 1024 * 1024) throw new TypeError("secret must contain 1 byte through 1 MiB");
+    const version = createHash("sha256").update(value).digest("hex");
+    const approvalId = await this.#host.approve({ kind: "secret-delivery", sandboxId: "host", operationId, request: { secretId, version, bytes: value.byteLength, destination: "host-capability-store" } });
+    const response = await this.#host.request({ kind: "put-secret", secretId, bytes: [...value], operationId, approvalId });
+    if (response.kind !== "secret" || !record(response.secret)) throw protocol("secret response");
+    return parseSecret(response.secret);
+  }
 }
 
 export class ImageCollection {
@@ -109,9 +134,13 @@ export class Sandbox {
   readonly fs: SandboxFilesystem;
   readonly workspace: SandboxWorkspace;
   readonly operations: SandboxOperations;
+  readonly network: SandboxNetwork;
+  readonly ports: SandboxPorts;
+  readonly resources: SandboxResources;
+  readonly secrets: SandboxSecrets;
   readonly #host: Sandsurf;
   #view: SandboxInspection;
-  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); }
+  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); }
   get revision(): number { return this.#view.configurationRevision; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
   async inspect(): Promise<SandboxInspection> { this.#view = sandboxViewFrom(await this.#host.request({ kind: "get-sandbox", sandboxId: this.id })); return this.#view; }
@@ -148,6 +177,74 @@ export class Sandbox {
   }
 }
 
+export class SandboxNetwork {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async configure(policy: NetworkPolicy, options: { readonly operationId?: string } = {}): Promise<RuntimeConfiguration> {
+    const normalized = normalizeNetworkPolicy(policy); const operationId = validateIdentity(options.operationId ?? identity("network")); const view = await this.#sandbox.inspect();
+    const approvalId = await this.#sandbox.approve({ kind: "network-access", sandboxId: this.#sandbox.id, operationId, request: { expectedRevision: view.configurationRevision, policy: normalized } });
+    const response = await this.#sandbox.hostRequest({ kind: "set-network-policy", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, policy: normalized, approvalId });
+    if (response.kind !== "configuration" || !record(response.sandbox)) throw protocol("network configuration response");
+    return parseView(response.sandbox).runtimeConfiguration;
+  }
+  async denyAll(options: { readonly operationId?: string } = {}): Promise<RuntimeConfiguration> { return this.configure({ rules: [] }, options); }
+  async inspect(): Promise<NetworkPolicy> { return (await this.#sandbox.inspect()).runtimeConfiguration.network; }
+}
+
+export class SandboxPorts {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async expose(spec: ExposureSpec, options: { readonly id?: string; readonly operationId?: string } = {}): Promise<Exposure> {
+    const exposureId = validateIdentity(options.id ?? identity("exposure")); const operationId = validateIdentity(options.operationId ?? identity("expose")); const view = await this.#sandbox.inspect();
+    const normalized = normalizeExposure(spec);
+    const approvalId = await this.#sandbox.approve({ kind: "port-exposure", sandboxId: this.#sandbox.id, operationId, request: { exposureId, expectedRevision: view.configurationRevision, spec: normalized, active: true } });
+    const response = await this.#sandbox.hostRequest({ kind: "set-exposure", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, exposureId, spec: normalized, active: true, approvalId });
+    if (response.kind !== "exposure" || !record(response.exposure)) throw protocol("port exposure response");
+    return parseExposure(response.exposure);
+  }
+  async revoke(id: string, options: { readonly operationId?: string } = {}): Promise<Exposure> {
+    const exposureId = validateIdentity(id); const operationId = validateIdentity(options.operationId ?? identity("unexpose")); const view = await this.#sandbox.inspect(); const existing = view.runtimeConfiguration.exposures.find((value) => value.id === exposureId);
+    if (existing === undefined) throw new SandsurfHostError("missing", `Exposure ${exposureId} does not exist`);
+    const approvalId = await this.#sandbox.approve({ kind: "port-exposure", sandboxId: this.#sandbox.id, operationId, request: { exposureId, expectedRevision: view.configurationRevision, spec: existing.spec, active: false } });
+    const response = await this.#sandbox.hostRequest({ kind: "set-exposure", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, exposureId, spec: existing.spec, active: false, approvalId });
+    if (response.kind !== "exposure" || !record(response.exposure)) throw protocol("port exposure revocation response");
+    return parseExposure(response.exposure);
+  }
+  async list(): Promise<readonly Exposure[]> { return (await this.#sandbox.inspect()).runtimeConfiguration.exposures; }
+}
+
+export class SandboxResources {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async usage(): Promise<ResourceUsage> {
+    const response = await this.#sandbox.hostRequest({ kind: "get-usage", sandboxId: this.#sandbox.id });
+    if (response.kind !== "usage" || !record(response.usage)) throw protocol("resource usage response");
+    return parseUsage(response.usage);
+  }
+  async update(resources: ResourceEnvelope, live: LiveResourceLimits, options: { readonly operationId?: string } = {}): Promise<SandboxInspection> {
+    const operationId = validateIdentity(options.operationId ?? identity("resources")); const view = await this.#sandbox.inspect(); const normalized = normalizeResources(resources); const limits = normalizeLiveResources(live);
+    const approvalId = await this.#sandbox.approve({ kind: "resource-increase", sandboxId: this.#sandbox.id, operationId, request: { expectedRevision: view.configurationRevision, resources: normalized, live: limits } });
+    const response = await this.#sandbox.hostRequest({ kind: "update-resources", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, resources: normalized, live: limits, approvalId });
+    if (response.kind !== "configuration" || !record(response.sandbox)) throw protocol("resource update response");
+    return parseView(response.sandbox);
+  }
+}
+
+export class SandboxSecrets {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async deliver(secret: SecretVersion, options: { readonly path?: string | Uint8Array; readonly mode?: number; readonly environment?: string; readonly processId?: string; readonly lifetime?: "process" | "sandbox" | "until-revoked"; readonly operationId?: string } = {}): Promise<SecretVersion> {
+    const parsed = parseSecret(secret as unknown as Record<string, unknown>); const operationId = validateIdentity(options.operationId ?? identity("deliver")); const view = await this.#sandbox.inspect(); let destination: Readonly<Record<string, unknown>>;
+    if (options.environment !== undefined) { if (!/^[A-Za-z0-9_]{1,4096}$/u.test(options.environment)) throw new TypeError("secret environment name is malformed"); destination = { kind: "environment", name: options.environment }; }
+    else { const path = options.path ?? `/run/sandsurf-secrets/${parsed.id}`; destination = { kind: "file", path: [...createSandsurfGuestPath(path)], mode: options.mode ?? 0o600 }; }
+    const lifetime = options.lifetime ?? (options.processId === undefined ? "sandbox" : "process"); const processId = options.processId === undefined ? null : validateIdentity(options.processId); const delivery = { secret: parsed, destination, lifetime, processId };
+    const approvalId = await this.#sandbox.approve({ kind: "secret-delivery", sandboxId: this.#sandbox.id, operationId, request: { expectedRevision: view.configurationRevision, delivery } });
+    const response = await this.#sandbox.hostRequest({ kind: "deliver-secret", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, scopeDigest: capabilityScope(this.#sandbox.id, "deliver-secret"), delivery, approvalId });
+    if (response.kind !== "secret" || !record(response.secret)) throw protocol("secret delivery response");
+    return parseSecret(response.secret);
+  }
+}
+
 export class SandboxOperations {
   readonly #sandbox: Sandbox;
   constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
@@ -170,8 +267,8 @@ export class ProcessCollection {
     const operationId = validateIdentity(options.operationId ?? identity("spawn")); const processId = validateIdentity(options.processId ?? identity("process"));
     const view = await this.#sandbox.inspect(); const machine = currentMachine(view); const stdio = options.stdio ?? "pipes";
     const terminalSize = stdio === "terminal" ? { columns: options.terminalSize?.columns ?? 80, rows: options.terminalSize?.rows ?? 24, pixelWidth: options.terminalSize?.pixelWidth ?? 0, pixelHeight: options.terminalSize?.pixelHeight ?? 0 } : null;
-    const user = options.user ?? view.workloadDefaults.user ?? "root";
-    const operation = await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: machine.epoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", outputBytes: options.outputBytes ?? 64 * 1024 * 1024 } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId);
+    const user = options.user ?? view.workloadDefaults.user ?? "root"; const proxy = view.runtimeConfiguration.network.rules.some((rule) => rule.plane === "named-proxy") ? { HTTP_PROXY: "http://127.0.0.1:3128", HTTPS_PROXY: "http://127.0.0.1:3128", http_proxy: "http://127.0.0.1:3128", https_proxy: "http://127.0.0.1:3128", ALL_PROXY: "socks5h://127.0.0.1:1080", all_proxy: "socks5h://127.0.0.1:1080", NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" } : {};
+    const operation = await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: machine.epoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...proxy, ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", outputBytes: options.outputBytes ?? 64 * 1024 * 1024 } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId);
     if (operation.delivery === "not-applied") throw new SandsurfHostError("workload", `Process ${processId} was not applied`);
     return new SandboxProcess(this.#sandbox, processId);
   }
@@ -461,12 +558,30 @@ function normalizeResources(value: ResourceEnvelope): Required<ResourceEnvelope>
   return { vcpus: value.vcpus, memoryMiB: value.memoryMiB, diskBytes: value.diskBytes, outputBytes, processes };
 }
 function sandboxViewFrom(response: Record<string, unknown>): SandboxInspection { const value = response.kind === "sandbox" ? response.value : response.kind === "lifecycle" ? response.sandbox : undefined; if (!record(value)) throw protocol("sandbox response"); return parseView(value); }
-function parseView(value: unknown): SandboxInspection { if (!record(value) || !record(value.resources) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.workloadDefaults)) throw protocol("sandbox view"); return value as unknown as SandboxInspection; }
+function parseView(value: unknown): SandboxInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.workloadDefaults)) throw protocol("sandbox view"); return { ...value, runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as SandboxInspection; }
 function currentMachine(view: SandboxInspection): { readonly epoch: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Sandbox machine observation is unavailable"); return { epoch: integer(view.machine.value.epoch) }; }
 function parseProcess(value: unknown): ProcessInspection { if (!record(value) || !record(value.request) || !record(value.state)) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state }; }
 function parseProcessObservation(value: unknown): ProcessObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseProcess(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseProcess(value.lastKnown) }; }
 function parseEvidencePage(value: Record<string, unknown>): OutputPage { if (!Array.isArray(value.chunks)) throw protocol("output page"); const chunks = value.chunks as unknown[]; return { after: integer(value.cursor), available: integer(value.available), chunks: chunks.map((chunk) => { if (!record(chunk) || !Array.isArray(chunk.bytes)) throw protocol("output chunk"); return { cursor: integer(chunk.offset), stream: text(chunk.stream) as OutputChunk["stream"], bytes: Uint8Array.from(chunk.bytes as number[]), digest: text(chunk.bytesDigest) }; }) }; }
 function capabilityScope(sandboxId: string, capability: SandsurfCapability): string { return sandsurfDigest("grant", ["sandsurf-sandbox-capability-v1", sandboxId, capability]); }
+function normalizeNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
+  if (!Array.isArray(value.rules) || value.rules.length > 4096) throw new TypeError("network policy exceeds its rule bound");
+  const rules = value.rules.map((rule: NetworkRule) => {
+    if (!(["named-proxy", "direct-tcp", "dns"] as const).includes(rule.plane) || !Array.isArray(rule.ports) || rule.ports.length === 0 || rule.ports.length > 4096) throw new TypeError("network rule is malformed");
+    const ports = rule.ports.map((port: number | { readonly from: number; readonly to: number }) => { const range = typeof port === "number" ? { from: port, to: port } : port; if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 1 || range.from > range.to || range.to > 65535) throw new TypeError("network port range is malformed"); return range; });
+    let destination: NetworkDestination;
+    if (rule.destination.kind === "dns") { const name = rule.destination.name.toLowerCase().replace(/\.$/u, ""); if (name.length === 0 || name.length > 253 || name.includes("*") || name.split(".").some((label: string) => label.length === 0 || label.length > 63)) throw new TypeError("network DNS name is malformed"); if (rule.plane === "direct-tcp") throw new TypeError("direct TCP rules require an IP CIDR"); destination = { kind: "dns", name, includeSubdomains: rule.destination.includeSubdomains ?? false, allowPrivateAddresses: rule.destination.allowPrivateAddresses ?? false }; }
+    else { const [address, prefixText, extra] = rule.destination.cidr.split("/"); const family = address === undefined ? 0 : isIP(address); const prefix = Number(prefixText); if (extra !== undefined || family === 0 || !Number.isInteger(prefix) || prefix < 0 || prefix > (family === 4 ? 32 : 128) || rule.plane !== "direct-tcp") throw new TypeError("direct TCP CIDR is malformed"); destination = { kind: "ip", cidr: `${address}/${prefix}` }; }
+    return { plane: rule.plane, destination, ports };
+  });
+  return { rules };
+}
+function normalizeExposure(value: ExposureSpec): Exposure["spec"] { const guestAddress = value.guestAddress ?? "127.0.0.1"; const hostAddress = value.hostAddress ?? "127.0.0.1"; const guestPort = value.guestPort; const hostPort = value.hostPort ?? 0; const publicValue = value.public ?? false; if (isIP(guestAddress) === 0 || !["127.0.0.1", "::1"].includes(guestAddress) || isIP(hostAddress) === 0 || (!publicValue && !["127.0.0.1", "::1"].includes(hostAddress)) || !Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535 || !Number.isInteger(hostPort) || hostPort < 0 || hostPort > 65535) throw new TypeError("port exposure is malformed"); return { guestAddress, guestPort, hostAddress, hostPort, public: publicValue }; }
+function normalizeLiveResources(value: LiveResourceLimits): Readonly<Record<string, unknown>> { for (const item of [value.workloadMemoryBytes, value.workloadProcesses]) if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError("live resource limit is invalid"); let cpuMax: readonly [number, number] | null = null; if (value.cpuMax !== undefined) { const [quota, period] = value.cpuMax; if (!Number.isSafeInteger(quota) || quota <= 0 || !Number.isSafeInteger(period) || period < 1000 || period > 1_000_000) throw new TypeError("CPU bandwidth limit is invalid"); cpuMax = [quota, period]; } return { workloadMemoryBytes: value.workloadMemoryBytes, workloadProcesses: value.workloadProcesses, cpuMax }; }
+function parseRuntimeConfiguration(value: Record<string, unknown>): RuntimeConfiguration { if (!record(value.network) || !Array.isArray(value.network.rules) || !Array.isArray(value.exposures) || !record(value.resources)) throw protocol("runtime configuration"); return { network: normalizeNetworkPolicy(value.network as unknown as NetworkPolicy), exposures: value.exposures.map(parseExposure), resources: { workloadMemoryBytes: integer(value.resources.workloadMemoryBytes), workloadProcesses: integer(value.resources.workloadProcesses), ...(value.resources.cpuMax === null ? {} : { cpuMax: value.resources.cpuMax as unknown as readonly [number, number] }) } }; }
+function parseExposure(value: unknown): Exposure { if (!record(value) || !record(value.spec)) throw protocol("exposure"); return { id: validateIdentity(text(value.id)), sandboxId: validateIdentity(text(value.sandboxId)), grantId: validateIdentity(text(value.grantId)), revision: integer(value.revision), spec: normalizeExposure({ guestAddress: text(value.spec.guestAddress), guestPort: integer(value.spec.guestPort), hostAddress: text(value.spec.hostAddress), hostPort: integer(value.spec.hostPort), public: value.spec.public === true }), active: value.active === true, boundPort: value.boundPort === null ? null : integer(value.boundPort) }; }
+function parseSecret(value: Record<string, unknown>): SecretVersion { return { id: validateIdentity(text(value.id)), version: digest(text(value.version)), bytes: integer(value.bytes) }; }
+function parseUsage(value: Record<string, unknown>): ResourceUsage { return { cpuMicros: integer(value.cpuMicros), memoryCurrent: integer(value.memoryCurrent), memoryPeak: integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: integer(value.ioReadBytes), ioWriteBytes: integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), processesCurrent: integer(value.processesCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
 function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string, unknown>> {
   if (options.source !== undefined && options.reference !== undefined) throw new TypeError("Specify either source or reference for OCI import");
   const source = options.source ?? (options.reference === undefined ? undefined : { kind: "registry" as const, reference: options.reference });

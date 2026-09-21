@@ -6,13 +6,14 @@ use std::path::Path;
 
 const SCHEMA: &str = "
 CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
-CREATE TABLE sandboxes(id TEXT PRIMARY KEY, image TEXT NOT NULL, resources TEXT NOT NULL, revision INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE sandboxes(id TEXT PRIMARY KEY, image TEXT NOT NULL, resources TEXT NOT NULL, configuration TEXT NOT NULL, revision INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE intents(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE grants(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +77,16 @@ pub struct ImageImportRecord {
     pub image: Option<ImageRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretDeliveryRecord {
+    pub operation_id: OperationId,
+    pub sandbox_id: SandboxId,
+    pub request_digest: Digest,
+    pub delivery: SecretDelivery,
+    pub applied: bool,
+}
+
 /// Host-owned identity, configuration, and reservation facts. Machine state is
 /// deliberately absent: callers obtain that separately from the guardian.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +95,7 @@ pub struct SandboxRecord {
     pub id: SandboxId,
     pub image_digest: Digest,
     pub resources: Resources,
+    pub runtime_configuration: RuntimeConfiguration,
     pub configuration_revision: Counter,
     pub reservation: ReservationState,
     pub latest_intent: LifecycleIntent,
@@ -150,6 +162,90 @@ impl HostCatalog {
     }
     pub fn host_id(&self) -> &HostId {
         &self.host
+    }
+
+    pub fn record_host_approval(&mut self, approval: Approval) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn admit_secret_delivery(
+        &mut self,
+        record: SecretDeliveryRecord,
+        approval: Approval,
+    ) -> Result<SecretDeliveryRecord> {
+        record.delivery.validate()?;
+        if approval.request_digest != record.request_digest {
+            return Err(Error::Conflict("secret delivery approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(encoded) = tx
+            .query_row(
+                "SELECT value FROM secret_deliveries WHERE operation=?1",
+                [record.operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: SecretDeliveryRecord = decode(&encoded)?;
+            if old.request_digest == record.request_digest {
+                return Ok(old);
+            }
+            return Err(Error::Conflict(
+                "secret delivery operation identity conflict",
+            ));
+        }
+        record_approval(&tx, &approval, self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO secret_deliveries(operation,sandbox,request_digest,value) VALUES (?1,?2,?3,?4)",
+            params![
+                record.operation_id.as_str(),
+                record.sandbox_id.as_str(),
+                record.request_digest.as_str(),
+                encode(&record)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn complete_secret_delivery(
+        &mut self,
+        operation: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<SecretDeliveryRecord> {
+        let tx = self.db.connection.transaction()?;
+        let encoded: String = tx
+            .query_row(
+                "SELECT value FROM secret_deliveries WHERE operation=?1 AND request_digest=?2",
+                params![operation.as_str(), request_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::Missing("secret delivery operation is missing"))?;
+        let mut record: SecretDeliveryRecord = decode(&encoded)?;
+        if !record.applied {
+            record.applied = true;
+            tx.execute(
+                "UPDATE secret_deliveries SET value=?2,applied=1 WHERE operation=?1",
+                params![operation.as_str(), encode(&record)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn secret_deliveries(&self, sandbox: &SandboxId) -> Result<Vec<SecretDeliveryRecord>> {
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT value FROM secret_deliveries WHERE sandbox=?1 ORDER BY rowid ASC")?;
+        statement
+            .query_map([sandbox.as_str()], |row| row.get::<_, String>(0))?
+            .map(|value| decode(&value?))
+            .collect()
     }
 
     /// Admit an image mutation before any source is read or builder is run.
@@ -342,9 +438,15 @@ impl HostCatalog {
             return Err(Error::Capacity("host resource reservations exhausted"));
         }
         record_approval(&tx, &approval, self.limits.operations)?;
+        let runtime_configuration = initial_runtime_configuration(&resources)?;
         tx.execute(
-            "INSERT INTO sandboxes(id,image,resources,revision) VALUES (?1,?2,?3,1)",
-            params![id.as_str(), image.as_str(), encode(&resources)?],
+            "INSERT INTO sandboxes(id,image,resources,configuration,revision) VALUES (?1,?2,?3,?4,1)",
+            params![
+                id.as_str(),
+                image.as_str(),
+                encode(&resources)?,
+                encode(&runtime_configuration)?
+            ],
         )?;
         let value = LifecycleIntent {
             sandbox_id: id,
@@ -425,10 +527,20 @@ impl HostCatalog {
         revision: Counter,
     ) -> Result<AuthorizedConfiguration> {
         require_revision(&self.db.connection, sandbox, revision)?;
+        let configuration = self
+            .sandbox(sandbox)?
+            .ok_or(Error::Missing("sandbox is missing"))?
+            .runtime_configuration;
+        configuration.validate()?;
         let operation_id: OperationId = format!("configuration-{}", revision.get()).try_into()?;
         let request_digest = digest(
             Domain::Grant,
-            &("sandsurf-apply-configuration-v1", sandbox, revision),
+            &(
+                "sandsurf-apply-configuration-v2",
+                sandbox,
+                revision,
+                &configuration,
+            ),
         )?;
         self.authority
             .authorize_configuration(ConfigurationCommand {
@@ -436,7 +548,127 @@ impl HostCatalog {
                 operation_id,
                 revision,
                 request_digest,
+                configuration,
             })
+    }
+
+    /// Replace the host-owned runtime configuration and advance its revision
+    /// atomically. A guardian receives the signed result but never owns a
+    /// separately mutable grant/configuration set.
+    pub fn set_runtime_configuration(
+        &mut self,
+        sandbox: &SandboxId,
+        operation: &OperationId,
+        expected: Counter,
+        configuration: RuntimeConfiguration,
+        approval: Approval,
+    ) -> Result<Counter> {
+        configuration.validate()?;
+        let request = digest(
+            Domain::Grant,
+            &(
+                "sandsurf-runtime-configuration-v1",
+                sandbox,
+                operation,
+                expected,
+                &configuration,
+            ),
+        )?;
+        if request != approval.request_digest {
+            return Err(Error::Conflict("runtime configuration approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        require_revision(&tx, sandbox, expected)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let revision = expected.next()?;
+        tx.execute(
+            "UPDATE sandboxes SET configuration=?2,revision=?3 WHERE id=?1",
+            params![sandbox.as_str(), encode(&configuration)?, revision.get()],
+        )?;
+        tx.commit()?;
+        Ok(revision)
+    }
+
+    /// Increase live-qualified reservations and workload cgroup ceilings. VM
+    /// RAM/vCPU topology remains a boot-time shape and cannot be changed here.
+    pub fn update_live_resources(
+        &mut self,
+        sandbox: &SandboxId,
+        operation: &OperationId,
+        expected: Counter,
+        resources: Resources,
+        live: LiveResourceLimits,
+        approval: Approval,
+    ) -> Result<Counter> {
+        resources.validate()?;
+        live.validate()?;
+        let old = self
+            .sandbox(sandbox)?
+            .ok_or(Error::Missing("sandbox is missing"))?;
+        let memory_bytes = resources
+            .memory_mib
+            .get()
+            .checked_mul(1024 * 1024)
+            .ok_or(Error::Capacity("memory reservation overflow"))?;
+        if resources.vcpus != old.resources.vcpus
+            || resources.memory_mib != old.resources.memory_mib
+            || resources.disk_bytes < old.resources.disk_bytes
+            || resources.output_bytes < old.resources.output_bytes
+            || resources.processes < old.resources.processes
+            || live.workload_memory_bytes.get() > memory_bytes
+            || live.workload_processes > resources.processes
+        {
+            return Err(Error::Conflict(
+                "live update changes boot shape, shrinks a reservation, or exceeds its envelope",
+            ));
+        }
+        let request = digest(
+            Domain::Grant,
+            &(
+                "sandsurf-live-resources-v1",
+                sandbox,
+                operation,
+                expected,
+                &resources,
+                &live,
+            ),
+        )?;
+        if approval.request_digest != request {
+            return Err(Error::Conflict("resource update approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        require_revision(&tx, sandbox, expected)?;
+        let mut total = resources.clone();
+        {
+            let mut statement =
+                tx.prepare("SELECT resources FROM sandboxes WHERE released=0 AND id<>?1")?;
+            for row in statement.query_map([sandbox.as_str()], |row| row.get::<_, String>(0))? {
+                total = total.checked_add(&decode::<Resources>(&row?)?)?;
+            }
+        }
+        if !total.within(&self.limits.resources) {
+            return Err(Error::Capacity("host resource reservations exhausted"));
+        }
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let encoded: String = tx.query_row(
+            "SELECT configuration FROM sandboxes WHERE id=?1",
+            [sandbox.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut configuration: RuntimeConfiguration = decode(&encoded)?;
+        configuration.resources = live;
+        let revision = expected.next()?;
+        tx.execute(
+            "UPDATE sandboxes SET resources=?2,configuration=?3,revision=?4 WHERE id=?1",
+            params![
+                sandbox.as_str(),
+                encode(&resources)?,
+                encode(&configuration)?,
+                revision.get()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(revision)
     }
 
     /// Called with evidence read from the exclusively owned guardian journal, not client observations.
@@ -806,19 +1038,20 @@ impl HostCatalog {
 fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Option<SandboxRecord>> {
     let row = db
         .query_row(
-            "SELECT image,resources,revision,released FROM sandboxes WHERE id=?1",
+            "SELECT image,resources,configuration,revision,released FROM sandboxes WHERE id=?1",
             [sandbox.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((image, resources, revision, released)) = row else {
+    let Some((image, resources, configuration, revision, released)) = row else {
         return Ok(None);
     };
     let latest: String = db.query_row(
@@ -835,10 +1068,28 @@ fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Opti
         id: sandbox.clone(),
         image_digest: image.try_into()?,
         resources: decode(&resources)?,
+        runtime_configuration: decode(&configuration)?,
         configuration_revision: revision.try_into()?,
         reservation,
         latest_intent: decode(&latest)?,
     }))
+}
+
+fn initial_runtime_configuration(resources: &Resources) -> Result<RuntimeConfiguration> {
+    let memory = resources
+        .memory_mib
+        .get()
+        .checked_mul(1024 * 1024)
+        .ok_or(Error::Capacity("workload memory envelope overflow"))?;
+    Ok(RuntimeConfiguration {
+        network: NetworkPolicy::default(),
+        exposures: Vec::new(),
+        resources: LiveResourceLimits {
+            workload_memory_bytes: Counter::try_from(memory)?,
+            workload_processes: resources.processes,
+            cpu_max: None,
+        },
+    })
 }
 
 fn revision(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Counter> {

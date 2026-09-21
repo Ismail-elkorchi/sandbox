@@ -3,7 +3,9 @@
 use crate::guest::{GuestClient, RemoteWorkloadDriver};
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandbox_image::{ImageTrust, RootfsFormat, VerifiedImage, verify_image};
-use sandbox_vm::{FirecrackerConfig, FirecrackerProcess, UnixVsockChannel};
+use sandbox_vm::{
+    FirecrackerConfig, FirecrackerProcess, UnixVsockChannel, VmNetworkBridge, VmPortGateway,
+};
 use sandsurf_control::{
     EffectOutcome, Error as ControlError, GuardianEffect, Result as ControlResult, WorkloadDriver,
 };
@@ -13,8 +15,8 @@ use sandsurf_machine::linux::{
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_protocol::{
     Capability, Counter, Digest, Domain, GuestServiceRequest, GuestServiceResponse,
-    LifecycleCommand, MachineObservation, MachineState, Mutation, Resources, SandboxId,
-    bytes_digest, digest,
+    LifecycleCommand, LiveResourceLimits, MachineObservation, MachineState, Mutation,
+    NetworkDestination, NetworkPolicy, Resources, SandboxId, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -293,6 +295,26 @@ pub fn workload_defaults(
 pub struct LinuxGuardianEffect {
     machine: FirecrackerDriver<LinuxEpochFactory>,
     workload: LinuxWorkload,
+    network: Arc<Mutex<Option<VmNetworkBridge>>>,
+    network_usage: NetworkUsage,
+    exposures: Arc<Mutex<Option<VmPortGateway>>>,
+}
+
+#[derive(Default)]
+struct NetworkUsageValue {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    connections: u64,
+}
+
+type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
+
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broker::BrokerReport) {
+    if let Ok(mut usage) = usage.lock() {
+        usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
+        usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
+        usage.connections = usage.connections.saturating_add(report.connections);
+    }
 }
 
 impl LinuxGuardianEffect {
@@ -323,6 +345,9 @@ impl LinuxGuardianEffect {
         ensure_mutable_disk(&config.disk_template, &control_state, control_bytes)?;
 
         let active = Arc::new(Mutex::new(None));
+        let network = Arc::new(Mutex::new(None));
+        let network_usage = Arc::new(Mutex::new(NetworkUsageValue::default()));
+        let exposures = Arc::new(Mutex::new(None));
         let factory = LinuxEpochFactory {
             config: config.clone(),
             sandbox_root: sandbox_root.to_path_buf(),
@@ -332,6 +357,7 @@ impl LinuxGuardianEffect {
             workload_state,
             control_state,
             active: Arc::clone(&active),
+            network: Arc::clone(&network),
             pending: None,
         };
         let machine = FirecrackerDriver::new(
@@ -346,6 +372,9 @@ impl LinuxGuardianEffect {
         Ok(Self {
             machine,
             workload: LinuxWorkload { active },
+            network,
+            network_usage,
+            exposures,
         })
     }
 }
@@ -368,6 +397,17 @@ impl GuardianEffect for LinuxGuardianEffect {
         ) && let Ok(mut active) = self.workload.active.lock()
         {
             *active = None;
+            if let Ok(mut network) = self.network.lock()
+                && let Some(bridge) = network.take()
+            {
+                let report = bridge.stop();
+                accumulate_network_usage(&self.network_usage, &report);
+            }
+            if let Ok(mut exposures) = self.exposures.lock()
+                && let Some(gateway) = exposures.take()
+            {
+                let _ = gateway.stop();
+            }
         }
         outcome
     }
@@ -378,8 +418,91 @@ impl GuardianEffect for LinuxGuardianEffect {
         current: &MachineObservation,
     ) -> EffectOutcome {
         match self.machine.configure(command, current) {
-            sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
-                EffectOutcome::Applied(evidence)
+            sandsurf_machine::ConfigurationOutcome::Applied(machine_evidence) => {
+                let Some(active) = self.workload.endpoint() else {
+                    return EffectOutcome::Unknown;
+                };
+                let Ok(rules) = network_rules(&command.configuration.network) else {
+                    return EffectOutcome::NotApplied(bytes_digest(
+                        b"network-policy-normalization-failed",
+                    ));
+                };
+                let Ok(mut network) = self.network.lock() else {
+                    return EffectOutcome::Unknown;
+                };
+                if let Some(old) = network.take() {
+                    let report = old.stop();
+                    accumulate_network_usage(&self.network_usage, &report);
+                    if !report.cleanup_failures.is_empty() {
+                        return EffectOutcome::Unknown;
+                    }
+                }
+                let bridge = match VmNetworkBridge::start(
+                    &active.socket,
+                    active.network_capability,
+                    rules,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => return EffectOutcome::Unknown,
+                };
+                *network = Some(bridge);
+                drop(network);
+                let Ok(mut exposures) = self.exposures.lock() else {
+                    return EffectOutcome::Unknown;
+                };
+                if let Some(old) = exposures.take()
+                    && old.stop().is_err()
+                {
+                    return EffectOutcome::Unknown;
+                }
+                let gateway = match VmPortGateway::start(
+                    &active.socket,
+                    active.network_capability,
+                    &command.configuration.exposures,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        if let Ok(mut network) = self.network.lock()
+                            && let Some(bridge) = network.take()
+                        {
+                            let _ = bridge.stop();
+                        }
+                        return EffectOutcome::Unknown;
+                    }
+                };
+                *exposures = Some(gateway);
+                drop(exposures);
+                let resource_evidence =
+                    match guest_client(&active).call(&GuestServiceRequest::ApplyResources {
+                        resources: command.configuration.resources.clone(),
+                    }) {
+                        Ok(GuestServiceResponse::ResourcesApplied { evidence }) => evidence,
+                        _ => {
+                            if let Ok(mut network) = self.network.lock()
+                                && let Some(bridge) = network.take()
+                            {
+                                let _ = bridge.stop();
+                            }
+                            if let Ok(mut exposures) = self.exposures.lock()
+                                && let Some(gateway) = exposures.take()
+                            {
+                                let _ = gateway.stop();
+                            }
+                            return EffectOutcome::Unknown;
+                        }
+                    };
+                match digest(
+                    Domain::Grant,
+                    &(
+                        "sandsurf-linux-runtime-configuration-v1",
+                        machine_evidence,
+                        resource_evidence,
+                        &command.configuration,
+                    ),
+                ) {
+                    Ok(evidence) => EffectOutcome::Applied(evidence),
+                    Err(_) => EffectOutcome::Unknown,
+                }
             }
             sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
                 EffectOutcome::NotApplied(evidence)
@@ -393,12 +516,85 @@ impl GuardianEffect for LinuxGuardianEffect {
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        self.workload.query(request)
+        let usage_requested = matches!(request, GuestServiceRequest::ResourceUsage);
+        let mut response = self.workload.query(request)?;
+        if usage_requested && let GuestServiceResponse::ResourceUsage { usage } = &mut response {
+            let accumulated = self
+                .network_usage
+                .lock()
+                .map_err(|_| sandsurf_control::Error::Protocol("network usage lock poisoned"))?;
+            let current = self
+                .network
+                .lock()
+                .map_err(|_| sandsurf_control::Error::Protocol("network bridge lock poisoned"))?
+                .as_ref()
+                .map_or_else(Default::default, VmNetworkBridge::snapshot);
+            usage.network_rx_bytes =
+                Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes)).map_err(
+                    |_| sandsurf_control::Error::Protocol("network receive accounting overflow"),
+                )?;
+            usage.network_tx_bytes =
+                Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes)).map_err(
+                    |_| sandsurf_control::Error::Protocol("network transmit accounting overflow"),
+                )?;
+            usage.network_connections =
+                Counter::try_from(accumulated.connections.saturating_add(current.connections))
+                    .map_err(|_| {
+                        sandsurf_control::Error::Protocol("network connection accounting overflow")
+                    })?;
+        }
+        Ok(response)
     }
 
     fn live_observation_reachable(&mut self) -> bool {
         self.machine.has_live_owner()
     }
+}
+
+fn network_rules(
+    policy: &NetworkPolicy,
+) -> Result<Vec<sandbox_policy::ManagedNetworkRule>, LinuxError> {
+    policy
+        .validate()
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    let mut rules = Vec::with_capacity(policy.rules.len());
+    for rule in &policy.rules {
+        let destination = match &rule.destination {
+            NetworkDestination::Dns {
+                name,
+                include_subdomains,
+                allow_private_addresses,
+            } => sandbox_policy::ManagedNetworkDestination::Dns {
+                name: sandbox_policy::normalize_dns_name(name)
+                    .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+                include_subdomains: *include_subdomains,
+                allow_private_addresses: *allow_private_addresses,
+            },
+            NetworkDestination::Ip { cidr } => {
+                sandbox_policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
+            }
+        };
+        let ports = rule
+            .ports
+            .iter()
+            .map(|range| {
+                if range.from == range.to {
+                    sandbox_policy::ManagedNetworkPort::Single(range.from)
+                } else {
+                    sandbox_policy::ManagedNetworkPort::Range {
+                        from: range.from,
+                        to: range.to,
+                    }
+                }
+            })
+            .collect();
+        rules.push(sandbox_policy::ManagedNetworkRule {
+            transport: "tcp".into(),
+            destination,
+            ports,
+        });
+    }
+    Ok(rules)
 }
 
 #[derive(Clone)]
@@ -408,12 +604,14 @@ struct ActiveGuest {
     epoch: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
+    network_capability: [u8; 32],
 }
 
 struct PendingGuest {
     epoch: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
+    network_capability: [u8; 32],
 }
 
 struct LinuxEpochFactory {
@@ -425,6 +623,7 @@ struct LinuxEpochFactory {
     workload_state: PathBuf,
     control_state: PathBuf,
     active: Arc<Mutex<Option<ActiveGuest>>>,
+    network: Arc<Mutex<Option<VmNetworkBridge>>>,
     pending: Option<PendingGuest>,
 }
 
@@ -438,6 +637,8 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
             return Err(bytes_digest(b"linux-epoch-factory-identity-conflict"));
         }
         let capability = random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?;
+        let network_capability =
+            random_bytes().map_err(|_| bytes_digest(b"linux-network-entropy"))?;
         let boot_identity = digest(
             Domain::Image,
             &(
@@ -458,6 +659,7 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
             epoch,
             &boot_identity,
             &capability,
+            &network_capability,
         )
         .map_err(|_| bytes_digest(b"linux-authentication-disk"))?;
         let state_directory = guardian.join(format!("vm-{}-{nonce}", epoch.get()));
@@ -466,6 +668,7 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
             epoch,
             boot_identity,
             capability,
+            network_capability,
         });
         Ok(FirecrackerConfig {
             launcher_executable: self.config.launcher.clone(),
@@ -507,7 +710,14 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
             epoch,
             boot_identity: pending.boot_identity,
             capability: pending.capability,
+            network_capability: pending.network_capability,
         };
+        let bridge = VmNetworkBridge::start(&active.socket, active.network_capability, Vec::new())
+            .map_err(|_| bytes_digest(b"linux-network-bridge-start"))?;
+        *self
+            .network
+            .lock()
+            .map_err(|_| bytes_digest(b"linux-network-lock"))? = Some(bridge);
         let deadline = Instant::now() + Duration::from_secs(45);
         loop {
             if process.has_exited().unwrap_or(true) {
@@ -518,6 +728,27 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
             let mut client = guest_client(&active);
             let failure = match client.call(&GuestServiceRequest::Processes) {
                 Ok(GuestServiceResponse::Processes { .. }) => {
+                    let memory = self
+                        .config
+                        .resources
+                        .memory_mib
+                        .get()
+                        .checked_mul(1024 * 1024)
+                        .ok_or_else(|| bytes_digest(b"guest-memory-envelope-overflow"))?;
+                    if !matches!(
+                        guest_client(&active).call(&GuestServiceRequest::ApplyResources {
+                            resources: LiveResourceLimits {
+                                workload_memory_bytes: Counter::try_from(memory).map_err(|_| {
+                                    bytes_digest(b"guest-memory-envelope-overflow")
+                                })?,
+                                workload_processes: self.config.resources.processes,
+                                cpu_max: None,
+                            },
+                        }),
+                        Ok(GuestServiceResponse::ResourcesApplied { .. })
+                    ) {
+                        return Err(bytes_digest(b"guest-resource-envelope-apply"));
+                    }
                     let evidence = digest(
                         Domain::Operation,
                         &(
@@ -794,6 +1025,7 @@ fn write_authentication(
     epoch: Counter,
     boot_identity: &Digest,
     capability: &[u8; 32],
+    network_capability: &[u8; 32],
 ) -> Result<(), LinuxError> {
     let identity = sandbox_id.as_str().as_bytes();
     let size = u16::try_from(identity.len())
@@ -806,6 +1038,7 @@ fn write_authentication(
     bytes.extend_from_slice(&epoch.get().to_be_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(capability);
+    bytes.extend_from_slice(network_capability);
     bytes.resize(512, 0);
     let mut file = OpenOptions::new()
         .write(true)

@@ -45,6 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some("image") => Domain::Image,
                 Some("checkpoint") => Domain::Checkpoint,
                 Some("transfer") => Domain::Transfer,
+                Some("network") => Domain::Network,
+                Some("secret") => Domain::Secret,
+                Some("resource") => Domain::Resource,
+                Some("exposure") => Domain::Exposure,
                 _ => return Err("unknown domain".into()),
             };
             let value: serde_json::Value = serde_json::from_slice(&bytes)?;

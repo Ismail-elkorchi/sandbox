@@ -118,6 +118,36 @@ impl CgroupManager {
         }
         Ok(handle)
     }
+
+    /// Apply aggregate workload limits at the delegated root. The protected
+    /// supervisor is in a sibling cgroup and therefore retains control/evidence
+    /// capacity when the workload reaches these ceilings.
+    pub fn apply_aggregate(&self, limits: CgroupLimits) -> io::Result<()> {
+        validate_limits(limits)?;
+        write_control(
+            &self.root.join("memory.max"),
+            &limits
+                .memory_max
+                .map_or_else(|| "max".into(), |value| value.to_string()),
+        )?;
+        write_control(
+            &self.root.join("pids.max"),
+            &limits
+                .pids_max
+                .map_or_else(|| "max".into(), |value| value.to_string()),
+        )?;
+        write_control(
+            &self.root.join("cpu.max"),
+            &limits.cpu_max.map_or_else(
+                || "max 100000".into(),
+                |(quota, period)| format!("{quota} {period}"),
+            ),
+        )
+    }
+
+    pub fn aggregate_usage(&self) -> io::Result<CgroupUsage> {
+        usage_at(&self.root, false)
+    }
 }
 
 impl ProcessCgroup {
@@ -149,19 +179,7 @@ impl ProcessCgroup {
     }
 
     pub fn usage(&self, complete: bool) -> io::Result<CgroupUsage> {
-        let cpu = key_values(&read_bounded(&self.path.join("cpu.stat"))?)?;
-        let io = nested_key_values(&read_bounded(&self.path.join("io.stat"))?)?;
-        Ok(CgroupUsage {
-            cpu_usage_micros: counter(*cpu.get("usage_usec").unwrap_or(&0))?,
-            memory_current: counter(read_number(&self.path.join("memory.current"))?)?,
-            memory_peak: counter(
-                read_optional_number(&self.path.join("memory.peak"))?.unwrap_or(0),
-            )?,
-            pids_current: counter(read_number(&self.path.join("pids.current"))?)?,
-            io_read_bytes: counter(*io.get("rbytes").unwrap_or(&0))?,
-            io_write_bytes: counter(*io.get("wbytes").unwrap_or(&0))?,
-            complete,
-        })
+        usage_at(&self.path, complete)
     }
 
     pub fn cleanup(&self) -> io::Result<()> {
@@ -173,6 +191,20 @@ impl ProcessCgroup {
         }
         fs::remove_dir(&self.path)
     }
+}
+
+fn usage_at(path: &Path, complete: bool) -> io::Result<CgroupUsage> {
+    let cpu = key_values(&read_bounded(&path.join("cpu.stat"))?)?;
+    let io = nested_key_values(&read_bounded(&path.join("io.stat"))?)?;
+    Ok(CgroupUsage {
+        cpu_usage_micros: counter(*cpu.get("usage_usec").unwrap_or(&0))?,
+        memory_current: counter(read_number(&path.join("memory.current"))?)?,
+        memory_peak: counter(read_optional_number(&path.join("memory.peak"))?.unwrap_or(0))?,
+        pids_current: counter(read_number(&path.join("pids.current"))?)?,
+        io_read_bytes: counter(*io.get("rbytes").unwrap_or(&0))?,
+        io_write_bytes: counter(*io.get("wbytes").unwrap_or(&0))?,
+        complete,
+    })
 }
 
 fn validate_limits(limits: CgroupLimits) -> io::Result<()> {

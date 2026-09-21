@@ -56,6 +56,10 @@ pub enum SandsurfDomain {
     Image,
     Checkpoint,
     Transfer,
+    Network,
+    Secret,
+    Resource,
+    Exposure,
 }
 
 pub fn sandsurf_digest<T: Serialize>(
@@ -72,6 +76,10 @@ pub fn sandsurf_digest<T: Serialize>(
         SandsurfDomain::Image => b"SANDSURF/IMAGE/1",
         SandsurfDomain::Checkpoint => b"SANDSURF/CHECKPOINT/1",
         SandsurfDomain::Transfer => b"SANDSURF/TRANSFER/1",
+        SandsurfDomain::Network => b"SANDSURF/NETWORK/1",
+        SandsurfDomain::Secret => b"SANDSURF/SECRET/1",
+        SandsurfDomain::Resource => b"SANDSURF/RESOURCE/1",
+        SandsurfDomain::Exposure => b"SANDSURF/EXPOSURE/1",
     };
     digest(domain, value)
 }

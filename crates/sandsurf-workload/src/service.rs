@@ -1,10 +1,11 @@
 use crate::{
-    ExpectedRevision, FilesystemError, FilesystemService, ProcessError, ProcessSupervisor,
+    CgroupLimits, CgroupManager, ExpectedRevision, FilesystemError, FilesystemService,
+    ProcessError, ProcessSupervisor,
 };
 use sandsurf_protocol::{
     Capability, Digest, FileExpectation, FileRevision, FilesystemRequest, FilesystemResponse,
     GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation, OperationId,
-    WorkloadRequest, bytes_digest,
+    ProcessId, ResourceUsage, SecretDestination, SecretId, WorkloadRequest, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LEDGER_VERSION: u16 = 1;
 const MAX_OPERATIONS: usize = 65_536;
@@ -28,6 +29,18 @@ pub struct PersistentWorkloadService {
     ledger_root: PathBuf,
     operations: Mutex<BTreeMap<OperationId, OperationRecord>>,
     mutation_barrier: RwLock<()>,
+    cgroups: Option<CgroupManager>,
+    installed_secrets: Mutex<BTreeMap<OperationId, InstalledSecret>>,
+}
+
+#[derive(Clone)]
+struct InstalledSecret {
+    id: SecretId,
+    version: Digest,
+    destination: SecretDestination,
+    lifetime: sandsurf_protocol::SecretLifetime,
+    process_id: Option<ProcessId>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -72,6 +85,24 @@ impl PersistentWorkloadService {
         filesystem: FilesystemService,
         ledger_root: &Path,
     ) -> io::Result<Self> {
+        Self::open_inner(processes, filesystem, ledger_root, None)
+    }
+
+    pub fn open_with_cgroups(
+        processes: ProcessSupervisor,
+        filesystem: FilesystemService,
+        ledger_root: &Path,
+        cgroups: CgroupManager,
+    ) -> io::Result<Self> {
+        Self::open_inner(processes, filesystem, ledger_root, Some(cgroups))
+    }
+
+    fn open_inner(
+        processes: ProcessSupervisor,
+        filesystem: FilesystemService,
+        ledger_root: &Path,
+        cgroups: Option<CgroupManager>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(ledger_root)?;
         let operations = load_operations(ledger_root)?;
         Ok(Self {
@@ -80,6 +111,8 @@ impl PersistentWorkloadService {
             ledger_root: ledger_root.to_path_buf(),
             operations: Mutex::new(operations),
             mutation_barrier: RwLock::new(()),
+            cgroups,
+            installed_secrets: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -125,6 +158,16 @@ impl PersistentWorkloadService {
                 "the machine shutdown barrier is owned by the guest supervisor".into(),
             )
                 .into()),
+            GuestServiceRequest::InstallSecret {
+                operation_id,
+                delivery,
+                bytes,
+            } => self.install_secret(&operation_id, delivery, bytes),
+            GuestServiceRequest::RevokeSecret { secret_id, version } => {
+                self.revoke_secret(&secret_id, &version)
+            }
+            GuestServiceRequest::ApplyResources { resources } => self.apply_resources(resources),
+            GuestServiceRequest::ResourceUsage => self.resource_usage(),
             GuestServiceRequest::Dispatch {
                 mutation,
                 capability,
@@ -198,7 +241,10 @@ impl PersistentWorkloadService {
                 if request.user.is_none() {
                     request.user = Some("agent".into());
                 }
-                self.processes.spawn(request).map(drop)
+                let secrets = self.process_secrets(&request)?;
+                self.processes
+                    .spawn_with_environment(request, &secrets)
+                    .map(drop)
             }
             WorkloadRequest::WriteInput { process_id, bytes } => {
                 self.processes.write_input(process_id, bytes)
@@ -246,6 +292,244 @@ impl PersistentWorkloadService {
         };
         let response = GuestServiceResponse::Effect { outcome };
         self.commit(mutation.operation_id, mutation.request_digest, response)
+    }
+
+    fn install_secret(
+        &self,
+        operation_id: &OperationId,
+        delivery: sandsurf_protocol::SecretDelivery,
+        bytes: Vec<u8>,
+    ) -> ServiceResult<GuestServiceResponse> {
+        delivery.validate().map_err(|error| ServiceFailure {
+            code: "secret.invalid",
+            message: error.to_string(),
+        })?;
+        if bytes.len() as u64 != delivery.secret.bytes.get()
+            || bytes_digest(&bytes) != delivery.secret.version
+        {
+            return Err((
+                "secret.integrity",
+                "secret bytes do not match their host-issued version".into(),
+            )
+                .into());
+        }
+        let mut installed = self.installed_secrets.lock().map_err(|_| ServiceFailure {
+            code: "service.unavailable",
+            message: "secret delivery state is unavailable".into(),
+        })?;
+        if let Some(old) = installed.get(operation_id) {
+            if old.id == delivery.secret.id
+                && old.version == delivery.secret.version
+                && old.destination == delivery.destination
+                && old.lifetime == delivery.lifetime
+                && old.process_id == delivery.process_id
+            {
+                return Ok(GuestServiceResponse::SecretInstalled {
+                    evidence: bytes_digest(b"secret-delivery-already-installed"),
+                });
+            }
+            return Err((
+                "secret.conflict",
+                "secret identity is already bound to another active delivery".into(),
+            )
+                .into());
+        }
+        if let SecretDestination::Environment { .. } = &delivery.destination
+            && (std::str::from_utf8(&bytes).is_err() || bytes.contains(&0))
+        {
+            return Err((
+                "secret.invalid",
+                "environment secret must be UTF-8 without NUL".into(),
+            )
+                .into());
+        }
+        if let SecretDestination::File { path, mode } = &delivery.destination {
+            let expected = ExpectedRevision::Any;
+            self.filesystem.write_file_from(
+                path,
+                &mut bytes.as_slice(),
+                crate::WriteOptions {
+                    maximum: bytes.len() as u64,
+                    mode: *mode,
+                    operation_id,
+                    expected: &expected,
+                },
+                &self.processes,
+            )?;
+        }
+        let evidence = sandsurf_protocol::digest(
+            sandsurf_protocol::Domain::Secret,
+            &(
+                "sandsurf-secret-installed-v1",
+                operation_id,
+                &delivery.secret,
+                &delivery.destination,
+                &delivery.lifetime,
+                &delivery.process_id,
+            ),
+        )
+        .map_err(|error| ServiceFailure {
+            code: "secret.invalid",
+            message: error.to_string(),
+        })?;
+        installed.insert(
+            operation_id.clone(),
+            InstalledSecret {
+                id: delivery.secret.id,
+                version: delivery.secret.version,
+                destination: delivery.destination,
+                lifetime: delivery.lifetime,
+                process_id: delivery.process_id,
+                bytes,
+            },
+        );
+        Ok(GuestServiceResponse::SecretInstalled { evidence })
+    }
+
+    fn revoke_secret(
+        &self,
+        secret_id: &SecretId,
+        version: &Digest,
+    ) -> ServiceResult<GuestServiceResponse> {
+        let mut installed = self.installed_secrets.lock().map_err(|_| ServiceFailure {
+            code: "service.unavailable",
+            message: "secret delivery state is unavailable".into(),
+        })?;
+        let operations = installed
+            .iter()
+            .filter(|(_, value)| &value.id == secret_id && &value.version == version)
+            .map(|(operation, _)| operation.clone())
+            .collect::<Vec<_>>();
+        if operations.is_empty() {
+            return Err(("secret.missing", "secret delivery is not active".into()).into());
+        }
+        for operation in operations {
+            let value = installed
+                .remove(&operation)
+                .ok_or_else(|| ("secret.missing", "secret delivery disappeared".into()))?;
+            if let SecretDestination::File { path, .. } = &value.destination {
+                match self.filesystem.remove_path(path, false) {
+                    Ok(()) | Err(FilesystemError::Conflict) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(GuestServiceResponse::SecretInstalled {
+            evidence: bytes_digest(b"secret-delivery-revoked"),
+        })
+    }
+
+    fn process_secrets(
+        &self,
+        request: &sandsurf_protocol::SpawnRequest,
+    ) -> ServiceResult<BTreeMap<String, String>> {
+        let installed = self.installed_secrets.lock().map_err(|_| ServiceFailure {
+            code: "service.unavailable",
+            message: "secret delivery state is unavailable".into(),
+        })?;
+        let mut environment = BTreeMap::new();
+        for value in installed.values() {
+            if value.process_id.as_ref() != Some(&request.process_id) {
+                continue;
+            }
+            if let SecretDestination::Environment { name } = &value.destination {
+                let secret = std::str::from_utf8(&value.bytes).map_err(|_| ServiceFailure {
+                    code: "secret.invalid",
+                    message: "environment secret is no longer valid UTF-8".into(),
+                })?;
+                if request.environment.contains_key(name)
+                    || environment.insert(name.clone(), secret.into()).is_some()
+                {
+                    return Err((
+                        "secret.conflict",
+                        "spawn environment overrides a delivered secret".into(),
+                    )
+                        .into());
+                }
+            }
+        }
+        Ok(environment)
+    }
+
+    fn apply_resources(
+        &self,
+        resources: sandsurf_protocol::LiveResourceLimits,
+    ) -> ServiceResult<GuestServiceResponse> {
+        resources.validate().map_err(|error| ServiceFailure {
+            code: "resource.invalid",
+            message: error.to_string(),
+        })?;
+        let cgroups = self.cgroups.as_ref().ok_or_else(|| ServiceFailure {
+            code: "resource.unsupported",
+            message: "guest cgroup v2 enforcement is unavailable".into(),
+        })?;
+        cgroups
+            .apply_aggregate(CgroupLimits {
+                memory_max: Some(resources.workload_memory_bytes.get()),
+                pids_max: Some(resources.workload_processes.get()),
+                cpu_max: resources
+                    .cpu_max
+                    .map(|(quota, period)| (quota.get(), period.get())),
+            })
+            .map_err(|error| ServiceFailure {
+                code: "resource.enforcement",
+                message: error.to_string(),
+            })?;
+        let evidence = sandsurf_protocol::digest(
+            sandsurf_protocol::Domain::Resource,
+            &("sandsurf-guest-cgroup-limits-v1", resources),
+        )
+        .map_err(|error| ServiceFailure {
+            code: "resource.invalid",
+            message: error.to_string(),
+        })?;
+        Ok(GuestServiceResponse::ResourcesApplied { evidence })
+    }
+
+    fn resource_usage(&self) -> ServiceResult<GuestServiceResponse> {
+        let cgroups = self.cgroups.as_ref().ok_or_else(|| ServiceFailure {
+            code: "resource.unsupported",
+            message: "guest cgroup v2 accounting is unavailable".into(),
+        })?;
+        let value = cgroups.aggregate_usage().map_err(|error| ServiceFailure {
+            code: "resource.accounting",
+            message: error.to_string(),
+        })?;
+        let observed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ServiceFailure {
+                code: "resource.accounting",
+                message: "guest clock is before the Unix epoch".into(),
+            })?
+            .as_millis();
+        Ok(GuestServiceResponse::ResourceUsage {
+            usage: ResourceUsage {
+                cpu_micros: value.cpu_usage_micros,
+                memory_current: value.memory_current,
+                memory_peak: value.memory_peak,
+                disk_logical_bytes: sandsurf_protocol::Counter::ZERO,
+                disk_allocated_bytes: sandsurf_protocol::Counter::ZERO,
+                io_read_bytes: value.io_read_bytes,
+                io_write_bytes: value.io_write_bytes,
+                output_retained_bytes: sandsurf_protocol::Counter::ZERO,
+                network_rx_bytes: sandsurf_protocol::Counter::ZERO,
+                network_tx_bytes: sandsurf_protocol::Counter::ZERO,
+                network_connections: sandsurf_protocol::Counter::ZERO,
+                processes_current: value.pids_current,
+                complete: value.complete,
+                source: "guest-cgroup-v2".into(),
+                observed_unix_millis: sandsurf_protocol::Counter::try_from(
+                    u64::try_from(observed).map_err(|_| ServiceFailure {
+                        code: "resource.accounting",
+                        message: "usage timestamp overflow".into(),
+                    })?,
+                )
+                .map_err(|error| ServiceFailure {
+                    code: "resource.accounting",
+                    message: error.to_string(),
+                })?,
+            },
+        })
     }
 
     fn filesystem(

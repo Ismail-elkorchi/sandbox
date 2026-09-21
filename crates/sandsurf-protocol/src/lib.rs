@@ -1,10 +1,12 @@
 #![deny(unsafe_code)]
 
+mod environment;
 mod frame;
 mod guest;
 mod session;
 mod types;
 
+pub use environment::*;
 pub use frame::*;
 pub use guest::*;
 pub use sandbox_digest::SandsurfDomain as Domain;

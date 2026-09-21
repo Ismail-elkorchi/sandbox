@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -13,10 +13,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const AUTH_MAGIC: &[u8; 7] = b"SBXNET1";
-const HTTP_VSOCK_PORT: u32 = 12080;
-const SOCKS_VSOCK_PORT: u32 = 12081;
-const DNS_TCP_VSOCK_PORT: u32 = 12082;
-const DNS_UDP_VSOCK_PORT: u32 = 12083;
+const HTTP_VSOCK_PORT: u32 = 12_080;
+const SOCKS_VSOCK_PORT: u32 = 12_081;
+const DNS_TCP_VSOCK_PORT: u32 = 12_082;
+const DNS_UDP_VSOCK_PORT: u32 = 12_083;
 const MAX_DNS_MESSAGE: usize = 4096;
 const MAX_RECORDED_VIOLATIONS: usize = 1024;
 
@@ -28,10 +28,22 @@ pub struct VmNetworkBridge {
     socket_paths: Vec<PathBuf>,
     violations: Arc<Mutex<Vec<NetworkViolation>>>,
     active_tunnels: ActiveTunnels,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
     stopped: bool,
 }
 
 type ActiveTunnels = Arc<Mutex<HashMap<u64, UnixStream>>>;
+
+#[derive(Clone)]
+struct TunnelContext {
+    stop: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
+    active_tunnels: ActiveTunnels,
+    next_tunnel_id: Arc<AtomicU64>,
+    rx_bytes: Arc<AtomicU64>,
+    tx_bytes: Arc<AtomicU64>,
+}
 
 struct TunnelRegistration {
     id: u64,
@@ -85,6 +97,16 @@ impl VmNetworkBridge {
         let active = Arc::new(AtomicUsize::new(0));
         let active_tunnels = Arc::new(Mutex::new(HashMap::new()));
         let next_tunnel_id = Arc::new(AtomicU64::new(1));
+        let rx_bytes = Arc::new(AtomicU64::new(0));
+        let tx_bytes = Arc::new(AtomicU64::new(0));
+        let tunnel_context = TunnelContext {
+            stop: Arc::clone(&stop),
+            active: Arc::clone(&active),
+            active_tunnels: Arc::clone(&active_tunnels),
+            next_tunnel_id,
+            rx_bytes: Arc::clone(&rx_bytes),
+            tx_bytes: Arc::clone(&tx_bytes),
+        };
         let specifications = [
             (HTTP_VSOCK_PORT, TunnelTarget::Tcp(http_address)),
             (SOCKS_VSOCK_PORT, TunnelTarget::Tcp(socks_address)),
@@ -94,7 +116,7 @@ impl VmNetworkBridge {
         let mut bound = Vec::with_capacity(specifications.len());
         for (port, target) in specifications {
             let path = guest_initiated_path(vsock_path, port);
-            let listener = match UnixListener::bind(&path) {
+            let listener = match bind_beneath_parent(&path) {
                 Ok(listener) => listener,
                 Err(error) => {
                     for (_, _, created_path) in &bound {
@@ -146,10 +168,7 @@ impl VmNetworkBridge {
                 listener,
                 target,
                 nonce,
-                Arc::clone(&stop),
-                Arc::clone(&active),
-                Arc::clone(&active_tunnels),
-                Arc::clone(&next_tunnel_id),
+                tunnel_context.clone(),
             ));
         }
         Ok(Self {
@@ -160,15 +179,21 @@ impl VmNetworkBridge {
             socket_paths,
             violations,
             active_tunnels,
+            rx_bytes,
+            tx_bytes,
             stopped: false,
         })
     }
 
     #[must_use]
     pub fn snapshot(&self) -> BrokerSnapshot {
-        self.broker
+        let mut snapshot = self
+            .broker
             .as_ref()
-            .map_or_else(BrokerSnapshot::default, BrokerHandle::snapshot)
+            .map_or_else(BrokerSnapshot::default, BrokerHandle::snapshot);
+        snapshot.rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
+        snapshot.tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
+        snapshot
     }
 
     pub fn take_violations(&self) -> Vec<NetworkViolation> {
@@ -224,6 +249,8 @@ impl VmNetworkBridge {
             report.violations = broker.violations;
             report.cleanup_failures.extend(broker.cleanup_failures);
         }
+        report.rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
+        report.tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         report
     }
 }
@@ -244,28 +271,62 @@ fn guest_initiated_path(base: &Path, port: u32) -> PathBuf {
     PathBuf::from(format!("{}_{port}", base.to_string_lossy()))
 }
 
+/// Bind through an open parent directory so deep durable state roots do not
+/// consume the fixed-size `sockaddr_un` pathname. The socket is still created
+/// in the exact VM state directory that Firecracker has mounted at `/vm/state`.
+fn bind_beneath_parent(path: &Path) -> io::Result<UnixListener> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VM network socket path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VM network socket has no parent directory",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "VM network socket has no name")
+    })?;
+    let directory = File::open(parent)?;
+    let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    let listener = UnixListener::bind(short)?;
+    drop(directory);
+    Ok(listener)
+}
+
 fn tunnel_accept_loop(
     listener: UnixListener,
     target: TunnelTarget,
     nonce: [u8; 32],
-    stop: Arc<AtomicBool>,
-    active: Arc<AtomicUsize>,
-    active_tunnels: ActiveTunnels,
-    next_tunnel_id: Arc<AtomicU64>,
+    context: TunnelContext,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        while !stop.load(Ordering::Acquire) {
+        while !context.stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    active.fetch_add(1, Ordering::AcqRel);
-                    let active = Arc::clone(&active);
-                    let stop = Arc::clone(&stop);
-                    let active_tunnels = Arc::clone(&active_tunnels);
-                    let tunnel_id = next_tunnel_id.fetch_add(1, Ordering::Relaxed);
+                    context.active.fetch_add(1, Ordering::AcqRel);
+                    let context = context.clone();
+                    let tunnel_id = context.next_tunnel_id.fetch_add(1, Ordering::Relaxed);
                     thread::spawn(move || {
-                        let _ = TunnelRegistration::new(tunnel_id, active_tunnels, &stream)
-                            .and_then(|_registration| handle_tunnel(stream, target, &nonce, &stop));
-                        active.fetch_sub(1, Ordering::AcqRel);
+                        let _ = TunnelRegistration::new(
+                            tunnel_id,
+                            Arc::clone(&context.active_tunnels),
+                            &stream,
+                        )
+                        .and_then(|_registration| {
+                            handle_tunnel(
+                                stream,
+                                target,
+                                &nonce,
+                                &context.stop,
+                                &context.rx_bytes,
+                                &context.tx_bytes,
+                            )
+                        });
+                        context.active.fetch_sub(1, Ordering::AcqRel);
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -282,6 +343,8 @@ fn handle_tunnel(
     target: TunnelTarget,
     nonce: &[u8; 32],
     stop: &Arc<AtomicBool>,
+    rx_bytes: &Arc<AtomicU64>,
+    tx_bytes: &Arc<AtomicU64>,
 ) -> io::Result<()> {
     if stop.load(Ordering::Acquire) {
         return Err(io::Error::new(
@@ -307,8 +370,14 @@ fn handle_tunnel(
         ));
     }
     match target {
-        TunnelTarget::Tcp(address) => relay_tcp(guest, TcpStream::connect(address)?, stop),
-        TunnelTarget::Udp(address) => relay_udp_query(guest, address, stop),
+        TunnelTarget::Tcp(address) => relay_tcp(
+            guest,
+            TcpStream::connect(address)?,
+            stop,
+            rx_bytes,
+            tx_bytes,
+        ),
+        TunnelTarget::Udp(address) => relay_udp_query(guest, address, stop, rx_bytes, tx_bytes),
     }
 }
 
@@ -316,6 +385,8 @@ fn relay_tcp(
     mut guest: UnixStream,
     mut broker: TcpStream,
     stop: &Arc<AtomicBool>,
+    rx_bytes: &Arc<AtomicU64>,
+    tx_bytes: &Arc<AtomicU64>,
 ) -> io::Result<()> {
     guest.set_read_timeout(Some(Duration::from_millis(200)))?;
     guest.set_write_timeout(Some(Duration::from_millis(200)))?;
@@ -324,9 +395,16 @@ fn relay_tcp(
     let mut guest_reader = guest.try_clone()?;
     let mut broker_writer = broker.try_clone()?;
     let copy_stop = Arc::clone(stop);
-    let outbound =
-        thread::spawn(move || copy_with_stop(&mut guest_reader, &mut broker_writer, &copy_stop));
-    let inbound = copy_with_stop(&mut broker, &mut guest, stop);
+    let outbound_bytes = Arc::clone(tx_bytes);
+    let outbound = thread::spawn(move || {
+        copy_with_stop(
+            &mut guest_reader,
+            &mut broker_writer,
+            &copy_stop,
+            &outbound_bytes,
+        )
+    });
+    let inbound = copy_with_stop(&mut broker, &mut guest, stop, rx_bytes);
     let _ = guest.shutdown(Shutdown::Both);
     let _ = broker.shutdown(Shutdown::Both);
     let outbound = outbound
@@ -339,12 +417,16 @@ fn copy_with_stop(
     reader: &mut impl Read,
     writer: &mut impl Write,
     stop: &AtomicBool,
+    bytes: &AtomicU64,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 64 * 1024];
     while !stop.load(Ordering::Acquire) {
         match reader.read(&mut buffer) {
             Ok(0) => return Ok(()),
-            Ok(count) => writer.write_all(&buffer[..count])?,
+            Ok(count) => {
+                writer.write_all(&buffer[..count])?;
+                bytes.fetch_add(count as u64, Ordering::Relaxed);
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -362,6 +444,8 @@ fn relay_udp_query(
     mut guest: UnixStream,
     broker_address: std::net::SocketAddr,
     stop: &AtomicBool,
+    rx_bytes: &AtomicU64,
+    tx_bytes: &AtomicU64,
 ) -> io::Result<()> {
     let mut length = [0_u8; 2];
     guest.read_exact(&mut length)?;
@@ -377,6 +461,7 @@ fn relay_udp_query(
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     socket.send_to(&query, broker_address)?;
+    tx_bytes.fetch_add(query.len() as u64, Ordering::Relaxed);
     let mut response = [0_u8; MAX_DNS_MESSAGE];
     let count = loop {
         if stop.load(Ordering::Acquire) {
@@ -397,6 +482,7 @@ fn relay_udp_query(
             Err(error) => return Err(error),
         }
     };
+    rx_bytes.fetch_add(count as u64, Ordering::Relaxed);
     guest.write_all(&(count as u16).to_be_bytes())?;
     guest.write_all(&response[..count])
 }
@@ -419,6 +505,8 @@ mod tests {
                 TunnelTarget::Tcp("127.0.0.1:1".parse().expect("address")),
                 &expected,
                 &stop,
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU64::new(0)),
             )
         });
         let mut authentication = Vec::from(AUTH_MAGIC);

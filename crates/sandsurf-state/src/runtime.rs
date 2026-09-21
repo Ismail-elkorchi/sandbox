@@ -749,8 +749,10 @@ impl RuntimeJournal {
         let tx = self.db.connection.transaction()?;
         let op =
             operation(&tx, operation_id)?.ok_or(Error::Missing("process operation missing"))?;
-        if op.capability != Capability::Spawn {
-            return Err(Error::Conflict("process creation requires spawn authority"));
+        if !matches!(op.capability, Capability::Spawn | Capability::WorkloadAdmin) {
+            return Err(Error::Conflict(
+                "process creation requires spawn or workload-administration authority",
+            ));
         }
         let WorkloadRequest::Spawn { request } = &op.request.request else {
             return Err(Error::Conflict(
@@ -897,6 +899,18 @@ impl RuntimeJournal {
             values.push(decode(&row?)?);
         }
         Ok(values)
+    }
+
+    /// Bytes whose complete payload is still durably retained by this guardian.
+    /// Receipt references are deliberately not counted unless their bytes remain
+    /// available either through the process or an independent retention pin.
+    pub fn retained_output_bytes(&self) -> Result<Counter> {
+        let retained: u64 = self.db.connection.query_row(
+            "SELECT coalesce(sum(length),0) FROM chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(retained.try_into()?)
     }
 
     pub fn append_output(

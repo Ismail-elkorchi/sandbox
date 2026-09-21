@@ -31,6 +31,8 @@ pub struct NetworkViolation {
 pub struct BrokerReport {
     pub connections: u64,
     pub violations: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
     pub cleanup_failures: Vec<String>,
 }
 
@@ -38,6 +40,8 @@ pub struct BrokerReport {
 pub struct BrokerSnapshot {
     pub connections: u64,
     pub violations: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 pub struct BrokerHandle {
@@ -201,6 +205,8 @@ impl BrokerHandle {
             return BrokerReport {
                 connections: self.connections.load(Ordering::Relaxed),
                 violations: self.violations.load(Ordering::Relaxed),
+                rx_bytes: 0,
+                tx_bytes: 0,
                 cleanup_failures: Vec::new(),
             };
         }
@@ -237,6 +243,8 @@ impl BrokerHandle {
         BrokerSnapshot {
             connections: self.connections.load(Ordering::Relaxed),
             violations: self.violations.load(Ordering::Relaxed),
+            rx_bytes: 0,
+            tx_bytes: 0,
         }
     }
 }

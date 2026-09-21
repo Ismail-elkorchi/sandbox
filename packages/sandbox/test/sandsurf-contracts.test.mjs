@@ -15,7 +15,7 @@ function native(mode, input, ...args) { return spawnSync(fixture, [mode, ...args
 
 test("Rust and TypeScript encode every Sandsurf digest domain identically", () => {
   const value = { z: 1, a: [true, null, "é", -13, Number.MAX_SAFE_INTEGER], "\u{10000}": "astral", "\ue000": "BMP" };
-  for (const domain of ["sandbox", "grant", "operation", "receipt", "output", "release", "image", "checkpoint", "transfer"]) {
+  for (const domain of ["sandbox", "grant", "operation", "receipt", "output", "release", "image", "checkpoint", "transfer", "network", "secret", "resource", "exposure"]) {
     const result = native("digest", JSON.stringify(value), domain);
     assert.equal(result.status, 0, result.stderr.toString());
     assert.equal(result.stdout.toString(), sandsurfDigest(domain, value));

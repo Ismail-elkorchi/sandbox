@@ -139,6 +139,21 @@ pub enum GuestServiceRequest {
     /// Guardian-only machine shutdown barrier. The host API never forwards
     /// this request from an application.
     PrepareStop,
+    /// Guardian-only secret installation. Raw bytes are never accepted by the
+    /// application guest-query route or persisted in ordinary operation logs.
+    InstallSecret {
+        operation_id: OperationId,
+        delivery: crate::SecretDelivery,
+        bytes: Vec<u8>,
+    },
+    RevokeSecret {
+        secret_id: crate::SecretId,
+        version: Digest,
+    },
+    ApplyResources {
+        resources: crate::LiveResourceLimits,
+    },
+    ResourceUsage,
     Dispatch {
         mutation: Mutation,
         capability: Capability,
@@ -358,6 +373,9 @@ pub enum FileExpectation {
 )]
 pub enum GuestServiceResponse {
     ReadyToStop { evidence: Digest },
+    SecretInstalled { evidence: Digest },
+    ResourcesApplied { evidence: Digest },
+    ResourceUsage { usage: crate::ResourceUsage },
     Effect { outcome: GuestEffectOutcome },
     Process { process: Box<ProcessSnapshot> },
     Processes { processes: Vec<ProcessSnapshot> },

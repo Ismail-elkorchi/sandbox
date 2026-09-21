@@ -262,6 +262,9 @@ pub struct ConfigurationCommand {
     pub operation_id: OperationId,
     pub revision: Counter,
     pub request_digest: Digest,
+    /// Exact host-authored configuration installed by the guardian. It is an
+    /// immutable signed snapshot, never a guardian-owned grant database.
+    pub configuration: crate::RuntimeConfiguration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
