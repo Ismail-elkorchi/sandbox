@@ -61,6 +61,7 @@ struct CheckpointManifest {
     image_digest: Digest,
     source_epoch: sandsurf_protocol::Counter,
     source_revision: sandsurf_protocol::Counter,
+    disk_container: DiskContainer,
     workload_disk_digest: Digest,
     workload_disk_bytes: sandsurf_protocol::Counter,
     consistency: CheckpointConsistency,
@@ -69,10 +70,41 @@ struct CheckpointManifest {
     full: Option<FullCheckpointMetadata>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DiskContainer {
+    RawExt4,
+    Vhdx,
+}
+
+impl DiskContainer {
+    fn workload_name(self) -> &'static str {
+        match self {
+            Self::RawExt4 => "workload-state.ext4",
+            Self::Vhdx => "workload-state.vhdx",
+        }
+    }
+
+    fn control_name(self) -> &'static str {
+        match self {
+            Self::RawExt4 => "control-state.ext4",
+            Self::Vhdx => "control-state.vhdx",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::RawExt4 => "ext4",
+            Self::Vhdx => "vhdx",
+        }
+    }
+}
+
 pub struct CaptureResult {
     pub disk_digest: Digest,
     pub manifest_digest: Digest,
     pub full: Option<FullCheckpointMetadata>,
+    container: DiskContainer,
 }
 
 pub fn published_filesystem(root: &Path, checkpoint: &Checkpoint) -> Result<Option<CaptureResult>> {
@@ -99,20 +131,23 @@ pub fn capture_filesystem(
         checkpoint.request.operation_id.as_str()
     ));
     private_directory(&stage)?;
-    let disk = stage.join("workload-state.ext4");
-    let disk_digest = copy_and_verify(
+    let source_container = disk_container(source_disk)?;
+    let container = DiskContainer::RawExt4;
+    let disk = stage.join(container.workload_name());
+    let disk_digest = capture_disk(
         source_disk,
         &disk,
         checkpoint.workload_disk_bytes.get(),
-        None,
+        source_container,
     )?;
     let manifest = CheckpointManifest {
-        format_version: 2,
+        format_version: 3,
         checkpoint_id: checkpoint.request.id.clone(),
         request_digest: checkpoint.request_digest.clone(),
         image_digest: checkpoint.image_digest.clone(),
         source_epoch: checkpoint.request.expected_epoch,
         source_revision: checkpoint.request.expected_revision,
+        disk_container: container,
         workload_disk_digest: disk_digest.clone(),
         workload_disk_bytes: checkpoint.workload_disk_bytes,
         consistency: CheckpointConsistency::Filesystem,
@@ -135,6 +170,7 @@ pub fn capture_filesystem(
         disk_digest,
         manifest_digest,
         full: None,
+        container,
     })
 }
 
@@ -153,6 +189,13 @@ pub fn capture_full(
         ));
     }
     private_directory(root)?;
+    let source_container = disk_container(workload_disk)?;
+    if disk_container(control_disk)? != source_container {
+        return Err(CheckpointError::Invalid(
+            "full checkpoint disk containers do not match",
+        ));
+    }
+    let container = DiskContainer::RawExt4;
     let final_directory = root.join(checkpoint.request.id.as_str());
     if final_directory.exists() {
         return verify_published(&final_directory, checkpoint);
@@ -163,23 +206,23 @@ pub fn capture_full(
         checkpoint.request.operation_id.as_str()
     ));
     private_directory(&stage)?;
-    let disk_digest = copy_and_verify(
+    let disk_digest = capture_disk(
         workload_disk,
-        &stage.join("workload-state.ext4"),
+        &stage.join(container.workload_name()),
         checkpoint.workload_disk_bytes.get(),
-        None,
+        source_container,
     )?;
-    let control_bytes = control_disk.metadata()?.len();
+    let control_bytes = disk_logical_bytes(control_disk, source_container)?;
     if control_bytes == 0 || control_bytes > 8 * 1024 * 1024 * 1024 {
         return Err(CheckpointError::Invalid(
             "full checkpoint control disk geometry is invalid",
         ));
     }
-    let control_digest = copy_and_verify(
+    let control_digest = capture_disk(
         control_disk,
-        &stage.join("control-state.ext4"),
+        &stage.join(container.control_name()),
         control_bytes,
-        None,
+        source_container,
     )?;
     let memory_bound = checkpoint
         .resources
@@ -234,12 +277,13 @@ pub fn capture_full(
         fork_safe: false,
     };
     let manifest = CheckpointManifest {
-        format_version: 2,
+        format_version: 3,
         checkpoint_id: checkpoint.request.id.clone(),
         request_digest: checkpoint.request_digest.clone(),
         image_digest: checkpoint.image_digest.clone(),
         source_epoch: checkpoint.request.expected_epoch,
         source_revision: checkpoint.request.expected_revision,
+        disk_container: container,
         workload_disk_digest: disk_digest.clone(),
         workload_disk_bytes: checkpoint.workload_disk_bytes,
         consistency: CheckpointConsistency::Filesystem,
@@ -262,6 +306,7 @@ pub fn capture_full(
         disk_digest,
         manifest_digest,
         full: Some(full),
+        container,
     })
 }
 
@@ -271,8 +316,14 @@ pub fn materialize_fork(root: &Path, checkpoint: &Checkpoint, destination: &Path
         .as_ref()
         .ok_or(CheckpointError::Invalid("checkpoint has no workload disk"))?;
     let source = checkpoint_disk(root, checkpoint)?;
+    let source_container = published_container(root, checkpoint)?;
+    let destination_container = disk_container(destination)?;
     if destination.exists() {
-        let actual = file_digest(destination, checkpoint.workload_disk_bytes.get())?;
+        let actual = materialized_digest(
+            destination,
+            checkpoint.workload_disk_bytes.get(),
+            destination_container,
+        )?;
         return if &actual == expected {
             Ok(())
         } else {
@@ -285,11 +336,13 @@ pub fn materialize_fork(root: &Path, checkpoint: &Checkpoint, destination: &Path
         .parent()
         .ok_or(CheckpointError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
-    copy_and_verify(
+    materialize_disk(
         &source,
         destination,
         checkpoint.workload_disk_bytes.get(),
-        Some(expected),
+        expected,
+        source_container,
+        destination_container,
     )?;
     sync_directory(parent)
 }
@@ -308,6 +361,13 @@ pub fn materialize_image_template(
         .as_ref()
         .ok_or(CheckpointError::Invalid("checkpoint has no workload disk"))?;
     let source = checkpoint_disk(root, checkpoint)?;
+    if disk_container(destination)? != DiskContainer::RawExt4
+        || published_container(root, checkpoint)? != DiskContainer::RawExt4
+    {
+        return Err(CheckpointError::Invalid(
+            "derived image requires a raw ext4 checkpoint",
+        ));
+    }
     copy_and_verify(
         &source,
         destination,
@@ -328,18 +388,43 @@ pub fn rollback(
         .as_ref()
         .ok_or(CheckpointError::Invalid("checkpoint has no workload disk"))?;
     let source = checkpoint_disk(root, checkpoint)?;
+    let source_container = published_container(root, checkpoint)?;
+    let target_container = disk_container(target)?;
     let parent = target
         .parent()
         .ok_or(CheckpointError::Invalid("rollback target has no parent"))?;
     private_directory(parent)?;
-    let next = parent.join(format!(".workload-state.{}.next", operation.as_str()));
+    let next = parent.join(format!(
+        ".workload-state.{}.next.{}",
+        operation.as_str(),
+        target_container.extension()
+    ));
     let previous = parent.join(format!(".workload-state.{}.previous", operation.as_str()));
 
-    if !target.exists() && previous.exists() && !next.exists() {
+    if !target.exists() && next.exists() {
+        if materialized_digest(
+            &next,
+            checkpoint.workload_disk_bytes.get(),
+            target_container,
+        )? != *expected
+        {
+            return Err(CheckpointError::Invalid(
+                "interrupted rollback candidate disagrees with its checkpoint",
+            ));
+        }
+        fs::rename(&next, target)?;
+        sync_directory(parent)?;
+    } else if !target.exists() && previous.exists() {
         fs::rename(&previous, target)?;
         sync_directory(parent)?;
     }
-    if target.exists() && file_digest(target, checkpoint.workload_disk_bytes.get())? == *expected {
+    if target.exists()
+        && materialized_digest(
+            target,
+            checkpoint.workload_disk_bytes.get(),
+            target_container,
+        )? == *expected
+    {
         remove_file_if_present(&next)?;
         remove_file_if_present(&previous)?;
         sync_directory(parent)?;
@@ -350,11 +435,13 @@ pub fn rollback(
             "interrupted rollback target conflicts with its retained original",
         ));
     }
-    copy_and_verify(
+    materialize_disk(
         &source,
         &next,
         checkpoint.workload_disk_bytes.get(),
-        Some(expected),
+        expected,
+        source_container,
+        target_container,
     )?;
     if target.exists() {
         fs::rename(target, &previous)?;
@@ -388,14 +475,18 @@ fn checkpoint_disk(root: &Path, checkpoint: &Checkpoint) -> Result<PathBuf> {
             "published checkpoint disagrees with its catalog record",
         ));
     }
-    Ok(directory.join("workload-state.ext4"))
+    Ok(directory.join(verified.container.workload_name()))
+}
+
+fn published_container(root: &Path, checkpoint: &Checkpoint) -> Result<DiskContainer> {
+    Ok(verify_published(&root.join(checkpoint.request.id.as_str()), checkpoint)?.container)
 }
 
 fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<CaptureResult> {
     private_directory(directory)?;
     let manifest: CheckpointManifest =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
-    if manifest.format_version != 2
+    if manifest.format_version != 3
         || manifest.checkpoint_id != checkpoint.request.id
         || manifest.request_digest != checkpoint.request_digest
         || manifest.image_digest != checkpoint.image_digest
@@ -414,7 +505,7 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
         ));
     }
     let actual = file_digest(
-        &directory.join("workload-state.ext4"),
+        &directory.join(manifest.disk_container.workload_name()),
         manifest.workload_disk_bytes.get(),
     )?;
     if actual != manifest.workload_disk_digest {
@@ -424,7 +515,7 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
     }
     if let Some(full) = &manifest.full {
         for (name, artifact) in [
-            ("control-state.ext4", &full.control_disk),
+            (manifest.disk_container.control_name(), &full.control_disk),
             ("snapshot.vmstate", &full.snapshot_state),
             ("memory", &full.memory),
             ("reconnect.json", &full.reconnect_state),
@@ -444,6 +535,7 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
         disk_digest: actual,
         manifest_digest: digest(Domain::Checkpoint, &manifest)?,
         full: manifest.full,
+        container: manifest.disk_container,
     })
 }
 
@@ -457,6 +549,127 @@ fn rollback_evidence(checkpoint: &Checkpoint, operation: &OperationId) -> Result
             operation,
         ),
     )?)
+}
+
+fn capture_disk(
+    source: &Path,
+    destination: &Path,
+    bytes: u64,
+    source_container: DiskContainer,
+) -> Result<Digest> {
+    match source_container {
+        DiskContainer::RawExt4 => copy_and_verify(source, destination, bytes, None),
+        DiskContainer::Vhdx => {
+            #[cfg(target_os = "windows")]
+            {
+                sandsurf_native::virtual_disk::export_raw(source, destination, bytes)?;
+                file_digest(destination, bytes)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (source, destination, bytes);
+                Err(CheckpointError::Invalid(
+                    "VHDX capture requires the Windows host driver",
+                ))
+            }
+        }
+    }
+}
+
+fn disk_logical_bytes(path: &Path, container: DiskContainer) -> Result<u64> {
+    match container {
+        DiskContainer::RawExt4 => Ok(path.metadata()?.len()),
+        DiskContainer::Vhdx => {
+            #[cfg(target_os = "windows")]
+            {
+                Ok(sandsurf_native::virtual_disk::virtual_disk_size(path)?)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = path;
+                Err(CheckpointError::Invalid(
+                    "VHDX inspection requires the Windows host driver",
+                ))
+            }
+        }
+    }
+}
+
+fn materialize_disk(
+    source: &Path,
+    destination: &Path,
+    bytes: u64,
+    expected: &Digest,
+    source_container: DiskContainer,
+    destination_container: DiskContainer,
+) -> Result<()> {
+    match (source_container, destination_container) {
+        (DiskContainer::RawExt4, DiskContainer::RawExt4) => {
+            copy_and_verify(source, destination, bytes, Some(expected))?;
+        }
+        (DiskContainer::RawExt4, DiskContainer::Vhdx) => {
+            #[cfg(target_os = "windows")]
+            {
+                if file_digest(source, bytes)? != *expected {
+                    return Err(CheckpointError::Invalid(
+                        "checkpoint source does not match its committed digest",
+                    ));
+                }
+                sandsurf_native::virtual_disk::import_raw(source, destination, bytes)?;
+                if materialized_digest(destination, bytes, DiskContainer::Vhdx)? != *expected {
+                    return Err(CheckpointError::Invalid(
+                        "converted VHDX does not match the checkpoint",
+                    ));
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (source, destination, bytes, expected);
+                return Err(CheckpointError::Invalid(
+                    "VHDX materialization requires the Windows host driver",
+                ));
+            }
+        }
+        _ => {
+            return Err(CheckpointError::Invalid(
+                "checkpoint container conversion is unsupported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn materialized_digest(path: &Path, bytes: u64, container: DiskContainer) -> Result<Digest> {
+    match container {
+        DiskContainer::RawExt4 => file_digest(path, bytes),
+        DiskContainer::Vhdx => {
+            #[cfg(target_os = "windows")]
+            {
+                let parent = path.parent().ok_or(CheckpointError::Invalid(
+                    "VHDX verification path has no parent",
+                ))?;
+                let verification = parent.join(format!(
+                    ".{}.verification.ext4",
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .ok_or(CheckpointError::Invalid("VHDX name is invalid"))?
+                ));
+                let exported = (|| {
+                    sandsurf_native::virtual_disk::export_raw(path, &verification, bytes)?;
+                    file_digest(&verification, bytes)
+                })();
+                let cleanup = remove_file_if_present(&verification);
+                exported.and_then(|digest| cleanup.map(|()| digest))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (path, bytes);
+                Err(CheckpointError::Invalid(
+                    "VHDX verification requires the Windows host driver",
+                ))
+            }
+        }
+    }
 }
 
 pub(crate) fn copy_and_verify(
@@ -558,11 +771,23 @@ fn try_clone(_: &File, _: &File) -> bool {
     false
 }
 
+fn disk_container(path: &Path) -> Result<DiskContainer> {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("ext4") | Some("raw") => Ok(DiskContainer::RawExt4),
+        Some("vhdx") => Ok(DiskContainer::Vhdx),
+        _ => Err(CheckpointError::Invalid(
+            "checkpoint disk container is unsupported",
+        )),
+    }
+}
+
 fn remove_stage(stage: &Path) -> Result<()> {
     for name in [
         "manifest.json",
         "workload-state.ext4",
+        "workload-state.vhdx",
         "control-state.ext4",
+        "control-state.vhdx",
         "snapshot.vmstate",
         "memory",
         "reconnect.json",

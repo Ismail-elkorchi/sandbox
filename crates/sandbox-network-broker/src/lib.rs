@@ -4,12 +4,14 @@ use sandbox_policy::{
     ManagedNetworkDestination, ManagedNetworkPort, ManagedNetworkRule, normalize_dns_name,
 };
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     UdpSocket,
 };
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +54,16 @@ pub struct BrokerHandle {
     active_streams: ActiveStreams,
     threads: Vec<JoinHandle<()>>,
     stopped: bool,
+}
+
+/// Already-bound loopback endpoints for the four independently authorized
+/// broker planes. Keeping native socket ownership typed makes the broker
+/// portable to Windows without reconstructing sockets through Unix FDs.
+pub struct BrokerSockets {
+    pub http: TcpListener,
+    pub socks: TcpListener,
+    pub dns_udp: UdpSocket,
+    pub dns_tcp: TcpListener,
 }
 
 /// Channel-separated network authority. A rule authorized for DNS lookup is
@@ -128,6 +140,7 @@ impl BrokerHandle {
     /// Starts all broker planes for one already normalized Sandbox policy.
     /// DNS destinations retain its historical proxy-plus-resolver semantics;
     /// IP destinations are direct TCP only.
+    #[cfg(unix)]
     pub fn start(
         listeners: Vec<File>,
         rules: Vec<ManagedNetworkRule>,
@@ -146,6 +159,7 @@ impl BrokerHandle {
         Self::start_partitioned(listeners, policy, callback)
     }
 
+    #[cfg(unix)]
     pub fn start_partitioned(
         listeners: Vec<File>,
         policy: BrokerPolicy,
@@ -158,10 +172,31 @@ impl BrokerHandle {
             ));
         }
         let mut listeners = listeners.into_iter();
-        let http = TcpListener::from(OwnedFd::from(listeners.next().expect("length checked")));
-        let socks = TcpListener::from(OwnedFd::from(listeners.next().expect("length checked")));
-        let dns_udp = UdpSocket::from(OwnedFd::from(listeners.next().expect("length checked")));
-        let dns_tcp = TcpListener::from(OwnedFd::from(listeners.next().expect("length checked")));
+        Self::start_sockets(
+            BrokerSockets {
+                http: TcpListener::from(OwnedFd::from(listeners.next().expect("length checked"))),
+                socks: TcpListener::from(OwnedFd::from(listeners.next().expect("length checked"))),
+                dns_udp: UdpSocket::from(OwnedFd::from(listeners.next().expect("length checked"))),
+                dns_tcp: TcpListener::from(OwnedFd::from(
+                    listeners.next().expect("length checked"),
+                )),
+            },
+            policy,
+            callback,
+        )
+    }
+
+    pub fn start_sockets(
+        sockets: BrokerSockets,
+        policy: BrokerPolicy,
+        callback: impl Fn(NetworkViolation) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let BrokerSockets {
+            http,
+            socks,
+            dns_udp,
+            dns_tcp,
+        } = sockets;
         http.set_nonblocking(true)?;
         socks.set_nonblocking(true)?;
         dns_udp.set_nonblocking(true)?;

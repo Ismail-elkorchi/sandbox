@@ -15,4 +15,6 @@ pub mod secrets;
 pub mod service;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+mod windows_network;
 pub mod workspace;

@@ -84,6 +84,13 @@ pub enum HyperVConfigError {
     TimeoutOutOfRange,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HyperVOperationError {
+    NoLiveMachine,
+    DispatchRejected,
+    OutcomeUnknown,
+}
+
 /// The exclusive guardian owner of one HCS compute-system handle.
 pub struct HyperVDriver {
     config: HyperVConfig,
@@ -177,22 +184,22 @@ impl HyperVDriver {
         self.contain_uncertain_machine();
     }
 
-    pub fn pause_for_capture(&mut self) -> Result<(), ()> {
+    pub fn pause_for_capture(&mut self) -> Result<(), HyperVOperationError> {
         self.run_operation("hcs-capture-pause", |system, operation| {
             // SAFETY: live owned handles and a bounded empty options document.
             unsafe { HcsPauseComputeSystem(system, operation, wide("{}").as_ptr()) }
         })
         .map(drop)
-        .map_err(|_| ())
+        .map_err(HyperVOperationError::from)
     }
 
-    pub fn resume_after_capture(&mut self) -> Result<(), ()> {
+    pub fn resume_after_capture(&mut self) -> Result<(), HyperVOperationError> {
         self.run_operation("hcs-capture-resume", |system, operation| {
             // SAFETY: live owned handles and a bounded empty options document.
             unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }
         })
         .map(drop)
-        .map_err(|_| ())
+        .map_err(HyperVOperationError::from)
     }
 
     fn unavailable(&self, reason: &'static [u8]) -> MachineOutcome {
@@ -695,6 +702,16 @@ enum OperationFailure {
     NotDispatched,
     Dispatch,
     Wait,
+}
+
+impl From<OperationFailure> for HyperVOperationError {
+    fn from(value: OperationFailure) -> Self {
+        match value {
+            OperationFailure::NotDispatched => Self::NoLiveMachine,
+            OperationFailure::Dispatch => Self::DispatchRejected,
+            OperationFailure::Wait => Self::OutcomeUnknown,
+        }
+    }
 }
 
 fn failed(result: HRESULT) -> bool {

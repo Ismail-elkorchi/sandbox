@@ -1,6 +1,7 @@
 //! Windows guardian integration for one retained Hyper-V/HCS Linux VM.
 
 use crate::guest::{GuestClient, RemoteWorkloadDriver};
+use crate::windows_network::{WindowsNetworkBridge, WindowsPortGateway};
 use sandbox_guest::{
     AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
     NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
@@ -14,8 +15,8 @@ use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::{GuestChannel, HyperVChannel, virtual_disk};
 use sandsurf_protocol::{
     Capability, Counter, Digest, Domain, GuestServiceRequest, GuestServiceResponse,
-    LifecycleCommand, MachineObservation, MachineState, Mutation, Resources, RuntimeConfiguration,
-    SandboxId, bytes_digest, digest,
+    LifecycleCommand, MachineObservation, MachineState, Mutation, NetworkDestination,
+    NetworkPolicy, Resources, RuntimeConfiguration, SandboxId, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,9 @@ pub struct WindowsGuardianEffect {
     machine: HyperVDriver,
     workload: WindowsWorkload,
     pending: Option<PendingGuest>,
+    network: Arc<Mutex<Option<WindowsNetworkBridge>>>,
+    network_usage: NetworkUsage,
+    exposures: Arc<Mutex<Option<WindowsPortGateway>>>,
     installed_runtime: Option<InstalledRuntime>,
 }
 
@@ -202,6 +206,7 @@ struct ActiveGuest {
     epoch: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
+    network_capability: [u8; 32],
 }
 
 struct PendingGuest {
@@ -217,6 +222,23 @@ struct InstalledRuntime {
     epoch: Counter,
     configuration: RuntimeConfiguration,
     evidence: Digest,
+}
+
+#[derive(Default)]
+struct NetworkUsageValue {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    connections: u64,
+}
+
+type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
+
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broker::BrokerReport) {
+    if let Ok(mut usage) = usage.lock() {
+        usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
+        usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
+        usage.connections = usage.connections.saturating_add(report.connections);
+    }
 }
 
 impl WindowsGuardianEffect {
@@ -293,6 +315,9 @@ impl WindowsGuardianEffect {
             machine,
             workload: WindowsWorkload { active },
             pending: None,
+            network: Arc::new(Mutex::new(None)),
+            network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),
+            exposures: Arc::new(Mutex::new(None)),
             installed_runtime: None,
         })
     }
@@ -326,6 +351,7 @@ impl WindowsGuardianEffect {
                 epoch,
                 boot_identity,
                 capability,
+                network_capability,
             },
             authentication,
         });
@@ -388,17 +414,64 @@ impl WindowsGuardianEffect {
         {
             return RuntimeInstallation::Applied(installed.evidence.clone());
         }
-        if !configuration.network.rules.is_empty() || !configuration.exposures.is_empty() {
-            return RuntimeInstallation::NotApplied(bytes_digest(
-                b"hyper-v-managed-network-data-plane-not-qualified",
-            ));
+        self.installed_runtime = None;
+        let rules = match network_rules(&configuration.network) {
+            Ok(value) => value,
+            Err(_) => {
+                return RuntimeInstallation::NotApplied(bytes_digest(
+                    b"hyper-v-network-policy-normalization-failed",
+                ));
+            }
+        };
+        let Ok(mut network) = self.network.lock() else {
+            return RuntimeInstallation::Unknown;
+        };
+        if let Some(old) = network.take() {
+            let report = old.stop();
+            accumulate_network_usage(&self.network_usage, &report);
+            if !report.cleanup_failures.is_empty() {
+                return RuntimeInstallation::Unknown;
+            }
         }
+        let bridge =
+            match WindowsNetworkBridge::start(&active.vm_id, active.network_capability, rules) {
+                Ok(value) => value,
+                Err(_) => return RuntimeInstallation::Unknown,
+            };
+        *network = Some(bridge);
+        drop(network);
+
+        let Ok(mut exposures) = self.exposures.lock() else {
+            return RuntimeInstallation::Unknown;
+        };
+        if let Some(old) = exposures.take()
+            && old.stop().is_err()
+        {
+            return RuntimeInstallation::Unknown;
+        }
+        let gateway = match WindowsPortGateway::start(
+            &active.vm_id,
+            active.network_capability,
+            &configuration.exposures,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                drop(exposures);
+                self.stop_data_planes();
+                return RuntimeInstallation::Unknown;
+            }
+        };
+        *exposures = Some(gateway);
+        drop(exposures);
         let resource_evidence =
             match guest_client(&active).call(&GuestServiceRequest::ApplyResources {
                 resources: configuration.resources.clone(),
             }) {
                 Ok(GuestServiceResponse::ResourcesApplied { evidence }) => evidence,
-                _ => return RuntimeInstallation::Unknown,
+                _ => {
+                    self.stop_data_planes();
+                    return RuntimeInstallation::Unknown;
+                }
             };
         match digest(
             Domain::Grant,
@@ -420,13 +493,28 @@ impl WindowsGuardianEffect {
         }
     }
 
+    fn stop_data_planes(&mut self) {
+        self.installed_runtime = None;
+        if let Ok(mut network) = self.network.lock()
+            && let Some(bridge) = network.take()
+        {
+            let report = bridge.stop();
+            accumulate_network_usage(&self.network_usage, &report);
+        }
+        if let Ok(mut exposures) = self.exposures.lock()
+            && let Some(gateway) = exposures.take()
+        {
+            let _ = gateway.stop();
+        }
+    }
+
     fn contain_unpublished(&mut self) {
         self.machine.contain_unobserved();
         self.pending = None;
-        self.installed_runtime = None;
         if let Ok(mut active) = self.workload.active.lock() {
             *active = None;
         }
+        self.stop_data_planes();
     }
 }
 
@@ -550,10 +638,10 @@ impl GuardianEffect for WindowsGuardianEffect {
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| matches!(value.state, MachineState::Stopped | MachineState::Suspended | MachineState::Destroyed))
         ) {
-            self.installed_runtime = None;
             if let Ok(mut active) = self.workload.active.lock() {
                 *active = None;
             }
+            self.stop_data_planes();
         }
         outcome
     }
@@ -625,7 +713,32 @@ impl GuardianEffect for WindowsGuardianEffect {
                 .workload
                 .query(GuestServiceRequest::FinishFilesystemCapture { operation_id });
         }
-        self.workload.query(request)
+        let usage_requested = matches!(request, GuestServiceRequest::ResourceUsage);
+        let mut response = self.workload.query(request)?;
+        if usage_requested && let GuestServiceResponse::ResourceUsage { usage } = &mut response {
+            let accumulated = self
+                .network_usage
+                .lock()
+                .map_err(|_| ControlError::Protocol("network usage lock poisoned"))?;
+            let current = self
+                .network
+                .lock()
+                .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
+                .as_ref()
+                .map_or_else(Default::default, WindowsNetworkBridge::snapshot);
+            usage.network_rx_bytes =
+                Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
+                    .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
+            usage.network_tx_bytes =
+                Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes))
+                    .map_err(|_| ControlError::Protocol("network transmit accounting overflow"))?;
+            usage.network_connections =
+                Counter::try_from(accumulated.connections.saturating_add(current.connections))
+                    .map_err(|_| {
+                        ControlError::Protocol("network connection accounting overflow")
+                    })?;
+        }
+        Ok(response)
     }
 
     fn live_observation_reachable(&mut self) -> bool {
@@ -669,8 +782,60 @@ fn authentication_record(
     Ok(bytes)
 }
 
+fn network_rules(
+    policy: &NetworkPolicy,
+) -> Result<sandbox_network_broker::BrokerPolicy, WindowsError> {
+    policy
+        .validate()
+        .map_err(|error| WindowsError::Invalid(error.to_string()))?;
+    let mut rules = sandbox_network_broker::BrokerPolicy::default();
+    for rule in &policy.rules {
+        let destination = match &rule.destination {
+            NetworkDestination::Dns {
+                name,
+                include_subdomains,
+                allow_private_addresses,
+            } => sandbox_policy::ManagedNetworkDestination::Dns {
+                name: sandbox_policy::normalize_dns_name(name)
+                    .map_err(|error| WindowsError::Invalid(error.to_string()))?,
+                include_subdomains: *include_subdomains,
+                allow_private_addresses: *allow_private_addresses,
+            },
+            NetworkDestination::Ip { cidr } => {
+                sandbox_policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
+            }
+        };
+        let ports = rule
+            .ports
+            .iter()
+            .map(|range| {
+                if range.from == range.to {
+                    sandbox_policy::ManagedNetworkPort::Single(range.from)
+                } else {
+                    sandbox_policy::ManagedNetworkPort::Range {
+                        from: range.from,
+                        to: range.to,
+                    }
+                }
+            })
+            .collect();
+        let managed = sandbox_policy::ManagedNetworkRule {
+            transport: "tcp".into(),
+            destination,
+            ports,
+        };
+        match rule.plane {
+            sandsurf_protocol::NetworkPlane::NamedProxy => rules.named_proxy.push(managed),
+            sandsurf_protocol::NetworkPlane::DirectTcp => rules.direct_tcp.push(managed),
+            sandsurf_protocol::NetworkPlane::Dns => rules.dns.push(managed),
+        }
+    }
+    Ok(rules)
+}
+
 fn ensure_mutable_vhdx(source: &Path, destination: &Path, bytes: u64) -> Result<(), WindowsError> {
-    if !bytes.is_multiple_of(1024 * 1024) || bytes < 64 * 1024 * 1024 || bytes > MAX_ARTIFACT_BYTES
+    if !bytes.is_multiple_of(1024 * 1024)
+        || !(64 * 1024 * 1024..=MAX_ARTIFACT_BYTES).contains(&bytes)
     {
         return Err(WindowsError::Invalid(
             "persistent VHDX geometry is outside the envelope".into(),

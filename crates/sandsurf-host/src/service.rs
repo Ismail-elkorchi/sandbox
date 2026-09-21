@@ -339,7 +339,7 @@ impl HostService {
                         let captured = crate::checkpoints::capture_filesystem(
                             &capture_root,
                             &capturing,
-                            &sandbox_root.join("disks/workload-state.ext4"),
+                            &sandbox_root.join("disks").join(workload_disk_name()),
                         );
                         let finished = client
                             .guest(
@@ -373,8 +373,8 @@ impl HostService {
                         let captured = crate::checkpoints::capture_full(
                             &capture_root,
                             &capturing,
-                            &sandbox_root.join("disks/workload-state.ext4"),
-                            &sandbox_root.join("disks/control-state.ext4"),
+                            &sandbox_root.join("disks").join(workload_disk_name()),
+                            &sandbox_root.join("disks").join(control_disk_name()),
                             &sandbox_root
                                 .join("guardian/full-captures")
                                 .join(request.operation_id.as_str()),
@@ -788,7 +788,7 @@ impl HostService {
                 crate::checkpoints::materialize_fork(
                     &self.root.join("checkpoints"),
                     &checkpoint,
-                    &disks.join("workload-state.ext4"),
+                    &disks.join(workload_disk_name()),
                 )?;
                 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
@@ -865,7 +865,8 @@ impl HostService {
                     &checkpoint,
                     &self
                         .sandbox_root(&sandbox_id)
-                        .join("disks/workload-state.ext4"),
+                        .join("disks")
+                        .join(workload_disk_name()),
                     &operation_id,
                 )?;
                 Ok(HostResponse::Rollback {
@@ -1718,8 +1719,8 @@ impl HostService {
                 let captured = crate::checkpoints::capture_full(
                     &self.root.join("checkpoints"),
                     &capturing,
-                    &sandbox_root.join("disks/workload-state.ext4"),
-                    &sandbox_root.join("disks/control-state.ext4"),
+                    &sandbox_root.join("disks").join(workload_disk_name()),
+                    &sandbox_root.join("disks").join(control_disk_name()),
                     &sandbox_root
                         .join("guardian/full-captures")
                         .join(capture_operation_id.as_str()),
@@ -2445,6 +2446,26 @@ pub(crate) fn native_guest_architecture() -> GuestArchitecture {
     } else {
         GuestArchitecture::Amd64
     }
+}
+
+#[cfg(target_os = "windows")]
+fn workload_disk_name() -> &'static str {
+    "workload-state.vhdx"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn workload_disk_name() -> &'static str {
+    "workload-state.ext4"
+}
+
+#[cfg(target_os = "windows")]
+fn control_disk_name() -> &'static str {
+    "control-state.vhdx"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn control_disk_name() -> &'static str {
+    "control-state.ext4"
 }
 
 fn error_category(error: &HostError) -> &'static str {

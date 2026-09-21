@@ -179,11 +179,7 @@ mod unix {
             use std::io::{Read, Write};
             use std::os::unix::net::UnixListener;
 
-            let root = std::env::temp_dir().join(format!(
-                "sandsurf-direct-channel-{}-{}",
-                std::process::id(),
-                std::thread::current().name().unwrap_or("test")
-            ));
+            let root = std::env::temp_dir().join(format!("ssdc-{}", std::process::id()));
             fs::create_dir_all(&root).expect("create root");
             let socket = root.join("guest.sock");
             let listener = UnixListener::bind(&socket).expect("bind");
@@ -249,8 +245,9 @@ mod windows {
     use std::sync::OnceLock;
     use std::time::Duration;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_HYPERV, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, WSADATA, WSAGetLastError, WSAStartup,
-        closesocket, connect, socket,
+        AF_HYPERV, FIONBIO, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKET_ERROR, SOMAXCONN,
+        WSADATA, WSAGetLastError, WSAStartup, accept, bind, closesocket, connect, ioctlsocket,
+        listen, socket,
     };
     use windows_sys::Win32::System::Hypervisor::{
         HV_GUID_VSOCK_TEMPLATE, HV_PROTOCOL_RAW, SOCKADDR_HV,
@@ -272,6 +269,104 @@ mod windows {
         pub vm_id: String,
         pub guest_port: u32,
         pub timeout: Duration,
+    }
+
+    /// Host listener for Linux-guest AF_VSOCK connections translated through
+    /// Hyper-V sockets. The accepted peer is fenced to one HCS VM identity;
+    /// purpose-bound protocol authentication remains mandatory above it.
+    pub struct HyperVListener {
+        socket: usize,
+        vm_id: GUID,
+    }
+
+    impl HyperVListener {
+        pub fn bind(vm_id: &str, guest_port: u32) -> io::Result<Self> {
+            let vm_id = parse_guid(vm_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid Hyper-V VM identity")
+            })?;
+            if !(1024..=0x7fff_ffff).contains(&guest_port) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid Hyper-V vsock port",
+                ));
+            }
+            initialize_winsock().map_err(io::Error::other)?;
+            // SAFETY: scalar arguments select the documented Hyper-V stream
+            // protocol and return a newly owned socket or INVALID_SOCKET.
+            let raw = unsafe { socket(AF_HYPERV as i32, SOCK_STREAM, HV_PROTOCOL_RAW as i32) };
+            if raw == INVALID_SOCKET {
+                return Err(last_socket_error());
+            }
+            let address = SOCKADDR_HV {
+                Family: AF_HYPERV,
+                Reserved: 0,
+                VmId: GUID::from_u128(0),
+                ServiceId: service_id(guest_port),
+            };
+            // SAFETY: address has the exact SOCKADDR_HV layout and remains live
+            // for these synchronous socket calls.
+            if unsafe {
+                bind(
+                    raw,
+                    (&raw const address).cast::<SOCKADDR>(),
+                    size_of::<SOCKADDR_HV>() as i32,
+                )
+            } == SOCKET_ERROR
+                || unsafe { listen(raw, SOMAXCONN as i32) } == SOCKET_ERROR
+            {
+                let error = last_socket_error();
+                // SAFETY: raw is uniquely owned until successful construction.
+                unsafe { closesocket(raw) };
+                return Err(error);
+            }
+            let mut nonblocking = 1_u32;
+            // SAFETY: raw is live and nonblocking is a writable u32 as required
+            // by FIONBIO.
+            if unsafe { ioctlsocket(raw, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+                let error = last_socket_error();
+                // SAFETY: raw is uniquely owned until successful construction.
+                unsafe { closesocket(raw) };
+                return Err(error);
+            }
+            Ok(Self { socket: raw, vm_id })
+        }
+
+        pub fn accept(&self) -> io::Result<TcpStream> {
+            let mut address = SOCKADDR_HV::default();
+            let mut length = size_of::<SOCKADDR_HV>() as i32;
+            // SAFETY: the listener is live and both peer outputs have the exact
+            // storage required by AF_HYPERV.
+            let accepted = unsafe {
+                accept(
+                    self.socket,
+                    (&raw mut address).cast::<SOCKADDR>(),
+                    &mut length,
+                )
+            };
+            if accepted == INVALID_SOCKET {
+                return Err(last_socket_error());
+            }
+            if length != size_of::<SOCKADDR_HV>() as i32
+                || address.Family != AF_HYPERV
+                || !same_guid(address.VmId, self.vm_id)
+            {
+                // SAFETY: the rejected accepted socket is uniquely owned here.
+                unsafe { closesocket(accepted) };
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Hyper-V socket peer is not the owned Sandbox VM",
+                ));
+            }
+            // SAFETY: ownership of the accepted Winsock socket transfers once.
+            Ok(unsafe { TcpStream::from_raw_socket(accepted as RawSocket) })
+        }
+    }
+
+    impl Drop for HyperVListener {
+        fn drop(&mut self) {
+            // SAFETY: this listener uniquely owns the socket until drop.
+            unsafe { closesocket(self.socket) };
+        }
     }
 
     impl GuestChannel for HyperVChannel {
@@ -345,6 +440,13 @@ mod windows {
         }
     }
 
+    fn same_guid(left: GUID, right: GUID) -> bool {
+        left.data1 == right.data1
+            && left.data2 == right.data2
+            && left.data3 == right.data3
+            && left.data4 == right.data4
+    }
+
     fn parse_guid(value: &str) -> Option<GUID> {
         let compact: String = value
             .chars()
@@ -359,4 +461,4 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::HyperVChannel;
+pub use windows::{HyperVChannel, HyperVListener};
