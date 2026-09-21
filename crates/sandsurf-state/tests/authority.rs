@@ -61,6 +61,103 @@ fn catalog_limits() -> CatalogLimits {
 }
 
 #[test]
+fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforcement() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut host =
+        HostCatalog::create(&path, "secret-host".try_into().unwrap(), catalog_limits()).unwrap();
+    let sandbox: SandboxId = "secret-box".try_into().unwrap();
+    let create: OperationId = "create-secret-box".try_into().unwrap();
+    let image = hash("secret-image");
+    let create_digest = digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+    host.create_sandbox(
+        sandbox.clone(),
+        image,
+        resources(),
+        create,
+        Approval {
+            id: "approve-secret-box".try_into().unwrap(),
+            request_digest: create_digest,
+        },
+    )
+    .unwrap();
+    let secret = SecretVersion {
+        id: "credential".try_into().unwrap(),
+        version: hash("secret-bytes"),
+        bytes: n(12),
+    };
+    let delivery = SecretDelivery {
+        secret: secret.clone(),
+        destination: SecretDestination::File {
+            path: GuestPath::try_from("/run/credential").unwrap(),
+            mode: 0o600,
+        },
+        lifetime: SecretLifetime::UntilRevoked,
+        process_id: None,
+    };
+    let delivery_digest = hash("delivery-request");
+    let delivery_operation: OperationId = "deliver-credential".try_into().unwrap();
+    host.admit_secret_delivery(
+        SecretDeliveryRecord {
+            operation_id: delivery_operation.clone(),
+            sandbox_id: sandbox.clone(),
+            request_digest: delivery_digest.clone(),
+            delivery: delivery.clone(),
+            applied: false,
+            revocation_operation: None,
+            revoked: false,
+        },
+        Approval {
+            id: "approve-delivery".try_into().unwrap(),
+            request_digest: delivery_digest.clone(),
+        },
+    )
+    .unwrap();
+    host.complete_secret_delivery(&delivery_operation, &delivery_digest)
+        .unwrap();
+    assert_eq!(host.active_secret_deliveries(&sandbox).unwrap().len(), 1);
+
+    let revoke_operation: OperationId = "revoke-credential".try_into().unwrap();
+    let revoke_digest = hash("revocation-request");
+    let pending = host
+        .admit_secret_revocation(
+            SecretRevocationAdmission {
+                sandbox_id: sandbox.clone(),
+                operation_id: revoke_operation.clone(),
+                expected_revision: Counter::ONE,
+                secret,
+                terminate_recipients: true,
+                request_digest: revoke_digest.clone(),
+            },
+            Approval {
+                id: "approve-revocation".try_into().unwrap(),
+                request_digest: revoke_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(pending.deliveries, vec![delivery]);
+    assert!(pending.evidence.is_none());
+    assert!(host.active_secret_deliveries(&sandbox).unwrap().is_empty());
+    let evidence = SecretRevocationEvidence {
+        files_removed: Counter::ONE,
+        environment_bindings_removed: Counter::ZERO,
+        recipients_terminated: Vec::new(),
+        recipients_already_stopped: Vec::new(),
+        residual_copies_possible: true,
+        enforcement_complete: true,
+    };
+    let completed = host
+        .complete_secret_revocation(&revoke_operation, &revoke_digest, evidence.clone())
+        .unwrap();
+    assert_eq!(completed.evidence, Some(evidence));
+    drop(host);
+
+    let host = HostCatalog::open(&path).unwrap();
+    assert!(host.active_secret_deliveries(&sandbox).unwrap().is_empty());
+    assert_eq!(host.secret_revocations(&sandbox).unwrap(), vec![completed]);
+}
+
+#[test]
 fn image_import_admission_and_publication_are_durable_and_idempotent() {
     let root = TempRoot::new();
     let path = root.0.join("host");

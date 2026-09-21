@@ -6,7 +6,7 @@ import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js"
 
 export type SandsurfCapability = "spawn" | "read-files" | "write-files" | "workload-admin" | "network" | "expose-port" | "deliver-secret" | "apply-to-host" | "increase-resources" | "checkpoint" | "fork" | "release-evidence";
 export type DesiredSandboxState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
-export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "image-publish" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
+export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "image-publish" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery" | "secret-revocation"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 export type SandsurfAuthorizer = (change: AuthorityChange) => AuthorityDecision | Promise<AuthorityDecision>;
 export interface SandsurfOpenOptions { readonly directory: string; readonly authorizer?: SandsurfAuthorizer; }
@@ -31,6 +31,21 @@ export interface LiveResourceLimits { readonly workloadMemoryBytes: number; read
 export interface RuntimeConfiguration { readonly network: NetworkPolicy; readonly exposures: readonly Exposure[]; readonly resources: LiveResourceLimits; }
 export interface ResourceUsage { readonly cpuMicros: number; readonly memoryCurrent: number; readonly memoryPeak: number; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number; readonly ioWriteBytes: number; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly processesCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
+export interface SecretRevocation {
+  readonly operationId: string;
+  readonly sandboxId: string;
+  readonly secret: SecretVersion;
+  readonly terminateRecipients: boolean;
+  readonly enforced: boolean;
+  readonly evidence: null | {
+    readonly filesRemoved: number;
+    readonly environmentBindingsRemoved: number;
+    readonly recipientsTerminated: readonly string[];
+    readonly recipientsAlreadyStopped: readonly string[];
+    readonly residualCopiesPossible: boolean;
+    readonly enforcementComplete: boolean;
+  };
+}
 export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: SecretVersion };
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
@@ -312,6 +327,13 @@ export class SandboxSecrets {
     const response = await this.#sandbox.hostRequest({ kind: "deliver-secret", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, scopeDigest: capabilityScope(this.#sandbox.id, "deliver-secret"), delivery, approvalId });
     if (response.kind !== "secret" || !record(response.secret)) throw protocol("secret delivery response");
     return parseSecret(response.secret);
+  }
+  async revoke(secret: SecretVersion, options: { readonly terminateRecipients?: boolean; readonly operationId?: string } = {}): Promise<SecretRevocation> {
+    const parsed = parseSecret(secret as unknown as Record<string, unknown>); const operationId = validateIdentity(options.operationId ?? identity("revoke-secret")); const view = await this.#sandbox.inspect(); const terminateRecipients = options.terminateRecipients ?? true;
+    const approvalId = await this.#sandbox.approve({ kind: "secret-revocation", sandboxId: this.#sandbox.id, operationId, request: { expectedRevision: view.configurationRevision, secret: parsed, terminateRecipients } });
+    const response = await this.#sandbox.hostRequest({ kind: "revoke-secret", sandboxId: this.#sandbox.id, operationId, expectedRevision: view.configurationRevision, secret: parsed, terminateRecipients, approvalId });
+    if (response.kind !== "secret-revocation" || !record(response.revocation)) throw protocol("secret revocation response");
+    return parseSecretRevocation(response.revocation);
   }
 }
 
@@ -654,6 +676,20 @@ function normalizeLiveResources(value: LiveResourceLimits): Readonly<Record<stri
 function parseRuntimeConfiguration(value: Record<string, unknown>): RuntimeConfiguration { if (!record(value.network) || !Array.isArray(value.network.rules) || !Array.isArray(value.exposures) || !record(value.resources)) throw protocol("runtime configuration"); return { network: normalizeNetworkPolicy(value.network as unknown as NetworkPolicy), exposures: value.exposures.map(parseExposure), resources: { workloadMemoryBytes: integer(value.resources.workloadMemoryBytes), workloadProcesses: integer(value.resources.workloadProcesses), ...(value.resources.cpuMax === null ? {} : { cpuMax: value.resources.cpuMax as unknown as readonly [number, number] }) } }; }
 function parseExposure(value: unknown): Exposure { if (!record(value) || !record(value.spec)) throw protocol("exposure"); return { id: validateIdentity(text(value.id)), sandboxId: validateIdentity(text(value.sandboxId)), grantId: validateIdentity(text(value.grantId)), revision: integer(value.revision), spec: normalizeExposure({ guestAddress: text(value.spec.guestAddress), guestPort: integer(value.spec.guestPort), hostAddress: text(value.spec.hostAddress), hostPort: integer(value.spec.hostPort), public: value.spec.public === true }), active: value.active === true, boundPort: value.boundPort === null ? null : integer(value.boundPort) }; }
 function parseSecret(value: Record<string, unknown>): SecretVersion { return { id: validateIdentity(text(value.id)), version: digest(text(value.version)), bytes: integer(value.bytes) }; }
+function parseSecretRevocation(value: Record<string, unknown>): SecretRevocation {
+  const evidence = value.evidence;
+  if (!record(value.secret) || (evidence !== null && !record(evidence))) throw protocol("secret revocation evidence");
+  const parsedEvidence = evidence === null ? null : {
+    filesRemoved: integer(evidence.filesRemoved),
+    environmentBindingsRemoved: integer(evidence.environmentBindingsRemoved),
+    recipientsTerminated: identityList(evidence.recipientsTerminated),
+    recipientsAlreadyStopped: identityList(evidence.recipientsAlreadyStopped),
+    residualCopiesPossible: evidence.residualCopiesPossible === true,
+    enforcementComplete: evidence.enforcementComplete === true,
+  };
+  return { operationId: validateIdentity(text(value.operationId)), sandboxId: validateIdentity(text(value.sandboxId)), secret: parseSecret(value.secret), terminateRecipients: value.terminateRecipients === true, enforced: parsedEvidence?.enforcementComplete === true, evidence: parsedEvidence };
+}
+function identityList(value: unknown): readonly string[] { if (!Array.isArray(value) || value.length > 1024) throw protocol("identity list"); return value.map((item) => validateIdentity(text(item))); }
 function parseUsage(value: Record<string, unknown>): ResourceUsage { return { cpuMicros: integer(value.cpuMicros), memoryCurrent: integer(value.memoryCurrent), memoryPeak: integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: integer(value.ioReadBytes), ioWriteBytes: integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), processesCurrent: integer(value.processesCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
 function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string, unknown>> {
   if (options.source !== undefined && options.reference !== undefined) throw new TypeError("Specify either source or reference for OCI import");

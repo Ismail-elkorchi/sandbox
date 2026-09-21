@@ -4,7 +4,7 @@ use sandsurf_protocol::{
     MachineObservation, Observation, Operation, OperationId, PinId, ProcessId, Qualification,
     ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, TransferId, VmEngine,
 };
-use sandsurf_state::{ImageImportRecord, ImageRecord};
+use sandsurf_state::{ImageImportRecord, ImageRecord, SecretRevocationRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -324,6 +324,14 @@ pub enum HostRequest {
         delivery: sandsurf_protocol::SecretDelivery,
         approval_id: CommitmentId,
     },
+    RevokeSecret {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_revision: Counter,
+        secret: sandsurf_protocol::SecretVersion,
+        terminate_recipients: bool,
+        approval_id: CommitmentId,
+    },
     UpdateResources {
         sandbox_id: SandboxId,
         operation_id: OperationId,
@@ -477,6 +485,9 @@ pub enum HostResponse {
     },
     Secret {
         secret: sandsurf_protocol::SecretVersion,
+    },
+    SecretRevocation {
+        revocation: SecretRevocationRecord,
     },
     Usage {
         usage: sandsurf_protocol::ResourceUsage,

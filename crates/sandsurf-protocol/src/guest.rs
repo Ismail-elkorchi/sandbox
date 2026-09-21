@@ -184,8 +184,11 @@ pub enum GuestServiceRequest {
         bytes: Vec<u8>,
     },
     RevokeSecret {
+        operation_id: OperationId,
         secret_id: crate::SecretId,
         version: Digest,
+        deliveries: Vec<crate::SecretDelivery>,
+        terminate_recipients: bool,
     },
     ApplyResources {
         resources: crate::LiveResourceLimits,
@@ -428,6 +431,9 @@ pub enum GuestServiceResponse {
     },
     SecretInstalled {
         evidence: Digest,
+    },
+    SecretRevoked {
+        evidence: crate::SecretRevocationEvidence,
     },
     ResourcesApplied {
         evidence: Digest,

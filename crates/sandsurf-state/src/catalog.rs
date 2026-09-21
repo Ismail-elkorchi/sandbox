@@ -14,6 +14,7 @@ CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, enforced INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE checkpoints(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage_observations(sandbox TEXT PRIMARY KEY REFERENCES sandboxes(id), epoch INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
@@ -90,6 +91,30 @@ pub struct SecretDeliveryRecord {
     pub request_digest: Digest,
     pub delivery: SecretDelivery,
     pub applied: bool,
+    pub revocation_operation: Option<OperationId>,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretRevocationRecord {
+    pub operation_id: OperationId,
+    pub sandbox_id: SandboxId,
+    pub request_digest: Digest,
+    pub secret: SecretVersion,
+    pub deliveries: Vec<SecretDelivery>,
+    pub terminate_recipients: bool,
+    pub evidence: Option<SecretRevocationEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretRevocationAdmission {
+    pub sandbox_id: SandboxId,
+    pub operation_id: OperationId,
+    pub expected_revision: Counter,
+    pub secret: SecretVersion,
+    pub terminate_recipients: bool,
+    pub request_digest: Digest,
 }
 
 /// Host-owned identity, configuration, and reservation facts. Machine state is
@@ -256,6 +281,180 @@ impl HostCatalog {
             .db
             .connection
             .prepare("SELECT value FROM secret_deliveries WHERE sandbox=?1 ORDER BY rowid ASC")?;
+        statement
+            .query_map([sandbox.as_str()], |row| row.get::<_, String>(0))?
+            .map(|value| decode(&value?))
+            .collect()
+    }
+
+    pub fn active_secret_deliveries(
+        &self,
+        sandbox: &SandboxId,
+    ) -> Result<Vec<SecretDeliveryRecord>> {
+        Ok(self
+            .secret_deliveries(sandbox)?
+            .into_iter()
+            .filter(|record| {
+                record.applied && record.revocation_operation.is_none() && !record.revoked
+            })
+            .collect())
+    }
+
+    pub fn admit_secret_revocation(
+        &mut self,
+        request: SecretRevocationAdmission,
+        approval: Approval,
+    ) -> Result<SecretRevocationRecord> {
+        if approval.request_digest != request.request_digest {
+            return Err(Error::Conflict("secret revocation approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(encoded) = tx
+            .query_row(
+                "SELECT value FROM secret_revocations WHERE operation=?1",
+                [request.operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: SecretRevocationRecord = decode(&encoded)?;
+            return if old.request_digest == request.request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "secret revocation operation identity conflict",
+                ))
+            };
+        }
+        require_revision(&tx, &request.sandbox_id, request.expected_revision)?;
+        let mut statement = tx.prepare(
+            "SELECT operation,value FROM secret_deliveries WHERE sandbox=?1 ORDER BY rowid ASC",
+        )?;
+        let encoded = statement
+            .query_map([request.sandbox_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut deliveries = Vec::new();
+        let mut updates = Vec::new();
+        for (delivery_operation, value) in encoded {
+            let mut record: SecretDeliveryRecord = decode(&value)?;
+            if record.applied
+                && !record.revoked
+                && record.delivery.secret == request.secret
+                && record
+                    .revocation_operation
+                    .as_ref()
+                    .is_none_or(|value| value == &request.operation_id)
+            {
+                record.revocation_operation = Some(request.operation_id.clone());
+                deliveries.push(record.delivery.clone());
+                updates.push((delivery_operation, encode(&record)?));
+            }
+        }
+        if deliveries.is_empty() {
+            return Err(Error::Missing("active secret delivery is missing"));
+        }
+        if deliveries.len() > 1024 {
+            return Err(Error::Capacity(
+                "secret revocation delivery set is oversized",
+            ));
+        }
+        capacity(&tx, "secret_revocations", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let record = SecretRevocationRecord {
+            operation_id: request.operation_id,
+            sandbox_id: request.sandbox_id,
+            request_digest: request.request_digest,
+            secret: request.secret,
+            deliveries,
+            terminate_recipients: request.terminate_recipients,
+            evidence: None,
+        };
+        for (delivery_operation, value) in updates {
+            tx.execute(
+                "UPDATE secret_deliveries SET value=?2 WHERE operation=?1",
+                params![delivery_operation, value],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO secret_revocations(operation,sandbox,request_digest,value) VALUES (?1,?2,?3,?4)",
+            params![
+                record.operation_id.as_str(),
+                record.sandbox_id.as_str(),
+                record.request_digest.as_str(),
+                encode(&record)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn complete_secret_revocation(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+        evidence: SecretRevocationEvidence,
+    ) -> Result<SecretRevocationRecord> {
+        if !evidence.enforcement_complete {
+            return Err(Error::Conflict(
+                "secret revocation enforcement is incomplete",
+            ));
+        }
+        let tx = self.db.connection.transaction()?;
+        let encoded: String = tx
+            .query_row(
+                "SELECT value FROM secret_revocations WHERE operation=?1 AND request_digest=?2",
+                params![operation_id.as_str(), request_digest.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(Error::Missing("secret revocation operation is missing"))?;
+        let mut record: SecretRevocationRecord = decode(&encoded)?;
+        if let Some(committed) = record.evidence.as_ref() {
+            if committed != &evidence {
+                return Err(Error::Conflict("secret revocation evidence changed"));
+            }
+            return Ok(record);
+        }
+        record.evidence = Some(evidence);
+        for delivery in &record.deliveries {
+            let mut statement = tx.prepare(
+                "SELECT operation,value FROM secret_deliveries WHERE sandbox=?1 ORDER BY rowid ASC",
+            )?;
+            let values = statement
+                .query_map([record.sandbox_id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            for (delivery_operation, value) in values {
+                let mut delivery_record: SecretDeliveryRecord = decode(&value)?;
+                if &delivery_record.delivery == delivery
+                    && delivery_record.revocation_operation.as_ref() == Some(operation_id)
+                {
+                    delivery_record.revoked = true;
+                    tx.execute(
+                        "UPDATE secret_deliveries SET value=?2 WHERE operation=?1",
+                        params![delivery_operation, encode(&delivery_record)?],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE secret_revocations SET value=?2,enforced=1 WHERE operation=?1",
+            params![operation_id.as_str(), encode(&record)?],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn secret_revocations(&self, sandbox: &SandboxId) -> Result<Vec<SecretRevocationRecord>> {
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT value FROM secret_revocations WHERE sandbox=?1 ORDER BY rowid ASC")?;
         statement
             .query_map([sandbox.as_str()], |row| row.get::<_, String>(0))?
             .map(|value| decode(&value?))

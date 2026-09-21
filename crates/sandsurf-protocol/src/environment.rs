@@ -1,4 +1,4 @@
-use crate::{Counter, Digest, ExposureId, GrantId, Invalid, SandboxId, SecretId};
+use crate::{Counter, Digest, ExposureId, GrantId, Invalid, ProcessId, SandboxId, SecretId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +179,20 @@ pub struct SecretDelivery {
     pub destination: SecretDestination,
     pub lifetime: SecretLifetime,
     pub process_id: Option<crate::ProcessId>,
+}
+
+/// Exact guest-side enforcement established for one host-owned revocation.
+/// Removing an installed binding is distinct from proving that no workload
+/// copied the bytes while it held them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretRevocationEvidence {
+    pub files_removed: Counter,
+    pub environment_bindings_removed: Counter,
+    pub recipients_terminated: Vec<ProcessId>,
+    pub recipients_already_stopped: Vec<ProcessId>,
+    pub residual_copies_possible: bool,
+    pub enforcement_complete: bool,
 }
 
 impl SecretDelivery {

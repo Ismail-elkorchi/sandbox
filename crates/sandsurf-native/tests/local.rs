@@ -86,6 +86,32 @@ fn private_endpoint_authenticates_both_peers_and_preserves_binary_frames() {
     assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_directory_socket_address_supports_long_private_state_roots() {
+    let root = Root::new();
+    let mut directory = root.0.clone();
+    for component in ["a".repeat(48), "b".repeat(48), "c".repeat(48)] {
+        directory.push(component);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+    }
+    assert!(
+        directory
+            .join("control.sock")
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            > 108
+    );
+    let listener = LocalListener::bind(&directory).unwrap();
+    let _client = LocalConnection::connect(&directory, WAIT).unwrap();
+    let _server = listener.accept(WAIT).unwrap();
+    listener.close().unwrap();
+}
+
 #[test]
 fn endpoint_lease_prevents_duplicate_listeners_and_supports_orderly_reopen() {
     let root = Root::new();

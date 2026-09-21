@@ -154,6 +154,7 @@ impl HostService {
             secrets,
         };
         service.recover_checkpoint_barriers();
+        service.recover_secret_authority();
         Ok(service)
     }
 
@@ -846,6 +847,9 @@ impl HostService {
                 self.provision_guardian(&sandbox_id)?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
                 let lifecycle = self.apply_lifecycle_intent(&intent, endpoint)?;
+                if desired == DesiredState::Running && lifecycle.completed_intent.is_some() {
+                    self.reconcile_secret_authority(&sandbox_id)?;
+                }
                 let record = self
                     .catalog
                     .sandbox(&sandbox_id)?
@@ -1081,6 +1085,8 @@ impl HostService {
                     request_digest: request_digest.clone(),
                     delivery: delivery.clone(),
                     applied: false,
+                    revocation_operation: None,
+                    revoked: false,
                 };
                 let record = self.catalog.admit_secret_delivery(
                     record,
@@ -1112,6 +1118,46 @@ impl HostService {
                 }
                 Ok(HostResponse::Secret {
                     secret: delivery.secret,
+                })
+            }
+            HostRequest::RevokeSecret {
+                sandbox_id,
+                operation_id,
+                expected_revision,
+                secret,
+                terminate_recipients,
+                approval_id,
+            } => {
+                if secret.bytes == Counter::ZERO || secret.bytes.get() > 1024 * 1024 {
+                    return Err(HostError::Invalid("secret version size is invalid"));
+                }
+                let request_digest = digest(
+                    Domain::Secret,
+                    &(
+                        "sandsurf-revoke-secret-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_revision,
+                        &secret,
+                        terminate_recipients,
+                    ),
+                )?;
+                let record = self.catalog.admit_secret_revocation(
+                    sandsurf_state::SecretRevocationAdmission {
+                        sandbox_id,
+                        operation_id,
+                        expected_revision,
+                        secret,
+                        terminate_recipients,
+                        request_digest: request_digest.clone(),
+                    },
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                Ok(HostResponse::SecretRevocation {
+                    revocation: self.enforce_secret_revocation(record)?,
                 })
             }
             HostRequest::UpdateResources {
@@ -1757,6 +1803,131 @@ impl HostService {
             }
             after = values.last().map(|value| value.request.id.clone());
         }
+    }
+
+    fn recover_secret_authority(&mut self) {
+        let mut after = None;
+        loop {
+            let Ok(values) = self.catalog.sandboxes(
+                after.as_ref(),
+                Counter::try_from(256).expect("constant is positive"),
+            ) else {
+                return;
+            };
+            if values.is_empty() {
+                return;
+            }
+            for sandbox in &values {
+                if let Ok(inspection) = GuardianClient::new(self.guardian_endpoint(&sandbox.id))
+                    .inspect(sandbox.id.clone(), None)
+                    && matches!(
+                        inspection.observation,
+                        Observation::Current {
+                            value: MachineObservation {
+                                state: MachineState::Running,
+                                ..
+                            }
+                        }
+                    )
+                {
+                    let _ = self.reconcile_secret_authority(&sandbox.id);
+                }
+            }
+            if values.len() < 256 {
+                return;
+            }
+            after = values.last().map(|value| value.id.clone());
+        }
+    }
+
+    fn enforce_secret_revocation(
+        &mut self,
+        record: sandsurf_state::SecretRevocationRecord,
+    ) -> Result<sandsurf_state::SecretRevocationRecord> {
+        self.provision_guardian(&record.sandbox_id)?;
+        let client = GuardianClient::new(self.guardian_endpoint(&record.sandbox_id));
+        let inspection = client.inspect(record.sandbox_id.clone(), None)?;
+        if !matches!(
+            inspection.observation,
+            Observation::Current {
+                value: MachineObservation {
+                    state: MachineState::Running,
+                    ..
+                }
+            }
+        ) {
+            return Ok(record);
+        }
+        let response = client.guest(
+            record.sandbox_id.clone(),
+            GuestServiceRequest::RevokeSecret {
+                operation_id: record.operation_id.clone(),
+                secret_id: record.secret.id.clone(),
+                version: record.secret.version.clone(),
+                deliveries: record.deliveries.clone(),
+                terminate_recipients: record.terminate_recipients,
+            },
+        )?;
+        let GuestServiceResponse::SecretRevoked { evidence } = response else {
+            return Err(HostError::Invalid(
+                "guest did not establish secret revocation",
+            ));
+        };
+        if !evidence.enforcement_complete {
+            return Ok(record);
+        }
+        if let Some(committed) = record.evidence.as_ref() {
+            if !committed.enforcement_complete {
+                return Err(HostError::Invalid(
+                    "committed secret revocation evidence is incomplete",
+                ));
+            }
+            return Ok(record);
+        }
+        Ok(self.catalog.complete_secret_revocation(
+            &record.operation_id,
+            &record.request_digest,
+            evidence,
+        )?)
+    }
+
+    fn reconcile_secret_authority(&mut self, sandbox: &SandboxId) -> Result<()> {
+        for revocation in self.catalog.secret_revocations(sandbox)? {
+            let enforced = self.enforce_secret_revocation(revocation)?;
+            if enforced.evidence.is_none() {
+                return Err(HostError::Invalid(
+                    "secret revocation remains unenforced after machine start",
+                ));
+            }
+        }
+        let client = GuardianClient::new(self.guardian_endpoint(sandbox));
+        for record in self.catalog.active_secret_deliveries(sandbox)? {
+            if matches!(record.delivery.lifetime, SecretLifetime::Process)
+                || matches!(
+                    record.delivery.destination,
+                    SecretDestination::Environment { .. }
+                )
+            {
+                continue;
+            }
+            let bytes = self
+                .secrets
+                .read(&record.delivery.secret.id, &record.delivery.secret.version)?;
+            let response = client.guest(
+                sandbox.clone(),
+                GuestServiceRequest::InstallSecret {
+                    operation_id: record.operation_id,
+                    delivery: record.delivery,
+                    bytes,
+                },
+            )?;
+            if !matches!(response, GuestServiceResponse::SecretInstalled { .. }) {
+                return Err(HostError::Invalid(
+                    "guest did not restore active sandbox secret",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn provision_guardian(&mut self, sandbox: &SandboxId) -> Result<()> {

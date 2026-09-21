@@ -84,6 +84,10 @@ struct ProcessEntry {
     record_path: PathBuf,
 }
 
+pub(crate) struct ProcessCompletionObserver {
+    entry: Arc<ProcessEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProcessRecord {
@@ -396,6 +400,15 @@ impl ProcessSupervisor {
         self.entry(id)?.snapshot()
     }
 
+    pub(crate) fn completion_observer(
+        &self,
+        id: &ProcessId,
+    ) -> Result<ProcessCompletionObserver, ProcessError> {
+        Ok(ProcessCompletionObserver {
+            entry: self.entry(id)?,
+        })
+    }
+
     pub fn list(&self) -> Result<Vec<ProcessSnapshot>, ProcessError> {
         let entries: Vec<_> = self
             .processes
@@ -675,6 +688,20 @@ impl ProcessSupervisor {
             .get_mut()
             .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))? = recovered;
         Ok(())
+    }
+}
+
+impl ProcessCompletionObserver {
+    pub(crate) fn wait(self) {
+        let Ok(mut state) = self.entry.state.lock() else {
+            return;
+        };
+        while matches!(*state, ProcessState::Running) {
+            let Ok(next) = self.entry.changed.wait(state) else {
+                return;
+            };
+            state = next;
+        }
     }
 }
 

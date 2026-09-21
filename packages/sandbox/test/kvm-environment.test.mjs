@@ -57,6 +57,16 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.equal(await run(sandbox, ["/bin/sh", "-c", "printf %s \"$SANDSURF_SECRET\""], { processId: secretProcessId, user: "root" }), "environment-secret");
     assert.equal(await run(sandbox, ["/bin/sh", "-c", "printf %s \"${SANDSURF_SECRET-unset}\""], { user: "root" }), "unset");
 
+    const secretHolderId = "secret-holder";
+    await sandbox.secrets.deliver(secret, { environment: "SANDSURF_SECRET", processId: secretHolderId, lifetime: "process" });
+    const secretHolder = await sandbox.processes.spawn({ processId: secretHolderId, argv: ["/bin/sh", "-c", "test \"$SANDSURF_SECRET\" = environment-secret && while :; do sleep 1; done"], user: "root", lifetime: "sandbox" });
+    const revocation = await sandbox.secrets.revoke(secret, { operationId: "revoke-integration-secret", terminateRecipients: true });
+    assert.equal(revocation.enforced, true);
+    assert.equal(revocation.evidence.residualCopiesPossible, true);
+    assert.ok(revocation.evidence.recipientsTerminated.includes(secretHolderId));
+    await secretHolder.wait();
+    await assert.rejects(sandbox.fs.readFile("/workspace/file-secret"));
+
     await sandbox.network.configure({ rules: [{
       plane: "named-proxy",
       destination: { kind: "dns", name: "localhost", allowPrivateAddresses: true },

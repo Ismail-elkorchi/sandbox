@@ -5,8 +5,8 @@ use crate::{
 use sandsurf_protocol::{
     Capability, CheckpointId, Counter, Digest, FileExpectation, FileRevision, FilesystemRequest,
     FilesystemResponse, GuestEffectOutcome, GuestServiceRequest, GuestServiceResponse, Mutation,
-    OperationId, ProcessId, ResourceUsage, SandboxId, SecretDestination, SecretId, WorkloadRequest,
-    bytes_digest,
+    OperationId, ProcessId, ProcessState, ResourceUsage, SandboxId, SecretDestination, SecretId,
+    SecretLifetime, SecretRevocationEvidence, WorkloadRequest, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LEDGER_VERSION: u16 = 1;
@@ -26,12 +26,12 @@ const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 /// across authenticated reconnects and conflicting identity reuse is rejected.
 pub struct PersistentWorkloadService {
     processes: ProcessSupervisor,
-    filesystem: FilesystemService,
+    filesystem: Arc<FilesystemService>,
     ledger_root: PathBuf,
     operations: Mutex<BTreeMap<OperationId, OperationRecord>>,
     mutation_barrier: RwLock<()>,
     cgroups: Option<CgroupManager>,
-    installed_secrets: Mutex<BTreeMap<OperationId, InstalledSecret>>,
+    installed_secrets: Arc<Mutex<BTreeMap<OperationId, InstalledSecret>>>,
     capture: Mutex<Option<OperationId>>,
 }
 
@@ -43,6 +43,7 @@ struct InstalledSecret {
     lifetime: sandsurf_protocol::SecretLifetime,
     process_id: Option<ProcessId>,
     bytes: Vec<u8>,
+    cleanup_armed: bool,
 }
 
 #[derive(Clone)]
@@ -109,12 +110,12 @@ impl PersistentWorkloadService {
         let operations = load_operations(ledger_root)?;
         Ok(Self {
             processes,
-            filesystem,
+            filesystem: Arc::new(filesystem),
             ledger_root: ledger_root.to_path_buf(),
             operations: Mutex::new(operations),
             mutation_barrier: RwLock::new(()),
             cgroups,
-            installed_secrets: Mutex::new(BTreeMap::new()),
+            installed_secrets: Arc::new(Mutex::new(BTreeMap::new())),
             capture: Mutex::new(None),
         })
     }
@@ -319,9 +320,19 @@ impl PersistentWorkloadService {
                 delivery,
                 bytes,
             } => self.install_secret(&operation_id, delivery, bytes),
-            GuestServiceRequest::RevokeSecret { secret_id, version } => {
-                self.revoke_secret(&secret_id, &version)
-            }
+            GuestServiceRequest::RevokeSecret {
+                operation_id,
+                secret_id,
+                version,
+                deliveries,
+                terminate_recipients,
+            } => self.revoke_secret(
+                &operation_id,
+                &secret_id,
+                &version,
+                &deliveries,
+                terminate_recipients,
+            ),
             GuestServiceRequest::ApplyResources { resources } => self.apply_resources(resources),
             GuestServiceRequest::ResourceUsage => self.resource_usage(),
             GuestServiceRequest::Dispatch {
@@ -406,9 +417,10 @@ impl PersistentWorkloadService {
                     request.user = Some("agent".into());
                 }
                 let secrets = self.process_secrets(&request)?;
+                let process_id = request.process_id.clone();
                 self.processes
                     .spawn_with_environment(request, &secrets)
-                    .map(drop)
+                    .and_then(|_| self.arm_process_secret_cleanup(&process_id))
             }
             WorkloadRequest::WriteInput { process_id, bytes } => {
                 self.processes.write_input(process_id, bytes)
@@ -536,6 +548,7 @@ impl PersistentWorkloadService {
             code: "secret.invalid",
             message: error.to_string(),
         })?;
+        let process_id = delivery.process_id.clone();
         installed.insert(
             operation_id.clone(),
             InstalledSecret {
@@ -543,18 +556,49 @@ impl PersistentWorkloadService {
                 version: delivery.secret.version,
                 destination: delivery.destination,
                 lifetime: delivery.lifetime,
-                process_id: delivery.process_id,
+                process_id: process_id.clone(),
                 bytes,
+                cleanup_armed: false,
             },
         );
+        drop(installed);
+        if let Some(process_id) = process_id.as_ref()
+            && self.processes.get(process_id).is_ok()
+        {
+            self.arm_process_secret_cleanup(process_id)
+                .map_err(process_error)?;
+        }
         Ok(GuestServiceResponse::SecretInstalled { evidence })
     }
 
     fn revoke_secret(
         &self,
+        operation_id: &OperationId,
         secret_id: &SecretId,
         version: &Digest,
+        deliveries: &[sandsurf_protocol::SecretDelivery],
+        terminate_recipients: bool,
     ) -> ServiceResult<GuestServiceResponse> {
+        if deliveries.is_empty() || deliveries.len() > 1024 {
+            return Err((
+                "secret.invalid",
+                "secret revocation delivery set is empty or oversized".into(),
+            )
+                .into());
+        }
+        for delivery in deliveries {
+            delivery.validate().map_err(|error| ServiceFailure {
+                code: "secret.invalid",
+                message: error.to_string(),
+            })?;
+            if &delivery.secret.id != secret_id || &delivery.secret.version != version {
+                return Err((
+                    "secret.invalid",
+                    "secret revocation contains another secret version".into(),
+                )
+                    .into());
+            }
+        }
         let mut installed = self.installed_secrets.lock().map_err(|_| ServiceFailure {
             code: "service.unavailable",
             message: "secret delivery state is unavailable".into(),
@@ -564,23 +608,142 @@ impl PersistentWorkloadService {
             .filter(|(_, value)| &value.id == secret_id && &value.version == version)
             .map(|(operation, _)| operation.clone())
             .collect::<Vec<_>>();
-        if operations.is_empty() {
-            return Err(("secret.missing", "secret delivery is not active".into()).into());
-        }
+        let mut environment_bindings_removed = 0_u64;
         for operation in operations {
-            let value = installed
+            let mut value = installed
                 .remove(&operation)
                 .ok_or_else(|| ("secret.missing", "secret delivery disappeared".into()))?;
-            if let SecretDestination::File { path, .. } = &value.destination {
+            if matches!(value.destination, SecretDestination::Environment { .. }) {
+                environment_bindings_removed += 1;
+            }
+            value.bytes.fill(0);
+        }
+        drop(installed);
+
+        let mut files_removed = 0_u64;
+        let mut recipients = std::collections::BTreeSet::new();
+        for delivery in deliveries {
+            if let Some(process_id) = delivery.process_id.as_ref() {
+                recipients.insert(process_id.clone());
+            }
+            if let SecretDestination::File { path, .. } = &delivery.destination {
                 match self.filesystem.remove_path(path, false) {
-                    Ok(()) | Err(FilesystemError::Conflict) => {}
+                    Ok(()) => files_removed += 1,
+                    Err(FilesystemError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(FilesystemError::Conflict) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
         }
-        Ok(GuestServiceResponse::SecretInstalled {
-            evidence: bytes_digest(b"secret-delivery-revoked"),
-        })
+
+        let mut recipients_terminated = Vec::new();
+        let mut recipients_already_stopped = Vec::new();
+        let mut enforcement_complete = true;
+        for process_id in recipients {
+            match self.processes.get(&process_id) {
+                Ok(process) if matches!(process.state, ProcessState::Running) => {
+                    if terminate_recipients {
+                        if self
+                            .processes
+                            .terminate(&process_id, Duration::from_secs(2))
+                            .and_then(|()| {
+                                self.processes
+                                    .wait(&process_id, Some(Duration::from_secs(5)))
+                                    .map(drop)
+                            })
+                            .is_ok()
+                        {
+                            recipients_terminated.push(process_id);
+                        } else {
+                            enforcement_complete = false;
+                        }
+                    }
+                }
+                Ok(_) | Err(ProcessError::Missing) => {
+                    recipients_already_stopped.push(process_id);
+                }
+                Err(_) => enforcement_complete = false,
+            }
+        }
+        let evidence = SecretRevocationEvidence {
+            files_removed: Counter::try_from(files_removed).map_err(|_| ServiceFailure {
+                code: "secret.invalid",
+                message: "secret file count cannot be represented".into(),
+            })?,
+            environment_bindings_removed: Counter::try_from(environment_bindings_removed).map_err(
+                |_| ServiceFailure {
+                    code: "secret.invalid",
+                    message: "secret environment count cannot be represented".into(),
+                },
+            )?,
+            recipients_terminated,
+            recipients_already_stopped,
+            // Raw delivery can never prove that a process did not copy bytes.
+            residual_copies_possible: true,
+            enforcement_complete,
+        };
+        let _ = operation_id;
+        Ok(GuestServiceResponse::SecretRevoked { evidence })
+    }
+
+    fn arm_process_secret_cleanup(&self, process_id: &ProcessId) -> Result<(), ProcessError> {
+        let observer = self.processes.completion_observer(process_id)?;
+        let operations = {
+            let mut installed = self
+                .installed_secrets
+                .lock()
+                .map_err(|_| ProcessError::Unknown(bytes_digest(b"secret-state-poisoned")))?;
+            installed
+                .iter_mut()
+                .filter(|(_, value)| {
+                    value.process_id.as_ref() == Some(process_id)
+                        && !value.cleanup_armed
+                        && (matches!(value.lifetime, SecretLifetime::Process)
+                            || matches!(value.destination, SecretDestination::Environment { .. }))
+                })
+                .map(|(operation, value)| {
+                    value.cleanup_armed = true;
+                    operation.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let secrets = Arc::clone(&self.installed_secrets);
+        let filesystem = Arc::clone(&self.filesystem);
+        std::thread::Builder::new()
+            .name("sandsurf-secret-lifetime".into())
+            .spawn(move || {
+                observer.wait();
+                for operation in operations {
+                    let path = secrets
+                        .lock()
+                        .ok()
+                        .and_then(|installed| installed.get(&operation).cloned())
+                        .and_then(|value| match value.destination {
+                            SecretDestination::File { path, .. } => Some(path),
+                            SecretDestination::Environment { .. } => None,
+                        });
+                    if let Some(path) = path {
+                        match filesystem.remove_path(&path, false) {
+                            Ok(()) | Err(FilesystemError::Conflict) => {}
+                            Err(FilesystemError::Io(error))
+                                if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                eprintln!("process secret cleanup failed: {error}");
+                                continue;
+                            }
+                        }
+                    }
+                    if let Ok(mut installed) = secrets.lock()
+                        && let Some(mut value) = installed.remove(&operation)
+                    {
+                        value.bytes.fill(0);
+                    }
+                }
+            })?;
+        Ok(())
     }
 
     fn process_secrets(
@@ -1142,7 +1305,9 @@ impl From<FilesystemError> for ServiceFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandsurf_protocol::{Counter, GuestPath, SandboxId, bytes_digest};
+    use sandsurf_protocol::{
+        Counter, GuestPath, ProcessLifetime, SandboxId, SpawnRequest, StdioMode, bytes_digest,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1164,6 +1329,23 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn spawn_request(id: &str, script: &str) -> SpawnRequest {
+        SpawnRequest {
+            sandbox_id: SandboxId::try_from("box").unwrap(),
+            epoch: Counter::ONE,
+            process_id: ProcessId::try_from(id).unwrap(),
+            operation_id: OperationId::try_from(format!("spawn-{id}")).unwrap(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: "/".into(),
+            environment: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            user: None,
+            stdio: StdioMode::Pipes,
+            terminal_size: None,
+            lifetime: ProcessLifetime::Job,
+            output_bytes: Counter::try_from(1024 * 1024).unwrap(),
         }
     }
 
@@ -1234,5 +1416,101 @@ mod tests {
         assert!(
             matches!(conflict, GuestServiceResponse::Error { code, .. } if code == "operation.conflict")
         );
+    }
+
+    #[test]
+    fn process_secrets_are_cleaned_and_revocation_terminates_live_recipients() {
+        let root = Temp::new();
+        let files = root.0.join("files");
+        let spool = root.0.join("spool");
+        fs::create_dir(&files).unwrap();
+        let service = PersistentWorkloadService::open(
+            ProcessSupervisor::create(&spool, SandboxId::try_from("box").unwrap(), Counter::ONE)
+                .unwrap(),
+            FilesystemService::open(&files, "/").unwrap(),
+            &root.0.join("operations"),
+        )
+        .unwrap();
+        let bytes = b"temporary-secret".to_vec();
+        let secret = sandsurf_protocol::SecretVersion {
+            id: SecretId::try_from("credential").unwrap(),
+            version: bytes_digest(&bytes),
+            bytes: Counter::try_from(bytes.len() as u64).unwrap(),
+        };
+        let process_id = ProcessId::try_from("short-job").unwrap();
+        let delivery = sandsurf_protocol::SecretDelivery {
+            secret: secret.clone(),
+            destination: SecretDestination::File {
+                path: GuestPath::try_from("/process-secret").unwrap(),
+                mode: 0o600,
+            },
+            lifetime: SecretLifetime::Process,
+            process_id: Some(process_id.clone()),
+        };
+        assert!(matches!(
+            service.handle(GuestServiceRequest::InstallSecret {
+                operation_id: OperationId::try_from("deliver-file").unwrap(),
+                delivery,
+                bytes: bytes.clone(),
+            }),
+            GuestServiceResponse::SecretInstalled { .. }
+        ));
+        service
+            .processes()
+            .spawn(spawn_request("short-job", "exit 0"))
+            .unwrap();
+        service.arm_process_secret_cleanup(&process_id).unwrap();
+        service
+            .processes()
+            .wait(&process_id, Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while files.join("process-secret").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!files.join("process-secret").exists());
+
+        let holder = ProcessId::try_from("secret-holder").unwrap();
+        let environment_delivery = sandsurf_protocol::SecretDelivery {
+            secret: secret.clone(),
+            destination: SecretDestination::Environment {
+                name: "TOKEN".into(),
+            },
+            lifetime: SecretLifetime::Process,
+            process_id: Some(holder.clone()),
+        };
+        assert!(matches!(
+            service.handle(GuestServiceRequest::InstallSecret {
+                operation_id: OperationId::try_from("deliver-environment").unwrap(),
+                delivery: environment_delivery.clone(),
+                bytes,
+            }),
+            GuestServiceResponse::SecretInstalled { .. }
+        ));
+        let spawn = spawn_request(
+            "secret-holder",
+            "test \"$TOKEN\" = temporary-secret; sleep 30",
+        );
+        let Ok(environment) = service.process_secrets(&spawn) else {
+            panic!("process secret environment was unavailable");
+        };
+        service
+            .processes()
+            .spawn_with_environment(spawn, &environment)
+            .unwrap();
+        service.arm_process_secret_cleanup(&holder).unwrap();
+        let response = service.handle(GuestServiceRequest::RevokeSecret {
+            operation_id: OperationId::try_from("revoke-environment").unwrap(),
+            secret_id: secret.id,
+            version: secret.version,
+            deliveries: vec![environment_delivery],
+            terminate_recipients: true,
+        });
+        let GuestServiceResponse::SecretRevoked { evidence } = response else {
+            panic!("secret revocation failed: {response:?}");
+        };
+        assert!(evidence.enforcement_complete);
+        assert_eq!(evidence.recipients_terminated, vec![holder]);
+        assert!(evidence.residual_copies_possible);
     }
 }

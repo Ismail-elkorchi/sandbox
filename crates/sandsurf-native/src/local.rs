@@ -104,6 +104,23 @@ impl Directory {
         crate::macos::require_private_path_acl(&self.path.join(SOCKET))?;
         Ok(metadata)
     }
+    fn native_socket_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            // AF_UNIX has a small pathname field. Resolve the already verified,
+            // retained directory descriptor through procfs so an otherwise
+            // valid private state root cannot make guardian IPC unreachable.
+            PathBuf::from(format!(
+                "/proc/self/fd/{}/{}",
+                self.held.as_raw_fd(),
+                SOCKET
+            ))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.path.join(SOCKET)
+        }
+    }
 }
 
 struct Lease(File);
@@ -211,7 +228,7 @@ impl LocalListener {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let listener = UnixListener::bind(&path)?;
+        let listener = UnixListener::bind(root.native_socket_path())?;
         let metadata = fs::symlink_metadata(&path)?;
         let owner = SocketOwner {
             root,
@@ -268,7 +285,7 @@ impl LocalConnection {
         let deadline = Deadline::new(timeout)?;
         let root = Directory::open(directory)?;
         let expected = identity(&root.socket()?);
-        let stream = connect_socket(&root.path.join(SOCKET), &deadline)?;
+        let stream = connect_socket(&root.native_socket_path(), &deadline)?;
         if identity(&root.socket()?) != expected {
             return Err(denied("endpoint changed while connecting"));
         }
