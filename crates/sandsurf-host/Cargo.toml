@@ -19,7 +19,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
-reqwest.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -28,6 +27,7 @@ sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-vm = { path = "../sandbox-vm" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
 sandbox-policy = { path = "../sandbox-policy" }
+reqwest.workspace = true
 
 [[bin]]
 name = "sandsurf-host"

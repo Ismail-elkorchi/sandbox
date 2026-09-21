@@ -297,6 +297,7 @@ pub fn materialize_fork(root: &Path, checkpoint: &Checkpoint, destination: &Path
 /// Materialize a checkpoint as the initial writable-state template of a
 /// derived VM-native image. The published checkpoint remains immutable and
 /// the template receives an independent, verified file identity.
+#[cfg(target_os = "linux")]
 pub fn materialize_image_template(
     root: &Path,
     checkpoint: &Checkpoint,

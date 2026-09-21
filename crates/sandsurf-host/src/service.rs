@@ -17,6 +17,7 @@ use sandsurf_state::{
     Approval, CatalogLimits, GrantChange, HostCatalog, ReservationState, RuntimeJournal,
     RuntimeLimits, SandboxRecord,
 };
+#[cfg(target_os = "linux")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -26,6 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use zeroize::Zeroizing;
 
 // Full-state capture/restore includes bounded memory and disk persistence plus
@@ -119,7 +121,9 @@ pub struct HostService {
     root: PathBuf,
     catalog: HostCatalog,
     executable: PathBuf,
+    #[cfg(target_os = "linux")]
     verified_guardians: BTreeSet<SandboxId>,
+    #[cfg(target_os = "linux")]
     verified_workload_defaults: BTreeMap<String, crate::api::WorkloadDefaultsView>,
     workspace: crate::workspace::WorkspaceAuthority,
     secrets: crate::secrets::SecretAuthority,
@@ -148,7 +152,9 @@ impl HostService {
             root: root.to_path_buf(),
             catalog,
             executable,
+            #[cfg(target_os = "linux")]
             verified_guardians: BTreeSet::new(),
+            #[cfg(target_os = "linux")]
             verified_workload_defaults: BTreeMap::new(),
             workspace,
             secrets,
@@ -409,6 +415,7 @@ impl HostService {
                         operation: admitted,
                     });
                 }
+                #[cfg(target_os = "linux")]
                 let registry_credential = match &source {
                     OciSource::Registry {
                         credential: Some(secret),
@@ -453,6 +460,7 @@ impl HostService {
                 operation_id,
                 approval_id,
             } => {
+                #[cfg(target_os = "linux")]
                 let checkpoint = self
                     .catalog
                     .checkpoint(&checkpoint_id)?

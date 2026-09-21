@@ -8,9 +8,11 @@ use crate::api::{
     HostApplyReport, HostBlobTransfer, HostTreeCapture, HostTreeEntry, HostTreeEntryKind,
     HostWorkspaceChange, HostWorkspaceChangeSet,
 };
+#[cfg(unix)]
+use cap_std::fs::Permissions as CapPermissions;
 use cap_std::{
     ambient_authority,
-    fs::{Dir, OpenOptions as CapOpenOptions, Permissions as CapPermissions},
+    fs::{Dir, OpenOptions as CapOpenOptions},
 };
 use sandsurf_protocol::{
     CommitmentId, Counter, Digest, Domain, OperationId, SandboxId, bytes_digest, digest,
@@ -984,7 +986,7 @@ pub fn change_set_digest(
 
 fn decode_digest(value: &Digest) -> Result<[u8; 32]> {
     let mut raw = [0_u8; 32];
-    for (index, chunk) in value.as_str().as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_str().as_bytes().chunks(2).enumerate() {
         raw[index] = (hex(chunk[0])? << 4) | hex(chunk[1])?;
     }
     Ok(raw)
@@ -1157,7 +1159,7 @@ fn manifest_digest(entries: &[HostTreeEntry]) -> Result<Digest> {
     for entry in entries {
         let entry_digest = digest(Domain::Transfer, &("sandsurf-workspace-entry-v1", entry))?;
         let mut raw = [0_u8; 32];
-        for (index, chunk) in entry_digest.as_str().as_bytes().chunks_exact(2).enumerate() {
+        for (index, chunk) in entry_digest.as_str().as_bytes().chunks(2).enumerate() {
             raw[index] = (hex(chunk[0])? << 4) | hex(chunk[1])?;
         }
         hash.update(raw);
