@@ -1,11 +1,13 @@
-import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, opendir, readlink } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import { NativeHostClient, SandsurfHostError, integer, record, text } from "./native-host.js";
 import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js";
 
 export type SandsurfCapability = "spawn" | "read-files" | "write-files" | "workload-admin" | "network" | "expose-port" | "deliver-secret" | "apply-to-host" | "increase-resources" | "checkpoint" | "fork" | "release-evidence";
 export type DesiredSandboxState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
-export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "evidence-loss"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
+export interface AuthorityChange { readonly kind: "sandbox-create" | "lifecycle" | "grant" | "image-import" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "checkpoint" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery"; readonly sandboxId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 export type SandsurfAuthorizer = (change: AuthorityChange) => AuthorityDecision | Promise<AuthorityDecision>;
 export interface SandsurfOpenOptions { readonly directory: string; readonly authorizer?: SandsurfAuthorizer; }
@@ -111,7 +113,7 @@ export class Sandbox {
   readonly operations: SandboxOperations;
   readonly #host: Sandsurf;
   #view: SandboxInspection;
-  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this.fs); this.operations = new SandboxOperations(this); }
+  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); }
   get revision(): number { return this.#view.configurationRevision; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
   async inspect(): Promise<SandboxInspection> { this.#view = sandboxViewFrom(await this.#host.request({ kind: "get-sandbox", sandboxId: this.id })); return this.#view; }
@@ -261,6 +263,7 @@ export type FileExpectation = { readonly kind: "any" } | { readonly kind: "absen
 export class SandboxFilesystem {
   readonly #sandbox: Sandbox; constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
   stat(path: string | Uint8Array, follow = true): Promise<Record<string, unknown>> { return this.#operation({ kind: "stat", path: [...createSandsurfGuestPath(path)], follow }, "read-files"); }
+  lstat(path: string | Uint8Array): Promise<Record<string, unknown>> { return this.stat(path, false); }
   list(path: string | Uint8Array, options: { readonly after?: Uint8Array; readonly maximum?: number } = {}): Promise<Record<string, unknown>> { return this.#operation({ kind: "list", path: [...createSandsurfGuestPath(path)], after: options.after === undefined ? null : [...options.after], maximum: options.maximum ?? 256 }, "read-files"); }
   read(path: string | Uint8Array, offset = 0, maximum = 64 * 1024): Promise<Record<string, unknown>> { return this.#operation({ kind: "read", path: [...createSandsurfGuestPath(path)], offset, maximum }, "read-files"); }
   async readFile(path: string | Uint8Array): Promise<Uint8Array> {
@@ -268,26 +271,91 @@ export class SandboxFilesystem {
     for (;;) { const response = await this.read(Uint8Array.from(guestPath), offset); if (response.kind !== "read" || !record(response.range) || !Array.isArray(response.range.bytes)) throw protocol("file range response"); const bytes = Uint8Array.from(response.range.bytes as number[]); chunks.push(bytes); offset += bytes.byteLength; if (response.range.eof === true) break; }
     const result = new Uint8Array(offset); let cursor = 0; for (const chunk of chunks) { result.set(chunk, cursor); cursor += chunk.byteLength; } return result;
   }
-  writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: { readonly mode?: number; readonly expected?: FileExpectation } = {}): Promise<Record<string, unknown>> { const value = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes; return this.#operation({ kind: "write", path: [...createSandsurfGuestPath(path)], bytes: [...value], mode: options.mode ?? 0o644, expected: options.expected ?? { kind: "any" } }, "write-files"); }
+  async writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: { readonly mode?: number; readonly expected?: FileExpectation } = {}): Promise<Record<string, unknown>> {
+    const value = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    return this.writeStream(path, [value], { length: value.byteLength, digest: createHash("sha256").update(value).digest("hex"), ...options });
+  }
+  async writeStream(path: string | Uint8Array, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, options: { readonly length: number; readonly digest: string; readonly mode?: number; readonly expected?: FileExpectation }): Promise<Record<string, unknown>> {
+    if (!Number.isSafeInteger(options.length) || options.length < 0 || options.length > 128 * 1024 ** 3) throw new TypeError("stream length is invalid");
+    const transfer = { id: identity("transfer"), path: [...createSandsurfGuestPath(path)], length: options.length, digest: digest(options.digest), mode: options.mode ?? 0o644, expected: options.expected ?? { kind: "any" } };
+    await this.#operation({ kind: "begin-write", transfer }, "write-files", identity("begin"));
+    try {
+      let offset = 0;
+      for await (const supplied of chunks) {
+        if (!(supplied instanceof Uint8Array)) throw new TypeError("stream chunks must be Uint8Array values");
+        for (let cursor = 0; cursor < supplied.byteLength; cursor += 64 * 1024) { const bytes = supplied.subarray(cursor, Math.min(cursor + 64 * 1024, supplied.byteLength)); await this.#operation({ kind: "write-chunk", transfer, offset, bytes: [...bytes] }, "write-files", identity("chunk")); offset += bytes.byteLength; }
+      }
+      if (offset !== options.length) throw new SandsurfHostError("transfer", "stream byte count does not match its declaration");
+      return await this.#operation({ kind: "commit-write", transfer }, "write-files", identity("commit"));
+    } catch (error) {
+      try { await this.#operation({ kind: "abort-write", transfer }, "write-files", identity("abort")); } catch { /* The original exact failure remains authoritative. */ }
+      throw error;
+    }
+  }
   async mkdir(path: string | Uint8Array, recursive = false): Promise<void> { await this.#operation({ kind: "mkdir", path: [...createSandsurfGuestPath(path)], recursive }, "write-files"); }
   async rename(from: string | Uint8Array, to: string | Uint8Array): Promise<void> { await this.#operation({ kind: "rename", from: [...createSandsurfGuestPath(from)], to: [...createSandsurfGuestPath(to)] }, "write-files"); }
   async remove(path: string | Uint8Array, recursive = false): Promise<void> { await this.#operation({ kind: "remove", path: [...createSandsurfGuestPath(path)], recursive }, "write-files"); }
   async chmod(path: string | Uint8Array, mode: number): Promise<void> { await this.#operation({ kind: "chmod", path: [...createSandsurfGuestPath(path)], mode }, "write-files"); }
   async readlink(path: string | Uint8Array): Promise<Uint8Array> { const response = await this.#operation({ kind: "readlink", path: [...createSandsurfGuestPath(path)] }, "read-files"); if (response.kind !== "link" || !Array.isArray(response.target)) throw protocol("readlink response"); return Uint8Array.from(response.target as number[]); }
   async symlink(path: string | Uint8Array, target: Uint8Array): Promise<void> { await this.#operation({ kind: "symlink", path: [...createSandsurfGuestPath(path)], target: [...target] }, "write-files"); }
-  async #operation(request: Readonly<Record<string, unknown>>, capability: "read-files" | "write-files"): Promise<Record<string, unknown>> {
-    const operationId = identity("file"); const operation = await this.#sandbox.workload({ kind: "filesystem", request }, capability, operationId); const mutation = operation.request;
+  async watch(path: string | Uint8Array, recursive = false): Promise<FilesystemWatcher> {
+    const machine = currentMachine(await this.#sandbox.inspect()); const watcherId = identity("watcher");
+    await this.#operation({ kind: "watch", watcherId, epoch: machine.epoch, path: [...createSandsurfGuestPath(path)], recursive }, "read-files");
+    return new FilesystemWatcher(this, watcherId, machine.epoch);
+  }
+  async pollWatcher(watcherId: string, epoch: number, maximum = 256): Promise<readonly Readonly<Record<string, unknown>>[]> { const response = await this.#operation({ kind: "poll-watch", watcherId, epoch, maximum }, "read-files"); if (response.kind !== "watch" || !Array.isArray(response.events)) throw protocol("watch response"); return response.events.map((event) => { if (!record(event)) throw protocol("watch event"); return event; }); }
+  async closeWatcher(watcherId: string, epoch: number): Promise<void> { await this.#operation({ kind: "unwatch", watcherId, epoch }, "read-files"); }
+  async #operation(request: Readonly<Record<string, unknown>>, capability: "read-files" | "write-files", operationId = identity("file")): Promise<Record<string, unknown>> {
+    const operation = await this.#sandbox.workload({ kind: "filesystem", request }, capability, operationId); const mutation = operation.request;
     if (!record(mutation)) throw protocol("filesystem operation receipt");
     const response = await this.#sandbox.guest({ kind: "operation", operationId, requestDigest: text(mutation.requestDigest) }, capability);
     if (response.kind !== "file" || !record(response.response)) throw protocol("filesystem response"); return response.response;
   }
 }
 
+export class FilesystemWatcher {
+  readonly id: string; readonly epoch: number; readonly #filesystem: SandboxFilesystem; #closed = false;
+  constructor(filesystem: SandboxFilesystem, id: string, epoch: number) { this.#filesystem = filesystem; this.id = id; this.epoch = epoch; }
+  poll(maximum = 256): Promise<readonly Readonly<Record<string, unknown>>[]> { if (this.#closed) throw new SandsurfHostError("client", "Filesystem watcher is closed"); return this.#filesystem.pollWatcher(this.id, this.epoch, maximum); }
+  async close(): Promise<void> { if (!this.#closed) { await this.#filesystem.closeWatcher(this.id, this.epoch); this.#closed = true; } }
+}
+
 export class SandboxWorkspace {
-  readonly #fs: SandboxFilesystem; constructor(fs: SandboxFilesystem) { this.#fs = fs; }
+  readonly #sandbox: Sandbox; readonly #fs: SandboxFilesystem; constructor(sandbox: Sandbox) { this.#sandbox = sandbox; this.#fs = sandbox.fs; }
   readFile(path: string | Uint8Array): Promise<Uint8Array> { return this.#fs.readFile(workspacePath(path)); }
   writeFile(path: string | Uint8Array, bytes: string | Uint8Array): Promise<Record<string, unknown>> { return this.#fs.writeFile(workspacePath(path), bytes); }
+  async importFromHost(options: WorkspaceImportOptions): Promise<WorkspaceManifest> {
+    if (!isAbsolute(options.source)) throw new TypeError("workspace import source must be absolute");
+    const source = resolve(options.source); const operationId = validateIdentity(options.operationId ?? identity("import")); const exclusions = normalizeExclusions(options.exclusions ?? []); const maximumBytes = options.maximumBytes ?? 8 * 1024 ** 3;
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0 || maximumBytes > 128 * 1024 ** 3) throw new TypeError("workspace import maximumBytes is invalid");
+    await this.#sandbox.approve({ kind: "host-import", sandboxId: this.#sandbox.id, operationId, request: { source, exclusions: [...exclusions].sort(), maximumBytes } });
+    const root = await lstat(source); if (!root.isDirectory() || root.isSymbolicLink()) throw new TypeError("workspace import source must be a directory, not a link");
+    const entries: WorkspaceManifestEntry[] = []; let total = 0;
+    const visit = async (directory: string, relative: string): Promise<void> => {
+      const handle = await opendir(directory);
+      const children = []; for await (const child of handle) children.push(child); children.sort((left, right) => Buffer.from(left.name).compare(Buffer.from(right.name)));
+      for (const child of children) {
+        const path = relative === "" ? child.name : `${relative}/${child.name}`; if (excluded(path, exclusions)) continue;
+        const hostPath = join(directory, child.name); const metadata = await lstat(hostPath); const mode = metadata.mode & 0o7777;
+        if (metadata.isDirectory() && !metadata.isSymbolicLink()) { await this.#fs.mkdir(workspacePath(path), true); entries.push({ path, kind: "directory", mode, size: 0, digest: null, target: null }); await visit(hostPath, path); continue; }
+        if (metadata.isSymbolicLink()) { const target = await readlink(hostPath, { encoding: "buffer" }); await this.#fs.symlink(workspacePath(path), target); entries.push({ path, kind: "symlink", mode, size: target.byteLength, digest: createHash("sha256").update(target).digest("hex"), target: target.toString("base64") }); continue; }
+        if (!metadata.isFile()) throw new TypeError(`workspace import does not support ${path}`);
+        total += metadata.size; if (total > maximumBytes) throw new SandsurfHostError("capacity", "workspace import exceeds its byte reservation");
+        const contentDigest = await hashHostFile(hostPath, metadata); const handle = await openStableHostFile(hostPath, metadata);
+        try {
+          await this.#fs.writeStream(workspacePath(path), handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 }), { length: metadata.size, digest: contentDigest, mode, expected: { kind: "absent" } });
+          assertSameHostFile(metadata, await handle.stat()); assertSameHostFile(metadata, await lstat(hostPath));
+        } finally { await handle.close(); }
+        entries.push({ path, kind: "file", mode, size: metadata.size, digest: contentDigest, target: null });
+      }
+    };
+    await visit(source, ""); return workspaceManifest(entries);
+  }
 }
+
+export interface WorkspaceImportOptions { readonly source: string; readonly operationId?: string; readonly exclusions?: readonly string[]; readonly maximumBytes?: number; }
+export interface WorkspaceManifestEntry { readonly path: string; readonly kind: "directory" | "file" | "symlink"; readonly mode: number; readonly size: number; readonly digest: string | null; readonly target: string | null; }
+export interface WorkspaceManifest { readonly digest: string; readonly entries: readonly WorkspaceManifestEntry[]; }
 
 function normalizeResources(value: ResourceEnvelope): Required<ResourceEnvelope> {
   const outputBytes = value.outputBytes ?? 1024 * 1024 * 1024; const processes = value.processes ?? 1024;
@@ -324,6 +392,41 @@ function workspacePath(value: string | Uint8Array): Uint8Array {
   const path = new Uint8Array(prefix.byteLength + relative.byteLength);
   path.set(prefix); path.set(relative, prefix.byteLength);
   return Uint8Array.from(createSandsurfGuestPath(path));
+}
+function normalizeExclusions(values: readonly string[]): ReadonlySet<string> {
+  const result = new Set<string>();
+  for (const value of values) {
+    if (value.length === 0 || value.startsWith("/") || value.endsWith("/") || value.includes("\\") || value.includes("\0") || value.split("/").some((part) => part.length === 0 || part === "." || part === "..")) throw new TypeError("workspace exclusion paths must be normalized relative POSIX paths");
+    result.add(value);
+  }
+  return result;
+}
+function excluded(path: string, exclusions: ReadonlySet<string>): boolean {
+  for (const exclusion of exclusions) if (path === exclusion || path.startsWith(`${exclusion}/`)) return true;
+  return false;
+}
+function assertSameHostFile(expected: Stats, actual: Stats): void {
+  if (!actual.isFile() || actual.isSymbolicLink() || actual.dev !== expected.dev || actual.ino !== expected.ino || actual.size !== expected.size || actual.mtimeMs !== expected.mtimeMs || actual.ctimeMs !== expected.ctimeMs) throw new SandsurfHostError("conflict", "host import source changed while it was being captured");
+}
+async function openStableHostFile(path: string, expected: Stats) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { assertSameHostFile(expected, await handle.stat()); return handle; }
+  catch (error) { await handle.close(); throw error; }
+}
+async function hashHostFile(path: string, expected: Stats): Promise<string> {
+  const handle = await openStableHostFile(path, expected); const hash = createHash("sha256"); let length = 0;
+  try {
+    for await (const chunk of handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 })) { hash.update(chunk); length += chunk.byteLength; }
+    assertSameHostFile(expected, await handle.stat()); assertSameHostFile(expected, await lstat(path));
+  } finally { await handle.close(); }
+  if (length !== expected.size) throw new SandsurfHostError("conflict", "host import source length changed while it was being captured");
+  return hash.digest("hex");
+}
+function workspaceManifest(entries: readonly WorkspaceManifestEntry[]): WorkspaceManifest {
+  const ordered = [...entries].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  const hash = createHash("sha256").update("SANDSURF-WORKSPACE-MANIFEST-V1\0");
+  for (const entry of ordered) hash.update(Buffer.from(sandsurfDigest("transfer", ["sandsurf-workspace-entry-v1", entry]), "hex"));
+  return { digest: hash.digest("hex"), entries: ordered };
 }
 function identity(prefix: string): string { return `${prefix}-${randomUUID()}`; }
 function validateIdentity(value: string): string { if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value)) throw new TypeError("Sandsurf identity is malformed"); return value; }

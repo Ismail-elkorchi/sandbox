@@ -1,9 +1,10 @@
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, MetadataExt, OpenOptions, Permissions, PermissionsExt};
+use cap_std::fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt};
 use cap_std::time::SystemClock;
 use sandsurf_protocol::{
-    Counter, Digest, DirectoryEntry, DirectoryPage, FileKind, FileRange, FileRevision, FileStat,
-    GuestPath, OperationId, WatchEvent, WatchEventKind, WatcherId,
+    Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind, FileRange,
+    FileRevision, FileStat, FileTransfer, GuestPath, OperationId, WatchEvent, WatchEventKind,
+    WatcherId,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+const MAX_IN_MEMORY_READ: u64 = 64 * 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_PAGE_ENTRIES: usize = 4096;
 const MAX_WATCHERS: usize = 1024;
@@ -199,7 +201,7 @@ impl FilesystemService {
     }
 
     pub fn read_file(&self, guest_path: &str, maximum: u64) -> Result<Vec<u8>, FilesystemError> {
-        if maximum == 0 || maximum > MAX_FILE_BYTES {
+        if maximum == 0 || maximum > MAX_IN_MEMORY_READ {
             return Err(FilesystemError::Invalid("read bound must be 1..64 MiB"));
         }
         let path = GuestPath::try_from(guest_path)
@@ -348,6 +350,133 @@ impl FilesystemService {
             let _ = parent.remove_file(&temporary);
         }
         result
+    }
+
+    pub fn begin_write_transfer(&self, transfer: &FileTransfer) -> Result<(), FilesystemError> {
+        transfer
+            .validate()
+            .map_err(|_| FilesystemError::Invalid("transfer is malformed"))?;
+        let (parent, temporary, _) = self.transfer_paths(transfer)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let file = parent.open_with(&temporary, &options).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                FilesystemError::Conflict
+            } else {
+                error.into()
+            }
+        })?;
+        file.sync_all()?;
+        sync_cap_directory(&parent)?;
+        Ok(())
+    }
+
+    pub fn write_transfer_chunk(
+        &self,
+        transfer: &FileTransfer,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u64, FilesystemError> {
+        transfer
+            .validate()
+            .map_err(|_| FilesystemError::Invalid("transfer is malformed"))?;
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|end| !bytes.is_empty() && *end <= transfer.length)
+            .ok_or(FilesystemError::Capacity)?;
+        let (parent, temporary, _) = self.transfer_paths(transfer)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = parent.open_with(&temporary, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != offset {
+            return Err(FilesystemError::Conflict);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(end)
+    }
+
+    pub fn commit_write_transfer<B: WriterBarrier>(
+        &self,
+        transfer: &FileTransfer,
+        barrier: &B,
+    ) -> Result<FileRevision, FilesystemError> {
+        transfer
+            .validate()
+            .map_err(|_| FilesystemError::Invalid("transfer is malformed"))?;
+        let (parent, temporary, destination) = self.transfer_paths(transfer)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = parent.open_with(&temporary, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() != transfer.length {
+            return Err(FilesystemError::Conflict);
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = Digest::try_from(format!("{:x}", hasher.finalize()))
+            .map_err(|_| FilesystemError::Invalid("digest encoding failed"))?;
+        if actual != transfer.digest {
+            return Err(FilesystemError::Conflict);
+        }
+        file.set_permissions(Permissions::from_mode(transfer.mode))?;
+        file.sync_all()?;
+        let expected = protocol_expectation(&transfer.expected);
+        let _transaction = self
+            .transactions
+            .lock()
+            .map_err(|_| FilesystemError::Barrier)?;
+        let _writer_barrier = barrier.acquire()?;
+        check_expected(&parent, &destination, &expected)?;
+        parent.rename(&temporary, &parent, &destination)?;
+        sync_cap_directory(&parent)?;
+        Ok(FileRevision {
+            size: transfer.length,
+            digest: actual,
+        })
+    }
+
+    pub fn abort_write_transfer(&self, transfer: &FileTransfer) -> Result<(), FilesystemError> {
+        transfer
+            .validate()
+            .map_err(|_| FilesystemError::Invalid("transfer is malformed"))?;
+        let (parent, temporary, _) = self.transfer_paths(transfer)?;
+        match parent.remove_file(&temporary) {
+            Ok(()) => sync_cap_directory(&parent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn transfer_paths(
+        &self,
+        transfer: &FileTransfer,
+    ) -> Result<(Dir, String, PathBuf), FilesystemError> {
+        let relative = self.relative_path(&transfer.path, false)?;
+        let (parent_path, destination) = split_parent(&relative)?;
+        let parent = self.root.open_dir(parent_path)?;
+        let temporary = format!(".sandsurf-transfer-{}.tmp", transfer.id.as_str());
+        if temporary.as_bytes() == destination.as_bytes() {
+            return Err(FilesystemError::Invalid(
+                "transfer name aliases destination",
+            ));
+        }
+        Ok((parent, temporary, PathBuf::from(destination)))
     }
 
     pub fn mkdir(&self, guest_path: &str, recursive: bool) -> Result<(), FilesystemError> {
@@ -670,10 +799,26 @@ fn split_parent(path: &Path) -> Result<(PathBuf, OsString), FilesystemError> {
         .file_name()
         .ok_or(FilesystemError::Invalid("path has no basename"))?
         .to_os_string();
-    Ok((
-        path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
-        name,
-    ))
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty());
+    Ok((parent.unwrap_or_else(|| Path::new(".")).to_path_buf(), name))
+}
+
+fn sync_cap_directory(directory: &Dir) -> Result<(), FilesystemError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    directory.open_with(".", &options)?.sync_all()?;
+    Ok(())
+}
+
+fn protocol_expectation(value: &FileExpectation) -> ExpectedRevision {
+    match value {
+        FileExpectation::Any => ExpectedRevision::Any,
+        FileExpectation::Absent => ExpectedRevision::Absent,
+        FileExpectation::Matches { size, digest } => ExpectedRevision::Matches(FileRevision {
+            size: *size,
+            digest: digest.clone(),
+        }),
+    }
 }
 
 fn revision_at(root: &Dir, relative: &Path) -> Result<Option<FileRevision>, FilesystemError> {
@@ -838,6 +983,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(service.list("/workspace/src").unwrap()[0].name, b"file");
+    }
+
+    #[test]
+    fn streamed_write_is_contiguous_digest_bound_and_atomically_published() {
+        let root = Temp::new();
+        let service = FilesystemService::open(&root.0, "/workspace").unwrap();
+        let bytes = b"streamed-binary\0content";
+        let transfer = FileTransfer {
+            id: "transfer".try_into().unwrap(),
+            path: GuestPath::try_from("/workspace/result").unwrap(),
+            length: bytes.len() as u64,
+            digest: Digest::try_from(format!("{:x}", Sha256::digest(bytes))).unwrap(),
+            mode: 0o640,
+            expected: FileExpectation::Absent,
+        };
+        service.begin_write_transfer(&transfer).unwrap();
+        assert!(matches!(
+            service.write_transfer_chunk(&transfer, 1, &bytes[..4]),
+            Err(FilesystemError::Conflict)
+        ));
+        service
+            .write_transfer_chunk(&transfer, 0, &bytes[..8])
+            .unwrap();
+        service
+            .write_transfer_chunk(&transfer, 8, &bytes[8..])
+            .unwrap();
+        assert!(!root.0.join("result").exists());
+        let revision = service.commit_write_transfer(&transfer, &Barrier).unwrap();
+        assert_eq!(revision.size, bytes.len() as u64);
+        assert_eq!(fs::read(root.0.join("result")).unwrap(), bytes);
     }
 
     #[test]

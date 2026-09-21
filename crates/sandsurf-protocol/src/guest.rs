@@ -1,6 +1,6 @@
 use crate::{
     Capability, Counter, Digest, GuestPath, Mutation, OperationId, OutputBoundary, ProcessId,
-    ProcessOutcome, SpawnRequest, Stream, WatcherId,
+    ProcessOutcome, SpawnRequest, Stream, TransferId, WatcherId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +186,20 @@ pub enum FilesystemRequest {
         mode: u32,
         expected: FileExpectation,
     },
+    BeginWrite {
+        transfer: FileTransfer,
+    },
+    WriteChunk {
+        transfer: FileTransfer,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    CommitWrite {
+        transfer: FileTransfer,
+    },
+    AbortWrite {
+        transfer: FileTransfer,
+    },
     Mkdir {
         path: GuestPath,
         recursive: bool,
@@ -246,6 +260,26 @@ impl FilesystemRequest {
                     "filesystem write is oversized or has invalid mode",
                 ));
             }
+            Self::BeginWrite { transfer }
+            | Self::CommitWrite { transfer }
+            | Self::AbortWrite { transfer }
+                if transfer.validate().is_err() =>
+            {
+                return Err(crate::Invalid("filesystem transfer is invalid"));
+            }
+            Self::WriteChunk {
+                transfer,
+                offset,
+                bytes,
+            } if transfer.validate().is_err()
+                || bytes.is_empty()
+                || bytes.len() > crate::MAX_STREAM_BYTES
+                || offset
+                    .checked_add(bytes.len() as u64)
+                    .is_none_or(|end| end > transfer.length) =>
+            {
+                return Err(crate::Invalid("filesystem transfer chunk is invalid"));
+            }
             Self::Chmod { mode, .. } if mode & !0o7777 != 0 => {
                 return Err(crate::Invalid("filesystem mode is invalid"));
             }
@@ -269,12 +303,36 @@ impl FilesystemRequest {
             | Self::PollWatch { .. }
             | Self::Unwatch { .. } => Capability::ReadFiles,
             Self::Write { .. }
+            | Self::BeginWrite { .. }
+            | Self::WriteChunk { .. }
+            | Self::CommitWrite { .. }
+            | Self::AbortWrite { .. }
             | Self::Mkdir { .. }
             | Self::Rename { .. }
             | Self::Remove { .. }
             | Self::Chmod { .. }
             | Self::Symlink { .. } => Capability::WriteFiles,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileTransfer {
+    pub id: TransferId,
+    pub path: GuestPath,
+    pub length: u64,
+    pub digest: Digest,
+    pub mode: u32,
+    pub expected: FileExpectation,
+}
+
+impl FileTransfer {
+    pub fn validate(&self) -> Result<(), crate::Invalid> {
+        if self.length > 128 * 1024 * 1024 * 1024 || self.mode & !0o7777 != 0 {
+            return Err(crate::Invalid("filesystem transfer exceeds its bound"));
+        }
+        Ok(())
     }
 }
 

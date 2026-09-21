@@ -6,6 +6,7 @@ export {
   SandsurfImage,
   ProcessOutput,
   PinnedOutput,
+  FilesystemWatcher,
   SandboxFilesystem,
   SandboxOperations,
   SandboxProcess,
@@ -39,5 +40,8 @@ export type {
   SpawnOptions,
   TerminalSize,
   WorkloadDefaults,
+  WorkspaceImportOptions,
+  WorkspaceManifest,
+  WorkspaceManifestEntry,
 } from "./sandsurf.js";
 export { SandsurfHostError } from "./native-host.js";

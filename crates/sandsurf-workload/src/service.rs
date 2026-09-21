@@ -319,6 +319,29 @@ impl PersistentWorkloadService {
                 )?;
                 FilesystemResponse::Written { revision }
             }
+            FilesystemRequest::BeginWrite { transfer } => {
+                self.filesystem.begin_write_transfer(&transfer)?;
+                FilesystemResponse::Complete
+            }
+            FilesystemRequest::WriteChunk {
+                transfer,
+                offset,
+                bytes,
+            } => {
+                self.filesystem
+                    .write_transfer_chunk(&transfer, offset, &bytes)?;
+                FilesystemResponse::Complete
+            }
+            FilesystemRequest::CommitWrite { transfer } => {
+                let revision = self
+                    .filesystem
+                    .commit_write_transfer(&transfer, &self.processes)?;
+                FilesystemResponse::Written { revision }
+            }
+            FilesystemRequest::AbortWrite { transfer } => {
+                self.filesystem.abort_write_transfer(&transfer)?;
+                FilesystemResponse::Complete
+            }
             FilesystemRequest::Mkdir { path, recursive } => {
                 self.filesystem.mkdir_path(&path, recursive)?;
                 FilesystemResponse::Complete
