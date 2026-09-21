@@ -22,6 +22,7 @@ private struct Request: Decodable {
     let controlSocket: String?
     let hostConnectPorts: [UInt32]?
     let guestListenPorts: [UInt32]?
+    let savedState: String?
 }
 
 private struct Response: Encodable {
@@ -336,58 +337,35 @@ private final class MachineOwner {
     func handle(_ request: Request) throws -> Response {
         switch request.kind {
         case "create":
-            guard machine == nil,
-                  let kernel = request.kernel,
-                  let commandLine = request.commandLine,
-                  let disks = request.disks,
-                  let memoryBytes = request.memoryBytes,
-                  let vcpus = request.vcpus,
-                  let controlSocket = request.controlSocket,
-                  let hostConnectPorts = request.hostConnectPorts,
-                  let guestListenPorts = request.guestListenPorts,
-                  request.sandboxId != nil else {
+            return try launch(request, savedState: nil)
+        case "restore":
+            guard let savedState = request.savedState else { throw OwnerError.invalidRequest }
+            if #available(macOS 14.0, *) {
+                return try launch(request, savedState: savedState)
+            }
+            return Response(kind: "not-applied", state: "stopped")
+        case "save":
+            guard let machine,
+                  let savedState = request.savedState,
+                  savedState.hasPrefix("/"),
+                  machine.state == .paused else {
                 throw OwnerError.invalidRequest
             }
-            guard VZVirtualMachine.isSupported else {
-                return Response(kind: "not-applied", state: "stopped")
+            if #available(macOS 14.0, *) {
+                let url = URL(fileURLWithPath: savedState)
+                guard !FileManager.default.fileExists(atPath: url.path) else {
+                    throw OwnerError.invalidRequest
+                }
+                try awaitResult { completion in
+                    machine.saveMachineStateTo(url: url) { error in
+                        if let error { completion(.failure(error)) }
+                        else { completion(.success(())) }
+                    }
+                }
+                guard machine.state == .paused else { throw OwnerError.unexpectedState }
+                return Response(kind: "observed", state: "paused")
             }
-            let configuration = VZVirtualMachineConfiguration()
-            let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: kernel))
-            bootLoader.commandLine = commandLine
-            if let initialRamdisk = request.initialRamdisk {
-                bootLoader.initialRamdiskURL = URL(fileURLWithPath: initialRamdisk)
-            }
-            configuration.bootLoader = bootLoader
-            configuration.cpuCount = vcpus
-            configuration.memorySize = memoryBytes
-            configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-            configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
-            configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
-            configuration.networkDevices = []
-            configuration.storageDevices = try disks.map { disk in
-                let attachment = try VZDiskImageStorageDeviceAttachment(
-                    url: URL(fileURLWithPath: disk.path),
-                    readOnly: disk.readOnly
-                )
-                return VZVirtioBlockDeviceConfiguration(attachment: attachment)
-            }
-            try configuration.validate()
-            let value = VZVirtualMachine(configuration: configuration, queue: vmQueue)
-            machine = value
-            try awaitResult { completion in value.start(completionHandler: completion) }
-            guard value.state == .running else { throw OwnerError.unexpectedState }
-            guard let socketDevice = value.socketDevices.first as? VZVirtioSocketDevice else {
-                throw OwnerError.unsupported
-            }
-            let socketRelay = try SocketRelay(
-                path: controlSocket,
-                device: socketDevice,
-                hostConnectPorts: hostConnectPorts,
-                guestListenPorts: guestListenPorts
-            )
-            try socketRelay.start()
-            relay = socketRelay
-            return Response(kind: "observed", state: "running")
+            return Response(kind: "not-applied", state: "paused")
         case "pause":
             guard let machine else { return Response(kind: "not-applied", state: "stopped") }
             guard machine.canPause else { return Response(kind: "not-applied", state: stateName(machine.state)) }
@@ -400,12 +378,101 @@ private final class MachineOwner {
             try awaitResult { completion in machine.resume(completionHandler: completion) }
             guard machine.state == .running else { throw OwnerError.unexpectedState }
             return Response(kind: "observed", state: "running")
+        case "release":
+            guard let machine, machine.state == .paused else {
+                return Response(kind: "not-applied", state: "stopped")
+            }
+            relay?.stop()
+            relay = nil
+            self.machine = nil
+            return Response(kind: "observed", state: "suspended")
         case "stop":
             try stop()
             return Response(kind: "observed", state: "stopped")
         default:
             throw OwnerError.invalidRequest
         }
+    }
+
+    private func launch(_ request: Request, savedState: String?) throws -> Response {
+        guard machine == nil,
+              let kernel = request.kernel,
+              let commandLine = request.commandLine,
+              let disks = request.disks,
+              let memoryBytes = request.memoryBytes,
+              let vcpus = request.vcpus,
+              let controlSocket = request.controlSocket,
+              let hostConnectPorts = request.hostConnectPorts,
+              let guestListenPorts = request.guestListenPorts,
+              request.sandboxId != nil,
+              savedState == nil || savedState!.hasPrefix("/") else {
+            throw OwnerError.invalidRequest
+        }
+        guard VZVirtualMachine.isSupported else {
+            return Response(kind: "not-applied", state: "stopped")
+        }
+        let configuration = VZVirtualMachineConfiguration()
+        let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: kernel))
+        bootLoader.commandLine = commandLine
+        if let initialRamdisk = request.initialRamdisk {
+            bootLoader.initialRamdiskURL = URL(fileURLWithPath: initialRamdisk)
+        }
+        configuration.bootLoader = bootLoader
+        configuration.cpuCount = vcpus
+        configuration.memorySize = memoryBytes
+        configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+        configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        configuration.networkDevices = []
+        configuration.storageDevices = try disks.map { disk in
+            let attachment = try VZDiskImageStorageDeviceAttachment(
+                url: URL(fileURLWithPath: disk.path),
+                readOnly: disk.readOnly
+            )
+            return VZVirtioBlockDeviceConfiguration(attachment: attachment)
+        }
+        try configuration.validate()
+        if savedState != nil {
+            if #available(macOS 14.0, *) {
+                try configuration.validateSaveRestoreSupport()
+            } else {
+                throw OwnerError.unsupported
+            }
+        }
+        let value = VZVirtualMachine(configuration: configuration, queue: vmQueue)
+        machine = value
+        if let savedState {
+            if #available(macOS 14.0, *) {
+                try awaitResult { completion in
+                    value.restoreMachineStateFrom(url: URL(fileURLWithPath: savedState)) { error in
+                        if let error { completion(.failure(error)) }
+                        else { completion(.success(())) }
+                    }
+                }
+                guard value.state == .paused else { throw OwnerError.unexpectedState }
+            } else {
+                throw OwnerError.unsupported
+            }
+        } else {
+            try awaitResult { completion in value.start(completionHandler: completion) }
+            guard value.state == .running else { throw OwnerError.unexpectedState }
+        }
+        guard let socketDevice = value.socketDevices.first as? VZVirtioSocketDevice else {
+            throw OwnerError.unsupported
+        }
+        let socketRelay = try SocketRelay(
+            path: controlSocket,
+            device: socketDevice,
+            hostConnectPorts: hostConnectPorts,
+            guestListenPorts: guestListenPorts
+        )
+        try socketRelay.start()
+        relay = socketRelay
+        if savedState != nil {
+            try awaitResult { completion in value.resume(completionHandler: completion) }
+            guard value.state == .running else { throw OwnerError.unexpectedState }
+        }
+        return Response(kind: "observed", state: "running")
     }
 
     func stop() throws {
@@ -516,7 +583,7 @@ do {
         do {
             let response = try owner.handle(request)
             try writeResponse(response)
-            if request.kind == "stop" { break }
+            if request.kind == "stop" || request.kind == "release" { break }
         } catch OwnerError.invalidRequest {
             try writeResponse(Response(kind: "not-applied", state: "stopped"))
         }

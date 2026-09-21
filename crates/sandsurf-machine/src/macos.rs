@@ -75,6 +75,16 @@ pub struct AppleDriver {
     config: AppleConfig,
     owner: Option<HelperOwner>,
     applied_revision: Option<Counter>,
+    capture_paused: bool,
+    full_capture_operation: Option<sandsurf_protocol::OperationId>,
+    committed_suspend: Option<(sandsurf_protocol::OperationId, Digest)>,
+    staged_restore: Option<AppleRestoreSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleRestoreSource {
+    pub saved_state: PathBuf,
+    pub manifest_digest: Digest,
 }
 
 impl AppleConfig {
@@ -152,6 +162,10 @@ impl AppleDriver {
             config,
             owner: None,
             applied_revision: None,
+            capture_paused: false,
+            full_capture_operation: None,
+            committed_suspend: None,
+            staged_restore: None,
         })
     }
 
@@ -161,6 +175,21 @@ impl AppleDriver {
 
     fn unavailable(reason: &'static [u8]) -> MachineOutcome {
         MachineOutcome::NotApplied(bytes_digest(reason))
+    }
+
+    fn helper_create(&self, sandbox_id: SandboxId) -> HelperCreate {
+        HelperCreate {
+            sandbox_id,
+            kernel: self.config.kernel.clone(),
+            initial_ramdisk: self.config.initial_ramdisk.clone(),
+            command_line: self.config.command_line.clone(),
+            disks: self.config.disks.clone(),
+            memory_bytes: self.config.memory_bytes,
+            vcpus: self.config.vcpus,
+            control_socket: self.config.control_socket.clone(),
+            host_connect_ports: self.config.host_connect_ports.clone(),
+            guest_listen_ports: self.config.guest_listen_ports.clone(),
+        }
     }
 
     fn create_and_start(&mut self, command: &LifecycleCommand, epoch: Counter) -> MachineOutcome {
@@ -178,24 +207,17 @@ impl AppleDriver {
             Ok(value) => value,
             Err(_) => return Self::unavailable(b"apple-helper-not-started"),
         };
-        let response = owner.request(&HelperRequest::Create(Box::new(HelperCreate {
-            sandbox_id: command.sandbox_id.clone(),
-            kernel: self.config.kernel.clone(),
-            initial_ramdisk: self.config.initial_ramdisk.clone(),
-            command_line: self.config.command_line.clone(),
-            disks: self.config.disks.clone(),
-            memory_bytes: self.config.memory_bytes,
-            vcpus: self.config.vcpus,
-            control_socket: self.config.control_socket.clone(),
-            host_connect_ports: self.config.host_connect_ports.clone(),
-            guest_listen_ports: self.config.guest_listen_ports.clone(),
-        })));
+        let response = owner.request(&HelperRequest::Create(Box::new(
+            self.helper_create(command.sandbox_id.clone()),
+        )));
         match response {
             Ok(value)
                 if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
             {
                 self.owner = Some(owner);
                 self.applied_revision = Some(command.revision);
+                self.capture_paused = false;
+                self.committed_suspend = None;
                 MachineOutcome::Observed(vec![
                     transition(
                         command,
@@ -280,6 +302,9 @@ impl AppleDriver {
     }
 
     pub fn pause_for_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        if self.capture_paused {
+            return Ok(());
+        }
         let owner = self
             .owner
             .as_mut()
@@ -288,6 +313,7 @@ impl AppleDriver {
             Ok(value)
                 if value.kind == ResponseKind::Observed && value.state == MachineState::Paused =>
             {
+                self.capture_paused = true;
                 Ok(())
             }
             _ => Err(AppleRuntimeError::TransitionFailed),
@@ -295,6 +321,30 @@ impl AppleDriver {
     }
 
     pub fn resume_after_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        if !self.capture_paused {
+            return Ok(());
+        }
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
+        match owner.request(&HelperRequest::Resume) {
+            Ok(value)
+                if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
+            {
+                self.capture_paused = false;
+                self.full_capture_operation = None;
+                self.committed_suspend = None;
+                Ok(())
+            }
+            _ => Err(AppleRuntimeError::TransitionFailed),
+        }
+    }
+
+    pub fn resume_public_pause_for_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        if self.capture_paused {
+            return Err(AppleRuntimeError::InvalidCaptureState);
+        }
         let owner = self
             .owner
             .as_mut()
@@ -309,10 +359,95 @@ impl AppleDriver {
         }
     }
 
+    pub fn restore_public_pause_after_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        if self.capture_paused {
+            return Err(AppleRuntimeError::InvalidCaptureState);
+        }
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
+        match owner.request(&HelperRequest::Pause) {
+            Ok(value)
+                if value.kind == ResponseKind::Observed && value.state == MachineState::Paused =>
+            {
+                Ok(())
+            }
+            _ => Err(AppleRuntimeError::TransitionFailed),
+        }
+    }
+
+    pub fn save_full_state(
+        &mut self,
+        operation_id: &sandsurf_protocol::OperationId,
+        destination: &Path,
+    ) -> Result<(), AppleRuntimeError> {
+        if !destination.is_absolute()
+            || self
+                .full_capture_operation
+                .as_ref()
+                .is_some_and(|value| value != operation_id)
+        {
+            return Err(AppleRuntimeError::InvalidCaptureState);
+        }
+        self.pause_for_capture()?;
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
+        match owner.request(&HelperRequest::Save {
+            saved_state: destination.to_path_buf(),
+        }) {
+            Ok(value)
+                if value.kind == ResponseKind::Observed && value.state == MachineState::Paused =>
+            {
+                self.full_capture_operation = Some(operation_id.clone());
+                Ok(())
+            }
+            _ => Err(AppleRuntimeError::TransitionFailed),
+        }
+    }
+
+    pub fn commit_suspend(
+        &mut self,
+        operation_id: &sandsurf_protocol::OperationId,
+        manifest_digest: Digest,
+    ) -> Result<(), AppleRuntimeError> {
+        if !self.capture_paused
+            || self.full_capture_operation.as_ref() != Some(operation_id)
+            || self
+                .committed_suspend
+                .as_ref()
+                .is_some_and(|(old, digest)| old != operation_id || digest != &manifest_digest)
+        {
+            return Err(AppleRuntimeError::InvalidCaptureState);
+        }
+        self.committed_suspend = Some((operation_id.clone(), manifest_digest));
+        Ok(())
+    }
+
+    pub fn stage_restore(&mut self, source: AppleRestoreSource) -> Result<(), AppleRuntimeError> {
+        if self.owner.is_some()
+            || !source.saved_state.is_absolute()
+            || self
+                .staged_restore
+                .as_ref()
+                .is_some_and(|old| old.manifest_digest != source.manifest_digest)
+        {
+            return Err(AppleRuntimeError::InvalidCaptureState);
+        }
+        self.staged_restore = Some(source);
+        Ok(())
+    }
+
     pub fn contain_unobserved(&mut self) {
         if let Some(mut owner) = self.owner.take() {
             owner.contain();
         }
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        self.staged_restore = None;
     }
 
     #[must_use]
@@ -321,12 +456,18 @@ impl AppleDriver {
             .as_mut()
             .is_some_and(|owner| matches!(owner.child.try_wait(), Ok(None)))
     }
+
+    #[must_use]
+    pub fn capture_is_paused(&self) -> bool {
+        self.capture_paused
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppleRuntimeError {
     OwnerUnavailable,
     TransitionFailed,
+    InvalidCaptureState,
 }
 
 impl MachineDriver for AppleDriver {
@@ -441,21 +582,114 @@ impl MachineDriver for AppleDriver {
 
     fn suspend(
         &mut self,
-        _command: &LifecycleCommand,
-        _current: &MachineObservation,
+        command: &LifecycleCommand,
+        current: &MachineObservation,
     ) -> MachineOutcome {
-        Self::unavailable(b"apple-full-state-capture-not-implemented")
+        if command.sandbox_id != self.config.sandbox_id
+            || !self.capture_paused
+            || self.full_capture_operation.is_none()
+            || self.committed_suspend.is_none()
+        {
+            return Self::unavailable(b"apple-suspend-capture-not-committed");
+        }
+        let (_, manifest) = self
+            .committed_suspend
+            .take()
+            .expect("committed suspend checked above");
+        let Some(mut owner) = self.owner.take() else {
+            return MachineOutcome::Unknown;
+        };
+        let released = owner.request(&HelperRequest::Release);
+        let exited = owner.finish();
+        if !matches!(
+            released,
+            Ok(HelperResponse {
+                kind: ResponseKind::Observed,
+                state: MachineState::Suspended,
+            })
+        ) || !exited
+        {
+            return MachineOutcome::Unknown;
+        }
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        MachineOutcome::Observed(vec![transition_with_digest(
+            command,
+            current.epoch,
+            MachineState::Suspended,
+            b"vz-saved-state-committed-and-owner-released",
+            &manifest,
+        )])
     }
 
     fn restore(
         &mut self,
-        _command: &LifecycleCommand,
-        _current: &MachineObservation,
+        command: &LifecycleCommand,
+        current: &MachineObservation,
     ) -> MachineOutcome {
-        Self::unavailable(b"apple-full-state-restore-not-implemented")
+        if command.sandbox_id != self.config.sandbox_id || self.owner.is_some() {
+            return Self::unavailable(b"apple-restore-state-mismatch");
+        }
+        let Some(source) = self.staged_restore.take() else {
+            return Self::unavailable(b"apple-restore-not-staged");
+        };
+        let Ok(epoch) = current.epoch.next() else {
+            return MachineOutcome::Unknown;
+        };
+        if !file_digest_matches(&self.config.helper, &self.config.helper_digest) {
+            return Self::unavailable(b"apple-helper-integrity-mismatch");
+        }
+        let mut owner = match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout)
+        {
+            Ok(value) => value,
+            Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+        };
+        let response = owner.request(&HelperRequest::Restore(Box::new(HelperRestore {
+            machine: self.helper_create(command.sandbox_id.clone()),
+            saved_state: source.saved_state,
+        })));
+        if !matches!(
+            response,
+            Ok(HelperResponse {
+                kind: ResponseKind::Observed,
+                state: MachineState::Running,
+            })
+        ) {
+            owner.contain();
+            return MachineOutcome::Unknown;
+        }
+        self.owner = Some(owner);
+        self.applied_revision = Some(command.revision);
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        MachineOutcome::Observed(vec![
+            transition_with_digest(
+                command,
+                epoch,
+                MachineState::Restoring,
+                b"vz-saved-state-loaded-paused",
+                &source.manifest_digest,
+            ),
+            transition(
+                command,
+                epoch,
+                MachineState::Running,
+                b"vz-saved-state-resumed",
+            ),
+        ])
     }
 
     fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {
+        if current.state == MachineState::Suspended && self.owner.is_none() {
+            self.staged_restore = None;
+            return MachineOutcome::Observed(vec![transition(
+                command,
+                current.epoch,
+                MachineState::Stopped,
+                b"vz-suspended-state-detached",
+            )]);
+        }
         self.stop_owner(
             command,
             current.epoch,
@@ -468,11 +702,21 @@ impl MachineDriver for AppleDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        let stopped = self.stop_owner(
-            command,
-            current.epoch,
-            current.state == MachineState::Stopped,
-        );
+        let stopped = if current.state == MachineState::Suspended && self.owner.is_none() {
+            self.staged_restore = None;
+            MachineOutcome::Observed(vec![transition(
+                command,
+                current.epoch,
+                MachineState::Stopped,
+                b"vz-suspended-state-detached",
+            )])
+        } else {
+            self.stop_owner(
+                command,
+                current.epoch,
+                current.state == MachineState::Stopped,
+            )
+        };
         if !matches!(stopped, MachineOutcome::Observed(_)) {
             return stopped;
         }
@@ -634,12 +878,15 @@ fn read_response(stream: &mut impl Read) -> io::Result<HelperResponse> {
 )]
 enum HelperRequest {
     Create(Box<HelperCreate>),
+    Restore(Box<HelperRestore>),
+    Save { saved_state: PathBuf },
     Pause,
     Resume,
+    Release,
     Stop,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HelperCreate {
     sandbox_id: SandboxId,
@@ -652,6 +899,14 @@ struct HelperCreate {
     control_socket: PathBuf,
     host_connect_ports: Vec<u32>,
     guest_listen_ports: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HelperRestore {
+    #[serde(flatten)]
+    machine: HelperCreate,
+    saved_state: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -694,6 +949,24 @@ fn transition(
     let mut evidence = Vec::with_capacity(native_evidence.len() + 64);
     evidence.extend_from_slice(native_evidence);
     evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
+    MachineTransition {
+        epoch,
+        state,
+        evidence_digest: bytes_digest(&evidence),
+    }
+}
+
+fn transition_with_digest(
+    command: &LifecycleCommand,
+    epoch: Counter,
+    state: MachineState,
+    native_evidence: &[u8],
+    bound: &Digest,
+) -> MachineTransition {
+    let mut evidence = Vec::with_capacity(native_evidence.len() + 128);
+    evidence.extend_from_slice(native_evidence);
+    evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
+    evidence.extend_from_slice(bound.as_str().as_bytes());
     MachineTransition {
         epoch,
         state,
@@ -750,7 +1023,7 @@ mod tests {
 
     #[test]
     fn create_request_keeps_the_flat_helper_contract() {
-        let request = HelperRequest::Create(Box::new(HelperCreate {
+        let machine = HelperCreate {
             sandbox_id: "box".try_into().unwrap(),
             kernel: "/kernel".into(),
             initial_ramdisk: None,
@@ -764,11 +1037,21 @@ mod tests {
             control_socket: "/private/tmp/control.sock".into(),
             host_connect_ports: vec![10_789],
             guest_listen_ports: vec![12_080],
-        }));
+        };
+        let request = HelperRequest::Create(Box::new(machine.clone()));
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["kind"], "create");
         assert_eq!(value["sandboxId"], "box");
         assert_eq!(value["hostConnectPorts"][0], 10_789);
+
+        let restore = serde_json::to_value(HelperRequest::Restore(Box::new(HelperRestore {
+            machine,
+            saved_state: "/private/tmp/checkpoint.vmstate".into(),
+        })))
+        .unwrap();
+        assert_eq!(restore["kind"], "restore");
+        assert_eq!(restore["sandboxId"], "box");
+        assert_eq!(restore["savedState"], "/private/tmp/checkpoint.vmstate");
     }
 
     #[test]

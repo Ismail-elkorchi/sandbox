@@ -230,10 +230,15 @@ pub fn capture_full(
         .get()
         .checked_mul(1024 * 1024)
         .ok_or(CheckpointError::Invalid("checkpoint memory bound overflow"))?;
-    if native.memory.bytes.get() == 0
-        || native.memory.bytes.get() > memory_bound
+    let integrated_state_bound = memory_bound
+        .checked_add(1024 * 1024 * 1024)
+        .ok_or(CheckpointError::Invalid("checkpoint state bound overflow"))?;
+    if native
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.bytes.get() == 0 || memory.bytes.get() > memory_bound)
         || native.snapshot_state.bytes.get() == 0
-        || native.snapshot_state.bytes.get() > 1024 * 1024 * 1024
+        || native.snapshot_state.bytes.get() > integrated_state_bound
         || native.reconnect_state.bytes.get() == 0
         || native.reconnect_state.bytes.get() > 1024 * 1024
     {
@@ -243,7 +248,6 @@ pub fn capture_full(
     }
     for (name, artifact) in [
         ("snapshot.vmstate", &native.snapshot_state),
-        ("memory", &native.memory),
         ("reconnect.json", &native.reconnect_state),
     ] {
         copy_and_verify(
@@ -251,6 +255,14 @@ pub fn capture_full(
             &stage.join(name),
             artifact.bytes.get(),
             Some(&artifact.digest),
+        )?;
+    }
+    if let Some(memory) = &native.memory {
+        copy_and_verify(
+            &native_directory.join("memory"),
+            &stage.join("memory"),
+            memory.bytes.get(),
+            Some(&memory.digest),
         )?;
     }
     if processes.len() > 65_536 {
@@ -517,7 +529,6 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
         for (name, artifact) in [
             (manifest.disk_container.control_name(), &full.control_disk),
             ("snapshot.vmstate", &full.snapshot_state),
-            ("memory", &full.memory),
             ("reconnect.json", &full.reconnect_state),
         ] {
             if file_digest(&directory.join(name), artifact.bytes.get())? != artifact.digest {
@@ -525,6 +536,13 @@ fn verify_published(directory: &Path, checkpoint: &Checkpoint) -> Result<Capture
                     "full checkpoint artifact digest mismatch",
                 ));
             }
+        }
+        if let Some(memory) = &full.memory
+            && file_digest(&directory.join("memory"), memory.bytes.get())? != memory.digest
+        {
+            return Err(CheckpointError::Invalid(
+                "full checkpoint memory artifact digest mismatch",
+            ));
         }
     } else if manifest.kind != CheckpointKind::Filesystem {
         return Err(CheckpointError::Invalid(

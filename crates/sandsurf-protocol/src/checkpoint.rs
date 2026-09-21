@@ -80,7 +80,9 @@ pub struct FullCheckpointMetadata {
     pub architecture: String,
     pub configuration_digest: Digest,
     pub snapshot_state: CheckpointArtifact,
-    pub memory: CheckpointArtifact,
+    /// Separate guest-memory material when the native engine emits it. Engines
+    /// with an integrated saved-machine artifact leave this absent.
+    pub memory: Option<CheckpointArtifact>,
     pub control_disk: CheckpointArtifact,
     pub reconnect_state: CheckpointArtifact,
     pub processes: Vec<CheckpointProcessWatermark>,
@@ -99,7 +101,7 @@ pub struct NativeFullCapture {
     pub architecture: String,
     pub configuration_digest: Digest,
     pub snapshot_state: CheckpointArtifact,
-    pub memory: CheckpointArtifact,
+    pub memory: Option<CheckpointArtifact>,
     pub reconnect_state: CheckpointArtifact,
     pub generation: Digest,
 }

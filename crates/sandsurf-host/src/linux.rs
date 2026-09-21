@@ -912,6 +912,9 @@ impl LinuxGuardianEffect {
                 "full checkpoint is incompatible with this Firecracker configuration",
             ));
         }
+        let memory = expected.memory.as_ref().ok_or(ControlError::Unsupported(
+            "Firecracker full checkpoints require a separate memory artifact",
+        ))?;
         let host_root = self
             .sandbox_root
             .parent()
@@ -922,7 +925,7 @@ impl LinuxGuardianEffect {
             ("workload-state.ext4", &workload_disk),
             ("control-state.ext4", &expected.control_disk),
             ("snapshot.vmstate", &expected.snapshot_state),
-            ("memory", &expected.memory),
+            ("memory", memory),
             ("reconnect.json", &expected.reconnect_state),
         ];
         for (name, artifact) in artifacts {
@@ -1159,11 +1162,11 @@ impl LinuxGuardianEffect {
                     bytes: Counter::try_from(snapshot.state_bytes)
                         .map_err(|error| LinuxError::Invalid(error.to_string()))?,
                 },
-                memory: CheckpointArtifact {
+                memory: Some(CheckpointArtifact {
                     digest: memory_digest,
                     bytes: Counter::try_from(snapshot.memory_bytes)
                         .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-                },
+                }),
                 reconnect_state: CheckpointArtifact {
                     digest: reconnect_digest,
                     bytes: Counter::try_from(reconnect_bytes)
