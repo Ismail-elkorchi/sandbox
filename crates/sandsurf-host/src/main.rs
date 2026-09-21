@@ -115,7 +115,11 @@ mod windows_service {
             .map_err(|_| "Windows service name was already initialized")?;
         let entries = [
             SERVICE_TABLE_ENTRYW {
-                lpServiceName: SERVICE_NAME.get().expect("service name").as_ptr().cast_mut(),
+                lpServiceName: SERVICE_NAME
+                    .get()
+                    .expect("service name")
+                    .as_ptr()
+                    .cast_mut(),
                 lpServiceProc: Some(service_main),
             },
             SERVICE_TABLE_ENTRYW {
