@@ -5,12 +5,13 @@
 //! until the trusted guest control channel has authenticated for its epoch.
 
 use crate::{
-    DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome, MachineTransition,
+    ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
+    MachineTransition,
 };
 use sandbox_vm::{FirecrackerConfig, FirecrackerProcess};
 use sandsurf_protocol::{
-    Counter, Digest, LifecycleCommand, MachineObservation, MachineState, Qualification, SandboxId,
-    VmEngine, bytes_digest,
+    ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand, MachineObservation,
+    MachineState, Qualification, SandboxId, VmEngine, bytes_digest, digest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +189,45 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
                 self.qualification.full_state.clone(),
                 "Firecracker full-state contract has not passed on this host/configuration",
             ),
+        }
+    }
+
+    fn configure(
+        &mut self,
+        command: &ConfigurationCommand,
+        current: &MachineObservation,
+    ) -> ConfigurationOutcome {
+        let live = matches!(current.state, MachineState::Running | MachineState::Paused);
+        if command.sandbox_id != self.sandbox_id
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+            || live != self.process.is_some()
+            || matches!(
+                current.state,
+                MachineState::Creating
+                    | MachineState::Starting
+                    | MachineState::Restoring
+                    | MachineState::Destroying
+                    | MachineState::Destroyed
+                    | MachineState::Failed
+            )
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"firecracker-configuration-state-mismatch",
+            ));
+        }
+        self.applied_revision = Some(command.revision);
+        match digest(
+            Domain::Grant,
+            &(
+                "firecracker-configuration-installed-v1",
+                &command.sandbox_id,
+                command.revision,
+                &command.request_digest,
+            ),
+        ) {
+            Ok(evidence) => ConfigurationOutcome::Applied(evidence),
+            Err(_) => ConfigurationOutcome::Unknown,
         }
     }
 

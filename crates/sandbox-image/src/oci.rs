@@ -147,6 +147,191 @@ pub struct OciLayout {
     limits: ConversionLimits,
 }
 
+/// Unpack the narrow OCI image-layout archive vocabulary into a fresh private
+/// staging directory. Archive links and arbitrary top-level files are refused;
+/// layer archive parsing remains a separate, independently bounded step.
+pub fn unpack_layout_archive(
+    archive_path: &Path,
+    destination: &Path,
+    limits: ConversionLimits,
+) -> Result<(), OciError> {
+    if !archive_path.is_absolute() || !destination.is_absolute() {
+        return Err(OciError::Invalid(
+            "OCI archive and destination paths must be absolute".into(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(archive_path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > limits.compressed_bytes
+    {
+        return Err(OciError::Limit("OCI archive byte count"));
+    }
+    prepare_empty_destination(destination)?;
+    let file = File::open(archive_path)?;
+    let mut archive = tar::Archive::new(file);
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    for item in archive.entries()? {
+        entries = entries
+            .checked_add(1)
+            .ok_or(OciError::Limit("OCI archive entry count"))?;
+        if entries > limits.entries {
+            return Err(OciError::Limit("OCI archive entry count"));
+        }
+        let mut item = item?;
+        let relative = normalize_layer_path(&item.path()?, limits.path_bytes)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if !is_layout_archive_path(&relative) {
+            return Err(OciError::Invalid(format!(
+                "OCI archive contains an unexpected path {}",
+                relative.display()
+            )));
+        }
+        let kind = item.header().entry_type();
+        let output = destination.join(&relative);
+        if kind.is_dir() {
+            fs::create_dir_all(&output)?;
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(OciError::Unsupported(
+                "OCI layout archive links and special files".into(),
+            ));
+        }
+        let declared = item.size();
+        bytes = bytes
+            .checked_add(declared)
+            .ok_or(OciError::Limit("OCI archive expanded byte count"))?;
+        if bytes > limits.compressed_bytes {
+            return Err(OciError::Limit("OCI archive expanded byte count"));
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)?;
+        let copied = io::copy(&mut item.by_ref().take(declared + 1), &mut target)?;
+        if copied != declared {
+            return Err(OciError::Invalid(
+                "OCI archive entry length differs from its header".into(),
+            ));
+        }
+        target.sync_all()?;
+    }
+    OciLayout::open(destination, limits)?;
+    Ok(())
+}
+
+/// Write a canonical uncompressed tar stream whose headers preserve the OCI
+/// UID/GID/mode/link metadata. `mke2fs -d` consumes this stream without the
+/// host mounting or chowning the untrusted tree.
+pub fn write_filesystem_tar(
+    tree_root: &Path,
+    tree: &ConvertedTree,
+    destination: &Path,
+) -> Result<(), OciError> {
+    if !tree_root.is_absolute() || !destination.is_absolute() {
+        return Err(OciError::Invalid(
+            "converted tree and tar paths must be absolute".into(),
+        ));
+    }
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut archive = tar::Builder::new(output);
+    archive.mode(tar::HeaderMode::Deterministic);
+    for entry in &tree.entries {
+        let relative = normalize_layer_path(Path::new(&entry.path), 4096)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(entry.uid);
+        header.set_gid(entry.gid);
+        header.set_mode(entry.mode);
+        header.set_mtime(0);
+        match entry.kind {
+            TreeEntryKind::Directory => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_cksum();
+                archive.append_data(&mut header, &relative, io::empty())?;
+            }
+            TreeEntryKind::Regular => {
+                let source = tree_root.join(&relative);
+                let metadata = fs::symlink_metadata(&source)?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() != entry.size
+                {
+                    return Err(OciError::Invalid(
+                        "converted regular file changed before materialization".into(),
+                    ));
+                }
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(entry.size);
+                header.set_cksum();
+                archive.append_data(&mut header, &relative, File::open(source)?)?;
+            }
+            TreeEntryKind::Symlink | TreeEntryKind::Hardlink => {
+                let target = entry
+                    .link_target
+                    .as_ref()
+                    .ok_or_else(|| OciError::Invalid("converted link target is absent".into()))?;
+                header.set_entry_type(if entry.kind == TreeEntryKind::Symlink {
+                    tar::EntryType::Symlink
+                } else {
+                    tar::EntryType::Link
+                });
+                header.set_size(0);
+                header.set_link_name(target)?;
+                header.set_cksum();
+                archive.append_data(&mut header, &relative, io::empty())?;
+            }
+        }
+    }
+    archive.finish()?;
+    let output = archive.into_inner()?;
+    output.sync_all()?;
+    Ok(())
+}
+
+fn is_layout_archive_path(path: &Path) -> bool {
+    if matches!(
+        path.to_str(),
+        Some("oci-layout" | "index.json" | "blobs" | "blobs/sha256")
+    ) {
+        return true;
+    }
+    let mut components = path.components();
+    let (
+        Some(Component::Normal(blobs)),
+        Some(Component::Normal(algorithm)),
+        Some(Component::Normal(digest)),
+        None,
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+    blobs == "blobs"
+        && algorithm == "sha256"
+        && digest
+            .to_str()
+            .is_some_and(|value| parse_digest(&format!("sha256:{value}")).is_ok())
+}
+
 impl OciLayout {
     pub fn open(root: &Path, limits: ConversionLimits) -> Result<Self, OciError> {
         if !root.is_absolute() {
@@ -1238,6 +1423,18 @@ mod tests {
                 entry.path == "usr/bin/tool" && entry.kind == TreeEntryKind::Regular
             })
         );
+        let filesystem_tar = layout.0.join("filesystem.tar");
+        write_filesystem_tar(&destination, &converted, &filesystem_tar).unwrap();
+        let mut archive = tar::Archive::new(File::open(&filesystem_tar).unwrap());
+        let tool = archive
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().unwrap() == Path::new("usr/bin/tool"))
+            .unwrap();
+        assert_eq!(tool.header().uid().unwrap(), 0);
+        assert_eq!(tool.header().gid().unwrap(), 0);
+        assert_eq!(tool.header().mode().unwrap(), 0o755);
 
         let mut forged = source;
         forged.config_digest = format!("sha256:{}", "0".repeat(64));
@@ -1248,6 +1445,31 @@ mod tests {
                 .convert(forged, &other)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn layout_archive_rejects_links_and_unrelated_paths() {
+        let root = Temp::new();
+        let archive_path = root.0.join("bad.tar");
+        let output = File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(output);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "unexpected", &b"x"[..])
+            .unwrap();
+        builder.finish().unwrap();
+        assert!(
+            unpack_layout_archive(
+                &archive_path,
+                &root.0.join("layout"),
+                ConversionLimits::default()
+            )
+            .is_err()
+        );
+        assert!(!root.0.join("layout/unexpected").exists());
     }
 
     fn tar_layer(entries: &[(&str, &[u8])]) -> Vec<u8> {

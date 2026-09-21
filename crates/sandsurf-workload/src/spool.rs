@@ -11,6 +11,7 @@ use std::sync::Mutex;
 const MAGIC: &[u8; 4] = b"SSO1";
 const HEADER_BYTES: usize = 4 + 8 + 1 + 4 + 32;
 const MAX_READ_BYTES: usize = 1024 * 1024;
+const MAX_CHUNKS: u64 = 1_000_000;
 
 #[derive(Debug)]
 pub enum SpoolError {
@@ -84,6 +85,87 @@ impl OutputSpool {
         })
     }
 
+    pub fn open(
+        path: &Path,
+        maximum: Counter,
+        sandbox: &SandboxId,
+        process: &ProcessId,
+        epoch: Counter,
+        finalized: bool,
+    ) -> Result<Self, SpoolError> {
+        if maximum == Counter::ZERO {
+            return Err(SpoolError::Invalid("reservation must be positive"));
+        }
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let length = file.metadata()?.len();
+        let metadata_bound = MAX_CHUNKS
+            .checked_mul(HEADER_BYTES as u64)
+            .and_then(|value| value.checked_add(maximum.get()))
+            .ok_or(SpoolError::Capacity)?;
+        if length > metadata_bound {
+            return Err(SpoolError::Capacity);
+        }
+        let mut reader = file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut boundary = initial_output_boundary(sandbox, process, epoch)
+            .map_err(|_| SpoolError::Invalid("output identity is invalid"))?;
+        let mut offset = 0u64;
+        while offset < length {
+            if boundary.chunks.get() >= MAX_CHUNKS {
+                return Err(SpoolError::Capacity);
+            }
+            let mut header = [0u8; HEADER_BYTES];
+            reader.read_exact(&mut header)?;
+            offset = offset
+                .checked_add(HEADER_BYTES as u64)
+                .ok_or(SpoolError::Capacity)?;
+            if &header[..4] != MAGIC {
+                return Err(SpoolError::Invalid("record magic mismatch"));
+            }
+            let cursor = u64::from_be_bytes(header[4..12].try_into().unwrap());
+            let stream = parse_stream(header[12])?;
+            let size = u32::from_be_bytes(header[13..17].try_into().unwrap()) as usize;
+            if cursor != boundary.final_cursor.get()
+                || size == 0
+                || size > sandsurf_protocol::MAX_STREAM_BYTES
+                || offset + size as u64 > length
+            {
+                return Err(SpoolError::Invalid("record bounds or cursor mismatch"));
+            }
+            let mut bytes = vec![0u8; size];
+            reader.read_exact(&mut bytes)?;
+            offset = offset
+                .checked_add(size as u64)
+                .ok_or(SpoolError::Capacity)?;
+            if decode_digest(&bytes_digest(&bytes))?.as_slice() != &header[17..49] {
+                return Err(SpoolError::Invalid("record digest mismatch"));
+            }
+            boundary = extend_output_boundary(
+                &boundary,
+                boundary.chunks.next().map_err(|_| SpoolError::Capacity)?,
+                stream,
+                &bytes,
+            )
+            .map_err(|_| SpoolError::Capacity)?;
+            if boundary.final_cursor > maximum {
+                return Err(SpoolError::Capacity);
+            }
+        }
+        if offset != length {
+            return Err(SpoolError::Invalid("spool has a truncated tail"));
+        }
+        Ok(Self {
+            file,
+            state: Mutex::new(SpoolState {
+                boundary: boundary.clone(),
+                file_bytes: length,
+                failed: false,
+                finalized: finalized.then_some(boundary),
+            }),
+            maximum: maximum.get(),
+        })
+    }
+
     /// Durably append before publishing the new cursor. Any storage/capacity
     /// failure poisons completion: callers must retain an unknown operation and
     /// may not mint a receipt that claims complete output.
@@ -94,6 +176,10 @@ impl OutputSpool {
         let mut state = self.state.lock().map_err(|_| SpoolError::Failed)?;
         if state.failed || state.finalized.is_some() {
             return Err(SpoolError::Failed);
+        }
+        if state.boundary.chunks.get() >= MAX_CHUNKS {
+            state.failed = true;
+            return Err(SpoolError::Capacity);
         }
         let sequence = state
             .boundary

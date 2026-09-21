@@ -152,10 +152,18 @@ impl<M: sandsurf_machine::MachineDriver, W: WorkloadDriver> GuardianEffect
 
     fn configure(
         &mut self,
-        _command: &ConfigurationCommand,
-        _current: &MachineObservation,
+        command: &ConfigurationCommand,
+        current: &MachineObservation,
     ) -> EffectOutcome {
-        EffectOutcome::Applied(bytes_digest(b"native-configuration-installed"))
+        match self.machine.configure(command, current) {
+            sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
+                EffectOutcome::Applied(evidence)
+            }
+            sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
+                EffectOutcome::NotApplied(evidence)
+            }
+            sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
+        }
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
@@ -448,6 +456,120 @@ impl<E: GuardianEffect> Guardian<E> {
                     response: self.effect.query(request)?,
                 })
             }
+            GuardianRequest::Runtime {
+                sandbox_id,
+                request,
+            } => {
+                if &sandbox_id != self.journal.sandbox_id() {
+                    return Err(Error::Protocol("guardian sandbox identity mismatch"));
+                }
+                let response = match request {
+                    RuntimeRequest::Process { process_id } => {
+                        let snapshot = self.journal.process_snapshot(&process_id)?;
+                        let reachable = snapshot.as_ref().is_some_and(|snapshot| {
+                            matches!(snapshot.state, ProcessState::Exited(_))
+                                || self.effect.live_observation_reachable()
+                        });
+                        RuntimeResponse::Process {
+                            process: Some(match snapshot {
+                                Some(value) if reachable => Observation::Current { value },
+                                Some(value) => Observation::Unavailable {
+                                    last_known: Some(value),
+                                },
+                                None => Observation::Unavailable { last_known: None },
+                            }),
+                        }
+                    }
+                    RuntimeRequest::Processes => {
+                        let snapshots = self.journal.process_snapshots()?;
+                        let reachable = snapshots
+                            .iter()
+                            .all(|snapshot| matches!(snapshot.state, ProcessState::Exited(_)))
+                            || self.effect.live_observation_reachable();
+                        RuntimeResponse::Processes {
+                            processes: snapshots
+                                .into_iter()
+                                .map(|value| {
+                                    if matches!(value.state, ProcessState::Exited(_)) || reachable {
+                                        Observation::Current { value }
+                                    } else {
+                                        Observation::Unavailable {
+                                            last_known: Some(value),
+                                        }
+                                    }
+                                })
+                                .collect(),
+                        }
+                    }
+                    RuntimeRequest::Operation { operation_id } => RuntimeResponse::Operation {
+                        operation: self.journal.operation(&operation_id)?,
+                    },
+                    RuntimeRequest::Receipt { process_id } => {
+                        let value = self.journal.receipt(&process_id)?;
+                        RuntimeResponse::Receipt {
+                            receipt: value.as_ref().map(|value| value.0.clone()),
+                            digest: value.map(|value| value.1),
+                        }
+                    }
+                    RuntimeRequest::ReadOutput {
+                        process_id,
+                        after,
+                        maximum,
+                    } => RuntimeResponse::Output {
+                        page: evidence_page(self.journal.read_output(
+                            &process_id,
+                            after,
+                            maximum as usize,
+                        )?),
+                    },
+                    RuntimeRequest::AcknowledgeReceipt {
+                        process_id,
+                        receipt_digest,
+                    } => {
+                        self.journal
+                            .acknowledge_receipt(&process_id, &receipt_digest)?;
+                        RuntimeResponse::Complete
+                    }
+                    RuntimeRequest::Pin {
+                        process_id,
+                        receipt_digest,
+                        pin_id,
+                    } => {
+                        self.journal.pin(&process_id, &receipt_digest, pin_id)?;
+                        RuntimeResponse::Complete
+                    }
+                    RuntimeRequest::ReadPin {
+                        pin_id,
+                        after,
+                        maximum,
+                    } => RuntimeResponse::Output {
+                        page: evidence_page(self.journal.read_pin(
+                            &pin_id,
+                            after,
+                            maximum as usize,
+                        )?),
+                    },
+                    RuntimeRequest::RecordLoss { authorization } => {
+                        self.journal.record_loss_authorization(authorization)?;
+                        RuntimeResponse::Complete
+                    }
+                    RuntimeRequest::Release {
+                        process_id,
+                        request,
+                    } => RuntimeResponse::Release {
+                        status: self.journal.release(&process_id, request)?,
+                    },
+                    RuntimeRequest::CleanupReleased {
+                        process_id,
+                        request_digest,
+                    } => RuntimeResponse::Release {
+                        status: self
+                            .journal
+                            .cleanup_released(&process_id, &request_digest)?,
+                    },
+                };
+                Ok(GuardianResponse::Runtime { response })
+            }
         }
     }
 
@@ -495,6 +617,25 @@ impl<E: GuardianEffect> Guardian<E> {
             )?);
         }
         Ok(operation)
+    }
+}
+
+fn evidence_page(value: sandsurf_state::OutputPage) -> EvidencePage {
+    EvidencePage {
+        cursor: value.cursor,
+        available: value.available,
+        chunks: value
+            .chunks
+            .into_iter()
+            .map(|chunk| EvidenceChunk {
+                sequence: chunk.sequence,
+                offset: chunk.offset,
+                stream: chunk.stream,
+                bytes: chunk.bytes,
+                bytes_digest: chunk.bytes_digest,
+                chain_digest: chunk.chain_digest,
+            })
+            .collect(),
     }
 }
 
@@ -625,6 +766,9 @@ impl GuardianClient {
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Runtime { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
             }
@@ -646,6 +790,9 @@ impl GuardianClient {
             GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
+            GuardianResponse::Runtime { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
             GuardianResponse::Rejected { category, message } => {
                 Err(Error::Rejected { category, message })
             }
@@ -658,7 +805,8 @@ impl GuardianClient {
             GuardianResponse::Inspection { .. }
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Configuration { .. }
-            | GuardianResponse::Guest { .. } => {
+            | GuardianResponse::Guest { .. }
+            | GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
             GuardianResponse::Rejected { category, message } => {
@@ -679,7 +827,8 @@ impl GuardianClient {
             GuardianResponse::Inspection { .. }
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Lifecycle { .. }
-            | GuardianResponse::Guest { .. } => {
+            | GuardianResponse::Guest { .. }
+            | GuardianResponse::Runtime { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }
@@ -701,7 +850,31 @@ impl GuardianClient {
             GuardianResponse::Inspection { .. }
             | GuardianResponse::Dispatch { .. }
             | GuardianResponse::Lifecycle { .. }
-            | GuardianResponse::Configuration { .. } => {
+            | GuardianResponse::Configuration { .. }
+            | GuardianResponse::Runtime { .. } => {
+                Err(Error::Protocol("guardian returned the wrong response kind"))
+            }
+        }
+    }
+
+    pub fn runtime(
+        &self,
+        sandbox_id: SandboxId,
+        request: RuntimeRequest,
+    ) -> Result<RuntimeResponse> {
+        match self.call(GuardianRequest::Runtime {
+            sandbox_id,
+            request,
+        })? {
+            GuardianResponse::Runtime { response } => Ok(response),
+            GuardianResponse::Rejected { category, message } => {
+                Err(Error::Rejected { category, message })
+            }
+            GuardianResponse::Inspection { .. }
+            | GuardianResponse::Dispatch { .. }
+            | GuardianResponse::Lifecycle { .. }
+            | GuardianResponse::Configuration { .. }
+            | GuardianResponse::Guest { .. } => {
                 Err(Error::Protocol("guardian returned the wrong response kind"))
             }
         }
@@ -739,7 +912,9 @@ pub fn serve_guardian<E: GuardianEffect>(
         let mut connection = match listener.accept(Duration::from_secs(1)) {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                guardian.reconcile()?;
+                if let Err(error) = guardian.reconcile() {
+                    eprintln!("sandsurf guardian reconciliation deferred: {error}");
+                }
                 continue;
             }
             Err(error) => return Err(error.into()),

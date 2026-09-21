@@ -169,6 +169,7 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
         };
         for snapshot in processes {
             let process_id = &snapshot.request.process_id;
+            journal.observe_process(&snapshot)?;
             let mut committed = journal.process_boundary(process_id)?;
             loop {
                 let maximum = u32::try_from(sandsurf_protocol::MAX_STREAM_BYTES)

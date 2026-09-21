@@ -82,6 +82,7 @@ impl WorkloadDriver for WorkloadService {
             .map_err(|_| sandsurf_state::Error::Corrupt("guest process inventory unavailable"))?;
         for snapshot in snapshots {
             let process_id = &snapshot.request.process_id;
+            journal.observe_process(&snapshot)?;
             let mut committed = journal.process_boundary(process_id)?;
             loop {
                 let page = self
@@ -370,6 +371,8 @@ mod tests {
             .unwrap();
         service.reconcile(&mut journal).unwrap();
         let (receipt, _) = journal.receipt(&process_id).unwrap().unwrap();
+        let observed = journal.process_snapshot(&process_id).unwrap().unwrap();
+        assert!(matches!(observed.state, ProcessState::Exited(_)));
         assert_eq!(receipt.output.final_cursor.get(), 11);
         let page = journal
             .read_output(&process_id, Counter::ZERO, 1024)

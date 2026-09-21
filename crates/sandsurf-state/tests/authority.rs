@@ -61,6 +61,49 @@ fn catalog_limits() -> CatalogLimits {
 }
 
 #[test]
+fn image_import_admission_and_publication_are_durable_and_idempotent() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut host =
+        HostCatalog::create(&path, "image-host".try_into().unwrap(), catalog_limits()).unwrap();
+    let operation: OperationId = "import-image".try_into().unwrap();
+    let request = hash("exact-import-request");
+    let admitted = host
+        .admit_image_import(
+            operation.clone(),
+            request.clone(),
+            Approval {
+                id: "approve-image".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(admitted.phase, ImageImportPhase::Admitted);
+    assert!(admitted.image.is_none());
+    let image = ImageRecord {
+        digest: hash("vm-native-image"),
+        source_digest: hash("oci-manifest"),
+        platform: "linux".into(),
+        architecture: "amd64".into(),
+        logical_bytes: n(4096),
+        provenance_digest: hash("conversion"),
+    };
+    let published = host
+        .complete_image_import(&operation, &request, image.clone())
+        .unwrap();
+    assert_eq!(published.phase, ImageImportPhase::Published);
+    assert_eq!(published.image, Some(image.clone()));
+    assert_eq!(host.images(None, n(10)).unwrap(), vec![image.clone()]);
+    drop(host);
+    let host = HostCatalog::open(&path).unwrap();
+    assert_eq!(host.image(&image.digest).unwrap(), Some(image.clone()));
+    assert_eq!(
+        host.image_import(&operation).unwrap().unwrap().image,
+        Some(image)
+    );
+}
+
+#[test]
 fn private_catalog_cannot_be_admitted_below_replaceable_ancestry() {
     let root = TempRoot::new();
     let catalog = root.0.join("catalog");

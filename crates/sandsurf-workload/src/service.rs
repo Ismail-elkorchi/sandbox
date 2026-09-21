@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 const LEDGER_VERSION: u16 = 1;
@@ -27,6 +27,7 @@ pub struct PersistentWorkloadService {
     filesystem: FilesystemService,
     ledger_root: PathBuf,
     operations: Mutex<BTreeMap<OperationId, OperationRecord>>,
+    mutation_barrier: RwLock<()>,
 }
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ impl PersistentWorkloadService {
             filesystem,
             ledger_root: ledger_root.to_path_buf(),
             operations: Mutex::new(operations),
+            mutation_barrier: RwLock::new(()),
         })
     }
 
@@ -86,6 +88,12 @@ impl PersistentWorkloadService {
     }
 
     pub fn handle(&self, request: GuestServiceRequest) -> GuestServiceResponse {
+        let Ok(_guard) = self.mutation_barrier.read() else {
+            return GuestServiceResponse::Error {
+                code: "service.unavailable".into(),
+                message: "workload mutation barrier is unavailable".into(),
+            };
+        };
         match self.handle_inner(request) {
             Ok(value) => value,
             Err(error) => GuestServiceResponse::Error {
@@ -93,6 +101,21 @@ impl PersistentWorkloadService {
                 message: error.message,
             },
         }
+    }
+
+    /// Fence all ordinary guest requests while the machine owner stops jobs
+    /// and establishes the persistent filesystem boundary.
+    pub fn prepare_stop(
+        &self,
+        grace: Duration,
+        flush: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let _guard = self
+            .mutation_barrier
+            .write()
+            .map_err(|_| io::Error::other("workload mutation barrier is unavailable"))?;
+        self.processes.quiesce(grace).map_err(io::Error::other)?;
+        flush()
     }
 
     fn handle_inner(&self, request: GuestServiceRequest) -> ServiceResult<GuestServiceResponse> {

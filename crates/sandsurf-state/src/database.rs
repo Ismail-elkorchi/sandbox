@@ -42,7 +42,7 @@ impl Database {
         let mut connection = connect(&database_path)?;
         configure_durability(&connection)?;
         let tx = connection.transaction()?;
-        tx.execute_batch("PRAGMA application_id = 1397966385; PRAGMA user_version = 2; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
+        tx.execute_batch("PRAGMA application_id = 1397966385; PRAGMA user_version = 3; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
         tx.execute("INSERT INTO identity VALUES (?1)", [role])?;
         tx.execute_batch(schema)?;
         tx.commit()?;
@@ -66,7 +66,7 @@ impl Database {
         let connection = connect(&path)?;
         let application: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if application != APPLICATION_ID || version != 2 {
+        if application != APPLICATION_ID || version != 3 {
             return Err(Error::Corrupt(
                 "incompatible authority catalog; preserved intact",
             ));

@@ -563,6 +563,109 @@ pub enum GuardianRequest {
         sandbox_id: SandboxId,
         request: crate::GuestServiceRequest,
     },
+    Runtime {
+        sandbox_id: SandboxId,
+        request: RuntimeRequest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RuntimeRequest {
+    Process {
+        process_id: ProcessId,
+    },
+    Processes,
+    Operation {
+        operation_id: OperationId,
+    },
+    Receipt {
+        process_id: ProcessId,
+    },
+    ReadOutput {
+        process_id: ProcessId,
+        after: Counter,
+        maximum: u32,
+    },
+    AcknowledgeReceipt {
+        process_id: ProcessId,
+        receipt_digest: Digest,
+    },
+    Pin {
+        process_id: ProcessId,
+        receipt_digest: Digest,
+        pin_id: PinId,
+    },
+    ReadPin {
+        pin_id: PinId,
+        after: Counter,
+        maximum: u32,
+    },
+    RecordLoss {
+        authorization: AuthorizedLoss,
+    },
+    Release {
+        process_id: ProcessId,
+        request: ReleaseRequest,
+    },
+    CleanupReleased {
+        process_id: ProcessId,
+        request_digest: Digest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceChunk {
+    pub sequence: Counter,
+    pub offset: Counter,
+    pub stream: Stream,
+    pub bytes: Vec<u8>,
+    pub bytes_digest: Digest,
+    pub chain_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidencePage {
+    pub cursor: Counter,
+    pub available: Counter,
+    pub chunks: Vec<EvidenceChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RuntimeResponse {
+    Process {
+        process: Option<Observation<crate::ProcessSnapshot>>,
+    },
+    Processes {
+        processes: Vec<Observation<crate::ProcessSnapshot>>,
+    },
+    Operation {
+        operation: Option<Operation>,
+    },
+    Receipt {
+        receipt: Option<Receipt>,
+        digest: Option<Digest>,
+    },
+    Output {
+        page: EvidencePage,
+    },
+    Release {
+        status: ReleaseStatus,
+    },
+    Complete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,6 +700,9 @@ pub enum GuardianResponse {
     },
     Guest {
         response: crate::GuestServiceResponse,
+    },
+    Runtime {
+        response: RuntimeResponse,
     },
     Rejected {
         category: String,

@@ -2,7 +2,7 @@
 
 use crate::guest::{GuestClient, RemoteWorkloadDriver};
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
-use sandbox_image::{ImageTrust, RootfsFormat, verify_image};
+use sandbox_image::{ImageTrust, RootfsFormat, VerifiedImage, verify_image};
 use sandbox_vm::{FirecrackerConfig, FirecrackerProcess, UnixVsockChannel};
 use sandsurf_control::{
     EffectOutcome, Error as ControlError, GuardianEffect, Result as ControlResult, WorkloadDriver,
@@ -10,7 +10,7 @@ use sandsurf_control::{
 use sandsurf_machine::linux::{
     FirecrackerDriver, FirecrackerEpochFactory, FirecrackerQualification,
 };
-use sandsurf_machine::{MachineOutcome, apply_lifecycle};
+use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_protocol::{
     Capability, Counter, Digest, Domain, GuestServiceRequest, GuestServiceResponse,
     LifecycleCommand, MachineObservation, MachineState, Mutation, Resources, SandboxId,
@@ -111,47 +111,17 @@ pub fn prepare_config(
         }
         return Ok(existing);
     }
-    let local_manifest = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from);
-    let (verified, source_template) = if let Some(path) = local_manifest {
-        if !path.is_absolute() {
-            return Err(LinuxError::Invalid(
-                "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
-            ));
-        }
-        let template = std::env::var_os("SANDSURF_EMPTY_DISK_IMAGE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                path.parent()
-                    .unwrap_or(Path::new("/"))
-                    .join("empty-workspace.ext4")
-            });
-        (verify_image(&path, ImageTrust::ExplicitLocal)?, template)
-    } else {
-        let package = executable
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
-        let manifest = package.join("images/minimal-x64/manifest.json");
-        let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
-        let expected = index
-            .files
-            .get("minimal-x64/manifest.json")
-            .ok_or_else(|| LinuxError::Invalid("packaged boot manifest is absent".into()))?
-            .clone();
+    let installed_root = host_root.join("images").join(image_digest.as_str());
+    let (verified, source_template) = if installed_root.exists() {
         (
             verify_image(
-                &manifest,
-                ImageTrust::Bundled {
-                    manifest_digest: &expected,
-                    release_public_key: &RELEASE_PUBLIC_KEY,
-                },
+                &installed_root.join("manifest.json"),
+                ImageTrust::ExplicitLocal,
             )?,
-            executable
-                .parent()
-                .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?
-                .join("empty-workspace.ext4"),
+            installed_root.join("empty-workspace.ext4"),
         )
+    } else {
+        resolve_source_bundle(executable)?
     };
     if verified.manifest_digest != image_digest.as_str()
         || verified.manifest.boot_bundle.bootstrap.format != RootfsFormat::Ext4
@@ -198,8 +168,55 @@ pub fn prepare_config(
             128 * 1024 * 1024 * 1024,
         )?,
         disk_template: installed.join("empty-workspace.ext4"),
-        guest_cid: random_guest_cid()?,
+        guest_cid: allocate_guest_cid(host_root)?,
     })
+}
+
+pub(crate) fn resolve_source_bundle(
+    executable: &Path,
+) -> Result<(VerifiedImage, PathBuf), LinuxError> {
+    let local_manifest = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from);
+    if let Some(path) = local_manifest {
+        if !path.is_absolute() {
+            return Err(LinuxError::Invalid(
+                "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
+            ));
+        }
+        let template = std::env::var_os("SANDSURF_EMPTY_DISK_IMAGE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                path.parent()
+                    .unwrap_or(Path::new("/"))
+                    .join("empty-workspace.ext4")
+            });
+        Ok((verify_image(&path, ImageTrust::ExplicitLocal)?, template))
+    } else {
+        let package = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
+        let manifest = package.join("images/minimal-x64/manifest.json");
+        let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
+        let expected = index
+            .files
+            .get("minimal-x64/manifest.json")
+            .ok_or_else(|| LinuxError::Invalid("packaged boot manifest is absent".into()))?
+            .clone();
+        Ok((
+            verify_image(
+                &manifest,
+                ImageTrust::Bundled {
+                    manifest_digest: &expected,
+                    release_public_key: &RELEASE_PUBLIC_KEY,
+                },
+            )?,
+            executable
+                .parent()
+                .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?
+                .join("empty-workspace.ext4"),
+        ))
+    }
 }
 
 pub fn write_config(path: &Path, config: &LinuxGuardianConfig) -> Result<(), LinuxError> {
@@ -247,6 +264,32 @@ pub fn read_config(path: &Path, sandbox_id: &SandboxId) -> Result<LinuxGuardianC
     Ok(value)
 }
 
+pub fn workload_defaults(
+    host_root: &Path,
+    image_digest: &Digest,
+) -> Result<crate::api::WorkloadDefaultsView, LinuxError> {
+    let image = verify_image(
+        &host_root
+            .join("images")
+            .join(image_digest.as_str())
+            .join("manifest.json"),
+        ImageTrust::ExplicitLocal,
+    )?;
+    if image.manifest_digest != image_digest.as_str() {
+        return Err(LinuxError::Invalid(
+            "installed image identity changed".into(),
+        ));
+    }
+    let defaults = image.manifest.workload.defaults;
+    Ok(crate::api::WorkloadDefaultsView {
+        environment: defaults.environment,
+        user: defaults.user,
+        working_directory: defaults.working_directory,
+        entrypoint: defaults.entrypoint,
+        command: defaults.command,
+    })
+}
+
 pub struct LinuxGuardianEffect {
     machine: FirecrackerDriver<LinuxEpochFactory>,
     workload: LinuxWorkload,
@@ -260,8 +303,24 @@ impl LinuxGuardianEffect {
         fs::create_dir_all(&disks)?;
         let workload_state = disks.join("workload-state.ext4");
         let control_state = disks.join("control-state.ext4");
-        ensure_mutable_copy(&config.disk_template, &workload_state)?;
-        ensure_mutable_copy(&config.disk_template, &control_state)?;
+        ensure_mutable_disk(
+            &config.disk_template,
+            &workload_state,
+            config.resources.disk_bytes.get(),
+        )?;
+        let control_bytes = config
+            .resources
+            .output_bytes
+            .get()
+            .checked_add(64 * 1024 * 1024)
+            .ok_or_else(|| LinuxError::Invalid("control disk size overflow".into()))?
+            .max(128 * 1024 * 1024);
+        if control_bytes > 8 * 1024 * 1024 * 1024 {
+            return Err(LinuxError::Invalid(
+                "control/output reservation exceeds the initial disk envelope".into(),
+            ));
+        }
+        ensure_mutable_disk(&config.disk_template, &control_state, control_bytes)?;
 
         let active = Arc::new(Mutex::new(None));
         let factory = LinuxEpochFactory {
@@ -318,16 +377,15 @@ impl GuardianEffect for LinuxGuardianEffect {
         command: &sandsurf_protocol::ConfigurationCommand,
         current: &MachineObservation,
     ) -> EffectOutcome {
-        if command.sandbox_id != current.sandbox_id || command.revision <= current.applied_revision
-        {
-            return EffectOutcome::NotApplied(bytes_digest(
-                b"linux-configuration-revision-invalid",
-            ));
+        match self.machine.configure(command, current) {
+            sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
+                EffectOutcome::Applied(evidence)
+            }
+            sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
+                EffectOutcome::NotApplied(evidence)
+            }
+            sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
         }
-        // Exact host-signed mutations carry process/file grant authority. The
-        // guardian records the required host revision without maintaining a
-        // second independently mutable grant set.
-        EffectOutcome::Applied(bytes_digest(b"linux-configuration-revision-installed"))
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
@@ -632,22 +690,101 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<(), LinuxError> {
     Ok(())
 }
 
-fn ensure_mutable_copy(source: &Path, destination: &Path) -> Result<(), LinuxError> {
+fn ensure_mutable_disk(
+    source: &Path,
+    destination: &Path,
+    requested_bytes: u64,
+) -> Result<(), LinuxError> {
     let source_metadata = fs::metadata(source)?;
+    if requested_bytes < source_metadata.len()
+        || !requested_bytes.is_multiple_of(4096)
+        || requested_bytes > 128 * 1024 * 1024 * 1024
+    {
+        return Err(LinuxError::Invalid(
+            "persistent disk geometry is outside the supported ext4 envelope".into(),
+        ));
+    }
     if destination.exists() {
         let current = fs::symlink_metadata(destination)?;
         if !current.is_file()
             || current.file_type().is_symlink()
-            || current.len() != source_metadata.len()
+            || current.len() != requested_bytes
         {
             return Err(LinuxError::Invalid(
                 "persistent disk geometry or type changed".into(),
             ));
         }
-        return Ok(());
+    } else {
+        copy_artifact(source, destination)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(destination)?;
+        file.set_len(requested_bytes)?;
+        file.sync_all()?;
     }
-    copy_artifact(source, destination)?;
+    if requested_bytes != source_metadata.len() {
+        let resize = protected_tool(&["/usr/sbin/resize2fs", "/sbin/resize2fs"])?;
+        let status = std::process::Command::new(resize)
+            .arg("-f")
+            .arg(destination)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(LinuxError::Invalid(
+                "persistent ext4 disk resize failed".into(),
+            ));
+        }
+    }
+    let fallocate = protected_tool(&["/usr/bin/fallocate", "/bin/fallocate"])?;
+    let status = std::process::Command::new(fallocate)
+        .args(["--keep-size", "--length", &requested_bytes.to_string()])
+        .arg(destination)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(LinuxError::Invalid(
+            "host storage cannot reserve the persistent disk capacity".into(),
+        ));
+    }
+    File::open(destination)?.sync_all()?;
+    require_allocated(destination, requested_bytes)?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn protected_tool(candidates: &[&str]) -> Result<PathBuf, LinuxError> {
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o022 == 0
+        {
+            return Ok(path);
+        }
+    }
+    Err(LinuxError::Invalid(
+        "required protected host storage tool is unavailable".into(),
+    ))
+}
+
+fn require_allocated(path: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path)?;
+    let allocated = metadata
+        .blocks()
+        .checked_mul(512)
+        .ok_or_else(|| LinuxError::Invalid("allocated disk size overflow".into()))?;
+    if allocated < requested_bytes {
+        return Err(LinuxError::Invalid(
+            "persistent disk capacity is not physically reserved".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -699,9 +836,33 @@ fn random_bytes() -> Result<[u8; 32], LinuxError> {
     Ok(bytes)
 }
 
-fn random_guest_cid() -> Result<u32, LinuxError> {
-    let bytes = random_bytes()?;
-    Ok(u32::from_be_bytes(bytes[..4].try_into().expect("four bytes")) | 3)
+fn allocate_guest_cid(host_root: &Path) -> Result<u32, LinuxError> {
+    let mut used = std::collections::BTreeSet::new();
+    let sandboxes = host_root.join("sandboxes");
+    if sandboxes.exists() {
+        for entry in fs::read_dir(&sandboxes)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path().join("guardian/config.json");
+            if path.exists() {
+                let value: LinuxGuardianConfig = read_json(&path, 1024 * 1024)?;
+                used.insert(value.guest_cid);
+            }
+        }
+    }
+    for _ in 0..64 {
+        let bytes = random_bytes()?;
+        let random = u32::from_be_bytes(bytes[..4].try_into().expect("four bytes"));
+        let candidate = 3 + random % (u32::MAX - 3);
+        if used.insert(candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(LinuxError::Invalid(
+        "could not allocate a unique guest CID".into(),
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {

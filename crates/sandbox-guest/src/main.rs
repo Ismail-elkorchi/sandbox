@@ -17,13 +17,17 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_AUTHENTICATION_DISK: u64 = 4096;
 const WORKLOAD_ROOT: &str = "/sandsurf/workload";
 const CONTROL_ROOT: &str = "/sandsurf/control";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/sandsurf-workload";
 const SUPERVISOR_CGROUP: &str = "/sys/fs/cgroup/sandsurf-supervisor";
+const MAX_CONTROL_CONNECTIONS: usize = 64;
 
+#[derive(Clone)]
 struct BootIdentity {
     sandbox_id: SandboxId,
     epoch: Counter,
@@ -56,24 +60,57 @@ fn supervisor_main() -> io::Result<()> {
     let filesystem = FilesystemService::open(Path::new(WORKLOAD_ROOT), "/")
         .map_err(io::Error::other)
         .map_err(|error| stage("open filesystem service", error))?;
-    let service = PersistentWorkloadService::open(
+    let service = Arc::new(PersistentWorkloadService::open(
         processes,
         filesystem,
         &Path::new(CONTROL_ROOT).join("operations"),
-    )?;
+    )?);
+    let connections = Arc::new(AtomicUsize::new(0));
 
     loop {
         let Ok(connection) = accept_connection(listener.as_raw_fd()) else {
             continue;
         };
-        // SAFETY: accept_connection returned one newly owned descriptor.
-        let mut connection = unsafe { File::from_raw_fd(connection) };
-        if let Err(error) = serve_connection(&mut connection, &identity, &service) {
+        if connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                (value < MAX_CONTROL_CONNECTIONS).then_some(value + 1)
+            })
+            .is_err()
+        {
+            // SAFETY: this accepted descriptor was not transferred elsewhere.
+            unsafe { libc::close(connection) };
+            continue;
+        }
+        if let Err(error) = set_socket_timeout(connection, std::time::Duration::from_secs(15)) {
+            connections.fetch_sub(1, Ordering::AcqRel);
+            // SAFETY: setup failed before ownership transfer.
+            unsafe { libc::close(connection) };
             eprintln!(
-                "sandsurf guest control connection failed: {}",
+                "sandsurf guest control timeout setup failed: {}",
                 bounded(&error.to_string())
             );
+            continue;
         }
+        let service = Arc::clone(&service);
+        let identity = identity.clone();
+        let connections = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            struct ConnectionGuard(Arc<AtomicUsize>);
+            impl Drop for ConnectionGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _guard = ConnectionGuard(connections);
+            // SAFETY: this worker receives sole ownership of the accepted descriptor.
+            let mut connection = unsafe { File::from_raw_fd(connection) };
+            if let Err(error) = serve_connection(&mut connection, &identity, &service) {
+                eprintln!(
+                    "sandsurf guest control connection failed: {}",
+                    bounded(&error.to_string())
+                );
+            }
+        });
     }
 }
 
@@ -135,11 +172,9 @@ fn serve_connection(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let response = match request {
             GuestServiceRequest::PrepareStop => {
-                service
-                    .processes()
-                    .quiesce(std::time::Duration::from_secs(5))
-                    .map_err(io::Error::other)?;
-                sync_persistent_filesystems()?;
+                service.prepare_stop(std::time::Duration::from_secs(5), || {
+                    sync_persistent_filesystems()
+                })?;
                 GuestServiceResponse::ReadyToStop {
                     evidence: bytes_digest(b"guest-processes-quiesced-and-filesystems-synced-v1"),
                 }
@@ -509,6 +544,34 @@ fn accept_connection(listener: RawFd) -> io::Result<RawFd> {
     } else {
         Ok(fd)
     }
+}
+
+fn set_socket_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
+    let seconds = timeout
+        .as_secs()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket timeout overflow"))?;
+    let value = libc::timeval {
+        tv_sec: seconds,
+        tv_usec: 0,
+    };
+    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: fd is one live owned socket and value has the exact timeval
+        // layout required by these scalar socket options.
+        if unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&value as *const libc::timeval).cast(),
+                size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn mount_if_absent(

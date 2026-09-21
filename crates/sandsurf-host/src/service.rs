@@ -157,6 +157,66 @@ impl HostService {
                     value: self.view(record)?,
                 })
             }
+            HostRequest::ListImages { after, maximum } => Ok(HostResponse::Images {
+                values: self.catalog.images(after.as_ref(), maximum)?,
+            }),
+            HostRequest::GetImage { digest } => Ok(HostResponse::Image {
+                value: self
+                    .catalog
+                    .image(&digest)?
+                    .ok_or(HostError::Invalid("image does not exist"))?,
+            }),
+            HostRequest::GetImageImport { operation_id } => Ok(HostResponse::ImageImport {
+                operation: self
+                    .catalog
+                    .image_import(&operation_id)?
+                    .ok_or(HostError::Invalid("image import operation does not exist"))?,
+            }),
+            HostRequest::ImportOci {
+                source,
+                platform,
+                operation_id,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Image,
+                    &("sandsurf-import-oci-v1", &source, &platform, &operation_id),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostResponse::ImageImport {
+                        operation: admitted,
+                    });
+                }
+                #[cfg(target_os = "linux")]
+                let image = crate::images::import_oci(
+                    &self.root,
+                    &self.executable,
+                    &source,
+                    &platform,
+                    &operation_id,
+                    &request_digest,
+                )?;
+                #[cfg(not(target_os = "linux"))]
+                return Err(HostError::Invalid(
+                    "OCI VM-image materialization is unqualified on this host build",
+                ));
+                #[cfg(target_os = "linux")]
+                Ok(HostResponse::ImageImport {
+                    operation: self.catalog.complete_image_import(
+                        &operation_id,
+                        &request_digest,
+                        image,
+                    )?,
+                })
+            }
             HostRequest::CreateSandbox {
                 sandbox_id,
                 image_digest,
@@ -342,6 +402,213 @@ impl HostService {
                         .guest(sandbox_id, request)?,
                 })
             }
+            HostRequest::GetOperation {
+                sandbox_id,
+                operation_id,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                        .runtime(sandbox_id, RuntimeRequest::Operation { operation_id })?,
+                })
+            }
+            HostRequest::GetProcess {
+                sandbox_id,
+                process_id,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                        .runtime(sandbox_id, RuntimeRequest::Process { process_id })?,
+                })
+            }
+            HostRequest::ListProcesses { sandbox_id } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                        .runtime(sandbox_id, RuntimeRequest::Processes)?,
+                })
+            }
+            HostRequest::GetReceipt {
+                sandbox_id,
+                process_id,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                        .runtime(sandbox_id, RuntimeRequest::Receipt { process_id })?,
+                })
+            }
+            HostRequest::ReadEvidence {
+                sandbox_id,
+                process_id,
+                after,
+                maximum,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
+                        sandbox_id,
+                        RuntimeRequest::ReadOutput {
+                            process_id,
+                            after,
+                            maximum,
+                        },
+                    )?,
+                })
+            }
+            HostRequest::ReadPinnedEvidence {
+                sandbox_id,
+                pin_id,
+                after,
+                maximum,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
+                        sandbox_id,
+                        RuntimeRequest::ReadPin {
+                            pin_id,
+                            after,
+                            maximum,
+                        },
+                    )?,
+                })
+            }
+            HostRequest::AcknowledgeReceipt {
+                sandbox_id,
+                process_id,
+                receipt_digest,
+                expected_revision,
+                scope_digest,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ReleaseEvidence,
+                    &scope_digest,
+                )?;
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
+                        sandbox_id,
+                        RuntimeRequest::AcknowledgeReceipt {
+                            process_id,
+                            receipt_digest,
+                        },
+                    )?,
+                })
+            }
+            HostRequest::PinEvidence {
+                sandbox_id,
+                process_id,
+                receipt_digest,
+                pin_id,
+                expected_revision,
+                scope_digest,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ReleaseEvidence,
+                    &scope_digest,
+                )?;
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
+                        sandbox_id,
+                        RuntimeRequest::Pin {
+                            process_id,
+                            receipt_digest,
+                            pin_id,
+                        },
+                    )?,
+                })
+            }
+            HostRequest::ReleaseEvidence {
+                sandbox_id,
+                process_id,
+                request,
+                expected_revision,
+                scope_digest,
+                loss_approval_id,
+            } => {
+                self.catalog.active_grant(
+                    &sandbox_id,
+                    expected_revision,
+                    Capability::ReleaseEvidence,
+                    &scope_digest,
+                )?;
+                self.provision_guardian(&sandbox_id)?;
+                let client = GuardianClient::new(self.guardian_endpoint(&sandbox_id));
+                match (&request.disposition, loss_approval_id) {
+                    (ReleaseDisposition::AuthorizedLoss { authorization }, Some(approval_id))
+                        if *authorization == approval_id =>
+                    {
+                        let authorized = self.catalog.authorize_output_loss(
+                            &sandbox_id,
+                            &process_id,
+                            &request.receipt_digest,
+                            &request.output,
+                            Approval {
+                                id: approval_id,
+                                request_digest: digest(
+                                    Domain::Release,
+                                    &(
+                                        &sandbox_id,
+                                        &process_id,
+                                        &request.receipt_digest,
+                                        &request.output,
+                                        "loss",
+                                    ),
+                                )?,
+                            },
+                        )?;
+                        client.runtime(
+                            sandbox_id.clone(),
+                            RuntimeRequest::RecordLoss {
+                                authorization: authorized,
+                            },
+                        )?;
+                    }
+                    (ReleaseDisposition::AuthorizedLoss { .. }, _) => {
+                        return Err(HostError::Invalid(
+                            "authorized loss requires its exact approval identity",
+                        ));
+                    }
+                    (_, Some(_)) => {
+                        return Err(HostError::Invalid(
+                            "loss approval is invalid for this release disposition",
+                        ));
+                    }
+                    (_, None) => {}
+                }
+                Ok(HostResponse::Runtime {
+                    response: client.runtime(
+                        sandbox_id,
+                        RuntimeRequest::Release {
+                            process_id,
+                            request,
+                        },
+                    )?,
+                })
+            }
+            HostRequest::CleanupReleasedEvidence {
+                sandbox_id,
+                process_id,
+                request_digest,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
+                        sandbox_id,
+                        RuntimeRequest::CleanupReleased {
+                            process_id,
+                            request_digest,
+                        },
+                    )?,
+                })
+            }
         }
     }
 
@@ -373,6 +640,28 @@ impl HostService {
             full_state: Qualification::Unqualified {
                 reasons: vec![reason],
             },
+            images: {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::images::qualification()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Qualification::Unqualified {
+                        reasons: vec![
+                            "OCI VM-image materialization is not implemented for this native driver"
+                                .into(),
+                        ],
+                    }
+                }
+            },
+            guest_platform: format!(
+                "linux/{}",
+                match native_guest_architecture() {
+                    GuestArchitecture::Amd64 => "amd64",
+                    GuestArchitecture::Arm64 => "arm64",
+                }
+            ),
         }
     }
 
@@ -459,6 +748,16 @@ impl HostService {
             Err(_) => Observation::Unavailable { last_known: None },
         };
         Ok(SandboxView {
+            #[cfg(target_os = "linux")]
+            workload_defaults: crate::linux::workload_defaults(&self.root, &record.image_digest)?,
+            #[cfg(not(target_os = "linux"))]
+            workload_defaults: crate::api::WorkloadDefaultsView {
+                environment: Default::default(),
+                user: Some("agent".into()),
+                working_directory: Some("/workspace".into()),
+                entrypoint: Vec::new(),
+                command: Vec::new(),
+            },
             id: record.id,
             image_digest: record.image_digest,
             resources: record.resources,

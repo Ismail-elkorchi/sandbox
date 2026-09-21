@@ -5,11 +5,12 @@
 //! qualification evidence.
 
 use crate::{
-    DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome, MachineTransition,
+    ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
+    MachineTransition,
 };
 use sandsurf_protocol::{
-    Counter, Digest, LifecycleCommand, MachineObservation, MachineState, Qualification, SandboxId,
-    VmEngine, bytes_digest,
+    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineObservation, MachineState,
+    Qualification, SandboxId, VmEngine, bytes_digest,
 };
 use serde::Serialize;
 use std::ffi::c_void;
@@ -378,6 +379,34 @@ impl MachineDriver for HyperVDriver {
                 "Hyper-V full-state contract has not passed on this host/configuration",
             ),
         }
+    }
+
+    fn configure(
+        &mut self,
+        command: &ConfigurationCommand,
+        current: &MachineObservation,
+    ) -> ConfigurationOutcome {
+        let live = matches!(current.state, MachineState::Running | MachineState::Paused);
+        if command.sandbox_id != self.config.sandbox_id
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+            || live != self.system.is_some()
+            || matches!(
+                current.state,
+                MachineState::Creating
+                    | MachineState::Starting
+                    | MachineState::Restoring
+                    | MachineState::Destroying
+                    | MachineState::Destroyed
+                    | MachineState::Failed
+            )
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"hyper-v-configuration-state-mismatch",
+            ));
+        }
+        self.applied_revision = Some(command.revision);
+        ConfigurationOutcome::Applied(bytes_digest(b"hyper-v-configuration-installed"))
     }
 
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {

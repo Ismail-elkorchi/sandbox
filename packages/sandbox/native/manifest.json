@@ -7,6 +7,6 @@
     "linux-x64/firecracker-NOTICE": "0f443af83ca8226c7ec44e2ade3a09fa3eed8c9b923b6c014b6d439816b6f1c2",
     "linux-x64/firecracker-THIRD-PARTY": "a6d3ebd1c2f37d4fd83d0676621f695fc0cc2d8c6e646cdbb831b46e0650c208",
     "linux-x64/firecracker-v1.16.1-x86_64": "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7",
-    "linux-x64/sandsurf-host-linux-x64": "4ac6c3f23c84c38a79a6cd90847f2cd9ae53ed61df625bf438eaccb4d922938b"
+    "linux-x64/sandsurf-host-linux-x64": "85a59d1026ce1dd132ce1420f9cfef98c36fd86e7a9b628a3b70d416c4c7923a"
   }
 }

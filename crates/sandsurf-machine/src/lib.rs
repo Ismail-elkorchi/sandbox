@@ -7,8 +7,8 @@
 //! the guardian; returning `Observed` is not itself a journal commit.
 
 use sandsurf_protocol::{
-    Counter, DesiredState, Digest, LifecycleCommand, MachineObservation, MachineState,
-    Qualification, VmEngine,
+    ConfigurationCommand, Counter, DesiredState, Digest, LifecycleCommand, MachineObservation,
+    MachineState, Qualification, VmEngine,
 };
 
 #[cfg(target_os = "linux")]
@@ -46,11 +46,23 @@ pub enum MachineOutcome {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationOutcome {
+    Applied(Digest),
+    NotApplied(Digest),
+    Unknown,
+}
+
 /// One exclusively owned native VM. Implementations must not silently cold-boot
 /// for restore, infer success from API request delivery, or return before the
 /// reported native postcondition has been observed.
 pub trait MachineDriver {
     fn qualification(&self) -> DriverQualification;
+    fn configure(
+        &mut self,
+        command: &ConfigurationCommand,
+        current: &MachineObservation,
+    ) -> ConfigurationOutcome;
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome;
     fn reconfigure(
         &mut self,
@@ -200,6 +212,13 @@ mod tests {
                 },
                 full_state: Qualification::Unqualified { reasons: vec![] },
             }
+        }
+        fn configure(
+            &mut self,
+            _: &ConfigurationCommand,
+            _: &MachineObservation,
+        ) -> ConfigurationOutcome {
+            ConfigurationOutcome::Applied(hash("configuration"))
         }
         fn create(&mut self, _: &LifecycleCommand) -> MachineOutcome {
             self.take("create")

@@ -4,11 +4,12 @@
 //! qualification, request bounds, lifecycle evidence, and helper containment.
 
 use crate::{
-    DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome, MachineTransition,
+    ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
+    MachineTransition,
 };
 use sandsurf_protocol::{
-    Counter, Digest, LifecycleCommand, MachineObservation, MachineState, Qualification, SandboxId,
-    VmEngine, bytes_digest,
+    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineObservation, MachineState,
+    Qualification, SandboxId, VmEngine, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -268,6 +269,34 @@ impl MachineDriver for AppleDriver {
                 "Apple full-state contract has not passed on this host/configuration",
             ),
         }
+    }
+
+    fn configure(
+        &mut self,
+        command: &ConfigurationCommand,
+        current: &MachineObservation,
+    ) -> ConfigurationOutcome {
+        let live = matches!(current.state, MachineState::Running | MachineState::Paused);
+        if command.sandbox_id != self.config.sandbox_id
+            || self.applied_revision != Some(current.applied_revision)
+            || command.revision <= current.applied_revision
+            || live != self.owner.is_some()
+            || matches!(
+                current.state,
+                MachineState::Creating
+                    | MachineState::Starting
+                    | MachineState::Restoring
+                    | MachineState::Destroying
+                    | MachineState::Destroyed
+                    | MachineState::Failed
+            )
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"apple-configuration-state-mismatch",
+            ));
+        }
+        self.applied_revision = Some(command.revision);
+        ConfigurationOutcome::Applied(bytes_digest(b"apple-configuration-installed"))
     }
 
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {

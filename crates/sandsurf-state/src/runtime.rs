@@ -18,7 +18,7 @@ CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STR
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
@@ -818,6 +818,85 @@ impl RuntimeJournal {
             |row| row.get(0),
         )?;
         decode(&raw)
+    }
+
+    pub fn observe_process(&mut self, snapshot: &ProcessSnapshot) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        let (operation_id, epoch, old, receipt): (String, u64, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT operation,epoch,snapshot,receipt FROM processes WHERE id=?1",
+                [snapshot.request.process_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let operation_id: OperationId = operation_id.try_into()?;
+        let admitted =
+            operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
+        let WorkloadRequest::Spawn { request } = &admitted.request.request else {
+            return Err(Error::Corrupt("process operation is not a spawn"));
+        };
+        if **request != snapshot.request
+            || snapshot.request.epoch.get() != epoch
+            || snapshot.guest_pid == 0
+        {
+            return Err(Error::Conflict(
+                "process observation does not match admitted spawn",
+            ));
+        }
+        if let Some(old) = old {
+            let old: ProcessSnapshot = decode(&old)?;
+            if old.request != snapshot.request || old.guest_pid != snapshot.guest_pid {
+                return Err(Error::Conflict("process observation identity changed"));
+            }
+            if matches!(
+                old.state,
+                ProcessState::Exited(_) | ProcessState::Unknown { .. }
+            ) && old.state != snapshot.state
+            {
+                return Err(Error::Conflict("terminal process observation changed"));
+            }
+        }
+        if let Some(receipt) = receipt {
+            let receipt: Receipt = decode(&receipt)?;
+            let expected = ProcessState::Exited(ProcessCompletion {
+                outcome: receipt.outcome,
+                output: receipt.output,
+                cleanup_digest: receipt.cleanup_digest,
+                accounting_digest: receipt.accounting_digest,
+            });
+            if snapshot.state != expected {
+                return Err(Error::Conflict(
+                    "process observation contradicts its terminal receipt",
+                ));
+            }
+        }
+        tx.execute(
+            "UPDATE processes SET snapshot=?2 WHERE id=?1",
+            params![snapshot.request.process_id.as_str(), encode(snapshot)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn process_snapshot(&self, id: &ProcessId) -> Result<Option<ProcessSnapshot>> {
+        let raw: Option<String> = self.db.connection.query_row(
+            "SELECT snapshot FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        raw.map(|value| decode(&value)).transpose()
+    }
+
+    pub fn process_snapshots(&self) -> Result<Vec<ProcessSnapshot>> {
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT snapshot FROM processes WHERE snapshot IS NOT NULL ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(decode(&row?)?);
+        }
+        Ok(values)
     }
 
     pub fn append_output(

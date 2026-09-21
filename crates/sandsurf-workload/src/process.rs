@@ -4,11 +4,13 @@ use sandsurf_protocol::{
     ProcessSnapshot, ProcessState, RetainedPage, SandboxId, SpawnRequest, StdioMode, Stream,
     TerminalSize, bytes_digest,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -19,6 +21,9 @@ use std::time::{Duration, Instant};
 const READ_BUFFER: usize = sandsurf_protocol::MAX_STREAM_BYTES;
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(500);
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
+const PROCESS_RECORD_VERSION: u16 = 1;
+const MAX_PROCESS_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_RETAINED_PROCESSES: usize = 65_536;
 
 #[derive(Debug)]
 pub enum ProcessError {
@@ -76,6 +81,16 @@ struct ProcessEntry {
     state: Mutex<ProcessState>,
     changed: Condvar,
     cgroup: Option<ProcessCgroup>,
+    record_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessRecord {
+    version: u16,
+    request: SpawnRequest,
+    guest_pid: u32,
+    state: ProcessState,
 }
 
 enum Input {
@@ -105,14 +120,16 @@ impl ProcessSupervisor {
         if !fs::metadata(root)?.is_dir() {
             return Err(ProcessError::Invalid("supervisor root is not a directory"));
         }
-        Ok(Self {
+        let mut value = Self {
             sandbox_id,
             epoch,
             root: root.to_path_buf(),
             workload_root: None,
             processes: Mutex::new(BTreeMap::new()),
             cgroups: None,
-        })
+        };
+        value.recover_processes()?;
+        Ok(value)
     }
 
     /// Construct a supervisor whose children execute inside one persistent
@@ -187,6 +204,19 @@ impl ProcessSupervisor {
             &request.process_id,
             self.epoch,
         )?);
+        let record_path = directory.join("process.json");
+        write_process_record(
+            &record_path,
+            &ProcessRecord {
+                version: PROCESS_RECORD_VERSION,
+                request: request.clone(),
+                guest_pid: 0,
+                state: ProcessState::Unknown {
+                    evidence: bytes_digest(b"process-spawn-dispatch-in-progress"),
+                },
+            },
+            true,
+        )?;
         let cgroup = self
             .cgroups
             .as_ref()
@@ -204,6 +234,26 @@ impl ProcessSupervisor {
                 }
             };
         let pid = spawned.child.id();
+        let initial_state = ProcessState::Running;
+        if let Err(error) = write_process_record(
+            &record_path,
+            &ProcessRecord {
+                version: PROCESS_RECORD_VERSION,
+                request: request.clone(),
+                guest_pid: pid,
+                state: initial_state.clone(),
+            },
+            false,
+        ) {
+            let _ = send_group_signal(
+                i32::try_from(pid).map_err(|_| ProcessError::Invalid("PID overflow"))?,
+                libc::SIGKILL,
+            );
+            if let Some(cgroup) = &cgroup {
+                let _ = cgroup.cleanup();
+            }
+            return Err(error);
+        }
         let entry = Arc::new(ProcessEntry {
             request: request.clone(),
             pid,
@@ -211,9 +261,10 @@ impl ProcessSupervisor {
             input: Mutex::new(Some(spawned.input)),
             terminal: spawned.terminal,
             spool,
-            state: Mutex::new(ProcessState::Running),
+            state: Mutex::new(initial_state),
             changed: Condvar::new(),
             cgroup,
+            record_path,
         });
         processes.insert(request.process_id.clone(), Arc::clone(&entry));
         drop(processes);
@@ -290,6 +341,9 @@ impl ProcessSupervisor {
             return Err(ProcessError::Invalid("signal is outside supported range"));
         }
         let entry = self.entry(id)?;
+        if !matches!(entry.state()?, ProcessState::Running) {
+            return Err(ProcessError::Conflict("process is not running"));
+        }
         if group {
             send_group_signal(entry.group, signal)
         } else {
@@ -431,6 +485,74 @@ impl ProcessSupervisor {
             .cloned()
             .ok_or(ProcessError::Missing)
     }
+
+    fn recover_processes(&mut self) -> Result<(), ProcessError> {
+        let mut recovered = BTreeMap::new();
+        let mut directories = fs::read_dir(&self.root)?.collect::<Result<Vec<_>, _>>()?;
+        directories.sort_by_key(|entry| entry.file_name());
+        if directories.len() > MAX_RETAINED_PROCESSES {
+            return Err(ProcessError::Invalid(
+                "retained process table exceeds bound",
+            ));
+        }
+        for directory in directories {
+            if !directory.file_type()?.is_dir() {
+                return Err(ProcessError::Invalid(
+                    "process spool root contains a non-directory entry",
+                ));
+            }
+            let process_id: ProcessId = directory
+                .file_name()
+                .to_str()
+                .ok_or(ProcessError::Invalid("process directory is not UTF-8"))?
+                .try_into()
+                .map_err(|_| ProcessError::Invalid("process directory identity is invalid"))?;
+            let record_path = directory.path().join("process.json");
+            let mut record = read_process_record(&record_path)?;
+            if record.version != PROCESS_RECORD_VERSION
+                || record.request.process_id != process_id
+                || record.request.sandbox_id != self.sandbox_id
+            {
+                return Err(ProcessError::Invalid(
+                    "retained process record identity is invalid",
+                ));
+            }
+            if matches!(record.state, ProcessState::Running) {
+                record.state = ProcessState::Unknown {
+                    evidence: bytes_digest(b"process-interrupted-before-cold-rebind"),
+                };
+                write_process_record(&record_path, &record, false)?;
+            }
+            let spool = Arc::new(OutputSpool::open(
+                &directory.path().join("output.ssf"),
+                record.request.output_bytes,
+                &self.sandbox_id,
+                &process_id,
+                record.request.epoch,
+                true,
+            )?);
+            recovered.insert(
+                process_id,
+                Arc::new(ProcessEntry {
+                    request: record.request,
+                    pid: record.guest_pid,
+                    group: 0,
+                    input: Mutex::new(None),
+                    terminal: None,
+                    spool,
+                    state: Mutex::new(record.state),
+                    changed: Condvar::new(),
+                    cgroup: None,
+                    record_path,
+                }),
+            );
+        }
+        *self
+            .processes
+            .get_mut()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))? = recovered;
+        Ok(())
+    }
 }
 
 impl Drop for ProcessSupervisor {
@@ -495,6 +617,21 @@ impl ProcessEntry {
     }
 
     fn finish(&self, value: ProcessState) {
+        let record = ProcessRecord {
+            version: PROCESS_RECORD_VERSION,
+            request: self.request.clone(),
+            guest_pid: self.pid,
+            state: value.clone(),
+        };
+        let value = match write_process_record(&self.record_path, &record, false) {
+            Ok(()) => value,
+            Err(error) => {
+                eprintln!("sandsurf process terminal record failed: {error}");
+                ProcessState::Unknown {
+                    evidence: bytes_digest(b"process-terminal-record-unavailable"),
+                }
+            }
+        };
         if let Ok(mut state) = self.state.lock() {
             *state = value;
             self.changed.notify_all();
@@ -509,6 +646,9 @@ impl ProcessEntry {
     }
 
     fn kill_owned(&self) {
+        if !matches!(self.state(), Ok(ProcessState::Running)) {
+            return;
+        }
         if self
             .cgroup
             .as_ref()
@@ -517,6 +657,64 @@ impl ProcessEntry {
             let _ = send_group_signal(self.group, libc::SIGKILL);
         }
     }
+}
+
+fn read_process_record(path: &Path) -> Result<ProcessRecord, ProcessError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_PROCESS_RECORD_BYTES
+    {
+        return Err(ProcessError::Invalid(
+            "process record is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_PROCESS_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes).map_err(|_| ProcessError::Invalid("process record is malformed"))
+}
+
+fn write_process_record(
+    path: &Path,
+    value: &ProcessRecord,
+    create: bool,
+) -> Result<(), ProcessError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| ProcessError::Invalid("process record cannot be encoded"))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PROCESS_RECORD_BYTES {
+        return Err(ProcessError::Invalid("process record exceeds bound"));
+    }
+    if create {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    } else {
+        let temporary = path.with_extension("json.new");
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+    }
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn reap_group_children(group: i32) {
@@ -603,7 +801,7 @@ fn spawn_child(
             let size = request
                 .terminal_size
                 .ok_or(ProcessError::Invalid("terminal size is absent"))?;
-            let pty = open_terminal(size)?;
+            let pty = open_terminal(size, workload_root)?;
             let input = pty.master.try_clone()?;
             let control = pty.master.try_clone()?;
             let stdin = pty.slave.try_clone()?;
@@ -948,7 +1146,35 @@ struct PtyPair {
     slave: File,
 }
 
-fn open_terminal(size: TerminalSize) -> Result<PtyPair, ProcessError> {
+fn open_terminal(
+    size: TerminalSize,
+    workload_root: Option<&Path>,
+) -> Result<PtyPair, ProcessError> {
+    if let Some(root) = workload_root {
+        let master = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(root.join("dev/pts/ptmx"))?;
+        let mut unlocked: libc::c_int = 0;
+        // SAFETY: master is one live PTY multiplexer descriptor and unlocked
+        // points to an initialized scalar for the duration of this ioctl.
+        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSPTLCK, &mut unlocked) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut number: libc::c_uint = 0;
+        // SAFETY: master is the same live descriptor and number is writable.
+        if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTN, &mut number) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(root.join("dev/pts").join(number.to_string()))?;
+        set_terminal_size(&master, size)?;
+        return Ok(PtyPair { master, slave });
+    }
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
     let dimensions = libc::winsize {
@@ -1246,5 +1472,49 @@ mod tests {
             ProcessState::Running
         ));
         supervisor.wait(&id, Some(Duration::from_secs(5))).unwrap();
+    }
+
+    #[test]
+    fn completed_process_and_binary_output_reopen_after_cold_epoch() {
+        let root = Temp::new();
+        let id = ProcessId::try_from("retained").unwrap();
+        {
+            let supervisor = ProcessSupervisor::create(
+                &root.0,
+                SandboxId::try_from("box").unwrap(),
+                Counter::ONE,
+            )
+            .unwrap();
+            supervisor
+                .spawn(request(
+                    "retained",
+                    "printf 'before\\000reboot'",
+                    StdioMode::Pipes,
+                ))
+                .unwrap();
+            supervisor.wait(&id, Some(Duration::from_secs(5))).unwrap();
+        }
+        let reopened = ProcessSupervisor::create(
+            &root.0,
+            SandboxId::try_from("box").unwrap(),
+            Counter::try_from(2).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.get(&id).unwrap().state,
+            ProcessState::Exited(_)
+        ));
+        let bytes: Vec<_> = reopened
+            .read_output(&id, Counter::ZERO, 4096)
+            .unwrap()
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.bytes)
+            .collect();
+        assert_eq!(bytes, b"before\0reboot");
+        assert!(matches!(
+            reopened.signal(&id, libc::SIGTERM, true),
+            Err(ProcessError::Conflict(_))
+        ));
     }
 }

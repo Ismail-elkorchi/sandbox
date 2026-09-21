@@ -4,5 +4,7 @@ pub mod api;
 #[cfg(target_os = "linux")]
 pub mod guest;
 #[cfg(target_os = "linux")]
+pub mod images;
+#[cfg(target_os = "linux")]
 pub mod linux;
 pub mod service;

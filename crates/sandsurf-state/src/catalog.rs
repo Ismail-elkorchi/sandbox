@@ -11,6 +11,8 @@ CREATE TABLE intents(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandb
 CREATE TABLE grants(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
+CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
+CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +47,33 @@ pub struct GrantChange {
 pub enum ReservationState {
     Held,
     Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageImportPhase {
+    Admitted,
+    Published,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageRecord {
+    pub digest: Digest,
+    pub source_digest: Digest,
+    pub platform: String,
+    pub architecture: String,
+    pub logical_bytes: Counter,
+    pub provenance_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageImportRecord {
+    pub operation_id: OperationId,
+    pub request_digest: Digest,
+    pub phase: ImageImportPhase,
+    pub image: Option<ImageRecord>,
 }
 
 /// Host-owned identity, configuration, and reservation facts. Machine state is
@@ -121,6 +150,122 @@ impl HostCatalog {
     }
     pub fn host_id(&self) -> &HostId {
         &self.host
+    }
+
+    /// Admit an image mutation before any source is read or builder is run.
+    /// The catalog stores only the exact request digest, never registry
+    /// credentials or an independently mutable copy of image metadata.
+    pub fn admit_image_import(
+        &mut self,
+        operation_id: OperationId,
+        request_digest: Digest,
+        approval: Approval,
+    ) -> Result<ImageImportRecord> {
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("image import approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = image_import(&tx, &operation_id)? {
+            return if old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("image import operation identity conflict"))
+            };
+        }
+        capacity(&tx, "image_imports", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let value = ImageImportRecord {
+            operation_id,
+            request_digest,
+            phase: ImageImportPhase::Admitted,
+            image: None,
+        };
+        tx.execute(
+            "INSERT INTO image_imports VALUES (?1,?2,?3,NULL)",
+            params![
+                value.operation_id.as_str(),
+                value.request_digest.as_str(),
+                encode(&value.phase)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn complete_image_import(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+        image: ImageRecord,
+    ) -> Result<ImageImportRecord> {
+        let tx = self.db.connection.transaction()?;
+        let old = image_import(&tx, operation_id)?
+            .ok_or(Error::Missing("image import operation is missing"))?;
+        if &old.request_digest != request_digest {
+            return Err(Error::Conflict("image import request digest changed"));
+        }
+        if old.phase == ImageImportPhase::Published {
+            return if old.image.as_ref() == Some(&image) {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "image import already published another image",
+                ))
+            };
+        }
+        if let Some(existing) = image_record(&tx, &image.digest)? {
+            if existing != image {
+                return Err(Error::Conflict(
+                    "image digest is bound to different metadata",
+                ));
+            }
+        } else {
+            capacity(&tx, "images", self.limits.identities)?;
+            tx.execute(
+                "INSERT INTO images VALUES (?1,?2)",
+                params![image.digest.as_str(), encode(&image)?],
+            )?;
+        }
+        tx.execute(
+            "UPDATE image_imports SET phase=?2,image=?3 WHERE operation=?1",
+            params![
+                operation_id.as_str(),
+                encode(&ImageImportPhase::Published)?,
+                image.digest.as_str()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ImageImportRecord {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+            phase: ImageImportPhase::Published,
+            image: Some(image),
+        })
+    }
+
+    pub fn image_import(&self, operation: &OperationId) -> Result<Option<ImageImportRecord>> {
+        image_import(&self.db.connection, operation)
+    }
+
+    pub fn image(&self, digest: &Digest) -> Result<Option<ImageRecord>> {
+        image_record(&self.db.connection, digest)
+    }
+
+    pub fn images(&self, after: Option<&Digest>, limit: Counter) -> Result<Vec<ImageRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("image page limit must be in 1..=256"));
+        }
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT value FROM images WHERE digest>?1 ORDER BY digest ASC LIMIT ?2")?;
+        statement
+            .query_map(
+                params![after.map_or("", Digest::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|value| decode(&value?))
+            .collect()
     }
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
@@ -733,6 +878,49 @@ fn get_grant(db: &rusqlite::Connection, id: &GrantId) -> Result<Option<Grant>> {
     })
     .optional()?
     .map(|s| decode(&s))
+    .transpose()
+}
+
+fn image_record(db: &rusqlite::Connection, digest: &Digest) -> Result<Option<ImageRecord>> {
+    db.query_row(
+        "SELECT value FROM images WHERE digest=?1",
+        [digest.as_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| decode(&value))
+    .transpose()
+}
+
+fn image_import(
+    db: &rusqlite::Connection,
+    operation: &OperationId,
+) -> Result<Option<ImageImportRecord>> {
+    let row: Option<(String, String, Option<String>)> = db
+        .query_row(
+            "SELECT request_digest,phase,image FROM image_imports WHERE operation=?1",
+            [operation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(request_digest, phase, image)| {
+        let image = image
+            .map(|digest| {
+                image_record(db, &Digest::try_from(digest)?)?
+                    .ok_or(Error::Corrupt("published image import has no image record"))
+            })
+            .transpose()?;
+        let phase: ImageImportPhase = decode(&phase)?;
+        if (phase == ImageImportPhase::Published) != image.is_some() {
+            return Err(Error::Corrupt("image import phase and result disagree"));
+        }
+        Ok(ImageImportRecord {
+            operation_id: operation.clone(),
+            request_digest: request_digest.try_into()?,
+            phase,
+            image,
+        })
+    })
     .transpose()
 }
 fn save_intent(db: &rusqlite::Connection, value: &LifecycleIntent) -> Result<()> {
