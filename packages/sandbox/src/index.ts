@@ -11,6 +11,7 @@ export {
   FilesystemWatcher,
   SandboxFilesystem,
   SandboxOperations,
+  SandboxEvents,
   SandboxCheckpoints,
   SandboxProcess,
   SandboxTerminal,
@@ -28,6 +29,7 @@ export type {
   DesiredSandboxState,
   DerivedImagePublishOptions,
   ExecOptions,
+  ExecShellOptions,
   ExecResult,
   FileExpectation,
   FileTransactionMutation,
@@ -48,10 +50,13 @@ export type {
   ResourceEnvelope,
   SandboxCreateOptions,
   SandboxInspection,
+  SandboxEvent,
+  SandboxEventPage,
   SandboxForkOptions,
   SandsurfAuthorizer,
   SandsurfCapability,
   SandsurfOpenOptions,
+  ShellOptions,
   SpawnOptions,
   TerminalOpenOptions,
   TerminalSize,
@@ -66,3 +71,12 @@ export type {
   WorkspaceManifestEntry,
 } from "./sandsurf.js";
 export { SandsurfHostError } from "./native-host.js";
+export {
+  renderSandsurfServiceDefinition,
+  sandsurfServiceDefinition,
+} from "./service.js";
+export type {
+  SandsurfServiceDefinition,
+  SandsurfServiceDefinitionOptions,
+  SandsurfServicePlatform,
+} from "./service.js";

@@ -66,6 +66,7 @@ fn windows_retained_disk_copy_is_verified_and_attachable() {
             identities: Counter::try_from(8).unwrap(),
             operations: Counter::try_from(8).unwrap(),
             observations: Counter::try_from(8).unwrap(),
+            events: Counter::try_from(32).unwrap(),
             chunks: Counter::try_from(8).unwrap(),
             pins: Counter::try_from(8).unwrap(),
             output_bytes: Counter::try_from(1024).unwrap(),

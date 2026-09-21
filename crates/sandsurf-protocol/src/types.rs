@@ -589,6 +589,10 @@ pub enum GuardianRequest {
     deny_unknown_fields
 )]
 pub enum RuntimeRequest {
+    Events {
+        after: Counter,
+        maximum: u16,
+    },
     Process {
         process_id: ProcessId,
     },
@@ -645,6 +649,7 @@ pub struct EvidenceChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidencePage {
+    pub after: Counter,
     pub cursor: Counter,
     pub available: Counter,
     pub chunks: Vec<EvidenceChunk>,
@@ -657,7 +662,64 @@ pub struct EvidencePage {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
+pub enum RuntimeEventValue {
+    Machine {
+        observation: MachineObservation,
+    },
+    WorkloadOperation {
+        operation: Operation,
+    },
+    LifecycleOperation {
+        operation: LifecycleOperation,
+    },
+    ConfigurationOperation {
+        operation: ConfigurationOperation,
+    },
+    Process {
+        process: crate::ProcessSnapshot,
+    },
+    Output {
+        process_id: ProcessId,
+        boundary: OutputBoundary,
+    },
+    Receipt {
+        process_id: ProcessId,
+        receipt_digest: Digest,
+    },
+    EvidenceRelease {
+        process_id: ProcessId,
+        request_digest: Digest,
+        cleanup_pending: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeEvent {
+    pub cursor: Counter,
+    pub value: RuntimeEventValue,
+    pub digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeEventPage {
+    pub cursor: Counter,
+    pub available: Counter,
+    pub events: Vec<RuntimeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum RuntimeResponse {
+    Events {
+        page: RuntimeEventPage,
+    },
     Process {
         process: Option<Observation<crate::ProcessSnapshot>>,
     },

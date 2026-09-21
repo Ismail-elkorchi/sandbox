@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use sandbox_policy::{SessionOptions, normalize_session, normalize_target_path};
+use sandbox_policy::{ManagedNetworkRule, normalize_managed_network_rules};
 use sandsurf_protocol::{Frame, MAX_CONTROL_BYTES};
 
 fn main() {
@@ -13,7 +13,6 @@ fn main() {
     for index in 0..iterations {
         fuzz_protocol(&mut random, index);
         fuzz_policy(&mut random, index);
-        fuzz_path(&mut random, index);
     }
     println!("sandbox fuzz smoke completed {iterations} iterations per target");
 }
@@ -38,21 +37,11 @@ fn fuzz_policy(random: &mut XorShift64, index: usize) {
     let mut bytes = vec![0_u8; random.length(8192)];
     random.fill(&mut bytes);
     if index.is_multiple_of(4) {
-        bytes.splice(0..0, br#"{"isolation":{"kind":"process"},"policy":{"filesystem":{"kind":"isolated","resources":[]},"network":{"mode":"none"},"process":{"visibility":"session","control":"session","termination":{"scope":"descendant-tree","graceMs":100}},"ipc":{"visibility":"session"}},"requirements":{}}"#.iter().copied());
+        bytes.splice(0..0, br#"[{"transport":"tcp","destination":{"kind":"dns","name":"example.com"},"ports":[443]}]"#.iter().copied());
     }
-    if let Ok(options) = serde_json::from_slice::<SessionOptions>(&bytes) {
-        let _ = normalize_session(options);
+    if let Ok(rules) = serde_json::from_slice::<Vec<ManagedNetworkRule>>(&bytes) {
+        let _ = normalize_managed_network_rules(&rules);
     }
-}
-
-fn fuzz_path(random: &mut XorShift64, index: usize) {
-    let mut bytes = vec![0_u8; random.length(2048)];
-    random.fill(&mut bytes);
-    if index.is_multiple_of(2) {
-        bytes.insert(0, b'/');
-    }
-    let value = String::from_utf8_lossy(&bytes);
-    let _ = normalize_target_path(&value);
 }
 
 struct XorShift64(u64);

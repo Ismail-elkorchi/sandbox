@@ -264,6 +264,7 @@ mod tests {
                 identities: n(32),
                 operations: n(64),
                 observations: n(64),
+                events: n(2048),
                 chunks: n(1024),
                 pins: n(32),
                 output_bytes: n(1024 * 1024),

@@ -18,6 +18,7 @@ CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STR
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
 CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_origin_epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
@@ -32,6 +33,7 @@ pub struct RuntimeLimits {
     pub identities: Counter,
     pub operations: Counter,
     pub observations: Counter,
+    pub events: Counter,
     pub chunks: Counter,
     pub pins: Counter,
     pub output_bytes: Counter,
@@ -67,6 +69,7 @@ pub struct OutputChunk {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputPage {
+    pub after: Counter,
     pub cursor: Counter,
     pub available: Counter,
     pub chunks: Vec<OutputChunk>,
@@ -142,6 +145,7 @@ impl RuntimeJournal {
             limits.identities,
             limits.operations,
             limits.observations,
+            limits.events,
             limits.chunks,
             limits.pins,
             limits.output_bytes,
@@ -259,11 +263,69 @@ impl RuntimeJournal {
             "INSERT INTO observations VALUES (?1,?2)",
             params![value.sequence.get(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::Machine {
+                observation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(CommittedObservation(value))
     }
     pub fn operation(&self, id: &OperationId) -> Result<Option<Operation>> {
         operation(&self.db.connection, id)
+    }
+
+    pub fn events(&self, after: Counter, maximum: u16) -> Result<RuntimeEventPage> {
+        if maximum == 0 || maximum > 256 {
+            return Err(Error::Capacity("event page must contain 1..256 entries"));
+        }
+        let available: u64 = self.db.connection.query_row(
+            "SELECT coalesce(max(sequence),0) FROM events",
+            [],
+            |row| row.get(0),
+        )?;
+        let available = Counter::try_from(available)?;
+        if after > available {
+            return Err(Error::Conflict("event cursor is beyond committed history"));
+        }
+        let mut statement = self.db.connection.prepare(
+            "SELECT sequence,value,digest FROM events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after.get(), maximum], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut cursor = after;
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, raw, stored_digest) = row?;
+            let sequence = Counter::try_from(sequence)?;
+            if sequence != cursor.next()? {
+                return Err(Error::Corrupt("runtime event history has a gap"));
+            }
+            let value: RuntimeEventValue = decode(&raw)?;
+            let event_digest = runtime_event_digest(&self.sandbox, sequence, &value)?;
+            if event_digest.as_str() != stored_digest {
+                return Err(Error::Corrupt("runtime event digest mismatch"));
+            }
+            events.push(RuntimeEvent {
+                cursor: sequence,
+                value,
+                digest: event_digest,
+            });
+            cursor = sequence;
+        }
+        Ok(RuntimeEventPage {
+            cursor,
+            available,
+            events,
+        })
     }
 
     pub fn lifecycle_operation(&self, id: &OperationId) -> Result<Option<LifecycleOperation>> {
@@ -320,6 +382,14 @@ impl RuntimeJournal {
             "INSERT INTO lifecycle_operations VALUES (?1,?2)",
             params![value.command.operation_id.as_str(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::LifecycleOperation {
+                operation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(value)
     }
@@ -344,6 +414,14 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
             params![command.operation_id.as_str(), encode(&value)?],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::LifecycleOperation {
+                operation: value.clone(),
+            },
         )?;
         tx.commit()?;
         Ok(LifecycleDecision::Perform(LifecyclePermit {
@@ -433,6 +511,14 @@ impl RuntimeJournal {
             "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
             params![id.as_str(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::LifecycleOperation {
+                operation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(value)
     }
@@ -475,6 +561,14 @@ impl RuntimeJournal {
             "INSERT INTO configuration_operations VALUES (?1,?2)",
             params![value.command.operation_id.as_str(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::ConfigurationOperation {
+                operation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(value)
     }
@@ -499,6 +593,14 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE configuration_operations SET value=?2 WHERE id=?1",
             params![command.operation_id.as_str(), encode(&value)?],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::ConfigurationOperation {
+                operation: value.clone(),
+            },
         )?;
         tx.commit()?;
         Ok(ConfigurationDecision::Perform(ConfigurationPermit {
@@ -589,6 +691,14 @@ impl RuntimeJournal {
             "UPDATE configuration_operations SET value=?2 WHERE id=?1",
             params![id.as_str(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::ConfigurationOperation {
+                operation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(value)
     }
@@ -642,6 +752,14 @@ impl RuntimeJournal {
             "INSERT INTO operations VALUES (?1,?2)",
             params![value.request.operation_id.as_str(), encode(&value)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::WorkloadOperation {
+                operation: value.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(value)
     }
@@ -681,6 +799,14 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE operations SET value=?2 WHERE id=?1",
             params![request.operation_id.as_str(), encode(&value)?],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::WorkloadOperation {
+                operation: value.clone(),
+            },
         )?;
         tx.commit()?;
         Ok(DispatchDecision::Perform(DispatchPermit {
@@ -731,6 +857,14 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE operations SET value=?2 WHERE id=?1",
             params![id.as_str(), encode(&value)?],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::WorkloadOperation {
+                operation: value.clone(),
+            },
         )?;
         tx.commit()?;
         Ok(value)
@@ -883,6 +1017,14 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE processes SET snapshot=?2 WHERE id=?1",
             params![snapshot.request.process_id.as_str(), encode(snapshot)?],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::Process {
+                process: snapshot.clone(),
+            },
         )?;
         tx.commit()?;
         Ok(())
@@ -1094,6 +1236,15 @@ impl RuntimeJournal {
             "UPDATE processes SET boundary=?2 WHERE id=?1",
             params![id.as_str(), encode(&boundary)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::Output {
+                process_id: id.clone(),
+                boundary: boundary.clone(),
+            },
+        )?;
         tx.commit()?;
         Ok(boundary)
     }
@@ -1139,6 +1290,7 @@ impl RuntimeJournal {
             return Err(Error::Conflict("output cursor beyond committed boundary"));
         }
         let mut page = OutputPage {
+            after,
             cursor: after,
             available: boundary.final_cursor,
             chunks: Vec::new(),
@@ -1307,6 +1459,23 @@ impl RuntimeJournal {
         tx.execute(
             "UPDATE processes SET receipt=?2,receipt_digest=?3 WHERE id=?1",
             params![id.as_str(), encode(&receipt)?, receipt_digest.as_str()],
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::WorkloadOperation {
+                operation: op.clone(),
+            },
+        )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::Receipt {
+                process_id: id.clone(),
+                receipt_digest: receipt_digest.clone(),
+            },
         )?;
         tx.commit()?;
         Ok((receipt, receipt_digest))
@@ -1483,6 +1652,16 @@ impl RuntimeJournal {
             "UPDATE processes SET release=?2,cleanup_pending=1 WHERE id=?1",
             params![id.as_str(), encode(&request)?],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::EvidenceRelease {
+                process_id: id.clone(),
+                request_digest: identity.clone(),
+                cleanup_pending: true,
+            },
+        )?;
         tx.commit()?;
         Ok(ReleaseStatus {
             request_digest: identity,
@@ -1506,6 +1685,9 @@ impl RuntimeJournal {
         if digest(Domain::Release, &request)? != *release_digest {
             return Err(Error::Conflict("release digest mismatch"));
         }
+        // Reserve the replay record before deleting any original bytes. Event
+        // exhaustion must never turn a failed cleanup commit into silent loss.
+        capacity(&tx, "events", self.limits.events)?;
         let pinned: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pins WHERE process=?1)",
             [id.as_str()],
@@ -1529,6 +1711,16 @@ impl RuntimeJournal {
             "UPDATE processes SET cleanup_pending=0 WHERE id=?1",
             [id.as_str()],
         )?;
+        append_event(
+            &tx,
+            &self.sandbox,
+            self.limits.events,
+            RuntimeEventValue::EvidenceRelease {
+                process_id: id.clone(),
+                request_digest: release_digest.clone(),
+                cleanup_pending: false,
+            },
+        )?;
         tx.commit()?;
         Ok(ReleaseStatus {
             request_digest: release_digest.clone(),
@@ -1546,6 +1738,37 @@ fn observation(db: &rusqlite::Connection) -> Result<Option<MachineObservation>> 
     .optional()?
     .map(|s| decode(&s))
     .transpose()
+}
+
+fn append_event(
+    db: &rusqlite::Connection,
+    sandbox: &SandboxId,
+    limit: Counter,
+    value: RuntimeEventValue,
+) -> Result<()> {
+    capacity(db, "events", limit)?;
+    let previous: u64 =
+        db.query_row("SELECT coalesce(max(sequence),0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+    let sequence = Counter::try_from(previous)?.next()?;
+    let event_digest = runtime_event_digest(sandbox, sequence, &value)?;
+    db.execute(
+        "INSERT INTO events VALUES (?1,?2,?3)",
+        params![sequence.get(), encode(&value)?, event_digest.as_str()],
+    )?;
+    Ok(())
+}
+
+fn runtime_event_digest(
+    sandbox: &SandboxId,
+    cursor: Counter,
+    value: &RuntimeEventValue,
+) -> Result<Digest> {
+    Ok(digest(
+        Domain::Operation,
+        &("sandsurf-runtime-event-v1", sandbox, cursor, value),
+    )?)
 }
 
 fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool {

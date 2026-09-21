@@ -41,6 +41,7 @@ pub enum HostError {
     Secret(crate::secrets::SecretError),
     Checkpoint(crate::checkpoints::CheckpointError),
     Image(crate::images::ImageBuildError),
+    GuardianStartup(String),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
     #[cfg(target_os = "macos")]
@@ -62,6 +63,7 @@ impl fmt::Display for HostError {
             Self::Secret(error) => error.fmt(output),
             Self::Checkpoint(error) => error.fmt(output),
             Self::Image(error) => error.fmt(output),
+            Self::GuardianStartup(message) => output.write_str(message),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
             #[cfg(target_os = "macos")]
@@ -1373,6 +1375,17 @@ impl HostService {
                         .runtime(sandbox_id, RuntimeRequest::Operation { operation_id })?,
                 })
             }
+            HostRequest::ListEvents {
+                sandbox_id,
+                after,
+                maximum,
+            } => {
+                self.provision_guardian(&sandbox_id)?;
+                Ok(HostResponse::Runtime {
+                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                        .runtime(sandbox_id, RuntimeRequest::Events { after, maximum })?,
+                })
+            }
             HostRequest::GetProcess {
                 sandbox_id,
                 process_id,
@@ -2094,7 +2107,7 @@ impl HostService {
             return Ok(());
         }
         let guardian_log = open_guardian_log(&root.join("guardian/guardian.log"))?;
-        Command::new(&self.executable)
+        let mut child = Command::new(&self.executable)
             .arg("guardian")
             .arg("--directory")
             .arg(&self.root)
@@ -2112,8 +2125,21 @@ impl HostService {
             {
                 return Ok(());
             }
+            if let Some(status) = child.try_wait()? {
+                return Err(HostError::GuardianStartup(format!(
+                    "guardian exited before becoming reachable ({status}); inspect {}",
+                    root.join("guardian/guardian.log").display()
+                )));
+            }
             if std::time::Instant::now() >= deadline {
-                return Err(HostError::Invalid("guardian did not become reachable"));
+                // A process which never publishes its authenticated endpoint is
+                // not an independently owned guardian. Do not leave it behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HostError::GuardianStartup(format!(
+                    "guardian did not become reachable; inspect {}",
+                    root.join("guardian/guardian.log").display()
+                )));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -2352,6 +2378,7 @@ fn runtime_limits() -> RuntimeLimits {
         identities: counter(1_000_000),
         operations: counter(1_000_000),
         observations: counter(1_000_000),
+        events: counter(20_000_000),
         chunks: counter(10_000_000),
         pins: counter(1_000_000),
         output_bytes: counter(1024 * 1024 * 1024 * 1024),
@@ -2498,7 +2525,7 @@ fn error_category(error: &HostError) -> &'static str {
         #[cfg(target_os = "windows")]
         HostError::Windows(_) => "native",
         HostError::State(_) => "state",
-        HostError::Control(_) => "guardian",
+        HostError::Control(_) | HostError::GuardianStartup(_) => "guardian",
         HostError::Workspace(crate::workspace::WorkspaceError::Conflict(_)) => "conflict",
         HostError::Workspace(crate::workspace::WorkspaceError::Capacity(_)) => "capacity",
         HostError::Workspace(_) => "workspace",

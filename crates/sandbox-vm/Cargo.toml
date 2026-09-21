@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 libc.workspace = true
-sandbox-digest = { path = "../sandbox-digest" }
 sandbox-image = { path = "../sandbox-image" }
 sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-policy = { path = "../sandbox-policy" }

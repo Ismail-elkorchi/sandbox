@@ -513,6 +513,9 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian sandbox identity mismatch"));
                 }
                 let response = match request {
+                    RuntimeRequest::Events { after, maximum } => RuntimeResponse::Events {
+                        page: self.journal.events(after, maximum)?,
+                    },
                     RuntimeRequest::Process { process_id } => {
                         let snapshot = self.journal.process_snapshot(&process_id)?;
                         let reachable = snapshot.as_ref().is_some_and(|snapshot| {
@@ -671,6 +674,7 @@ impl<E: GuardianEffect> Guardian<E> {
 
 fn evidence_page(value: sandsurf_state::OutputPage) -> EvidencePage {
     EvidencePage {
+        after: value.after,
         cursor: value.cursor,
         available: value.available,
         chunks: value

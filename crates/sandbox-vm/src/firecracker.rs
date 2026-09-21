@@ -515,19 +515,13 @@ impl FirecrackerProcess {
         if self.final_status.is_none() {
             self.control
                 .set_read_timeout(Some(Duration::from_secs(5)))?;
-            loop {
-                match read_launcher_event(&mut self.control)? {
-                    LauncherEvent::Final(status) => {
-                        self.final_status = Some(status);
-                        break;
-                    }
-                    LauncherEvent::RuntimeError(error) => {
-                        return Err(FirecrackerError::Setup(format!(
-                            "{}: {}",
-                            error.code, error.message
-                        )));
-                    }
-                    LauncherEvent::StdinCredit(_) => {}
+            match read_launcher_event(&mut self.control)? {
+                LauncherEvent::Final(status) => self.final_status = Some(status),
+                LauncherEvent::RuntimeError(error) => {
+                    return Err(FirecrackerError::Setup(format!(
+                        "{}: {}",
+                        error.code, error.message
+                    )));
                 }
             }
             let _ = self.child.wait()?;

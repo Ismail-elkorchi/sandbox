@@ -29,7 +29,7 @@ export class NativeHostClient {
     if (!isAbsolute(directory)) throw new TypeError("Sandsurf state directory must be absolute");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") await chmod(directory, 0o700);
-    const binary = await locateNativeHost();
+    const binary = await resolveSandsurfNativeHost();
     const client = new NativeHostClient(directory, binary);
     try {
       await client.request({ kind: "inspect" });
@@ -73,7 +73,7 @@ export class NativeHostClient {
   }
 }
 
-async function locateNativeHost(): Promise<string> {
+export async function resolveSandsurfNativeHost(): Promise<string> {
   const platform = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform;
   const architecture = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : process.arch;
   if (!["linux", "macos", "windows"].includes(platform) || !["x64", "arm64"].includes(architecture)) {

@@ -373,6 +373,11 @@ pub enum HostRequest {
     ListProcesses {
         sandbox_id: SandboxId,
     },
+    ListEvents {
+        sandbox_id: SandboxId,
+        after: Counter,
+        maximum: u16,
+    },
     GetOperation {
         sandbox_id: SandboxId,
         operation_id: OperationId,

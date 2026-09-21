@@ -5,7 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-const RUNTIME_PATH: &str = "/.sandbox-launcher";
+const RUNTIME_PATH: &str = "/.sandsurf/launcher";
 
 /// Retain the host-authorized namespace launcher through policy approval and execution.
 #[derive(Debug)]
@@ -53,30 +53,17 @@ impl NamespaceLauncher {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Handoff {
-    spec: LaunchSpec,
+    spec: VmmSandboxSpec,
     descriptors: Vec<RawFd>,
     parent_process: RawFd,
 }
 
 /// The namespace helper preserves unconsumed descriptors across exec. Mount input
 /// descriptors are separate from the authority retained by the isolated supervisor.
-pub(super) fn launch(spec: &LaunchSpec, files: &[File]) -> io::Result<i32> {
-    let mut command = namespace_command(
-        &files[spec.launcher_fd_index],
-        spec.network_mode != "unrestricted",
-    );
+pub(super) fn launch(spec: &VmmSandboxSpec, files: &[File]) -> io::Result<i32> {
+    let mut command = namespace_command(&files[spec.launcher_fd_index], true);
     let mut inputs = vec![File::open(std::env::current_exe()?)?];
     data_mount(&mut command, &inputs[0], RUNTIME_PATH, "0500");
-    if spec.network_mode == "managed" {
-        // This sysctl belongs to the newly created network namespace. Its unprivileged
-        // supervisor must bind DNS after the helper drops every capability.
-        let ports = sealed_data(b"0\n")?;
-        command
-            .arg("--file")
-            .arg(ports.as_raw_fd().to_string())
-            .arg("/proc/sys/net/ipv4/ip_unprivileged_port_start");
-        inputs.push(ports);
-    }
     command.args(["--remount-ro", "/proc"]);
     let mut mounts: Vec<_> = spec.mounts.iter().collect();
     mounts.sort_by_key(|mount| component_count(&mount.target_path));
@@ -91,108 +78,10 @@ pub(super) fn launch(spec: &LaunchSpec, files: &[File]) -> io::Result<i32> {
         });
         command.arg(descriptor_path(source)).arg(&mount.target_path);
     }
-    let mut snapshot = files[spec.executable_fd_index].try_clone()?;
+    let mut snapshot = files[spec.firecracker_fd_index].try_clone()?;
     snapshot.seek(SeekFrom::Start(0))?;
-    data_mount(
-        &mut command,
-        &snapshot,
-        &spec.executable_snapshot_path,
-        "0500",
-    );
+    data_mount(&mut command, &snapshot, "/.sandsurf/firecracker", "0500");
     inputs.push(snapshot);
-
-    for directory in spec.private_home.iter().chain(spec.temporary.iter()) {
-        command.args([
-            "--perms",
-            if spec
-                .private_home
-                .as_ref()
-                .is_some_and(|home| home.target_path == directory.target_path)
-            {
-                "0700"
-            } else {
-                "1777"
-            },
-        ]);
-        command
-            .arg("--size")
-            .arg(directory.size_bytes.to_string())
-            .arg("--tmpfs")
-            .arg(&directory.target_path);
-    }
-    for mask in &spec.masks {
-        let mapping = spec
-            .mounts
-            .iter()
-            .filter(|mount| contains(&mount.target_path, &mask.target_path))
-            .max_by_key(|mount| mount.target_path.len())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "mask must name an admitted resource",
-                )
-            })?;
-        let relative = mask
-            .target_path
-            .strip_prefix(&mapping.target_path)
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let target = mask_target(&files[mapping.fd_index], relative)?;
-        let kind = file_identity(target.as_raw_fd())?.mode & libc::S_IFMT;
-        if kind == libc::S_IFDIR && mask.replacement != "empty-file" {
-            command
-                .args([
-                    "--perms",
-                    if mask.replacement == "inaccessible" {
-                        "0000"
-                    } else {
-                        "0755"
-                    },
-                    "--size",
-                    "4096",
-                    "--tmpfs",
-                ])
-                .arg(&mask.target_path)
-                .arg("--remount-ro")
-                .arg(&mask.target_path);
-        } else if kind == libc::S_IFREG && mask.replacement != "empty-directory" {
-            let empty = sealed_data(&[])?;
-            data_mount(
-                &mut command,
-                &empty,
-                &mask.target_path,
-                if mask.replacement == "inaccessible" {
-                    "0000"
-                } else {
-                    "0444"
-                },
-            );
-            inputs.push(empty);
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "mask replacement type conflicts with target",
-            ));
-        }
-    }
-    let resolver = match spec.network_mode.as_str() {
-        "managed" => "nameserver 127.0.0.1\noptions timeout:1 attempts:2\n".to_owned(),
-        "unrestricted" => fs::read_to_string("/etc/resolv.conf")?,
-        _ => String::new(),
-    };
-    for (path, content) in [
-        (
-            "/etc/passwd",
-            "sandbox:x:0:0:Sandbox:/home/sandbox:/bin/sh\n",
-        ),
-        ("/etc/group", "sandbox:x:0:\n"),
-        ("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n"),
-        ("/etc/resolv.conf", resolver.as_str()),
-    ] {
-        let file = sealed_data(content.as_bytes())?;
-        data_mount(&mut command, &file, path, "0444");
-        inputs.push(file);
-    }
     let parent = open_pidfd(std::process::id())?;
     let handoff = sealed_data(
         &serde_json::to_vec(&Handoff {
@@ -274,16 +163,8 @@ pub fn vmm_isolated_main(descriptor: Option<OsString>) -> i32 {
         let parent = unsafe { File::from_raw_fd(handoff.parent_process) };
         sandsurf_native::linux::bind_to_retained_parent(&parent)?;
         drop(parent);
-        validate_spec(&handoff.spec, files.len())?;
+        validate_vmm_sandbox_spec(&handoff.spec, files.len())?;
         for mount in &handoff.spec.mounts {
-            if handoff
-                .spec
-                .masks
-                .iter()
-                .any(|mask| contains(&mask.target_path, &mount.target_path))
-            {
-                continue;
-            }
             let mounted = open_path(
                 Path::new(&mount.target_path),
                 libc::O_PATH | libc::O_CLOEXEC,
@@ -293,11 +174,11 @@ pub fn vmm_isolated_main(descriptor: Option<OsString>) -> i32 {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "mounted resource identity differs from prepared authority",
+                    "mounted VMM resource identity differs from retained authority",
                 ));
             }
         }
-        namespace_init(&mut control, &handoff.spec, files, true)
+        namespace_init(&mut control, &handoff.spec, files)
     })();
     match result {
         Ok(code) => code,
@@ -389,34 +270,6 @@ fn descriptor_path(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
 }
 
-fn mask_target(root: &File, relative: &str) -> io::Result<File> {
-    let mut target = root.try_clone()?;
-    for component in relative.split('/').filter(|part| !part.is_empty()) {
-        let component = CString::new(component).map_err(invalid_data)?;
-        // SAFETY: target is a retained directory descriptor and component is one
-        // NUL-terminated path component; O_NOFOLLOW binds the named object itself.
-        let fd = unsafe {
-            libc::openat(
-                target.as_raw_fd(),
-                component.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: openat returned a new descriptor whose ownership transfers once to File.
-        target = unsafe { File::from_raw_fd(fd) };
-        if file_identity(target.as_raw_fd())?.mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "mask paths cannot traverse symbolic links",
-            ));
-        }
-    }
-    Ok(target)
-}
-
 fn inherit(file: &File) -> io::Result<()> {
     // SAFETY: this single-threaded launcher owns the descriptor and intentionally transfers it across exec.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
@@ -459,11 +312,4 @@ fn sealed_data(bytes: &[u8]) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     Ok(file)
-}
-
-fn contains(parent: &str, child: &str) -> bool {
-    parent == child
-        || child
-            .strip_prefix(parent)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }

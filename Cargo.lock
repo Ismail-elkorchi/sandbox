@@ -1401,7 +1401,6 @@ name = "sandbox-launcher-linux"
 version = "0.1.0"
 dependencies = [
  "libc",
- "sandbox-policy",
  "sandsurf-native",
  "serde",
  "serde_json",
@@ -1420,7 +1419,6 @@ name = "sandbox-policy"
 version = "0.1.0"
 dependencies = [
  "idna",
- "sandbox-digest",
  "serde",
  "serde_json",
 ]
@@ -1430,7 +1428,6 @@ name = "sandbox-vm"
 version = "0.1.0"
 dependencies = [
  "libc",
- "sandbox-digest",
  "sandbox-image",
  "sandbox-launcher-linux",
  "sandbox-network-broker",
@@ -1476,6 +1473,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "unicode-normalization",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

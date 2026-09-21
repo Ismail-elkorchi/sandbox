@@ -88,6 +88,7 @@ fn runtime_limits() -> RuntimeLimits {
         identities: n(16),
         operations: n(64),
         observations: n(64),
+        events: n(256),
         chunks: n(64),
         pins: n(16),
         output_bytes: n(4096),

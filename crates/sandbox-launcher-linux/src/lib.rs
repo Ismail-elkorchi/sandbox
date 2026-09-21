@@ -5,7 +5,6 @@ mod namespace;
 
 pub use namespace::{NamespaceLauncher, namespace_probe_main, vmm_isolated_main};
 
-use sandbox_policy::{HardLimit, NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
 use sandsurf_native::linux::{
     bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
 };
@@ -16,47 +15,37 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{self, MaybeUninit};
-use std::net::{TcpListener, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 use std::time::{Duration, Instant};
 
 const MAX_INTERNAL_MESSAGE: usize = 1024 * 1024;
-const INTERNAL_STDIN: u8 = 2;
-const INTERNAL_CLOSE_STDIN: u8 = 3;
 const INTERNAL_TERMINATE: u8 = 4;
 const INTERNAL_STARTED: u8 = 101;
 const INTERNAL_SETUP_ERROR: u8 = 102;
 const INTERNAL_EXIT: u8 = 103;
-const INTERNAL_STDIN_CREDIT: u8 = 104;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct LaunchSpec {
-    pub filesystem_kind: String,
+pub(crate) struct VmmSandboxSpec {
     pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
-    pub masks: Vec<NormalizedMask>,
-    pub private_home: Option<NormalizedSyntheticDirectory>,
-    pub temporary: Option<NormalizedSyntheticDirectory>,
-    pub executable_fd_index: usize,
-    pub executable_identity: FileIdentity,
-    pub executable_content_sha256: String,
-    pub executable_snapshot_path: String,
-    pub cwd: PreparedCwd,
-    pub executable: String,
+    pub firecracker_fd_index: usize,
+    pub firecracker_identity: FileIdentity,
+    pub firecracker_sha256: String,
+    pub state_directory_fd_index: usize,
+    pub state_directory_identity: FileIdentity,
     pub args: Vec<String>,
-    pub environment: BTreeMap<String, String>,
-    pub resources: ResourceLimits,
+    pub open_files_limit: u64,
+    pub file_size_limit: u64,
     pub termination_grace_ms: u64,
-    pub network_mode: String,
 }
 
-/// Fixed launch contract for one Firecracker VMM. Unlike `LaunchSpec`, callers
-/// cannot select arbitrary executable arguments, environment, mount targets,
+/// Fixed launch contract for one Firecracker VMM. Callers cannot select
+/// arbitrary executable arguments, environment, mount targets,
 /// network modes, or host paths. Descriptor identities are revalidated inside
 /// the confined launcher immediately before exec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,20 +85,6 @@ pub(crate) struct MountSpec {
     pub executable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub(crate) enum PreparedCwd {
-    Bound {
-        fd_index: usize,
-        identity: FileIdentity,
-        target_path: String,
-    },
-    Synthetic {
-        target_path: String,
-        identity_nonce: String,
-    },
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileIdentity {
@@ -145,7 +120,6 @@ pub struct LauncherFinalStatus {
 #[derive(Debug)]
 pub enum LauncherEvent {
     Final(LauncherFinalStatus),
-    StdinCredit(u64),
     RuntimeError(LauncherSetupError),
 }
 
@@ -226,7 +200,7 @@ fn run_kernel_probe() -> KernelProbeResult {
             unavailable("prctl(PR_SET_NO_NEW_PRIVS)", &io::Error::last_os_error()),
         );
     } else {
-        match apply_seccomp("unrestricted", false) {
+        match apply_seccomp() {
             Ok(()) => {
                 // SAFETY: PR_GET_SECCOMP has no pointer arguments and returns the active mode.
                 let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
@@ -406,11 +380,6 @@ pub fn read_launcher_event(stream: &mut UnixStream) -> io::Result<LauncherEvent>
         INTERNAL_EXIT => serde_json::from_slice(&payload)
             .map(LauncherEvent::Final)
             .map_err(invalid_data),
-        INTERNAL_STDIN_CREDIT if payload.len() == 8 => {
-            let mut bytes = [0_u8; 8];
-            bytes.copy_from_slice(&payload);
-            Ok(LauncherEvent::StdinCredit(u64::from_be_bytes(bytes)))
-        }
         INTERNAL_SETUP_ERROR => serde_json::from_slice(&payload)
             .map(LauncherEvent::RuntimeError)
             .map_err(invalid_data),
@@ -419,44 +388,6 @@ pub fn read_launcher_event(stream: &mut UnixStream) -> io::Result<LauncherEvent>
             "unknown launcher event",
         )),
     }
-}
-
-pub fn receive_managed_listener_fds(stream: &UnixStream) -> io::Result<Vec<File>> {
-    let (count, files) = receive_fds(stream.as_raw_fd())?;
-    if count != 4 || files.len() != 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "managed network listener bundle must contain four descriptors",
-        ));
-    }
-    Ok(files)
-}
-
-/// Receive the gated target's pidfd in the host PID namespace. The target cannot
-/// execute or fork until the supervisor admits it to the requested resource scope.
-pub fn receive_target_pid(stream: &UnixStream) -> io::Result<u32> {
-    let (count, files) = receive_fds(stream.as_raw_fd())?;
-    if count != 1 || files.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "expected one target pidfd",
-        ));
-    }
-    let information = fs::read_to_string(format!("/proc/self/fdinfo/{}", files[0].as_raw_fd()))?;
-    information
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:")?.trim().parse::<u32>().ok())
-        .filter(|pid| *pid > 0)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "target pidfd has no live host process",
-            )
-        })
-}
-
-pub fn admit_target(stream: &mut UnixStream) -> io::Result<()> {
-    stream.write_all(&[1])
 }
 
 pub fn vmm_launcher_main() -> i32 {
@@ -556,7 +487,7 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
     Ok(())
 }
 
-fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
+fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmSandboxSpec {
     let mut mounts = vec![
         (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
         (
@@ -642,106 +573,43 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
         args.push("--config-file".into());
         args.push("/vm/state/firecracker.json".into());
     }
-    LaunchSpec {
-        filesystem_kind: "isolated".into(),
+    VmmSandboxSpec {
         launcher_fd_index: spec.namespace_launcher_fd_index,
         mounts,
-        masks: Vec::new(),
-        private_home: None,
-        temporary: None,
-        executable_fd_index: spec.firecracker_fd_index,
-        executable_identity: spec.firecracker_identity,
-        executable_content_sha256: spec.firecracker_sha256.clone(),
-        executable_snapshot_path: "/.sandbox-runtime/firecracker".into(),
-        cwd: PreparedCwd::Bound {
-            fd_index: spec.state_directory_fd_index,
-            identity: spec.state_directory_identity,
-            target_path: "/vm/state".into(),
-        },
-        executable: "/.sandbox-runtime/firecracker".into(),
+        firecracker_fd_index: spec.firecracker_fd_index,
+        firecracker_identity: spec.firecracker_identity,
+        firecracker_sha256: spec.firecracker_sha256.clone(),
+        state_directory_fd_index: spec.state_directory_fd_index,
+        state_directory_identity: spec.state_directory_identity,
         args,
-        environment: BTreeMap::new(),
-        resources: ResourceLimits {
-            // The generic launcher does not interpret these two legacy fields;
-            // VMM lifetime and diagnostics belong to the guardian.
-            wall_time: HardLimit {
-                enforcement: "guardian".into(),
-                scope: "sandbox".into(),
-                value: u64::MAX,
-            },
-            cpu_time: None,
-            memory: None,
-            process_count: None,
-            open_files: Some(HardLimit {
-                enforcement: "hard".into(),
-                scope: "vmm".into(),
-                value: spec.open_files_limit,
-            }),
-            single_file_size: Some(HardLimit {
-                enforcement: "hard".into(),
-                scope: "vmm".into(),
-                value: spec.file_size_limit,
-            }),
-            output: HardLimit {
-                enforcement: "guardian".into(),
-                scope: "diagnostics".into(),
-                value: 64 * 1024 * 1024,
-            },
-        },
+        open_files_limit: spec.open_files_limit,
+        file_size_limit: spec.file_size_limit,
         termination_grace_ms: spec.termination_grace_ms,
-        network_mode: "none".into(),
     }
 }
 
 fn namespace_init(
     control: &mut UnixStream,
-    spec: &LaunchSpec,
+    spec: &VmmSandboxSpec,
     files: Vec<File>,
-    isolated: bool,
 ) -> io::Result<i32> {
-    let managed_environment = if spec.network_mode == "managed" {
-        setup_managed_listeners(control)?
-    } else {
-        BTreeMap::new()
-    };
-    let (stdin_read, stdin_write) = pipe_cloexec()?;
     let (exec_status_read, mut exec_status_write) = pipe_cloexec()?;
-    let gate = if spec.resources.memory.is_some() || spec.resources.process_count.is_some() {
-        Some(pipe_cloexec()?)
-    } else {
-        None
-    };
     // SAFETY: namespace init remains single-threaded, and the child immediately performs bounded setup then exec/_exit.
     let target_pid = unsafe { libc::fork() };
     if target_pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if target_pid == 0 {
-        drop(stdin_write);
         drop(exec_status_read);
-        if let Some((mut read, write)) = gate {
-            drop(write);
-            let mut admitted = [0];
-            if read.read_exact(&mut admitted).is_err() || admitted != [1] {
-                // SAFETY: this post-fork child has not executed target code; failed admission terminates it.
-                unsafe { libc::_exit(125) };
-            }
-        }
         // SAFETY: setpgid(0, 0) affects only the calling child and uses no pointers.
         if unsafe { libc::setpgid(0, 0) } != 0 {
-            let error = context("create target process group", io::Error::last_os_error());
+            let error = context("create VMM process group", io::Error::last_os_error());
             let _ = exec_status_write.write_all(error.to_string().as_bytes());
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
             unsafe { libc::_exit(125) };
         }
-        if let Err(error) = target_exec(
-            stdin_read.as_raw_fd(),
-            spec,
-            &files,
-            &managed_environment,
-            isolated,
-        ) {
-            let error = context("target exec setup", error);
+        if let Err(error) = vmm_exec(spec, &files) {
+            let error = context("Firecracker exec setup", error);
             let _ = exec_status_write.write_all(error.to_string().as_bytes());
             // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
             unsafe { libc::_exit(125) };
@@ -749,27 +617,12 @@ fn namespace_init(
         unreachable!();
     }
     drop(files);
-    drop(stdin_read);
     drop(exec_status_write);
-    if let Some((read, mut write)) = gate {
-        drop(read);
-        let target = open_pidfd(target_pid as u32)?;
-        send_fds(control.as_raw_fd(), 1, &[target])?;
-        let mut admitted = [0];
-        control.read_exact(&mut admitted)?;
-        if admitted != [1] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid resource admission",
-            ));
-        }
-        write.write_all(&admitted)?;
-    }
     let mut setup_error = Vec::new();
     exec_status_read.take(4097).read_to_end(&mut setup_error)?;
     if !setup_error.is_empty() {
         let failure = LauncherSetupError {
-            code: "setup.target_exec".into(),
+            code: "setup.firecracker-exec".into(),
             message: String::from_utf8_lossy(&setup_error[..setup_error.len().min(4096)])
                 .into_owned(),
         };
@@ -791,13 +644,7 @@ fn namespace_init(
         INTERNAL_STARTED,
         &serde_json::to_vec(&started).map_err(invalid_data)?,
     )?;
-    let final_status = supervise_process(
-        control,
-        stdin_write,
-        target_pid,
-        spec.termination_grace_ms,
-        isolated,
-    )?;
+    let final_status = supervise_vmm(control, target_pid, spec.termination_grace_ms)?;
     write_internal(
         control,
         INTERNAL_EXIT,
@@ -806,202 +653,115 @@ fn namespace_init(
     Ok(status_to_exit(final_status.raw_wait_status))
 }
 
-fn target_exec(
-    stdin_fd: RawFd,
-    spec: &LaunchSpec,
-    files: &[File],
-    managed_environment: &BTreeMap<String, String>,
-    isolated: bool,
-) -> io::Result<()> {
-    // SAFETY: stdin_fd is an owned live pipe descriptor; dup2 atomically replaces descriptor 0.
-    if unsafe { libc::dup2(stdin_fd, libc::STDIN_FILENO) } < 0 {
-        return Err(context("install target stdin", io::Error::last_os_error()));
-    }
-    let cwd_target = match &spec.cwd {
-        PreparedCwd::Bound {
-            fd_index,
-            identity,
-            target_path,
-        } => {
-            let prepared = files.get(*fd_index).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "cwd descriptor index is invalid",
-                )
-            })?;
-            let target = PathBuf::from(target_path);
-            let opened = open_path(&target, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-                .map_err(|error| context("open mounted working directory", error))?;
-            if file_identity(opened.as_raw_fd())? != *identity
-                || file_identity(prepared.as_raw_fd())? != *identity
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "working directory identity changed",
-                ));
-            }
-            (target_path.clone(), Some(opened))
-        }
-        PreparedCwd::Synthetic { target_path, .. } => (target_path.clone(), None),
-    };
-
-    let executable = files.get(spec.executable_fd_index).ok_or_else(|| {
+fn vmm_exec(spec: &VmmSandboxSpec, files: &[File]) -> io::Result<()> {
+    let state_directory = files.get(spec.state_directory_fd_index).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            "executable descriptor index is invalid",
+            "state directory index is invalid",
         )
     })?;
-    if file_identity(executable.as_raw_fd())? != spec.executable_identity {
+    let mounted_state = open_path(
+        Path::new("/vm/state"),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    if file_identity(state_directory.as_raw_fd())? != spec.state_directory_identity
+        || file_identity(mounted_state.as_raw_fd())? != spec.state_directory_identity
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "executable identity changed",
+            "VMM state directory identity changed",
         ));
     }
-    if sha256_file(executable)? != spec.executable_content_sha256 {
+    let firecracker = files.get(spec.firecracker_fd_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firecracker descriptor index is invalid",
+        )
+    })?;
+    if file_identity(firecracker.as_raw_fd())? != spec.firecracker_identity {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "prepared executable snapshot digest changed",
+            "Firecracker identity changed",
         ));
     }
-    if spec.filesystem_kind == "isolated" {
-        let mounted_executable = open_path(
-            Path::new(&spec.executable_snapshot_path),
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        )?;
-        if sha256_file(&mounted_executable)? != spec.executable_content_sha256 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "mounted executable snapshot digest changed",
-            ));
-        }
+    if sha256_file(firecracker)? != spec.firecracker_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firecracker digest changed",
+        ));
     }
-
-    let cwd = CString::new(cwd_target.0).map_err(invalid_data)?;
-    // SAFETY: cwd is a valid CString validated and identity-checked inside the new root.
+    let mounted_firecracker = open_path(
+        Path::new("/.sandsurf/firecracker"),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+    )?;
+    if sha256_file(&mounted_firecracker)? != spec.firecracker_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mounted Firecracker digest changed",
+        ));
+    }
+    let cwd = c"/vm/state";
+    // SAFETY: the fixed path names the identity-checked mounted state directory.
     if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
         return Err(context(
-            "select prepared working directory",
+            "select VMM state directory",
             io::Error::last_os_error(),
         ));
     }
-    drop(cwd_target.1);
-
-    drop_capabilities(isolated).map_err(|error| context("drop capabilities", error))?;
+    drop(mounted_state);
+    drop_capabilities(true).map_err(|error| context("drop capabilities", error))?;
     // SAFETY: PR_SET_NO_NEW_PRIVS takes scalar arguments and only restricts this process.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(context("set no_new_privs", io::Error::last_os_error()));
     }
     apply_landlock(spec).map_err(|error| context("install Landlock ruleset", error))?;
-    apply_seccomp(&spec.network_mode, spec.filesystem_kind == "host")
-        .map_err(|error| context("install seccomp filter", error))?;
+    apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
 
     prepare_descriptors_for_exec().map_err(|error| context("close ambient descriptors", error))?;
 
-    let executable_name = CString::new(spec.executable.as_bytes()).map_err(invalid_data)?;
+    let executable_name = CString::new("/.sandsurf/firecracker").map_err(invalid_data)?;
     let mut arguments = Vec::with_capacity(spec.args.len() + 1);
     arguments.push(executable_name);
     for argument in &spec.args {
         arguments.push(CString::new(argument.as_bytes()).map_err(invalid_data)?);
     }
     let argument_pointers = c_string_pointers(&arguments);
-    let mut environment_values = spec.environment.clone();
-    environment_values.extend(managed_environment.clone());
-    let environment: Vec<CString> = environment_values
-        .iter()
-        .map(|(name, value)| CString::new(format!("{name}={value}")).map_err(invalid_data))
-        .collect::<io::Result<_>>()?;
+    let environment = Vec::<CString>::new();
     let environment_pointers = c_string_pointers(&environment);
-    apply_rlimits(&spec.resources).map_err(|error| context("apply target rlimits", error))?;
-    let result = if spec.filesystem_kind == "host" {
-        // SAFETY: executable is the verified sealed snapshot retained through setup;
-        // argv and envp are live NUL-terminated arrays.
-        unsafe {
-            libc::fexecve(
-                executable.as_raw_fd(),
-                argument_pointers.as_ptr(),
-                environment_pointers.as_ptr(),
-            )
-        }
-    } else {
-        let launch_path =
-            CString::new(spec.executable_snapshot_path.as_bytes()).map_err(invalid_data)?;
-        // SAFETY: launch_path names the read-only bind mount of the sealed snapshot.
-        unsafe {
-            libc::execve(
-                launch_path.as_ptr(),
-                argument_pointers.as_ptr(),
-                environment_pointers.as_ptr(),
-            )
-        }
+    apply_vmm_rlimits(spec).map_err(|error| context("apply VMM rlimits", error))?;
+    let launch_path = c"/.sandsurf/firecracker";
+    // SAFETY: launch_path is the verified read-only Firecracker bind mount and
+    // argv/envp are live NUL-terminated arrays.
+    let result = unsafe {
+        libc::execve(
+            launch_path.as_ptr(),
+            argument_pointers.as_ptr(),
+            environment_pointers.as_ptr(),
+        )
     } as libc::c_long;
     if result != 0 {
         return Err(context(
-            "execve prepared executable snapshot mount",
+            "execve verified Firecracker mount",
             io::Error::last_os_error(),
         ));
     }
     Ok(())
 }
 
-fn setup_managed_listeners(control: &mut UnixStream) -> io::Result<BTreeMap<String, String>> {
-    let http = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    let socks = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    let dns_udp = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 53))?;
-    let dns_tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 53))?;
-    let http_port = http.local_addr()?.port();
-    let socks_port = socks.local_addr()?.port();
-    let listeners = vec![
-        // SAFETY: each into_raw_fd transfers one distinct socket descriptor exactly once.
-        unsafe { File::from_raw_fd(http.into_raw_fd()) },
-        // SAFETY: each into_raw_fd transfers one distinct socket descriptor exactly once.
-        unsafe { File::from_raw_fd(socks.into_raw_fd()) },
-        // SAFETY: each into_raw_fd transfers one distinct socket descriptor exactly once.
-        unsafe { File::from_raw_fd(dns_udp.into_raw_fd()) },
-        // SAFETY: each into_raw_fd transfers one distinct socket descriptor exactly once.
-        unsafe { File::from_raw_fd(dns_tcp.into_raw_fd()) },
-    ];
-    send_fds(control.as_raw_fd(), listeners.len() as u32, &listeners)?;
-    Ok(BTreeMap::from([
-        ("HTTP_PROXY".into(), format!("http://127.0.0.1:{http_port}")),
-        (
-            "HTTPS_PROXY".into(),
-            format!("http://127.0.0.1:{http_port}"),
-        ),
-        (
-            "ALL_PROXY".into(),
-            format!("socks5h://127.0.0.1:{socks_port}"),
-        ),
-        ("NO_PROXY".into(), String::new()),
-    ]))
-}
-
-fn supervise_process(
+fn supervise_vmm(
     control: &mut UnixStream,
-    stdin_write: File,
     target_pid: libc::pid_t,
     termination_grace_ms: u64,
-    isolated: bool,
 ) -> io::Result<LauncherFinalStatus> {
     let mut target_status = None;
     let mut terminating_at: Option<Instant> = None;
-    let mut stdin_open = true;
-    let mut stdin_close_requested = false;
-    let mut stdin_queue = Vec::new();
-    let mut stdin_offset = 0_usize;
     let mut decoder = InternalDecoder::default();
     control.set_nonblocking(true)?;
-    set_nonblocking(stdin_write.as_raw_fd(), true)?;
-    let mut stdin_write = Some(stdin_write);
     loop {
         reap_children(target_pid, &mut target_status)?;
         if let Some(status) = target_status {
             let mut cleanup_failures = Vec::new();
-            let cleanup = if isolated {
-                kill_all_children()
-            } else {
-                signal_process_group(target_pid, libc::SIGKILL)
-            };
-            if let Err(error) = cleanup {
+            if let Err(error) = kill_all_children() {
                 cleanup_failures.push(format!("kill descendants: {error}"));
             }
             let tree_reaped = match reap_until_empty() {
@@ -1022,23 +782,7 @@ fn supervise_process(
             Ok(messages) => {
                 for (kind, payload) in messages {
                     match kind {
-                        INTERNAL_STDIN if stdin_open && !stdin_close_requested => {
-                            if stdin_queue.len().saturating_sub(stdin_offset) + payload.len()
-                                > sandbox_protocol_credit_limit()
-                            {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "stdin queue exceeded granted credit",
-                                ));
-                            }
-                            if stdin_offset == stdin_queue.len() {
-                                stdin_queue.clear();
-                                stdin_offset = 0;
-                            }
-                            stdin_queue.extend_from_slice(&payload);
-                        }
-                        INTERNAL_CLOSE_STDIN => stdin_close_requested = true,
-                        INTERNAL_TERMINATE => {
+                        INTERNAL_TERMINATE if payload.is_empty() => {
                             if terminating_at.is_none() {
                                 signal_process_group(target_pid, libc::SIGTERM)?;
                                 terminating_at = Some(Instant::now());
@@ -1059,37 +803,6 @@ fn supervise_process(
             }
             Err(error) => return Err(error),
         }
-        if stdin_open && stdin_offset < stdin_queue.len() {
-            let Some(writer) = stdin_write.as_mut() else {
-                stdin_open = false;
-                continue;
-            };
-            match writer.write(&stdin_queue[stdin_offset..]) {
-                Ok(0) => stdin_open = false,
-                Ok(count) => {
-                    stdin_offset += count;
-                    write_internal(
-                        control,
-                        INTERNAL_STDIN_CREDIT,
-                        &(count as u64).to_be_bytes(),
-                    )?;
-                    if stdin_offset == stdin_queue.len() {
-                        stdin_queue.clear();
-                        stdin_offset = 0;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => stdin_open = false,
-            }
-        }
-        if !stdin_open {
-            stdin_queue.clear();
-            stdin_write.take();
-        } else if stdin_close_requested && stdin_queue.is_empty() {
-            stdin_open = false;
-            stdin_write.take();
-        }
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -1109,21 +822,10 @@ fn final_status(
     }
 }
 
-fn sandbox_protocol_credit_limit() -> usize {
-    1024 * 1024
-}
-
-fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
-    if !matches!(spec.filesystem_kind.as_str(), "host" | "isolated")
-        || (spec.filesystem_kind == "host" && spec.network_mode == "managed")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid launcher filesystem and network combination",
-        ));
-    }
+fn validate_vmm_sandbox_spec(spec: &VmmSandboxSpec, descriptor_count: usize) -> io::Result<()> {
     if spec.launcher_fd_index >= descriptor_count
-        || spec.executable_fd_index >= descriptor_count
+        || spec.firecracker_fd_index >= descriptor_count
+        || spec.state_directory_fd_index >= descriptor_count
         || spec
             .mounts
             .iter()
@@ -1134,19 +836,10 @@ fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
             "launcher descriptor index is outside the received set",
         ));
     }
-    if spec.args.len() > 65_536 || spec.environment.len() > 65_536 {
+    if spec.args.len() > 16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "launcher vector count exceeds limit",
-        ));
-    }
-    if !matches!(
-        spec.network_mode.as_str(),
-        "none" | "managed" | "unrestricted"
-    ) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid network mode",
+            "VMM argument count exceeds limit",
         ));
     }
     for mount in &spec.mounts {
@@ -1158,30 +851,12 @@ fn validate_spec(spec: &LaunchSpec, descriptor_count: usize) -> io::Result<()> {
             ));
         }
     }
-    validate_target(&spec.executable_snapshot_path)?;
-    if !spec
-        .executable_snapshot_path
-        .starts_with("/.sandbox-runtime/")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "executable snapshot path is outside the reserved runtime namespace",
-        ));
-    }
     Ok(())
 }
 
-fn apply_rlimits(limits: &ResourceLimits) -> io::Result<()> {
-    if let Some(limit) = &limits.open_files {
-        set_rlimit(libc::RLIMIT_NOFILE, limit.value)?;
-    }
-    if let Some(limit) = &limits.single_file_size {
-        set_rlimit(libc::RLIMIT_FSIZE, limit.value)?;
-    }
-    if let Some(cpu_time) = &limits.cpu_time {
-        let soft = cpu_time.value.div_ceil(1000);
-        set_rlimit_pair(libc::RLIMIT_CPU, soft, soft.saturating_add(1))?;
-    }
+fn apply_vmm_rlimits(spec: &VmmSandboxSpec) -> io::Result<()> {
+    set_rlimit(libc::RLIMIT_NOFILE, spec.open_files_limit)?;
+    set_rlimit(libc::RLIMIT_FSIZE, spec.file_size_limit)?;
     Ok(())
 }
 
@@ -1320,7 +995,7 @@ fn landlock_abi() -> io::Result<u32> {
     u32::try_from(result).map_err(invalid_data)
 }
 
-fn apply_landlock(spec: &LaunchSpec) -> io::Result<()> {
+fn apply_landlock(spec: &VmmSandboxSpec) -> io::Result<()> {
     let abi = landlock_abi()?;
     let mut handled = LL_EXECUTE
         | LL_WRITE_FILE
@@ -1386,44 +1061,16 @@ fn apply_landlock(spec: &LaunchSpec) -> io::Result<()> {
         add_landlock_rule(&ruleset, Path::new(&mount.target_path), access & handled)
             .map_err(|error| context(&format!("add Landlock rule {}", mount.target_path), error))?;
     }
-    if let Some(private_home) = &spec.private_home {
-        let access = LL_READ
-            | LL_WRITE
-            | if private_home.executable {
-                LL_EXECUTE
-            } else {
-                0
-            };
-        add_landlock_rule(
-            &ruleset,
-            Path::new(&private_home.target_path),
-            access & handled,
-        )
-        .map_err(|error| context("add Landlock rule private home", error))?;
-    }
-    if let Some(temporary) = &spec.temporary {
-        let temp_access = LL_READ | LL_WRITE | if temporary.executable { LL_EXECUTE } else { 0 };
-        add_landlock_rule(
-            &ruleset,
-            Path::new(&temporary.target_path),
-            temp_access & handled,
-        )
-        .map_err(|error| context("add Landlock rule temporary directory", error))?;
-    }
-    if spec.filesystem_kind == "isolated" {
-        add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
-            .map_err(|error| context("add Landlock rule /dev", error))?;
-        add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
-            .map_err(|error| context("add Landlock rule /proc", error))?;
-        add_landlock_rule(&ruleset, Path::new("/etc"), LL_READ & handled)
-            .map_err(|error| context("add Landlock rule /etc", error))?;
-        add_landlock_rule(
-            &ruleset,
-            Path::new(&spec.executable_snapshot_path),
-            (LL_READ_FILE | LL_EXECUTE) & handled,
-        )
-        .map_err(|error| context("add Landlock rule executable snapshot", error))?;
-    }
+    add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
+        .map_err(|error| context("add Landlock rule /dev", error))?;
+    add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
+        .map_err(|error| context("add Landlock rule /proc", error))?;
+    add_landlock_rule(
+        &ruleset,
+        Path::new("/.sandsurf/firecracker"),
+        (LL_READ_FILE | LL_EXECUTE) & handled,
+    )
+    .map_err(|error| context("add Landlock rule Firecracker", error))?;
 
     // SAFETY: ruleset is a live Landlock ruleset descriptor and flags zero is required by the negotiated ABI.
     if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 {
@@ -1466,13 +1113,13 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
 
-fn apply_seccomp(network_mode: &str, host_layout: bool) -> io::Result<()> {
+fn apply_seccomp() -> io::Result<()> {
     let architecture = if cfg!(target_arch = "x86_64") {
         AUDIT_ARCH_X86_64
     } else {
         AUDIT_ARCH_AARCH64
     };
-    let blocked = blocked_syscalls(network_mode, host_layout);
+    let blocked = blocked_syscalls();
     let mut filters = Vec::with_capacity(blocked.len() * 2 + 10);
     filters.push(stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4));
     filters.push(jump(
@@ -1547,8 +1194,8 @@ fn apply_seccomp(network_mode: &str, host_layout: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn blocked_syscalls(network_mode: &str, host_layout: bool) -> Vec<libc::c_long> {
-    let mut syscalls = vec![
+fn blocked_syscalls() -> Vec<libc::c_long> {
+    vec![
         libc::SYS_mount,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
@@ -1572,32 +1219,7 @@ fn blocked_syscalls(network_mode: &str, host_layout: bool) -> Vec<libc::c_long> 
         libc::SYS_keyctl,
         libc::SYS_perf_event_open,
         libc::SYS_clone3,
-    ];
-    if host_layout {
-        syscalls.extend([
-            libc::SYS_setsid,
-            libc::SYS_setpgid,
-            libc::SYS_kill,
-            libc::SYS_tkill,
-            libc::SYS_tgkill,
-            libc::SYS_pidfd_open,
-            libc::SYS_pidfd_send_signal,
-            libc::SYS_process_vm_readv,
-            libc::SYS_process_vm_writev,
-        ]);
-    }
-    if host_layout && network_mode == "none" {
-        syscalls.extend([
-            libc::SYS_socket,
-            libc::SYS_socketpair,
-            libc::SYS_connect,
-            libc::SYS_bind,
-            libc::SYS_listen,
-            libc::SYS_accept,
-            libc::SYS_accept4,
-        ]);
-    }
-    syscalls
+    ]
 }
 
 const fn stmt(code: u16, value: u32) -> libc::sock_filter {
@@ -1888,24 +1510,6 @@ fn read_internal(stream: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
     Ok((header[0], payload))
 }
 
-fn set_nonblocking(fd: RawFd, enabled: bool) -> io::Result<()> {
-    // SAFETY: F_GETFL reads scalar descriptor flags from a live descriptor.
-    let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if current < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let flags = if enabled {
-        current | libc::O_NONBLOCK
-    } else {
-        current & !libc::O_NONBLOCK
-    };
-    // SAFETY: F_SETFL updates only status flags on the same live descriptor.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 fn send_fds(socket: RawFd, length: u32, files: &[File]) -> io::Result<()> {
     if files.is_empty() {
         return Err(io::Error::new(
@@ -2082,9 +1686,9 @@ mod tests {
     #[test]
     fn internal_messages_are_bounded_and_round_trip() {
         let (mut left, mut right) = UnixStream::pair().expect("pair");
-        write_internal(&mut left, INTERNAL_STDIN, b"abc").expect("write");
+        write_internal(&mut left, INTERNAL_TERMINATE, b"abc").expect("write");
         let (kind, value) = read_internal(&mut right).expect("read");
-        assert_eq!(kind, INTERNAL_STDIN);
+        assert_eq!(kind, INTERNAL_TERMINATE);
         assert_eq!(value, b"abc");
     }
 
@@ -2113,7 +1717,7 @@ mod tests {
     fn nonblocking_internal_decoder_preserves_partial_frames() {
         let (mut writer, mut reader) = UnixStream::pair().expect("pair");
         reader.set_nonblocking(true).expect("nonblocking");
-        let mut frame = vec![INTERNAL_STDIN];
+        let mut frame = vec![INTERNAL_TERMINATE];
         frame.extend_from_slice(&3_u32.to_be_bytes());
         frame.extend_from_slice(b"abc");
         writer.write_all(&frame[..2]).expect("partial header");
@@ -2134,7 +1738,7 @@ mod tests {
         writer.write_all(&frame[6..]).expect("final payload");
         assert_eq!(
             decoder.read_available(&mut reader).expect("complete"),
-            vec![(INTERNAL_STDIN, b"abc".to_vec())]
+            vec![(INTERNAL_TERMINATE, b"abc".to_vec())]
         );
     }
 
@@ -2142,7 +1746,7 @@ mod tests {
     fn nonblocking_internal_decoder_rejects_length_lies() {
         let (mut writer, mut reader) = UnixStream::pair().expect("pair");
         reader.set_nonblocking(true).expect("nonblocking");
-        let mut frame = vec![INTERNAL_STDIN];
+        let mut frame = vec![INTERNAL_TERMINATE];
         frame.extend_from_slice(&((MAX_INTERNAL_MESSAGE as u32) + 1).to_be_bytes());
         writer.write_all(&frame).expect("malformed frame");
         assert_eq!(

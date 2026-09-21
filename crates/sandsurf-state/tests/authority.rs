@@ -346,6 +346,7 @@ fn runtime_limits() -> RuntimeLimits {
         identities: n(16),
         operations: n(64),
         observations: n(1000),
+        events: n(4096),
         chunks: n(1000),
         pins: n(64),
         output_bytes: n(1000),
@@ -540,6 +541,53 @@ impl Fixture {
             },
         }
     }
+}
+
+#[test]
+fn runtime_events_are_digest_bound_paginated_and_replayable_after_reopen() {
+    let mut fixture = Fixture::new();
+    fixture.terminal();
+    let mut cursor = Counter::ZERO;
+    let mut values = Vec::new();
+    loop {
+        let page = fixture.runtime.events(cursor, 2).unwrap();
+        assert!(page.cursor >= cursor);
+        for event in page.events {
+            assert_eq!(event.cursor, cursor.next().unwrap());
+            cursor = event.cursor;
+            values.push(event.value);
+        }
+        if cursor == page.available {
+            break;
+        }
+    }
+    assert!(
+        values
+            .iter()
+            .any(|value| matches!(value, RuntimeEventValue::Machine { .. }))
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| matches!(value, RuntimeEventValue::WorkloadOperation { .. }))
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| matches!(value, RuntimeEventValue::Output { .. }))
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| matches!(value, RuntimeEventValue::Receipt { .. }))
+    );
+
+    let path = fixture.root.0.join("runtime");
+    drop(fixture.runtime);
+    let reopened = RuntimeJournal::open(&path, &fixture.sandbox).unwrap();
+    let tail = reopened.events(Counter::ZERO, 256).unwrap();
+    assert_eq!(tail.cursor, cursor);
+    assert_eq!(tail.available, cursor);
 }
 
 fn dispatch(runtime: &mut RuntimeJournal, host: &HostCatalog, mutation: &Mutation) {

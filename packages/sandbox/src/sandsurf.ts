@@ -55,6 +55,8 @@ export interface ReceiptView { readonly receipt: Receipt; readonly digest: strin
 export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: Readonly<Record<string, unknown>>; }
 export type ReleaseDisposition = { readonly kind: "complete-capture"; readonly commitment: CaptureCommitment } | { readonly kind: "continuing-retention"; readonly pin: string } | { readonly kind: "authorized-loss"; readonly authorization?: string };
 export interface ReleaseStatus { readonly requestDigest: string; readonly cleanupPending: boolean; }
+export interface SandboxEvent { readonly cursor: number; readonly value: Readonly<Record<string, unknown>>; readonly digest: string; }
+export interface SandboxEventPage { readonly cursor: number; readonly available: number; readonly events: readonly SandboxEvent[]; }
 
 export class Sandsurf {
   readonly sandboxes: SandboxCollection;
@@ -205,6 +207,7 @@ export class Sandbox {
   readonly fs: SandboxFilesystem;
   readonly workspace: SandboxWorkspace;
   readonly operations: SandboxOperations;
+  readonly events: SandboxEvents;
   readonly network: SandboxNetwork;
   readonly ports: SandboxPorts;
   readonly resources: SandboxResources;
@@ -212,7 +215,7 @@ export class Sandbox {
   readonly checkpoints: SandboxCheckpoints;
   readonly #host: Sandsurf;
   #view: SandboxInspection;
-  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.terminals = new TerminalCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); this.checkpoints = new SandboxCheckpoints(this, host); }
+  constructor(host: Sandsurf, view: SandboxInspection) { this.#host = host; this.#view = view; this.id = view.id; this.processes = new ProcessCollection(this); this.terminals = new TerminalCollection(this); this.fs = new SandboxFilesystem(this); this.workspace = new SandboxWorkspace(this); this.operations = new SandboxOperations(this); this.events = new SandboxEvents(this); this.network = new SandboxNetwork(this); this.ports = new SandboxPorts(this); this.resources = new SandboxResources(this); this.secrets = new SandboxSecrets(this); this.checkpoints = new SandboxCheckpoints(this, host); }
   get revision(): number { return this.#view.configurationRevision; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
   async inspect(): Promise<SandboxInspection> { this.#view = sandboxViewFrom(await this.#host.request({ kind: "get-sandbox", sandboxId: this.id })); return this.#view; }
@@ -356,9 +359,43 @@ export class SandboxOperations {
   }
 }
 
+export class SandboxEvents {
+  readonly #sandbox: Sandbox;
+  constructor(sandbox: Sandbox) { this.#sandbox = sandbox; }
+  async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<SandboxEventPage> {
+    const after = options.after ?? 0; const maximum = options.maximum ?? 256;
+    if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("event cursor must be a non-negative safe integer");
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new TypeError("event page maximum must be 1 through 256");
+    const response = await this.#sandbox.hostRequest({ kind: "list-events", sandboxId: this.#sandbox.id, after, maximum });
+    if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "events" || !record(response.response.page) || !Array.isArray(response.response.page.events)) throw protocol("event page response");
+    const page = response.response.page; const events = page.events;
+    if (!Array.isArray(events)) throw protocol("runtime events");
+    return {
+      cursor: integer(page.cursor),
+      available: integer(page.available),
+      events: Object.freeze(events.map((event: unknown) => {
+        if (!record(event) || !record(event.value)) throw protocol("runtime event");
+        return Object.freeze({ cursor: integer(event.cursor), value: Object.freeze({ ...event.value }), digest: digest(text(event.digest)) });
+      })),
+    };
+  }
+  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly pollMs?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<SandboxEvent, void> {
+    let cursor = options.after ?? 0; const poll = options.pollMs ?? 50;
+    if (!Number.isSafeInteger(poll) || poll < 1 || poll > 60_000) throw new TypeError("event poll interval must be 1 through 60000 milliseconds");
+    for (;;) {
+      if (options.signal?.aborted === true) return;
+      const page = await this.read({ after: cursor, maximum: options.maximum ?? 256 });
+      for (const event of page.events) { cursor = event.cursor; yield event; }
+      if (page.events.length === 0) await new Promise((done) => setTimeout(done, poll));
+    }
+  }
+}
+
 export interface TerminalSize { readonly columns: number; readonly rows: number; readonly pixelWidth?: number; readonly pixelHeight?: number; }
 export interface SpawnOptions { readonly operationId?: string; readonly processId?: string; readonly argv: readonly string[]; readonly cwd?: string; readonly environment?: Readonly<Record<string, string>>; readonly user?: string; readonly stdio?: "pipes" | "terminal"; readonly terminalSize?: TerminalSize; readonly lifetime?: "job" | "sandbox"; readonly deadlineMs?: number; readonly outputBytes?: number; }
 export type ExecOptions = Omit<SpawnOptions, "lifetime"> & { readonly signal?: AbortSignal; readonly pollMs?: number };
+export type ShellOptions = Omit<SpawnOptions, "argv"> & { readonly shell?: string };
+export type ExecShellOptions = Omit<ExecOptions, "argv"> & { readonly shell?: string };
 export interface ExecResult { readonly process: SandboxProcess; readonly inspection: ProcessInspection; }
 export interface ProcessInspection { readonly request: Readonly<Record<string, unknown>>; readonly guestPid: number; readonly state: Readonly<Record<string, unknown>>; readonly lineage: Readonly<Record<string, unknown>> | null; }
 export type ProcessObservation = { readonly kind: "current"; readonly value: ProcessInspection } | { readonly kind: "unavailable"; readonly lastKnown: ProcessInspection | null };
@@ -380,6 +417,16 @@ export class ProcessCollection {
     const { signal, pollMs, ...spawn } = options;
     const process = await this.spawn({ ...spawn, lifetime: "job" });
     return { process, inspection: await process.wait({ ...(signal === undefined ? {} : { signal }), ...(pollMs === undefined ? {} : { pollMs }) }) };
+  }
+  spawnShell(command: string, options: ShellOptions = {}): Promise<SandboxProcess> {
+    if (command.length === 0 || command.length > 1024 * 1024) throw new TypeError("shell command is empty or oversized");
+    const { shell = "/bin/sh", ...spawn } = options;
+    return this.spawn({ ...spawn, argv: [shell, "-lc", command] });
+  }
+  execShell(command: string, options: ExecShellOptions = {}): Promise<ExecResult> {
+    if (command.length === 0 || command.length > 1024 * 1024) throw new TypeError("shell command is empty or oversized");
+    const { shell = "/bin/sh", ...exec } = options;
+    return this.exec({ ...exec, argv: [shell, "-lc", command] });
   }
   async get(id: string): Promise<SandboxProcess> { const process = new SandboxProcess(this.#sandbox, validateIdentity(id)); await process.inspect(); return process; }
   async list(): Promise<readonly ProcessObservation[]> {
@@ -436,7 +483,20 @@ export class SandboxProcess {
   readonly id: string; readonly output: ProcessOutput; readonly #sandbox: Sandbox;
   constructor(sandbox: Sandbox, id: string) { this.#sandbox = sandbox; this.id = id; this.output = new ProcessOutput(this); }
   async inspect(): Promise<ProcessObservation> { const response = await this.#sandbox.hostRequest({ kind: "get-process", sandboxId: this.#sandbox.id, processId: this.id }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response"); if (response.response.process === null) throw new SandsurfHostError("missing", `Process ${this.id} does not exist`); return parseProcessObservation(response.response.process); }
-  async wait(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ProcessInspection> { for (;;) { if (options.signal?.aborted === true) throw options.signal.reason; const observed = await this.inspect(); if (observed.kind !== "current") throw new SandsurfHostError("unavailable", `Process ${this.id} is not currently observable`); if (observed.value.state.kind !== "running") return observed.value; await new Promise((done) => setTimeout(done, options.pollMs ?? 50)); } }
+  async wait(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ProcessInspection> {
+    if (options.signal?.aborted === true) throw options.signal.reason;
+    const boundary = await this.#sandbox.events.read({ maximum: 1 });
+    const observed = await this.inspect();
+    if (observed.kind !== "current") throw new SandsurfHostError("unavailable", `Process ${this.id} is not currently observable`);
+    if (observed.value.state.kind !== "running") return observed.value;
+    for await (const event of this.#sandbox.events.follow({ after: boundary.available, ...(options.pollMs === undefined ? {} : { pollMs: options.pollMs }), ...(options.signal === undefined ? {} : { signal: options.signal }) })) {
+      if (event.value.kind !== "process" || !record(event.value.process)) continue;
+      const process = parseProcess(event.value.process);
+      if (process.request.processId === this.id && process.state.kind !== "running") return process;
+    }
+    if (options.signal !== undefined) throw options.signal.reason;
+    throw new SandsurfHostError("unavailable", `Process ${this.id} event stream ended`);
+  }
   async readOutput(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> {
     const { after, maximum } = normalizeOutputRead(options);
     const response = await this.#sandbox.hostRequest({ kind: "read-evidence", sandboxId: this.#sandbox.id, processId: this.id, after, maximum });
@@ -725,7 +785,7 @@ function parseView(value: unknown): SandboxInspection { if (!record(value) || !r
 function currentMachine(view: SandboxInspection): { readonly epoch: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Sandbox machine observation is unavailable"); return { epoch: integer(view.machine.value.epoch) }; }
 function parseProcess(value: unknown): ProcessInspection { if (!record(value) || !record(value.request) || !record(value.state) || (value.lineage !== null && !record(value.lineage))) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state, lineage: value.lineage }; }
 function parseProcessObservation(value: unknown): ProcessObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseProcess(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseProcess(value.lastKnown) }; }
-function parseEvidencePage(value: Record<string, unknown>): OutputPage { if (!Array.isArray(value.chunks)) throw protocol("output page"); const chunks = value.chunks as unknown[]; return { after: integer(value.cursor), available: integer(value.available), chunks: chunks.map((chunk) => { if (!record(chunk) || !Array.isArray(chunk.bytes)) throw protocol("output chunk"); return { cursor: integer(chunk.offset), stream: text(chunk.stream) as OutputChunk["stream"], bytes: Uint8Array.from(chunk.bytes as number[]), digest: text(chunk.bytesDigest) }; }) }; }
+function parseEvidencePage(value: Record<string, unknown>): OutputPage { if (!Array.isArray(value.chunks)) throw protocol("output page"); const chunks = value.chunks as unknown[]; const after = integer(value.after); const cursor = integer(value.cursor); const available = integer(value.available); if (cursor < after || available < cursor) throw protocol("output page cursors"); return { after, available, chunks: chunks.map((chunk) => { if (!record(chunk) || !Array.isArray(chunk.bytes)) throw protocol("output chunk"); return { cursor: integer(chunk.offset), stream: text(chunk.stream) as OutputChunk["stream"], bytes: Uint8Array.from(chunk.bytes as number[]), digest: text(chunk.bytesDigest) }; }) }; }
 function normalizeOutputRead(options: { readonly after?: number; readonly maximum?: number }): { readonly after: number; readonly maximum: number } { const after = options.after ?? 0; const maximum = options.maximum ?? 64 * 1024; if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("output cursor must be a nonnegative safe integer"); if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256 * 1024) throw new TypeError("output page size must be 1 through 256 KiB"); return { after, maximum }; }
 function capabilityScope(sandboxId: string, capability: SandsurfCapability): string { return sandsurfDigest("grant", ["sandsurf-sandbox-capability-v1", sandboxId, capability]); }
 function normalizeNetworkPolicy(value: NetworkPolicy): NetworkPolicy {

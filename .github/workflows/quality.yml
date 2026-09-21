@@ -104,6 +104,6 @@ jobs:
       - run: cargo +nightly install cargo-fuzz --locked
       - name: Fuzz every required trust-boundary parser
         run: |
-          for target in sandsurf_protocol canonical_digest policy paths network_rules dns socks5 http_connect image_manifest guest_protocol artifact_manifest changesets; do
+          for target in sandsurf_protocol canonical_digest network_rules dns socks5 http_connect image_manifest guest_protocol; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30 -max_len=1048576
           done
