@@ -21,16 +21,20 @@ import { spawn } from "node:child_process";
 
 const kernelUrl = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/x86_64/vmlinux-6.1.177";
 const kernelSha256 = "18beee8e4b355140e637f5d2360cdf23b11a8979edbefacb3941b1ad28158f34";
+const localBuild = process.env.SANDSURF_LOCAL_IMAGE === "1";
 const signingKeyPath = process.env.SANDBOX_IMAGE_SIGNING_KEY_FILE;
-if (signingKeyPath === undefined || !isAbsolute(signingKeyPath)) {
-  throw new Error("SANDBOX_IMAGE_SIGNING_KEY_FILE must name an absolute file containing a 32-byte Ed25519 seed");
+let releaseSeed: Buffer | undefined;
+if (!localBuild) {
+  if (signingKeyPath === undefined || !isAbsolute(signingKeyPath)) {
+    throw new Error("SANDBOX_IMAGE_SIGNING_KEY_FILE must name an absolute file containing a 32-byte Ed25519 seed");
+  }
+  const signingKeyMetadata = await stat(signingKeyPath);
+  if (!signingKeyMetadata.isFile() || (signingKeyMetadata.mode & 0o077) !== 0) {
+    throw new Error("the image signing seed must be a private regular file");
+  }
+  releaseSeed = await readFile(signingKeyPath);
+  if (releaseSeed.byteLength !== 32) throw new Error("the image signing seed must contain exactly 32 bytes");
 }
-const signingKeyMetadata = await stat(signingKeyPath);
-if (!signingKeyMetadata.isFile() || (signingKeyMetadata.mode & 0o077) !== 0) {
-  throw new Error("the image signing seed must be a private regular file");
-}
-const releaseSeed = await readFile(signingKeyPath);
-if (releaseSeed.byteLength !== 32) throw new Error("the image signing seed must contain exactly 32 bytes");
 const releasePublicKey = "495b4a26a65df66f7090065ed23a30a29ad3b53e0ed90d6506a2d6c8c0aba684";
 const busyboxPath = process.env.SANDBOX_BUSYBOX_PATH ?? "/usr/bin/busybox";
 const caBundlePath = process.env.SANDBOX_CA_BUNDLE_FILE ?? "/etc/ssl/certs/ca-certificates.crt";
@@ -38,8 +42,9 @@ if (!isAbsolute(busyboxPath) || !isAbsolute(caBundlePath)) {
   throw new Error("guest runtime inputs must use absolute paths");
 }
 const guestProtocolSource = await readFile(resolve("crates/sandbox-guest/src/lib.rs"), "utf8");
+const guestProtocolMajor = Number(/GUEST_PROTOCOL_MAJOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
 const guestProtocolMinor = Number(/GUEST_PROTOCOL_MINOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
-if (!Number.isSafeInteger(guestProtocolMinor)) throw new Error("guest protocol minor is not declared");
+if (!Number.isSafeInteger(guestProtocolMajor) || !Number.isSafeInteger(guestProtocolMinor)) throw new Error("guest protocol version is not declared");
 
 if (process.platform !== "linux" || process.arch !== "x64") {
   throw new Error("the initial guest image builder requires Linux x64");
@@ -56,7 +61,8 @@ try {
 
   const root = resolve(temporary, "root");
   for (const path of [
-    "bin", "dev", "etc/ssl/certs", "home/agent", "proc", "run", "sbin", "sys/fs/cgroup", "tmp", "workspace",
+    "bin", "dev", "etc/ssl/certs", "home/agent", "proc", "run", "sandsurf/control",
+    "sandsurf/lower", "sandsurf/state", "sandsurf/workload", "sbin", "sys/fs/cgroup", "tmp", "workspace",
   ]) {
     await mkdir(resolve(root, path), { recursive: true });
   }
@@ -100,7 +106,7 @@ try {
   await createSparse(workspace, 64 * 1024 * 1024);
   await run(
     "mkfs.ext4",
-    ["-F", "-q", "-O", "^has_journal", "-U", "22222222-2222-4222-8222-222222222222", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", empty, workspace],
+    ["-F", "-q", "-U", "22222222-2222-4222-8222-222222222222", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", empty, workspace],
     process.cwd(),
     { E2FSPROGS_FAKE_TIME: "1700000000" },
   );
@@ -110,8 +116,10 @@ try {
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
   if (sha256(await readFile(kernel)) !== kernelSha256) throw new Error("guest kernel digest mismatch");
 
-  const destination = resolve("packages/sandbox/images/minimal-x64");
-  const native = resolve("packages/sandbox/native/linux-x64");
+  const explicitOutput = process.env.SANDSURF_IMAGE_OUTPUT_DIRECTORY;
+  if (explicitOutput !== undefined && !isAbsolute(explicitOutput)) throw new Error("SANDSURF_IMAGE_OUTPUT_DIRECTORY must be absolute");
+  const destination = explicitOutput ?? resolve("packages/sandbox/images/minimal-x64");
+  const native = explicitOutput ?? resolve("packages/sandbox/native/linux-x64");
   await mkdir(destination, { recursive: true });
   await mkdir(native, { recursive: true });
   await replaceArtifact(kernel, resolve(destination, "vmlinux-6.1.177"));
@@ -131,7 +139,7 @@ try {
     },
     guestAgent: {
       version: "0.1.0",
-      protocolMajor: 1,
+      protocolMajor: guestProtocolMajor,
       protocolMinor: guestProtocolMinor,
       sha256: sha256(guestBytes),
     },
@@ -139,20 +147,26 @@ try {
   } as const;
   // Rust serializes the cleared optional signature as JSON null before canonical hashing.
   const identity = identityDigest({ ...unsigned, signature: null });
-  const privateKey = createPrivateKey({
-    key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), releaseSeed]),
-    format: "der",
-    type: "pkcs8",
-  });
-  const derivedPublicKey = createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
-  if (derivedPublicKey !== releasePublicKey) throw new Error("the signing seed does not match the embedded release public key");
-  const manifest = { ...unsigned, signature: sign(null, Buffer.from(identity, "ascii"), privateKey).toString("hex") };
+  let signature: string | null = null;
+  if (releaseSeed !== undefined) {
+    const privateKey = createPrivateKey({
+      key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), releaseSeed]),
+      format: "der",
+      type: "pkcs8",
+    });
+    const derivedPublicKey = createPublicKey(privateKey).export({ format: "der", type: "spki" }).subarray(-32).toString("hex");
+    if (derivedPublicKey !== releasePublicKey) throw new Error("the signing seed does not match the embedded release public key");
+    signature = sign(null, Buffer.from(identity, "ascii"), privateKey).toString("hex");
+  }
+  const manifest = { ...unsigned, signature };
   await writeFile(resolve(destination, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
-  await writeFile(resolve("packages/sandbox/images/manifest.json"), `${JSON.stringify({
-    formatVersion: 1,
-    buildId: "sandsurf-images-0.1.0",
-    files: { "minimal-x64/manifest.json": sha256(Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`)) },
-  }, null, 2)}\n`, { mode: 0o644 });
+  if (explicitOutput === undefined) {
+    await writeFile(resolve("packages/sandbox/images/manifest.json"), `${JSON.stringify({
+      formatVersion: 1,
+      buildId: "sandsurf-images-0.1.0",
+      files: { "minimal-x64/manifest.json": sha256(Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`)) },
+    }, null, 2)}\n`, { mode: 0o644 });
+  }
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

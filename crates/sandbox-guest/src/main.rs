@@ -1,11 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use sandbox_guest::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
-use sandsurf_protocol::GuestServiceRequest;
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, Counter, Digest, Frame, FrameKind, GuestChallenge,
     GuestFinish, GuestHandshake, GuestHello, SandboxId,
 };
+use sandsurf_protocol::{GuestServiceRequest, GuestServiceResponse, bytes_digest};
 use sandsurf_workload::{
     CgroupLimits, CgroupManager, FilesystemService, PersistentWorkloadService, ProcessSupervisor,
 };
@@ -22,6 +22,7 @@ const MAX_AUTHENTICATION_DISK: u64 = 4096;
 const WORKLOAD_ROOT: &str = "/sandsurf/workload";
 const CONTROL_ROOT: &str = "/sandsurf/control";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup/sandsurf-workload";
+const SUPERVISOR_CGROUP: &str = "/sys/fs/cgroup/sandsurf-supervisor";
 
 struct BootIdentity {
     sandbox_id: SandboxId,
@@ -44,17 +45,17 @@ fn main() {
 }
 
 fn supervisor_main() -> io::Result<()> {
-    harden_supervisor()?;
-    mount_control_filesystems()?;
-    let identity = read_boot_identity()?;
-    let listener = listen_vsock(GUEST_CONTROL_PORT)?;
-    prepare_persistent_workload()?;
-    establish_workload_namespaces()?;
-    let _init = start_workload_init()?;
-
-    let processes = create_process_supervisor(&identity)?;
-    let filesystem =
-        FilesystemService::open(Path::new(WORKLOAD_ROOT), "/").map_err(io::Error::other)?;
+    harden_supervisor().map_err(|error| stage("harden protected supervisor", error))?;
+    mount_control_filesystems().map_err(|error| stage("mount control filesystems", error))?;
+    let identity = read_boot_identity().map_err(|error| stage("read boot identity", error))?;
+    let listener = listen_vsock(GUEST_CONTROL_PORT)
+        .map_err(|error| stage("listen on guest control", error))?;
+    prepare_persistent_workload().map_err(|error| stage("prepare persistent workload", error))?;
+    let processes = create_process_supervisor(&identity)
+        .map_err(|error| stage("open process supervisor", error))?;
+    let filesystem = FilesystemService::open(Path::new(WORKLOAD_ROOT), "/")
+        .map_err(io::Error::other)
+        .map_err(|error| stage("open filesystem service", error))?;
     let service = PersistentWorkloadService::new(processes, filesystem);
 
     loop {
@@ -63,7 +64,12 @@ fn supervisor_main() -> io::Result<()> {
         };
         // SAFETY: accept_connection returned one newly owned descriptor.
         let mut connection = unsafe { File::from_raw_fd(connection) };
-        let _ = serve_connection(&mut connection, &identity, &service);
+        if let Err(error) = serve_connection(&mut connection, &identity, &service) {
+            eprintln!(
+                "sandsurf guest control connection failed: {}",
+                bounded(&error.to_string())
+            );
+        }
     }
 }
 
@@ -123,7 +129,20 @@ fn serve_connection(
         }
         let request: GuestServiceRequest = serde_json::from_slice(&frame.payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let payload = serde_json::to_vec(&service.handle(request)).map_err(io::Error::other)?;
+        let response = match request {
+            GuestServiceRequest::PrepareStop => {
+                service
+                    .processes()
+                    .quiesce(std::time::Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+                sync_persistent_filesystems()?;
+                GuestServiceResponse::ReadyToStop {
+                    evidence: bytes_digest(b"guest-processes-quiesced-and-filesystems-synced-v1"),
+                }
+            }
+            request => service.handle(request),
+        };
+        let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
         if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -145,6 +164,18 @@ fn serve_connection(
         response.write(connection)?;
         connection.flush()?;
     }
+}
+
+fn sync_persistent_filesystems() -> io::Result<()> {
+    for path in ["/sandsurf/state", CONTROL_ROOT] {
+        let directory = File::open(path)?;
+        // SAFETY: syncfs borrows one valid descriptor for a mounted persistent
+        // filesystem and has no ownership transfer.
+        if unsafe { libc::syncfs(directory.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn accept_handshake(
@@ -238,34 +269,51 @@ fn mount_control_filesystems() -> io::Result<()> {
         libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
     )?;
-    let _ = fs::write(
+    // Cgroup v2 does not permit domain controllers below a cgroup that also
+    // contains processes. Move the protected supervisor first, then delegate a
+    // distinct empty subtree whose children belong only to workload processes.
+    fs::create_dir_all(SUPERVISOR_CGROUP)?;
+    fs::write(format!("{SUPERVISOR_CGROUP}/cgroup.procs"), "0\n")?;
+    fs::write(
         "/sys/fs/cgroup/cgroup.subtree_control",
         "+cpu +memory +pids +io\n",
-    );
+    )?;
+    fs::create_dir_all(CGROUP_ROOT)?;
+    fs::write(
+        format!("{CGROUP_ROOT}/cgroup.subtree_control"),
+        "+cpu +memory +pids +io\n",
+    )?;
     Ok(())
 }
 
 fn prepare_persistent_workload() -> io::Result<()> {
-    for directory in ["/sandsurf/state", "/sandsurf/lower", WORKLOAD_ROOT] {
+    for directory in [
+        "/sandsurf/state",
+        "/sandsurf/lower",
+        CONTROL_ROOT,
+        WORKLOAD_ROOT,
+    ] {
         fs::create_dir_all(directory)?;
     }
     mount(
-        Some("/dev/vdb"),
+        Some("/dev/vdc"),
         "/sandsurf/state",
         Some("ext4"),
         libc::MS_NOSUID | libc::MS_NODEV,
         Some("errors=remount-ro"),
     )?;
-    let lower_device = if Path::new("/dev/vdd").exists() {
-        "/dev/vdd"
-    } else {
-        "/dev/vda"
-    };
     mount(
-        Some(lower_device),
+        Some("/dev/vdb"),
         "/sandsurf/lower",
         Some("ext4"),
         libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+        Some("errors=remount-ro"),
+    )?;
+    mount(
+        Some("/dev/vdd"),
+        CONTROL_ROOT,
+        Some("ext4"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         Some("errors=remount-ro"),
     )?;
     fs::create_dir_all("/sandsurf/state/upper")?;
@@ -346,67 +394,8 @@ fn bind_device(name: &str) -> io::Result<()> {
     mount(Some(&source), &target, None, libc::MS_BIND, None)
 }
 
-fn establish_workload_namespaces() -> io::Result<()> {
-    let flags = libc::CLONE_NEWUSER
-        | libc::CLONE_NEWPID
-        | libc::CLONE_NEWIPC
-        | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWNET;
-    // SAFETY: unshare receives a fixed namespace flag set and affects only this
-    // dedicated guest supervisor.
-    if unsafe { libc::unshare(flags) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let _ = fs::write("/proc/self/setgroups", "deny\n");
-    fs::write("/proc/self/uid_map", "0 0 65536\n")?;
-    fs::write("/proc/self/gid_map", "0 0 65536\n")?;
-    let hostname = CString::new("sandsurf").expect("static hostname");
-    // SAFETY: hostname points to initialized bytes for the supplied length.
-    if unsafe { libc::sethostname(hostname.as_ptr().cast(), 8) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn start_workload_init() -> io::Result<libc::pid_t> {
-    // SAFETY: fork is called before any workload service threads are started.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if pid == 0 {
-        close_inherited_descriptors();
-        workload_init();
-    }
-    Ok(pid)
-}
-
-fn workload_init() -> ! {
-    // SAFETY: fixed signal dispositions and waitpid arguments are valid.
-    // SAFETY: SIGTERM/SIGINT and SIG_IGN are valid signal API constants.
-    unsafe {
-        libc::signal(libc::SIGTERM, libc::SIG_IGN);
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-    }
-    loop {
-        let mut status = 0_i32;
-        // SAFETY: PID -1 selects any orphaned child in the workload namespace.
-        let result = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if result < 0 {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-}
-
-fn close_inherited_descriptors() {
-    // SAFETY: closing an unopened descriptor number is harmless.
-    for fd in 3..1024 {
-        unsafe { libc::close(fd) };
-    }
-}
-
 fn read_boot_identity() -> io::Result<BootIdentity> {
-    let mut file = File::open("/dev/vdc")?;
+    let mut file = File::open("/dev/vde")?;
     if file.metadata()?.len() > MAX_AUTHENTICATION_DISK {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -581,6 +570,10 @@ fn hex(bytes: &[u8]) -> String {
 
 fn bounded(value: &str) -> String {
     value.chars().take(2048).collect()
+}
+
+fn stage(name: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{name}: {error}"))
 }
 
 #[cfg(test)]

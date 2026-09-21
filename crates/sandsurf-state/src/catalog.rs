@@ -271,6 +271,29 @@ impl HostCatalog {
         })
     }
 
+    /// Authorize installation of the host-owned configuration revision without
+    /// manufacturing a lifecycle intent. The guardian records the applied
+    /// revision as an observation; this catalog remains the only grant writer.
+    pub fn authorize_configuration(
+        &self,
+        sandbox: &SandboxId,
+        revision: Counter,
+    ) -> Result<AuthorizedLifecycle> {
+        require_revision(&self.db.connection, sandbox, revision)?;
+        let operation_id: OperationId = format!("configuration-{}", revision.get()).try_into()?;
+        let request_digest = digest(
+            Domain::Grant,
+            &("sandsurf-apply-configuration-v1", sandbox, revision),
+        )?;
+        self.authority.authorize_lifecycle(LifecycleCommand {
+            sandbox_id: sandbox.clone(),
+            operation_id,
+            desired: DesiredState::Running,
+            revision,
+            request_digest,
+        })
+    }
+
     /// Called with evidence read from the exclusively owned guardian journal, not client observations.
     pub fn complete_intent(
         &mut self,

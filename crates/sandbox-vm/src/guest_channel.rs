@@ -1,7 +1,10 @@
 use std::fmt::{Display, Formatter};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub trait GuestConnection: Read + Write + Send {
@@ -33,7 +36,7 @@ impl GuestChannel for UnixVsockChannel {
                 "invalid guest vsock port".into(),
             ));
         }
-        let mut stream = UnixStream::connect(&self.socket_path)?;
+        let mut stream = connect_beneath_parent(&self.socket_path)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         writeln!(stream, "CONNECT {}", self.guest_port)?;
@@ -54,6 +57,39 @@ impl GuestChannel for UnixVsockChannel {
         stream.set_write_timeout(None)?;
         Ok(Box::new(stream))
     }
+}
+
+/// Connect through a retained parent directory so the host state root never
+/// becomes part of `sockaddr_un`. This also binds path resolution to the exact
+/// directory opened by the guardian instead of resolving an arbitrarily long
+/// mutable pathname twice.
+fn connect_beneath_parent(path: &Path) -> io::Result<UnixStream> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest socket path must be absolute",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest socket has no parent directory",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "guest socket has no name"))?;
+    if name.as_bytes().is_empty() || name.as_bytes().contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "guest socket name is invalid",
+        ));
+    }
+    let directory = File::open(parent)?;
+    let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    let stream = UnixStream::connect(short)?;
+    drop(directory);
+    Ok(stream)
 }
 
 #[derive(Debug)]
@@ -94,5 +130,36 @@ mod tests {
             channel.connect(),
             Err(GuestChannelError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn descriptor_relative_socket_connect_ignores_long_state_roots() {
+        use std::fs;
+        use std::os::unix::net::UnixListener;
+
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-vsock-{}-{}",
+            std::process::id(),
+            "x".repeat(120)
+        ));
+        fs::create_dir(&root).expect("create long root");
+        let socket = root.join("guest.vsock");
+        let descriptor_path = format!(
+            "/proc/self/fd/{}/guest.vsock",
+            File::open(&root).expect("root").as_raw_fd()
+        );
+        // A temporary descriptor cannot be used after this statement; this
+        // assertion merely proves the alternate address is within the ABI.
+        assert!(descriptor_path.len() < 108);
+        let directory = File::open(&root).expect("open root");
+        let listener_path =
+            PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join("guest.vsock");
+        let listener = UnixListener::bind(listener_path).expect("bind short address");
+        let client = connect_beneath_parent(&socket).expect("connect");
+        let _server = listener.accept().expect("accept").0;
+        drop(client);
+        drop(directory);
+        fs::remove_file(&socket).expect("remove socket");
+        fs::remove_dir(&root).expect("remove root");
     }
 }

@@ -57,6 +57,11 @@ impl PersistentWorkloadService {
 
     fn handle_inner(&self, request: GuestServiceRequest) -> ServiceResult<GuestServiceResponse> {
         match request {
+            GuestServiceRequest::PrepareStop => Err((
+                "request.internal",
+                "the machine shutdown barrier is owned by the guest supervisor".into(),
+            )
+                .into()),
             GuestServiceRequest::Dispatch {
                 mutation,
                 capability,
@@ -153,6 +158,12 @@ impl PersistentWorkloadService {
                 );
             }
         };
+        if let Err(error) = &result {
+            eprintln!(
+                "sandsurf workload operation failed: {}",
+                error.to_string().chars().take(1024).collect::<String>()
+            );
+        }
         let outcome = match result {
             Ok(()) => GuestEffectOutcome::Applied {
                 evidence: effect_digest(&mutation.request_digest, b"workload-effect-applied"),

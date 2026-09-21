@@ -1,7 +1,7 @@
 use sandsurf_protocol::{
-    Counter, OutputBoundary, RetainedChunk, RetainedPage, Stream, bytes_digest,
+    Counter, OutputBoundary, ProcessId, RetainedChunk, RetainedPage, SandboxId, Stream,
+    bytes_digest, extend_output_boundary, initial_output_boundary,
 };
-use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -45,19 +45,20 @@ pub struct OutputSpool {
 }
 
 struct SpoolState {
-    cursor: u64,
-    chunks: u64,
-    stdout: u64,
-    stderr: u64,
-    terminal: u64,
+    boundary: OutputBoundary,
     file_bytes: u64,
-    chain: Sha256,
     failed: bool,
     finalized: Option<OutputBoundary>,
 }
 
 impl OutputSpool {
-    pub fn create(path: &Path, maximum: Counter) -> Result<Self, SpoolError> {
+    pub fn create(
+        path: &Path,
+        maximum: Counter,
+        sandbox: &SandboxId,
+        process: &ProcessId,
+        epoch: Counter,
+    ) -> Result<Self, SpoolError> {
         if maximum == Counter::ZERO {
             return Err(SpoolError::Invalid("reservation must be positive"));
         }
@@ -73,13 +74,9 @@ impl OutputSpool {
         Ok(Self {
             file,
             state: Mutex::new(SpoolState {
-                cursor: 0,
-                chunks: 0,
-                stdout: 0,
-                stderr: 0,
-                terminal: 0,
+                boundary: initial_output_boundary(sandbox, process, epoch)
+                    .map_err(|_| SpoolError::Invalid("output identity is invalid"))?,
                 file_bytes: 0,
-                chain: Sha256::new(),
                 failed: false,
                 finalized: None,
             }),
@@ -98,21 +95,25 @@ impl OutputSpool {
         if state.failed || state.finalized.is_some() {
             return Err(SpoolError::Failed);
         }
-        let next = state
-            .cursor
-            .checked_add(bytes.len() as u64)
-            .ok_or(SpoolError::Capacity)?;
-        if next > self.maximum || next > Counter::MAX {
+        let sequence = state
+            .boundary
+            .chunks
+            .next()
+            .map_err(|_| SpoolError::Capacity)?;
+        let next_boundary = extend_output_boundary(&state.boundary, sequence, stream, bytes)
+            .map_err(|_| SpoolError::Capacity)?;
+        if next_boundary.final_cursor.get() > self.maximum {
             state.failed = true;
             return Err(SpoolError::Capacity);
         }
-        let digest = Sha256::digest(bytes);
+        let digest = bytes_digest(bytes);
         let mut record = Vec::with_capacity(HEADER_BYTES + bytes.len());
         record.extend_from_slice(MAGIC);
-        record.extend_from_slice(&state.cursor.to_be_bytes());
+        record.extend_from_slice(&state.boundary.final_cursor.get().to_be_bytes());
         record.push(stream_tag(stream));
         record.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        record.extend_from_slice(&digest);
+        let digest_bytes = decode_digest(&digest)?;
+        record.extend_from_slice(&digest_bytes);
         record.extend_from_slice(bytes);
         let mut file = self.file.try_clone()?;
         file.seek(SeekFrom::Start(state.file_bytes))?;
@@ -124,17 +125,8 @@ impl OutputSpool {
             .file_bytes
             .checked_add(record.len() as u64)
             .ok_or(SpoolError::Capacity)?;
-        state.chain.update([stream_tag(stream)]);
-        state.chain.update((bytes.len() as u64).to_be_bytes());
-        state.chain.update(bytes);
-        state.cursor = next;
-        state.chunks += 1;
-        match stream {
-            Stream::Stdout => state.stdout += bytes.len() as u64,
-            Stream::Stderr => state.stderr += bytes.len() as u64,
-            Stream::Terminal => state.terminal += bytes.len() as u64,
-        }
-        Counter::try_from(next).map_err(|_| SpoolError::Capacity)
+        state.boundary = next_boundary;
+        Ok(state.boundary.final_cursor)
     }
 
     pub fn read(&self, after: Counter, maximum: usize) -> Result<RetainedPage, SpoolError> {
@@ -142,11 +134,11 @@ impl OutputSpool {
             return Err(SpoolError::Invalid("read bound must be 1..1 MiB"));
         }
         let state = self.state.lock().map_err(|_| SpoolError::Failed)?;
-        if after.get() > state.cursor {
+        if after > state.boundary.final_cursor {
             return Err(SpoolError::Invalid("cursor is beyond retained output"));
         }
         let expected_file_bytes = state.file_bytes;
-        let available = Counter::try_from(state.cursor).map_err(|_| SpoolError::Capacity)?;
+        let available = state.boundary.final_cursor;
         drop(state);
 
         let mut file = self.file.try_clone()?;
@@ -180,7 +172,7 @@ impl OutputSpool {
             let mut bytes = vec![0u8; length];
             file.read_exact(&mut bytes)?;
             file_cursor += length as u64;
-            if Sha256::digest(&bytes).as_slice() != &header[17..49] {
+            if decode_digest(&bytes_digest(&bytes))?.as_slice() != &header[17..49] {
                 return Err(SpoolError::Invalid("record digest mismatch"));
             }
             if cursor == after.get() {
@@ -228,15 +220,7 @@ impl OutputSpool {
             return Ok(value.clone());
         }
         self.file.sync_all()?;
-        let boundary = OutputBoundary {
-            final_cursor: Counter::try_from(state.cursor).map_err(|_| SpoolError::Capacity)?,
-            chunks: Counter::try_from(state.chunks).map_err(|_| SpoolError::Capacity)?,
-            stdout_bytes: Counter::try_from(state.stdout).map_err(|_| SpoolError::Capacity)?,
-            stderr_bytes: Counter::try_from(state.stderr).map_err(|_| SpoolError::Capacity)?,
-            terminal_bytes: Counter::try_from(state.terminal).map_err(|_| SpoolError::Capacity)?,
-            omitted_bytes: Counter::ZERO,
-            final_hash: bytes_digest(&state.chain.clone().finalize()),
-        };
+        let boundary = state.boundary.clone();
         state.finalized = Some(boundary.clone());
         Ok(boundary)
     }
@@ -244,6 +228,16 @@ impl OutputSpool {
     pub fn has_failed(&self) -> bool {
         self.state.lock().map_or(true, |state| state.failed)
     }
+}
+
+fn decode_digest(value: &sandsurf_protocol::Digest) -> Result<[u8; 32], SpoolError> {
+    let mut bytes = [0_u8; 32];
+    for (index, output) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&value.as_str()[offset..offset + 2], 16)
+            .map_err(|_| SpoolError::Invalid("digest encoding is invalid"))?;
+    }
+    Ok(bytes)
 }
 
 fn stream_tag(stream: Stream) -> u8 {
@@ -278,10 +272,21 @@ mod tests {
         ))
     }
 
+    fn spool(path: &Path, maximum: u64) -> OutputSpool {
+        OutputSpool::create(
+            path,
+            maximum.try_into().unwrap(),
+            &SandboxId::try_from("box").unwrap(),
+            &ProcessId::try_from("process").unwrap(),
+            Counter::ONE,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn binary_output_is_durable_cursor_addressed_and_finalized() {
         let path = path();
-        let spool = OutputSpool::create(&path, 1024u64.try_into().unwrap()).unwrap();
+        let spool = spool(&path, 1024);
         assert_eq!(spool.append(Stream::Stdout, &[0, 255, 1]).unwrap().get(), 3);
         assert_eq!(spool.append(Stream::Stderr, b"err").unwrap().get(), 6);
         let page = spool.read(Counter::ZERO, 1024).unwrap();
@@ -306,7 +311,7 @@ mod tests {
     #[test]
     fn capacity_failure_prevents_a_false_completion_boundary() {
         let path = path();
-        let spool = OutputSpool::create(&path, 3u64.try_into().unwrap()).unwrap();
+        let spool = spool(&path, 3);
         spool.append(Stream::Stdout, b"abc").unwrap();
         assert!(matches!(
             spool.append(Stream::Stdout, b"d"),
@@ -320,7 +325,7 @@ mod tests {
     #[test]
     fn undersized_page_reports_the_next_atomic_chunk() {
         let path = path();
-        let spool = OutputSpool::create(&path, 1024u64.try_into().unwrap()).unwrap();
+        let spool = spool(&path, 1024);
         spool.append(Stream::Stdout, b"0123456789").unwrap();
         let page = spool.read(Counter::ZERO, 4).unwrap();
         assert!(page.chunks.is_empty());

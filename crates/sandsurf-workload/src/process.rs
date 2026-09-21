@@ -183,6 +183,9 @@ impl ProcessSupervisor {
         let spool = Arc::new(OutputSpool::create(
             &directory.join("output.ssf"),
             request.output_bytes,
+            &self.sandbox_id,
+            &request.process_id,
+            self.epoch,
         )?);
         let cgroup = self
             .cgroups
@@ -376,6 +379,48 @@ impl ProcessSupervisor {
             .map(|cgroup| cgroup.usage(!matches!(entry.state(), Ok(ProcessState::Running))))
             .transpose()
             .map_err(ProcessError::Io)
+    }
+
+    /// Quiesce every admitted workload group and wait until output readers have
+    /// durably finalized their spools. This is the guest shutdown barrier: a
+    /// VMM may not be terminated after this returns an error.
+    pub fn quiesce(&self, grace: Duration) -> Result<(), ProcessError> {
+        if grace > Duration::from_secs(60) {
+            return Err(ProcessError::Invalid("quiesce grace exceeds 60 seconds"));
+        }
+        let entries: Vec<_> = self
+            .processes
+            .lock()
+            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))?
+            .values()
+            .cloned()
+            .collect();
+        for entry in &entries {
+            if matches!(entry.state()?, ProcessState::Running) {
+                send_group_signal(entry.group, libc::SIGTERM)?;
+            }
+        }
+        let deadline = Instant::now() + grace;
+        for entry in &entries {
+            while matches!(entry.state()?, ProcessState::Running) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if matches!(entry.state()?, ProcessState::Running) {
+                entry.kill_owned();
+            }
+        }
+        let finalization_deadline = Instant::now() + PROCESS_EXIT_GRACE;
+        for entry in entries {
+            while matches!(entry.state()?, ProcessState::Running)
+                && Instant::now() < finalization_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if matches!(entry.state()?, ProcessState::Running) {
+                return Err(ProcessError::Timeout);
+            }
+        }
+        Ok(())
     }
 
     fn entry(&self, id: &ProcessId) -> Result<Arc<ProcessEntry>, ProcessError> {
@@ -651,9 +696,7 @@ fn restrict_workload_capabilities() -> io::Result<()> {
         5,  // CAP_KILL
         6,  // CAP_SETGID
         7,  // CAP_SETUID
-        8,  // CAP_SETPCAP
         10, // CAP_NET_BIND_SERVICE
-        18, // CAP_SYS_CHROOT
     ];
     for capability in 0..64 {
         if ALLOWED.contains(&capability) {
@@ -677,6 +720,31 @@ fn restrict_workload_capabilities() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    let mut allowed = 0_u64;
+    for capability in ALLOWED {
+        allowed |= 1_u64 << capability;
+    }
+    let header = CapabilityHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [
+        CapabilityData {
+            effective: allowed as u32,
+            permitted: allowed as u32,
+            inheritable: 0,
+        },
+        CapabilityData {
+            effective: (allowed >> 32) as u32,
+            permitted: (allowed >> 32) as u32,
+            inheritable: 0,
+        },
+    ];
+    // SAFETY: capset receives the documented version-3 header and two fully
+    // initialized 32-bit capability words for the current process.
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     // SAFETY: both prctl operations monotonically prevent ambient or setuid
     // escalation after this trusted pre-exec boundary.
     if unsafe {
@@ -694,6 +762,20 @@ fn restrict_workload_capabilities() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
 }
 
 fn attach_current_process(attachment: Option<RawFd>) -> io::Result<()> {

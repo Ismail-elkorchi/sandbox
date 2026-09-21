@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,11 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const debugBuild = process.env.SANDBOX_NATIVE_PROFILE === "debug";
 const requestedTarget = process.env.SANDBOX_NATIVE_TARGET || undefined;
-const defaultTarget = undefined;
+// An explicit Linux target keeps target-only static-link flags away from host
+// build scripts and proc macros.
+const defaultTarget = process.platform === "linux"
+  ? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`
+  : undefined;
 const target = requestedTarget ?? defaultTarget;
 const targetHost = target === undefined ? undefined : classifyTarget(target);
 const architecture = targetHost?.architecture ?? process.arch;
@@ -27,6 +31,10 @@ const buildArguments = [
 const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
   ? { [`CARGO_TARGET_${target.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" }
   : {};
+if (nativePlatform === "linux" && !debugBuild && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
+  const linuxTarget = target ?? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
+  buildEnvironment[`CARGO_TARGET_${linuxTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`] = "-C target-feature=+crt-static";
+}
 if (nativePlatform === "windows" && !debugBuild) {
   buildEnvironment.RUSTFLAGS = `${process.env.RUSTFLAGS ?? ""} -C target-feature=+crt-static`.trim();
 }
@@ -37,22 +45,21 @@ const destinationDirectory = resolve(repository, "native", `${nativePlatform}-${
 const destinationName = `sandsurf-host-${nativePlatform}-${architecture}${executableSuffix}`;
 const destination = resolve(destinationDirectory, destinationName);
 await mkdir(destinationDirectory, { recursive: true });
-await copyFile(resolve(
+await replaceArtifact(resolve(
   repository,
   "target",
   ...(target === undefined ? [] : [target]),
   debugBuild ? "debug" : "release",
   `sandsurf-host${executableSuffix}`,
 ), destination);
-await chmod(destination, 0o755);
+if (nativePlatform === "linux") await assertStaticElf(destination);
 if (nativePlatform === "macos") {
   await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
 }
 const packageNativeRoot = resolve(repository, "packages", "sandbox", "native");
 const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform}-${architecture}`);
 await mkdir(packageDestinationDirectory, { recursive: true });
-await copyFile(destination, resolve(packageDestinationDirectory, destinationName));
-await chmod(resolve(packageDestinationDirectory, destinationName), 0o755);
+await replaceArtifact(destination, resolve(packageDestinationDirectory, destinationName));
 if (nativePlatform === "macos") {
   const helperName = `sandsurf-vz-helper-${architecture}`;
   const helper = resolve(destinationDirectory, helperName);
@@ -65,8 +72,7 @@ if (nativePlatform === "macos") {
     "--entitlements", resolve(repository, "scripts/qualification/apple.entitlements"),
     helper,
   ], {});
-  await copyFile(helper, resolve(packageDestinationDirectory, helperName));
-  await chmod(resolve(packageDestinationDirectory, helperName), 0o755);
+  await replaceArtifact(helper, resolve(packageDestinationDirectory, helperName));
 }
 await writeManifest(resolve(repository, "native"));
 await writeManifest(packageNativeRoot);
@@ -101,6 +107,18 @@ function classifyTarget(target: string): { platform: "linux" | "macos" | "window
   return { platform, architecture };
 }
 
+async function replaceArtifact(source: string, destination: string): Promise<void> {
+  const temporary = `${destination}.new-${process.pid}`;
+  await rm(temporary, { force: true });
+  try {
+    await copyFile(source, temporary);
+    await chmod(temporary, 0o755);
+    await rename(temporary, destination);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
 function run(command: string, args: readonly string[], environment: Readonly<Record<string, string>>): Promise<void> {
   return new Promise<void>((resolveRun, rejectRun) => {
     const child = spawn(command, args, { cwd: repository, stdio: "inherit", env: { ...process.env, ...environment } });
@@ -108,6 +126,20 @@ function run(command: string, args: readonly string[], environment: Readonly<Rec
     child.on("exit", (code, signal) => {
       if (code === 0) resolveRun();
       else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`));
+    });
+  });
+}
+
+function assertStaticElf(path: string): Promise<void> {
+  return new Promise<void>((resolveCheck, rejectCheck) => {
+    const output: Buffer[] = [];
+    const child = spawn("readelf", ["--program-headers", path], { stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+    child.once("error", rejectCheck);
+    child.once("exit", (code, signal) => {
+      if (code !== 0 || signal !== null) rejectCheck(new Error(`native ELF inspection failed (${code ?? signal ?? "unknown"})`));
+      else if (Buffer.concat(output).toString("utf8").includes(" INTERP ")) rejectCheck(new Error("the Linux Sandsurf host must be statically linked for confined VMM launch"));
+      else resolveCheck();
     });
   });
 }

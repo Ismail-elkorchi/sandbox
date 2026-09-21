@@ -169,12 +169,12 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
     {
         return Err(ImageError::Invalid("invalid version or identifier".into()));
     }
-    if manifest.guest_agent.protocol_major != 1
+    if manifest.guest_agent.protocol_major != 2
         || !manifest.capabilities.vsock
         || !manifest.capabilities.seccomp
     {
         return Err(ImageError::Invalid(
-            "guest must support protocol 1, vsock, and seccomp".into(),
+            "guest must support protocol 2, vsock, and seccomp".into(),
         ));
     }
     for digest in [
@@ -351,7 +351,7 @@ mod tests {
             },
             guest_agent: GuestAgentArtifact {
                 version: "1".into(),
-                protocol_major: 1,
+                protocol_major: 2,
                 protocol_minor: 3,
                 sha256: hex_sha256(b"guest-agent"),
             },

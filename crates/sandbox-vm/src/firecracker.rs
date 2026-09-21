@@ -10,10 +10,11 @@ use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -26,8 +27,12 @@ pub struct FirecrackerConfig {
     pub rootfs_image: PathBuf,
     /// Immutable distribution/workload root. The trusted bootstrap rootfs is
     /// always separate and remains the only source of the supervisor.
-    pub workload_image: Option<PathBuf>,
+    pub workload_image: PathBuf,
     pub workspace_image: PathBuf,
+    /// Protected guest replay and control state. This disk is never mounted in
+    /// the workload root and is independently bounded from writable workload
+    /// storage.
+    pub control_image: PathBuf,
     pub authentication_image: PathBuf,
     pub owner_token: String,
     pub guest_cid: u32,
@@ -39,8 +44,7 @@ pub struct FirecrackerConfig {
 pub struct FirecrackerProcess {
     child: Child,
     control: UnixStream,
-    pub stdout: Option<ChildStdout>,
-    pub stderr: Option<ChildStderr>,
+    diagnostics: Vec<JoinHandle<()>>,
     pub vsock_path: PathBuf,
     pub api_socket_path: PathBuf,
     final_status: Option<sandbox_launcher_linux::LauncherFinalStatus>,
@@ -49,13 +53,15 @@ pub struct FirecrackerProcess {
 impl FirecrackerProcess {
     pub fn spawn(config: &FirecrackerConfig) -> Result<Self, FirecrackerError> {
         validate_config(config)?;
-        fs::create_dir(&config.state_directory)?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&config.state_directory)?;
         let vm_state = config.state_directory.join("vm-state");
-        fs::create_dir(&vm_state)?;
+        fs::DirBuilder::new().mode(0o700).create(&vm_state)?;
         let vsock_path = vm_state.join("guest.vsock");
         let api_socket_path = vm_state.join("firecracker.socket");
         let config_path = vm_state.join("firecracker.json");
-        let mut drives = vec![
+        let drives = vec![
             Drive {
                 drive_id: "bootstrap".into(),
                 path_on_host: "/vm/bootstrap".into(),
@@ -63,8 +69,20 @@ impl FirecrackerProcess {
                 is_read_only: true,
             },
             Drive {
-                drive_id: "state".into(),
-                path_on_host: "/vm/state-disk".into(),
+                drive_id: "workload".into(),
+                path_on_host: "/vm/workload".into(),
+                is_root_device: false,
+                is_read_only: true,
+            },
+            Drive {
+                drive_id: "workload-state".into(),
+                path_on_host: "/vm/workload-state".into(),
+                is_root_device: false,
+                is_read_only: false,
+            },
+            Drive {
+                drive_id: "control-state".into(),
+                path_on_host: "/vm/control-state".into(),
                 is_root_device: false,
                 is_read_only: false,
             },
@@ -75,14 +93,6 @@ impl FirecrackerProcess {
                 is_read_only: true,
             },
         ];
-        if config.workload_image.is_some() {
-            drives.push(Drive {
-                drive_id: "workload".into(),
-                path_on_host: "/vm/workload".into(),
-                is_root_device: false,
-                is_read_only: true,
-            });
-        }
         let firecracker_json = FirecrackerJson {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
@@ -102,32 +112,29 @@ impl FirecrackerProcess {
                 uds_path: "/vm/state/guest.vsock".into(),
             },
         };
-        fs::write(
-            &config_path,
-            serde_json::to_vec(&firecracker_json)
+        let mut config_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config_path)?;
+        config_file.write_all(
+            &serde_json::to_vec(&firecracker_json)
                 .map_err(|error| FirecrackerError::Invalid(error.to_string()))?,
         )?;
+        config_file.sync_all()?;
 
         let mut files = Vec::new();
         let mut mounts = Vec::new();
         for (path, target, read_only, executable) in [
             (&config.kernel_image, "/vm/kernel", true, false),
             (&config.rootfs_image, "/vm/bootstrap", true, false),
-            (&config.workspace_image, "/vm/state-disk", false, false),
+            (&config.workload_image, "/vm/workload", true, false),
+            (&config.workspace_image, "/vm/workload-state", false, false),
+            (&config.control_image, "/vm/control-state", false, false),
             (&config.authentication_image, "/vm/auth", true, false),
             (&config_path, "/vm/state/firecracker.json", true, false),
         ] {
             add_mount(&mut files, &mut mounts, path, target, read_only, executable)?;
-        }
-        if let Some(workload) = &config.workload_image {
-            add_mount(
-                &mut files,
-                &mut mounts,
-                workload,
-                "/vm/workload",
-                true,
-                false,
-            )?;
         }
         add_mount(
             &mut files,
@@ -242,13 +249,29 @@ impl FirecrackerProcess {
             };
         }
         let mut child = guard.handoff();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let diagnostics = [
+            (
+                child
+                    .stdout
+                    .take()
+                    .map(|value| Box::new(value) as Box<dyn Read + Send>),
+                vm_state.join("console.log"),
+            ),
+            (
+                child
+                    .stderr
+                    .take()
+                    .map(|value| Box::new(value) as Box<dyn Read + Send>),
+                vm_state.join("vmm.log"),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(input, path)| input.map(|input| drain_diagnostic(input, path)))
+        .collect();
         Ok(Self {
             child,
             control,
-            stdout,
-            stderr,
+            diagnostics,
             vsock_path,
             api_socket_path,
             final_status: None,
@@ -337,10 +360,17 @@ impl FirecrackerProcess {
                 }
             }
             let _ = self.child.wait()?;
+            self.finish_diagnostics();
         }
         self.final_status
             .as_ref()
             .ok_or_else(|| FirecrackerError::Setup("missing VMM final status".into()))
+    }
+
+    fn finish_diagnostics(&mut self) {
+        for thread in self.diagnostics.drain(..) {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -384,6 +414,32 @@ impl ChildLaunchGuard {
         if let Err(error) = child.wait() {
             failures.push(format!("wait: {error}"));
         }
+        for (label, stream) in [
+            (
+                "stdout",
+                child
+                    .stdout
+                    .take()
+                    .map(|value| Box::new(value) as Box<dyn Read>),
+            ),
+            (
+                "stderr",
+                child
+                    .stderr
+                    .take()
+                    .map(|value| Box::new(value) as Box<dyn Read>),
+            ),
+        ] {
+            if let Some(stream) = stream {
+                let mut bytes = Vec::new();
+                if stream.take(16 * 1024 + 1).read_to_end(&mut bytes).is_ok() && !bytes.is_empty() {
+                    failures.push(format!(
+                        "{label}: {}",
+                        String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)])
+                    ));
+                }
+            }
+        }
         failures
     }
 }
@@ -401,7 +457,27 @@ impl Drop for FirecrackerProcess {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        self.finish_diagnostics();
     }
+}
+
+fn drain_diagnostic(mut input: Box<dyn Read + Send>, path: PathBuf) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        const RETAINED: u64 = 8 * 1024 * 1024;
+        let Ok(mut output) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        else {
+            let _ = io::copy(&mut input, &mut io::sink());
+            return;
+        };
+        let mut retained = (&mut input).take(RETAINED);
+        let _ = io::copy(&mut retained, &mut output);
+        let _ = output.sync_all();
+        let _ = io::copy(&mut input, &mut io::sink());
+    })
 }
 
 #[derive(Debug)]
@@ -454,7 +530,9 @@ fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
         &config.firecracker_executable,
         &config.kernel_image,
         &config.rootfs_image,
+        &config.workload_image,
         &config.workspace_image,
+        &config.control_image,
         &config.authentication_image,
     ] {
         if !path.is_absolute() || !path.is_file() {
@@ -463,13 +541,6 @@ fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
                 path.display()
             )));
         }
-    }
-    if let Some(path) = &config.workload_image
-        && (!path.is_absolute() || !path.is_file())
-    {
-        return Err(FirecrackerError::Invalid(
-            "missing immutable workload image".into(),
-        ));
     }
     Ok(())
 }

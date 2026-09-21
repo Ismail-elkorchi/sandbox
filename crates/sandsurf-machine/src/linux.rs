@@ -35,6 +35,10 @@ pub trait FirecrackerEpochFactory {
         epoch: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest>;
+
+    /// Establishes the guest's durable stop boundary before VMM termination.
+    /// Returning an error leaves the live machine owned by this driver.
+    fn prepare_stop(&mut self, sandbox_id: &SandboxId, epoch: Counter) -> Result<Digest, Digest>;
 }
 
 pub struct FirecrackerDriver<F> {
@@ -75,9 +79,6 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
         }
-        if self.qualification.lifecycle.is_none() {
-            return Self::unavailable(b"firecracker-configuration-not-qualified");
-        }
         if self.process.is_some() {
             return MachineOutcome::Unknown;
         }
@@ -87,27 +88,31 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         };
         let mut process = match FirecrackerProcess::spawn(&configuration) {
             Ok(value) => value,
-            Err(_) => return MachineOutcome::Unknown,
+            Err(error) => {
+                eprintln!("sandsurf Firecracker spawn failed: {error}");
+                return MachineOutcome::Unknown;
+            }
         };
         let authentication = match self
             .factory
             .authenticate(&self.sandbox_id, epoch, &mut process)
         {
             Ok(value) => value,
-            Err(_) => {
+            Err(evidence) => {
+                eprintln!("sandsurf guest authentication failed: {evidence:?}");
                 contain(&mut process);
                 return MachineOutcome::Unknown;
             }
         };
         self.process = Some(process);
         self.applied_revision = Some(command.revision);
+        let booting = if epoch == Counter::ONE {
+            MachineState::Creating
+        } else {
+            MachineState::Starting
+        };
         MachineOutcome::Observed(vec![
-            transition(
-                command,
-                epoch,
-                MachineState::Creating,
-                b"firecracker-created",
-            ),
+            transition(command, epoch, booting, b"firecracker-created"),
             transition_with_digest(
                 command,
                 epoch,
@@ -118,6 +123,14 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         ])
     }
 
+    /// Whether this guardian still owns a live VMM for the current epoch. This
+    /// is reachability evidence only; it never changes host lifecycle intent.
+    pub fn has_live_owner(&mut self) -> bool {
+        self.process
+            .as_mut()
+            .is_some_and(|process| matches!(process.has_exited(), Ok(false)))
+    }
+
     fn stop_process(
         &mut self,
         command: &LifecycleCommand,
@@ -126,7 +139,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
         }
-        let Some(mut process) = self.process.take() else {
+        let Some(process) = self.process.as_ref() else {
             return if current.state == MachineState::Stopped {
                 MachineOutcome::Observed(vec![transition(
                     command,
@@ -138,15 +151,26 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
                 MachineOutcome::Unknown
             };
         };
+        if current.state == MachineState::Paused && process.resume().is_err() {
+            return MachineOutcome::Unknown;
+        }
+        let quiesce = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
+            Ok(value) => value,
+            Err(_) => return MachineOutcome::Unknown,
+        };
+        let Some(mut process) = self.process.take() else {
+            return MachineOutcome::Unknown;
+        };
         if process.terminate().is_err() || process.wait().is_err() {
             contain(&mut process);
             return MachineOutcome::Unknown;
         }
-        MachineOutcome::Observed(vec![transition(
+        MachineOutcome::Observed(vec![transition_with_digest(
             command,
             current.epoch,
             MachineState::Stopped,
             b"firecracker-exit-confirmed",
+            &quiesce,
         )])
     }
 }

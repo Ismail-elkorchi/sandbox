@@ -17,7 +17,7 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const SERVICE_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum Error {
@@ -85,6 +85,12 @@ pub trait GuardianEffect {
     }
     fn query(&mut self, _request: GuestServiceRequest) -> Result<GuestServiceResponse> {
         Err(Error::Unsupported("guest query is not implemented"))
+    }
+    /// Reports whether a last committed live-machine observation is currently
+    /// backed by this guardian's exclusive native owner. It is not a lifecycle
+    /// transition and cannot manufacture a stopped/failed observation.
+    fn live_observation_reachable(&mut self) -> bool {
+        true
     }
 }
 
@@ -185,8 +191,18 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian sandbox identity mismatch"));
                 }
                 let observation = match self.journal.last_observation()? {
-                    Some(value) => Observation::Current {
-                        value: value.value().clone(),
+                    Some(value)
+                        if !matches!(
+                            value.value().state,
+                            MachineState::Running | MachineState::Paused
+                        ) || self.effect.live_observation_reachable() =>
+                    {
+                        Observation::Current {
+                            value: value.value().clone(),
+                        }
+                    }
+                    Some(value) => Observation::Unavailable {
+                        last_known: Some(value.value().clone()),
                     },
                     None => Observation::Unavailable { last_known: None },
                 };

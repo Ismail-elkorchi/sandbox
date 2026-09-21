@@ -64,11 +64,15 @@ impl CgroupManager {
                 "cgroup root must be an absolute delegated directory",
             ));
         }
-        let controllers = read_bounded(&root.join("cgroup.controllers"))?;
-        if controllers.is_empty() {
+        let controllers = read_bounded(&root.join("cgroup.subtree_control"))?;
+        let enabled: std::collections::BTreeSet<_> = controllers.split_ascii_whitespace().collect();
+        if ["cpu", "memory", "pids", "io"]
+            .iter()
+            .any(|controller| !enabled.contains(controller))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "cgroup v2 controllers are unavailable",
+                "required cgroup v2 controllers are not delegated",
             ));
         }
         Ok(Self {

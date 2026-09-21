@@ -22,6 +22,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "--linux-launcher" {
         std::process::exit(sandbox_launcher_linux::launcher_main());
     }
+    #[cfg(target_os = "linux")]
+    if mode == "--linux-isolated" {
+        std::process::exit(sandbox_launcher_linux::isolated_main(arguments.next()));
+    }
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;
     match mode.as_str() {

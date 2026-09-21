@@ -1,25 +1,31 @@
 use crate::api::{
     HOST_API_VERSION, HostInspection, HostRequest, HostResponse, ReservationView, SandboxView,
 };
+#[cfg(not(target_os = "linux"))]
+use sandsurf_control::{EffectOutcome, GuardianEffect, LifecycleEffect, Result as ControlResult};
 use sandsurf_control::{
-    EffectOutcome, Guardian, GuardianClient, GuardianEffect, HostGuardianLink, LifecycleEffect,
-    Result as ControlResult, apply_lifecycle, serve_guardian,
+    Guardian, GuardianClient, HostGuardianLink, apply_lifecycle, serve_guardian,
 };
-use sandsurf_machine::{GuestArchitecture, MachineOutcome};
+use sandsurf_machine::GuestArchitecture;
+#[cfg(not(target_os = "linux"))]
+use sandsurf_machine::MachineOutcome;
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_protocol::*;
 use sandsurf_state::{
     Approval, CatalogLimits, GrantChange, HostCatalog, ReservationState, RuntimeJournal,
     RuntimeLimits, SandboxRecord,
 };
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const API_TIMEOUT: Duration = Duration::from_secs(30);
+const API_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum HostError {
@@ -28,6 +34,8 @@ pub enum HostError {
     State(sandsurf_state::Error),
     Control(sandsurf_control::Error),
     Contract(sandsurf_protocol::Invalid),
+    #[cfg(target_os = "linux")]
+    Linux(crate::linux::LinuxError),
     Invalid(&'static str),
 }
 
@@ -39,6 +47,8 @@ impl fmt::Display for HostError {
             Self::State(error) => write!(output, "host catalog: {error}"),
             Self::Control(error) => write!(output, "host/guardian: {error}"),
             Self::Contract(error) => write!(output, "host contract: {error}"),
+            #[cfg(target_os = "linux")]
+            Self::Linux(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
         }
     }
@@ -69,6 +79,12 @@ impl From<sandsurf_protocol::Invalid> for HostError {
         Self::Contract(value)
     }
 }
+#[cfg(target_os = "linux")]
+impl From<crate::linux::LinuxError> for HostError {
+    fn from(value: crate::linux::LinuxError) -> Self {
+        Self::Linux(value)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, HostError>;
 
@@ -76,6 +92,7 @@ pub struct HostService {
     root: PathBuf,
     catalog: HostCatalog,
     executable: PathBuf,
+    verified_guardians: BTreeSet<SandboxId>,
 }
 
 impl HostService {
@@ -99,6 +116,7 @@ impl HostService {
             root: root.to_path_buf(),
             catalog,
             executable,
+            verified_guardians: BTreeSet::new(),
         })
     }
 
@@ -146,6 +164,14 @@ impl HostService {
                 operation_id,
                 approval_id,
             } => {
+                #[cfg(target_os = "linux")]
+                let native_config = crate::linux::prepare_config(
+                    &self.root,
+                    &self.executable,
+                    &sandbox_id,
+                    &image_digest,
+                    &resources,
+                )?;
                 let approval = Approval {
                     id: approval_id,
                     request_digest: digest(
@@ -160,6 +186,9 @@ impl HostService {
                     operation_id.clone(),
                     approval,
                 )?;
+                #[cfg(target_os = "linux")]
+                self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
+                #[cfg(not(target_os = "linux"))]
                 self.provision_guardian(&sandbox_id)?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
                 let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
@@ -229,7 +258,7 @@ impl HostService {
                 )?;
                 let grant = self.catalog.set_grant(
                     GrantChange {
-                        sandbox_id,
+                        sandbox_id: sandbox_id.clone(),
                         id: grant_id,
                         expected_revision,
                         capability,
@@ -241,6 +270,19 @@ impl HostService {
                         request_digest,
                     },
                 )?;
+                self.provision_guardian(&sandbox_id)?;
+                let authorization = self
+                    .catalog
+                    .authorize_configuration(&sandbox_id, grant.revision)?;
+                let operation = GuardianClient::new(self.guardian_endpoint(&sandbox_id))
+                    .transition(authorization)?;
+                if operation.delivery != Delivery::Applied
+                    || operation.command.revision != grant.revision
+                {
+                    return Err(HostError::Invalid(
+                        "guardian did not apply the host configuration revision",
+                    ));
+                }
                 Ok(HostResponse::Grant { grant })
             }
             HostRequest::Workload {
@@ -280,9 +322,12 @@ impl HostService {
                 scope_digest,
                 request,
             } => {
-                if matches!(request, GuestServiceRequest::Dispatch { .. }) {
+                if matches!(
+                    request,
+                    GuestServiceRequest::Dispatch { .. } | GuestServiceRequest::PrepareStop
+                ) {
                     return Err(HostError::Invalid(
-                        "guest dispatch must use the signed host dispatch route",
+                        "internal guest control requests cannot use the application route",
                     ));
                 }
                 self.catalog.active_grant(
@@ -331,7 +376,34 @@ impl HostService {
         }
     }
 
-    fn provision_guardian(&self, sandbox: &SandboxId) -> Result<()> {
+    fn provision_guardian(&mut self, sandbox: &SandboxId) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        return self.provision_guardian_with_config(sandbox, None);
+        #[cfg(not(target_os = "linux"))]
+        self.provision_guardian_inner(sandbox)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn provision_guardian_with_config(
+        &mut self,
+        sandbox: &SandboxId,
+        config: Option<&crate::linux::LinuxGuardianConfig>,
+    ) -> Result<()> {
+        let root = self.sandbox_root(sandbox);
+        prepare_directory(&root)?;
+        prepare_directory(&root.join("guardian"))?;
+        let config_path = root.join("guardian/config.json");
+        if let Some(config) = config {
+            crate::linux::write_config(&config_path, config)?;
+            self.verified_guardians.insert(sandbox.clone());
+        } else if !self.verified_guardians.contains(sandbox) {
+            crate::linux::read_config(&config_path, sandbox)?;
+            self.verified_guardians.insert(sandbox.clone());
+        }
+        self.provision_guardian_inner(sandbox)
+    }
+
+    fn provision_guardian_inner(&self, sandbox: &SandboxId) -> Result<()> {
         let root = self.sandbox_root(sandbox);
         prepare_directory(&root)?;
         prepare_directory(&root.join("guardian"))?;
@@ -353,6 +425,7 @@ impl HostService {
         {
             return Ok(());
         }
+        let guardian_log = open_guardian_log(&root.join("guardian/guardian.log"))?;
         Command::new(&self.executable)
             .arg("guardian")
             .arg("--directory")
@@ -361,9 +434,9 @@ impl HostService {
             .arg(sandbox.as_str())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(guardian_log))
             .spawn()?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if GuardianClient::new(endpoint.clone())
                 .inspect(sandbox.clone(), None)
@@ -440,7 +513,17 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
 pub fn serve_sandbox_guardian(root: &Path, sandbox: SandboxId) -> Result<()> {
     let sandbox_root = root.join("sandboxes").join(sandbox.as_str());
     let journal = RuntimeJournal::open(&sandbox_root.join("runtime"), &sandbox)?;
+    #[cfg(target_os = "linux")]
+    {
+        let config =
+            crate::linux::read_config(&sandbox_root.join("guardian/config.json"), &sandbox)?;
+        let effect = crate::linux::LinuxGuardianEffect::open(&sandbox_root, config)?;
+        let mut guardian = Guardian::new(journal, effect);
+        serve_guardian(&sandbox_root.join("guardian"), &mut guardian)?;
+    }
+    #[cfg(not(target_os = "linux"))]
     let mut guardian = Guardian::new(journal, UnqualifiedEffect);
+    #[cfg(not(target_os = "linux"))]
     serve_guardian(&sandbox_root.join("guardian"), &mut guardian)?;
     Ok(())
 }
@@ -467,7 +550,9 @@ pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
     parse_host_response(frame)
 }
 
+#[cfg(not(target_os = "linux"))]
 struct UnqualifiedEffect;
+#[cfg(not(target_os = "linux"))]
 impl GuardianEffect for UnqualifiedEffect {
     fn dispatch(&mut self, _: &Mutation, _: Capability) -> EffectOutcome {
         EffectOutcome::NotApplied(bytes_digest(b"native-guest-driver-unqualified"))
@@ -581,7 +666,7 @@ fn random_id(prefix: &str) -> Result<String> {
     Ok(value)
 }
 
-fn native_guest_architecture() -> GuestArchitecture {
+pub(crate) fn native_guest_architecture() -> GuestArchitecture {
     if cfg!(target_arch = "aarch64") {
         GuestArchitecture::Arm64
     } else {
@@ -593,9 +678,28 @@ fn error_category(error: &HostError) -> &'static str {
     match error {
         HostError::Io(_) => "transport",
         HostError::Json(_) | HostError::Contract(_) | HostError::Invalid(_) => "protocol",
+        #[cfg(target_os = "linux")]
+        HostError::Linux(_) => "native",
         HostError::State(_) => "state",
         HostError::Control(_) => "guardian",
     }
+}
+
+#[cfg(unix)]
+fn open_guardian_log(path: &Path) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(windows)]
+fn open_guardian_log(path: &Path) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?)
 }
 
 #[cfg(unix)]

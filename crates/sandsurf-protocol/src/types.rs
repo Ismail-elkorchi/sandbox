@@ -592,6 +592,7 @@ pub struct LifecycleOperation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Resources {
     pub vcpus: Counter,
+    #[serde(rename = "memoryMiB")]
     pub memory_mib: Counter,
     pub disk_bytes: Counter,
     pub output_bytes: Counter,

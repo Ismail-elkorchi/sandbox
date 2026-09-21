@@ -702,24 +702,14 @@ impl RuntimeJournal {
         if sequence != boundary.chunks.next()? {
             return Err(Error::Conflict("output sequence gap"));
         }
-        let end = boundary.final_cursor.checked_add(bytes.len() as u64)?;
-        if end.get() > limit {
+        let next_boundary = extend_output_boundary(&boundary, sequence, stream, bytes)?;
+        if next_boundary.final_cursor.get() > limit {
             return Err(Error::Capacity(
                 "output reservation full; producer must stop before dropping evidence",
             ));
         }
         capacity(&tx, "chunks", self.limits.chunks)?;
-        let chain = digest(
-            Domain::Output,
-            &(
-                &boundary.final_hash,
-                sequence,
-                boundary.final_cursor,
-                stream,
-                &content,
-                bytes.len(),
-            ),
-        )?;
+        let chain = next_boundary.final_hash.clone();
         let mut file = match private_file(&path, boundary.final_cursor == Counter::ZERO) {
             Ok(file) => file,
             Err(Error::Io(e))
@@ -751,20 +741,7 @@ impl RuntimeJournal {
                 chain.as_str()
             ],
         )?;
-        match stream {
-            Stream::Stdout => {
-                boundary.stdout_bytes = boundary.stdout_bytes.checked_add(bytes.len() as u64)?
-            }
-            Stream::Stderr => {
-                boundary.stderr_bytes = boundary.stderr_bytes.checked_add(bytes.len() as u64)?
-            }
-            Stream::Terminal => {
-                boundary.terminal_bytes = boundary.terminal_bytes.checked_add(bytes.len() as u64)?
-            }
-        }
-        boundary.final_cursor = end;
-        boundary.chunks = sequence;
-        boundary.final_hash = chain;
+        boundary = next_boundary;
         tx.execute(
             "UPDATE processes SET boundary=?2 WHERE id=?1",
             params![id.as_str(), encode(&boundary)?],
@@ -1340,13 +1317,5 @@ fn require_receipt(
     Ok(value)
 }
 fn empty_boundary(sandbox: &SandboxId, id: &ProcessId, epoch: Counter) -> Result<OutputBoundary> {
-    Ok(OutputBoundary {
-        final_cursor: Counter::ZERO,
-        chunks: Counter::ZERO,
-        stdout_bytes: Counter::ZERO,
-        stderr_bytes: Counter::ZERO,
-        terminal_bytes: Counter::ZERO,
-        omitted_bytes: Counter::ZERO,
-        final_hash: digest(Domain::Output, &(sandbox, id, epoch))?,
-    })
+    Ok(initial_output_boundary(sandbox, id, epoch)?)
 }

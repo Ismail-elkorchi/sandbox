@@ -136,6 +136,9 @@ pub struct ProcessSnapshot {
     deny_unknown_fields
 )]
 pub enum GuestServiceRequest {
+    /// Guardian-only machine shutdown barrier. The host API never forwards
+    /// this request from an application.
+    PrepareStop,
     Dispatch {
         mutation: Mutation,
         capability: Capability,
@@ -296,6 +299,7 @@ pub enum FileExpectation {
     deny_unknown_fields
 )]
 pub enum GuestServiceResponse {
+    ReadyToStop { evidence: Digest },
     Effect { outcome: GuestEffectOutcome },
     Process { process: Box<ProcessSnapshot> },
     Processes { processes: Vec<ProcessSnapshot> },

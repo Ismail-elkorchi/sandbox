@@ -693,6 +693,8 @@ name = "sandsurf-host"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "sandbox-guest",
+ "sandbox-image",
  "sandbox-launcher-linux",
  "sandbox-vm",
  "sandsurf-control",
@@ -702,6 +704,7 @@ dependencies = [
  "sandsurf-state",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
