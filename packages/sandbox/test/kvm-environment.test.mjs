@@ -13,7 +13,7 @@ const enabled = process.env.SANDSURF_KVM_TEST === "1";
 
 test("persistent KVM environment enforces runtime capabilities", { skip: !enabled, timeout: 1_200_000 }, async () => {
   const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ??
-    resolve("packages/sandbox/images/minimal-x64/manifest.json");
+    resolve("packages/sandbox/images/development-x64/manifest.json");
   const state = process.env.SANDSURF_TEST_STATE ?? await mkdtemp(join(tmpdir(), "sandsurf-kvm-environment-"));
   const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
   const upstream = createServer((_request, response) => response.end("network-ok\n"));
@@ -44,10 +44,15 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
         network: true,
         "expose-port": true,
         "deliver-secret": true,
-      "increase-resources": true,
-      checkpoint: true,
+        "increase-resources": true,
+        checkpoint: true,
       },
     });
+
+    assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
+    assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);
+    assert.equal(await run(sandbox, ["/sbin/apk", "info", "--installed", "git"], { user: "root" }), "git\n");
+    await run(sandbox, ["/usr/bin/git", "init", "/home/agent/persistent-repository"]);
 
     await sandbox.secrets.deliver(secret, { path: "/workspace/file-secret" });
     assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/file-secret")).toString(), "environment-secret");
@@ -135,6 +140,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.equal(reboundObservation.value.state.kind, "running");
     assert.equal(reboundObservation.value.request.epoch, restored.machine.value.epoch);
     assert.equal(reboundObservation.value.lineage.checkpointId.startsWith("suspend-"), true);
+    assert.equal(await run(sandbox, ["/usr/bin/git", "-C", "/home/agent/persistent-repository", "rev-parse", "--is-inside-work-tree"]), "true\n");
     await waitForOutput(reboundProcess, 8);
     await reboundProcess.terminate();
     await reboundProcess.wait();

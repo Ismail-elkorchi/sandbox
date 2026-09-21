@@ -23,12 +23,12 @@ serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
 zeroize.workspace = true
+reqwest.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sandbox-network-broker = { path = "../sandbox-network-broker" }
 sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
 sandbox-policy = { path = "../sandbox-policy" }
-reqwest.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 sandbox-guest = { path = "../sandbox-guest" }

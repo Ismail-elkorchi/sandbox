@@ -276,6 +276,22 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle.cast()) })
 }
 
+pub(crate) fn directory_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let information = information(&open_directory(path)?)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory identity has an unsafe type or reparse point",
+        ));
+    }
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
 fn validate(file: &File, directory: bool, protected: bool) -> io::Result<(u32, u64)> {
     let information = information(file)?;
     let attributes = information.dwFileAttributes;

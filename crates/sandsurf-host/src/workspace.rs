@@ -185,8 +185,9 @@ impl WorkspaceAuthority {
                     "capture source must be a directory, not a link",
                 ));
             }
+            let source_identity = native_identity(source, &source_metadata)?;
             let canonical = fs::canonicalize(source)?;
-            if !same_native_identity(&source_metadata, &fs::symlink_metadata(&canonical)?) {
+            if source_identity != native_identity(&canonical, &fs::symlink_metadata(&canonical)?)? {
                 return Err(WorkspaceError::Conflict(
                     "capture source changed during admission",
                 ));
@@ -573,14 +574,15 @@ impl WorkspaceAuthority {
                 "host apply destination must be a directory, not a link",
             ));
         }
+        let supplied_identity = native_identity(destination, &supplied_metadata)?;
         let destination = fs::canonicalize(destination)?;
         let actual_metadata = fs::symlink_metadata(&destination)?;
-        if !same_native_identity(&supplied_metadata, &actual_metadata) {
+        let destination_identity = native_identity(&destination, &actual_metadata)?;
+        if supplied_identity != destination_identity {
             return Err(WorkspaceError::Conflict(
                 "host apply destination changed during admission",
             ));
         }
-        let destination_identity = native_identity(&actual_metadata);
         let request_digest = digest(
             Domain::Transfer,
             &(
@@ -1129,24 +1131,20 @@ fn sync_cap_parent(_: &Dir, _: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn native_identity(metadata: &fs::Metadata) -> NativeIdentity {
+fn native_identity(_: &Path, metadata: &fs::Metadata) -> io::Result<NativeIdentity> {
     use std::os::unix::fs::MetadataExt;
-    NativeIdentity {
+    Ok(NativeIdentity {
         first: metadata.dev(),
         second: metadata.ino(),
-    }
+    })
 }
-#[cfg(not(unix))]
-fn native_identity(metadata: &fs::Metadata) -> NativeIdentity {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos() as u64);
-    NativeIdentity {
-        first: metadata.len(),
-        second: modified,
-    }
+#[cfg(windows)]
+fn native_identity(path: &Path, _: &fs::Metadata) -> io::Result<NativeIdentity> {
+    let (volume, file) = sandsurf_state::native_directory_identity(path)?;
+    Ok(NativeIdentity {
+        first: volume,
+        second: file,
+    })
 }
 
 fn persist_replace<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1321,16 +1319,6 @@ fn same_cap_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata
 }
 #[cfg(not(unix))]
 fn same_cap_identity(left: &cap_std::fs::Metadata, right: &cap_std::fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn same_native_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-#[cfg(not(unix))]
-fn same_native_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 

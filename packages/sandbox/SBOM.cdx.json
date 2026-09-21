@@ -34,6 +34,17 @@
     },
     {
       "type": "library",
+      "name": "arcbox-ext4",
+      "version": "0.1.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/arcbox-ext4@0.1.2"
+    },
+    {
+      "type": "library",
       "name": "arrayvec",
       "version": "0.7.8",
       "licenses": [
@@ -2084,6 +2095,17 @@
         }
       ],
       "purl": "pkg:cargo/utf8_iter@1.0.4"
+    },
+    {
+      "type": "library",
+      "name": "uuid",
+      "version": "1.23.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/uuid@1.23.0"
     },
     {
       "type": "library",

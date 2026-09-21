@@ -12,7 +12,7 @@
   "scripts": {
     "build": "npm run build:native && npm run build:ts",
     "build:native": "node scripts/build-native.ts",
-    "build:ts": "tsc -b && tsc -p scripts/tsconfig.json",
+    "build:ts": "node scripts/build-typescript.ts",
     "check": "tsc -b --pretty false && tsc -p scripts/tsconfig.json --pretty false && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
     "test": "npm run build && node --test packages/sandbox/test/*.test.mjs && cargo test --workspace",
     "test:rust": "cargo test --workspace",

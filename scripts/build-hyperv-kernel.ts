@@ -17,7 +17,7 @@ if (requestedOutput !== undefined && !isAbsolute(requestedOutput)) {
   throw new Error("SANDSURF_HYPERV_KERNEL_OUTPUT must be absolute");
 }
 const output = requestedOutput
-  ?? resolve("packages/sandbox/images/minimal-x64/hyperv-vmlinuz-6.18.41");
+  ?? resolve("packages/sandbox/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
 
 if (process.platform !== "linux" || process.arch !== "x64") {
   throw new Error("the Hyper-V guest kernel builder requires Linux x64");

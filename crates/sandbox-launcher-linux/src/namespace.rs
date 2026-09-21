@@ -203,7 +203,13 @@ pub(super) fn launch(spec: &LaunchSpec, files: &[File]) -> io::Result<i32> {
         .map_err(invalid_data)?,
     )?;
     command
-        .args(["--remount-ro", "/", "--", RUNTIME_PATH, "--linux-isolated"])
+        .args([
+            "--remount-ro",
+            "/",
+            "--",
+            RUNTIME_PATH,
+            "--linux-vmm-isolated",
+        ])
         .arg(handoff.as_raw_fd().to_string());
     for file in files.iter().chain(inputs.iter()).chain([&handoff, &parent]) {
         inherit(file)?;
@@ -211,7 +217,7 @@ pub(super) fn launch(spec: &LaunchSpec, files: &[File]) -> io::Result<i32> {
     Err(command.exec())
 }
 
-pub fn isolated_main(descriptor: Option<OsString>) -> i32 {
+pub fn vmm_isolated_main(descriptor: Option<OsString>) -> i32 {
     // SAFETY: isolated mode exclusively owns the inherited private control socket as fd 0.
     let mut control = unsafe { UnixStream::from_raw_fd(0) };
     let result = (|| -> io::Result<i32> {

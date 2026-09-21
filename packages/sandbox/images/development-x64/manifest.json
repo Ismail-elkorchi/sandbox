@@ -1,0 +1,82 @@
+{
+  "formatVersion": 2,
+  "id": "sandsurf-development",
+  "version": "3.24.2",
+  "architecture": "x64",
+  "bootBundle": {
+    "kernel": {
+      "path": "vmlinux-6.18.41",
+      "sha256": "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5"
+    },
+    "bootstrap": {
+      "path": "trusted-bootstrap.ext4",
+      "sha256": "61b419ea7a084a1217fdb50810db9b05bb2ab61cb0e8e64a3f32ea151e6cd8d3",
+      "format": "ext4"
+    },
+    "guestAgent": {
+      "version": "0.1.0",
+      "protocolMajor": 2,
+      "protocolMinor": 0,
+      "sha256": "59e918ba62eb80061f4e5bacf8564297cbb06c148c24b1c154542d73f617d916"
+    },
+    "capabilities": {
+      "overlayfs": true,
+      "vsock": true,
+      "seccomp": true,
+      "cgroupV2": true,
+      "devpts": true
+    }
+  },
+  "workload": {
+    "rootfs": {
+      "path": "development-workload.ext4",
+      "sha256": "0f1542ba68fe165527dec1cf63c8a2a9186a0ba5a074c885e5a272c79c9c6290",
+      "format": "ext4"
+    },
+    "stateTemplate": {
+      "path": "empty-workspace.ext4",
+      "sha256": "6e3818582200ac0a24aa37362592b4e294b85f948d0805abcab502efd1ed7bfe",
+      "format": "ext4"
+    },
+    "defaults": {
+      "environment": {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "user": "agent",
+      "workingDirectory": "/workspace",
+      "entrypoint": [],
+      "command": []
+    },
+    "provenance": {
+      "kind": "source-built",
+      "sourceDigest": "82dbf9fcfd670ab3a1242a3db4ff2796cbf435ddf28f5d1ad7af3f378666d024",
+      "materials": {
+        "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
+        "alpine-packages": "3e0249dff59adfb2a7b0a909df5a944d1e96965035560525cd0522b057299ff8",
+        "sandsurf-ext4-builder": "dc9c1246c767342b8208e721924dcd5d86c24211fa4bf11b1fc6c9f822dde80a"
+      }
+    },
+    "compatibleProtocolMajor": 2
+  },
+  "platformArtifacts": {
+    "windowsX64": {
+      "kernel": {
+        "path": "hyperv-vmlinuz-6.18.41",
+        "sha256": "bdb750c617bf47fc893c9ee849e82b4b3bc0287d693195b58bd3fa1c4c8936b5"
+      },
+      "bootstrap": {
+        "path": "trusted-bootstrap.vhdx",
+        "sha256": "298bce1744b096ce543f95f975718411ff1dc2e50e96284e647bab07c490a677"
+      },
+      "workload": {
+        "path": "development-workload.vhdx",
+        "sha256": "9b7b8c00b55e9a894101e09e01be7194f59c205b14e075d8a2cc6d708dfc8371"
+      },
+      "stateTemplate": {
+        "path": "empty-workspace.vhdx",
+        "sha256": "a0094a9def57fc40a981c03743b814c67fcf56e6aab353419af22a2134cf6db6"
+      }
+    }
+  },
+  "signature": null
+}

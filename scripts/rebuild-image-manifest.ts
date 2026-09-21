@@ -17,7 +17,7 @@ for (const architecture of required) {
 
 const files: Record<string, string> = {};
 for (const directory of (await readdir(root, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))) {
-  const match = /^minimal-(x64|arm64)$/u.exec(directory.name);
+  const match = /^development-(x64|arm64)$/u.exec(directory.name);
   if (!directory.isDirectory() || match === null) continue;
   const manifest = resolve(root, directory.name, "manifest.json");
   const metadata = await lstat(manifest);

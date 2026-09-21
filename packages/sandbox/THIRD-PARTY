@@ -2,6 +2,7 @@ Third-party components
 
 adler2 2.0.1	0BSD OR MIT OR Apache-2.0
 ambient-authority 0.0.2	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+arcbox-ext4 0.1.2	MIT OR Apache-2.0
 arrayvec 0.7.8	MIT OR Apache-2.0
 atomic-waker 1.1.2	Apache-2.0 OR MIT
 aws-lc-rs 1.18.1	ISC AND (Apache-2.0 OR ISC)
@@ -188,6 +189,7 @@ unicode-normalization 0.1.25	MIT OR Apache-2.0
 untrusted 0.9.0	ISC
 url 2.5.8	MIT OR Apache-2.0
 utf8_iter 1.0.4	Apache-2.0 OR MIT
+uuid 1.23.0	Apache-2.0 OR MIT
 vcpkg 0.2.15	MIT/Apache-2.0
 version_check 0.9.5	MIT/Apache-2.0
 walkdir 2.5.0	Unlicense/MIT

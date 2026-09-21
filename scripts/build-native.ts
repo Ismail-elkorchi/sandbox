@@ -107,7 +107,7 @@ async function bundledImageManifestDigest(guestArchitecture: "x64" | "arm64"): P
   const images = resolve(repository, "packages/sandbox/images");
   const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
   if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
-  const relative = `minimal-${guestArchitecture}/manifest.json`;
+  const relative = `development-${guestArchitecture}/manifest.json`;
   const expected = index.files[relative];
   if (typeof expected !== "string" || !/^[a-f0-9]{64}$/u.test(expected)) {
     throw new Error(`bundled ${guestArchitecture} image identity is absent from the image index`);

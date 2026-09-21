@@ -2,6 +2,7 @@
 *.vhdx binary
 packages/sandbox/images/**/*.json text eol=lf
 packages/**/vmlinux-* binary
+packages/sandbox/image-build-inputs/** binary
 packages/**/sandbox-runtime-* binary
 packages/**/sandbox-vm-runtime-* binary
 packages/**/firecracker-* binary

@@ -1,16 +1,18 @@
-//! Linux OCI-to-VM image publication. The conversion never mounts the source
-//! tree or generated filesystem in the host kernel.
+//! Cross-platform OCI-to-VM image publication. The conversion never mounts
+//! the source tree or generated filesystem in the host kernel.
 
 use crate::api::{DerivedImageInclusion, OciSource};
-use crate::linux::{LinuxError, resolve_source_bundle};
+use sandbox_image::ext4::{BUILDER_ID as EXT4_BUILDER_ID, materialize_tar};
 use sandbox_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
     unpack_layout_archive, write_filesystem_tar,
 };
 use sandbox_image::{
-    Architecture, ImageManifest, ImageTrust, RootfsArtifact, RootfsFormat, WorkloadDefaults,
-    WorkloadImageManifest, WorkloadProvenance, verify_image,
+    Architecture, ImageManifest, ImageTrust, PlatformArtifacts, RootfsArtifact, RootfsFormat,
+    VerifiedImage, WorkloadDefaults, WorkloadImageManifest, WorkloadProvenance, verify_image,
 };
+#[cfg(target_os = "windows")]
+use sandbox_image::{ImageArtifact, WindowsArtifacts};
 use sandsurf_protocol::{
     Checkpoint, CheckpointPhase, Counter, Digest, Domain, OperationId, Qualification, digest,
 };
@@ -18,13 +20,54 @@ use sandsurf_state::ImageRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 const MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
+    option_env!("SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST");
+
+#[derive(Debug)]
+pub enum ImageBuildError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    Image(sandbox_image::ImageError),
+    Invalid(String),
+}
+
+impl fmt::Display for ImageBuildError {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(output, "image builder I/O: {error}"),
+            Self::Json(error) => write!(output, "image builder document: {error}"),
+            Self::Image(error) => error.fmt(output),
+            Self::Invalid(message) => output.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ImageBuildError {}
+impl From<io::Error> for ImageBuildError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+impl From<serde_json::Error> for ImageBuildError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+impl From<sandbox_image::ImageError> for ImageBuildError {
+    fn from(value: sandbox_image::ImageError) -> Self {
+        Self::Image(value)
+    }
+}
+
+type LinuxError = ImageBuildError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -34,11 +77,16 @@ struct ImportResult {
 }
 
 pub fn qualification() -> Qualification {
-    let result = find_builder().and_then(|path| {
-        let tool = sha256_file(&path, 128 * 1024 * 1024)?;
-        digest(Domain::Image, &("sandsurf-linux-oci-builder-v1", tool))
-            .map_err(|error| LinuxError::Invalid(error.to_string()))
-    });
+    let result = digest(
+        Domain::Image,
+        &(
+            "sandsurf-portable-oci-builder-v1",
+            EXT4_BUILDER_ID,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+    )
+    .map_err(|error| LinuxError::Invalid(error.to_string()));
     match result {
         Ok(evidence) => Qualification::Qualified { evidence },
         Err(error) => Qualification::Unqualified {
@@ -67,8 +115,7 @@ pub fn import_oci(
         ));
     }
     let imports = host_root.join("images/imports");
-    fs::create_dir_all(&imports)?;
-    fs::set_permissions(&imports, fs::Permissions::from_mode(0o700))?;
+    prepare_private_directory(&imports)?;
     let stage = imports.join(operation.as_str());
     let result_path = stage.join("result.json");
     if result_path.exists() {
@@ -89,7 +136,7 @@ pub fn import_oci(
         ));
         fs::rename(&stage, quarantine)?;
     }
-    fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    prepare_private_directory(&stage)?;
     let layout_path = match source {
         OciSource::Layout { path } => {
             if !path.is_absolute() {
@@ -133,7 +180,7 @@ pub fn import_oci(
         .map_err(|error| LinuxError::Invalid(error.to_string()))?;
     let rootfs_bytes = rootfs_size(&tree)?;
     let artifact = stage.join("artifact");
-    fs::DirBuilder::new().mode(0o700).create(&artifact)?;
+    prepare_private_directory(&artifact)?;
     let workload_path = artifact.join("oci-workload.ext4");
     let builder = materialize_ext4(&filesystem_tar, &workload_path, rootfs_bytes)?;
     let (base, template) = resolve_source_bundle(executable)?;
@@ -142,6 +189,8 @@ pub fn import_oci(
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
     copy_regular(&base.bootstrap_path, &artifact.join(bootstrap_name))?;
     copy_regular(&template, &artifact.join("empty-workspace.ext4"))?;
+    let platform_artifacts =
+        materialize_platform_artifacts(&base, &workload_path, &artifact, rootfs_bytes)?;
     let mut environment = BTreeMap::new();
     for assignment in &tree.source.defaults.environment {
         let (name, value) = assignment
@@ -195,18 +244,14 @@ pub fn import_oci(
             },
             compatible_protocol_major: base.manifest.workload.compatible_protocol_major,
         },
-        platform_artifacts: Default::default(),
+        platform_artifacts,
         signature: None,
     };
     manifest.boot_bundle.kernel.path = kernel_name.into();
     manifest.boot_bundle.bootstrap.path = bootstrap_name.into();
     let manifest_path = artifact.join("manifest.json");
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    let mut manifest_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&manifest_path)?;
+    let mut manifest_file = create_private_file(&manifest_path)?;
     manifest_file.write_all(&manifest_bytes)?;
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
@@ -273,8 +318,7 @@ pub fn publish_checkpoint(
     }
 
     let imports = host_root.join("images/imports");
-    fs::create_dir_all(&imports)?;
-    fs::set_permissions(&imports, fs::Permissions::from_mode(0o700))?;
+    prepare_private_directory(&imports)?;
     let stage = imports.join(operation.as_str());
     let result_path = stage.join("result.json");
     if result_path.exists() {
@@ -295,7 +339,7 @@ pub fn publish_checkpoint(
         ));
         fs::rename(&stage, quarantine)?;
     }
-    fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    prepare_private_directory(&stage)?;
 
     let source_root = host_root
         .join("images")
@@ -310,7 +354,7 @@ pub fn publish_checkpoint(
         ));
     }
     let artifact = stage.join("artifact");
-    fs::DirBuilder::new().mode(0o700).create(&artifact)?;
+    prepare_private_directory(&artifact)?;
     let kernel = artifact.join("boot-kernel");
     let bootstrap = artifact.join("trusted-bootstrap.ext4");
     let workload = artifact.join("derived-workload.ext4");
@@ -345,6 +389,12 @@ pub fn publish_checkpoint(
         ),
     )
     .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    let platform_artifacts = materialize_derived_platform_artifacts(
+        &source,
+        &template,
+        &artifact,
+        checkpoint.workload_disk_bytes.get(),
+    )?;
     let mut manifest = source.manifest;
     manifest.id = format!("derived-{}", &provenance_digest.as_str()[..16]);
     manifest.version = checkpoint_manifest.as_str()[..16].to_owned();
@@ -359,6 +409,7 @@ pub fn publish_checkpoint(
         sha256: sha256_file(&template, MAX_ROOTFS_BYTES)?,
         format: RootfsFormat::Ext4,
     });
+    manifest.platform_artifacts = platform_artifacts;
     manifest.workload.provenance = WorkloadProvenance::Derived {
         source_image_digest: checkpoint.image_digest.as_str().to_owned(),
         checkpoint_manifest_digest: checkpoint_manifest.as_str().to_owned(),
@@ -368,11 +419,7 @@ pub fn publish_checkpoint(
     };
     manifest.signature = None;
     let manifest_path = artifact.join("manifest.json");
-    let mut manifest_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&manifest_path)?;
+    let mut manifest_file = create_private_file(&manifest_path)?;
     manifest_file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
@@ -434,6 +481,10 @@ fn remove_derived_artifact(path: &Path) -> Result<(), LinuxError> {
         "derived-workload.ext4",
         "trusted-bootstrap.ext4",
         "boot-kernel",
+        "windows-kernel",
+        "windows-bootstrap.vhdx",
+        "windows-workload.vhdx",
+        "windows-state-template.vhdx",
     ] {
         match fs::remove_file(path.join(name)) {
             Ok(()) => {}
@@ -493,57 +544,7 @@ fn rootfs_size(tree: &ConvertedTree) -> Result<u64, LinuxError> {
 }
 
 fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, LinuxError> {
-    let builder = find_builder()?;
-    let builder_digest = sha256_file(&builder, 128 * 1024 * 1024)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(output)?;
-    file.set_len(bytes)?;
-    file.sync_all()?;
-    let status = Command::new(&builder)
-        .args([
-            "-F",
-            "-q",
-            "-O",
-            "^has_journal",
-            "-U",
-            "00000000-0000-4000-8000-000000000001",
-            "-E",
-            "lazy_itable_init=0,lazy_journal_init=0",
-            "-d",
-        ])
-        .arg(tar)
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        return Err(LinuxError::Invalid(
-            "the qualified ext4 builder rejected the converted OCI tree".into(),
-        ));
-    }
-    File::open(output)?.sync_all()?;
-    Ok(builder_digest)
-}
-
-fn find_builder() -> Result<PathBuf, LinuxError> {
-    for candidate in ["/usr/sbin/mke2fs", "/sbin/mke2fs"] {
-        let path = PathBuf::from(candidate);
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o022 == 0
-        {
-            return Ok(path);
-        }
-    }
-    Err(LinuxError::Invalid(
-        "a protected mke2fs image builder is unavailable".into(),
-    ))
+    materialize_tar(tar, output, bytes).map_err(|error| LinuxError::Invalid(error.to_string()))
 }
 
 fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), LinuxError> {
@@ -562,6 +563,188 @@ fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), LinuxEr
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImageIndex {
+    #[serde(rename = "formatVersion")]
+    _format_version: u16,
+    #[serde(rename = "buildId")]
+    _build_id: String,
+    files: BTreeMap<String, String>,
+}
+
+fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), LinuxError> {
+    if let Some(path) = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from) {
+        if !path.is_absolute() {
+            return Err(LinuxError::Invalid(
+                "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
+            ));
+        }
+        let image = verify_image(&path, ImageTrust::ExplicitLocal)?;
+        let template = state_template_path(&image)?;
+        return Ok((image, template));
+    }
+    let package = executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    };
+    let relative = format!("development-{architecture}/manifest.json");
+    let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
+    let indexed = index
+        .files
+        .get(&relative)
+        .ok_or_else(|| LinuxError::Invalid("packaged image manifest is absent".into()))?;
+    let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
+        LinuxError::Invalid("native host has no bundled image trust identity".into())
+    })?;
+    if indexed != pinned {
+        return Err(LinuxError::Invalid(
+            "packaged image index differs from the native trust identity".into(),
+        ));
+    }
+    let image = verify_image(
+        &package.join("images").join(relative),
+        ImageTrust::Pinned {
+            manifest_digest: pinned,
+        },
+    )?;
+    let template = state_template_path(&image)?;
+    Ok((image, template))
+}
+
+fn state_template_path(image: &VerifiedImage) -> Result<PathBuf, LinuxError> {
+    let template = image
+        .manifest
+        .workload
+        .state_template
+        .as_ref()
+        .ok_or_else(|| LinuxError::Invalid("image has no writable-state template".into()))?;
+    Ok(image
+        .manifest_path
+        .parent()
+        .ok_or_else(|| LinuxError::Invalid("image manifest has no parent".into()))?
+        .join(&template.path))
+}
+
+#[cfg(target_os = "windows")]
+fn materialize_platform_artifacts(
+    base: &VerifiedImage,
+    workload: &Path,
+    destination: &Path,
+    bytes: u64,
+) -> Result<PlatformArtifacts, LinuxError> {
+    let windows = base.windows_x64.as_ref().ok_or_else(|| {
+        LinuxError::Invalid("packaged boot bundle has no Windows artifacts".into())
+    })?;
+    let kernel = destination.join("windows-kernel");
+    let bootstrap = destination.join("windows-bootstrap.vhdx");
+    let workload_vhdx = destination.join("windows-workload.vhdx");
+    let state = destination.join("windows-state-template.vhdx");
+    copy_regular(&windows.kernel_path, &kernel)?;
+    copy_regular(&windows.bootstrap_path, &bootstrap)?;
+    copy_regular(&windows.state_template_path, &state)?;
+    sandsurf_native::virtual_disk::import_raw(workload, &workload_vhdx, bytes)?;
+    Ok(PlatformArtifacts {
+        windows_x64: Some(WindowsArtifacts {
+            kernel: image_artifact(&kernel, "windows-kernel")?,
+            bootstrap: image_artifact(&bootstrap, "windows-bootstrap.vhdx")?,
+            workload: image_artifact(&workload_vhdx, "windows-workload.vhdx")?,
+            state_template: image_artifact(&state, "windows-state-template.vhdx")?,
+        }),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn materialize_platform_artifacts(
+    _base: &VerifiedImage,
+    _workload: &Path,
+    _destination: &Path,
+    _bytes: u64,
+) -> Result<PlatformArtifacts, LinuxError> {
+    Ok(PlatformArtifacts::default())
+}
+
+#[cfg(target_os = "windows")]
+fn materialize_derived_platform_artifacts(
+    source: &VerifiedImage,
+    state_template: &Path,
+    destination: &Path,
+    state_bytes: u64,
+) -> Result<PlatformArtifacts, LinuxError> {
+    let windows = source
+        .windows_x64
+        .as_ref()
+        .ok_or_else(|| LinuxError::Invalid("source image has no Windows artifacts".into()))?;
+    let kernel = destination.join("windows-kernel");
+    let bootstrap = destination.join("windows-bootstrap.vhdx");
+    let workload = destination.join("windows-workload.vhdx");
+    let state = destination.join("windows-state-template.vhdx");
+    copy_regular(&windows.kernel_path, &kernel)?;
+    copy_regular(&windows.bootstrap_path, &bootstrap)?;
+    copy_regular(&windows.workload_path, &workload)?;
+    sandsurf_native::virtual_disk::import_raw(state_template, &state, state_bytes)?;
+    Ok(PlatformArtifacts {
+        windows_x64: Some(WindowsArtifacts {
+            kernel: image_artifact(&kernel, "windows-kernel")?,
+            bootstrap: image_artifact(&bootstrap, "windows-bootstrap.vhdx")?,
+            workload: image_artifact(&workload, "windows-workload.vhdx")?,
+            state_template: image_artifact(&state, "windows-state-template.vhdx")?,
+        }),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn materialize_derived_platform_artifacts(
+    _source: &VerifiedImage,
+    _state_template: &Path,
+    _destination: &Path,
+    _state_bytes: u64,
+) -> Result<PlatformArtifacts, LinuxError> {
+    Ok(PlatformArtifacts::default())
+}
+
+#[cfg(target_os = "windows")]
+fn image_artifact(path: &Path, name: &str) -> Result<ImageArtifact, LinuxError> {
+    Ok(ImageArtifact {
+        path: name.into(),
+        sha256: sha256_file(path, MAX_ROOTFS_BYTES)?,
+    })
+}
+
+fn prepare_private_directory(path: &Path) -> Result<(), LinuxError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(_) => {
+            return Err(LinuxError::Invalid(
+                "image staging path is not a directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    fs::DirBuilder::new().mode(0o700).create(path)?;
+    #[cfg(target_os = "windows")]
+    sandsurf_native::local::create_private_directory(path)?;
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> Result<File, LinuxError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    Ok(options.open(path)?)
+}
+
 fn copy_regular(source: &Path, destination: &Path) -> Result<(), LinuxError> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -570,11 +753,7 @@ fn copy_regular(source: &Path, destination: &Path) -> Result<(), LinuxError> {
         ));
     }
     let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
+    let mut output = create_private_file(destination)?;
     io::copy(&mut input, &mut output)?;
     output.sync_all()?;
     Ok(())
@@ -618,11 +797,7 @@ fn sha256_file(path: &Path, maximum: u64) -> Result<String, LinuxError> {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LinuxError> {
     let bytes = serde_json::to_vec(value)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = create_private_file(path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     Ok(())

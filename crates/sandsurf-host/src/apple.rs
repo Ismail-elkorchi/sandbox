@@ -1495,7 +1495,7 @@ fn resolve_source_bundle(
     } else {
         "x64"
     };
-    let relative = format!("minimal-{architecture}/manifest.json");
+    let relative = format!("development-{architecture}/manifest.json");
     let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
     let indexed = index
         .files

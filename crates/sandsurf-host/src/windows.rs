@@ -1501,7 +1501,7 @@ fn resolve_source_bundle(
         .and_then(Path::parent)
         .and_then(Path::parent)
         .ok_or_else(|| WindowsError::Invalid("native package layout is invalid".into()))?;
-    let relative = "minimal-x64/manifest.json";
+    let relative = "development-x64/manifest.json";
     let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
     let indexed = index
         .files

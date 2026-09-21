@@ -20,7 +20,7 @@ try {
     for (const imagePath of expectedImages) {
       if (!paths.includes(imagePath)) throw new Error(`${tarball} is missing ${imagePath}`);
     }
-    if (paths.some((path) => path.endsWith("minimal-rootfs.ext4") || path.endsWith("vmlinux-6.1.177"))) {
+    if (paths.some((path) => path.includes("/minimal-") || path.endsWith("vmlinux-6.1.177"))) {
       throw new Error(`${tarball} contains a retired guest image artifact`);
     }
   }
@@ -47,13 +47,15 @@ async function packagedImagePaths(): Promise<readonly string[]> {
   const paths = ["package/images/manifest.json"];
   const required = new Set((process.env.SANDSURF_REQUIRED_IMAGE_ARCHITECTURES ?? "").split(",").filter(Boolean));
   for (const relative of Object.keys(index.files).sort()) {
-    const match = /^(minimal-(x64|arm64))\/manifest\.json$/u.exec(relative);
+    const match = /^(development-(x64|arm64))\/manifest\.json$/u.exec(relative);
     if (match === null) throw new Error(`unsupported guest image index entry ${relative}`);
     required.delete(match[2]!);
     const manifest: unknown = JSON.parse(await readFile(resolve(root, relative), "utf8"));
-    if (!record(manifest) || !record(manifest.bootBundle) || !record(manifest.bootBundle.kernel) ||
+    if (!record(manifest) || manifest.id !== "sandsurf-development" || manifest.version !== "3.24.2" ||
+        !record(manifest.bootBundle) || !record(manifest.bootBundle.kernel) ||
         !record(manifest.bootBundle.bootstrap) || !record(manifest.workload) ||
-        !record(manifest.workload.rootfs) || !record(manifest.workload.stateTemplate)) {
+        !record(manifest.workload.rootfs) || !record(manifest.workload.stateTemplate) ||
+        !record(manifest.workload.provenance) || !record(manifest.workload.provenance.materials)) {
       throw new Error(`${relative} is malformed`);
     }
     paths.push(`package/images/${relative}`);

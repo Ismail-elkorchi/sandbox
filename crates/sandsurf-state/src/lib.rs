@@ -24,6 +24,13 @@ pub use catalog::*;
 pub use disks::*;
 pub use runtime::*;
 
+/// Return the stable filesystem identity of a non-reparse Windows directory.
+/// The handle excludes delete sharing while the identity is observed.
+#[cfg(target_os = "windows")]
+pub fn native_directory_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    windows::directory_identity(path)
+}
+
 use sandsurf_protocol::Invalid;
 use serde::{Serialize, de::DeserializeOwned};
 use std::fmt;

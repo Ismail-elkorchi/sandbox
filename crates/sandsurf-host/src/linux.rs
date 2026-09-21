@@ -208,7 +208,7 @@ pub(crate) fn resolve_source_bundle(
         } else {
             "x64"
         };
-        let relative_manifest = format!("minimal-{architecture}/manifest.json");
+        let relative_manifest = format!("development-{architecture}/manifest.json");
         let manifest = package.join("images").join(&relative_manifest);
         let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
         let expected = index

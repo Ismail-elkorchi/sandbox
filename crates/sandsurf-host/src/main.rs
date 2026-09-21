@@ -19,16 +19,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|value| value.into_string().ok())
         .ok_or("missing Sandsurf host mode")?;
     #[cfg(target_os = "linux")]
-    if mode == "--linux-launcher" {
-        std::process::exit(sandbox_launcher_linux::launcher_main());
-    }
-    #[cfg(target_os = "linux")]
     if mode == "--linux-vmm-launcher" {
         std::process::exit(sandbox_launcher_linux::vmm_launcher_main());
     }
     #[cfg(target_os = "linux")]
-    if mode == "--linux-isolated" {
-        std::process::exit(sandbox_launcher_linux::isolated_main(arguments.next()));
+    if mode == "--linux-vmm-isolated" {
+        std::process::exit(sandbox_launcher_linux::vmm_isolated_main(arguments.next()));
+    }
+    #[cfg(target_os = "linux")]
+    if mode == "--linux-kernel-probe" {
+        std::process::exit(sandbox_launcher_linux::probe_main());
+    }
+    #[cfg(target_os = "linux")]
+    if mode == "--linux-namespace-probe" {
+        std::process::exit(sandbox_launcher_linux::namespace_probe_main());
     }
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;

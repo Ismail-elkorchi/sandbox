@@ -63,8 +63,10 @@ jobs:
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
+      - run: npm run verify:native
       - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host
       - run: node --test packages/sandbox/test/*.test.mjs
+      - run: npm run test:package
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: npm run test:sandsurf
 
@@ -87,8 +89,10 @@ jobs:
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
       - run: npm run build:native
+      - run: npm run verify:native
       - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-machine -p sandsurf-control -p sandsurf-host
       - run: node --test packages/sandbox/test/*.test.mjs
+      - run: npm run test:package
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: npm run test:sandsurf
 

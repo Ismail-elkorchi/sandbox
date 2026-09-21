@@ -1,0 +1,63 @@
+{
+  "formatVersion": 2,
+  "id": "sandsurf-development",
+  "version": "3.24.2",
+  "architecture": "arm64",
+  "bootBundle": {
+    "kernel": {
+      "path": "vmlinux-6.18.41",
+      "sha256": "b2054e82c9d1120519882c39485a17b29657b77c93ed8c9d412996de6ba9711c"
+    },
+    "bootstrap": {
+      "path": "trusted-bootstrap.ext4",
+      "sha256": "c1c35fb367a6e1e13ead6cbb17d791650fad1467fffd949acddd816be71e69e6",
+      "format": "ext4"
+    },
+    "guestAgent": {
+      "version": "0.1.0",
+      "protocolMajor": 2,
+      "protocolMinor": 0,
+      "sha256": "76c88c92e8749e45ca0d398c1ca9b0ac706e487dbab59eec04c64fea12e796f0"
+    },
+    "capabilities": {
+      "overlayfs": true,
+      "vsock": true,
+      "seccomp": true,
+      "cgroupV2": true,
+      "devpts": true
+    }
+  },
+  "workload": {
+    "rootfs": {
+      "path": "development-workload.ext4",
+      "sha256": "82bcb9165501abd3676f7f0a481c5d812076b3294e17acee5979ebf125ed26f3",
+      "format": "ext4"
+    },
+    "stateTemplate": {
+      "path": "empty-workspace.ext4",
+      "sha256": "6e3818582200ac0a24aa37362592b4e294b85f948d0805abcab502efd1ed7bfe",
+      "format": "ext4"
+    },
+    "defaults": {
+      "environment": {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "user": "agent",
+      "workingDirectory": "/workspace",
+      "entrypoint": [],
+      "command": []
+    },
+    "provenance": {
+      "kind": "source-built",
+      "sourceDigest": "7a332da262dd88a2f4a43fbb4b14f41de3db0de5e436d5a5676d59bfd5f757ea",
+      "materials": {
+        "alpine-minirootfs": "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
+        "alpine-packages": "3e0249dff59adfb2a7b0a909df5a944d1e96965035560525cd0522b057299ff8",
+        "sandsurf-ext4-builder": "dc9c1246c767342b8208e721924dcd5d86c24211fa4bf11b1fc6c9f822dde80a"
+      }
+    },
+    "compatibleProtocolMajor": 2
+  },
+  "platformArtifacts": {},
+  "signature": null
+}

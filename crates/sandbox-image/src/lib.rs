@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod ext4;
 pub mod oci;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -83,6 +84,7 @@ pub struct WorkloadDefaults {
 pub enum WorkloadProvenance {
     SourceBuilt {
         source_digest: String,
+        materials: BTreeMap<String, String>,
     },
     Oci {
         index_digest: String,
@@ -380,7 +382,22 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
         ));
     }
     match &manifest.workload.provenance {
-        WorkloadProvenance::SourceBuilt { source_digest } => validate_digest(source_digest)?,
+        WorkloadProvenance::SourceBuilt {
+            source_digest,
+            materials,
+        } => {
+            validate_digest(source_digest)?;
+            if materials.is_empty()
+                || materials.len() > 4096
+                || materials.iter().any(|(name, digest)| {
+                    name.is_empty() || name.len() > 4096 || validate_digest(digest).is_err()
+                })
+            {
+                return Err(ImageError::Invalid(
+                    "source-built image materials are malformed".into(),
+                ));
+            }
+        }
         WorkloadProvenance::Oci {
             index_digest,
             manifest_digest,
@@ -611,6 +628,7 @@ mod tests {
                 },
                 provenance: WorkloadProvenance::SourceBuilt {
                     source_digest: hex_sha256(b"source"),
+                    materials: BTreeMap::from([("fixture".into(), hex_sha256(b"fixture"))]),
                 },
                 compatible_protocol_major: 2,
             },

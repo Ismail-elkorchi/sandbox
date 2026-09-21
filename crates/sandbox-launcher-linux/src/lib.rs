@@ -3,7 +3,7 @@
 
 mod namespace;
 
-pub use namespace::{NamespaceLauncher, isolated_main, namespace_probe_main};
+pub use namespace::{NamespaceLauncher, namespace_probe_main, vmm_isolated_main};
 
 use sandbox_policy::{HardLimit, NormalizedMask, NormalizedSyntheticDirectory, ResourceLimits};
 use sandsurf_native::linux::{
@@ -35,7 +35,7 @@ const INTERNAL_STDIN_CREDIT: u8 = 104;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LaunchSpec {
+pub(crate) struct LaunchSpec {
     pub filesystem_kind: String,
     pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
@@ -88,7 +88,7 @@ pub struct VmmLaunchSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MountSpec {
+pub(crate) struct MountSpec {
     pub fd_index: usize,
     pub target_path: String,
     pub kind: String,
@@ -98,7 +98,7 @@ pub struct MountSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum PreparedCwd {
+pub(crate) enum PreparedCwd {
     Bound {
         fd_index: usize,
         identity: FileIdentity,
@@ -360,26 +360,6 @@ fn probe_landlock_enforcement() -> io::Result<u32> {
     }
 }
 
-pub fn send_launch_spec(
-    stream: &mut UnixStream,
-    spec: &LaunchSpec,
-    files: &[File],
-) -> io::Result<()> {
-    let payload = serde_json::to_vec(spec).map_err(invalid_data)?;
-    if payload.len() > MAX_INTERNAL_MESSAGE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "launcher request is too large",
-        ));
-    }
-    send_fds(
-        stream.as_raw_fd(),
-        u32::try_from(payload.len()).map_err(invalid_data)?,
-        files,
-    )?;
-    stream.write_all(&payload)
-}
-
 pub fn send_vmm_launch_spec(
     stream: &mut UnixStream,
     spec: &VmmLaunchSpec,
@@ -398,14 +378,6 @@ pub fn send_vmm_launch_spec(
         files,
     )?;
     stream.write_all(&payload)
-}
-
-pub fn send_launcher_stdin(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
-    write_internal(stream, INTERNAL_STDIN, payload)
-}
-
-pub fn send_launcher_close_stdin(stream: &mut UnixStream) -> io::Result<()> {
-    write_internal(stream, INTERNAL_CLOSE_STDIN, &[])
 }
 
 pub fn send_launcher_terminate(stream: &mut UnixStream) -> io::Result<()> {
@@ -485,28 +457,6 @@ pub fn receive_target_pid(stream: &UnixStream) -> io::Result<u32> {
 
 pub fn admit_target(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(&[1])
-}
-
-pub fn launcher_main() -> i32 {
-    // Keep an independent failure channel because run_launcher owns and may close descriptor 0.
-    // SAFETY: fd 0 is the trusted Unix socket in launcher mode; F_DUPFD_CLOEXEC creates an owned duplicate.
-    let failure_fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
-    match run_launcher() {
-        Ok(code) => code,
-        Err(error) => {
-            let failure = LauncherSetupError {
-                code: "setup.launcher".into(),
-                message: bounded_error(&error),
-            };
-            let payload = serde_json::to_vec(&failure).unwrap_or_else(|_| b"{}".to_vec());
-            if failure_fd >= 0 {
-                // SAFETY: fcntl returned an independent owned Unix-domain descriptor.
-                let mut control = unsafe { UnixStream::from_raw_fd(failure_fd) };
-                let _ = write_internal(&mut control, INTERNAL_SETUP_ERROR, &payload);
-            }
-            125
-        }
-    }
 }
 
 pub fn vmm_launcher_main() -> i32 {
@@ -741,47 +691,6 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> LaunchSpec {
         termination_grace_ms: spec.termination_grace_ms,
         network_mode: "none".into(),
     }
-}
-
-fn run_launcher() -> io::Result<i32> {
-    bind_lifetime_to_parent()?;
-    // Ownership of fd 0 transfers from the process standard-input slot to this UnixStream.
-    // SAFETY: launcher mode exclusively transfers ownership of its Unix-domain stdin descriptor here.
-    let mut control = unsafe { UnixStream::from_raw_fd(0) };
-    let (length, files) = receive_fds(control.as_raw_fd())?;
-    if length as usize > MAX_INTERNAL_MESSAGE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "launcher request exceeds limit",
-        ));
-    }
-    let mut payload = vec![0_u8; length as usize];
-    control.read_exact(&mut payload)?;
-    let spec: LaunchSpec = serde_json::from_slice(&payload).map_err(invalid_data)?;
-    validate_spec(&spec, files.len())?;
-
-    if spec.filesystem_kind == "host" {
-        host_launch(&mut control, &spec, files)
-    } else {
-        namespace::launch(&spec, &files)
-    }
-}
-
-fn host_launch(control: &mut UnixStream, spec: &LaunchSpec, files: Vec<File>) -> io::Result<i32> {
-    if !spec.masks.is_empty() || spec.private_home.is_some() || spec.temporary.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "host layout cannot contain isolated filesystem features",
-        ));
-    }
-    // SAFETY: these prctl operations apply monotonic lifecycle restrictions to this
-    // single-threaded launcher before it creates the target.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
-        || unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    namespace_init(control, spec, files, false)
 }
 
 fn namespace_init(

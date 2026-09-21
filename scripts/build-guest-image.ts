@@ -3,21 +3,23 @@ import { constants } from "node:fs";
 import {
   chmod,
   copyFile,
+  lstat,
+  lutimes,
   mkdir,
   mkdtemp,
-  open,
   readdir,
   readFile,
   rename,
   rm,
   stat,
-  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
+
+process.umask(0o022);
 
 const requestedArchitecture = process.env.SANDSURF_IMAGE_ARCHITECTURE
   ?? (process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : undefined);
@@ -30,14 +32,34 @@ const imageBuild = architecture === "x64" ? {
   kernelArchitecture: "x86_64",
   kernelSha256: "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5",
   kernelConfigSha256: "c9779a5f7e89c91e371c0a4d15134f46a4cdf2fce6239261edb5c169baec3f2d",
+  alpineArchitecture: "x86_64",
+  alpineSha256: "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
   elfMachine: 62,
 } : {
   rustTarget: "aarch64-unknown-linux-musl",
   kernelArchitecture: "aarch64",
   kernelSha256: "b2054e82c9d1120519882c39485a17b29657b77c93ed8c9d412996de6ba9711c",
   kernelConfigSha256: "4307633ad8dbe3726f36dc11aca9d1eda8c8f2c8a28cdb9888fcfcc3648e409b",
+  alpineArchitecture: "aarch64",
+  alpineSha256: "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
   elfMachine: 183,
 };
+const alpineVersion = "3.24.2";
+const alpineSeries = "v3.24";
+const alpineRepository = `https://dl-cdn.alpinelinux.org/alpine/${alpineSeries}`;
+const alpineToolSha256 = "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
+const expectedAlpinePackages = [
+  "alpine-baselayout-data=3.7.2-r1", "alpine-baselayout=3.7.2-r1", "alpine-keys=2.6-r0",
+  "alpine-release=3.24.2-r0", "apk-tools=3.0.8-r0", "brotli-libs=1.2.0-r1",
+  "busybox-binsh=1.37.0-r31", "busybox=1.37.0-r31", "c-ares=1.34.8-r0",
+  "ca-certificates-bundle=20260909-r0", "ca-certificates=20260909-r0",
+  "git-init-template=2.54.0-r0", "git=2.54.0-r0", "libapk=3.0.8-r0",
+  "libcrypto3=3.5.8-r0", "libcurl=8.22.0-r0", "libexpat=2.8.4-r0",
+  "libidn2=2.3.8-r0", "libpsl=0.21.5-r3", "libssl3=3.5.8-r0",
+  "libunistring=1.4.2-r0", "musl-utils=1.2.6-r2", "musl=1.2.6-r2",
+  "nghttp2-libs=1.69.0-r0", "pcre2=10.48-r0", "scanelf=1.3.9-r1",
+  "ssl_client=1.37.0-r31", "zlib=1.3.2-r0", "zstd-libs=1.5.7-r2",
+] as const;
 const kernelName = "vmlinux-6.18.41";
 const kernelBaseUrl = `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/${imageBuild.kernelArchitecture}`;
 const kernelUrl = `${kernelBaseUrl}/${kernelName}`;
@@ -60,11 +82,6 @@ if (!localBuild) {
   if (releaseSeed.byteLength !== 32) throw new Error("the image signing seed must contain exactly 32 bytes");
 }
 const releasePublicKey = "495b4a26a65df66f7090065ed23a30a29ad3b53e0ed90d6506a2d6c8c0aba684";
-const busyboxPath = process.env.SANDSURF_BUSYBOX_PATH ?? "/usr/bin/busybox";
-const caBundlePath = process.env.SANDSURF_CA_BUNDLE_FILE ?? "/etc/ssl/certs/ca-certificates.crt";
-if (!isAbsolute(busyboxPath) || !isAbsolute(caBundlePath)) {
-  throw new Error("guest runtime inputs must use absolute paths");
-}
 const guestProtocolSource = await readFile(resolve("crates/sandbox-guest/src/lib.rs"), "utf8");
 const guestProtocolMajor = Number(/GUEST_PROTOCOL_MAJOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
 const guestProtocolMinor = Number(/GUEST_PROTOCOL_MINOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
@@ -90,68 +107,19 @@ try {
   ]) {
     await mkdir(resolve(root, path), { recursive: true });
   }
-  const workloadRoot = resolve(temporary, "workload");
-  for (const path of ["bin", "etc/ssl/certs", "home/agent", "run", "tmp", "workspace"]) {
-    await mkdir(resolve(workloadRoot, path), { recursive: true });
-  }
-  const busyboxBytes = await boundedRegularFile(busyboxPath, 64 * 1024 * 1024, "BusyBox");
-  assertElfArchitecture(busyboxBytes, "BusyBox");
-  await assertStaticElf(busyboxPath, "BusyBox");
-  await copyFile(busyboxPath, resolve(workloadRoot, "bin/busybox"));
-  await chmod(resolve(workloadRoot, "bin/busybox"), 0o755);
-  for (const applet of [
-    "cat", "chmod", "cp", "env", "false", "ls", "mkdir", "mv", "printf", "rm", "sh",
-    "sleep", "test", "touch", "true", "uname",
-  ]) {
-    await symlink("busybox", resolve(workloadRoot, "bin", applet));
-  }
-  const caBundle = await boundedRegularFile(caBundlePath, 4 * 1024 * 1024, "CA bundle");
-  if (caBundle.includes(0) || !caBundle.includes(Buffer.from("-----BEGIN CERTIFICATE-----", "ascii"))) {
-    throw new Error("CA bundle is not a PEM certificate bundle");
-  }
-  await copyFile(caBundlePath, resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"));
-  await chmod(resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"), 0o644);
-  await symlink("certs/ca-certificates.crt", resolve(workloadRoot, "etc/ssl/cert.pem"));
   await copyFile(guestAgent, resolve(root, "sbin/sandbox-guest"));
   await chmod(resolve(root, "sbin/sandbox-guest"), 0o755);
-  await writeFile(resolve(workloadRoot, "etc/passwd"), "root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000:agent:/home/agent:/bin/sh\n", { mode: 0o644 });
-  await writeFile(resolve(workloadRoot, "etc/group"), "root:x:0:\nagent:x:1000:\n", { mode: 0o644 });
   await normalizeTimestamps(root);
-  await normalizeTimestamps(workloadRoot);
 
-  const rootfs = resolve(temporary, "minimal-bootstrap.ext4");
-  await createSparse(rootfs, 32 * 1024 * 1024);
-  await run(
-    "mkfs.ext4",
-    ["-F", "-q", "-O", "^has_journal", "-U", "11111111-1111-4111-8111-111111111111", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", root, rootfs],
-    process.cwd(),
-    { E2FSPROGS_FAKE_TIME: "1700000000" },
-  );
-  await normalizeExt4(rootfs, 8192, "33333333-3333-4333-8333-333333333333", temporary, true);
-  const workload = resolve(temporary, "minimal-workload.ext4");
-  // Keep the distributable raw image below common source-hosting blob limits.
-  // The immutable minimal workload occupies only a few MiB; mutable package
-  // installations and caches live on the separately sized state disk.
-  await createSparse(workload, 96 * 1024 * 1024);
-  await run(
-    "mkfs.ext4",
-    ["-F", "-q", "-O", "^has_journal", "-U", "55555555-5555-4555-8555-555555555555", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", workloadRoot, workload],
-    process.cwd(),
-    { E2FSPROGS_FAKE_TIME: "1700000000" },
-  );
-  await normalizeExt4(workload, 24576, "66666666-6666-4666-8666-666666666666", temporary, true);
+  const rootfs = resolve(temporary, "trusted-bootstrap.ext4");
+  await materializeTree(root, rootfs, 32 * 1024 * 1024, temporary, "trusted-bootstrap");
+  const workload = resolve(temporary, "development-workload.ext4");
+  const workloadMaterials = await buildDevelopmentWorkload(temporary, workload);
   const workspace = resolve(temporary, "empty-workspace.ext4");
   const empty = resolve(temporary, "empty");
   await mkdir(empty);
   await normalizeTimestamps(empty);
-  await createSparse(workspace, 64 * 1024 * 1024);
-  await run(
-    "mkfs.ext4",
-    ["-F", "-q", "-U", "22222222-2222-4222-8222-222222222222", "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", empty, workspace],
-    process.cwd(),
-    { E2FSPROGS_FAKE_TIME: "1700000000" },
-  );
-  await normalizeExt4(workspace, 16384, "44444444-4444-4444-8444-444444444444", temporary, false);
+  await materializeTree(empty, workspace, 64 * 1024 * 1024, temporary, "empty-workspace");
 
   const kernel = resolve(temporary, kernelName);
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
@@ -170,21 +138,21 @@ try {
 
   const explicitOutput = process.env.SANDSURF_IMAGE_OUTPUT_DIRECTORY;
   if (explicitOutput !== undefined && !isAbsolute(explicitOutput)) throw new Error("SANDSURF_IMAGE_OUTPUT_DIRECTORY must be absolute");
-  const imageDirectory = `minimal-${architecture}`;
+  const imageDirectory = `development-${architecture}`;
   const destination = explicitOutput ?? resolve("packages/sandbox/images", imageDirectory);
   await mkdir(destination, { recursive: true });
-  for (const retired of ["minimal-rootfs.ext4", "vmlinux-6.1.177"]) {
+  for (const retired of ["minimal-rootfs.ext4", "minimal-workload.ext4", "vmlinux-6.1.177"]) {
     await rm(resolve(destination, retired), { force: true });
   }
   await replaceArtifact(kernel, resolve(destination, kernelName));
-  await replaceArtifact(rootfs, resolve(destination, "minimal-bootstrap.ext4"));
-  await replaceArtifact(workload, resolve(destination, "minimal-workload.ext4"));
+  await replaceArtifact(rootfs, resolve(destination, "trusted-bootstrap.ext4"));
+  await replaceArtifact(workload, resolve(destination, "development-workload.ext4"));
   await replaceArtifact(workspace, resolve(destination, "empty-workspace.ext4"));
 
   let platformArtifacts: Record<string, unknown> = {};
   if (architecture === "x64") {
     const hypervKernelSource = process.env.SANDSURF_HYPERV_KERNEL_FILE
-      ?? resolve(destination, "hyperv-vmlinuz-6.18.41");
+      ?? resolve("packages/sandbox/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
     if (!isAbsolute(hypervKernelSource)) {
       throw new Error("SANDSURF_HYPERV_KERNEL_FILE must be absolute");
     }
@@ -204,8 +172,8 @@ try {
     assertElfOrBzImage(hypervKernelBytes, "Hyper-V kernel");
     const qemuImg = process.env.SANDSURF_QEMU_IMG ?? "qemu-img";
     const conversions = [
-      [rootfs, resolve(destination, "minimal-bootstrap.vhdx")],
-      [workload, resolve(destination, "minimal-workload.vhdx")],
+      [rootfs, resolve(destination, "trusted-bootstrap.vhdx")],
+      [workload, resolve(destination, "development-workload.vhdx")],
       [workspace, resolve(destination, "empty-workspace.vhdx")],
     ] as const;
     for (const [source, output] of conversions) {
@@ -226,8 +194,8 @@ try {
     platformArtifacts = {
       windowsX64: {
         kernel: { path: "hyperv-vmlinuz-6.18.41", sha256: sha256(hypervKernelBytes) },
-        bootstrap: { path: "minimal-bootstrap.vhdx", sha256: sha256(await readFile(conversions[0][1])) },
-        workload: { path: "minimal-workload.vhdx", sha256: sha256(await readFile(conversions[1][1])) },
+        bootstrap: { path: "trusted-bootstrap.vhdx", sha256: sha256(await readFile(conversions[0][1])) },
+        workload: { path: "development-workload.vhdx", sha256: sha256(await readFile(conversions[1][1])) },
         stateTemplate: { path: "empty-workspace.vhdx", sha256: sha256(await readFile(conversions[2][1])) },
       },
     };
@@ -235,13 +203,13 @@ try {
 
   const unsigned = {
     formatVersion: 2,
-    id: "sandsurf-minimal",
-    version: "0.1.0",
+    id: "sandsurf-development",
+    version: alpineVersion,
     architecture,
     bootBundle: {
       kernel: { path: kernelName, sha256: kernelSha256 },
       bootstrap: {
-        path: "minimal-bootstrap.ext4",
+        path: "trusted-bootstrap.ext4",
         sha256: sha256(await readFile(rootfs)),
         format: "ext4",
       },
@@ -255,7 +223,7 @@ try {
     },
     workload: {
       rootfs: {
-        path: "minimal-workload.ext4",
+        path: "development-workload.ext4",
         sha256: sha256(await readFile(workload)),
         format: "ext4",
       },
@@ -273,7 +241,8 @@ try {
       },
       provenance: {
         kind: "source-built",
-        sourceDigest: sha256(Buffer.concat([busyboxBytes, caBundle])),
+        sourceDigest: workloadMaterials.sourceDigest,
+        materials: workloadMaterials.materials,
       },
       compatibleProtocolMajor: guestProtocolMajor,
     },
@@ -301,6 +270,129 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
+async function buildDevelopmentWorkload(
+  temporary: string,
+  output: string,
+): Promise<{ sourceDigest: string; materials: Readonly<Record<string, string>> }> {
+  const targetArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`);
+  const toolArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-x86_64.tar.gz`);
+  const targetUrl = `${alpineRepository}/releases/${imageBuild.alpineArchitecture}/alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`;
+  const toolUrl = `${alpineRepository}/releases/x86_64/alpine-minirootfs-${alpineVersion}-x86_64.tar.gz`;
+  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", targetArchive, targetUrl]);
+  if (sha256(await readFile(targetArchive)) !== imageBuild.alpineSha256) {
+    throw new Error("Alpine development root digest mismatch");
+  }
+  if (targetArchive !== toolArchive) {
+    await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", toolArchive, toolUrl]);
+  }
+  if (sha256(await readFile(toolArchive)) !== alpineToolSha256) {
+    throw new Error("Alpine package-tool root digest mismatch");
+  }
+
+  const workloadRoot = resolve(temporary, "development-root");
+  const toolRoot = resolve(temporary, "apk-tool-root");
+  await mkdir(workloadRoot);
+  await mkdir(toolRoot);
+  for (const [archive, destination] of [[targetArchive, workloadRoot], [toolArchive, toolRoot]] as const) {
+    await run("tar", [
+      "--extract", "--gzip", "--file", archive, "--directory", destination,
+      "--no-same-owner",
+    ]);
+  }
+  const apk = resolve(toolRoot, "sbin/apk");
+  const loader = resolve(toolRoot, "lib/ld-musl-x86_64.so.1");
+  await run(loader, [
+    "--library-path", `${resolve(toolRoot, "lib")}:${resolve(toolRoot, "usr/lib")}`,
+    apk,
+    "--root", workloadRoot,
+    "--arch", imageBuild.alpineArchitecture,
+    "--no-cache",
+    "--no-scripts",
+    "--repository", `${alpineRepository}/main`,
+    "--repository", `${alpineRepository}/community`,
+    "add",
+    "ca-certificates=20260909-r0",
+    "git=2.54.0-r0",
+  ]);
+
+  const installed = await readFile(resolve(workloadRoot, "lib/apk/db/installed"), "utf8");
+  const packages = parseInstalledPackages(installed);
+  if (JSON.stringify(packages) !== JSON.stringify([...expectedAlpinePackages].sort())) {
+    throw new Error("installed Alpine package closure differs from the reviewed development image lock");
+  }
+  for (const [relative, label] of [
+    ["bin/busybox", "BusyBox"],
+    ["sbin/apk", "apk"],
+    ["usr/bin/git", "Git"],
+  ] as const) {
+    const bytes = await boundedRegularFile(resolve(workloadRoot, relative), 64 * 1024 * 1024, label, true);
+    assertElfArchitecture(bytes, label);
+  }
+  const caBundle = await boundedRegularFile(
+    resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"),
+    4 * 1024 * 1024,
+    "Alpine CA bundle",
+    true,
+  );
+  if (caBundle.includes(0) || !caBundle.includes(Buffer.from("-----BEGIN CERTIFICATE-----", "ascii"))) {
+    throw new Error("Alpine CA bundle is not a PEM certificate bundle");
+  }
+  await appendAccount(resolve(workloadRoot, "etc/passwd"), "agent", "agent:x:1000:1000:agent:/home/agent:/bin/sh");
+  await appendAccount(resolve(workloadRoot, "etc/group"), "agent", "agent:x:1000:");
+  await normalizeTimestamps(workloadRoot);
+
+  const canonicalTar = resolve(temporary, "development-root.tar");
+  await run("tar", [
+    "--create", "--file", canonicalTar,
+    "--format=gnu", "--sort=name", "--mtime=@1700000000",
+    "--owner=0", "--group=0", "--numeric-owner",
+    "--directory", workloadRoot, ".",
+  ]);
+  const agentRoot = resolve(temporary, "agent-directories");
+  await mkdir(resolve(agentRoot, "home/agent"), { recursive: true, mode: 0o775 });
+  await mkdir(resolve(agentRoot, "workspace"), { mode: 0o775 });
+  await normalizeTimestamps(agentRoot);
+  await run("tar", [
+    "--append", "--file", canonicalTar,
+    "--format=gnu", "--sort=name", "--mtime=@1700000000",
+    "--owner=1000", "--group=1000", "--numeric-owner",
+    "--directory", agentRoot, "home/agent", "workspace",
+  ]);
+  await run("cargo", [
+    "run", "--locked", "--release", "-p", "sandbox-image", "--example", "materialize_ext4", "--",
+    canonicalTar, output, String(96 * 1024 * 1024),
+  ]);
+
+  const packageLock = Buffer.from(`${packages.join("\n")}\n`, "utf8");
+  const builderIdentity = Buffer.from("arcbox-ext4-0.1.2+sandsurf-deterministic-v2", "utf8");
+  return {
+    sourceDigest: sha256(Buffer.concat([await readFile(targetArchive), packageLock, builderIdentity])),
+    materials: {
+      "alpine-minirootfs": imageBuild.alpineSha256,
+      "alpine-packages": sha256(packageLock),
+      "sandsurf-ext4-builder": sha256(builderIdentity),
+    },
+  };
+}
+
+function parseInstalledPackages(database: string): string[] {
+  const packages: string[] = [];
+  for (const record of database.split("\n\n")) {
+    const name = /^P:(.+)$/mu.exec(record)?.[1];
+    const version = /^V:(.+)$/mu.exec(record)?.[1];
+    if (name !== undefined && version !== undefined) packages.push(`${name}=${version}`);
+  }
+  return packages.sort();
+}
+
+async function appendAccount(path: string, name: string, record: string): Promise<void> {
+  const current = await readFile(path, "utf8");
+  if (current.split("\n").some((line) => line.startsWith(`${name}:`))) {
+    throw new Error(`Alpine development root already defines ${name}`);
+  }
+  await writeFile(path, `${current.endsWith("\n") ? current : `${current}\n`}${record}\n`, { mode: 0o644 });
+}
+
 function assertElfArchitecture(bytes: Buffer, label: string): void {
   if (bytes.length < 20 || !bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) ||
       bytes[4] !== 2 || bytes[5] !== 1 || bytes.readUInt16LE(18) !== imageBuild.elfMachine) {
@@ -317,7 +409,7 @@ function assertElfOrBzImage(bytes: Buffer, label: string): void {
 async function writeImageIndex(root: string): Promise<void> {
   const files: Record<string, string> = {};
   for (const name of (await readdir(root)).sort()) {
-    if (!/^minimal-(x64|arm64)$/u.test(name)) continue;
+    if (!/^development-(x64|arm64)$/u.test(name)) continue;
     const path = resolve(root, name, "manifest.json");
     try {
       files[`${name}/manifest.json`] = sha256(await readFile(path));
@@ -346,62 +438,33 @@ async function boundedRegularFile(
   return readFile(path);
 }
 
-function assertStaticElf(path: string, label: string): Promise<void> {
-  return new Promise((resolveCheck, rejectCheck) => {
-    const output: Buffer[] = [];
-    const child = spawn("readelf", ["--program-headers", path], { stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.once("error", rejectCheck);
-    child.once("exit", (code, signal) => {
-      if (code !== 0 || signal !== null) {
-        rejectCheck(new Error(`${label} ELF inspection failed (${code ?? signal ?? "unknown"})`));
-      } else if (Buffer.concat(output).toString("utf8").includes(" INTERP ")) {
-        rejectCheck(new Error(`${label} must be statically linked`));
-      } else {
-        resolveCheck();
-      }
-    });
-  });
-}
-
-async function createSparse(path: string, bytes: number): Promise<void> {
-  const file = await open(path, "wx", 0o600);
-  try {
-    await file.truncate(bytes);
-  } finally {
-    await file.close();
-  }
-}
-
 async function normalizeTimestamps(path: string): Promise<void> {
-  if ((await stat(path)).isDirectory()) {
+  const metadata = await lstat(path);
+  if (metadata.isDirectory()) {
     for (const entry of await readdir(path)) await normalizeTimestamps(resolve(path, entry));
   }
-  await utimes(path, 1_700_000_000, 1_700_000_000);
+  if (metadata.isSymbolicLink()) await lutimes(path, 1_700_000_000, 1_700_000_000);
+  else await utimes(path, 1_700_000_000, 1_700_000_000);
 }
 
-async function normalizeExt4(
+async function materializeTree(
+  root: string,
   image: string,
-  inodeCount: number,
-  hashSeed: string,
+  bytes: number,
   temporary: string,
-  normalizeInodeTimes: boolean,
+  label: string,
 ): Promise<void> {
-  const commands = resolve(temporary, `debugfs-${hashSeed}.commands`);
-  const lines = [`set_super_value hash_seed ${hashSeed}`];
-  for (let inode = 1; inode <= inodeCount; inode += 1) {
-    lines.push(`set_inode_field <${inode}> generation 0`);
-    if (normalizeInodeTimes) {
-      for (const field of ["atime", "ctime", "mtime", "crtime"]) {
-        lines.push(`set_inode_field <${inode}> ${field} 1700000000`);
-      }
-      for (const field of ["atime_extra", "ctime_extra", "mtime_extra", "crtime_extra"]) {
-        lines.push(`set_inode_field <${inode}> ${field} 0`);
-      }
-    }
-  }
-  await writeFile(commands, `${lines.join("\n")}\n`, { mode: 0o600 });
-  await runQuiet("debugfs", ["-w", "-f", commands, image]);
+  const archive = resolve(temporary, `${label}.tar`);
+  await run("tar", [
+    "--create", "--file", archive,
+    "--format=gnu", "--sort=name", "--mtime=@1700000000",
+    "--owner=0", "--group=0", "--numeric-owner",
+    "--directory", root, ".",
+  ]);
+  await run("cargo", [
+    "run", "--locked", "--release", "-p", "sandbox-image", "--example", "materialize_ext4", "--",
+    archive, image, String(bytes),
+  ]);
 }
 
 function sha256(bytes: Buffer): string {
@@ -479,22 +542,6 @@ function run(
     child.on("exit", (code, signal) => {
       if (code === 0) resolveRun();
       else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`));
-    });
-  });
-}
-
-function runQuiet(command: string, args: readonly string[]): Promise<void> {
-  return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(command, args, {
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, E2FSPROGS_FAKE_TIME: "1700000000" },
-    });
-    const errors: Buffer[] = [];
-    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
-    child.on("error", rejectRun);
-    child.on("exit", (code, signal) => {
-      if (code === 0) resolveRun();
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
     });
   });
 }

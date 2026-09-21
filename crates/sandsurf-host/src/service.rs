@@ -1,4 +1,3 @@
-#[cfg(target_os = "linux")]
 use crate::api::OciSource;
 use crate::api::{
     HOST_API_VERSION, HostInspection, HostRequest, HostResponse, ReservationView, SandboxView,
@@ -24,7 +23,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-#[cfg(target_os = "linux")]
 use zeroize::Zeroizing;
 
 // Full-state capture/restore includes bounded memory and disk persistence plus
@@ -42,6 +40,7 @@ pub enum HostError {
     Workspace(crate::workspace::WorkspaceError),
     Secret(crate::secrets::SecretError),
     Checkpoint(crate::checkpoints::CheckpointError),
+    Image(crate::images::ImageBuildError),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
     #[cfg(target_os = "macos")]
@@ -62,6 +61,7 @@ impl fmt::Display for HostError {
             Self::Workspace(error) => error.fmt(output),
             Self::Secret(error) => error.fmt(output),
             Self::Checkpoint(error) => error.fmt(output),
+            Self::Image(error) => error.fmt(output),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
             #[cfg(target_os = "macos")]
@@ -111,6 +111,11 @@ impl From<crate::secrets::SecretError> for HostError {
 impl From<crate::checkpoints::CheckpointError> for HostError {
     fn from(value: crate::checkpoints::CheckpointError) -> Self {
         Self::Checkpoint(value)
+    }
+}
+impl From<crate::images::ImageBuildError> for HostError {
+    fn from(value: crate::images::ImageBuildError) -> Self {
+        Self::Image(value)
     }
 }
 #[cfg(target_os = "linux")]
@@ -432,7 +437,6 @@ impl HostService {
                         operation: admitted,
                     });
                 }
-                #[cfg(target_os = "linux")]
                 let registry_credential = match &source {
                     OciSource::Registry {
                         credential: Some(secret),
@@ -448,7 +452,6 @@ impl HostService {
                     }
                     _ => None,
                 };
-                #[cfg(target_os = "linux")]
                 let image = crate::images::import_oci(
                     &self.root,
                     &self.executable,
@@ -458,11 +461,6 @@ impl HostService {
                     &request_digest,
                     registry_credential.as_ref().map(|value| value.as_slice()),
                 )?;
-                #[cfg(not(target_os = "linux"))]
-                return Err(HostError::Invalid(
-                    "OCI VM-image materialization is unqualified on this host build",
-                ));
-                #[cfg(target_os = "linux")]
                 Ok(HostResponse::ImageImport {
                     operation: self.catalog.complete_image_import(
                         &operation_id,
@@ -477,7 +475,6 @@ impl HostService {
                 operation_id,
                 approval_id,
             } => {
-                #[cfg(target_os = "linux")]
                 let checkpoint = self
                     .catalog
                     .checkpoint(&checkpoint_id)?
@@ -504,7 +501,6 @@ impl HostService {
                         operation: admitted,
                     });
                 }
-                #[cfg(target_os = "linux")]
                 let image = crate::images::publish_checkpoint(
                     &self.root,
                     &checkpoint,
@@ -512,11 +508,6 @@ impl HostService {
                     &operation_id,
                     &request_digest,
                 )?;
-                #[cfg(not(target_os = "linux"))]
-                return Err(HostError::Invalid(
-                    "derived VM-image publication is unqualified on this host build",
-                ));
-                #[cfg(target_os = "linux")]
                 Ok(HostResponse::ImageImport {
                     operation: self.catalog.complete_image_import(
                         &operation_id,
@@ -1583,21 +1574,7 @@ impl HostService {
             full_state: Qualification::Unqualified {
                 reasons: vec![reason],
             },
-            images: {
-                #[cfg(target_os = "linux")]
-                {
-                    crate::images::qualification()
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Qualification::Unqualified {
-                        reasons: vec![
-                            "OCI VM-image materialization is not implemented for this native driver"
-                                .into(),
-                        ],
-                    }
-                }
-            },
+            images: { crate::images::qualification() },
             guest_platform: format!(
                 "linux/{}",
                 match native_guest_architecture() {
@@ -2488,6 +2465,7 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Secret(_) => "secret",
         HostError::Checkpoint(crate::checkpoints::CheckpointError::Invalid(_)) => "conflict",
         HostError::Checkpoint(_) => "checkpoint",
+        HostError::Image(_) => "image",
     }
 }
 
