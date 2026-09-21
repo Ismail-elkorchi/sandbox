@@ -1,5 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod direct_network;
+
 use sandbox_guest::{
     AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT, NETWORK_AUTH_MAGIC,
     NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
@@ -64,6 +66,7 @@ fn supervisor_main() -> io::Result<()> {
     prepare_persistent_workload().map_err(|error| stage("prepare persistent workload", error))?;
     start_network_relays(Arc::clone(&network_capability))
         .map_err(|error| stage("start workload network relays", error))?;
+    direct_network::start().map_err(|error| stage("start direct TCP gateway", error))?;
     let identity_snapshot = identity
         .read()
         .map_err(|_| io::Error::other("boot identity lock is unavailable"))?

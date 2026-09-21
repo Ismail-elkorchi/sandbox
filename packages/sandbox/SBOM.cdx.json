@@ -34,6 +34,17 @@
     },
     {
       "type": "library",
+      "name": "arrayvec",
+      "version": "0.7.8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/arrayvec@0.7.8"
+    },
+    {
+      "type": "library",
       "name": "atomic-waker",
       "version": "1.1.2",
       "licenses": [
@@ -111,6 +122,17 @@
     },
     {
       "type": "library",
+      "name": "bitflags",
+      "version": "1.3.2",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/bitflags@1.3.2"
+    },
+    {
+      "type": "library",
       "name": "block-buffer",
       "version": "0.10.4",
       "licenses": [
@@ -130,6 +152,17 @@
         }
       ],
       "purl": "pkg:cargo/bumpalo@3.20.3"
+    },
+    {
+      "type": "library",
+      "name": "byteorder",
+      "version": "1.5.0",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/byteorder@1.5.0"
     },
     {
       "type": "library",
@@ -331,6 +364,50 @@
     },
     {
       "type": "library",
+      "name": "defmt",
+      "version": "0.3.100",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/defmt@0.3.100"
+    },
+    {
+      "type": "library",
+      "name": "defmt",
+      "version": "1.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/defmt@1.1.1"
+    },
+    {
+      "type": "library",
+      "name": "defmt-macros",
+      "version": "1.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/defmt-macros@1.1.1"
+    },
+    {
+      "type": "library",
+      "name": "defmt-parser",
+      "version": "1.0.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/defmt-parser@1.0.0"
+    },
+    {
+      "type": "library",
       "name": "der",
       "version": "0.7.10",
       "licenses": [
@@ -394,6 +471,17 @@
         }
       ],
       "purl": "pkg:cargo/errno@0.3.14"
+    },
+    {
+      "type": "library",
+      "name": "etherparse",
+      "version": "0.16.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/etherparse@0.16.0"
     },
     {
       "type": "library",
@@ -514,6 +602,17 @@
     },
     {
       "type": "library",
+      "name": "futures",
+      "version": "0.3.34",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/futures@0.3.34"
+    },
+    {
+      "type": "library",
       "name": "futures-channel",
       "version": "0.3.34",
       "licenses": [
@@ -536,6 +635,17 @@
     },
     {
       "type": "library",
+      "name": "futures-executor",
+      "version": "0.3.34",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/futures-executor@0.3.34"
+    },
+    {
+      "type": "library",
       "name": "futures-io",
       "version": "0.3.34",
       "licenses": [
@@ -544,6 +654,17 @@
         }
       ],
       "purl": "pkg:cargo/futures-io@0.3.34"
+    },
+    {
+      "type": "library",
+      "name": "futures-macro",
+      "version": "0.3.34",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/futures-macro@0.3.34"
     },
     {
       "type": "library",
@@ -610,6 +731,28 @@
         }
       ],
       "purl": "pkg:cargo/getrandom@0.4.3"
+    },
+    {
+      "type": "library",
+      "name": "hash32",
+      "version": "0.3.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/hash32@0.3.1"
+    },
+    {
+      "type": "library",
+      "name": "heapless",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/heapless@0.8.0"
     },
     {
       "type": "library",
@@ -888,6 +1031,17 @@
     },
     {
       "type": "library",
+      "name": "lock_api",
+      "version": "0.4.14",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/lock_api@0.4.14"
+    },
+    {
+      "type": "library",
       "name": "log",
       "version": "0.4.34",
       "licenses": [
@@ -907,6 +1061,17 @@
         }
       ],
       "purl": "pkg:cargo/lru-slab@0.1.3"
+    },
+    {
+      "type": "library",
+      "name": "managed",
+      "version": "0.8.0",
+      "licenses": [
+        {
+          "expression": "0BSD"
+        }
+      ],
+      "purl": "pkg:cargo/managed@0.8.0"
     },
     {
       "type": "library",
@@ -951,6 +1116,17 @@
         }
       ],
       "purl": "pkg:cargo/mio@1.1.0"
+    },
+    {
+      "type": "library",
+      "name": "netstack-smoltcp",
+      "version": "0.2.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/netstack-smoltcp@0.2.4"
     },
     {
       "type": "library",
@@ -1017,6 +1193,17 @@
         }
       ],
       "purl": "pkg:cargo/pkg-config@0.3.34"
+    },
+    {
+      "type": "library",
+      "name": "ppv-lite86",
+      "version": "0.2.21",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/ppv-lite86@0.2.21"
     },
     {
       "type": "library",
@@ -1087,6 +1274,17 @@
     {
       "type": "library",
       "name": "rand",
+      "version": "0.8.8",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rand@0.8.8"
+    },
+    {
+      "type": "library",
+      "name": "rand",
       "version": "0.10.3",
       "licenses": [
         {
@@ -1094,6 +1292,17 @@
         }
       ],
       "purl": "pkg:cargo/rand@0.10.3"
+    },
+    {
+      "type": "library",
+      "name": "rand_chacha",
+      "version": "0.3.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rand_chacha@0.3.1"
     },
     {
       "type": "library",
@@ -1328,6 +1537,17 @@
     },
     {
       "type": "library",
+      "name": "scopeguard",
+      "version": "1.2.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/scopeguard@1.2.0"
+    },
+    {
+      "type": "library",
       "name": "security-framework",
       "version": "3.7.0",
       "licenses": [
@@ -1493,6 +1713,17 @@
     },
     {
       "type": "library",
+      "name": "smoltcp",
+      "version": "0.12.0",
+      "licenses": [
+        {
+          "expression": "0BSD"
+        }
+      ],
+      "purl": "pkg:cargo/smoltcp@0.12.0"
+    },
+    {
+      "type": "library",
       "name": "socket2",
       "version": "0.6.5",
       "licenses": [
@@ -1504,6 +1735,17 @@
     },
     {
       "type": "library",
+      "name": "spin",
+      "version": "0.9.9",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/spin@0.9.9"
+    },
+    {
+      "type": "library",
       "name": "spki",
       "version": "0.7.3",
       "licenses": [
@@ -1512,6 +1754,17 @@
         }
       ],
       "purl": "pkg:cargo/spki@0.7.3"
+    },
+    {
+      "type": "library",
+      "name": "stable_deref_trait",
+      "version": "1.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/stable_deref_trait@1.2.1"
     },
     {
       "type": "library",
@@ -1625,6 +1878,17 @@
     },
     {
       "type": "library",
+      "name": "tokio-macros",
+      "version": "2.6.1",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/tokio-macros@2.6.1"
+    },
+    {
+      "type": "library",
       "name": "tokio-rustls",
       "version": "0.26.5",
       "licenses": [
@@ -1633,6 +1897,17 @@
         }
       ],
       "purl": "pkg:cargo/tokio-rustls@0.26.5"
+    },
+    {
+      "type": "library",
+      "name": "tokio-util",
+      "version": "0.7.19",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "purl": "pkg:cargo/tokio-util@0.7.19"
     },
     {
       "type": "library",
@@ -2238,6 +2513,28 @@
         }
       ],
       "purl": "pkg:cargo/xattr@1.6.1"
+    },
+    {
+      "type": "library",
+      "name": "zerocopy",
+      "version": "0.8.57",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/zerocopy@0.8.57"
+    },
+    {
+      "type": "library",
+      "name": "zerocopy-derive",
+      "version": "0.8.57",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause OR Apache-2.0 OR MIT"
+        }
+      ],
+      "purl": "pkg:cargo/zerocopy-derive@0.8.57"
     },
     {
       "type": "library",

@@ -1,4 +1,6 @@
-use sandbox_network_broker::{BrokerHandle, BrokerReport, BrokerSnapshot, NetworkViolation};
+use sandbox_network_broker::{
+    BrokerHandle, BrokerPolicy, BrokerReport, BrokerSnapshot, NetworkViolation,
+};
 use sandbox_policy::ManagedNetworkRule;
 use std::collections::HashMap;
 use std::fs::File;
@@ -85,6 +87,18 @@ impl VmNetworkBridge {
         nonce: [u8; 32],
         rules: Vec<ManagedNetworkRule>,
     ) -> io::Result<Self> {
+        Self::start_inner(vsock_path, nonce, BrokerRules::Legacy(rules))
+    }
+
+    pub fn start_partitioned(
+        vsock_path: &Path,
+        nonce: [u8; 32],
+        policy: BrokerPolicy,
+    ) -> io::Result<Self> {
+        Self::start_inner(vsock_path, nonce, BrokerRules::Partitioned(policy))
+    }
+
+    fn start_inner(vsock_path: &Path, nonce: [u8; 32], rules: BrokerRules) -> io::Result<Self> {
         let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let http_address = http.local_addr()?;
         let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -136,22 +150,26 @@ impl VmNetworkBridge {
         }
         let violations = Arc::new(Mutex::new(Vec::new()));
         let callback_violations = Arc::clone(&violations);
-        let broker = match BrokerHandle::start(
-            vec![
-                File::from(OwnedFd::from(http)),
-                File::from(OwnedFd::from(socks)),
-                File::from(OwnedFd::from(dns_udp)),
-                File::from(OwnedFd::from(dns_tcp)),
-            ],
-            rules,
-            move |violation| {
-                if let Ok(mut values) = callback_violations.lock()
-                    && values.len() < MAX_RECORDED_VIOLATIONS
-                {
-                    values.push(violation);
-                }
-            },
-        ) {
+        let listeners = vec![
+            File::from(OwnedFd::from(http)),
+            File::from(OwnedFd::from(socks)),
+            File::from(OwnedFd::from(dns_udp)),
+            File::from(OwnedFd::from(dns_tcp)),
+        ];
+        let callback = move |violation| {
+            if let Ok(mut values) = callback_violations.lock()
+                && values.len() < MAX_RECORDED_VIOLATIONS
+            {
+                values.push(violation);
+            }
+        };
+        let broker_result = match rules {
+            BrokerRules::Legacy(rules) => BrokerHandle::start(listeners, rules, callback),
+            BrokerRules::Partitioned(policy) => {
+                BrokerHandle::start_partitioned(listeners, policy, callback)
+            }
+        };
+        let broker = match broker_result {
             Ok(broker) => broker,
             Err(error) => {
                 for (_, _, path) in &bound {
@@ -253,6 +271,11 @@ impl VmNetworkBridge {
         report.tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         report
     }
+}
+
+enum BrokerRules {
+    Legacy(Vec<ManagedNetworkRule>),
+    Partitioned(BrokerPolicy),
 }
 
 impl Drop for VmNetworkBridge {

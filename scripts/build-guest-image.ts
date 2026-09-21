@@ -19,8 +19,12 @@ import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
 
-const kernelUrl = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/x86_64/vmlinux-6.1.177";
-const kernelSha256 = "18beee8e4b355140e637f5d2360cdf23b11a8979edbefacb3941b1ad28158f34";
+const kernelName = "vmlinux-6.18.41";
+const kernelBaseUrl = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/x86_64";
+const kernelUrl = `${kernelBaseUrl}/${kernelName}`;
+const kernelSha256 = "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5";
+const kernelConfigUrl = `${kernelUrl}.config`;
+const kernelConfigSha256 = "c9779a5f7e89c91e371c0a4d15134f46a4cdf2fce6239261edb5c169baec3f2d";
 const localBuild = process.env.SANDSURF_LOCAL_IMAGE === "1";
 const signingKeyPath = process.env.SANDBOX_IMAGE_SIGNING_KEY_FILE;
 let releaseSeed: Buffer | undefined;
@@ -126,9 +130,20 @@ try {
   );
   await normalizeExt4(workspace, 16384, "44444444-4444-4444-8444-444444444444", temporary, false);
 
-  const kernel = resolve(temporary, "vmlinux-6.1.177");
+  const kernel = resolve(temporary, kernelName);
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
   if (sha256(await readFile(kernel)) !== kernelSha256) throw new Error("guest kernel digest mismatch");
+  const kernelConfig = resolve(temporary, `${kernelName}.config`);
+  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernelConfig, kernelConfigUrl]);
+  const kernelConfigBytes = await readFile(kernelConfig);
+  if (sha256(kernelConfigBytes) !== kernelConfigSha256) throw new Error("guest kernel configuration digest mismatch");
+  const kernelConfiguration = kernelConfigBytes.toString("utf8");
+  for (const required of [
+    "CONFIG_CGROUPS=y", "CONFIG_DEVTMPFS=y", "CONFIG_IPV6=y", "CONFIG_OVERLAY_FS=y",
+    "CONFIG_SECCOMP=y", "CONFIG_TUN=y", "CONFIG_VIRTIO_VSOCKETS=y", "CONFIG_VSOCKETS=y",
+  ]) {
+    if (!kernelConfiguration.split("\n").includes(required)) throw new Error(`guest kernel lacks ${required}`);
+  }
 
   const explicitOutput = process.env.SANDSURF_IMAGE_OUTPUT_DIRECTORY;
   if (explicitOutput !== undefined && !isAbsolute(explicitOutput)) throw new Error("SANDSURF_IMAGE_OUTPUT_DIRECTORY must be absolute");
@@ -136,7 +151,7 @@ try {
   const native = explicitOutput ?? resolve("packages/sandbox/native/linux-x64");
   await mkdir(destination, { recursive: true });
   await mkdir(native, { recursive: true });
-  await replaceArtifact(kernel, resolve(destination, "vmlinux-6.1.177"));
+  await replaceArtifact(kernel, resolve(destination, kernelName));
   await replaceArtifact(rootfs, resolve(destination, "minimal-bootstrap.ext4"));
   await replaceArtifact(workload, resolve(destination, "minimal-workload.ext4"));
   await replaceArtifact(workspace, resolve(destination, "empty-workspace.ext4"));
@@ -148,7 +163,7 @@ try {
     version: "0.1.0",
     architecture: "x64",
     bootBundle: {
-      kernel: { path: "vmlinux-6.1.177", sha256: kernelSha256 },
+      kernel: { path: kernelName, sha256: kernelSha256 },
       bootstrap: {
         path: "minimal-bootstrap.ext4",
         sha256: sha256(await readFile(rootfs)),

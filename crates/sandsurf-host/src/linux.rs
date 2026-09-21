@@ -463,8 +463,11 @@ impl LinuxGuardianEffect {
                 return RuntimeInstallation::Unknown;
             }
         }
-        let bridge = match VmNetworkBridge::start(&active.socket, active.network_capability, rules)
-        {
+        let bridge = match VmNetworkBridge::start_partitioned(
+            &active.socket,
+            active.network_capability,
+            rules,
+        ) {
             Ok(value) => value,
             Err(_) => return RuntimeInstallation::Unknown,
         };
@@ -1246,11 +1249,11 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), LinuxEr
 
 fn network_rules(
     policy: &NetworkPolicy,
-) -> Result<Vec<sandbox_policy::ManagedNetworkRule>, LinuxError> {
+) -> Result<sandbox_network_broker::BrokerPolicy, LinuxError> {
     policy
         .validate()
         .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-    let mut rules = Vec::with_capacity(policy.rules.len());
+    let mut rules = sandbox_network_broker::BrokerPolicy::default();
     for rule in &policy.rules {
         let destination = match &rule.destination {
             NetworkDestination::Dns {
@@ -1281,11 +1284,16 @@ fn network_rules(
                 }
             })
             .collect();
-        rules.push(sandbox_policy::ManagedNetworkRule {
+        let managed = sandbox_policy::ManagedNetworkRule {
             transport: "tcp".into(),
             destination,
             ports,
-        });
+        };
+        match rule.plane {
+            sandsurf_protocol::NetworkPlane::NamedProxy => rules.named_proxy.push(managed),
+            sandsurf_protocol::NetworkPlane::DirectTcp => rules.direct_tcp.push(managed),
+            sandsurf_protocol::NetworkPlane::Dns => rules.dns.push(managed),
+        }
     }
     Ok(rules)
 }

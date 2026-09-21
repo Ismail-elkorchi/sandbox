@@ -13,9 +13,12 @@ name = "sandbox-guest"
 path = "src/main.rs"
 
 [dependencies]
+futures.workspace = true
 libc.workspace = true
+netstack-smoltcp.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-workload = { path = "../sandsurf-workload", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true

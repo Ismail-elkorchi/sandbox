@@ -54,6 +54,16 @@ pub struct BrokerHandle {
     stopped: bool,
 }
 
+/// Channel-separated network authority. A rule authorized for DNS lookup is
+/// not automatically usable by an HTTP/SOCKS proxy, and a named-proxy rule is
+/// not usable by transparent direct-IP TCP.
+#[derive(Debug, Clone, Default)]
+pub struct BrokerPolicy {
+    pub named_proxy: Vec<ManagedNetworkRule>,
+    pub direct_tcp: Vec<ManagedNetworkRule>,
+    pub dns: Vec<ManagedNetworkRule>,
+}
+
 type ViolationCallback = Arc<dyn Fn(NetworkViolation) + Send + Sync>;
 type ActiveStreams = Arc<Mutex<HashMap<u64, Vec<TcpStream>>>>;
 
@@ -115,9 +125,30 @@ fn shutdown_active_streams(streams: &ActiveStreams) {
 }
 
 impl BrokerHandle {
+    /// Compatibility entry point for the retired prepared-execution runtime.
+    /// DNS destinations retain its historical proxy-plus-resolver semantics;
+    /// IP destinations are direct TCP only.
     pub fn start(
         listeners: Vec<File>,
         rules: Vec<ManagedNetworkRule>,
+        callback: impl Fn(NetworkViolation) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let mut policy = BrokerPolicy::default();
+        for rule in rules {
+            match rule.destination {
+                ManagedNetworkDestination::Dns { .. } => {
+                    policy.named_proxy.push(rule.clone());
+                    policy.dns.push(rule);
+                }
+                ManagedNetworkDestination::Ip { .. } => policy.direct_tcp.push(rule),
+            }
+        }
+        Self::start_partitioned(listeners, policy, callback)
+    }
+
+    pub fn start_partitioned(
+        listeners: Vec<File>,
+        policy: BrokerPolicy,
         callback: impl Fn(NetworkViolation) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         if listeners.len() != 4 {
@@ -142,7 +173,11 @@ impl BrokerHandle {
         let violations = Arc::new(AtomicU64::new(0));
         let active_streams = Arc::new(Mutex::new(HashMap::new()));
         let next_connection_id = Arc::new(AtomicU64::new(1));
-        let rules = Arc::new(rules);
+        let named_rules = Arc::new(policy.named_proxy);
+        let mut socks_rules = (*named_rules).clone();
+        socks_rules.extend(policy.direct_tcp);
+        let socks_rules = Arc::new(socks_rules);
+        let dns_rules = Arc::new(policy.dns);
         let callback: ViolationCallback = Arc::new(callback);
         let threads = vec![
             tcp_accept_loop(
@@ -151,7 +186,7 @@ impl BrokerHandle {
                 Arc::clone(&active),
                 Arc::clone(&connections),
                 Arc::clone(&violations),
-                Arc::clone(&rules),
+                Arc::clone(&named_rules),
                 Arc::clone(&callback),
                 Arc::clone(&active_streams),
                 Arc::clone(&next_connection_id),
@@ -163,7 +198,7 @@ impl BrokerHandle {
                 Arc::clone(&active),
                 Arc::clone(&connections),
                 Arc::clone(&violations),
-                Arc::clone(&rules),
+                Arc::clone(&socks_rules),
                 Arc::clone(&callback),
                 Arc::clone(&active_streams),
                 Arc::clone(&next_connection_id),
@@ -173,7 +208,7 @@ impl BrokerHandle {
                 dns_udp,
                 Arc::clone(&stop),
                 Arc::clone(&violations),
-                Arc::clone(&rules),
+                Arc::clone(&dns_rules),
                 Arc::clone(&callback),
             ),
             dns_tcp_loop(
@@ -181,7 +216,7 @@ impl BrokerHandle {
                 Arc::clone(&stop),
                 Arc::clone(&active),
                 Arc::clone(&violations),
-                Arc::clone(&rules),
+                Arc::clone(&dns_rules),
                 Arc::clone(&callback),
             ),
         ];

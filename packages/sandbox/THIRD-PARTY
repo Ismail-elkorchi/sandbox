@@ -2,6 +2,7 @@ Third-party components
 
 adler2 2.0.1	0BSD OR MIT OR Apache-2.0
 ambient-authority 0.0.2	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+arrayvec 0.7.8	MIT OR Apache-2.0
 atomic-waker 1.1.2	Apache-2.0 OR MIT
 aws-lc-rs 1.18.1	ISC AND (Apache-2.0 OR ISC)
 aws-lc-sys 0.45.0	ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)
@@ -9,8 +10,10 @@ base64 0.22.1	MIT OR Apache-2.0
 base64 0.23.1	MIT OR Apache-2.0
 base64ct 1.8.3	Apache-2.0 OR MIT
 bitflags 2.13.2	MIT OR Apache-2.0
+bitflags 1.3.2	MIT/Apache-2.0
 block-buffer 0.10.4	MIT OR Apache-2.0
 bumpalo 3.20.3	MIT OR Apache-2.0
+byteorder 1.5.0	Unlicense OR MIT
 bytes 1.12.1	MIT
 cap-primitives 4.0.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 cap-std 4.0.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
@@ -29,12 +32,17 @@ crc32fast 1.5.2	MIT OR Apache-2.0
 crypto-common 0.1.7	MIT OR Apache-2.0
 curve25519-dalek 4.1.3	BSD-3-Clause
 curve25519-dalek-derive 0.1.1	MIT/Apache-2.0
+defmt 0.3.100	MIT OR Apache-2.0
+defmt 1.1.1	MIT OR Apache-2.0
+defmt-macros 1.1.1	MIT OR Apache-2.0
+defmt-parser 1.0.0	MIT OR Apache-2.0
 der 0.7.10	Apache-2.0 OR MIT
 digest 0.10.7	MIT OR Apache-2.0
 dunce 1.0.5	CC0-1.0 OR MIT-0 OR Apache-2.0
 ed25519 2.2.3	Apache-2.0 OR MIT
 ed25519-dalek 2.2.0	BSD-3-Clause
 errno 0.3.14	MIT OR Apache-2.0
+etherparse 0.16.0	MIT OR Apache-2.0
 fallible-iterator 0.3.0	MIT/Apache-2.0
 fallible-streaming-iterator 0.1.9	MIT/Apache-2.0
 fiat-crypto 0.2.9	MIT OR Apache-2.0 OR BSD-1-Clause
@@ -45,15 +53,20 @@ flate2 1.1.10	MIT OR Apache-2.0
 form_urlencoded 1.2.2	MIT OR Apache-2.0
 fs_extra 1.3.0	MIT
 fs-set-times 0.20.3	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+futures 0.3.34	MIT OR Apache-2.0
 futures-channel 0.3.34	MIT OR Apache-2.0
 futures-core 0.3.34	MIT OR Apache-2.0
+futures-executor 0.3.34	MIT OR Apache-2.0
 futures-io 0.3.34	MIT OR Apache-2.0
+futures-macro 0.3.34	MIT OR Apache-2.0
 futures-sink 0.3.34	MIT OR Apache-2.0
 futures-task 0.3.34	MIT OR Apache-2.0
 futures-util 0.3.34	MIT OR Apache-2.0
 generic-array 0.14.7	MIT
 getrandom 0.2.17	MIT OR Apache-2.0
 getrandom 0.4.3	MIT OR Apache-2.0
+hash32 0.3.1	MIT OR Apache-2.0
+heapless 0.8.0	MIT OR Apache-2.0
 hmac 0.12.1	MIT OR Apache-2.0
 http 1.5.0	MIT OR Apache-2.0
 http-body 1.1.0	MIT
@@ -79,25 +92,31 @@ js-sys 0.3.105	MIT OR Apache-2.0
 libc 0.2.177	MIT OR Apache-2.0
 libsqlite3-sys 0.38.2	MIT
 linux-raw-sys 0.11.0	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+lock_api 0.4.14	MIT OR Apache-2.0
 log 0.4.34	MIT OR Apache-2.0
 lru-slab 0.1.3	MIT OR Apache-2.0 OR Zlib
+managed 0.8.0	0BSD
 maybe-owned 0.3.4	MIT OR Apache-2.0
 memchr 2.8.3	Unlicense OR MIT
 miniz_oxide 0.9.1	MIT OR Zlib OR Apache-2.0
 mio 1.1.0	MIT
+netstack-smoltcp 0.2.4	MIT OR Apache-2.0
 once_cell 1.21.4	MIT OR Apache-2.0
 openssl-probe 0.2.1	MIT OR Apache-2.0
 percent-encoding 2.3.2	MIT OR Apache-2.0
 pin-project-lite 0.2.17	Apache-2.0 OR MIT
 pkcs8 0.10.2	Apache-2.0 OR MIT
 pkg-config 0.3.34	MIT OR Apache-2.0
+ppv-lite86 0.2.21	MIT OR Apache-2.0
 proc-macro2 1.0.107	MIT OR Apache-2.0
 quinn 0.11.12	MIT OR Apache-2.0
 quinn-proto 0.11.18	MIT OR Apache-2.0
 quinn-udp 0.5.15	MIT OR Apache-2.0
 quote 1.0.47	MIT OR Apache-2.0
 r-efi 6.0.0	MIT OR Apache-2.0 OR LGPL-2.1-or-later
+rand 0.8.8	MIT OR Apache-2.0
 rand 0.10.3	MIT OR Apache-2.0
+rand_chacha 0.3.1	MIT OR Apache-2.0
 rand_core 0.10.1	MIT OR Apache-2.0
 rand_core 0.6.4	MIT OR Apache-2.0
 rand_pcg 0.10.2	MIT OR Apache-2.0
@@ -119,6 +138,7 @@ ruzstd 0.9.0	MIT
 ryu 1.0.23	Apache-2.0 OR BSL-1.0
 same-file 1.0.6	Unlicense/MIT
 schannel 0.1.29	MIT
+scopeguard 1.2.0	MIT OR Apache-2.0
 security-framework 3.7.0	MIT OR Apache-2.0
 security-framework-sys 2.17.0	MIT OR Apache-2.0
 semver 1.0.28	MIT OR Apache-2.0
@@ -134,8 +154,11 @@ simd-adler32 0.3.10	MIT
 simdutf8 0.1.5	MIT OR Apache-2.0
 slab 0.4.12	MIT
 smallvec 1.15.2	MIT OR Apache-2.0
+smoltcp 0.12.0	0BSD
 socket2 0.6.5	MIT OR Apache-2.0
+spin 0.9.9	MIT
 spki 0.7.3	Apache-2.0 OR MIT
+stable_deref_trait 1.2.1	MIT OR Apache-2.0
 subtle 2.6.1	BSD-3-Clause
 syn 2.0.119	MIT OR Apache-2.0
 syn 3.0.6	MIT OR Apache-2.0
@@ -146,7 +169,9 @@ thiserror-impl 2.0.20	MIT OR Apache-2.0
 tinyvec 1.12.0	Zlib OR Apache-2.0 OR MIT
 tinyvec_macros 0.1.1	MIT OR Apache-2.0 OR Zlib
 tokio 1.50.0	MIT
+tokio-macros 2.6.1	MIT
 tokio-rustls 0.26.5	MIT OR Apache-2.0
+tokio-util 0.7.19	MIT
 tower 0.5.3	MIT
 tower-http 0.6.11	MIT
 tower-layer 0.3.3	MIT
@@ -202,5 +227,7 @@ windows-targets 0.53.5	MIT OR Apache-2.0
 windows-targets 0.52.6	MIT OR Apache-2.0
 winx 0.36.4	Apache-2.0 WITH LLVM-exception
 xattr 1.6.1	MIT OR Apache-2.0
+zerocopy 0.8.57	BSD-2-Clause OR Apache-2.0 OR MIT
+zerocopy-derive 0.8.57	BSD-2-Clause OR Apache-2.0 OR MIT
 zeroize 1.9.0	Apache-2.0 OR MIT
 zlib-rs 0.6.8	Zlib
