@@ -61,6 +61,16 @@ pub struct FileRange {
     pub revision: FileRevision,
 }
 
+/// Capture-only bytes. The host computes the content digest while the exact
+/// filesystem freeze is held; ordinary reads retain their revision contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenFileRange {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub eof: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WatchEventKind {
@@ -149,14 +159,35 @@ pub enum GuestServiceRequest {
     /// Guardian-only machine shutdown barrier. The host API never forwards
     /// this request from an application.
     PrepareStop,
-    /// Guardian-only capture barrier. The workload cgroup is frozen and its
-    /// persistent filesystem is synchronized before this request completes.
+    /// Guardian-only disk/full-state capture barrier. The workload cgroup is
+    /// frozen and its persistent filesystem synchronized; the guardian then
+    /// pauses the VM before copying mutable disk or memory state.
     PrepareFilesystemCapture {
         operation_id: OperationId,
     },
-    /// Guardian-only release of an exact capture barrier.
+    /// Guardian-only release after the VM has resumed from disk/full capture.
     FinishFilesystemCapture {
         operation_id: OperationId,
+    },
+    /// Freeze workload writers for a host-owned immutable tree transfer while
+    /// leaving the guest supervisor running to serve bounded file reads.
+    PrepareGuestTreeCapture {
+        operation_id: OperationId,
+    },
+    FinishGuestTreeCapture {
+        operation_id: OperationId,
+    },
+    /// Trusted capture worker reads the frozen workload tree under the exact
+    /// barrier identity. Applications cannot route this request directly.
+    CaptureFilesystemQuery {
+        operation_id: OperationId,
+        request: FilesystemRequest,
+    },
+    CaptureFilesystemRead {
+        operation_id: OperationId,
+        path: GuestPath,
+        offset: u64,
+        maximum: u32,
     },
     /// Guardian-only restore handshake sent over the captured boot capability.
     /// The response is sealed under that old session; all later connections
@@ -544,6 +575,9 @@ pub enum GuestServiceResponse {
     File {
         response: FilesystemResponse,
     },
+    FilesystemCaptureRead {
+        range: FrozenFileRange,
+    },
     Error {
         code: String,
         message: String,
@@ -578,4 +612,22 @@ pub enum FilesystemResponse {
     Link { target: Vec<u8> },
     Watch { events: Vec<WatchEvent> },
     Complete,
+}
+
+#[cfg(test)]
+mod capture_frame_tests {
+    use super::*;
+
+    #[test]
+    fn worst_case_frozen_chunk_fits_one_control_frame() {
+        let response = GuestServiceResponse::FilesystemCaptureRead {
+            range: FrozenFileRange {
+                offset: u64::MAX,
+                bytes: vec![255; crate::MAX_CONTROL_BYTE_PAGE],
+                eof: false,
+            },
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(bytes.len() < crate::MAX_CONTROL_BYTES);
+    }
 }

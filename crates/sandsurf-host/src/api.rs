@@ -238,6 +238,14 @@ pub enum HostRequest {
         maximum_bytes: Counter,
         approval_id: CommitmentId,
     },
+    CaptureGuestTree {
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        expected_epoch: Counter,
+        expected_revision: Counter,
+        scope_digest: Digest,
+        maximum_bytes: Counter,
+    },
     ListHostTree {
         sandbox_id: SandboxId,
         operation_id: OperationId,

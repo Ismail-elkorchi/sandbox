@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { packImageSources } from "./image-sources.ts";
 
 process.umask(0o022);
 
@@ -51,7 +52,7 @@ const alpineToolSha256 = "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409
 const expectedAlpinePackages = [
   "alpine-baselayout-data=3.7.2-r1", "alpine-baselayout=3.7.2-r1", "alpine-keys=2.6-r0",
   "alpine-release=3.24.2-r0", "apk-tools=3.0.8-r0", "brotli-libs=1.2.0-r1",
-  "busybox-binsh=1.37.0-r31", "busybox=1.37.0-r31", "c-ares=1.34.8-r0",
+  "busybox-binsh=1.37.0-r31", "busybox-extras=1.37.0-r31", "busybox=1.37.0-r31", "c-ares=1.34.8-r0",
   "ca-certificates-bundle=20260909-r0", "ca-certificates=20260909-r0",
   "git-init-template=2.54.0-r0", "git=2.54.0-r0", "libapk=3.0.8-r0",
   "libcrypto3=3.5.8-r0", "libcurl=8.22.0-r0", "libexpat=2.8.4-r0",
@@ -112,14 +113,14 @@ try {
   await normalizeTimestamps(root);
 
   const rootfs = resolve(temporary, "trusted-bootstrap.ext4");
-  await materializeTree(root, rootfs, 32 * 1024 * 1024, temporary, "trusted-bootstrap");
+  await materializeTree(root, rootfs, 128 * 1024 * 1024, temporary, "trusted-bootstrap");
   const workload = resolve(temporary, "development-workload.ext4");
   const workloadMaterials = await buildDevelopmentWorkload(temporary, workload);
   const workspace = resolve(temporary, "empty-workspace.ext4");
   const empty = resolve(temporary, "empty");
   await mkdir(empty);
   await normalizeTimestamps(empty);
-  await materializeTree(empty, workspace, 64 * 1024 * 1024, temporary, "empty-workspace");
+  await materializeTree(empty, workspace, 128 * 1024 * 1024, temporary, "empty-workspace");
 
   const kernel = resolve(temporary, kernelName);
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
@@ -265,6 +266,7 @@ try {
   await writeFile(resolve(destination, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
   if (explicitOutput === undefined) {
     await writeImageIndex(resolve("packages/sandbox/images"));
+    await packImageSources(architecture);
   }
 } finally {
   await rm(temporary, { recursive: true, force: true });
@@ -312,6 +314,7 @@ async function buildDevelopmentWorkload(
     "--repository", `${alpineRepository}/community`,
     "add",
     "ca-certificates=20260909-r0",
+    "busybox-extras=1.37.0-r31",
     "git=2.54.0-r0",
   ]);
 
@@ -322,6 +325,7 @@ async function buildDevelopmentWorkload(
   }
   for (const [relative, label] of [
     ["bin/busybox", "BusyBox"],
+    ["bin/busybox-extras", "BusyBox extras"],
     ["sbin/apk", "apk"],
     ["usr/bin/git", "Git"],
   ] as const) {
@@ -360,7 +364,7 @@ async function buildDevelopmentWorkload(
   ]);
   await run("cargo", [
     "run", "--locked", "--release", "-p", "sandbox-image", "--example", "materialize_ext4", "--",
-    canonicalTar, output, String(96 * 1024 * 1024),
+    canonicalTar, output, String(128 * 1024 * 1024),
   ]);
 
   const packageLock = Buffer.from(`${packages.join("\n")}\n`, "utf8");

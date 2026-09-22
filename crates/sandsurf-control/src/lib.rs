@@ -226,6 +226,16 @@ impl<E: GuardianEffect> Guardian<E> {
         Ok(())
     }
 
+    /// A destroyed VM no longer needs a resident owner. Its journal remains
+    /// durable and can be reopened if the host later reads historical evidence.
+    pub fn can_retire(&mut self) -> Result<bool> {
+        Ok(self
+            .journal
+            .last_observation()?
+            .is_some_and(|value| value.value().state == MachineState::Destroyed)
+            && !self.effect.live_observation_reachable())
+    }
+
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
         self.effect.reconcile(&mut self.journal)?;
         match request {
@@ -1026,12 +1036,16 @@ pub fn serve_guardian<E: GuardianEffect>(
 ) -> Result<()> {
     use sandsurf_native::local::LocalListener;
     let listener = LocalListener::bind(endpoint)?;
+    let mut last_request = std::time::Instant::now();
     loop {
         let mut connection = match listener.accept(Duration::from_secs(1)) {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 if let Err(error) = guardian.reconcile() {
                     eprintln!("sandsurf guardian reconciliation deferred: {error}");
+                }
+                if last_request.elapsed() >= Duration::from_secs(3) && guardian.can_retire()? {
+                    return Ok(());
                 }
                 continue;
             }
@@ -1041,6 +1055,7 @@ pub fn serve_guardian<E: GuardianEffect>(
             Ok(Some(frame)) => frame,
             Ok(None) | Err(_) => continue,
         };
+        last_request = std::time::Instant::now();
         let sequence = frame.sequence;
         let response = match parse_request(frame) {
             Ok(request) => guardian.handle(request),

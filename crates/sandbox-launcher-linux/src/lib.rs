@@ -374,19 +374,88 @@ pub fn read_launcher_status(stream: &mut UnixStream) -> io::Result<LauncherStatu
     }
 }
 
-pub fn read_launcher_event(stream: &mut UnixStream) -> io::Result<LauncherEvent> {
-    let (kind, payload) = read_internal(stream)?;
-    match kind {
-        INTERNAL_EXIT => serde_json::from_slice(&payload)
-            .map(LauncherEvent::Final)
-            .map_err(invalid_data),
-        INTERNAL_SETUP_ERROR => serde_json::from_slice(&payload)
-            .map(LauncherEvent::RuntimeError)
-            .map_err(invalid_data),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unknown launcher event",
-        )),
+/// Incrementally reads the final launcher event. A deadline never discards a
+/// partial frame, so a guardian can retain its VMM owner and retry observation.
+#[derive(Default)]
+pub struct LauncherEventReader {
+    buffer: Vec<u8>,
+}
+
+impl LauncherEventReader {
+    pub fn read(
+        &mut self,
+        stream: &mut UnixStream,
+        timeout: Duration,
+    ) -> io::Result<LauncherEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.buffer.len() >= 5 {
+                let length = u32::from_be_bytes(self.buffer[1..5].try_into().expect("header bound"))
+                    as usize;
+                if length > MAX_INTERNAL_MESSAGE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "launcher event too large",
+                    ));
+                }
+                if self.buffer.len() >= 5 + length {
+                    if self.buffer.len() != 5 + length {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "multiple launcher events",
+                        ));
+                    }
+                    let event = match self.buffer[0] {
+                        INTERNAL_EXIT => serde_json::from_slice(&self.buffer[5..])
+                            .map(LauncherEvent::Final)
+                            .map_err(invalid_data),
+                        INTERNAL_SETUP_ERROR => serde_json::from_slice(&self.buffer[5..])
+                            .map(LauncherEvent::RuntimeError)
+                            .map_err(invalid_data),
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unknown launcher event",
+                        )),
+                    };
+                    self.buffer.clear();
+                    return event;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "launcher exit confirmation timed out",
+                ));
+            }
+            stream.set_read_timeout(Some(remaining.min(Duration::from_millis(250))))?;
+            let mut chunk = [0_u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "launcher closed before final event",
+                    ));
+                }
+                Ok(count) => {
+                    self.buffer.extend_from_slice(&chunk[..count]);
+                    if self.buffer.len() > MAX_INTERNAL_MESSAGE + 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "launcher event buffer exceeded bound",
+                        ));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -714,6 +783,16 @@ fn vmm_exec(spec: &VmmSandboxSpec, files: &[File]) -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(context("set no_new_privs", io::Error::last_os_error()));
     }
+    // Descriptor zero is the launcher's private control socket. The VMM must
+    // never inherit a second reader for that channel: it could consume a
+    // termination request before the namespace supervisor observes it.
+    let null = File::open("/dev/null").map_err(|error| context("open VMM stdin sink", error))?;
+    // SAFETY: null is a live readable descriptor and dup2 atomically replaces
+    // only this child process's fd 0 before it executes Firecracker.
+    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
+        return Err(context("isolate VMM stdin", io::Error::last_os_error()));
+    }
+
     apply_landlock(spec).map_err(|error| context("install Landlock ruleset", error))?;
     apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
 
@@ -1690,6 +1769,40 @@ mod tests {
         let (kind, value) = read_internal(&mut right).expect("read");
         assert_eq!(kind, INTERNAL_TERMINATE);
         assert_eq!(value, b"abc");
+    }
+
+    #[test]
+    fn final_event_reader_retains_partial_frame_across_timeout() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        let final_status = LauncherFinalStatus {
+            raw_wait_status: 0,
+            exit_code: Some(0),
+            signal: None,
+            core_dumped: false,
+            cleanup_failures: Vec::new(),
+            tree_reaped: true,
+        };
+        let payload = serde_json::to_vec(&final_status).expect("status");
+        let mut frame = vec![INTERNAL_EXIT];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        writer.write_all(&frame[..7]).expect("partial event");
+        let mut events = LauncherEventReader::default();
+        assert_eq!(
+            events
+                .read(&mut reader, Duration::from_millis(10))
+                .expect_err("incomplete event")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        writer.write_all(&frame[7..]).expect("finish event");
+        match events
+            .read(&mut reader, Duration::from_secs(1))
+            .expect("event")
+        {
+            LauncherEvent::Final(value) => assert!(value.tree_reaped),
+            LauncherEvent::RuntimeError(_) => panic!("expected final status"),
+        }
     }
 
     #[test]

@@ -207,7 +207,7 @@ pub struct WindowsGuardianEffect {
     capture_origin_was_paused: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
     vm_id: String,
     sandbox_id: SandboxId,
@@ -224,6 +224,7 @@ struct PendingGuest {
 
 struct WindowsWorkload {
     active: Arc<Mutex<Option<ActiveGuest>>>,
+    remote: Option<(ActiveGuest, RemoteWorkloadDriver<HyperVChannel>)>,
 }
 
 struct InstalledRuntime {
@@ -330,7 +331,10 @@ impl WindowsGuardianEffect {
             sandbox_root: sandbox_root.to_path_buf(),
             config,
             machine,
-            workload: WindowsWorkload { active },
+            workload: WindowsWorkload {
+                active,
+                remote: None,
+            },
             pending: None,
             network: Arc::new(Mutex::new(None)),
             network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),
@@ -922,28 +926,47 @@ impl WindowsWorkload {
     fn endpoint(&self) -> Option<ActiveGuest> {
         self.active.lock().ok()?.clone()
     }
+
+    fn driver(&mut self) -> Option<&mut RemoteWorkloadDriver<HyperVChannel>> {
+        let active = self.endpoint();
+        let Some(active) = active else {
+            self.remote = None;
+            return None;
+        };
+        if self
+            .remote
+            .as_ref()
+            .is_none_or(|(cached, _)| cached != &active)
+        {
+            self.remote = Some((
+                active.clone(),
+                RemoteWorkloadDriver::new(guest_client(&active)),
+            ));
+        }
+        self.remote.as_mut().map(|(_, driver)| driver)
+    }
 }
 
 impl WorkloadDriver for WindowsWorkload {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
-        let Some(active) = self.endpoint() else {
+        let Some(driver) = self.driver() else {
             return EffectOutcome::NotApplied(bytes_digest(b"hyper-v-guest-not-running"));
         };
-        RemoteWorkloadDriver::new(guest_client(&active)).dispatch(mutation, capability)
+        driver.dispatch(mutation, capability)
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if let Some(active) = self.endpoint() {
-            RemoteWorkloadDriver::new(guest_client(&active)).reconcile(journal)?;
+        if let Some(driver) = self.driver() {
+            driver.reconcile(journal)?;
         }
         Ok(())
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        let active = self.endpoint().ok_or(ControlError::Unsupported(
+        let driver = self.driver().ok_or(ControlError::Unsupported(
             "guest is unavailable because the Hyper-V VM has no live owner",
         ))?;
-        RemoteWorkloadDriver::new(guest_client(&active)).query(request)
+        driver.query(request)
     }
 }
 

@@ -2394,6 +2394,111 @@ fn independent_jobs_and_pty_streams_have_separate_reservations() {
     assert!(f.runtime.receipt(&terminal).unwrap().is_none());
 }
 
+#[test]
+fn completed_jobs_return_unused_output_headroom_without_releasing_bytes() {
+    let mut f = Fixture::new();
+    for index in 0..12 {
+        let identity = format!("short-job-{index}");
+        let mutation = process_mutation(&f.mutation, &identity, n(100), StdioMode::Pipes);
+        let authorization = f
+            .host
+            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+            .unwrap();
+        f.runtime.admit(authorization).unwrap();
+        let process: ProcessId = identity.try_into().unwrap();
+        f.runtime
+            .admit_process(process.clone(), &mutation.operation_id, n(100), false)
+            .unwrap();
+        dispatch(&mut f.runtime, &f.host, &mutation);
+        f.runtime
+            .append_output(&process, n(1), Stream::Stdout, b"x")
+            .unwrap();
+        f.runtime
+            .publish_receipt(
+                &process,
+                ProcessOutcome::Exit { code: 0 },
+                hash("reaped"),
+                hash("accounted"),
+            )
+            .unwrap();
+        assert_eq!(
+            f.runtime.read_output(&process, n(0), 16).unwrap().chunks[0].bytes,
+            b"x"
+        );
+    }
+    let mutation = process_mutation(&f.mutation, "large-job", n(880), StdioMode::Pipes);
+    let authorization = f
+        .host
+        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    f.runtime
+        .admit_process(
+            "large-job".try_into().unwrap(),
+            &mutation.operation_id,
+            n(880),
+            false,
+        )
+        .unwrap();
+    let excessive = process_mutation(&f.mutation, "too-large-job", n(10), StdioMode::Pipes);
+    let authorization = f
+        .host
+        .authorize(excessive.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    assert!(
+        f.runtime
+            .admit_process(
+                "too-large-job".try_into().unwrap(),
+                &excessive.operation_id,
+                n(10),
+                false,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn confirmed_non_application_returns_output_reservation() {
+    let mut f = Fixture::new();
+    let failed = process_mutation(&f.mutation, "rejected-job", n(850), StdioMode::Pipes);
+    let authorization = f
+        .host
+        .authorize(failed.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    f.runtime
+        .admit_process(
+            "rejected-job".try_into().unwrap(),
+            &failed.operation_id,
+            n(850),
+            false,
+        )
+        .unwrap();
+    f.runtime
+        .record_delivery(
+            &failed.operation_id,
+            &failed.request_digest,
+            Delivery::NotApplied,
+            Some(hash("rejected")),
+        )
+        .unwrap();
+    let next = process_mutation(&f.mutation, "next-job", n(900), StdioMode::Pipes);
+    let authorization = f
+        .host
+        .authorize(next.clone(), Capability::Spawn, &hash("workload"))
+        .unwrap();
+    f.runtime.admit(authorization).unwrap();
+    f.runtime
+        .admit_process(
+            "next-job".try_into().unwrap(),
+            &next.operation_id,
+            n(900),
+            false,
+        )
+        .unwrap();
+}
+
 // Invoked only by the parent test with its newly allocated private fixture directory.
 #[test]
 fn abrupt_writer_child() {

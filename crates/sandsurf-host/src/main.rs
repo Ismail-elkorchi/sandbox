@@ -266,8 +266,11 @@ mod tests {
         let mut input = request(&message);
         input.extend_from_slice(&request(&message));
         let mut output = Vec::new();
-        let missing = Path::new("/this-sandsurf-host-endpoint-does-not-exist");
-        bridge_loop(missing, &mut input.as_slice(), &mut output).unwrap();
+        let missing = std::env::temp_dir().join(format!(
+            "sandsurf-host-endpoint-absent-{}",
+            std::process::id()
+        ));
+        bridge_loop(&missing, &mut input.as_slice(), &mut output).unwrap();
         let mut cursor = output.as_slice();
         for _ in 0..2 {
             let mut length = [0_u8; 4];

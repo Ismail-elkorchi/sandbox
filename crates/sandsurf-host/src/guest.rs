@@ -5,7 +5,7 @@ use sandsurf_native::{GuestChannel, GuestChannelError, GuestConnection};
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, CONTROL_COMPLETE, Counter, Frame, FrameKind,
     GuestChallenge, GuestServiceRequest, GuestServiceResponse, HostHandshake, Mutation,
-    ProcessState,
+    ProcessState, SessionCodec,
 };
 use sandsurf_protocol::{Capability, Digest, SandboxId};
 use sandsurf_state::RuntimeJournal;
@@ -64,6 +64,13 @@ pub struct GuestClient<C> {
     epoch: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
+    session: Option<GuestSession>,
+}
+
+struct GuestSession {
+    connection: Box<dyn GuestConnection>,
+    codec: SessionCodec,
+    outgoing: Counter,
 }
 
 impl<C: GuestChannel> GuestClient<C> {
@@ -80,6 +87,7 @@ impl<C: GuestChannel> GuestClient<C> {
             epoch,
             boot_identity,
             capability,
+            session: None,
         }
     }
 
@@ -87,6 +95,22 @@ impl<C: GuestChannel> GuestClient<C> {
         &mut self,
         request: &GuestServiceRequest,
     ) -> Result<GuestServiceResponse, GuestClientError> {
+        if self.session.is_none() {
+            self.session = Some(self.connect()?);
+        }
+        let result = self.call_session(request);
+        if result.is_err()
+            || matches!(
+                request,
+                GuestServiceRequest::RebindEpoch { .. } | GuestServiceRequest::PrepareStop
+            )
+        {
+            self.session = None;
+        }
+        result
+    }
+
+    fn connect(&mut self) -> Result<GuestSession, GuestClientError> {
         let mut connection = self.channel.connect()?;
         connection.set_io_timeout(Some(IO_TIMEOUT))?;
         let (handshake, hello) = HostHandshake::start(
@@ -97,38 +121,54 @@ impl<C: GuestChannel> GuestClient<C> {
         )?;
         write_unauthed(&mut *connection, &hello)?;
         let challenge: GuestChallenge = read_unauthed(&mut *connection)?;
-        let (finish, mut codec) = handshake.finish(&challenge)?;
+        let (finish, codec) = handshake.finish(&challenge)?;
         write_unauthed(&mut *connection, &finish)?;
+        Ok(GuestSession {
+            connection,
+            codec,
+            outgoing: Counter::ZERO,
+        })
+    }
 
+    fn call_session(
+        &mut self,
+        request: &GuestServiceRequest,
+    ) -> Result<GuestServiceResponse, GuestClientError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(GuestClientError::Protocol("guest session is unavailable"))?;
         let payload = serde_json::to_vec(request)?;
         if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
             return Err(GuestClientError::Protocol(
                 "guest request exceeds control bound",
             ));
         }
-        codec
+        session.outgoing = session.outgoing.next()?;
+        session
+            .codec
             .seal(Frame {
                 kind: FrameKind::Control,
                 stream: 0,
-                sequence: Counter::ONE,
+                sequence: session.outgoing,
                 authentication: [0; AUTHENTICATION_BYTES],
                 payload,
             })?
-            .write(&mut *connection)?;
-        let response = Frame::read(&mut *connection)?.ok_or(GuestClientError::Protocol(
+            .write(&mut *session.connection)?;
+        let response = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
             "guest closed without a response",
         ))?;
-        let response = codec.open(response)?;
+        let response = session.codec.open(response)?;
         if response.kind != FrameKind::Control || response.stream != 0 {
             return Err(GuestClientError::Protocol(
                 "guest returned a non-control response",
             ));
         }
         let response = serde_json::from_slice(&response.payload)?;
-        let completion = Frame::read(&mut *connection)?.ok_or(GuestClientError::Protocol(
-            "guest closed without protocol completion",
-        ))?;
-        let completion = codec.open(completion)?;
+        let completion = Frame::read(&mut *session.connection)?.ok_or(
+            GuestClientError::Protocol("guest closed without protocol completion"),
+        )?;
+        let completion = session.codec.open(completion)?;
         if completion.kind != FrameKind::Control
             || completion.stream != 0
             || completion.payload != CONTROL_COMPLETE
@@ -323,4 +363,111 @@ fn read_unauthed<T: serde::de::DeserializeOwned>(
         ));
     }
     Ok(serde_json::from_slice(&frame.payload)?)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use sandsurf_protocol::{GuestFinish, GuestHandshake, GuestHello};
+    use std::os::unix::net::UnixStream;
+
+    struct PairChannel(Option<UnixStream>);
+
+    impl GuestChannel for PairChannel {
+        fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
+            self.0
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn GuestConnection>)
+                .ok_or_else(|| GuestChannelError::Protocol("unexpected reconnect".into()))
+        }
+    }
+
+    fn send_unauthed<T: serde::Serialize>(stream: &mut UnixStream, value: &T) {
+        Frame {
+            kind: FrameKind::Control,
+            stream: 0,
+            sequence: Counter::ZERO,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: serde_json::to_vec(value).unwrap(),
+        }
+        .write(stream)
+        .unwrap();
+    }
+
+    #[test]
+    fn authenticated_guest_session_serves_multiple_requests() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let sandbox = SandboxId::try_from("persistent-guest").unwrap();
+        let boot = sandsurf_protocol::bytes_digest(b"verified-boot");
+        let capability = [7; 32];
+        let expected_sandbox = sandbox.clone();
+        let expected_boot = boot.clone();
+        let server = std::thread::spawn(move || {
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let hello: GuestHello = read_unauthed(&mut server_stream).unwrap();
+            let (handshake, challenge) = GuestHandshake::accept(
+                BootCapability::from_bytes(capability),
+                &expected_sandbox,
+                Counter::ONE,
+                &expected_boot,
+                &hello,
+            )
+            .unwrap();
+            send_unauthed(&mut server_stream, &challenge);
+            let finish: GuestFinish = read_unauthed(&mut server_stream).unwrap();
+            let mut codec = handshake.finish(&finish).unwrap();
+            let mut outgoing = Counter::ZERO;
+            for _ in 0..2 {
+                let request = codec
+                    .open(Frame::read(&mut server_stream).unwrap().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<GuestServiceRequest>(&request.payload).unwrap(),
+                    GuestServiceRequest::ProbeIdentity
+                );
+                for payload in [
+                    serde_json::to_vec(&GuestServiceResponse::Identity {
+                        sandbox_id: expected_sandbox.clone(),
+                        epoch: Counter::ONE,
+                        boot_identity: expected_boot.clone(),
+                    })
+                    .unwrap(),
+                    CONTROL_COMPLETE.to_vec(),
+                ] {
+                    outgoing = outgoing.next().unwrap();
+                    codec
+                        .seal(Frame {
+                            kind: FrameKind::Control,
+                            stream: 0,
+                            sequence: outgoing,
+                            authentication: [0; AUTHENTICATION_BYTES],
+                            payload,
+                        })
+                        .unwrap()
+                        .write(&mut server_stream)
+                        .unwrap();
+                }
+            }
+        });
+        let mut client = GuestClient::new(
+            PairChannel(Some(client_stream)),
+            sandbox.clone(),
+            Counter::ONE,
+            boot.clone(),
+            capability,
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                client.call(&GuestServiceRequest::ProbeIdentity).unwrap(),
+                GuestServiceResponse::Identity {
+                    sandbox_id: sandbox.clone(),
+                    epoch: Counter::ONE,
+                    boot_identity: boot.clone(),
+                }
+            );
+        }
+        server.join().unwrap();
+    }
 }

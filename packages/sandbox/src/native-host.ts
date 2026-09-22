@@ -153,8 +153,12 @@ export class NativeHostClient {
   }
 
   async stopService(): Promise<void> {
-    const response = await this.request({ kind: "stop-service" });
-    if (response.kind !== "complete") throw new SandsurfHostError("protocol", "native host did not confirm service stop");
+    try {
+      const response = await this.request({ kind: "stop-service" });
+      if (response.kind !== "complete") throw new SandsurfHostError("protocol", "native host did not confirm service stop");
+    } finally {
+      await this.close();
+    }
   }
 }
 

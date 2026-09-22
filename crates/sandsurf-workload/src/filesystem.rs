@@ -281,6 +281,35 @@ impl FilesystemService {
         })
     }
 
+    /// Used only by the trusted capture worker while the workload cgroup is
+    /// frozen. It avoids rehashing the whole file for every bounded page.
+    pub fn read_frozen_range(
+        &self,
+        guest_path: &GuestPath,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<sandsurf_protocol::FrozenFileRange, FilesystemError> {
+        if maximum == 0 || maximum > sandsurf_protocol::MAX_CONTROL_BYTE_PAGE {
+            return Err(FilesystemError::Invalid("capture read bound is invalid"));
+        }
+        let relative = self.relative_path(guest_path, false)?;
+        let mut file = self.root.open(&relative)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES || offset > metadata.len() {
+            return Err(FilesystemError::Capacity);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let available = metadata.len() - offset;
+        let length = available.min(maximum as u64) as usize;
+        let mut bytes = vec![0; length];
+        file.read_exact(&mut bytes)?;
+        Ok(sandsurf_protocol::FrozenFileRange {
+            offset,
+            bytes,
+            eof: length as u64 == available,
+        })
+    }
+
     pub fn revision(&self, guest_path: &str) -> Result<Option<FileRevision>, FilesystemError> {
         let path = GuestPath::try_from(guest_path)
             .map_err(|_| FilesystemError::Invalid("guest path is malformed"))?;

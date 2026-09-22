@@ -260,7 +260,7 @@ pub struct AppleGuardianEffect {
     capture_origin_was_paused: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
     socket: PathBuf,
     sandbox_id: SandboxId,
@@ -272,6 +272,7 @@ struct ActiveGuest {
 
 struct AppleWorkload {
     active: Arc<Mutex<Option<ActiveGuest>>>,
+    remote: Option<(ActiveGuest, RemoteWorkloadDriver<UnixVsockChannel>)>,
 }
 
 struct InstalledRuntime {
@@ -387,6 +388,7 @@ impl AppleGuardianEffect {
                 .map_err(|error| AppleError::Invalid(format!("invalid Apple VM: {error:?}")))?,
             workload: AppleWorkload {
                 active: Arc::clone(&active),
+                remote: None,
             },
             pending: None,
             authentication_disk,
@@ -942,28 +944,47 @@ impl AppleWorkload {
     fn endpoint(&self) -> Option<ActiveGuest> {
         self.active.lock().ok()?.clone()
     }
+
+    fn driver(&mut self) -> Option<&mut RemoteWorkloadDriver<UnixVsockChannel>> {
+        let active = self.endpoint();
+        let Some(active) = active else {
+            self.remote = None;
+            return None;
+        };
+        if self
+            .remote
+            .as_ref()
+            .is_none_or(|(cached, _)| cached != &active)
+        {
+            self.remote = Some((
+                active.clone(),
+                RemoteWorkloadDriver::new(guest_client(&active)),
+            ));
+        }
+        self.remote.as_mut().map(|(_, driver)| driver)
+    }
 }
 
 impl WorkloadDriver for AppleWorkload {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
-        let Some(active) = self.endpoint() else {
+        let Some(driver) = self.driver() else {
             return EffectOutcome::NotApplied(bytes_digest(b"apple-guest-not-running"));
         };
-        RemoteWorkloadDriver::new(guest_client(&active)).dispatch(mutation, capability)
+        driver.dispatch(mutation, capability)
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if let Some(active) = self.endpoint() {
-            RemoteWorkloadDriver::new(guest_client(&active)).reconcile(journal)?;
+        if let Some(driver) = self.driver() {
+            driver.reconcile(journal)?;
         }
         Ok(())
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        let active = self.endpoint().ok_or(ControlError::Unsupported(
+        let driver = self.driver().ok_or(ControlError::Unsupported(
             "guest is unavailable because the Apple VM has no live owner",
         ))?;
-        RemoteWorkloadDriver::new(guest_client(&active)).query(request)
+        driver.query(request)
     }
 }
 

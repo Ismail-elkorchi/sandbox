@@ -257,3 +257,50 @@ test("guest filesystem errors retain their structured category", async () => {
     (error) => error instanceof SandsurfHostError && error.category === "filesystem.missing",
   );
 });
+
+test("workspace publication uploads immutable captured blobs rather than live guest files", async () => {
+  const captured = Buffer.from("captured before later edits");
+  const fileDigest = createHash("sha256").update(captured).digest("hex");
+  const entry = { path: "file.txt", kind: "file", mode: 0o644, size: captured.byteLength, digest: fileDigest, target: null };
+  const entryDigest = sandsurfDigest("transfer", ["sandsurf-workspace-entry-v1", entry]);
+  const manifestDigest = createHash("sha256").update("SANDSURF-WORKSPACE-MANIFEST-V1\0").update(Buffer.from(entryDigest, "hex")).digest("hex");
+  const emptyDigest = createHash("sha256").update("SANDSURF-WORKSPACE-MANIFEST-V1\0").digest("hex");
+  const calls = [];
+  const uploaded = [];
+  let currentCaptureId = "capture-1";
+  const view = {
+    id: "box", imageDigest: "a".repeat(64), resources: { vcpus: 1, memoryMiB: 1, diskBytes: 1024, outputBytes: 1, processes: 1 },
+    runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { workloadMemoryBytes: 1, workloadProcesses: 1 } },
+    configurationRevision: 1, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { epoch: 1 } }, workloadDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace", entrypoint: [], command: [] }, lifetime: { idleStopAfterMillis: null, expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
+  };
+  const capture = () => ({ sandboxId: "box", operationId: currentCaptureId, requestDigest: "b".repeat(64), manifestDigest, entries: 1, bytes: captured.byteLength });
+  const host = {
+    async approve() { return "approval"; },
+    async request(request) {
+      calls.push(request);
+      switch (request.kind) {
+        case "get-sandbox": return { kind: "sandbox", value: view };
+        case "capture-guest-tree": currentCaptureId = request.operationId; return { kind: "host-tree-capture", capture: capture() };
+        case "list-host-tree": assert.equal(request.operationId, currentCaptureId); return { kind: "host-tree-entries", capture: capture(), entries: [entry], next: null };
+        case "read-host-tree-blob": assert.equal(request.operationId, currentCaptureId); return { kind: "host-blob", digest: fileDigest, offset: request.offset, bytes: [...captured], eof: true };
+        case "write-host-blob": uploaded.push(...request.bytes); return { kind: "complete" };
+        case "begin-host-blob": case "commit-host-blob": return { kind: "complete" };
+        case "apply-host-workspace":
+          assert.equal("captureOperationId" in request.changeSet, false);
+          return { kind: "host-apply", report: { operationId: request.operationId, changeSetDigest: request.changeSet.digest, applied: 1, recovered: false } };
+        default: throw new Error(`Unexpected request ${request.kind}`);
+      }
+    },
+  };
+  const sandbox = new Sandbox(host, view);
+  const snapshot = await sandbox.workspace.snapshot({ operationId: "capture-1", maximumBytes: 1024 });
+  assert.equal(snapshot.digest, manifestDigest);
+  assert.equal(snapshot.captureOperationId, "capture-1");
+  const changes = await sandbox.workspace.diff({ digest: emptyDigest, entries: [] });
+  assert.equal(changes.captureOperationId.startsWith("workspace-capture-"), true);
+  const report = await sandbox.workspace.applyToHost({ destination: resolve(root, "captured-publication"), operationId: "publish-1", changeSet: changes });
+  assert.equal(report.applied, 1);
+  assert.deepEqual(uploaded, [...captured]);
+  assert.equal(calls.some((request) => request.kind === "guest"), false);
+  assert.equal(calls.filter((request) => request.kind === "capture-guest-tree").length, 2);
+});

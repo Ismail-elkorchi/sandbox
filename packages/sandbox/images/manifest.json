@@ -3,6 +3,6 @@
   "buildId": "sandsurf-images-0.1.0",
   "files": {
     "development-arm64/manifest.json": "e32bcb69ac5fdb6e618ed2c052ebf8df90fb0bccbb02233653727bb0b0fecd6f",
-    "development-x64/manifest.json": "27454113500ce1b561f099313df4efeeaa0a76286e9502894e7971ef83a526b6"
+    "development-x64/manifest.json": "7343d25f7be2ab6fa0139d5194fb51e4567c224eb5e35f69a64c710076bd29f3"
   }
 }

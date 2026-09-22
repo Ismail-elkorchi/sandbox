@@ -187,6 +187,7 @@ impl HostService {
             workspace,
             secrets,
         };
+        service.recover_guest_capture_barriers();
         service.recover_checkpoint_barriers();
         service.recover_secret_authority();
         service.recover_image_releases();
@@ -626,6 +627,181 @@ impl HostService {
                 }
                 Ok(HostResponse::HostTreeCapture { capture })
             }
+            HostRequest::CaptureGuestTree {
+                sandbox_id,
+                operation_id,
+                expected_epoch,
+                expected_revision,
+                scope_digest,
+                maximum_bytes,
+            } => {
+                let request_digest = digest(
+                    Domain::Transfer,
+                    &(
+                        "sandsurf-guest-tree-capture-v1",
+                        &sandbox_id,
+                        &operation_id,
+                        expected_epoch,
+                        expected_revision,
+                        &scope_digest,
+                        maximum_bytes,
+                    ),
+                )?;
+                if self.catalog.operation(&operation_id)?.is_none() {
+                    self.catalog.active_grant(
+                        &sandbox_id,
+                        expected_revision,
+                        Capability::ReadFiles,
+                        &scope_digest,
+                    )?;
+                }
+                let admitted = self.catalog.admit_transfer_operation(
+                    operation_id.clone(),
+                    sandbox_id.clone(),
+                    request_digest.clone(),
+                )?;
+                if let Some(capture) = self.workspace.existing_guest_capture(
+                    &sandbox_id,
+                    &operation_id,
+                    &request_digest,
+                )? {
+                    if self.workspace.guest_capture_pending(&operation_id)? {
+                        self.recover_guest_capture_barriers();
+                        if self.workspace.guest_capture_pending(&operation_id)? {
+                            return Err(HostError::Invalid(
+                                "published guest tree still has an unresolved freeze barrier",
+                            ));
+                        }
+                    }
+                    if !admitted.applied {
+                        self.catalog
+                            .complete_transfer_operation(&operation_id, &request_digest)?;
+                    }
+                    return Ok(HostResponse::HostTreeCapture { capture });
+                }
+                if admitted.applied {
+                    return Err(HostError::Invalid(
+                        "completed guest capture has no published tree",
+                    ));
+                }
+                let sandbox = self
+                    .catalog
+                    .sandbox(&sandbox_id)?
+                    .ok_or(HostError::Invalid("guest capture sandbox is missing"))?;
+                if maximum_bytes > sandbox.resources.disk_bytes {
+                    return Err(HostError::Invalid(
+                        "guest capture bound exceeds the sandbox disk budget",
+                    ));
+                }
+                self.provision_guardian(&sandbox_id)?;
+                let client = GuardianClient::new(self.guardian_endpoint(&sandbox_id));
+                let inspection = client.inspect(sandbox_id.clone(), None)?;
+                let Observation::Current { value: machine } = inspection.observation else {
+                    return Err(HostError::Invalid(
+                        "guest capture requires a current machine observation",
+                    ));
+                };
+                if machine.epoch != expected_epoch
+                    || machine.applied_revision != expected_revision
+                    || machine.state != MachineState::Running
+                {
+                    return Err(HostError::Invalid(
+                        "guest capture requires the expected running epoch and revision",
+                    ));
+                }
+                self.workspace
+                    .begin_guest_capture(&crate::workspace::PendingGuestCapture {
+                        sandbox_id: sandbox_id.clone(),
+                        operation_id: operation_id.clone(),
+                        epoch: expected_epoch,
+                    })?;
+                let result = (|| {
+                    if !matches!(
+                        client.guest(
+                            sandbox_id.clone(),
+                            GuestServiceRequest::PrepareGuestTreeCapture {
+                                operation_id: operation_id.clone(),
+                            },
+                        )?,
+                        GuestServiceResponse::FilesystemCapturePrepared { .. }
+                    ) {
+                        return Err(HostError::Invalid(
+                            "guest did not establish the filesystem capture barrier",
+                        ));
+                    }
+                    self.workspace
+                        .capture_guest(
+                            sandbox_id.clone(),
+                            operation_id.clone(),
+                            request_digest.clone(),
+                            maximum_bytes,
+                            |request| match client.guest(
+                                sandbox_id.clone(),
+                                GuestServiceRequest::CaptureFilesystemQuery {
+                                    operation_id: operation_id.clone(),
+                                    request,
+                                },
+                            ) {
+                                Ok(GuestServiceResponse::File { response }) => Ok(response),
+                                Ok(GuestServiceResponse::Error { code, message }) => {
+                                    Err(crate::workspace::WorkspaceError::Guest(format!(
+                                        "{code}: {message}"
+                                    )))
+                                }
+                                Ok(_) => Err(crate::workspace::WorkspaceError::Invalid(
+                                    "guest capture query returned the wrong response",
+                                )),
+                                Err(error) => {
+                                    Err(crate::workspace::WorkspaceError::Guest(error.to_string()))
+                                }
+                            },
+                            |path, offset, maximum| match client.guest(
+                                sandbox_id.clone(),
+                                GuestServiceRequest::CaptureFilesystemRead {
+                                    operation_id: operation_id.clone(),
+                                    path,
+                                    offset,
+                                    maximum,
+                                },
+                            ) {
+                                Ok(GuestServiceResponse::FilesystemCaptureRead { range }) => {
+                                    Ok(range)
+                                }
+                                Ok(GuestServiceResponse::Error { code, message }) => {
+                                    Err(crate::workspace::WorkspaceError::Guest(format!(
+                                        "{code}: {message}"
+                                    )))
+                                }
+                                Ok(_) => Err(crate::workspace::WorkspaceError::Invalid(
+                                    "guest capture read returned the wrong response",
+                                )),
+                                Err(error) => {
+                                    Err(crate::workspace::WorkspaceError::Guest(error.to_string()))
+                                }
+                            },
+                        )
+                        .map_err(HostError::from)
+                })();
+                let finish = client.guest(
+                    sandbox_id.clone(),
+                    GuestServiceRequest::FinishGuestTreeCapture {
+                        operation_id: operation_id.clone(),
+                    },
+                )?;
+                if !matches!(
+                    finish,
+                    GuestServiceResponse::FilesystemCaptureFinished { .. }
+                ) {
+                    return Err(HostError::Invalid(
+                        "guest did not release the filesystem capture barrier",
+                    ));
+                }
+                self.workspace.finish_guest_capture(&operation_id)?;
+                let capture = result?;
+                self.catalog
+                    .complete_transfer_operation(&operation_id, &request_digest)?;
+                Ok(HostResponse::HostTreeCapture { capture })
+            }
             HostRequest::ListHostTree {
                 sandbox_id,
                 operation_id,
@@ -962,6 +1138,23 @@ impl HostService {
                         request_digest,
                     },
                 )?;
+                let sandbox_root = self.sandbox_root(&sandbox_id);
+                prepare_directory(&sandbox_root)?;
+                let disks = sandbox_root.join("disks");
+                prepare_directory(&disks)?;
+                let workload_disk = disks.join(workload_disk_name());
+                // The guardian creates a blank mutable disk when none exists.
+                // A new fork must install its captured disk before the guardian
+                // is allowed to open that VM. An interrupted pre-launch copy is
+                // verified and resumed by the same exact checkpoint identity.
+                let materialized_before_owner = !workload_disk.exists();
+                if materialized_before_owner {
+                    crate::checkpoints::materialize_fork(
+                        &self.root.join("checkpoints"),
+                        &checkpoint,
+                        &workload_disk,
+                    )?;
+                }
                 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                 self.provision_guardian_with_config(&sandbox_id, Some(&native_config))?;
                 let endpoint = self.guardian_endpoint(&sandbox_id);
@@ -982,15 +1175,13 @@ impl HostService {
                     value.completed_intent.is_none()
                         && value.guardian_operation.delivery == Delivery::NotApplied
                 }) {
-                    let sandbox_root = self.sandbox_root(&sandbox_id);
-                    prepare_directory(&sandbox_root)?;
-                    let disks = sandbox_root.join("disks");
-                    prepare_directory(&disks)?;
-                    crate::checkpoints::materialize_fork(
-                        &self.root.join("checkpoints"),
-                        &checkpoint,
-                        &disks.join(workload_disk_name()),
-                    )?;
+                    if !materialized_before_owner {
+                        crate::checkpoints::materialize_fork(
+                            &self.root.join("checkpoints"),
+                            &checkpoint,
+                            &workload_disk,
+                        )?;
+                    }
                     lifecycle = Some(apply_lifecycle(
                         &mut self.catalog,
                         endpoint,
@@ -1646,6 +1837,10 @@ impl HostService {
                         | GuestServiceRequest::PrepareStop
                         | GuestServiceRequest::PrepareFilesystemCapture { .. }
                         | GuestServiceRequest::FinishFilesystemCapture { .. }
+                        | GuestServiceRequest::PrepareGuestTreeCapture { .. }
+                        | GuestServiceRequest::FinishGuestTreeCapture { .. }
+                        | GuestServiceRequest::CaptureFilesystemQuery { .. }
+                        | GuestServiceRequest::CaptureFilesystemRead { .. }
                         | GuestServiceRequest::RebindEpoch { .. }
                         | GuestServiceRequest::ProbeIdentity
                         | GuestServiceRequest::InstallSecret { .. }
@@ -2277,6 +2472,52 @@ impl HostService {
                 return;
             }
             after = values.last().map(|value| value.request.id.clone());
+        }
+    }
+
+    fn recover_guest_capture_barriers(&mut self) {
+        let pending = match self.workspace.pending_guest_captures() {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("sandsurf guest capture recovery deferred: {error}");
+                return;
+            }
+        };
+        for capture in pending {
+            if self.provision_guardian(&capture.sandbox_id).is_err() {
+                continue;
+            }
+            let client = GuardianClient::new(self.guardian_endpoint(&capture.sandbox_id));
+            let Ok(inspection) = client.inspect(capture.sandbox_id.clone(), None) else {
+                continue;
+            };
+            let Observation::Current { value: machine } = inspection.observation else {
+                continue;
+            };
+            if machine.epoch > capture.epoch
+                || (machine.epoch == capture.epoch
+                    && matches!(
+                        machine.state,
+                        MachineState::Stopped | MachineState::Destroyed
+                    ))
+            {
+                let _ = self.workspace.finish_guest_capture(&capture.operation_id);
+                continue;
+            }
+            if machine.epoch != capture.epoch {
+                continue;
+            }
+            if matches!(
+                client.guest(
+                    capture.sandbox_id,
+                    GuestServiceRequest::FinishGuestTreeCapture {
+                        operation_id: capture.operation_id.clone(),
+                    },
+                ),
+                Ok(GuestServiceResponse::FilesystemCaptureFinished { .. })
+            ) {
+                let _ = self.workspace.finish_guest_capture(&capture.operation_id);
+            }
         }
     }
 

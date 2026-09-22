@@ -272,6 +272,80 @@ impl PersistentWorkloadService {
         ))
     }
 
+    /// Read through the trusted filesystem worker while the exact workload
+    /// freeze remains held. Keeping the capture mutex through the query
+    /// prevents a concurrent finish from thawing a file mid-read.
+    pub fn capture_filesystem_query(
+        &self,
+        operation_id: &OperationId,
+        request: FilesystemRequest,
+    ) -> GuestServiceResponse {
+        let Ok(capture) = self.capture.lock() else {
+            return GuestServiceResponse::Error {
+                code: "service.unavailable".into(),
+                message: "filesystem capture state is unavailable".into(),
+            };
+        };
+        if capture.as_ref() != Some(operation_id) {
+            return GuestServiceResponse::Error {
+                code: "service.capture-identity".into(),
+                message: "filesystem query does not match the active capture".into(),
+            };
+        }
+        if !matches!(
+            request,
+            FilesystemRequest::Stat { .. }
+                | FilesystemRequest::List { .. }
+                | FilesystemRequest::Readlink { .. }
+        ) {
+            return GuestServiceResponse::Error {
+                code: "request.invalid".into(),
+                message: "capture query must read filesystem content".into(),
+            };
+        }
+        match self.filesystem_query(request) {
+            Ok(value) => value,
+            Err(error) => GuestServiceResponse::Error {
+                code: error.code.into(),
+                message: error.message,
+            },
+        }
+    }
+
+    pub fn capture_filesystem_read(
+        &self,
+        operation_id: &OperationId,
+        path: &sandsurf_protocol::GuestPath,
+        offset: u64,
+        maximum: u32,
+    ) -> GuestServiceResponse {
+        let Ok(capture) = self.capture.lock() else {
+            return GuestServiceResponse::Error {
+                code: "service.unavailable".into(),
+                message: "filesystem capture state is unavailable".into(),
+            };
+        };
+        if capture.as_ref() != Some(operation_id) {
+            return GuestServiceResponse::Error {
+                code: "service.capture-identity".into(),
+                message: "filesystem read does not match the active capture".into(),
+            };
+        }
+        match self
+            .filesystem
+            .read_frozen_range(path, offset, maximum as usize)
+        {
+            Ok(range) => GuestServiceResponse::FilesystemCaptureRead { range },
+            Err(error) => {
+                let failure = ServiceFailure::from(error);
+                GuestServiceResponse::Error {
+                    code: failure.code.into(),
+                    message: failure.message,
+                }
+            }
+        }
+    }
+
     /// Rebind captured in-memory workload state to a fresh machine epoch while
     /// the exact capture barrier remains held. Old authenticated connections
     /// are rotated by the guest supervisor after this method commits.
@@ -312,6 +386,10 @@ impl PersistentWorkloadService {
                 .into()),
             GuestServiceRequest::PrepareFilesystemCapture { .. }
             | GuestServiceRequest::FinishFilesystemCapture { .. }
+            | GuestServiceRequest::PrepareGuestTreeCapture { .. }
+            | GuestServiceRequest::FinishGuestTreeCapture { .. }
+            | GuestServiceRequest::CaptureFilesystemQuery { .. }
+            | GuestServiceRequest::CaptureFilesystemRead { .. }
             | GuestServiceRequest::RebindEpoch { .. }
             | GuestServiceRequest::ProbeIdentity => Err((
                 "request.internal",
@@ -1469,6 +1547,76 @@ mod tests {
             elapsed_deadline_unix_millis: None,
             output_bytes: Counter::try_from(1024 * 1024).unwrap(),
         }
+    }
+
+    #[test]
+    fn capture_queries_require_the_exact_barrier_and_cannot_mutate() {
+        let root = Temp::new();
+        let files = root.0.join("files");
+        fs::create_dir(&files).unwrap();
+        fs::write(files.join("example"), b"captured").unwrap();
+        let processes = ProcessSupervisor::create(
+            &root.0.join("spool"),
+            SandboxId::try_from("box").unwrap(),
+            Counter::ONE,
+        )
+        .unwrap();
+        let service = PersistentWorkloadService::open(
+            processes,
+            FilesystemService::open(&files, "/").unwrap(),
+            &root.0.join("operations"),
+        )
+        .unwrap();
+        let capture: OperationId = "capture".try_into().unwrap();
+        let other: OperationId = "other".try_into().unwrap();
+        let read = FilesystemRequest::Stat {
+            path: GuestPath::try_from("/example").unwrap(),
+            follow: true,
+        };
+        assert!(matches!(
+            service.capture_filesystem_query(&capture, read.clone()),
+            GuestServiceResponse::Error { code, .. } if code == "service.capture-identity"
+        ));
+        *service.capture.lock().unwrap() = Some(capture.clone());
+        assert!(matches!(
+            service.capture_filesystem_query(&other, read.clone()),
+            GuestServiceResponse::Error { code, .. } if code == "service.capture-identity"
+        ));
+        assert!(matches!(
+            service.capture_filesystem_query(&capture, read),
+            GuestServiceResponse::File { response: FilesystemResponse::Stat { value } }
+                if value.size == 8
+        ));
+        assert!(matches!(
+            service.capture_filesystem_read(
+                &other,
+                &GuestPath::try_from("/example").unwrap(),
+                0,
+                64,
+            ),
+            GuestServiceResponse::Error { code, .. } if code == "service.capture-identity"
+        ));
+        assert!(matches!(
+            service.capture_filesystem_read(
+                &capture,
+                &GuestPath::try_from("/example").unwrap(),
+                0,
+                64,
+            ),
+            GuestServiceResponse::FilesystemCaptureRead { range }
+                if range.bytes == b"captured" && range.eof
+        ));
+        assert!(matches!(
+            service.capture_filesystem_query(
+                &capture,
+                FilesystemRequest::Mkdir {
+                    path: GuestPath::try_from("/forbidden").unwrap(),
+                    recursive: false,
+                },
+            ),
+            GuestServiceResponse::Error { code, .. } if code == "request.invalid"
+        ));
+        assert!(!files.join("forbidden").exists());
     }
 
     #[test]

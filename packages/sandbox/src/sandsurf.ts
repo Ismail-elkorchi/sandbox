@@ -487,7 +487,10 @@ export class ProcessCollection {
     const user = options.user ?? view.workloadDefaults.user ?? "root"; const proxy = view.runtimeConfiguration.network.rules.some((rule) => rule.plane === "named-proxy") ? { HTTP_PROXY: "http://127.0.0.1:3128", HTTPS_PROXY: "http://127.0.0.1:3128", http_proxy: "http://127.0.0.1:3128", https_proxy: "http://127.0.0.1:3128", ALL_PROXY: "socks5h://127.0.0.1:1080", all_proxy: "socks5h://127.0.0.1:1080", NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" } : {};
     const activeDeadlineMillis = options.activeDeadlineMs ?? null; if (activeDeadlineMillis !== null && (!Number.isSafeInteger(activeDeadlineMillis) || activeDeadlineMillis <= 0 || activeDeadlineMillis > 30 * 24 * 60 * 60 * 1000)) throw new TypeError("active process deadline must be a positive safe integer no greater than 30 days");
     const elapsedDeadlineUnixMillis = options.elapsedDeadlineUnixMs ?? null; if (elapsedDeadlineUnixMillis !== null && (!Number.isSafeInteger(elapsedDeadlineUnixMillis) || elapsedDeadlineUnixMillis <= 0)) throw new TypeError("elapsed process deadline must be a positive Unix millisecond value");
-    await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: authority.expectedEpoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...proxy, ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", activeDeadlineMillis, elapsedDeadlineUnixMillis, outputBytes: options.outputBytes ?? 64 * 1024 * 1024 } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId, authority);
+    const outputBudget = integer(view.resources.outputBytes);
+    const outputBytes = options.outputBytes ?? Math.max(1, Math.min(16 * 1024 * 1024, Math.floor(outputBudget / 8)));
+    if (!Number.isSafeInteger(outputBytes) || outputBytes < 1 || outputBytes > outputBudget) throw new TypeError("process output reservation must fit the Sandbox output budget");
+    await this.#sandbox.workload({ kind: "spawn", request: { sandboxId: this.#sandbox.id, epoch: authority.expectedEpoch, processId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.workloadDefaults.workingDirectory ?? "/workspace", environment: { ...proxy, ...view.workloadDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, lifetime: options.lifetime ?? "job", activeDeadlineMillis, elapsedDeadlineUnixMillis, outputBytes } }, user === "root" || user === "0" || user.startsWith("0:") ? "workload-admin" : "spawn", operationId, authority);
     return new SandboxProcess(this.#sandbox, processId);
   }
   async exec(options: ExecOptions): Promise<ExecResult> {
@@ -756,16 +759,33 @@ export class SandboxWorkspace {
   readonly #sandbox: Sandbox; readonly #fs: SandboxFilesystem; constructor(sandbox: Sandbox) { this.#sandbox = sandbox; this.#fs = sandbox.fs; }
   readFile(path: string | Uint8Array): Promise<Uint8Array> { return this.#fs.readFile(workspacePath(path)); }
   writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: FileMutationOptions & { readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string } = {}): Promise<Record<string, unknown>> { return this.#fs.writeFile(workspacePath(path), bytes, options); }
-  async snapshot(options: { readonly attempts?: number } = {}): Promise<WorkspaceManifest> {
-    const attempts = options.attempts ?? 3; if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 10) throw new TypeError("snapshot attempts must be in 1..=10");
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const watcher = await this.#fs.watch("/workspace", { recursive: true });
-      try {
-        const entries = await this.#snapshotEntries(); const events = await watcher.poll(4096);
-        if (events.length === 0) return workspaceManifest(entries);
-      } finally { await watcher.close(); }
+  async snapshot(options: SandboxMutationPrecondition & { readonly operationId?: string; readonly maximumBytes?: number } = {}): Promise<WorkspaceManifest> {
+    const operationId = validateIdentity(options.operationId ?? identity("workspace-capture"));
+    const view = await this.#sandbox.inspect();
+    const authority = {
+      expectedRevision: expectedCounter(options.expectedRevision, "expected revision") ?? view.configurationRevision,
+      expectedEpoch: expectedCounter(options.expectedEpoch, "expected epoch") ?? currentMachine(view).epoch,
+    };
+    const maximumBytes = options.maximumBytes ?? Math.min(integer(view.resources.diskBytes), 128 * 1024 ** 3);
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0 || maximumBytes > 128 * 1024 ** 3) throw new TypeError("workspace capture byte bound is invalid");
+    const response = await this.#sandbox.hostRequest({ kind: "capture-guest-tree", sandboxId: this.#sandbox.id, operationId, expectedEpoch: authority.expectedEpoch, expectedRevision: authority.expectedRevision, scopeDigest: capabilityScope(this.#sandbox.id, "read-files"), maximumBytes });
+    if (response.kind !== "host-tree-capture" || !record(response.capture)) throw protocol("guest tree capture response");
+    const capture = parseHostCapture(response.capture);
+    const entries: WorkspaceManifestEntry[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await this.#sandbox.hostRequest({ kind: "list-host-tree", sandboxId: this.#sandbox.id, operationId, after, maximum: 1024 });
+      if (page.kind !== "host-tree-entries" || !record(page.capture) || !Array.isArray(page.entries)) throw protocol("guest tree capture page");
+      const observed = parseHostCapture(page.capture);
+      if (observed.manifestDigest !== capture.manifestDigest || observed.requestDigest !== capture.requestDigest) throw new SandsurfHostError("integrity", "guest tree capture identity changed");
+      for (const supplied of page.entries) entries.push(parseWorkspaceEntry(supplied));
+      if (page.next === null) break;
+      after = integer(page.next);
     }
-    throw new SandsurfHostError("conflict", "workspace did not remain stable during snapshot capture");
+    if (entries.length !== capture.entries) throw new SandsurfHostError("integrity", "guest tree capture entry count changed");
+    const manifest = workspaceManifest(entries, operationId);
+    if (manifest.digest !== capture.manifestDigest) throw new SandsurfHostError("integrity", "guest tree capture manifest digest changed");
+    return manifest;
   }
   async diff(base: WorkspaceManifest): Promise<WorkspaceChangeSet> {
     validateWorkspaceManifest(base); const current = await this.snapshot();
@@ -780,7 +800,8 @@ export class SandboxWorkspace {
       return pathDepth(left.path) - pathDepth(right.path) || Buffer.from(left.path).compare(Buffer.from(right.path));
     });
     for (const entry of upserts) changes.push({ kind: "upsert", entry });
-    return workspaceChangeSet(base, changes);
+    if (current.captureOperationId === undefined) throw protocol("guest tree capture identity");
+    return workspaceChangeSet(base, changes, current.captureOperationId);
   }
   async exportToHost(options: WorkspaceExportOptions): Promise<WorkspaceApplyReport> {
     return this.applyToHost({ destination: options.destination, ...(options.operationId === undefined ? {} : { operationId: options.operationId }), ...(options.expectedRevision === undefined ? {} : { expectedRevision: options.expectedRevision }), changeSet: await this.diff(workspaceManifest([])) });
@@ -788,6 +809,7 @@ export class SandboxWorkspace {
   async applyToHost(options: WorkspaceApplyOptions): Promise<WorkspaceApplyReport> {
     if (!isAbsolute(options.destination)) throw new TypeError("host apply destination must be absolute"); validateWorkspaceChangeSet(options.changeSet);
     const destination = resolve(options.destination); const operationId = validateIdentity(options.operationId ?? identity("apply"));
+    const captureOperationId = validateIdentity(options.changeSet.captureOperationId);
     const approvalId = await this.#sandbox.approve({ kind: "host-apply", sandboxId: this.#sandbox.id, operationId, request: { destination, changeSetDigest: options.changeSet.digest } });
     const expectedRevision = await resolveRevisionPrecondition(this.#sandbox, options.expectedRevision); const scopeDigest = capabilityScope(this.#sandbox.id, "apply-to-host");
     const uploaded = new Set<string>();
@@ -798,11 +820,12 @@ export class SandboxWorkspace {
       const transfer = { id: childIdentity(operationId, `blob-${change.entry.digest}`), length: change.entry.size, digest: change.entry.digest };
       await this.#sandbox.hostRequest({ kind: "begin-host-blob", sandboxId: this.#sandbox.id, operationId: childIdentity(operationId, `blob-${change.entry.digest}-begin`), expectedRevision, scopeDigest, transfer, approvalId });
       let offset = 0;
-      for await (const bytes of this.#readGuestFile(change.entry)) { await this.#sandbox.hostRequest({ kind: "write-host-blob", sandboxId: this.#sandbox.id, operationId: childIdentity(operationId, `blob-${change.entry.digest}-chunk-${offset}`), expectedRevision, scopeDigest, transfer, offset, bytes: [...bytes] }); offset += bytes.byteLength; }
+      for await (const bytes of this.#captureBlob(captureOperationId, change.entry.digest, change.entry.size)) { await this.#sandbox.hostRequest({ kind: "write-host-blob", sandboxId: this.#sandbox.id, operationId: childIdentity(operationId, `blob-${change.entry.digest}-chunk-${offset}`), expectedRevision, scopeDigest, transfer, offset, bytes: [...bytes] }); offset += bytes.byteLength; }
       if (offset !== change.entry.size) throw new SandsurfHostError("conflict", `workspace file ${change.entry.path} changed length during export`);
       await this.#sandbox.hostRequest({ kind: "commit-host-blob", sandboxId: this.#sandbox.id, operationId: childIdentity(operationId, `blob-${change.entry.digest}-commit`), expectedRevision, scopeDigest, transfer });
     }
-    const response = await this.#sandbox.hostRequest({ kind: "apply-host-workspace", sandboxId: this.#sandbox.id, operationId, expectedRevision, scopeDigest, destination, changeSet: options.changeSet, approvalId });
+    const { captureOperationId: _captureOperationId, ...changeSet } = options.changeSet;
+    const response = await this.#sandbox.hostRequest({ kind: "apply-host-workspace", sandboxId: this.#sandbox.id, operationId, expectedRevision, scopeDigest, destination, changeSet, approvalId });
     if (response.kind !== "host-apply" || !record(response.report)) throw protocol("host workspace apply response");
     return { operationId: text(response.report.operationId), changeSetDigest: digest(text(response.report.changeSetDigest)), applied: integer(response.report.applied), recovered: response.report.recovered === true };
   }
@@ -846,48 +869,13 @@ export class SandboxWorkspace {
     }
     if (offset !== expectedLength) throw new SandsurfHostError("integrity", "host blob length changed");
   }
-  async #snapshotEntries(): Promise<WorkspaceManifestEntry[]> {
-    const entries: WorkspaceManifestEntry[] = []; const collisions = new Set<string>();
-    const visit = async (relative: string, absolute: Uint8Array): Promise<void> => {
-      let after: Uint8Array | undefined;
-      for (;;) {
-        const response = await this.#fs.list(absolute, { ...(after === undefined ? {} : { after }), maximum: 1024 });
-        if (response.kind !== "list" || !record(response.page) || !Array.isArray(response.page.entries)) throw protocol("workspace directory page");
-        for (const supplied of response.page.entries) {
-          if (!record(supplied) || !Array.isArray(supplied.name) || !record(supplied.stat)) throw protocol("workspace directory entry");
-          const nameBytes = Uint8Array.from(supplied.name as number[]); const name = decodePortableName(nameBytes); const path = relative === "" ? name : `${relative}/${name}`; validatePortableWorkspacePath(path);
-          const collision = path.toLocaleLowerCase("en-US"); if (collisions.has(collision)) throw new SandsurfHostError("conflict", "workspace contains a case-folding path collision"); collisions.add(collision);
-          const guestPath = appendGuestPath(absolute, nameBytes); const stat = supplied.stat; const kind = text(stat.kind); const mode = integer(stat.mode); const size = integer(stat.size);
-          if (kind === "directory") { entries.push({ path, kind: "directory", mode, size: 0, digest: null, target: null }); await visit(path, guestPath); }
-          else if (kind === "symlink") { const target = await this.#fs.readlink(guestPath); entries.push({ path, kind: "symlink", mode, size: target.byteLength, digest: createHash("sha256").update(target).digest("hex"), target: [...target] }); }
-          else if (kind === "regular") { const revision = await this.#fileRevision(guestPath); if (revision.size !== size) throw new SandsurfHostError("conflict", `workspace file ${path} changed during snapshot`); entries.push({ path, kind: "file", mode, size, digest: revision.digest, target: null }); }
-          else throw new SandsurfHostError("unsupported", `workspace object ${path} is not portable`);
-        }
-        if (response.page.next === null) break; if (!Array.isArray(response.page.next)) throw protocol("workspace directory cursor"); after = Uint8Array.from(response.page.next as number[]);
-      }
-    };
-    await visit("", Uint8Array.from(createSandsurfGuestPath("/workspace"))); return entries;
-  }
-  async #fileRevision(path: Uint8Array): Promise<{ readonly size: number; readonly digest: string }> {
-    const response = await this.#fs.read(path, 0, 1); if (response.kind !== "read" || !record(response.range) || !record(response.range.revision)) throw protocol("workspace file revision");
-    return { size: integer(response.range.revision.size), digest: digest(text(response.range.revision.digest)) };
-  }
-  async *#readGuestFile(entry: WorkspaceManifestEntry): AsyncGenerator<Uint8Array, void, void> {
-    if (entry.digest === null) throw protocol("workspace file digest"); const path = workspacePath(entry.path); let offset = 0;
-    for (;;) {
-      const response = await this.#fs.read(path, offset, 64 * 1024); if (response.kind !== "read" || !record(response.range) || !record(response.range.revision) || !Array.isArray(response.range.bytes)) throw protocol("workspace file page");
-      if (integer(response.range.offset) !== offset || integer(response.range.revision.size) !== entry.size || digest(text(response.range.revision.digest)) !== entry.digest) throw new SandsurfHostError("conflict", `workspace file ${entry.path} changed during export`);
-      const bytes = Uint8Array.from(response.range.bytes as number[]); offset += bytes.byteLength; yield bytes;
-      if (response.range.eof === true) break; if (bytes.byteLength === 0) throw protocol("empty non-terminal workspace file page");
-    }
-  }
 }
 
 export interface WorkspaceImportOptions extends SandboxMutationPrecondition { readonly source: string; readonly operationId?: string; readonly exclusions?: readonly string[]; readonly maximumBytes?: number; }
 export interface WorkspaceManifestEntry { readonly path: string; readonly kind: "directory" | "file" | "symlink"; readonly mode: number; readonly size: number; readonly digest: string | null; readonly target: readonly number[] | null; }
-export interface WorkspaceManifest { readonly digest: string; readonly entries: readonly WorkspaceManifestEntry[]; }
+export interface WorkspaceManifest { readonly digest: string; readonly entries: readonly WorkspaceManifestEntry[]; readonly captureOperationId?: string; }
 export type WorkspaceChange = { readonly kind: "upsert"; readonly entry: WorkspaceManifestEntry } | { readonly kind: "delete"; readonly path: string };
-export interface WorkspaceChangeSet { readonly baseManifestDigest: string; readonly base: readonly WorkspaceManifestEntry[]; readonly changes: readonly WorkspaceChange[]; readonly digest: string; }
+export interface WorkspaceChangeSet { readonly baseManifestDigest: string; readonly base: readonly WorkspaceManifestEntry[]; readonly changes: readonly WorkspaceChange[]; readonly digest: string; readonly captureOperationId: string; }
 export interface WorkspaceExportOptions extends SandboxRevisionPrecondition { readonly destination: string; readonly operationId?: string; }
 export interface WorkspaceApplyOptions extends SandboxRevisionPrecondition { readonly destination: string; readonly operationId?: string; readonly changeSet: WorkspaceChangeSet; }
 export interface WorkspaceApplyReport { readonly operationId: string; readonly changeSetDigest: string; readonly applied: number; readonly recovered: boolean; }
@@ -1028,22 +1016,22 @@ function normalizeExclusions(values: readonly string[]): ReadonlySet<string> {
   }
   return result;
 }
-function workspaceManifest(entries: readonly WorkspaceManifestEntry[]): WorkspaceManifest {
+function workspaceManifest(entries: readonly WorkspaceManifestEntry[], captureOperationId?: string): WorkspaceManifest {
   const ordered = [...entries].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
   const paths = new Set<string>(); for (const entry of ordered) { validateWorkspaceEntry(entry); if (paths.has(entry.path)) throw new TypeError("workspace manifest paths must be unique"); paths.add(entry.path); }
   const hash = createHash("sha256").update("SANDSURF-WORKSPACE-MANIFEST-V1\0");
   for (const entry of ordered) hash.update(Buffer.from(workspaceEntryDigest(entry), "hex"));
-  return { digest: hash.digest("hex"), entries: ordered };
+  return { digest: hash.digest("hex"), entries: ordered, ...(captureOperationId === undefined ? {} : { captureOperationId: validateIdentity(captureOperationId) }) };
 }
 function workspaceEntryDigest(entry: WorkspaceManifestEntry): string { return sandsurfDigest("transfer", ["sandsurf-workspace-entry-v1", entry]); }
-function workspaceChangeSet(base: WorkspaceManifest, changes: readonly WorkspaceChange[]): WorkspaceChangeSet {
+function workspaceChangeSet(base: WorkspaceManifest, changes: readonly WorkspaceChange[], captureOperationId: string): WorkspaceChangeSet {
   const hash = createHash("sha256").update("SANDSURF-WORKSPACE-CHANGES-V1\0");
   const paths = new Set<string>();
   for (const change of changes) { const path = change.kind === "upsert" ? change.entry.path : change.path; validatePortableWorkspacePath(path); if (change.kind === "upsert") validateWorkspaceEntry(change.entry); if (paths.has(path)) throw new TypeError("workspace change paths must be unique"); paths.add(path); hash.update(Buffer.from(sandsurfDigest("transfer", ["sandsurf-workspace-change-v1", change]), "hex")); }
-  const changesDigest = hash.digest("hex"); return { baseManifestDigest: base.digest, base: base.entries, changes: [...changes], digest: sandsurfDigest("transfer", ["sandsurf-workspace-change-set-v1", base.digest, changesDigest]) };
+  const changesDigest = hash.digest("hex"); return { baseManifestDigest: base.digest, base: base.entries, changes: [...changes], digest: sandsurfDigest("transfer", ["sandsurf-workspace-change-set-v1", base.digest, changesDigest]), captureOperationId: validateIdentity(captureOperationId) };
 }
 function validateWorkspaceManifest(value: WorkspaceManifest): void { const rebuilt = workspaceManifest(value.entries); if (rebuilt.digest !== digest(value.digest)) throw new TypeError("workspace manifest digest mismatch"); }
-function validateWorkspaceChangeSet(value: WorkspaceChangeSet): void { const base = { digest: value.baseManifestDigest, entries: value.base }; validateWorkspaceManifest(base); const rebuilt = workspaceChangeSet(base, value.changes); if (rebuilt.digest !== digest(value.digest)) throw new TypeError("workspace change-set digest mismatch"); }
+function validateWorkspaceChangeSet(value: WorkspaceChangeSet): void { const base = { digest: value.baseManifestDigest, entries: value.base }; validateWorkspaceManifest(base); const rebuilt = workspaceChangeSet(base, value.changes, value.captureOperationId); if (rebuilt.digest !== digest(value.digest)) throw new TypeError("workspace change-set digest mismatch"); }
 function validateWorkspaceEntry(entry: WorkspaceManifestEntry): void {
   validatePortableWorkspacePath(entry.path); if (!Number.isSafeInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o7777 || !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > 128 * 1024 ** 3) throw new TypeError("workspace entry metadata is invalid");
   if (entry.kind === "directory") { if (entry.size !== 0 || entry.digest !== null || entry.target !== null) throw new TypeError("workspace directory entry is malformed"); return; }
@@ -1054,8 +1042,6 @@ function validatePortableWorkspacePath(value: string): void {
   if (value.length === 0 || value.startsWith("/") || value.endsWith("/") || value.includes("\\") || value.includes("\0") || value.normalize("NFC") !== value || value.split("/").some((part) => part.length === 0 || part === "." || part === ".." || windowsReserved(part))) throw new TypeError("workspace paths must be normalized portable relative paths");
 }
 function windowsReserved(value: string): boolean { const stem = (value.split(".")[0] ?? value).toUpperCase(); return value.endsWith(" ") || value.endsWith(".") || value.includes(":") || ["CON", "PRN", "AUX", "NUL"].includes(stem) || /^(?:COM|LPT)[1-9]$/u.test(stem); }
-function decodePortableName(value: Uint8Array): string { try { return new TextDecoder("utf-8", { fatal: true }).decode(value); } catch { throw new SandsurfHostError("unsupported", "workspace contains a non-UTF-8 path that cannot be exported to every host"); } }
-function appendGuestPath(parent: Uint8Array, name: Uint8Array): Uint8Array { if (name.byteLength === 0 || name.includes(0) || name.includes(0x2f)) throw protocol("workspace entry name"); const value = new Uint8Array(parent.byteLength + 1 + name.byteLength); value.set(parent); value[parent.byteLength] = 0x2f; value.set(name, parent.byteLength + 1); return Uint8Array.from(createSandsurfGuestPath(value)); }
 function pathDepth(path: string): number { return path.split("/").length; }
 function parseWorkspaceEntry(value: unknown): WorkspaceManifestEntry {
   if (!record(value) || typeof value.path !== "string" || !["directory", "file", "symlink"].includes(String(value.kind))) throw protocol("host tree entry");

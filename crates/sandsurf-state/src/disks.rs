@@ -476,6 +476,24 @@ fn free_bytes(file: &File) -> Result<u64> {
         .map_err(|_| Error::Capacity("filesystem capacity exceeds accounting range"))
 }
 
+/// Available physical bytes on the state volume. Transfer writers use this
+/// before each bounded chunk to preserve room for control and cleanup records.
+pub fn available_storage_bytes(root: &std::path::Path) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        free_bytes(&File::open(root)?)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_free_bytes(root)
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = root;
+        Err(Error::Unsupported("host storage capacity is unavailable"))
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_headroom(file: &File, headroom: u64, _: &std::path::Path) -> Result<()> {
     if free_bytes(file)? < headroom {

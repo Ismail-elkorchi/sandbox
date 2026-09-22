@@ -6,6 +6,7 @@ use sandsurf_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1010,15 +1011,15 @@ fn spawn_child(
     workload_root: Option<&Path>,
 ) -> Result<Spawned, ProcessError> {
     let mut command = Command::new(&request.argv[0]);
-    let cwd = match workload_root {
-        Some(root) => root.join(request.cwd.trim_start_matches('/')),
-        None => PathBuf::from(&request.cwd),
-    };
+    let guest_cwd = CString::new(request.cwd.as_bytes())
+        .map_err(|_| ProcessError::Invalid("working directory contains NUL"))?;
     command
         .args(&request.argv[1..])
-        .current_dir(cwd)
         .env_clear()
         .envs(&request.environment);
+    if workload_root.is_none() {
+        command.current_dir(&request.cwd);
+    }
     let credentials = request
         .user
         .as_deref()
@@ -1036,7 +1037,7 @@ fn spawn_child(
                     if libc::setpgid(0, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    enter_workload(workload_root, credentials)?;
+                    enter_workload(workload_root, credentials, &guest_cwd)?;
                     Ok(())
                 });
             }
@@ -1094,7 +1095,7 @@ fn spawn_child(
                     if libc::ioctl(0, libc::TIOCSCTTY as _, 0) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    enter_workload(workload_root, credentials)?;
+                    enter_workload(workload_root, credentials, &guest_cwd)?;
                     Ok(())
                 });
             }
@@ -1117,7 +1118,11 @@ fn open_workload_root(root: Option<&Path>) -> Result<Option<RawFd>, ProcessError
     Ok(Some(file.into_raw_fd()))
 }
 
-fn enter_workload(root: Option<RawFd>, credentials: Option<(u32, u32)>) -> io::Result<()> {
+fn enter_workload(
+    root: Option<RawFd>,
+    credentials: Option<(u32, u32)>,
+    cwd: &CStr,
+) -> io::Result<()> {
     let confined = root.is_some();
     if let Some(root) = root {
         // SAFETY: root is a retained descriptor opened by the trusted
@@ -1134,6 +1139,11 @@ fn enter_workload(root: Option<RawFd>, credentials: Option<(u32, u32)>) -> io::R
         }
         // SAFETY: the inherited descriptor is no longer needed after chroot.
         unsafe { libc::close(root) };
+        // SAFETY: cwd was validated and encoded before fork. Resolve it after
+        // chroot so symlinks can never make a supervisor-side cwd escape.
+        if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     if confined {
         restrict_workload_capabilities()?;

@@ -184,171 +184,190 @@ fn serve_connection(
     let mut codec = handshake
         .finish(&finish)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    // The guardian owns this authenticated transport for the guest epoch.
+    set_socket_timeout(connection.as_raw_fd(), std::time::Duration::ZERO)?;
     let mut outgoing = Counter::ZERO;
 
-    let Some(frame) = Frame::read(connection)? else {
-        return Ok(());
-    };
-    let frame = codec
-        .open(frame)
-        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
-    if frame.kind != FrameKind::Control || frame.stream != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "guest service accepts requests on the reserved control stream",
-        ));
-    }
-    let request: GuestServiceRequest = serde_json::from_slice(&frame.payload)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let response = match request {
-        GuestServiceRequest::PrepareStop => {
-            service.prepare_stop(std::time::Duration::from_secs(5), || {
-                sync_persistent_filesystems()
-            })?;
-            GuestServiceResponse::ReadyToStop {
-                evidence: bytes_digest(b"guest-processes-quiesced-and-filesystems-synced-v1"),
-            }
+    loop {
+        let Some(frame) = Frame::read(connection)? else {
+            return Ok(());
+        };
+        let frame = codec
+            .open(frame)
+            .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        if frame.kind != FrameKind::Control || frame.stream != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest service accepts requests on the reserved control stream",
+            ));
         }
-        GuestServiceRequest::PrepareFilesystemCapture { operation_id } => {
-            let evidence =
-                service.prepare_filesystem_capture(&operation_id, sync_persistent_filesystems)?;
-            GuestServiceResponse::FilesystemCapturePrepared { evidence }
-        }
-        GuestServiceRequest::FinishFilesystemCapture { operation_id } => {
-            let evidence = service.finish_filesystem_capture(&operation_id)?;
-            GuestServiceResponse::FilesystemCaptureFinished { evidence }
-        }
-        GuestServiceRequest::RebindEpoch {
-            checkpoint_id,
-            capture_operation_id,
-            sandbox_id,
-            previous_epoch,
-            epoch,
-            boot_identity,
-            capability,
-            network_capability: next_network_capability,
-            generation_seed,
-        } => {
-            let current = identity
-                .read()
-                .map_err(|_| io::Error::other("boot identity lock is unavailable"))?
-                .clone();
-            let valid_epoch = if sandbox_id == current.sandbox_id {
-                current.epoch.next().ok() == Some(epoch)
-            } else {
-                epoch == Counter::ONE
-            };
-            if current.epoch != previous_epoch {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "restore source epoch does not match",
-                ));
+        let request: GuestServiceRequest = serde_json::from_slice(&frame.payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let rebinds_epoch = matches!(request, GuestServiceRequest::RebindEpoch { .. });
+        let response = match request {
+            GuestServiceRequest::PrepareStop => {
+                service.prepare_stop(std::time::Duration::from_secs(5), || {
+                    sync_persistent_filesystems()
+                })?;
+                GuestServiceResponse::ReadyToStop {
+                    evidence: bytes_digest(b"guest-processes-quiesced-and-filesystems-synced-v1"),
+                }
             }
-            if !valid_epoch {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "restore target epoch is not the next generation",
-                ));
+            GuestServiceRequest::PrepareFilesystemCapture { operation_id }
+            | GuestServiceRequest::PrepareGuestTreeCapture { operation_id } => {
+                let evidence = service
+                    .prepare_filesystem_capture(&operation_id, sync_persistent_filesystems)?;
+                GuestServiceResponse::FilesystemCapturePrepared { evidence }
             }
-            if capability.iter().all(|byte| *byte == 0)
-                || next_network_capability.iter().all(|byte| *byte == 0)
-                || generation_seed.iter().all(|byte| *byte == 0)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "restore generation material is invalid",
-                ));
+            GuestServiceRequest::FinishFilesystemCapture { operation_id }
+            | GuestServiceRequest::FinishGuestTreeCapture { operation_id } => {
+                let evidence = service.finish_filesystem_capture(&operation_id)?;
+                GuestServiceResponse::FilesystemCaptureFinished { evidence }
             }
-            let workload_evidence = service.rebind_epoch(
-                &checkpoint_id,
-                &capture_operation_id,
-                sandbox_id.clone(),
+            GuestServiceRequest::CaptureFilesystemQuery {
+                operation_id,
+                request,
+            } => service.capture_filesystem_query(&operation_id, request),
+            GuestServiceRequest::CaptureFilesystemRead {
+                operation_id,
+                path,
+                offset,
+                maximum,
+            } => service.capture_filesystem_read(&operation_id, &path, offset, maximum),
+            GuestServiceRequest::RebindEpoch {
+                checkpoint_id,
+                capture_operation_id,
+                sandbox_id,
                 previous_epoch,
                 epoch,
-            )?;
-            mix_generation_seed(&generation_seed)?;
-            {
-                let mut value = identity
+                boot_identity,
+                capability,
+                network_capability: next_network_capability,
+                generation_seed,
+            } => {
+                let current = identity
+                    .read()
+                    .map_err(|_| io::Error::other("boot identity lock is unavailable"))?
+                    .clone();
+                let valid_epoch = if sandbox_id == current.sandbox_id {
+                    current.epoch.next().ok() == Some(epoch)
+                } else {
+                    epoch == Counter::ONE
+                };
+                if current.epoch != previous_epoch {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "restore source epoch does not match",
+                    ));
+                }
+                if !valid_epoch {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "restore target epoch is not the next generation",
+                    ));
+                }
+                if capability.iter().all(|byte| *byte == 0)
+                    || next_network_capability.iter().all(|byte| *byte == 0)
+                    || generation_seed.iter().all(|byte| *byte == 0)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "restore generation material is invalid",
+                    ));
+                }
+                let workload_evidence = service.rebind_epoch(
+                    &checkpoint_id,
+                    &capture_operation_id,
+                    sandbox_id.clone(),
+                    previous_epoch,
+                    epoch,
+                )?;
+                mix_generation_seed(&generation_seed)?;
+                {
+                    let mut value = identity
+                        .write()
+                        .map_err(|_| io::Error::other("boot identity lock is unavailable"))?;
+                    value.sandbox_id = sandbox_id.clone();
+                    value.epoch = epoch;
+                    value.boot_digest = boot_identity;
+                    value.capability = BootCapability::from_bytes(capability);
+                    value.network_capability = next_network_capability;
+                }
+                *network_capability
                     .write()
+                    .map_err(|_| io::Error::other("network capability lock is unavailable"))? =
+                    next_network_capability;
+                GuestServiceResponse::EpochRebound {
+                    evidence: sandsurf_protocol::digest(
+                        sandsurf_protocol::Domain::Operation,
+                        &(
+                            "sandsurf-guest-epoch-rebound-v1",
+                            checkpoint_id,
+                            sandbox_id,
+                            previous_epoch,
+                            epoch,
+                            workload_evidence,
+                            sandsurf_protocol::bytes_digest(&generation_seed),
+                        ),
+                    )
+                    .map_err(io::Error::other)?,
+                }
+            }
+            GuestServiceRequest::ProbeIdentity => {
+                let current = identity
+                    .read()
                     .map_err(|_| io::Error::other("boot identity lock is unavailable"))?;
-                value.sandbox_id = sandbox_id.clone();
-                value.epoch = epoch;
-                value.boot_digest = boot_identity;
-                value.capability = BootCapability::from_bytes(capability);
-                value.network_capability = next_network_capability;
+                GuestServiceResponse::Identity {
+                    sandbox_id: current.sandbox_id.clone(),
+                    epoch: current.epoch,
+                    boot_identity: current.boot_digest.clone(),
+                }
             }
-            *network_capability
-                .write()
-                .map_err(|_| io::Error::other("network capability lock is unavailable"))? =
-                next_network_capability;
-            GuestServiceResponse::EpochRebound {
-                evidence: sandsurf_protocol::digest(
-                    sandsurf_protocol::Domain::Operation,
-                    &(
-                        "sandsurf-guest-epoch-rebound-v1",
-                        checkpoint_id,
-                        sandbox_id,
-                        previous_epoch,
-                        epoch,
-                        workload_evidence,
-                        sandsurf_protocol::bytes_digest(&generation_seed),
-                    ),
-                )
-                .map_err(io::Error::other)?,
+            GuestServiceRequest::ApplyResources { resources } => {
+                service.apply_guardian_resources(resources)
             }
+            request => service.handle(request),
+        };
+        let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest response exceeds the control-frame bound",
+            ));
         }
-        GuestServiceRequest::ProbeIdentity => {
-            let current = identity
-                .read()
-                .map_err(|_| io::Error::other("boot identity lock is unavailable"))?;
-            GuestServiceResponse::Identity {
-                sandbox_id: current.sandbox_id.clone(),
-                epoch: current.epoch,
-                boot_identity: current.boot_digest.clone(),
-            }
+        outgoing = outgoing
+            .next()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let response = codec
+            .seal(Frame {
+                kind: FrameKind::Control,
+                stream: 0,
+                sequence: outgoing,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload,
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        response.write(connection)?;
+        outgoing = outgoing
+            .next()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        codec
+            .seal(Frame {
+                kind: FrameKind::Control,
+                stream: 0,
+                sequence: outgoing,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload: sandsurf_protocol::CONTROL_COMPLETE.to_vec(),
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .write(connection)?;
+        connection.flush()?;
+        // A rebind changes the authenticated identity; the next request must
+        // establish a fresh session with the new epoch capability.
+        if rebinds_epoch {
+            break;
         }
-        GuestServiceRequest::ApplyResources { resources } => {
-            service.apply_guardian_resources(resources)
-        }
-        request => service.handle(request),
-    };
-    let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
-    if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "guest response exceeds the control-frame bound",
-        ));
     }
-    outgoing = outgoing
-        .next()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let response = codec
-        .seal(Frame {
-            kind: FrameKind::Control,
-            stream: 0,
-            sequence: outgoing,
-            authentication: [0; AUTHENTICATION_BYTES],
-            payload,
-        })
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    response.write(connection)?;
-    outgoing = outgoing
-        .next()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    codec
-        .seal(Frame {
-            kind: FrameKind::Control,
-            stream: 0,
-            sequence: outgoing,
-            authentication: [0; AUTHENTICATION_BYTES],
-            payload: sandsurf_protocol::CONTROL_COMPLETE.to_vec(),
-        })
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-        .write(connection)?;
-    connection.flush()?;
-    // One request is served per authenticated transport. Receipt of the
-    // terminal frame proves protocol completion; dropping this descriptor is
-    // transport teardown, not application acceptance.
     Ok(())
 }
 

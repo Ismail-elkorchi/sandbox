@@ -1,6 +1,7 @@
 node_modules/
 target/
 packages/sandbox/dist/
+packages/sandbox/images/development-*/*.ext4
 packages/sandbox-hardware-vm/dist/
 native/*/sandbox-runtime-*
 native/manifest.json

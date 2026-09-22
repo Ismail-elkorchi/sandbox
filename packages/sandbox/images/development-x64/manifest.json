@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "trusted-bootstrap.ext4",
-      "sha256": "a7173778e43ffa5d1a9eff4f6015bad0a638081c1acd923239a3cf235ef85397",
+      "sha256": "70cfcd0fbca7953d1ab93277f2536335535c758af96030ca1b7f0c4773ceee40",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
       "protocolMajor": 2,
       "protocolMinor": 0,
-      "sha256": "af579b4491ab6ef473d9a49bf002c83bc0db19ff8a19ae3a59cd8a99a47aee34"
+      "sha256": "a906a3786d2fe99d2c89ccf3ef9cb8a65a8ce846667b9b69b25e0e0d004cf15d"
     },
     "capabilities": {
       "overlayfs": true,
@@ -30,12 +30,12 @@
   "workload": {
     "rootfs": {
       "path": "development-workload.ext4",
-      "sha256": "f1e62712bf7a0738eef7d66da4277f6e78c6ed44f7af91e0c38f6acc844e35a5",
+      "sha256": "7fb45c09f20cf5e0761106003fa991a2a621e9257fe211864f34e7168520dd3a",
       "format": "ext4"
     },
     "stateTemplate": {
       "path": "empty-workspace.ext4",
-      "sha256": "6e3818582200ac0a24aa37362592b4e294b85f948d0805abcab502efd1ed7bfe",
+      "sha256": "4db750beb9a97973a5f74e81423086a81efe0d2e35b0fac205b7c4f1269f60d2",
       "format": "ext4"
     },
     "defaults": {
@@ -49,10 +49,10 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "82dbf9fcfd670ab3a1242a3db4ff2796cbf435ddf28f5d1ad7af3f378666d024",
+      "sourceDigest": "12084097bea254bcc623895c3b59759854b6ee3d3c56740c09e89cfd810cf2b2",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
-        "alpine-packages": "3e0249dff59adfb2a7b0a909df5a944d1e96965035560525cd0522b057299ff8",
+        "alpine-packages": "45a37ce23d979ec3addae1a34a708e792434193064e2451c20008b71f829364a",
         "sandsurf-ext4-builder": "dc9c1246c767342b8208e721924dcd5d86c24211fa4bf11b1fc6c9f822dde80a"
       }
     },
@@ -66,15 +66,15 @@
       },
       "bootstrap": {
         "path": "trusted-bootstrap.vhdx",
-        "sha256": "88e1c44c8a8dd40f24b1a0547cd2edcd90f15fd8aa4f4193b6f1bb5210b5ff0e"
+        "sha256": "77c058b9f8d93de928b2afc8dada6d05d0aaba6d42e01c980bd0bb543e1f4981"
       },
       "workload": {
         "path": "development-workload.vhdx",
-        "sha256": "f6aca532422cd26e90656e4ed61856af7f4f12fff39a5a380c3f1622046a9ae7"
+        "sha256": "3b56b1a2178b39d3677d67b9b245f96e74b68c5f01e2f8411928d4c4b0967860"
       },
       "stateTemplate": {
         "path": "empty-workspace.vhdx",
-        "sha256": "aed94b0912fc20b3e7ba473d0c376293303fa815d228754cad93fd4bd90004dd"
+        "sha256": "745be2d1a243f3a67c25b8c34829c7b779ef8e85db582dac7b5d718a18faa500"
       }
     }
   },

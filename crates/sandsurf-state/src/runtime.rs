@@ -19,7 +19,7 @@ CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
-CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_origin_epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_origin_epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
@@ -178,6 +178,9 @@ impl RuntimeJournal {
     }
     pub fn open(path: &Path, sandbox: &SandboxId) -> Result<Self> {
         let db = Database::open(path, "guardian")?;
+        db.connection
+            .prepare("SELECT reservation_active FROM processes LIMIT 0")
+            .map_err(|_| Error::Corrupt("incompatible guardian journal; preserved intact"))?;
         let (identity, limits, binding): (String, String, String) = db.connection.query_row(
             "SELECT sandbox,limits,authority FROM configuration WHERE id=1",
             [],
@@ -919,6 +922,24 @@ impl RuntimeJournal {
                 "invalid delivery transition or missing effect evidence",
             ));
         }
+        if delivery == Delivery::NotApplied
+            && matches!(&value.request.request, WorkloadRequest::Spawn { .. })
+        {
+            let progressed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM processes p WHERE p.operation=?1 AND (p.snapshot IS NOT NULL OR p.receipt IS NOT NULL OR EXISTS(SELECT 1 FROM chunks c WHERE c.process=p.id)))",
+                [id.as_str()],
+                |row| row.get(0),
+            )?;
+            if progressed {
+                return Err(Error::Conflict(
+                    "non-application contradicts observed process evidence",
+                ));
+            }
+            tx.execute(
+                "UPDATE processes SET reservation_active=0 WHERE operation=?1",
+                [id.as_str()],
+            )?;
+        }
         value.delivery = delivery;
         value.evidence_digest = evidence;
         tx.execute(
@@ -969,9 +990,9 @@ impl RuntimeJournal {
                 "process reservation does not match the authorized spawn request",
             ));
         }
-        if let Some((old_operation, old_epoch, old_limit, old_terminal)) = tx
+        if let Some((old_operation, old_epoch, old_limit, old_terminal, released)) = tx
             .query_row(
-                "SELECT operation,epoch,output_limit,terminal_mode FROM processes WHERE id=?1",
+                "SELECT operation,epoch,output_limit,terminal_mode,release FROM processes WHERE id=?1",
                 [id.as_str()],
                 |row| {
                     Ok((
@@ -979,11 +1000,15 @@ impl RuntimeJournal {
                         row.get::<_, u64>(1)?,
                         row.get::<_, u64>(2)?,
                         row.get::<_, bool>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()?
         {
+            if released.is_some() {
+                return Err(Error::Conflict("process evidence identity was retired"));
+            }
             return if old_operation == operation_id.as_str()
                 && old_epoch == op.request.epoch.get()
                 && old_limit == output_limit.get()
@@ -998,13 +1023,23 @@ impl RuntimeJournal {
             return Err(Error::Conflict("process must be reserved before dispatch"));
         }
         capacity(&tx, "processes", self.limits.identities)?;
-        // Retired data retained by independent pins continues to consume storage.
-        let retained: u64 = tx.query_row(
-            "SELECT coalesce(sum(output_limit),0) FROM processes",
+        // Live producers reserve their full limit. Settled processes consume
+        // only their actual retained bytes; unused headroom returns at the
+        // same commit that publishes a terminal receipt.
+        let reserved: u64 = tx.query_row(
+            "SELECT coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
             [],
             |r| r.get(0),
         )?;
-        if Counter::try_from(retained)?.checked_add(output_limit.get())? > self.limits.output_bytes
+        let retained: u64 = tx.query_row(
+            "SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0",
+            [],
+            |r| r.get(0),
+        )?;
+        if reserved
+            .checked_add(retained)
+            .and_then(|used| used.checked_add(output_limit.get()))
+            .is_none_or(|used| used > self.limits.output_bytes.get())
         {
             return Err(Error::Capacity("output reservations exhausted"));
         }
@@ -1524,7 +1559,7 @@ impl RuntimeJournal {
             params![op.request.operation_id.as_str(), encode(&op)?],
         )?;
         tx.execute(
-            "UPDATE processes SET receipt=?2,receipt_digest=?3 WHERE id=?1",
+            "UPDATE processes SET receipt=?2,receipt_digest=?3,reservation_active=0 WHERE id=?1",
             params![id.as_str(), encode(&receipt)?, receipt_digest.as_str()],
         )?;
         append_event(
@@ -1874,10 +1909,6 @@ impl RuntimeJournal {
             }
             sync_directory(&self.db.root)?;
             tx.execute("DELETE FROM chunks WHERE process=?1", [id.as_str()])?;
-            tx.execute(
-                "UPDATE processes SET output_limit=0 WHERE id=?1",
-                [id.as_str()],
-            )?;
         }
         tx.execute(
             "UPDATE processes SET cleanup_pending=0 WHERE id=?1",

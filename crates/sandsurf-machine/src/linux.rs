@@ -8,7 +8,10 @@ use crate::{
     ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
     MachineTransition,
 };
-use sandbox_vm::{FirecrackerConfig, FirecrackerProcess, FirecrackerRestore, FirecrackerSnapshot};
+use sandbox_vm::{
+    FirecrackerConfig, FirecrackerError, FirecrackerProcess, FirecrackerRestore,
+    FirecrackerSnapshot,
+};
 use sandsurf_protocol::{
     CheckpointId, ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand,
     MachineObservation, MachineState, OperationId, Qualification, SandboxId, VmEngine,
@@ -76,6 +79,7 @@ pub struct FirecrackerDriver<F> {
     qualification: FirecrackerQualification,
     factory: F,
     process: Option<FirecrackerProcess>,
+    stop_quiesce: Option<Digest>,
     applied_revision: Option<Counter>,
     capture_paused: bool,
     full_capture_operation: Option<OperationId>,
@@ -97,6 +101,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             qualification,
             factory,
             process: None,
+            stop_quiesce: None,
             applied_revision: None,
             capture_paused: false,
             full_capture_operation: None,
@@ -144,6 +149,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             }
         };
         self.process = Some(process);
+        self.stop_quiesce = None;
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
@@ -206,17 +212,38 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         if self.remove_full_snapshot().is_err() {
             return MachineOutcome::Unknown;
         }
-        let quiesce = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
-            Ok(value) => value,
-            Err(_) => return MachineOutcome::Unknown,
+        let quiesce = if let Some(evidence) = self.stop_quiesce.clone() {
+            evidence
+        } else {
+            let evidence = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
+                Ok(value) => value,
+                Err(evidence) => {
+                    eprintln!("sandsurf guest stop barrier failed: {evidence:?}");
+                    return MachineOutcome::Unknown;
+                }
+            };
+            self.stop_quiesce = Some(evidence.clone());
+            evidence
         };
         let Some(mut process) = self.process.take() else {
             return MachineOutcome::Unknown;
         };
-        if process.terminate().is_err() || process.wait().is_err() {
+        if let Err(error) = process.terminate() {
+            eprintln!("sandsurf VMM termination request failed: {error}");
             contain(&mut process);
             return MachineOutcome::Unknown;
         }
+        if let Err(error) = process.wait() {
+            eprintln!("sandsurf VMM termination confirmation failed: {error}");
+            if matches!(&error, FirecrackerError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
+            {
+                self.process = Some(process);
+            } else {
+                contain(&mut process);
+            }
+            return MachineOutcome::Unknown;
+        }
+        self.stop_quiesce = None;
         MachineOutcome::Observed(vec![transition_with_digest(
             command,
             current.epoch,
@@ -359,6 +386,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             contain(&mut process);
         }
         self.applied_revision = None;
+        self.stop_quiesce = None;
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
@@ -539,17 +567,29 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         {
             return Self::unavailable(b"firecracker-suspend-capture-not-committed");
         }
-        let (_, manifest) = self
+        let manifest = self
             .committed_suspend
-            .take()
-            .expect("committed suspend checked above");
+            .as_ref()
+            .expect("committed suspend checked above")
+            .1
+            .clone();
         let Some(mut process) = self.process.take() else {
             return MachineOutcome::Unknown;
         };
-        if process.terminate().is_err() || process.wait().is_err() {
+        if process.terminate().is_err() {
             contain(&mut process);
             return MachineOutcome::Unknown;
         }
+        if let Err(error) = process.wait() {
+            if matches!(&error, FirecrackerError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
+            {
+                self.process = Some(process);
+            } else {
+                contain(&mut process);
+            }
+            return MachineOutcome::Unknown;
+        }
+        self.committed_suspend = None;
         self.capture_paused = false;
         self.full_capture_operation = None;
         if self.remove_full_snapshot().is_err() {
@@ -610,6 +650,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
                 }
             };
         self.process = Some(process);
+        self.stop_quiesce = None;
         self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;

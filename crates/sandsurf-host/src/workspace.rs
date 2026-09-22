@@ -15,7 +15,8 @@ use cap_std::{
     fs::{Dir, OpenOptions as CapOpenOptions},
 };
 use sandsurf_protocol::{
-    CommitmentId, Counter, Digest, Domain, OperationId, SandboxId, bytes_digest, digest,
+    CommitmentId, Counter, Digest, Domain, FileKind, FilesystemRequest, FilesystemResponse,
+    FrozenFileRange, GuestPath, OperationId, SandboxId, bytes_digest, digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -25,20 +26,25 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use unicode_normalization::UnicodeNormalization;
 
 const MAX_ENTRIES: usize = 100_000;
+const MAX_CAPTURE_DEPTH: usize = 256;
 const MAX_BLOB_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = sandsurf_protocol::MAX_STREAM_BYTES;
+const CONTROL_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum WorkspaceError {
     Io(io::Error),
     Json(serde_json::Error),
     Contract(sandsurf_protocol::Invalid),
+    State(sandsurf_state::Error),
     Invalid(&'static str),
     Conflict(&'static str),
     Capacity(&'static str),
+    Guest(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -47,9 +53,11 @@ impl fmt::Display for WorkspaceError {
             Self::Io(error) => write!(output, "host workspace I/O: {error}"),
             Self::Json(error) => write!(output, "host workspace metadata: {error}"),
             Self::Contract(error) => write!(output, "host workspace contract: {error}"),
+            Self::State(error) => write!(output, "host workspace storage: {error}"),
             Self::Invalid(message) => write!(output, "invalid host workspace request: {message}"),
             Self::Conflict(message) => write!(output, "host workspace conflict: {message}"),
             Self::Capacity(message) => write!(output, "host workspace capacity: {message}"),
+            Self::Guest(message) => write!(output, "guest workspace capture: {message}"),
         }
     }
 }
@@ -69,6 +77,11 @@ impl From<sandsurf_protocol::Invalid> for WorkspaceError {
         Self::Contract(value)
     }
 }
+impl From<sandsurf_state::Error> for WorkspaceError {
+    fn from(value: sandsurf_state::Error) -> Self {
+        Self::State(value)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, WorkspaceError>;
 
@@ -76,7 +89,15 @@ pub type Result<T> = std::result::Result<T, WorkspaceError>;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CaptureRecord {
     capture: HostTreeCapture,
-    approval_id: CommitmentId,
+    approval_id: Option<CommitmentId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingGuestCapture {
+    pub sandbox_id: SandboxId,
+    pub operation_id: OperationId,
+    pub epoch: Counter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +142,13 @@ struct NativeIdentity {
 
 pub struct WorkspaceAuthority {
     root: PathBuf,
+    capture_index: Mutex<Option<Arc<CaptureIndex>>>,
+}
+
+struct CaptureIndex {
+    capture: HostTreeCapture,
+    entries: Vec<HostTreeEntry>,
+    file_digests: BTreeSet<String>,
 }
 
 impl WorkspaceAuthority {
@@ -130,7 +158,11 @@ impl WorkspaceAuthority {
         }
         create_private_directory(root)?;
         create_private_directory(&root.join("blobs"))?;
-        Ok(Self { root: root.into() })
+        create_private_directory(&root.join("guest-pending"))?;
+        Ok(Self {
+            root: root.into(),
+            capture_index: Mutex::new(None),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -220,7 +252,7 @@ impl WorkspaceAuthority {
                 &stage.join("record.json"),
                 &CaptureRecord {
                     capture: capture.clone(),
-                    approval_id,
+                    approval_id: Some(approval_id),
                 },
             )?;
             sync_directory(&stage)?;
@@ -230,6 +262,436 @@ impl WorkspaceAuthority {
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    }
+
+    pub fn begin_guest_capture(&self, pending: &PendingGuestCapture) -> Result<()> {
+        let path = self.guest_pending_path(&pending.operation_id);
+        if path.exists() {
+            if read_json::<PendingGuestCapture>(&path)? == *pending {
+                return Ok(());
+            }
+            return Err(WorkspaceError::Conflict(
+                "guest capture operation identity is already bound",
+            ));
+        }
+        write_json(&path, pending)?;
+        sync_directory(&self.root.join("guest-pending"))?;
+        Ok(())
+    }
+
+    pub fn finish_guest_capture(&self, operation_id: &OperationId) -> Result<()> {
+        let path = self.guest_pending_path(operation_id);
+        match fs::remove_file(&path) {
+            Ok(()) => sync_directory(&self.root.join("guest-pending"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub fn pending_guest_captures(&self) -> Result<Vec<PendingGuestCapture>> {
+        let mut values = Vec::new();
+        for entry in fs::read_dir(self.root.join("guest-pending"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or(WorkspaceError::Invalid("guest capture name is not UTF-8"))?;
+            let operation = name
+                .strip_suffix(".json")
+                .ok_or(WorkspaceError::Invalid("guest capture name is malformed"))?;
+            let operation: OperationId = operation.try_into()?;
+            let value = read_json::<PendingGuestCapture>(&entry.path())?;
+            if value.operation_id != operation {
+                return Err(WorkspaceError::Conflict(
+                    "guest capture pending record identity changed",
+                ));
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+
+    pub fn guest_capture_pending(&self, operation_id: &OperationId) -> Result<bool> {
+        let path = self.guest_pending_path(operation_id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let value = read_json::<PendingGuestCapture>(&path)?;
+                if &value.operation_id != operation_id {
+                    return Err(WorkspaceError::Conflict(
+                        "guest capture pending record identity changed",
+                    ));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn capture_guest<F, R>(
+        &self,
+        sandbox_id: SandboxId,
+        operation_id: OperationId,
+        request_digest: Digest,
+        maximum_bytes: Counter,
+        mut query: F,
+        mut read: R,
+    ) -> Result<HostTreeCapture>
+    where
+        F: FnMut(FilesystemRequest) -> Result<FilesystemResponse>,
+        R: FnMut(GuestPath, u64, u32) -> Result<FrozenFileRange>,
+    {
+        if maximum_bytes == Counter::ZERO || maximum_bytes.get() > MAX_BLOB_BYTES {
+            return Err(WorkspaceError::Capacity(
+                "guest capture byte bound is invalid",
+            ));
+        }
+        if let Some(capture) =
+            self.existing_guest_capture(&sandbox_id, &operation_id, &request_digest)?
+        {
+            return Ok(capture);
+        }
+        let pending = read_json::<PendingGuestCapture>(&self.guest_pending_path(&operation_id))?;
+        if pending.sandbox_id != sandbox_id || pending.operation_id != operation_id {
+            return Err(WorkspaceError::Conflict(
+                "guest capture has no matching durable barrier intent",
+            ));
+        }
+        let published = self.capture_directory(&operation_id);
+        let stage = self.capture_stage(&operation_id);
+        if stage.exists() {
+            fs::remove_dir_all(&stage)?;
+        }
+        create_private_directory(&stage)?;
+        let result = (|| {
+            let mut entries = Vec::new();
+            let mut bytes = 0_u64;
+            let mut portable_names = BTreeSet::new();
+            self.walk_guest_capture(
+                &mut query,
+                &mut read,
+                GuestPath::try_from("/workspace")?,
+                "",
+                0,
+                maximum_bytes.get(),
+                &mut bytes,
+                &mut entries,
+                &mut portable_names,
+            )?;
+            let manifest_digest = manifest_digest(&entries)?;
+            let capture = HostTreeCapture {
+                operation_id,
+                sandbox_id,
+                request_digest,
+                manifest_digest,
+                entries: Counter::try_from(entries.len() as u64)?,
+                bytes: Counter::try_from(bytes)?,
+            };
+            write_json(&stage.join("entries.json"), &entries)?;
+            write_json(
+                &stage.join("record.json"),
+                &CaptureRecord {
+                    capture: capture.clone(),
+                    approval_id: None,
+                },
+            )?;
+            sync_directory(&stage)?;
+            fs::rename(&stage, &published)?;
+            sync_directory(&self.root)?;
+            Ok(capture)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    }
+
+    pub fn existing_guest_capture(
+        &self,
+        sandbox_id: &SandboxId,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<Option<HostTreeCapture>> {
+        let published = self.capture_directory(operation_id);
+        if !published.exists() {
+            return Ok(None);
+        }
+        let record = read_json::<CaptureRecord>(&published.join("record.json"))?;
+        if &record.capture.sandbox_id != sandbox_id
+            || &record.capture.request_digest != request_digest
+            || record.approval_id.is_some()
+        {
+            return Err(WorkspaceError::Conflict(
+                "guest capture operation identity is already bound",
+            ));
+        }
+        self.load_capture_index(sandbox_id, operation_id)?;
+        Ok(Some(record.capture))
+    }
+
+    fn load_capture_index(
+        &self,
+        sandbox_id: &SandboxId,
+        operation_id: &OperationId,
+    ) -> Result<Arc<CaptureIndex>> {
+        let mut cache = self
+            .capture_index
+            .lock()
+            .map_err(|_| WorkspaceError::Conflict("capture index is unavailable"))?;
+        if let Some(index) = cache.as_ref()
+            && &index.capture.operation_id == operation_id
+        {
+            if &index.capture.sandbox_id != sandbox_id {
+                return Err(WorkspaceError::Conflict(
+                    "capture belongs to another sandbox",
+                ));
+            }
+            return Ok(index.clone());
+        }
+        let directory = self.capture_directory(operation_id);
+        let record = read_json::<CaptureRecord>(&directory.join("record.json"))?;
+        if &record.capture.sandbox_id != sandbox_id || &record.capture.operation_id != operation_id
+        {
+            return Err(WorkspaceError::Conflict(
+                "capture belongs to another sandbox",
+            ));
+        }
+        let entries = read_json::<Vec<HostTreeEntry>>(&directory.join("entries.json"))?;
+        if manifest_digest(&entries)? != record.capture.manifest_digest
+            || entries.len() as u64 != record.capture.entries.get()
+        {
+            return Err(WorkspaceError::Conflict("capture manifest is corrupt"));
+        }
+        let file_digests = entries
+            .iter()
+            .filter(|entry| entry.kind == HostTreeEntryKind::File)
+            .filter_map(|entry| entry.digest.as_ref().map(|value| value.as_str().to_owned()))
+            .collect();
+        let index = Arc::new(CaptureIndex {
+            capture: record.capture,
+            entries,
+            file_digests,
+        });
+        *cache = Some(index.clone());
+        Ok(index)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_guest_capture<F, R>(
+        &self,
+        query: &mut F,
+        read: &mut R,
+        directory: GuestPath,
+        parent: &str,
+        depth: usize,
+        maximum_bytes: u64,
+        bytes: &mut u64,
+        entries: &mut Vec<HostTreeEntry>,
+        portable_names: &mut BTreeSet<String>,
+    ) -> Result<()>
+    where
+        F: FnMut(FilesystemRequest) -> Result<FilesystemResponse>,
+        R: FnMut(GuestPath, u64, u32) -> Result<FrozenFileRange>,
+    {
+        if depth > MAX_CAPTURE_DEPTH {
+            return Err(WorkspaceError::Capacity(
+                "guest capture directory depth exceeds its bound",
+            ));
+        }
+        let mut after = None;
+        loop {
+            let page = match query(FilesystemRequest::List {
+                path: directory.clone(),
+                after: after.clone(),
+                maximum: 1024,
+            })? {
+                FilesystemResponse::List { page } => page,
+                _ => {
+                    return Err(WorkspaceError::Invalid(
+                        "guest directory query was not a page",
+                    ));
+                }
+            };
+            for child in page.entries {
+                let name = std::str::from_utf8(&child.name)
+                    .map_err(|_| WorkspaceError::Invalid("guest path is not portable UTF-8"))?;
+                if name.contains('/') || name.contains('\\') {
+                    return Err(WorkspaceError::Invalid("guest entry name is malformed"));
+                }
+                let portable = if parent.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{parent}/{name}")
+                };
+                validate_relative(&portable)?;
+                let collision = portable
+                    .split('/')
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !portable_names.insert(collision) {
+                    return Err(WorkspaceError::Invalid(
+                        "guest capture has a case-folding path collision",
+                    ));
+                }
+                if entries.len() >= MAX_ENTRIES {
+                    return Err(WorkspaceError::Capacity(
+                        "guest capture has too many entries",
+                    ));
+                }
+                let mut path = directory.as_bytes().to_vec();
+                path.push(b'/');
+                path.extend_from_slice(&child.name);
+                let path = GuestPath::try_from(path)?;
+                let mode = child.stat.mode;
+                match child.stat.kind {
+                    FileKind::Directory => {
+                        entries.push(HostTreeEntry {
+                            path: portable.clone(),
+                            kind: HostTreeEntryKind::Directory,
+                            mode,
+                            size: Counter::ZERO,
+                            digest: None,
+                            target: None,
+                        });
+                        self.walk_guest_capture(
+                            query,
+                            read,
+                            path,
+                            &portable,
+                            depth + 1,
+                            maximum_bytes,
+                            bytes,
+                            entries,
+                            portable_names,
+                        )?;
+                    }
+                    FileKind::Symlink => {
+                        let target = match query(FilesystemRequest::Readlink { path })? {
+                            FilesystemResponse::Link { target } => target,
+                            _ => return Err(WorkspaceError::Invalid("guest symlink query failed")),
+                        };
+                        if target.is_empty() || target.len() > 4096 || target.contains(&0) {
+                            return Err(WorkspaceError::Invalid(
+                                "guest symlink target is malformed",
+                            ));
+                        }
+                        entries.push(HostTreeEntry {
+                            path: portable,
+                            kind: HostTreeEntryKind::Symlink,
+                            mode,
+                            size: Counter::try_from(target.len() as u64)?,
+                            digest: Some(bytes_digest(&target)),
+                            target: Some(target),
+                        });
+                    }
+                    FileKind::Regular => {
+                        let length = child.stat.size;
+                        if length > MAX_BLOB_BYTES {
+                            return Err(WorkspaceError::Capacity("guest file is too large"));
+                        }
+                        *bytes = bytes
+                            .checked_add(length)
+                            .filter(|value| *value <= maximum_bytes)
+                            .ok_or(WorkspaceError::Capacity(
+                                "guest capture exceeds its byte bound",
+                            ))?;
+                        let digest = self.publish_guest_blob(read, path, length)?;
+                        entries.push(HostTreeEntry {
+                            path: portable,
+                            kind: HostTreeEntryKind::File,
+                            mode,
+                            size: Counter::try_from(length)?,
+                            digest: Some(digest),
+                            target: None,
+                        });
+                    }
+                    FileKind::Other => {
+                        return Err(WorkspaceError::Invalid(
+                            "guest capture contains an unsupported filesystem object",
+                        ));
+                    }
+                }
+            }
+            match page.next {
+                Some(next)
+                    if !next.is_empty()
+                        && after
+                            .as_ref()
+                            .is_none_or(|old| next.as_slice() > old.as_slice()) =>
+                {
+                    after = Some(next);
+                }
+                Some(_) => return Err(WorkspaceError::Invalid("guest directory cursor is empty")),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn publish_guest_blob<R>(&self, read: &mut R, path: GuestPath, length: u64) -> Result<Digest>
+    where
+        R: FnMut(GuestPath, u64, u32) -> Result<FrozenFileRange>,
+    {
+        let temporary = self.root.join("blobs").join(format!(
+            "guest-{}-{}.tmp",
+            std::process::id(),
+            random_suffix()?
+        ));
+        let result = (|| {
+            let mut output = private_file(&temporary, true)?;
+            let mut hasher = Sha256::new();
+            let mut offset = 0_u64;
+            loop {
+                let range = read(
+                    path.clone(),
+                    offset,
+                    sandsurf_protocol::MAX_CONTROL_BYTE_PAGE as u32,
+                )?;
+                if range.offset != offset
+                    || range.bytes.len() > sandsurf_protocol::MAX_CONTROL_BYTE_PAGE
+                {
+                    return Err(WorkspaceError::Invalid("guest file page is malformed"));
+                }
+                if range.bytes.is_empty() && !range.eof {
+                    return Err(WorkspaceError::Invalid("guest file page is empty"));
+                }
+                offset = offset
+                    .checked_add(range.bytes.len() as u64)
+                    .filter(|value| *value <= length)
+                    .ok_or(WorkspaceError::Conflict("guest file grew during capture"))?;
+                if sandsurf_state::available_storage_bytes(&self.root)?
+                    < CONTROL_HEADROOM_BYTES + range.bytes.len() as u64
+                {
+                    return Err(WorkspaceError::Capacity(
+                        "guest capture would consume host control headroom",
+                    ));
+                }
+                output.write_all(&range.bytes)?;
+                hasher.update(&range.bytes);
+                if range.eof {
+                    break;
+                }
+            }
+            if offset != length {
+                return Err(WorkspaceError::Conflict("guest file length changed"));
+            }
+            let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
+            output.sync_all()?;
+            let destination = self.blob_path(&digest);
+            if destination.exists() {
+                verify_blob(&destination, &digest, length)?;
+                fs::remove_file(&temporary)?;
+            } else {
+                fs::rename(&temporary, &destination)?;
+                sync_directory(&self.root.join("blobs"))?;
+            }
+            Ok(digest)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
         }
         result
     }
@@ -405,19 +867,8 @@ impl WorkspaceAuthority {
                 "capture page bound must be in 1..=4096",
             ));
         }
-        let directory = self.capture_directory(operation_id);
-        let record = read_json::<CaptureRecord>(&directory.join("record.json"))?;
-        if &record.capture.sandbox_id != sandbox_id {
-            return Err(WorkspaceError::Conflict(
-                "capture belongs to another sandbox",
-            ));
-        }
-        let entries = read_json::<Vec<HostTreeEntry>>(&directory.join("entries.json"))?;
-        if manifest_digest(&entries)? != record.capture.manifest_digest
-            || entries.len() as u64 != record.capture.entries.get()
-        {
-            return Err(WorkspaceError::Conflict("capture manifest is corrupt"));
-        }
+        let index = self.load_capture_index(sandbox_id, operation_id)?;
+        let entries = &index.entries;
         let start = usize::try_from(after.get())
             .map_err(|_| WorkspaceError::Capacity("capture cursor is invalid"))?;
         if start > entries.len() {
@@ -429,7 +880,7 @@ impl WorkspaceAuthority {
         let next = (end < entries.len())
             .then(|| Counter::try_from(end as u64))
             .transpose()?;
-        Ok((record.capture, entries[start..end].to_vec(), next))
+        Ok((index.capture.clone(), entries[start..end].to_vec(), next))
     }
 
     pub fn read_capture_blob(
@@ -443,33 +894,18 @@ impl WorkspaceAuthority {
         if maximum == 0 || maximum as usize > MAX_CHUNK_BYTES {
             return Err(WorkspaceError::Capacity("blob page bound is invalid"));
         }
-        let (capture, entries, _) = self.capture_entries(
-            sandbox_id,
-            operation_id,
-            Counter::ZERO,
-            Counter::try_from(4096)?,
-        )?;
-        if capture.entries.get() > 4096 {
-            let all = read_json::<Vec<HostTreeEntry>>(
-                &self.capture_directory(operation_id).join("entries.json"),
-            )?;
-            if !all
-                .iter()
-                .any(|entry| entry.digest.as_ref() == Some(requested))
-            {
-                return Err(WorkspaceError::Conflict(
-                    "blob is not referenced by this capture",
-                ));
-            }
-        } else if !entries
-            .iter()
-            .any(|entry| entry.digest.as_ref() == Some(requested))
-        {
+        let index = self.load_capture_index(sandbox_id, operation_id)?;
+        if !index.file_digests.contains(requested.as_str()) {
             return Err(WorkspaceError::Conflict(
                 "blob is not referenced by this capture",
             ));
         }
-        read_blob(&self.blob_path(requested), requested, offset, maximum)
+        read_blob(
+            &self.blob_path(requested),
+            requested,
+            offset,
+            maximum.min(sandsurf_protocol::MAX_CONTROL_BYTE_PAGE as u32),
+        )
     }
 
     pub fn begin_upload(
@@ -910,6 +1346,11 @@ impl WorkspaceAuthority {
     fn capture_stage(&self, operation: &OperationId) -> PathBuf {
         self.root
             .join(format!("capture-{}.stage", operation.as_str()))
+    }
+    fn guest_pending_path(&self, operation: &OperationId) -> PathBuf {
+        self.root
+            .join("guest-pending")
+            .join(format!("{}.json", operation.as_str()))
     }
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         self.root.join("blobs").join(digest.as_str())
@@ -1485,6 +1926,7 @@ fn sync_directory(_: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandsurf_protocol::{DirectoryEntry, DirectoryPage, FileStat};
 
     fn temporary(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1493,6 +1935,122 @@ mod tests {
         ));
         create_private_directory(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn guest_capture_publishes_immutable_bytes_under_a_recoverable_barrier() {
+        let state = temporary("guest-capture");
+        let authority = WorkspaceAuthority::open(&state).unwrap();
+        let sandbox: SandboxId = "sandbox-a".try_into().unwrap();
+        let operation: OperationId = "guest-capture-a".try_into().unwrap();
+        let request_digest = bytes_digest(b"guest-capture-request");
+        authority
+            .begin_guest_capture(&PendingGuestCapture {
+                sandbox_id: sandbox.clone(),
+                operation_id: operation.clone(),
+                epoch: Counter::ONE,
+            })
+            .unwrap();
+        let mut content = b"original guest bytes".repeat(8192);
+        let original = content.clone();
+        let content_digest = bytes_digest(&content);
+        let capture = authority
+            .capture_guest(
+                sandbox.clone(),
+                operation.clone(),
+                request_digest.clone(),
+                Counter::try_from(1024 * 1024).unwrap(),
+                |request| match request {
+                    FilesystemRequest::List { path, after, .. }
+                        if path.to_utf8() == Some("/workspace") && after.is_none() =>
+                    {
+                        Ok(FilesystemResponse::List {
+                            page: DirectoryPage {
+                                entries: vec![DirectoryEntry {
+                                    name: b"file".to_vec(),
+                                    stat: FileStat {
+                                        kind: FileKind::Regular,
+                                        size: content.len() as u64,
+                                        readonly: false,
+                                        modified_millis: None,
+                                        mode: 0o644,
+                                        device: 1,
+                                        inode: 2,
+                                    },
+                                }],
+                                next: None,
+                            },
+                        })
+                    }
+                    _ => Err(WorkspaceError::Invalid("unexpected guest query")),
+                },
+                |path, offset, maximum| {
+                    if path.to_utf8() == Some("/workspace/file") {
+                        let start = offset as usize;
+                        let end = (start + maximum as usize).min(content.len());
+                        Ok(FrozenFileRange {
+                            offset,
+                            bytes: content[start..end].to_vec(),
+                            eof: end == content.len(),
+                        })
+                    } else {
+                        Err(WorkspaceError::Invalid("unexpected guest read"))
+                    }
+                },
+            )
+            .unwrap();
+        assert!(authority.guest_capture_pending(&operation).unwrap());
+        assert_eq!(capture.entries.get(), 1);
+        let (_, entries, _) = authority
+            .capture_entries(&sandbox, &operation, Counter::ZERO, Counter::ONE)
+            .unwrap();
+        assert_eq!(entries[0].digest, Some(content_digest.clone()));
+        content.fill(0);
+        let mut retained = Vec::new();
+        loop {
+            let (page, eof) = authority
+                .read_capture_blob(
+                    &sandbox,
+                    &operation,
+                    &content_digest,
+                    Counter::try_from(retained.len() as u64).unwrap(),
+                    1024,
+                )
+                .unwrap();
+            retained.extend_from_slice(&page);
+            if eof {
+                break;
+            }
+        }
+        assert_eq!(retained, original);
+        assert_eq!(
+            authority
+                .existing_guest_capture(&sandbox, &operation, &request_digest)
+                .unwrap(),
+            Some(capture.clone())
+        );
+        let recovered = WorkspaceAuthority::open(&state).unwrap();
+        assert_eq!(recovered.pending_guest_captures().unwrap().len(), 1);
+        assert_eq!(
+            recovered
+                .existing_guest_capture(&sandbox, &operation, &request_digest)
+                .unwrap(),
+            Some(capture)
+        );
+        recovered.finish_guest_capture(&operation).unwrap();
+        assert!(!recovered.guest_capture_pending(&operation).unwrap());
+        fs::write(
+            recovered.capture_directory(&operation).join("entries.json"),
+            b"[]",
+        )
+        .unwrap();
+        assert!(matches!(
+            WorkspaceAuthority::open(&state)
+                .unwrap()
+                .existing_guest_capture(&sandbox, &operation, &request_digest),
+            Err(WorkspaceError::Conflict("capture manifest is corrupt"))
+        ));
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

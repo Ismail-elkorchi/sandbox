@@ -397,6 +397,7 @@ impl LinuxGuardianEffect {
         ensure_mutable_disk(&config.disk_template, &control_state, control_bytes)?;
 
         let active = Arc::new(Mutex::new(None));
+        let remote = Arc::new(Mutex::new(None));
         let network = Arc::new(Mutex::new(None));
         let network_usage = Arc::new(Mutex::new(NetworkUsageValue::default()));
         let exposures = Arc::new(Mutex::new(None));
@@ -409,6 +410,7 @@ impl LinuxGuardianEffect {
             workload_state,
             control_state,
             active: Arc::clone(&active),
+            remote: Arc::clone(&remote),
             pending: None,
             pending_restore: None,
         };
@@ -425,7 +427,7 @@ impl LinuxGuardianEffect {
             sandbox_root: sandbox_root.to_path_buf(),
             config,
             machine,
-            workload: LinuxWorkload { active },
+            workload: LinuxWorkload { active, remote },
             network,
             network_usage,
             exposures,
@@ -650,6 +652,9 @@ impl GuardianEffect for LinuxGuardianEffect {
         ) {
             if let Ok(mut active) = self.workload.active.lock() {
                 *active = None;
+            }
+            if let Ok(mut remote) = self.workload.remote.lock() {
+                *remote = None;
             }
             self.stop_runtime_data_planes();
         }
@@ -1328,7 +1333,7 @@ fn network_rules(
     Ok(rules)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
     socket: PathBuf,
     sandbox_id: SandboxId,
@@ -1362,6 +1367,7 @@ struct LinuxEpochFactory {
     workload_state: PathBuf,
     control_state: PathBuf,
     active: Arc<Mutex<Option<ActiveGuest>>>,
+    remote: LinuxRemoteCache,
     pending: Option<PendingGuest>,
     pending_restore: Option<PendingRestore>,
 }
@@ -1532,9 +1538,16 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
         if active.sandbox_id != *sandbox_id || active.epoch != epoch {
             return Err(bytes_digest(b"guest-stop-epoch-mismatch"));
         }
-        match guest_client(&active).call(&GuestServiceRequest::PrepareStop) {
+        let result = with_cached_guest(&active, &self.remote, |driver| {
+            driver.query(GuestServiceRequest::PrepareStop)
+        })
+        .ok_or_else(|| bytes_digest(b"guest-stop-session-unavailable"))?;
+        match result {
             Ok(GuestServiceResponse::ReadyToStop { evidence }) => Ok(evidence),
-            _ => Err(bytes_digest(b"guest-stop-barrier-unconfirmed")),
+            other => {
+                eprintln!("sandsurf guest stop barrier response: {other:?}");
+                Err(bytes_digest(b"guest-stop-barrier-unconfirmed"))
+            }
         }
     }
 
@@ -1730,34 +1743,66 @@ impl FirecrackerEpochFactory for LinuxEpochFactory {
 
 struct LinuxWorkload {
     active: Arc<Mutex<Option<ActiveGuest>>>,
+    remote: LinuxRemoteCache,
+}
+
+type LinuxRemoteCache = Arc<Mutex<Option<(ActiveGuest, RemoteWorkloadDriver<UnixVsockChannel>)>>>;
+
+fn with_cached_guest<T>(
+    active: &ActiveGuest,
+    cache: &LinuxRemoteCache,
+    operation: impl FnOnce(&mut RemoteWorkloadDriver<UnixVsockChannel>) -> T,
+) -> Option<T> {
+    let mut cache = cache.lock().ok()?;
+    if cache.as_ref().is_none_or(|(cached, _)| cached != active) {
+        *cache = Some((
+            active.clone(),
+            RemoteWorkloadDriver::new(guest_client(active)),
+        ));
+    }
+    Some(operation(&mut cache.as_mut()?.1))
 }
 
 impl LinuxWorkload {
     fn endpoint(&self) -> Option<ActiveGuest> {
         self.active.lock().ok()?.clone()
     }
+
+    fn with_driver<T>(
+        &self,
+        operation: impl FnOnce(&mut RemoteWorkloadDriver<UnixVsockChannel>) -> T,
+    ) -> Option<T> {
+        let active = self.endpoint();
+        let Some(active) = active else {
+            if let Ok(mut remote) = self.remote.lock() {
+                *remote = None;
+            }
+            return None;
+        };
+        with_cached_guest(&active, &self.remote, operation)
+    }
 }
 
 impl WorkloadDriver for LinuxWorkload {
     fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
-        let Some(active) = self.endpoint() else {
-            return EffectOutcome::NotApplied(bytes_digest(b"guest-machine-not-running"));
-        };
-        RemoteWorkloadDriver::new(guest_client(&active)).dispatch(mutation, capability)
+        self.with_driver(|driver| driver.dispatch(mutation, capability))
+            .unwrap_or_else(|| {
+                EffectOutcome::NotApplied(bytes_digest(b"guest-machine-not-running"))
+            })
     }
 
     fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if let Some(active) = self.endpoint() {
-            RemoteWorkloadDriver::new(guest_client(&active)).reconcile(journal)?;
+        if let Some(result) = self.with_driver(|driver| driver.reconcile(journal)) {
+            result?;
         }
         Ok(())
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        let active = self.endpoint().ok_or(ControlError::Unsupported(
-            "guest is unavailable because the machine has no live owner",
-        ))?;
-        RemoteWorkloadDriver::new(guest_client(&active)).query(request)
+        self.with_driver(|driver| driver.query(request))
+            .ok_or(ControlError::Unsupported(
+                "guest is unavailable because the machine has no live owner",
+            ))?
     }
 }
 

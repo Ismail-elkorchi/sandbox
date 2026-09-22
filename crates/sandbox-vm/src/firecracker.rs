@@ -1,5 +1,5 @@
 use sandbox_launcher_linux::{
-    LauncherEvent, LauncherStatus, VmmLaunchSpec, file_identity, read_launcher_event,
+    LauncherEvent, LauncherEventReader, LauncherStatus, VmmLaunchSpec, file_identity,
     read_launcher_status, send_launcher_terminate, send_vmm_launch_spec,
 };
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,8 @@ pub struct FirecrackerProcess {
     pub vsock_path: PathBuf,
     pub api_socket_path: PathBuf,
     final_status: Option<sandbox_launcher_linux::LauncherFinalStatus>,
+    event_reader: LauncherEventReader,
+    termination_requested: bool,
 }
 
 impl FirecrackerProcess {
@@ -286,6 +288,8 @@ impl FirecrackerProcess {
             vsock_path,
             api_socket_path,
             final_status: None,
+            event_reader: LauncherEventReader::default(),
+            termination_requested: false,
         };
         if restore.is_some() {
             process.wait_for_api()?;
@@ -307,8 +311,16 @@ impl FirecrackerProcess {
     }
 
     pub fn terminate(&mut self) -> Result<(), FirecrackerError> {
-        send_launcher_terminate(&mut self.control)?;
+        if !self.termination_requested {
+            send_launcher_terminate(&mut self.control)?;
+            self.termination_requested = true;
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn termination_requested(&self) -> bool {
+        self.termination_requested
     }
 
     /// Pause vCPUs through the private Firecracker API and wait for the API's
@@ -513,9 +525,10 @@ impl FirecrackerProcess {
         &mut self,
     ) -> Result<&sandbox_launcher_linux::LauncherFinalStatus, FirecrackerError> {
         if self.final_status.is_none() {
-            self.control
-                .set_read_timeout(Some(Duration::from_secs(5)))?;
-            match read_launcher_event(&mut self.control)? {
+            match self
+                .event_reader
+                .read(&mut self.control, Duration::from_secs(30))?
+            {
                 LauncherEvent::Final(status) => self.final_status = Some(status),
                 LauncherEvent::RuntimeError(error) => {
                     return Err(FirecrackerError::Setup(format!(

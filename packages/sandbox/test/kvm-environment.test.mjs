@@ -75,6 +75,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.equal(await run(sandbox, ["/bin/sh", "-c", "test \"$(cat source.txt)\" = in-place && printf checked"]), "checked");
     assert.equal(await readFile(join(hostWorkspace, "source.txt"), "utf8"), "base\n");
     const inPlaceChanges = await sandbox.workspace.diff(baseWorkspace);
+    await sandbox.workspace.writeFile("source.txt", "later-guest-edit\n");
     await writeFile(join(hostWorkspace, "source.txt"), "external-change\n");
     await assert.rejects(
       sandbox.workspace.applyToHost({
@@ -96,6 +97,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
     assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);
     assert.equal(await run(sandbox, ["/sbin/apk", "info", "--installed", "git"], { user: "root" }), "git\n");
+    assert.equal(await run(sandbox, ["/sbin/apk", "info", "--installed", "busybox-extras"], { user: "root" }), "busybox-extras\n");
     await run(sandbox, ["/usr/bin/git", "init", "/home/agent/persistent-repository"]);
 
     await sandbox.secrets.deliver(secret, { path: "/workspace/file-secret" });
@@ -132,7 +134,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
 
     await sandbox.workspace.writeFile("index.html", "exposure-ok\n");
     const server = await sandbox.processes.spawn({
-      argv: ["/bin/busybox", "httpd", "-f", "-p", "127.0.0.1:18080", "-h", "/workspace"],
+      argv: ["/bin/busybox-extras", "httpd", "-f", "-p", "127.0.0.1:18080", "-h", "/workspace"],
       user: "root",
       lifetime: "sandbox",
     });
@@ -252,7 +254,8 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       try { await forkSandbox.destroy({ operationId: "cleanup-checkpoint-fork" }); } catch { /* Preserve the primary assertion. */ }
     }
     if (sandbox !== undefined) {
-      try { await sandbox.stop({ operationId: "stop-kvm-environment" }); } catch { /* Preserve the primary assertion. */ }
+      try { await sandbox.stop({ operationId: "stop-kvm-environment" }); } catch (error) { console.error("KVM sandbox stop cleanup:", error); }
+      try { await sandbox.destroy({ operationId: "destroy-kvm-environment" }); } catch (error) { console.error("KVM sandbox destroy cleanup:", error); }
     }
     await host.close();
     try { await (await NativeHostClient.open(state)).stopService(); } catch { /* Best effort test cleanup. */ }

@@ -3,8 +3,10 @@ import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hydrateImageSources } from "./image-sources.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+await hydrateImageSources();
 
 const debugBuild = process.env.SANDSURF_NATIVE_PROFILE === "debug";
 const requestedTarget = process.env.SANDSURF_NATIVE_TARGET || undefined;

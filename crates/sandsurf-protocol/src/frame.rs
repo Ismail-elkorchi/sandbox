@@ -8,6 +8,9 @@ pub const HEADER_BYTES: usize = 56;
 pub const AUTHENTICATION_BYTES: usize = 32;
 pub const MAX_CONTROL_BYTES: usize = 256 * 1024;
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
+/// Byte vectors carried inside JSON control messages need worst-case decimal
+/// expansion space until they move to binary data frames.
+pub const MAX_CONTROL_BYTE_PAGE: usize = 48 * 1024;
 pub const MAX_STREAMS: usize = 256;
 pub const MAX_CREDIT: u64 = 1024 * 1024;
 /// Authenticated terminal payload for one request/response control exchange.

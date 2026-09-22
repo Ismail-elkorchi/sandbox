@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 pub const BUILDER_ID: &str = "arcbox-ext4-0.1.2+sandsurf-deterministic-v2";
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const MIN_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum Ext4Error {
@@ -45,8 +46,7 @@ impl From<io::Error> for Ext4Error {
 pub fn materialize_tar(tar: &Path, output: &Path, bytes: u64) -> Result<String, Ext4Error> {
     if !tar.is_absolute()
         || !output.is_absolute()
-        || bytes == 0
-        || bytes > MAX_IMAGE_BYTES
+        || !(MIN_IMAGE_BYTES..=MAX_IMAGE_BYTES).contains(&bytes)
         || !bytes.is_multiple_of(4096)
     {
         return Err(Ext4Error::Invalid(
@@ -86,11 +86,34 @@ pub fn materialize_tar(tar: &Path, output: &Path, bytes: u64) -> Result<String, 
     formatter
         .close()
         .map_err(|error| Ext4Error::Invalid(format!("ext4 image publication: {error}")))?;
+    verify_formatted_geometry(output, bytes)?;
     normalize_formatter_metadata(output)?;
     #[cfg(unix)]
     fs::set_permissions(output, fs::Permissions::from_mode(0o600))?;
     File::open(output)?.sync_all()?;
     Ok(format!("{:x}", Sha256::digest(BUILDER_ID.as_bytes())))
+}
+
+fn verify_formatted_geometry(path: &Path, expected_bytes: u64) -> Result<(), Ext4Error> {
+    let mut file = File::open(path)?;
+    let actual_bytes = file.metadata()?.len();
+    let mut superblock = [0_u8; 1024];
+    file.seek(SeekFrom::Start(1024))?;
+    file.read_exact(&mut superblock)?;
+    let blocks = u32::from_le_bytes(superblock[4..8].try_into().unwrap()) as u64;
+    let log_block_size = u32::from_le_bytes(superblock[24..28].try_into().unwrap());
+    let block_size = 1024_u64
+        .checked_shl(log_block_size)
+        .ok_or_else(|| Ext4Error::Invalid("ext4 block size overflow".into()))?;
+    if block_size != 4096
+        || actual_bytes != expected_bytes
+        || blocks.checked_mul(block_size) != Some(expected_bytes)
+    {
+        return Err(Ext4Error::Invalid(
+            "ext4 formatter produced a filesystem larger than its backing file".into(),
+        ));
+    }
+    Ok(())
 }
 
 struct HashWriter<'a>(&'a mut Sha256);
@@ -198,6 +221,26 @@ mod tests {
         for path in [&archive_path, &first, &second] {
             fs::remove_file(path).unwrap();
         }
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn formatter_minimum_is_enforced_before_publication() {
+        let directory = std::env::temp_dir().join(format!(
+            "sandsurf-ext4-minimum-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let archive = directory.join("empty.tar");
+        File::create(&archive).unwrap();
+        let output = directory.join("undersized.ext4");
+        assert!(matches!(
+            materialize_tar(&archive, &output, 32 * 1024 * 1024),
+            Err(Ext4Error::Invalid(_))
+        ));
+        assert!(!output.exists());
+        fs::remove_file(archive).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 
