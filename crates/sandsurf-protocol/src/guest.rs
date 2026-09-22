@@ -194,6 +194,9 @@ pub enum GuestServiceRequest {
         resources: crate::LiveResourceLimits,
     },
     ResourceUsage,
+    FilesystemQuery {
+        request: FilesystemRequest,
+    },
     Dispatch {
         mutation: Mutation,
         capability: Capability,
@@ -375,6 +378,17 @@ impl FilesystemRequest {
             | Self::Chmod { .. }
             | Self::Symlink { .. } => Capability::WriteFiles,
         }
+    }
+
+    pub fn is_query(&self) -> bool {
+        matches!(
+            self,
+            Self::Stat { .. }
+                | Self::List { .. }
+                | Self::Read { .. }
+                | Self::Readlink { .. }
+                | Self::PollWatch { .. }
+        )
     }
 }
 

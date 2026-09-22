@@ -11,7 +11,7 @@ try {
   const expectedImages = await packagedImagePaths();
   for (const tarball of [core]) {
     const listing = await capture("tar", ["-tzf", tarball]);
-    const paths = listing.trim().split("\n");
+    const paths = listing.trim().split(/\r?\n/u).map((path) => path.replaceAll("\\", "/"));
     if (paths.some((path) => path.includes("node_modules/") || path.includes("/target/") || path.endsWith(".tsbuildinfo"))) {
       throw new Error(`${tarball} contains development output`);
     }

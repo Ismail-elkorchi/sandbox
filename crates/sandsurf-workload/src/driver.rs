@@ -245,12 +245,28 @@ mod tests {
             },
         )
         .unwrap();
-        let creation = digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+        let workload = WorkloadConfiguration::default();
+        let creation = digest(
+            Domain::Sandbox,
+            &(
+                &sandbox,
+                &image,
+                resources(),
+                &workload,
+                &SandboxLifetime::default(),
+                &create,
+            ),
+        )
+        .unwrap();
         host.create_sandbox(
-            sandbox.clone(),
-            image,
-            resources(),
-            create.clone(),
+            SandboxAdmission {
+                id: sandbox.clone(),
+                image,
+                resources: resources(),
+                workload,
+                lifetime: SandboxLifetime::default(),
+                operation: create.clone(),
+            },
             Approval {
                 id: "approve-create".try_into().unwrap(),
                 request_digest: creation,
@@ -299,11 +315,14 @@ mod tests {
             .unwrap();
         host.complete_intent(&running).unwrap();
         let grant: GrantId = "spawn".try_into().unwrap();
+        let grant_operation: OperationId = "grant-spawn".try_into().unwrap();
         let scope = bytes_digest(b"workload");
         let grant_digest = digest(
             Domain::Grant,
             &(
+                "sandsurf-grant-change-v1",
                 &sandbox,
+                &grant_operation,
                 &grant,
                 Counter::ONE,
                 Capability::Spawn,
@@ -315,6 +334,7 @@ mod tests {
         host.set_grant(
             GrantChange {
                 sandbox_id: sandbox.clone(),
+                operation_id: grant_operation,
                 id: grant.clone(),
                 expected_revision: Counter::ONE,
                 capability: Capability::Spawn,
@@ -356,7 +376,8 @@ mod tests {
             stdio: StdioMode::Pipes,
             terminal_size: None,
             lifetime: ProcessLifetime::Job,
-            deadline_millis: None,
+            active_deadline_millis: None,
+            elapsed_deadline_unix_millis: None,
             output_bytes: n(1024),
         };
         let mutation = Mutation::new(

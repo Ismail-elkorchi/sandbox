@@ -1,5 +1,90 @@
 use crate::{Counter, Digest, ExposureId, GrantId, Invalid, ProcessId, SandboxId, SecretId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// Persistent per-Sandbox overrides layered over immutable image defaults.
+/// This is workload configuration, not authority over the trusted supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkloadConfiguration {
+    pub environment: BTreeMap<String, String>,
+    pub user: Option<String>,
+    pub working_directory: Option<String>,
+}
+
+/// Host-owned persistent-environment lifetime policy. No value means no
+/// automatic cutoff. Idle time advances only while a running machine has no
+/// live or uncertain workload process; absolute expiration advances while the
+/// machine is running, paused, suspended, or stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxLifetime {
+    pub idle_stop_after_millis: Option<Counter>,
+    pub expires_at_unix_millis: Option<Counter>,
+    pub expiration_action: ExpirationAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExpirationAction {
+    #[default]
+    Stop,
+    Destroy,
+}
+
+impl SandboxLifetime {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        const MAX_IDLE_MILLIS: u64 = 365 * 24 * 60 * 60 * 1000;
+        if self
+            .idle_stop_after_millis
+            .is_some_and(|value| value.get() < 1_000 || value.get() > MAX_IDLE_MILLIS)
+        {
+            return Err(Invalid(
+                "idle shutdown must be between one second and 365 days",
+            ));
+        }
+        if self
+            .expires_at_unix_millis
+            .is_some_and(|value| value == Counter::ZERO)
+        {
+            return Err(Invalid("absolute Sandbox expiration must be positive"));
+        }
+        Ok(())
+    }
+}
+
+impl WorkloadConfiguration {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if self.environment.len() > 4096 {
+            return Err(Invalid("workload environment exceeds 4096 entries"));
+        }
+        if self.environment.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.len() > 512
+                || name.contains(['\0', '='])
+                || value.len() > 64 * 1024
+                || value.contains('\0')
+        }) {
+            return Err(Invalid("workload environment is malformed"));
+        }
+        if self
+            .user
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256 || value.contains('\0'))
+        {
+            return Err(Invalid("workload user is malformed"));
+        }
+        if self.working_directory.as_ref().is_some_and(|value| {
+            value.len() > 4096
+                || !value.starts_with('/')
+                || value.contains('\0')
+                || value.split('/').any(|part| part == "..")
+        }) {
+            return Err(Invalid("workload working directory is malformed"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

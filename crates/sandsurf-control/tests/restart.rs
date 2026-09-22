@@ -117,13 +117,28 @@ impl Fixture {
         let sandbox: SandboxId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
-        let request_digest =
-            digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+        let workload = WorkloadConfiguration::default();
+        let request_digest = digest(
+            Domain::Sandbox,
+            &(
+                &sandbox,
+                &image,
+                resources(),
+                &workload,
+                &SandboxLifetime::default(),
+                &create,
+            ),
+        )
+        .unwrap();
         host.create_sandbox(
-            sandbox.clone(),
-            image,
-            resources(),
-            create.clone(),
+            SandboxAdmission {
+                id: sandbox.clone(),
+                image,
+                resources: resources(),
+                workload,
+                lifetime: SandboxLifetime::default(),
+                operation: create.clone(),
+            },
             Approval {
                 id: "approve-create".try_into().unwrap(),
                 request_digest,
@@ -162,10 +177,13 @@ impl Fixture {
         host.complete_intent(&running).unwrap();
         let scope = hash("workload");
         let grant: GrantId = "spawn".try_into().unwrap();
+        let grant_operation: OperationId = "grant-spawn".try_into().unwrap();
         let request_digest = digest(
             Domain::Grant,
             &(
+                "sandsurf-grant-change-v1",
                 &sandbox,
+                &grant_operation,
                 &grant,
                 Counter::ONE,
                 Capability::Spawn,
@@ -177,6 +195,7 @@ impl Fixture {
         host.set_grant(
             GrantChange {
                 sandbox_id: sandbox.clone(),
+                operation_id: grant_operation,
                 id: grant.clone(),
                 expected_revision: Counter::ONE,
                 capability: Capability::Spawn,
@@ -221,7 +240,8 @@ impl Fixture {
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
                     lifetime: ProcessLifetime::Job,
-                    deadline_millis: None,
+                    active_deadline_millis: None,
+                    elapsed_deadline_unix_millis: None,
                     output_bytes: n(1024),
                 }),
             },
@@ -337,7 +357,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         )
         .unwrap();
     let payload = serde_json::to_vec(&(
-        1_u16,
+        2_u16,
         GuardianRequest::Dispatch {
             authorization: authorization.clone(),
         },
@@ -419,7 +439,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let lifecycle = result.guardian_operation;
     assert_eq!(lifecycle.delivery, Delivery::Applied);
     assert!(result.completed_intent.unwrap().completion.is_some());
-    let link = HostGuardianLink::new(&host, endpoint);
+    let link = HostGuardianLink::new(&host, endpoint.clone());
     let inspection = link
         .inspect(fixture.sandbox.clone(), Some(pause.clone()))
         .unwrap();
@@ -432,8 +452,45 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
             }
         }
     ));
-    assert_eq!(inspection.lifecycle_operation, Some(lifecycle));
+    assert_eq!(inspection.lifecycle_operation, Some(lifecycle.clone()));
     assert!(host.intent(&pause).unwrap().unwrap().completion.is_some());
+    drop(link);
+
+    let resume: OperationId = "resume-machine".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&fixture.sandbox, &resume, n(3), DesiredState::Running),
+    )
+    .unwrap();
+    host.request_lifecycle(
+        &fixture.sandbox,
+        resume.clone(),
+        n(3),
+        DesiredState::Running,
+        Approval {
+            id: "approve-resume-machine".try_into().unwrap(),
+            request_digest,
+        },
+    )
+    .unwrap();
+    let resumed = apply_lifecycle(&mut host, endpoint.clone(), &resume).unwrap();
+    assert_eq!(resumed.guardian_operation.delivery, Delivery::Applied);
+
+    let replayed = apply_lifecycle(&mut host, endpoint.clone(), &pause).unwrap();
+    assert_eq!(replayed.guardian_operation, lifecycle);
+    assert_eq!(replayed.completed_intent, host.intent(&pause).unwrap());
+    let current = HostGuardianLink::new(&host, endpoint)
+        .inspect(fixture.sandbox.clone(), None)
+        .unwrap();
+    assert!(matches!(
+        current.observation,
+        Observation::Current {
+            value: MachineObservation {
+                state: MachineState::Running,
+                ..
+            }
+        }
+    ));
 }
 
 fn wait_for(path: &Path) {

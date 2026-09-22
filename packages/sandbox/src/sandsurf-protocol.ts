@@ -73,7 +73,8 @@ export interface SandsurfSpawnRequest {
   readonly stdio: "pipes" | "terminal";
   readonly terminalSize: SandsurfTerminalSize | null;
   readonly lifetime: "job" | "sandbox";
-  readonly deadlineMillis: number | null;
+  readonly activeDeadlineMillis: number | null;
+  readonly elapsedDeadlineUnixMillis: number | null;
   readonly outputBytes: number;
 }
 
@@ -106,6 +107,7 @@ export interface SandsurfOutputBoundary {
 }
 
 export interface SandsurfReleaseRequest {
+  readonly operationId: string;
   readonly receiptDigest: string;
   readonly output: SandsurfOutputBoundary;
   readonly disposition:
@@ -199,7 +201,7 @@ function recordValue(value: unknown): value is Record<string, unknown> {
 }
 
 function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
-  record(value, ["sandboxId", "epoch", "processId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "lifetime", "deadlineMillis", "outputBytes"]);
+  record(value, ["sandboxId", "epoch", "processId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "lifetime", "activeDeadlineMillis", "elapsedDeadlineUnixMillis", "outputBytes"]);
   identity(value.sandboxId); identity(value.processId); identity(value.operationId); counter(value.epoch); counter(value.outputBytes);
   if (value.epoch === 0 || value.outputBytes === 0 || !Array.isArray(value.argv) || value.argv.length < 1 || value.argv.length > 4096
     || value.argv.some((item) => typeof item !== "string" || item.length < 1 || item.length > 64 * 1024 || item.includes("\0"))) {
@@ -218,10 +220,11 @@ function validateSpawn(value: unknown): asserts value is SandsurfSpawnRequest {
   if (value.stdio === "terminal") validateTerminalSize(value.terminalSize);
   else if (value.stdio !== "pipes" || value.terminalSize !== null) throw new Error("invalid Sandsurf stdio mode");
   if (value.lifetime !== "job" && value.lifetime !== "sandbox") throw new Error("invalid Sandsurf process lifetime");
-  if (value.deadlineMillis !== null) {
-    counter(value.deadlineMillis);
-    if (value.deadlineMillis === 0 || value.deadlineMillis > 30 * 24 * 60 * 60 * 1000) throw new Error("invalid Sandsurf process deadline");
+  if (value.activeDeadlineMillis !== null) {
+    counter(value.activeDeadlineMillis);
+    if (value.activeDeadlineMillis === 0 || value.activeDeadlineMillis > 30 * 24 * 60 * 60 * 1000) throw new Error("invalid Sandsurf active process deadline");
   }
+  if (value.elapsedDeadlineUnixMillis !== null) { counter(value.elapsedDeadlineUnixMillis); if (value.elapsedDeadlineUnixMillis === 0) throw new Error("invalid Sandsurf elapsed process deadline"); }
 }
 
 function validateTerminalSize(value: unknown): asserts value is SandsurfTerminalSize {
@@ -244,8 +247,8 @@ export function validateSandsurfOutputBoundary(value: unknown): asserts value is
 }
 
 export function validateSandsurfRelease(value: unknown): asserts value is SandsurfReleaseRequest {
-  record(value, ["receiptDigest", "output", "disposition"]);
-  sha256(value.receiptDigest); validateSandsurfOutputBoundary(value.output);
+  record(value, ["operationId", "receiptDigest", "output", "disposition"]);
+  identity(value.operationId); sha256(value.receiptDigest); validateSandsurfOutputBoundary(value.output);
   const disposition = value.disposition;
   if (disposition === null || typeof disposition !== "object" || !("kind" in disposition)) throw new Error("missing release disposition");
   const fields = disposition as Record<string, unknown>;

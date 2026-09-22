@@ -48,7 +48,7 @@ try {
       ports: [bound.port],
     }],
   }, { operationId: "direct-policy" });
-  await sandbox.start("direct-start");
+  await sandbox.start({ operationId: "direct-start" });
 
   const allowed = await sandbox.processes.spawn({
     operationId: "direct-allowed",
@@ -102,8 +102,8 @@ try {
   if (usage.networkConnections < 1 || usage.networkRxBytes === 0 || usage.networkTxBytes === 0) {
     throw new Error(`direct TCP was not accounted: ${JSON.stringify(usage)}`);
   }
-  await sandbox.stop("direct-stop");
-  await sandbox.destroy("direct-destroy");
+  await sandbox.stop({ operationId: "direct-stop" });
+  await sandbox.destroy({ operationId: "direct-destroy" });
   process.stdout.write(`${JSON.stringify({ hostAddress, port: bound.port, usage }, null, 2)}\n`);
 } finally {
   upstream.close();
@@ -121,7 +121,7 @@ async function output(process: SandboxProcess): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let cursor = 0;
   for (;;) {
-    const page = await process.readOutput({ after: cursor });
+    const page = await process.output.read({ after: cursor });
     for (const chunk of page.chunks) {
       if (chunk.cursor !== cursor) throw new Error("process output is non-contiguous");
       const bytes = Buffer.from(chunk.bytes);

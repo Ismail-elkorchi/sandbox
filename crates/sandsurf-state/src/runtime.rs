@@ -23,6 +23,9 @@ CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFER
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE acknowledgement_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE pin_operations(id TEXT PRIMARY KEY, pin TEXT NOT NULL REFERENCES pins(id), process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE release_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), request_digest TEXT NOT NULL) STRICT;
 CREATE TABLE loss_authorizations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL, approval_digest TEXT NOT NULL) STRICT;
 CREATE TABLE disks(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, request TEXT NOT NULL, request_digest TEXT NOT NULL, phase TEXT NOT NULL, cleanup_digest TEXT) STRICT;
 ";
@@ -278,6 +281,88 @@ impl RuntimeJournal {
         operation(&self.db.connection, id)
     }
 
+    pub fn runtime_operation(&self, id: &OperationId) -> Result<Option<RuntimeOperationRecord>> {
+        let db = &self.db.connection;
+        let mut records = Vec::new();
+        if let Some(operation) = operation(db, id)? {
+            records.push(RuntimeOperationRecord::Workload { operation });
+        }
+        if let Some((process, receipt_digest)) = db
+            .query_row(
+                "SELECT process,receipt_digest FROM acknowledgement_operations WHERE id=?1",
+                [id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            records.push(RuntimeOperationRecord::ReceiptAcknowledgement {
+                operation_id: id.clone(),
+                process_id: process.try_into()?,
+                receipt_digest: receipt_digest.try_into()?,
+            });
+        }
+        if let Some((pin, process, receipt_digest)) = db
+            .query_row(
+                "SELECT pin,process,receipt_digest FROM pin_operations WHERE id=?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            records.push(RuntimeOperationRecord::EvidencePin {
+                operation_id: id.clone(),
+                pin_id: pin.try_into()?,
+                process_id: process.try_into()?,
+                receipt_digest: receipt_digest.try_into()?,
+            });
+        }
+        if let Some((process, request_digest, raw_request, cleanup_pending)) = db
+            .query_row(
+                "SELECT r.process,r.request_digest,p.release,p.cleanup_pending FROM release_operations r JOIN processes p ON p.id=r.process WHERE r.id=?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            let raw_request = raw_request.ok_or(Error::Corrupt(
+                "release operation has no committed disposition",
+            ))?;
+            let request: ReleaseRequest = decode(&raw_request)?;
+            let expected = digest(Domain::Release, &request)?;
+            if request.operation_id != *id || expected.as_str() != request_digest {
+                return Err(Error::Corrupt("release operation binding is invalid"));
+            }
+            records.push(RuntimeOperationRecord::EvidenceRelease {
+                process_id: process.try_into()?,
+                request,
+                status: ReleaseStatus {
+                    request_digest: expected,
+                    cleanup_pending,
+                },
+            });
+        }
+        match records.len() {
+            0 => Ok(None),
+            1 => Ok(records.pop()),
+            _ => Err(Error::Corrupt(
+                "runtime operation identity is bound to multiple mutations",
+            )),
+        }
+    }
+
     pub fn events(&self, after: Counter, maximum: u16) -> Result<RuntimeEventPage> {
         if maximum == 0 || maximum > 256 {
             return Err(Error::Capacity("event page must contain 1..256 entries"));
@@ -355,21 +440,7 @@ impl RuntimeJournal {
                 ))
             };
         }
-        let workload_operation: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1)",
-            [command.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        let disk_operation: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
-            [command.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if workload_operation || disk_operation {
-            return Err(Error::Conflict(
-                "operation identity already belongs to another guardian operation",
-            ));
-        }
+        runtime_operation_identity_available(&tx, &command.operation_id)?;
         require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = LifecycleOperation {
@@ -406,11 +477,13 @@ impl RuntimeJournal {
         if value.command != *command {
             return Err(Error::Conflict("lifecycle authority mismatch"));
         }
-        if value.delivery != Delivery::Admitted {
+        if !matches!(value.delivery, Delivery::Admitted | Delivery::NotApplied) {
             return Ok(LifecycleDecision::Reconcile(value));
         }
         require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
         value.delivery = Delivery::Dispatched;
+        value.evidence_digest = None;
+        value.observation = None;
         tx.execute(
             "UPDATE lifecycle_operations SET value=?2 WHERE id=?1",
             params![command.operation_id.as_str(), encode(&value)?],
@@ -539,16 +612,7 @@ impl RuntimeJournal {
                 ))
             };
         }
-        let conflicting: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
-            [command.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if conflicting {
-            return Err(Error::Conflict(
-                "operation identity already belongs to another guardian operation",
-            ));
-        }
+        runtime_operation_identity_available(&tx, &command.operation_id)?;
         require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = ConfigurationOperation {
@@ -585,8 +649,20 @@ impl RuntimeJournal {
         if value.command != *command {
             return Err(Error::Conflict("configuration authority mismatch"));
         }
-        if value.delivery != Delivery::Admitted {
+        if matches!(
+            value.delivery,
+            Delivery::Dispatched | Delivery::Unknown | Delivery::Applied
+        ) {
             return Ok(ConfigurationDecision::Reconcile(value));
+        }
+        // `NotApplied` is positive evidence that the prior dispatch had no
+        // effect. Configuration installation is an idempotent control-plane
+        // postcondition, so the same signed command may be dispatched again.
+        // Unknown delivery remains non-replayable above.
+        if value.delivery != Delivery::Admitted && value.delivery != Delivery::NotApplied {
+            return Err(Error::Conflict(
+                "configuration operation has an invalid retry state",
+            ));
         }
         require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
         value.delivery = Delivery::Dispatched;
@@ -720,16 +796,7 @@ impl RuntimeJournal {
             }
             return Err(Error::Conflict("runtime operation identity already bound"));
         }
-        let disk_operation: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM disks WHERE operation=?1)",
-            [request.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if disk_operation {
-            return Err(Error::Conflict(
-                "operation identity already belongs to disk provisioning",
-            ));
-        }
+        runtime_operation_identity_available(&tx, &request.operation_id)?;
         let observed =
             observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
         if request.sandbox_id != self.sandbox
@@ -1485,22 +1552,83 @@ impl RuntimeJournal {
         receipt(&self.db.connection, id)
     }
 
-    pub fn acknowledge_receipt(&mut self, id: &ProcessId, expected: &Digest) -> Result<()> {
-        require_receipt(&self.db.connection, id, expected)?;
-        self.db.connection.execute(
+    pub fn acknowledge_receipt(
+        &mut self,
+        operation: &OperationId,
+        id: &ProcessId,
+        expected: &Digest,
+    ) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        if let Some((old_process, old_digest)) = tx
+            .query_row(
+                "SELECT process,receipt_digest FROM acknowledgement_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            return if old_process == id.as_str() && old_digest == expected.as_str() {
+                Ok(())
+            } else {
+                Err(Error::Conflict(
+                    "acknowledgement operation identity conflict",
+                ))
+            };
+        }
+        require_receipt(&tx, id, expected)?;
+        runtime_operation_identity_available(&tx, operation)?;
+        operation_capacity(&tx, self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO acknowledgement_operations VALUES (?1,?2,?3)",
+            params![operation.as_str(), id.as_str(), expected.as_str()],
+        )?;
+        tx.execute(
             "UPDATE processes SET acknowledged=1 WHERE id=?1",
             [id.as_str()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn pin(&mut self, id: &ProcessId, expected: &Digest, pin: PinId) -> Result<()> {
+    pub fn pin(
+        &mut self,
+        operation: &OperationId,
+        id: &ProcessId,
+        expected: &Digest,
+        pin: PinId,
+    ) -> Result<()> {
+        if let Some((old_pin, old_process, old_digest)) = self
+            .db
+            .connection
+            .query_row(
+                "SELECT pin,process,receipt_digest FROM pin_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            return if old_pin == pin.as_str()
+                && old_process == id.as_str()
+                && old_digest == expected.as_str()
+            {
+                Ok(())
+            } else {
+                Err(Error::Conflict("pin operation identity conflict"))
+            };
+        }
         let receipt = require_receipt(&self.db.connection, id, expected)?;
         let mut cursor = Counter::ZERO;
         while cursor < receipt.output.final_cursor {
             cursor = self.read_output(id, cursor, MAX_CONTROL_BYTES)?.cursor;
         }
         let tx = self.db.connection.transaction()?;
+        runtime_operation_identity_available(&tx, operation)?;
         require_receipt(&tx, id, expected)?;
         let released: Option<String> = tx.query_row(
             "SELECT release FROM processes WHERE id=?1",
@@ -1512,7 +1640,7 @@ impl RuntimeJournal {
                 "cannot create a retention obligation after release",
             ));
         }
-        if let Some((old_process, old_digest)) = tx
+        let pin_exists = if let Some((old_process, old_digest)) = tx
             .query_row(
                 "SELECT process,receipt_digest FROM pins WHERE id=?1",
                 [pin.as_str()],
@@ -1520,16 +1648,29 @@ impl RuntimeJournal {
             )
             .optional()?
         {
-            return if old_process == id.as_str() && old_digest == expected.as_str() {
-                Ok(())
-            } else {
-                Err(Error::Conflict("pin identity conflict"))
-            };
+            if old_process != id.as_str() || old_digest != expected.as_str() {
+                return Err(Error::Conflict("pin identity conflict"));
+            }
+            true
+        } else {
+            false
+        };
+        if !pin_exists {
+            capacity(&tx, "pins", self.limits.pins)?;
+            tx.execute(
+                "INSERT INTO pins VALUES (?1,?2,?3)",
+                params![pin.as_str(), id.as_str(), expected.as_str()],
+            )?;
         }
-        capacity(&tx, "pins", self.limits.pins)?;
+        operation_capacity(&tx, self.limits.operations)?;
         tx.execute(
-            "INSERT INTO pins VALUES (?1,?2,?3)",
-            params![pin.as_str(), id.as_str(), expected.as_str()],
+            "INSERT INTO pin_operations VALUES (?1,?2,?3,?4)",
+            params![
+                operation.as_str(),
+                pin.as_str(),
+                id.as_str(),
+                expected.as_str()
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -1603,6 +1744,27 @@ impl RuntimeJournal {
     pub fn release(&mut self, id: &ProcessId, request: ReleaseRequest) -> Result<ReleaseStatus> {
         let identity = digest(Domain::Release, &request)?;
         let tx = self.db.connection.transaction()?;
+        if let Some((old_process, old_digest)) = tx
+            .query_row(
+                "SELECT process,request_digest FROM release_operations WHERE id=?1",
+                [request.operation_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            if old_process != id.as_str() || old_digest != identity.as_str() {
+                return Err(Error::Conflict("release operation identity conflict"));
+            }
+            let pending: bool = tx.query_row(
+                "SELECT cleanup_pending FROM processes WHERE id=?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )?;
+            return Ok(ReleaseStatus {
+                request_digest: identity,
+                cleanup_pending: pending,
+            });
+        }
         let receipt = require_receipt(&tx, id, &request.receipt_digest)?;
         if receipt.output != request.output {
             return Err(Error::Conflict(
@@ -1648,6 +1810,16 @@ impl RuntimeJournal {
                 }
             }
         }
+        runtime_operation_identity_available(&tx, &request.operation_id)?;
+        operation_capacity(&tx, self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO release_operations VALUES (?1,?2,?3)",
+            params![
+                request.operation_id.as_str(),
+                id.as_str(),
+                identity.as_str()
+            ],
+        )?;
         tx.execute(
             "UPDATE processes SET release=?2,cleanup_pending=1 WHERE id=?1",
             params![id.as_str(), encode(&request)?],
@@ -1846,13 +2018,26 @@ fn require_configuration_state(
 }
 fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
     let count: u64 = db.query_row(
-        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations) + (SELECT count(*) FROM configuration_operations)",
+        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations) + (SELECT count(*) FROM configuration_operations) + (SELECT count(*) FROM acknowledgement_operations) + (SELECT count(*) FROM pin_operations) + (SELECT count(*) FROM release_operations)",
         [],
         |row| row.get(0),
     )?;
     if count >= limit.get() {
         return Err(Error::Capacity(
             "durable operation capacity exhausted; no evidence evicted",
+        ));
+    }
+    Ok(())
+}
+fn runtime_operation_identity_available(db: &rusqlite::Connection, id: &OperationId) -> Result<()> {
+    let conflicting: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM disks WHERE operation=?1) OR EXISTS(SELECT 1 FROM acknowledgement_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM pin_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM release_operations WHERE id=?1)",
+        [id.as_str()],
+        |row| row.get(0),
+    )?;
+    if conflicting {
+        return Err(Error::Conflict(
+            "operation identity already belongs to another guardian operation",
         ));
     }
     Ok(())

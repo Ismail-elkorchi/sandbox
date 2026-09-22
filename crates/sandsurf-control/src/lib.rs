@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SERVICE_VERSION: u16 = 1;
+const SERVICE_VERSION: u16 = 2;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -554,7 +554,7 @@ impl<E: GuardianEffect> Guardian<E> {
                         }
                     }
                     RuntimeRequest::Operation { operation_id } => RuntimeResponse::Operation {
-                        operation: self.journal.operation(&operation_id)?,
+                        operation: self.journal.runtime_operation(&operation_id)?,
                     },
                     RuntimeRequest::Receipt { process_id } => {
                         let value = self.journal.receipt(&process_id)?;
@@ -575,19 +575,25 @@ impl<E: GuardianEffect> Guardian<E> {
                         )?),
                     },
                     RuntimeRequest::AcknowledgeReceipt {
+                        operation_id,
                         process_id,
                         receipt_digest,
                     } => {
-                        self.journal
-                            .acknowledge_receipt(&process_id, &receipt_digest)?;
+                        self.journal.acknowledge_receipt(
+                            &operation_id,
+                            &process_id,
+                            &receipt_digest,
+                        )?;
                         RuntimeResponse::Complete
                     }
                     RuntimeRequest::Pin {
+                        operation_id,
                         process_id,
                         receipt_digest,
                         pin_id,
                     } => {
-                        self.journal.pin(&process_id, &receipt_digest, pin_id)?;
+                        self.journal
+                            .pin(&operation_id, &process_id, &receipt_digest, pin_id)?;
                         RuntimeResponse::Complete
                     }
                     RuntimeRequest::ReadPin {
@@ -729,8 +735,33 @@ pub fn apply_lifecycle(
     endpoint: PathBuf,
     operation_id: &OperationId,
 ) -> Result<HostLifecycleResult> {
-    let authorization = catalog.authorize_lifecycle(operation_id)?;
     let client = GuardianClient::new(endpoint);
+    if let Some(intent) = catalog.intent(operation_id)?
+        && let Some(completion) = intent.completion.as_ref()
+    {
+        let inspection = client.inspect(intent.sandbox_id.clone(), Some(operation_id.clone()))?;
+        let operation = inspection.lifecycle_operation.ok_or(Error::Protocol(
+            "guardian no longer retains a completed lifecycle operation",
+        ))?;
+        if operation.command.sandbox_id != intent.sandbox_id
+            || operation.command.operation_id != intent.operation_id
+            || operation.command.desired != intent.desired
+            || operation.command.revision != intent.revision
+            || operation.command.request_digest != intent.request_digest
+            || operation.delivery != Delivery::Applied
+            || operation.evidence_digest.is_none()
+            || operation.observation.as_ref() != Some(completion)
+        {
+            return Err(Error::Protocol(
+                "guardian lifecycle history conflicts with completed host intent",
+            ));
+        }
+        return Ok(HostLifecycleResult {
+            guardian_operation: operation,
+            completed_intent: Some(intent),
+        });
+    }
+    let authorization = catalog.authorize_lifecycle(operation_id)?;
     let operation = client.transition(authorization)?;
     let completed_intent = if operation.delivery == Delivery::Applied {
         let inspection = client.inspect(

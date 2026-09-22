@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -15,6 +15,8 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
   const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ??
     resolve("packages/sandbox/images/development-x64/manifest.json");
   const state = process.env.SANDSURF_TEST_STATE ?? await mkdtemp(join(tmpdir(), "sandsurf-kvm-environment-"));
+  const hostWorkspace = await mkdtemp(join(tmpdir(), "sandsurf-kvm-workspace-"));
+  await writeFile(join(hostWorkspace, "source.txt"), "base\n");
   const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
   const upstream = createServer((_request, response) => response.end("network-ok\n"));
   await new Promise((resolve, reject) => {
@@ -25,6 +27,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
   const host = await Sandsurf.open({ directory: state, authorizer: () => true });
   let sandbox;
   let forkSandbox;
+  let discardedFork;
   try {
     const secret = await host.secrets.put("integration-secret", "environment-secret");
     sandbox = await host.sandboxes.create({
@@ -36,8 +39,13 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
         outputBytes: 128 * 1024 * 1024,
         processes: 128,
       },
+      workspace: { path: "/workspace" },
+      user: "agent",
+      environment: { SANDSURF_ENVIRONMENT: "persistent-config" },
+      workingDirectory: "/workspace",
+      network: { egress: "deny" },
+      lifetime: { kind: "persistent" },
       capabilities: {
-        spawn: true,
         "read-files": true,
         "write-files": true,
         "workload-admin": true,
@@ -46,8 +54,44 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
         "deliver-secret": true,
         "increase-resources": true,
         checkpoint: true,
+        "apply-to-host": true,
       },
     });
+    const spawnGrant = await sandbox.grants.grant("spawn", {
+      id: "integration-spawn-grant",
+      operationId: "grant-integration-spawn",
+    });
+
+    assert.equal(
+      await run(sandbox, ["/bin/sh", "-c", "printf '%s:%s:%s' \"$SANDSURF_ENVIRONMENT\" \"$(id -un)\" \"$PWD\""]),
+      "persistent-config:agent:/workspace",
+    );
+
+    const baseWorkspace = await sandbox.workspace.importFromHost({
+      source: hostWorkspace,
+      operationId: "import-integration-workspace",
+    });
+    await sandbox.workspace.writeFile("source.txt", "in-place\n");
+    assert.equal(await run(sandbox, ["/bin/sh", "-c", "test \"$(cat source.txt)\" = in-place && printf checked"]), "checked");
+    assert.equal(await readFile(join(hostWorkspace, "source.txt"), "utf8"), "base\n");
+    const inPlaceChanges = await sandbox.workspace.diff(baseWorkspace);
+    await writeFile(join(hostWorkspace, "source.txt"), "external-change\n");
+    await assert.rejects(
+      sandbox.workspace.applyToHost({
+        destination: hostWorkspace,
+        operationId: "apply-conflicting-in-place-change",
+        changeSet: inPlaceChanges,
+      }),
+      /conflict|changed/iu,
+    );
+    await writeFile(join(hostWorkspace, "source.txt"), "base\n");
+    const applied = await sandbox.workspace.applyToHost({
+      destination: hostWorkspace,
+      operationId: "apply-in-place-change",
+      changeSet: inPlaceChanges,
+    });
+    assert.equal(applied.applied, 1);
+    assert.equal(await readFile(join(hostWorkspace, "source.txt"), "utf8"), "in-place\n");
 
     assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
     assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);
@@ -118,8 +162,8 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.ok(after.networkTxBytes > 0);
     assert.ok(after.networkConnections > 0);
 
-    await sandbox.pause("pause-before-checkpoint");
-    await sandbox.resume("resume-before-checkpoint");
+    await sandbox.pause({ operationId: "pause-before-checkpoint" });
+    await sandbox.resume({ operationId: "resume-before-checkpoint" });
     assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/index.html")).toString(), "exposure-ok\n");
 
     const restoredProcess = await sandbox.processes.spawn({
@@ -130,9 +174,9 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       lifetime: "sandbox",
     });
     await waitForOutput(restoredProcess, 4);
-    const suspended = await sandbox.suspend("suspend-full-state");
+    const suspended = await sandbox.suspend({ operationId: "suspend-full-state" });
     assert.equal(suspended.machine.value.state, "suspended");
-    const restored = await sandbox.resume("restore-full-state");
+    const restored = await sandbox.resume({ operationId: "restore-full-state" });
     assert.equal(restored.machine.value.state, "running");
     const reboundProcess = await sandbox.processes.get("full-state-service");
     const reboundObservation = await reboundProcess.inspect();
@@ -156,6 +200,11 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.equal(fullCheckpoint.inspection.sensitive, true);
     const checkpoint = await sandbox.checkpoints.create({ id: "filesystem-checkpoint" });
     assert.equal(checkpoint.inspection.phase, "ready");
+    await sandbox.fs.writeFile("/workspace/continued-after-checkpoint", "continued\n");
+    assert.equal(
+      Buffer.from(await sandbox.fs.readFile("/workspace/continued-after-checkpoint")).toString(),
+      "continued\n",
+    );
     await assert.rejects(checkpoint.publishImage({ operationId: "reject-implicit-sensitive-publication" }));
     const derived = await checkpoint.publishImage({
       operationId: "publish-derived-image",
@@ -170,18 +219,40 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       capabilities: { spawn: true, "read-files": true, "write-files": true },
     });
     assert.equal(Buffer.from(await forkSandbox.fs.readFile("/workspace/checkpoint-value")).toString(), "captured\n");
-    await forkSandbox.stop("stop-checkpoint-fork");
-    await sandbox.stop("stop-before-rollback");
+    discardedFork = await checkpoint.fork({
+      id: "checkpoint-discarded-fork",
+      capabilities: { spawn: true, "read-files": true, "write-files": true },
+    });
+    await forkSandbox.fs.writeFile("/workspace/fork-disposition", "retained\n");
+    await discardedFork.fs.writeFile("/workspace/fork-disposition", "discarded\n");
+    assert.equal(Buffer.from(await forkSandbox.fs.readFile("/workspace/fork-disposition")).toString(), "retained\n");
+    assert.equal(Buffer.from(await discardedFork.fs.readFile("/workspace/fork-disposition")).toString(), "discarded\n");
+    await discardedFork.destroy({ operationId: "destroy-discarded-checkpoint-fork" });
+    discardedFork = undefined;
+    assert.equal(Buffer.from(await forkSandbox.fs.readFile("/workspace/fork-disposition")).toString(), "retained\n");
+    await sandbox.stop({ operationId: "stop-before-rollback" });
     await sandbox.checkpoints.rollback(checkpoint.id, { operationId: "rollback-filesystem-checkpoint" });
-    await sandbox.start("start-after-rollback");
+    await sandbox.start({ operationId: "start-after-rollback" });
     assert.equal(Buffer.from(await sandbox.fs.readFile("/workspace/checkpoint-value")).toString(), "captured\n");
+    const revokedSpawn = await sandbox.grants.revoke(spawnGrant, {
+      operationId: "revoke-integration-spawn",
+    });
+    assert.equal(revokedSpawn.revoked, true);
+    await assert.rejects(
+      sandbox.processes.spawn({ argv: ["/bin/true"] }),
+      /grant|authorization|active/iu,
+    );
   } finally {
     upstream.close();
+    await rm(hostWorkspace, { recursive: true, force: true });
+    if (discardedFork !== undefined) {
+      try { await discardedFork.destroy({ operationId: "cleanup-discarded-checkpoint-fork" }); } catch { /* Preserve the primary assertion. */ }
+    }
     if (forkSandbox !== undefined) {
-      try { await forkSandbox.stop("cleanup-checkpoint-fork"); } catch { /* Preserve the primary assertion. */ }
+      try { await forkSandbox.destroy({ operationId: "cleanup-checkpoint-fork" }); } catch { /* Preserve the primary assertion. */ }
     }
     if (sandbox !== undefined) {
-      try { await sandbox.stop("stop-kvm-environment"); } catch { /* Preserve the primary assertion. */ }
+      try { await sandbox.stop({ operationId: "stop-kvm-environment" }); } catch { /* Preserve the primary assertion. */ }
     }
     await host.close();
     try { await (await NativeHostClient.open(state)).stopService(); } catch { /* Best effort test cleanup. */ }
@@ -197,7 +268,7 @@ async function run(sandbox, argv, options = {}) {
 async function runResult(sandbox, argv, options = {}) {
   const process = await sandbox.processes.spawn({ argv, ...options });
   const ended = await process.wait();
-  const page = await process.readOutput({ maximum: 256 * 1024 });
+  const page = await process.output.read({ maximum: 256 * 1024 });
   return { state: ended.state, output: Buffer.concat(page.chunks.map((chunk) => Buffer.from(chunk.bytes))) };
 }
 
@@ -209,7 +280,7 @@ function exitCode(state) {
 async function waitForOutput(process, minimum) {
   const deadline = Date.now() + 30_000;
   for (;;) {
-    const page = await process.readOutput({ maximum: 64 * 1024 });
+    const page = await process.output.read({ maximum: 64 * 1024 });
     const bytes = page.chunks.reduce((total, chunk) => total + chunk.bytes.byteLength, 0);
     if (bytes >= minimum) return;
     if (Date.now() >= deadline) throw new Error(`process ${process.id} produced fewer than ${minimum} bytes`);

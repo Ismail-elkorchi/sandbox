@@ -62,6 +62,74 @@ fn catalog_limits() -> CatalogLimits {
 }
 
 #[test]
+fn sandbox_workload_configuration_is_host_owned_and_durable() {
+    let root = TempRoot::new();
+    let path = root.0.join("workload-configuration-host");
+    let sandbox: SandboxId = "configured-box".try_into().unwrap();
+    let operation: OperationId = "create-configured-box".try_into().unwrap();
+    let image = hash("configured-image");
+    let workload = WorkloadConfiguration {
+        environment: std::collections::BTreeMap::from([("MODE".into(), "agent".into())]),
+        user: Some("agent".into()),
+        working_directory: Some("/workspace".into()),
+    };
+    let lifetime = SandboxLifetime {
+        idle_stop_after_millis: Some(n(60_000)),
+        expires_at_unix_millis: Some(n(9_000_000_000_000)),
+        expiration_action: ExpirationAction::Destroy,
+    };
+    let request_digest = digest(
+        Domain::Sandbox,
+        &(
+            &sandbox,
+            &image,
+            resources(),
+            &workload,
+            &lifetime,
+            &operation,
+        ),
+    )
+    .unwrap();
+    let mut host = HostCatalog::create(
+        &path,
+        "configured-host".try_into().unwrap(),
+        catalog_limits(),
+    )
+    .unwrap();
+    host.create_sandbox(
+        SandboxAdmission {
+            id: sandbox.clone(),
+            image,
+            resources: resources(),
+            workload: workload.clone(),
+            lifetime: lifetime.clone(),
+            operation,
+        },
+        Approval {
+            id: "approve-configured-box".try_into().unwrap(),
+            request_digest,
+        },
+    )
+    .unwrap();
+    let created = host.sandbox(&sandbox).unwrap().unwrap();
+    assert_eq!(created.workload_configuration, workload);
+    assert_eq!(created.lifetime, lifetime);
+    let later = created.last_activity_unix_millis.next().unwrap();
+    host.observe_activity(&sandbox, later).unwrap();
+    host.observe_activity(&sandbox, created.last_activity_unix_millis)
+        .unwrap();
+    drop(host);
+    let reopened = HostCatalog::open(&path)
+        .unwrap()
+        .sandbox(&sandbox)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.workload_configuration, workload);
+    assert_eq!(reopened.lifetime, lifetime);
+    assert_eq!(reopened.last_activity_unix_millis, later);
+}
+
+#[test]
 fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforcement() {
     let root = TempRoot::new();
     let path = root.0.join("host");
@@ -70,12 +138,28 @@ fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforceme
     let sandbox: SandboxId = "secret-box".try_into().unwrap();
     let create: OperationId = "create-secret-box".try_into().unwrap();
     let image = hash("secret-image");
-    let create_digest = digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+    let workload = WorkloadConfiguration::default();
+    let create_digest = digest(
+        Domain::Sandbox,
+        &(
+            &sandbox,
+            &image,
+            resources(),
+            &workload,
+            &SandboxLifetime::default(),
+            &create,
+        ),
+    )
+    .unwrap();
     host.create_sandbox(
-        sandbox.clone(),
-        image,
-        resources(),
-        create,
+        SandboxAdmission {
+            id: sandbox.clone(),
+            image,
+            resources: resources(),
+            workload,
+            lifetime: SandboxLifetime::default(),
+            operation: create,
+        },
         Approval {
             id: "approve-secret-box".try_into().unwrap(),
             request_digest: create_digest,
@@ -376,13 +460,28 @@ impl Fixture {
         let sandbox: SandboxId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
-        let request_digest =
-            digest(Domain::Sandbox, &(&sandbox, &image, resources(), &create)).unwrap();
+        let workload = WorkloadConfiguration::default();
+        let request_digest = digest(
+            Domain::Sandbox,
+            &(
+                &sandbox,
+                &image,
+                resources(),
+                &workload,
+                &SandboxLifetime::default(),
+                &create,
+            ),
+        )
+        .unwrap();
         host.create_sandbox(
-            sandbox.clone(),
-            image,
-            resources(),
-            create.clone(),
+            SandboxAdmission {
+                id: sandbox.clone(),
+                image,
+                resources: resources(),
+                workload,
+                lifetime: SandboxLifetime::default(),
+                operation: create.clone(),
+            },
             Approval {
                 id: "approve-create".try_into().unwrap(),
                 request_digest,
@@ -420,15 +519,26 @@ impl Fixture {
             .unwrap();
         host.complete_intent(&evidence).unwrap();
         let grant_id: GrantId = "spawn".try_into().unwrap();
+        let grant_operation: OperationId = "grant-spawn".try_into().unwrap();
         let scope = hash("workload");
         let request_digest = digest(
             Domain::Grant,
-            &(&sandbox, &grant_id, n(1), Capability::Spawn, &scope, false),
+            &(
+                "sandsurf-grant-change-v1",
+                &sandbox,
+                &grant_operation,
+                &grant_id,
+                n(1),
+                Capability::Spawn,
+                &scope,
+                false,
+            ),
         )
         .unwrap();
         host.set_grant(
             GrantChange {
                 sandbox_id: sandbox.clone(),
+                operation_id: grant_operation,
                 id: grant_id.clone(),
                 expected_revision: n(1),
                 capability: Capability::Spawn,
@@ -466,7 +576,8 @@ impl Fixture {
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
                     lifetime: ProcessLifetime::Job,
-                    deadline_millis: None,
+                    active_deadline_millis: None,
+                    elapsed_deadline_unix_millis: None,
                     output_bytes: n(100),
                 }),
             },
@@ -528,6 +639,7 @@ impl Fixture {
         commitment.sync_all().unwrap();
         fs::File::open(&self.root.0).unwrap().sync_all().unwrap();
         ReleaseRequest {
+            operation_id: "release-output".try_into().unwrap(),
             receipt_digest: receipt_digest.clone(),
             output: receipt.output.clone(),
             disposition: ReleaseDisposition::CompleteCapture {
@@ -654,6 +766,7 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
             &checkpoint_id,
             &fork_id,
             resources(),
+            &SandboxLifetime::default(),
             &fork_operation,
         ),
     )
@@ -664,6 +777,7 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
             fork_id.clone(),
             &checkpoint_id,
             resources(),
+            SandboxLifetime::default(),
             fork_operation,
             Approval {
                 id: "approve-fork".try_into().unwrap(),
@@ -1135,13 +1249,81 @@ fn interrupted_lifecycle_dispatch_is_reconciled_without_replay() {
 }
 
 #[test]
+fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() {
+    let mut f = Fixture::new();
+    let pause: OperationId = "pause-before-next-intent".try_into().unwrap();
+    let pause_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &pause, n(2), DesiredState::Paused),
+    )
+    .unwrap();
+    let intent = f
+        .host
+        .request_lifecycle(
+            &f.sandbox,
+            pause.clone(),
+            n(2),
+            DesiredState::Paused,
+            Approval {
+                id: "approve-pause-before-next".try_into().unwrap(),
+                request_digest: pause_digest,
+            },
+        )
+        .unwrap();
+
+    let stop: OperationId = "stop-overtaking-pause".try_into().unwrap();
+    let stop_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &stop, n(3), DesiredState::Stopped),
+    )
+    .unwrap();
+    assert!(
+        f.host
+            .request_lifecycle(
+                &f.sandbox,
+                stop,
+                n(3),
+                DesiredState::Stopped,
+                Approval {
+                    id: "approve-overtaking-stop".try_into().unwrap(),
+                    request_digest: stop_digest,
+                },
+            )
+            .is_err()
+    );
+
+    let authorization = f.host.authorize_lifecycle(&pause).unwrap();
+    f.runtime.admit_lifecycle(authorization.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_lifecycle(authorization.clone()).unwrap(),
+        LifecycleDecision::Perform(_)
+    ));
+    f.runtime
+        .record_lifecycle_delivery(
+            &pause,
+            &intent.request_digest,
+            Delivery::NotApplied,
+            Some(hash("pause-was-not-applied")),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        f.runtime.begin_lifecycle(authorization).unwrap(),
+        LifecycleDecision::Perform(_)
+    ));
+}
+
+#[test]
 fn revoked_grants_and_stale_revisions_cannot_authorize() {
     let mut f = Fixture::new();
     let scope = hash("workload");
+    let revoke: OperationId = "revoke-spawn".try_into().unwrap();
     let request_digest = digest(
         Domain::Grant,
         &(
+            "sandsurf-grant-change-v1",
             &f.sandbox,
+            &revoke,
             &f.mutation.grant_id,
             n(2),
             Capability::Spawn,
@@ -1150,10 +1332,12 @@ fn revoked_grants_and_stale_revisions_cannot_authorize() {
         ),
     )
     .unwrap();
-    f.host
+    let revoked = f
+        .host
         .set_grant(
             GrantChange {
                 sandbox_id: f.sandbox.clone(),
+                operation_id: revoke.clone(),
                 id: f.mutation.grant_id.clone(),
                 expected_revision: n(2),
                 capability: Capability::Spawn,
@@ -1162,10 +1346,71 @@ fn revoked_grants_and_stale_revisions_cannot_authorize() {
             },
             Approval {
                 id: "revoke".try_into().unwrap(),
-                request_digest,
+                request_digest: request_digest.clone(),
             },
         )
         .unwrap();
+    assert!(revoked.revoked);
+    assert_eq!(
+        f.host
+            .set_grant(
+                GrantChange {
+                    sandbox_id: f.sandbox.clone(),
+                    operation_id: revoke,
+                    id: f.mutation.grant_id.clone(),
+                    expected_revision: n(2),
+                    capability: Capability::Spawn,
+                    scope_digest: scope.clone(),
+                    revoked: true,
+                },
+                Approval {
+                    id: "revoke-retry".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap(),
+        revoked
+    );
+    assert_eq!(
+        f.host.grants(&f.sandbox, None, n(10)).unwrap(),
+        vec![revoked]
+    );
+    let original_operation: OperationId = "grant-spawn".try_into().unwrap();
+    let original_digest = digest(
+        Domain::Grant,
+        &(
+            "sandsurf-grant-change-v1",
+            &f.sandbox,
+            &original_operation,
+            &f.mutation.grant_id,
+            n(1),
+            Capability::Spawn,
+            &scope,
+            false,
+        ),
+    )
+    .unwrap();
+    let historical = f
+        .host
+        .set_grant(
+            GrantChange {
+                sandbox_id: f.sandbox.clone(),
+                operation_id: original_operation,
+                id: f.mutation.grant_id.clone(),
+                expected_revision: n(1),
+                capability: Capability::Spawn,
+                scope_digest: scope.clone(),
+                revoked: false,
+            },
+            Approval {
+                id: "observe-original-grant".try_into().unwrap(),
+                request_digest: original_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(historical.revision, n(2));
+    assert!(!historical.revoked);
+    assert!(f.host.grant(&f.mutation.grant_id).unwrap().unwrap().revoked);
     assert!(
         f.host
             .authorize(f.mutation.clone(), Capability::Spawn, &scope)
@@ -1177,10 +1422,13 @@ fn revoked_grants_and_stale_revisions_cannot_authorize() {
             .authorize(f.mutation.clone(), Capability::Spawn, &scope)
             .is_err()
     );
+    let revive: OperationId = "revive-spawn".try_into().unwrap();
     let request_digest = digest(
         Domain::Grant,
         &(
+            "sandsurf-grant-change-v1",
             &f.sandbox,
+            &revive,
             &f.mutation.grant_id,
             n(3),
             Capability::Spawn,
@@ -1194,6 +1442,7 @@ fn revoked_grants_and_stale_revisions_cannot_authorize() {
             .set_grant(
                 GrantChange {
                     sandbox_id: f.sandbox.clone(),
+                    operation_id: revive,
                     id: f.mutation.grant_id.clone(),
                     expected_revision: n(3),
                     capability: Capability::Spawn,
@@ -1205,6 +1454,287 @@ fn revoked_grants_and_stale_revisions_cannot_authorize() {
                     request_digest
                 }
             )
+            .is_err()
+    );
+}
+
+#[test]
+fn host_configuration_operations_replay_immutable_results_without_reapplying_old_state() {
+    let mut f = Fixture::new();
+    let original = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    let first_operation: OperationId = "configure-first".try_into().unwrap();
+    let first_digest = hash("configure-first-request");
+    let mut first_configuration = original.runtime_configuration.clone();
+    first_configuration.resources.cpu_max = Some((n(10_000), n(100_000)));
+    let first = f
+        .host
+        .set_runtime_configuration(
+            &f.sandbox,
+            &first_operation,
+            n(2),
+            first_configuration.clone(),
+            first_digest.clone(),
+            Approval {
+                id: "approve-configure-first".try_into().unwrap(),
+                request_digest: first_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(first.revision, n(3));
+
+    let second_operation: OperationId = "configure-second".try_into().unwrap();
+    let second_digest = hash("configure-second-request");
+    let mut second_configuration = first_configuration.clone();
+    second_configuration.resources.cpu_max = Some((n(20_000), n(100_000)));
+    let second = f
+        .host
+        .set_runtime_configuration(
+            &f.sandbox,
+            &second_operation,
+            n(3),
+            second_configuration.clone(),
+            second_digest.clone(),
+            Approval {
+                id: "approve-configure-second".try_into().unwrap(),
+                request_digest: second_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(second.revision, n(4));
+
+    assert_eq!(
+        f.host
+            .set_runtime_configuration(
+                &f.sandbox,
+                &first_operation,
+                n(2),
+                first_configuration,
+                first_digest.clone(),
+                Approval {
+                    id: "ignored-replay-approval".try_into().unwrap(),
+                    request_digest: first_digest,
+                },
+            )
+            .unwrap(),
+        first
+    );
+    let current = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    assert_eq!(current.configuration_revision, n(4));
+    assert_eq!(current.runtime_configuration, second_configuration);
+    assert_eq!(
+        f.host.operation(&first_operation).unwrap(),
+        Some(HostOperationRecord::Configuration(first.clone()))
+    );
+    assert!(
+        f.host
+            .set_runtime_configuration(
+                &f.sandbox,
+                &first_operation,
+                n(2),
+                current.runtime_configuration,
+                hash("conflicting-request"),
+                Approval {
+                    id: "conflicting-approval".try_into().unwrap(),
+                    request_digest: hash("conflicting-request"),
+                },
+            )
+            .is_err()
+    );
+    let conflicting_grant: GrantId = "conflicting-host-operation".try_into().unwrap();
+    let scope = hash("conflicting-host-operation-scope");
+    let grant_digest = digest(
+        Domain::Grant,
+        &(
+            "sandsurf-grant-change-v1",
+            &f.sandbox,
+            &first_operation,
+            &conflicting_grant,
+            n(4),
+            Capability::ReadFiles,
+            &scope,
+            false,
+        ),
+    )
+    .unwrap();
+    assert!(
+        f.host
+            .set_grant(
+                GrantChange {
+                    sandbox_id: f.sandbox.clone(),
+                    operation_id: first_operation,
+                    id: conflicting_grant,
+                    expected_revision: n(4),
+                    capability: Capability::ReadFiles,
+                    scope_digest: scope,
+                    revoked: false,
+                },
+                Approval {
+                    id: "approve-conflicting-host-operation".try_into().unwrap(),
+                    request_digest: grant_digest,
+                },
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn guardian_retries_only_configuration_dispatches_proven_not_applied() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "configure-retry".try_into().unwrap();
+    let request_digest = hash("configure-retry-request");
+    let mut configuration = f
+        .host
+        .sandbox(&f.sandbox)
+        .unwrap()
+        .unwrap()
+        .runtime_configuration;
+    configuration.resources.cpu_max = Some((n(10_000), n(100_000)));
+    f.host
+        .set_runtime_configuration(
+            &f.sandbox,
+            &operation,
+            n(2),
+            configuration,
+            request_digest.clone(),
+            Approval {
+                id: "approve-configure-retry".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    let authorization = f.host.authorize_configuration(&f.sandbox, n(3)).unwrap();
+    let command = authorization.statement.command.clone();
+    f.runtime
+        .admit_configuration(authorization.clone())
+        .unwrap();
+    assert!(matches!(
+        f.runtime
+            .begin_configuration(authorization.clone())
+            .unwrap(),
+        ConfigurationDecision::Perform(_)
+    ));
+    f.runtime
+        .record_configuration_delivery(
+            &command.operation_id,
+            &command.request_digest,
+            Delivery::NotApplied,
+            Some(hash("configuration-not-applied")),
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        f.runtime.begin_configuration(authorization).unwrap(),
+        ConfigurationDecision::Perform(_)
+    ));
+}
+
+#[test]
+fn host_transfer_operations_reconcile_admission_completion_and_cross_kind_identity() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "host-transfer-step".try_into().unwrap();
+    let request = hash("host-transfer-request");
+    let admitted = f
+        .host
+        .admit_transfer_operation(operation.clone(), f.sandbox.clone(), request.clone())
+        .unwrap();
+    assert!(!admitted.applied);
+    assert_eq!(
+        f.host
+            .admit_transfer_operation(operation.clone(), f.sandbox.clone(), request.clone())
+            .unwrap(),
+        admitted
+    );
+    assert!(
+        f.host
+            .admit_transfer_operation(operation.clone(), f.sandbox.clone(), hash("changed"))
+            .is_err()
+    );
+    let completed = f
+        .host
+        .complete_transfer_operation(&operation, &request)
+        .unwrap();
+    assert!(completed.applied);
+    assert_eq!(
+        f.host.operation(&operation).unwrap(),
+        Some(HostOperationRecord::Transfer(completed.clone()))
+    );
+    assert_eq!(
+        f.host
+            .complete_transfer_operation(&operation, &request)
+            .unwrap(),
+        completed
+    );
+
+    let lifecycle_digest = digest(
+        Domain::Operation,
+        &(&f.sandbox, &operation, n(2), DesiredState::Paused),
+    )
+    .unwrap();
+    assert!(
+        f.host
+            .request_lifecycle(
+                &f.sandbox,
+                operation,
+                n(2),
+                DesiredState::Paused,
+                Approval {
+                    id: "approve-transfer-as-lifecycle".try_into().unwrap(),
+                    request_digest: lifecycle_digest,
+                },
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn host_secret_put_operation_is_durable_and_distinct_from_delivery() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "put-secret-version".try_into().unwrap();
+    let request = hash("put-secret-request");
+    let secret = SecretVersion {
+        id: "registry-credential".try_into().unwrap(),
+        version: hash("secret-originals"),
+        bytes: n(16),
+    };
+    let admitted = f
+        .host
+        .admit_secret_put(
+            operation.clone(),
+            request.clone(),
+            secret.clone(),
+            Approval {
+                id: "approve-put-secret".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!admitted.applied);
+    let completed = f
+        .host
+        .complete_secret_put(&operation, &request, &secret)
+        .unwrap();
+    assert!(completed.applied);
+    assert_eq!(
+        f.host.operation(&operation).unwrap(),
+        Some(HostOperationRecord::SecretPut(completed.clone()))
+    );
+    assert_eq!(
+        f.host
+            .admit_secret_put(
+                operation.clone(),
+                request.clone(),
+                secret.clone(),
+                Approval {
+                    id: "ignored-put-secret-retry".try_into().unwrap(),
+                    request_digest: request,
+                },
+            )
+            .unwrap(),
+        completed
+    );
+    assert!(
+        f.host
+            .admit_transfer_operation(operation, f.sandbox, hash("not-a-secret-put"))
             .is_err()
     );
 }
@@ -1269,15 +1799,30 @@ fn admission_reservations_are_transactional_and_no_eviction_occurs() {
     let mut resources = resources();
     resources.vcpus = n(8);
     let image = hash("image");
-    let request_digest =
-        digest(Domain::Sandbox, &(&sandbox, &image, &resources, &operation)).unwrap();
+    let workload = WorkloadConfiguration::default();
+    let request_digest = digest(
+        Domain::Sandbox,
+        &(
+            &sandbox,
+            &image,
+            &resources,
+            &workload,
+            &SandboxLifetime::default(),
+            &operation,
+        ),
+    )
+    .unwrap();
     assert!(
         f.host
             .create_sandbox(
-                sandbox,
-                image,
-                resources,
-                operation.clone(),
+                SandboxAdmission {
+                    id: sandbox,
+                    image,
+                    resources,
+                    workload,
+                    lifetime: SandboxLifetime::default(),
+                    operation: operation.clone(),
+                },
                 Approval {
                     id: "approve-too-large".try_into().unwrap(),
                     request_digest
@@ -1305,7 +1850,11 @@ fn acknowledgement_and_disconnect_never_release_bytes() {
     let mut f = Fixture::new();
     let (receipt, identity) = f.terminal();
     f.runtime
-        .acknowledge_receipt(&f.process, &identity)
+        .acknowledge_receipt(
+            &"acknowledge-receipt".try_into().unwrap(),
+            &f.process,
+            &identity,
+        )
         .unwrap();
     let path = f.root.0.join("runtime");
     drop(f.runtime);
@@ -1316,6 +1865,85 @@ fn acknowledgement_and_disconnect_never_release_bytes() {
     );
     assert_eq!(
         runtime.read_output(&f.process, n(0), 256).unwrap().cursor,
+        n(13)
+    );
+}
+
+#[test]
+fn evidence_mutation_identities_are_exact_retry_safe_and_globally_fenced() {
+    let mut f = Fixture::new();
+    let mut release = f.capture_release();
+    let receipt_digest = release.receipt_digest.clone();
+    let acknowledgement: OperationId = "evidence-operation".try_into().unwrap();
+    f.runtime
+        .acknowledge_receipt(&acknowledgement, &f.process, &receipt_digest)
+        .unwrap();
+    assert_eq!(
+        f.runtime.runtime_operation(&acknowledgement).unwrap(),
+        Some(RuntimeOperationRecord::ReceiptAcknowledgement {
+            operation_id: acknowledgement.clone(),
+            process_id: f.process.clone(),
+            receipt_digest: receipt_digest.clone(),
+        })
+    );
+    f.runtime
+        .acknowledge_receipt(&acknowledgement, &f.process, &receipt_digest)
+        .unwrap();
+    assert!(
+        f.runtime
+            .acknowledge_receipt(&acknowledgement, &f.process, &hash("other-receipt"))
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .pin(
+                &acknowledgement,
+                &f.process,
+                &receipt_digest,
+                "cross-kind-pin".try_into().unwrap(),
+            )
+            .is_err()
+    );
+
+    let pin_operation: OperationId = "pin-operation".try_into().unwrap();
+    let pin: PinId = "retained-output".try_into().unwrap();
+    f.runtime
+        .pin(&pin_operation, &f.process, &receipt_digest, pin.clone())
+        .unwrap();
+    assert_eq!(
+        f.runtime.runtime_operation(&pin_operation).unwrap(),
+        Some(RuntimeOperationRecord::EvidencePin {
+            operation_id: pin_operation.clone(),
+            pin_id: pin.clone(),
+            process_id: f.process.clone(),
+            receipt_digest: receipt_digest.clone(),
+        })
+    );
+    f.runtime
+        .pin(&pin_operation, &f.process, &receipt_digest, pin.clone())
+        .unwrap();
+    assert_eq!(
+        f.runtime.read_pin(&pin, Counter::ZERO, 64).unwrap().cursor,
+        n(13)
+    );
+    assert!(
+        f.runtime
+            .pin(
+                &pin_operation,
+                &f.process,
+                &receipt_digest,
+                "different-pin".try_into().unwrap(),
+            )
+            .is_err()
+    );
+
+    release.operation_id = pin_operation;
+    assert!(f.runtime.release(&f.process, release).is_err());
+    assert_eq!(
+        f.runtime
+            .read_output(&f.process, Counter::ZERO, 64)
+            .unwrap()
+            .cursor,
         n(13)
     );
 }
@@ -1396,6 +2024,14 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
     let request = f.capture_release();
     let status = f.runtime.release(&f.process, request.clone()).unwrap();
     assert!(status.cleanup_pending);
+    assert_eq!(
+        f.runtime.runtime_operation(&request.operation_id).unwrap(),
+        Some(RuntimeOperationRecord::EvidenceRelease {
+            process_id: f.process.clone(),
+            request: request.clone(),
+            status: status.clone(),
+        })
+    );
     assert!(f.root.0.join("runtime/process.output").exists());
     let path = f.root.0.join("runtime");
     drop(f.runtime);
@@ -1447,7 +2083,12 @@ fn continuing_retention_keeps_actual_originals_after_source_release() {
     let mut request = f.capture_release();
     let pin: PinId = "archive-owner".try_into().unwrap();
     f.runtime
-        .pin(&f.process, &request.receipt_digest, pin.clone())
+        .pin(
+            &"pin-archive".try_into().unwrap(),
+            &f.process,
+            &request.receipt_digest,
+            pin.clone(),
+        )
         .unwrap();
     request.disposition = ReleaseDisposition::ContinuingRetention { pin: pin.clone() };
     let status = f.runtime.release(&f.process, request).unwrap();
@@ -1532,7 +2173,12 @@ fn corrupt_output_does_not_rewrite_terminal_truth_or_support_new_pin() {
     );
     assert!(
         f.runtime
-            .pin(&f.process, &receipt.1, "bad-pin".try_into().unwrap())
+            .pin(
+                &"pin-corrupt".try_into().unwrap(),
+                &f.process,
+                &receipt.1,
+                "bad-pin".try_into().unwrap(),
+            )
             .is_err()
     );
 }

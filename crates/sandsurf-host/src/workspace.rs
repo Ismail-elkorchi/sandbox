@@ -513,23 +513,45 @@ impl WorkspaceAuthority {
         if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
             return Err(WorkspaceError::Capacity("upload chunk bound is invalid"));
         }
+        let destination = self.blob_path(&transfer.digest);
+        if destination.exists() {
+            return verify_blob(&destination, &transfer.digest, transfer.length.get());
+        }
         let record = read_json::<UploadRecord>(&self.upload_record_path(&transfer.id))?;
         if &record.sandbox_id != sandbox_id || &record.transfer != transfer {
             return Err(WorkspaceError::Conflict("upload request changed"));
         }
         let mut file = private_file(&self.upload_data_path(&transfer.id), false)?;
-        if file.metadata()?.len() != offset.get()
-            || offset
-                .get()
-                .checked_add(bytes.len() as u64)
-                .is_none_or(|end| end > transfer.length.get())
-        {
+        let end = offset
+            .get()
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= transfer.length.get())
+            .ok_or(WorkspaceError::Conflict(
+                "upload chunk exceeds its declaration",
+            ))?;
+        let existing = file.metadata()?.len();
+        if existing < offset.get() {
             return Err(WorkspaceError::Conflict(
                 "upload chunks must be contiguous and within the declaration",
             ));
         }
-        file.seek(SeekFrom::Start(offset.get()))?;
-        file.write_all(bytes)?;
+        let retained_end = existing.min(end);
+        if retained_end > offset.get() {
+            let retained = (retained_end - offset.get()) as usize;
+            let mut previous = vec![0; retained];
+            file.seek(SeekFrom::Start(offset.get()))?;
+            file.read_exact(&mut previous)?;
+            if previous != bytes[..retained] {
+                return Err(WorkspaceError::Conflict(
+                    "upload retry bytes do not match retained bytes",
+                ));
+            }
+        }
+        if existing < end {
+            let written = existing.saturating_sub(offset.get()) as usize;
+            file.seek(SeekFrom::Start(existing))?;
+            file.write_all(&bytes[written..])?;
+        }
         file.sync_all()?;
         Ok(())
     }
@@ -1557,6 +1579,9 @@ mod tests {
         authority
             .write_upload(&sandbox, &transfer, Counter::ZERO, &bytes[..4])
             .unwrap();
+        authority
+            .write_upload(&sandbox, &transfer, Counter::ZERO, &bytes[..4])
+            .unwrap();
         assert!(
             authority
                 .write_upload(&sandbox, &transfer, Counter::ZERO, &bytes[4..])
@@ -1569,6 +1594,10 @@ mod tests {
                 Counter::try_from(4).unwrap(),
                 &bytes[4..],
             )
+            .unwrap();
+        authority.commit_upload(&sandbox, &transfer).unwrap();
+        authority
+            .write_upload(&sandbox, &transfer, Counter::ZERO, &bytes[..4])
             .unwrap();
         authority.commit_upload(&sandbox, &transfer).unwrap();
         verify_blob(

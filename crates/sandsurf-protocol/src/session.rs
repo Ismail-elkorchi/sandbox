@@ -8,7 +8,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
-const HANDSHAKE_VERSION: u16 = 1;
+const HANDSHAKE_VERSION: u16 = 2;
 const NONCE_BYTES: usize = 32;
 const LABEL_CHALLENGE: &[u8] = b"SANDSURF/GUEST-CHALLENGE/1";
 const LABEL_FINISH: &[u8] = b"SANDSURF/HOST-FINISH/1";

@@ -6,9 +6,12 @@ use std::path::Path;
 
 const SCHEMA: &str = "
 CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
-CREATE TABLE sandboxes(id TEXT PRIMARY KEY, image TEXT NOT NULL, resources TEXT NOT NULL, configuration TEXT NOT NULL, revision INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE sandboxes(id TEXT PRIMARY KEY, image TEXT NOT NULL, resources TEXT NOT NULL, configuration TEXT NOT NULL, workload TEXT NOT NULL, lifetime TEXT NOT NULL, activity INTEGER NOT NULL, revision INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE intents(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE grants(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
+CREATE TABLE grant_operations(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
+CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
+CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
@@ -16,6 +19,7 @@ CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGE
 CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFERENCES images(digest), request_digest TEXT NOT NULL, cleanup_pending INTEGER NOT NULL) STRICT;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), request_digest TEXT NOT NULL, value TEXT NOT NULL, enforced INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE checkpoints(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, sandbox TEXT NOT NULL REFERENCES sandboxes(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage_observations(sandbox TEXT PRIMARY KEY REFERENCES sandboxes(id), epoch INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
@@ -43,11 +47,32 @@ pub struct Approval {
 #[derive(Debug, Clone)]
 pub struct GrantChange {
     pub sandbox_id: SandboxId,
+    pub operation_id: OperationId,
     pub id: GrantId,
     pub expected_revision: Counter,
     pub capability: Capability,
     pub scope_digest: Digest,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostConfigurationOperation {
+    pub operation_id: OperationId,
+    pub sandbox_id: SandboxId,
+    pub request_digest: Digest,
+    pub revision: Counter,
+    pub resources: Resources,
+    pub configuration: RuntimeConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostTransferOperation {
+    pub operation_id: OperationId,
+    pub sandbox_id: SandboxId,
+    pub request_digest: Digest,
+    pub applied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +134,15 @@ pub struct SecretDeliveryRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretPutRecord {
+    pub operation_id: OperationId,
+    pub request_digest: Digest,
+    pub secret: SecretVersion,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretRevocationRecord {
     pub operation_id: OperationId,
     pub sandbox_id: SandboxId,
@@ -138,6 +172,9 @@ pub struct SandboxRecord {
     pub image_digest: Digest,
     pub resources: Resources,
     pub runtime_configuration: RuntimeConfiguration,
+    pub workload_configuration: WorkloadConfiguration,
+    pub lifetime: SandboxLifetime,
+    pub last_activity_unix_millis: Counter,
     pub configuration_revision: Counter,
     pub reservation: ReservationState,
     pub latest_intent: LifecycleIntent,
@@ -150,6 +187,60 @@ pub struct SuspensionRecord {
     pub lifecycle_operation_id: OperationId,
     pub checkpoint_id: CheckpointId,
     pub manifest_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxAdmission {
+    pub id: SandboxId,
+    pub image: Digest,
+    pub resources: Resources,
+    pub workload: WorkloadConfiguration,
+    pub lifetime: SandboxLifetime,
+    pub operation: OperationId,
+}
+
+/// Immutable host-authority result for reconciling a caller operation ID.
+/// Machine observations and workload effects remain in the guardian journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum HostOperationRecord {
+    Lifecycle(LifecycleIntent),
+    Grant {
+        operation_id: OperationId,
+        sandbox_id: SandboxId,
+        request_digest: Digest,
+        grant: Grant,
+    },
+    Configuration(HostConfigurationOperation),
+    Transfer(HostTransferOperation),
+    ImageImport(ImageImportRecord),
+    ImageRelease(ImageReleaseRecord),
+    SecretDelivery(SecretDeliveryRecord),
+    SecretPut(SecretPutRecord),
+    SecretRevocation(SecretRevocationRecord),
+    Checkpoint(Box<Checkpoint>),
+    Rollback(RollbackRecord),
+}
+
+impl HostOperationRecord {
+    pub fn sandbox_id(&self) -> Option<&SandboxId> {
+        match self {
+            Self::Lifecycle(value) => Some(&value.sandbox_id),
+            Self::Grant { sandbox_id, .. } => Some(sandbox_id),
+            Self::Configuration(value) => Some(&value.sandbox_id),
+            Self::Transfer(value) => Some(&value.sandbox_id),
+            Self::SecretDelivery(value) => Some(&value.sandbox_id),
+            Self::SecretRevocation(value) => Some(&value.sandbox_id),
+            Self::Checkpoint(value) => Some(&value.request.sandbox_id),
+            Self::Rollback(value) => Some(&value.sandbox_id),
+            Self::ImageImport(_) | Self::ImageRelease(_) | Self::SecretPut(_) => None,
+        }
+    }
 }
 
 pub struct HostCatalog {
@@ -216,11 +307,259 @@ impl HostCatalog {
         &self.host
     }
 
-    pub fn record_host_approval(&mut self, approval: Approval) -> Result<()> {
+    pub fn operation(&self, operation: &OperationId) -> Result<Option<HostOperationRecord>> {
+        let db = &self.db.connection;
+        let mut result = Vec::new();
+        if let Some(value) = intent(db, operation)? {
+            result.push(HostOperationRecord::Lifecycle(value));
+        }
+        if let Some((sandbox, request_digest, value)) = db
+            .query_row(
+                "SELECT sandbox,request_digest,value FROM grant_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::Grant {
+                operation_id: operation.clone(),
+                sandbox_id: sandbox.try_into()?,
+                request_digest: request_digest.try_into()?,
+                grant: decode(&value)?,
+            });
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM configuration_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::Configuration(decode(&value)?));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM transfer_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::Transfer(decode(&value)?));
+        }
+        if let Some(value) = image_import(db, operation)? {
+            result.push(HostOperationRecord::ImageImport(value));
+        }
+        if let Some(value) = image_release(db, operation)? {
+            result.push(HostOperationRecord::ImageRelease(value));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM secret_deliveries WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::SecretDelivery(decode(&value)?));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM secret_puts WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::SecretPut(decode(&value)?));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM secret_revocations WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::SecretRevocation(decode(&value)?));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM checkpoints WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::Checkpoint(Box::new(decode(&value)?)));
+        }
+        if let Some(value) = db
+            .query_row(
+                "SELECT value FROM rollbacks WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            result.push(HostOperationRecord::Rollback(decode(&value)?));
+        }
+        match result.len() {
+            0 => Ok(None),
+            1 => Ok(result.pop()),
+            _ => Err(Error::Corrupt(
+                "host operation identity is bound to multiple authorities",
+            )),
+        }
+    }
+
+    pub fn admit_transfer_operation(
+        &mut self,
+        operation_id: OperationId,
+        sandbox_id: SandboxId,
+        request_digest: Digest,
+    ) -> Result<HostTransferOperation> {
         let tx = self.db.connection.transaction()?;
-        record_approval(&tx, &approval, self.limits.operations)?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT value FROM transfer_operations WHERE id=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: HostTransferOperation = decode(&raw)?;
+            return if old.sandbox_id == sandbox_id && old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("transfer operation identity conflict"))
+            };
+        }
+        host_operation_identity_available(&tx, &operation_id)?;
+        capacity(&tx, "transfer_operations", self.limits.operations)?;
+        let value = HostTransferOperation {
+            operation_id,
+            sandbox_id,
+            request_digest,
+            applied: false,
+        };
+        tx.execute(
+            "INSERT INTO transfer_operations VALUES (?1,?2,?3,?4)",
+            params![
+                value.operation_id.as_str(),
+                value.sandbox_id.as_str(),
+                value.request_digest.as_str(),
+                encode(&value)?
+            ],
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(value)
+    }
+
+    pub fn complete_transfer_operation(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<HostTransferOperation> {
+        let tx = self.db.connection.transaction()?;
+        let raw: String = tx.query_row(
+            "SELECT value FROM transfer_operations WHERE id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut value: HostTransferOperation = decode(&raw)?;
+        if value.request_digest != *request_digest {
+            return Err(Error::Conflict("transfer request digest changed"));
+        }
+        if !value.applied {
+            value.applied = true;
+            tx.execute(
+                "UPDATE transfer_operations SET value=?2 WHERE id=?1",
+                params![operation_id.as_str(), encode(&value)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn admit_secret_put(
+        &mut self,
+        operation_id: OperationId,
+        request_digest: Digest,
+        secret: SecretVersion,
+        approval: Approval,
+    ) -> Result<SecretPutRecord> {
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("secret put approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT value FROM secret_puts WHERE operation=?1",
+                [operation_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: SecretPutRecord = decode(&raw)?;
+            return if old.request_digest == request_digest && old.secret == secret {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("secret put operation identity conflict"))
+            };
+        }
+        host_operation_identity_available(&tx, &operation_id)?;
+        capacity(&tx, "secret_puts", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let value = SecretPutRecord {
+            operation_id,
+            request_digest,
+            secret,
+            applied: false,
+        };
+        tx.execute(
+            "INSERT INTO secret_puts VALUES (?1,?2,?3)",
+            params![
+                value.operation_id.as_str(),
+                value.request_digest.as_str(),
+                encode(&value)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn complete_secret_put(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+        secret: &SecretVersion,
+    ) -> Result<SecretPutRecord> {
+        let tx = self.db.connection.transaction()?;
+        let raw: String = tx.query_row(
+            "SELECT value FROM secret_puts WHERE operation=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let mut value: SecretPutRecord = decode(&raw)?;
+        if value.request_digest != *request_digest || value.secret != *secret {
+            return Err(Error::Conflict("secret put completion changed"));
+        }
+        if !value.applied {
+            value.applied = true;
+            tx.execute(
+                "UPDATE secret_puts SET value=?2 WHERE operation=?1",
+                params![operation_id.as_str(), encode(&value)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(value)
     }
 
     pub fn admit_secret_delivery(
@@ -249,6 +588,7 @@ impl HostCatalog {
                 "secret delivery operation identity conflict",
             ));
         }
+        host_operation_identity_available(&tx, &record.operation_id)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         tx.execute(
             "INSERT INTO secret_deliveries(operation,sandbox,request_digest,value) VALUES (?1,?2,?3,?4)",
@@ -339,6 +679,7 @@ impl HostCatalog {
                 ))
             };
         }
+        host_operation_identity_available(&tx, &request.operation_id)?;
         require_revision(&tx, &request.sandbox_id, request.expected_revision)?;
         let mut statement = tx.prepare(
             "SELECT operation,value FROM secret_deliveries WHERE sandbox=?1 ORDER BY rowid ASC",
@@ -494,6 +835,7 @@ impl HostCatalog {
                 Err(Error::Conflict("image import operation identity conflict"))
             };
         }
+        host_operation_identity_available(&tx, &operation_id)?;
         capacity(&tx, "image_imports", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let value = ImageImportRecord {
@@ -634,6 +976,7 @@ impl HostCatalog {
                 Err(Error::Conflict("image release operation identity conflict"))
             };
         }
+        host_operation_identity_available(&tx, &operation_id)?;
         let (_, retired, _) =
             image_state(&tx, &image_digest)?.ok_or(Error::Missing("image does not exist"))?;
         if retired {
@@ -876,14 +1219,7 @@ impl HostCatalog {
                 Err(Error::Conflict("checkpoint identity conflict"))
             };
         }
-        let operation_used: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE operation=?1 UNION ALL SELECT 1 FROM intents WHERE id=?1 UNION ALL SELECT 1 FROM rollbacks WHERE operation=?1)",
-            [request.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if operation_used {
-            return Err(Error::Conflict("checkpoint operation identity conflict"));
-        }
+        host_operation_identity_available(&tx, &request.operation_id)?;
         require_revision(&tx, &request.sandbox_id, request.expected_revision)?;
         if let Some(parent) = request.parent.as_ref() {
             let parent = checkpoint_record(&tx, parent)?
@@ -963,16 +1299,7 @@ impl HostCatalog {
                 "suspension checkpoint does not match its lifecycle intent",
             ));
         }
-        let operation_used: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE operation=?1 UNION ALL SELECT 1 FROM intents WHERE id=?1 UNION ALL SELECT 1 FROM rollbacks WHERE operation=?1)",
-            [request.operation_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if operation_used {
-            return Err(Error::Conflict(
-                "suspension checkpoint operation identity conflict",
-            ));
-        }
+        host_operation_identity_available(&tx, &request.operation_id)?;
         let sandbox = sandbox_record(&tx, &request.sandbox_id)?
             .ok_or(Error::Missing("suspension sandbox is missing"))?;
         if sandbox.configuration_revision != lifecycle.revision {
@@ -1149,14 +1476,24 @@ impl HostCatalog {
 
     pub fn create_sandbox(
         &mut self,
-        id: SandboxId,
-        image: Digest,
-        resources: Resources,
-        operation: OperationId,
+        admission: SandboxAdmission,
         approval: Approval,
     ) -> Result<LifecycleIntent> {
+        let SandboxAdmission {
+            id,
+            image,
+            resources,
+            workload,
+            lifetime,
+            operation,
+        } = admission;
         resources.validate()?;
-        let request = digest(Domain::Sandbox, &(&id, &image, &resources, &operation))?;
+        workload.validate()?;
+        lifetime.validate()?;
+        let request = digest(
+            Domain::Sandbox,
+            &(&id, &image, &resources, &workload, &lifetime, &operation),
+        )?;
         if request != approval.request_digest {
             return Err(Error::Conflict(
                 "creation approval does not bind the exact request",
@@ -1171,6 +1508,7 @@ impl HostCatalog {
                 "operation identity already bound to another request",
             ));
         }
+        host_operation_identity_available(&tx, &operation)?;
         capacity(&tx, "sandboxes", self.limits.identities)?;
         capacity(&tx, "intents", self.limits.operations)?;
         if image_state(&tx, &image)?.is_some_and(|(_, retired, _)| retired) {
@@ -1189,13 +1527,17 @@ impl HostCatalog {
         }
         record_approval(&tx, &approval, self.limits.operations)?;
         let runtime_configuration = initial_runtime_configuration(&resources)?;
+        let activity = current_unix_millis()?;
         tx.execute(
-            "INSERT INTO sandboxes(id,image,resources,configuration,revision) VALUES (?1,?2,?3,?4,1)",
+            "INSERT INTO sandboxes(id,image,resources,configuration,workload,lifetime,activity,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,1)",
             params![
                 id.as_str(),
                 image.as_str(),
                 encode(&resources)?,
-                encode(&runtime_configuration)?
+                encode(&runtime_configuration)?,
+                encode(&workload)?,
+                encode(&lifetime)?,
+                activity.get()
             ],
         )?;
         let value = LifecycleIntent {
@@ -1216,10 +1558,12 @@ impl HostCatalog {
         id: SandboxId,
         checkpoint_id: &CheckpointId,
         resources: Resources,
+        lifetime: SandboxLifetime,
         operation: OperationId,
         approval: Approval,
     ) -> Result<LifecycleIntent> {
         resources.validate()?;
+        lifetime.validate()?;
         let request = digest(
             Domain::Checkpoint,
             &(
@@ -1227,6 +1571,7 @@ impl HostCatalog {
                 checkpoint_id,
                 &id,
                 &resources,
+                &lifetime,
                 &operation,
             ),
         )?;
@@ -1241,6 +1586,7 @@ impl HostCatalog {
                 Err(Error::Conflict("fork operation identity conflict"))
             };
         }
+        host_operation_identity_available(&tx, &operation)?;
         let checkpoint = checkpoint_record(&tx, checkpoint_id)?
             .ok_or(Error::Missing("fork checkpoint is missing"))?;
         if checkpoint.phase != CheckpointPhase::Ready
@@ -1264,13 +1610,22 @@ impl HostCatalog {
         }
         record_approval(&tx, &approval, self.limits.operations)?;
         let configuration = initial_runtime_configuration(&resources)?;
+        let source_workload: String = tx.query_row(
+            "SELECT workload FROM sandboxes WHERE id=?1",
+            [checkpoint.request.sandbox_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let activity = current_unix_millis()?;
         tx.execute(
-            "INSERT INTO sandboxes(id,image,resources,configuration,revision) VALUES (?1,?2,?3,?4,1)",
+            "INSERT INTO sandboxes(id,image,resources,configuration,workload,lifetime,activity,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,1)",
             params![
                 id.as_str(),
                 checkpoint.image_digest.as_str(),
                 encode(&resources)?,
-                encode(&configuration)?
+                encode(&configuration)?,
+                source_workload,
+                encode(&lifetime)?,
+                activity.get()
             ],
         )?;
         let value = LifecycleIntent {
@@ -1323,6 +1678,7 @@ impl HostCatalog {
                 Err(Error::Conflict("rollback operation identity conflict"))
             };
         }
+        host_operation_identity_available(&tx, &operation_id)?;
         require_revision(&tx, sandbox, expected_revision)?;
         let source = checkpoint_record(&tx, checkpoint_id)?
             .ok_or(Error::Missing("rollback checkpoint is missing"))?;
@@ -1410,7 +1766,18 @@ impl HostCatalog {
             }
             return Err(Error::Conflict("operation identity conflict"));
         }
+        host_operation_identity_available(&tx, &operation)?;
         require_revision(&tx, sandbox, expected)?;
+        let latest: String = tx.query_row(
+            "SELECT value FROM intents WHERE sandbox=?1 ORDER BY rowid DESC LIMIT 1",
+            [sandbox.as_str()],
+            |row| row.get(0),
+        )?;
+        if decode::<LifecycleIntent>(&latest)?.completion.is_none() {
+            return Err(Error::Conflict(
+                "a new lifecycle intent cannot overtake an incomplete intent",
+            ));
+        }
         capacity(&tx, "intents", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let revision = expected.next()?;
@@ -1499,32 +1866,62 @@ impl HostCatalog {
         operation: &OperationId,
         expected: Counter,
         configuration: RuntimeConfiguration,
+        request: Digest,
         approval: Approval,
-    ) -> Result<Counter> {
+    ) -> Result<HostConfigurationOperation> {
         configuration.validate()?;
-        let request = digest(
-            Domain::Grant,
-            &(
-                "sandsurf-runtime-configuration-v1",
-                sandbox,
-                operation,
-                expected,
-                &configuration,
-            ),
-        )?;
         if request != approval.request_digest {
             return Err(Error::Conflict("runtime configuration approval mismatch"));
         }
         let tx = self.db.connection.transaction()?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT value FROM configuration_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: HostConfigurationOperation = decode(&raw)?;
+            return if old.sandbox_id == *sandbox && old.request_digest == request {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("configuration operation identity conflict"))
+            };
+        }
+        host_operation_identity_available(&tx, operation)?;
         require_revision(&tx, sandbox, expected)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let revision = expected.next()?;
+        let resources: String = tx.query_row(
+            "SELECT resources FROM sandboxes WHERE id=?1",
+            [sandbox.as_str()],
+            |row| row.get(0),
+        )?;
         tx.execute(
             "UPDATE sandboxes SET configuration=?2,revision=?3 WHERE id=?1",
             params![sandbox.as_str(), encode(&configuration)?, revision.get()],
         )?;
+        let value = HostConfigurationOperation {
+            operation_id: operation.clone(),
+            sandbox_id: sandbox.clone(),
+            request_digest: request,
+            revision,
+            resources: decode(&resources)?,
+            configuration,
+        };
+        capacity(&tx, "configuration_operations", self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO configuration_operations VALUES (?1,?2,?3,?4)",
+            params![
+                operation.as_str(),
+                sandbox.as_str(),
+                value.request_digest.as_str(),
+                encode(&value)?
+            ],
+        )?;
         tx.commit()?;
-        Ok(revision)
+        Ok(value)
     }
 
     /// Increase live-qualified reservations and workload cgroup ceilings. VM
@@ -1537,29 +1934,9 @@ impl HostCatalog {
         resources: Resources,
         live: LiveResourceLimits,
         approval: Approval,
-    ) -> Result<Counter> {
+    ) -> Result<HostConfigurationOperation> {
         resources.validate()?;
         live.validate()?;
-        let old = self
-            .sandbox(sandbox)?
-            .ok_or(Error::Missing("sandbox is missing"))?;
-        let memory_bytes = resources
-            .memory_mib
-            .get()
-            .checked_mul(1024 * 1024)
-            .ok_or(Error::Capacity("memory reservation overflow"))?;
-        if resources.vcpus != old.resources.vcpus
-            || resources.memory_mib != old.resources.memory_mib
-            || resources.disk_bytes < old.resources.disk_bytes
-            || resources.output_bytes < old.resources.output_bytes
-            || resources.processes < old.resources.processes
-            || live.workload_memory_bytes.get() > memory_bytes
-            || live.workload_processes > resources.processes
-        {
-            return Err(Error::Conflict(
-                "live update changes boot shape, shrinks a reservation, or exceeds its envelope",
-            ));
-        }
         let request = digest(
             Domain::Grant,
             &(
@@ -1574,7 +1951,41 @@ impl HostCatalog {
         if approval.request_digest != request {
             return Err(Error::Conflict("resource update approval mismatch"));
         }
+        if let Some(raw) = self
+            .db
+            .connection
+            .query_row(
+                "SELECT value FROM configuration_operations WHERE id=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let old: HostConfigurationOperation = decode(&raw)?;
+            return if old.sandbox_id == *sandbox && old.request_digest == request {
+                Ok(old)
+            } else {
+                Err(Error::Conflict("configuration operation identity conflict"))
+            };
+        }
+        let old = self
+            .sandbox(sandbox)?
+            .ok_or(Error::Missing("sandbox is missing"))?;
+        let memory_bytes = resources
+            .memory_mib
+            .get()
+            .checked_mul(1024 * 1024)
+            .ok_or(Error::Capacity("memory reservation overflow"))?;
+        if resources != old.resources
+            || live.workload_memory_bytes.get() > memory_bytes
+            || live.workload_processes > resources.processes
+        {
+            return Err(Error::Conflict(
+                "live update changes the reserved machine envelope or exceeds it",
+            ));
+        }
         let tx = self.db.connection.transaction()?;
+        host_operation_identity_available(&tx, operation)?;
         require_revision(&tx, sandbox, expected)?;
         let mut total = resources.clone();
         {
@@ -1605,8 +2016,26 @@ impl HostCatalog {
                 revision.get()
             ],
         )?;
+        let value = HostConfigurationOperation {
+            operation_id: operation.clone(),
+            sandbox_id: sandbox.clone(),
+            request_digest: request,
+            revision,
+            resources,
+            configuration,
+        };
+        capacity(&tx, "configuration_operations", self.limits.operations)?;
+        tx.execute(
+            "INSERT INTO configuration_operations VALUES (?1,?2,?3,?4)",
+            params![
+                operation.as_str(),
+                sandbox.as_str(),
+                value.request_digest.as_str(),
+                encode(&value)?
+            ],
+        )?;
         tx.commit()?;
-        Ok(revision)
+        Ok(value)
     }
 
     /// Called with evidence read from the exclusively owned guardian journal, not client observations.
@@ -1695,9 +2124,23 @@ impl HostCatalog {
         revision(&self.db.connection, sandbox)
     }
 
+    /// Record host-observed application activity monotonically. This is an
+    /// input to an admitted idle policy, never machine-state evidence.
+    pub fn observe_activity(&mut self, sandbox: &SandboxId, at: Counter) -> Result<()> {
+        let changed = self.db.connection.execute(
+            "UPDATE sandboxes SET activity=max(activity,?2) WHERE id=?1 AND released=0",
+            params![sandbox.as_str(), at.get()],
+        )?;
+        if changed != 1 {
+            return Err(Error::Missing("active sandbox is missing"));
+        }
+        Ok(())
+    }
+
     pub fn set_grant(&mut self, change: GrantChange, approval: Approval) -> Result<Grant> {
         let GrantChange {
             sandbox_id,
+            operation_id,
             id,
             expected_revision: expected,
             capability,
@@ -1707,27 +2150,38 @@ impl HostCatalog {
         let sandbox = &sandbox_id;
         let request = digest(
             Domain::Grant,
-            &(sandbox, &id, expected, capability, &scope, revoked),
+            &(
+                "sandsurf-grant-change-v1",
+                sandbox,
+                &operation_id,
+                &id,
+                expected,
+                capability,
+                &scope,
+                revoked,
+            ),
         )?;
         if approval.request_digest != request {
             return Err(Error::Conflict("grant approval mismatch"));
         }
         let tx = self.db.connection.transaction()?;
-        if let Some(old_digest) = tx
+        if let Some((old_digest, old_value)) = tx
             .query_row(
-                "SELECT digest FROM approvals WHERE id=?1",
-                [approval.id.as_str()],
-                |r| r.get::<_, String>(0),
+                "SELECT request_digest,value FROM grant_operations WHERE id=?1",
+                [operation_id.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?
         {
             if old_digest != request.as_str() {
-                return Err(Error::Conflict("approval identity conflict"));
+                return Err(Error::Conflict("grant operation identity conflict"));
             }
-            // A retry is observation, never reinstalling a prior revision after revocation.
-            let old = get_grant(&tx, &id)?.ok_or(Error::Corrupt("approved grant is missing"))?;
-            return Ok(old);
+            // The operation result is immutable historical evidence. Returning
+            // it does not reinstall that revision or override the current
+            // host-owned grant row.
+            return decode(&old_value);
         }
+        host_operation_identity_available(&tx, &operation_id)?;
         require_revision(&tx, sandbox, expected)?;
         if let Some(old) = get_grant(&tx, &id)? {
             if old.sandbox_id != *sandbox
@@ -1758,6 +2212,15 @@ impl HostCatalog {
         };
         tx.execute("INSERT INTO grants VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET value=excluded.value", params![value.id.as_str(), sandbox.as_str(), encode(&value)?])?;
         tx.execute(
+            "INSERT INTO grant_operations VALUES (?1,?2,?3,?4)",
+            params![
+                operation_id.as_str(),
+                sandbox.as_str(),
+                request.as_str(),
+                encode(&value)?
+            ],
+        )?;
+        tx.execute(
             "UPDATE sandboxes SET revision=?2 WHERE id=?1",
             params![sandbox.as_str(), next.get()],
         )?;
@@ -1767,6 +2230,33 @@ impl HostCatalog {
 
     pub fn grant(&self, id: &GrantId) -> Result<Option<Grant>> {
         get_grant(&self.db.connection, id)
+    }
+
+    /// Read host-owned grant observations for one Sandbox. Callers may cache
+    /// these values with their revisions, but cannot use that cache to mutate
+    /// or restore authority.
+    pub fn grants(
+        &self,
+        sandbox: &SandboxId,
+        after: Option<&GrantId>,
+        limit: Counter,
+    ) -> Result<Vec<Grant>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("grant page limit must be in 1..=256"));
+        }
+        if self.sandbox(sandbox)?.is_none() {
+            return Err(Error::Missing("sandbox is missing"));
+        }
+        let after = after.map_or("", GrantId::as_str);
+        let mut statement = self.db.connection.prepare(
+            "SELECT value FROM grants WHERE sandbox=?1 AND id>?2 ORDER BY id ASC LIMIT ?3",
+        )?;
+        statement
+            .query_map(params![sandbox.as_str(), after, limit.get()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|value| decode(&value?))
+            .collect()
     }
 
     /// Validate an application precondition against the host's authoritative
@@ -2084,20 +2574,25 @@ fn add_observed(total: Counter, current: Counter, previous: Counter) -> Result<C
 fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Option<SandboxRecord>> {
     let row = db
         .query_row(
-            "SELECT image,resources,configuration,revision,released FROM sandboxes WHERE id=?1",
+            "SELECT image,resources,configuration,workload,lifetime,activity,revision,released FROM sandboxes WHERE id=?1",
             [sandbox.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((image, resources, configuration, revision, released)) = row else {
+    let Some((image, resources, configuration, workload, lifetime, activity, revision, released)) =
+        row
+    else {
         return Ok(None);
     };
     let latest: String = db.query_row(
@@ -2115,6 +2610,9 @@ fn sandbox_record(db: &rusqlite::Connection, sandbox: &SandboxId) -> Result<Opti
         image_digest: image.try_into()?,
         resources: decode(&resources)?,
         runtime_configuration: decode(&configuration)?,
+        workload_configuration: decode(&workload)?,
+        lifetime: decode(&lifetime)?,
+        last_activity_unix_millis: activity.try_into()?,
         configuration_revision: revision.try_into()?,
         reservation,
         latest_intent: decode(&latest)?,
@@ -2204,6 +2702,34 @@ fn get_grant(db: &rusqlite::Connection, id: &GrantId) -> Result<Option<Grant>> {
     .optional()?
     .map(|s| decode(&s))
     .transpose()
+}
+
+fn host_operation_identity_available(
+    db: &rusqlite::Connection,
+    operation: &OperationId,
+) -> Result<()> {
+    let used: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM intents WHERE id=?1) OR EXISTS(SELECT 1 FROM grant_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM transfer_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM image_imports WHERE operation=?1) OR EXISTS(SELECT 1 FROM image_releases WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_puts WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_deliveries WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_revocations WHERE operation=?1) OR EXISTS(SELECT 1 FROM checkpoints WHERE operation=?1) OR EXISTS(SELECT 1 FROM rollbacks WHERE operation=?1)",
+        [operation.as_str()],
+        |row| row.get(0),
+    )?;
+    if used {
+        Err(Error::Conflict(
+            "host operation identity already belongs to another operation",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn current_unix_millis() -> Result<Counter> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| Error::Conflict("host wall clock is before the Unix epoch"))?
+        .as_millis();
+    let millis = u64::try_from(millis)
+        .map_err(|_| Error::Capacity("host wall clock exceeds the counter range"))?;
+    millis.try_into().map_err(Error::from)
 }
 
 fn image_record(db: &rusqlite::Connection, digest: &Digest) -> Result<Option<ImageRecord>> {

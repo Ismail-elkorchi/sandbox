@@ -338,6 +338,7 @@ impl PersistentWorkloadService {
             ),
             GuestServiceRequest::ApplyResources { resources } => self.apply_resources(resources),
             GuestServiceRequest::ResourceUsage => self.resource_usage(),
+            GuestServiceRequest::FilesystemQuery { request } => self.filesystem_query(request),
             GuestServiceRequest::Dispatch {
                 mutation,
                 capability,
@@ -1046,6 +1047,60 @@ impl PersistentWorkloadService {
         )
     }
 
+    fn filesystem_query(&self, request: FilesystemRequest) -> ServiceResult<GuestServiceResponse> {
+        if !request.is_query() || request.validate().is_err() {
+            return Err(("request.invalid", "filesystem query is malformed".into()).into());
+        }
+        let response = match request {
+            FilesystemRequest::Stat { path, follow } => {
+                let value = if follow {
+                    self.filesystem.stat_path(&path)
+                } else {
+                    self.filesystem.lstat_path(&path)
+                }?;
+                FilesystemResponse::Stat { value }
+            }
+            FilesystemRequest::List {
+                path,
+                after,
+                maximum,
+            } => FilesystemResponse::List {
+                page: self
+                    .filesystem
+                    .list_page(&path, after.as_deref(), maximum.into())?,
+            },
+            FilesystemRequest::Read {
+                path,
+                offset,
+                maximum,
+            } => FilesystemResponse::Read {
+                range: self
+                    .filesystem
+                    .read_range(&path, offset, maximum as usize)?,
+            },
+            FilesystemRequest::Readlink { path } => FilesystemResponse::Link {
+                target: self.filesystem.read_link_path(&path)?,
+            },
+            FilesystemRequest::PollWatch {
+                watcher_id,
+                epoch,
+                maximum,
+            } => FilesystemResponse::Watch {
+                events: self
+                    .filesystem
+                    .poll_watcher(&watcher_id, epoch, maximum.into())?,
+            },
+            _ => {
+                return Err((
+                    "request.invalid",
+                    "filesystem mutation cannot use the query route".into(),
+                )
+                    .into());
+            }
+        };
+        Ok(GuestServiceResponse::File { response })
+    }
+
     fn reconcile(
         &self,
         operation_id: &OperationId,
@@ -1340,6 +1395,12 @@ impl From<FilesystemError> for ServiceFailure {
             FilesystemError::Conflict => "filesystem.conflict",
             FilesystemError::Capacity => "filesystem.capacity",
             FilesystemError::Barrier => "filesystem.barrier",
+            FilesystemError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+                "filesystem.missing"
+            }
+            FilesystemError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                "filesystem.permission"
+            }
             FilesystemError::Io(_) => "filesystem.io",
         };
         Self {
@@ -1360,6 +1421,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn filesystem_missing_is_distinct_from_other_io_failures() {
+        let missing = ServiceFailure::from(FilesystemError::Io(io::Error::from(
+            io::ErrorKind::NotFound,
+        )));
+        let denied = ServiceFailure::from(FilesystemError::Io(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(missing.code, "filesystem.missing");
+        assert_eq!(denied.code, "filesystem.permission");
+    }
 
     struct Temp(PathBuf);
     impl Temp {
@@ -1392,7 +1465,8 @@ mod tests {
             stdio: StdioMode::Pipes,
             terminal_size: None,
             lifetime: ProcessLifetime::Job,
-            deadline_millis: None,
+            active_deadline_millis: None,
+            elapsed_deadline_unix_millis: None,
             output_bytes: Counter::try_from(1024 * 1024).unwrap(),
         }
     }

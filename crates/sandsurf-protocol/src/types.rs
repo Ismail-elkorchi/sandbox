@@ -609,10 +609,12 @@ pub enum RuntimeRequest {
         maximum: u32,
     },
     AcknowledgeReceipt {
+        operation_id: OperationId,
         process_id: ProcessId,
         receipt_digest: Digest,
     },
     Pin {
+        operation_id: OperationId,
         process_id: ProcessId,
         receipt_digest: Digest,
         pin_id: PinId,
@@ -727,7 +729,7 @@ pub enum RuntimeResponse {
         processes: Vec<Observation<crate::ProcessSnapshot>>,
     },
     Operation {
-        operation: Option<Operation>,
+        operation: Option<RuntimeOperationRecord>,
     },
     Receipt {
         receipt: Option<Receipt>,
@@ -740,6 +742,38 @@ pub enum RuntimeResponse {
         status: ReleaseStatus,
     },
     Complete,
+}
+
+/// Immutable guardian-owned mutation history. These records support
+/// reconciliation only; acknowledgement is not acceptance and none of the
+/// evidence variants delegate the grant that originally admitted them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RuntimeOperationRecord {
+    Workload {
+        operation: Operation,
+    },
+    ReceiptAcknowledgement {
+        operation_id: OperationId,
+        process_id: ProcessId,
+        receipt_digest: Digest,
+    },
+    EvidencePin {
+        operation_id: OperationId,
+        pin_id: PinId,
+        process_id: ProcessId,
+        receipt_digest: Digest,
+    },
+    EvidenceRelease {
+        process_id: ProcessId,
+        request: ReleaseRequest,
+        status: ReleaseStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,7 +909,12 @@ pub struct SpawnRequest {
     /// Elapsed workload time after which the supervisor terminates this
     /// process group. This is part of execution semantics, not a client wait
     /// timeout, and therefore survives client disconnects.
-    pub deadline_millis: Option<Counter>,
+    /// Relative workload-active deadline. This guest-owned countdown does not
+    /// advance while the VM is paused or suspended.
+    pub active_deadline_millis: Option<Counter>,
+    /// Absolute host wall-clock boundary. This advances while paused and is
+    /// rechecked against Unix time when the workload resumes.
+    pub elapsed_deadline_unix_millis: Option<Counter>,
     pub output_bytes: Counter,
 }
 
@@ -995,11 +1034,19 @@ impl SpawnRequest {
             return Err(Invalid("process output reservation must be positive"));
         }
         if self
-            .deadline_millis
+            .active_deadline_millis
             .is_some_and(|value| value == Counter::ZERO || value.get() > 30 * 24 * 60 * 60 * 1000)
         {
             return Err(Invalid(
-                "process deadline must be positive and no more than 30 days",
+                "active process deadline must be positive and no more than 30 days",
+            ));
+        }
+        if self
+            .elapsed_deadline_unix_millis
+            .is_some_and(|value| value == Counter::ZERO)
+        {
+            return Err(Invalid(
+                "elapsed process deadline must be a positive Unix time",
             ));
         }
         Ok(())
@@ -1145,6 +1192,7 @@ pub enum ReleaseDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseRequest {
+    pub operation_id: OperationId,
     pub receipt_digest: Digest,
     /// The initial API releases the whole receipt's output, not selected ranges.
     pub output: OutputBoundary,

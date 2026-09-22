@@ -335,8 +335,11 @@ impl ProcessSupervisor {
             readers.push(start_reader(Arc::clone(&entry), reader, stream));
         }
         start_waiter(Arc::clone(&entry), spawned.child, readers);
-        if let Some(deadline) = request.deadline_millis {
+        if let Some(deadline) = request.active_deadline_millis {
             start_deadline(Arc::clone(&entry), Duration::from_millis(deadline.get()));
+        }
+        if let Some(deadline) = request.elapsed_deadline_unix_millis {
+            start_elapsed_deadline(Arc::clone(&entry), deadline);
         }
         entry.snapshot()
     }
@@ -1302,17 +1305,56 @@ fn start_deadline(entry: Arc<ProcessEntry>, deadline: Duration) {
         if !timeout.timed_out() || !matches!(*state, ProcessState::Running) {
             return;
         }
-        entry.deadline_exceeded.store(true, Ordering::Release);
         drop(state);
-        let _ = send_group_signal(entry.group, libc::SIGTERM);
-        let grace_deadline = Instant::now() + DEADLINE_TERMINATION_GRACE;
-        while entry.owned_processes_exist() && Instant::now() < grace_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if entry.owned_processes_exist() {
-            entry.kill_owned();
+        expire_deadline(&entry);
+    });
+}
+
+fn start_elapsed_deadline(entry: Arc<ProcessEntry>, deadline: Counter) {
+    std::thread::spawn(move || {
+        loop {
+            let Ok(state) = entry.state.lock() else {
+                return;
+            };
+            if !matches!(*state, ProcessState::Running) {
+                return;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|value| u64::try_from(value.as_millis()).ok());
+            let Some(now) = now else {
+                return;
+            };
+            if now >= deadline.get() {
+                drop(state);
+                expire_deadline(&entry);
+                return;
+            }
+            // Recheck wall time periodically so clock adjustment and a VM
+            // pause/resume cannot turn the absolute boundary into a relative
+            // guest timer.
+            let wait = Duration::from_millis((deadline.get() - now).min(1_000));
+            let Ok((next, _)) = entry.changed.wait_timeout(state, wait) else {
+                return;
+            };
+            drop(next);
         }
     });
+}
+
+fn expire_deadline(entry: &Arc<ProcessEntry>) {
+    if entry.deadline_exceeded.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = send_group_signal(entry.group, libc::SIGTERM);
+    let grace_deadline = Instant::now() + DEADLINE_TERMINATION_GRACE;
+    while entry.owned_processes_exist() && Instant::now() < grace_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if entry.owned_processes_exist() {
+        entry.kill_owned();
+    }
 }
 
 fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<()>>) {
@@ -1656,7 +1698,8 @@ mod tests {
                 pixel_height: 0,
             }),
             lifetime: ProcessLifetime::Job,
-            deadline_millis: None,
+            active_deadline_millis: None,
+            elapsed_deadline_unix_millis: None,
             output_bytes: (1024 * 1024u64).try_into().unwrap(),
         }
     }
@@ -1799,7 +1842,7 @@ mod tests {
         let timed = ProcessId::try_from("timed").unwrap();
         let sibling = ProcessId::try_from("sibling").unwrap();
         let mut timed_request = request("timed", "sleep 30", StdioMode::Pipes);
-        timed_request.deadline_millis = Some(Counter::try_from(30).unwrap());
+        timed_request.active_deadline_millis = Some(Counter::try_from(30).unwrap());
         supervisor.spawn(timed_request).unwrap();
         supervisor
             .spawn(request("sibling", "sleep 0.2", StdioMode::Pipes))
@@ -1815,6 +1858,27 @@ mod tests {
         supervisor
             .wait(&sibling, Some(Duration::from_secs(5)))
             .unwrap();
+    }
+
+    #[test]
+    fn elapsed_deadline_uses_an_absolute_wall_clock_boundary() {
+        let root = Temp::new();
+        let supervisor =
+            ProcessSupervisor::create(&root.0, SandboxId::try_from("box").unwrap(), Counter::ONE)
+                .unwrap();
+        let process = ProcessId::try_from("elapsed").unwrap();
+        let mut request = request("elapsed", "sleep 30", StdioMode::Pipes);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        request.elapsed_deadline_unix_millis =
+            Some(Counter::try_from(u64::try_from(now + 30).unwrap()).unwrap());
+        supervisor.spawn(request).unwrap();
+        let completion = supervisor
+            .wait(&process, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(completion.outcome, ProcessOutcome::DeadlineExceeded);
     }
 
     #[test]

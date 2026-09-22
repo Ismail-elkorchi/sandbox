@@ -2,14 +2,17 @@ use sandsurf_protocol::{
     Capability, Checkpoint, CheckpointId, CheckpointRequest, CommitmentId, Counter, Digest, Grant,
     GrantId, GuestServiceRequest, GuestServiceResponse, LifecycleIntent, LifecycleOperation,
     MachineObservation, Observation, Operation, OperationId, PinId, ProcessId, Qualification,
-    ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, TransferId, VmEngine,
+    ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, SandboxLifetime,
+    TransferId, VmEngine, WorkloadConfiguration,
 };
-use sandsurf_state::{ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord};
+use sandsurf_state::{
+    HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 1;
+pub const HOST_API_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -75,6 +78,8 @@ pub struct SandboxView {
     pub lifecycle_intent: LifecycleIntent,
     pub machine: Observation<MachineObservation>,
     pub workload_defaults: WorkloadDefaultsView,
+    pub lifetime: SandboxLifetime,
+    pub last_activity_unix_millis: Counter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +177,18 @@ pub enum HostRequest {
     GetSandbox {
         sandbox_id: SandboxId,
     },
+    GetHostOperation {
+        operation_id: OperationId,
+    },
+    ListGrants {
+        sandbox_id: SandboxId,
+        after: Option<GrantId>,
+        maximum: Counter,
+    },
+    GetGrant {
+        sandbox_id: SandboxId,
+        grant_id: GrantId,
+    },
     ListImages {
         after: Option<Digest>,
         maximum: Counter,
@@ -236,6 +253,7 @@ pub enum HostRequest {
     },
     BeginHostBlob {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         expected_revision: Counter,
         scope_digest: Digest,
         transfer: HostBlobTransfer,
@@ -243,6 +261,7 @@ pub enum HostRequest {
     },
     WriteHostBlob {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         expected_revision: Counter,
         scope_digest: Digest,
         transfer: HostBlobTransfer,
@@ -251,6 +270,7 @@ pub enum HostRequest {
     },
     CommitHostBlob {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         expected_revision: Counter,
         scope_digest: Digest,
         transfer: HostBlobTransfer,
@@ -268,6 +288,8 @@ pub enum HostRequest {
         sandbox_id: SandboxId,
         image_digest: Digest,
         resources: Resources,
+        workload_configuration: WorkloadConfiguration,
+        lifetime: SandboxLifetime,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
@@ -275,6 +297,7 @@ pub enum HostRequest {
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
         resources: Resources,
+        lifetime: SandboxLifetime,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
@@ -295,6 +318,7 @@ pub enum HostRequest {
     },
     SetGrant {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         grant_id: GrantId,
         expected_revision: Counter,
         capability: Capability,
@@ -400,6 +424,7 @@ pub enum HostRequest {
     },
     AcknowledgeReceipt {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         process_id: ProcessId,
         receipt_digest: Digest,
         expected_revision: Counter,
@@ -407,6 +432,7 @@ pub enum HostRequest {
     },
     PinEvidence {
         sandbox_id: SandboxId,
+        operation_id: OperationId,
         process_id: ProcessId,
         receipt_digest: Digest,
         pin_id: PinId,
@@ -445,6 +471,9 @@ pub enum HostResponse {
     },
     Sandbox {
         value: SandboxView,
+    },
+    HostOperation {
+        value: Option<HostOperationRecord>,
     },
     Images {
         values: Vec<ImageRecord>,
@@ -490,6 +519,9 @@ pub enum HostResponse {
     },
     Grant {
         grant: Grant,
+    },
+    Grants {
+        values: Vec<Grant>,
     },
     Configuration {
         revision: Counter,
