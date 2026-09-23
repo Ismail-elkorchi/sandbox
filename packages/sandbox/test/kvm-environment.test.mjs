@@ -66,26 +66,6 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       await run(sandbox, ["/bin/sh", "-c", "printf '%s:%s:%s' \"$SANDSURF_ENVIRONMENT\" \"$(id -un)\" \"$PWD\""]),
       "persistent-config:agent:/workspace",
     );
-    const largeOutput = await sandbox.processes.spawn({
-      processId: "multipage-output",
-      argv: ["/bin/sh", "-c", "head -c 131072 /dev/urandom > /workspace/binary-output; cat /workspace/binary-output"],
-    });
-    assert.equal(exitCode((await largeOutput.wait()).state), 0);
-    let outputCursor = 0;
-    const outputParts = [];
-    while (outputCursor < 131072) {
-      const page = await largeOutput.output.read({ after: outputCursor, maximum: 64 * 1024 });
-      assert.ok(page.chunks.length > 0, "terminal receipt must cover every output page");
-      for (const chunk of page.chunks) {
-        assert.equal(chunk.cursor, outputCursor);
-        outputParts.push(Buffer.from(chunk.bytes));
-        outputCursor += chunk.bytes.byteLength;
-      }
-    }
-    assert.equal(outputCursor, 131072);
-    const expectedOutputDigest = (await run(sandbox, ["/bin/busybox", "sha256sum", "/workspace/binary-output"])).slice(0, 64);
-    assert.equal(createHash("sha256").update(Buffer.concat(outputParts)).digest("hex"), expectedOutputDigest);
-
     const baseWorkspace = await sandbox.workspace.importFromHost({
       source: hostWorkspace,
       operationId: "import-integration-workspace",
@@ -112,6 +92,26 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     });
     assert.equal(applied.applied, 1);
     assert.equal(await readFile(join(hostWorkspace, "source.txt"), "utf8"), "in-place\n");
+
+    const largeOutput = await sandbox.processes.spawn({
+      processId: "multipage-output",
+      argv: ["/bin/sh", "-c", "head -c 131072 /dev/urandom > /workspace/binary-output; cat /workspace/binary-output"],
+    });
+    assert.equal(exitCode((await largeOutput.wait()).state), 0);
+    let outputCursor = 0;
+    const outputParts = [];
+    while (outputCursor < 131072) {
+      const page = await largeOutput.output.read({ after: outputCursor, maximum: 64 * 1024 });
+      assert.ok(page.chunks.length > 0, "terminal receipt must cover every output page");
+      for (const chunk of page.chunks) {
+        assert.equal(chunk.cursor, outputCursor);
+        outputParts.push(Buffer.from(chunk.bytes));
+        outputCursor += chunk.bytes.byteLength;
+      }
+    }
+    assert.equal(outputCursor, 131072);
+    const expectedOutputDigest = (await run(sandbox, ["/bin/busybox", "sha256sum", "/workspace/binary-output"])).slice(0, 64);
+    assert.equal(createHash("sha256").update(Buffer.concat(outputParts)).digest("hex"), expectedOutputDigest);
 
     assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
     assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);

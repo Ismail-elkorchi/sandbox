@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "trusted-bootstrap.ext4",
-      "sha256": "d1b06911c99fcc2ff94446f86f017fa080bf9ba6e87b8d69cbe83be4c3beaaf2",
+      "sha256": "60c60a1397e2ffa7e00098ddbc79f59cf0141b0c28787598b1f985b0dddcca41",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
-      "protocolMajor": 2,
+      "protocolMajor": 3,
       "protocolMinor": 0,
-      "sha256": "864f6c98e5e659a576d8190c453eccd14e1248c340e0e372412a32fee0487b37"
+      "sha256": "ba3239a98816fc0285c7c08587201f12d1477332754e5e90d2ac70f7a772fbc3"
     },
     "capabilities": {
       "overlayfs": true,
@@ -30,7 +30,7 @@
   "workload": {
     "rootfs": {
       "path": "development-workload.ext4",
-      "sha256": "8ab5e6388842d2d35de277a96ba9f6e99f83d5e61284caf54006b1c744438f80",
+      "sha256": "e060fb20d2ac33912b16c44a563202a669a52915b4424d5b6929e1af3ea3126a",
       "format": "ext4"
     },
     "stateTemplate": {
@@ -56,7 +56,7 @@
         "sandsurf-ext4-builder": "dc9c1246c767342b8208e721924dcd5d86c24211fa4bf11b1fc6c9f822dde80a"
       }
     },
-    "compatibleProtocolMajor": 2
+    "compatibleProtocolMajor": 3
   },
   "platformArtifacts": {},
   "signature": null
