@@ -149,7 +149,10 @@ export class NativeHostClient {
       this.#pending.delete(parsed[0]);
       let value: Record<string, unknown>;
       try { value = decodeBridgeResponse(parsed[2], binary); }
-      catch { this.#fail(new SandsurfHostError("protocol", "native bridge returned invalid binary output")); return; }
+      catch (error) {
+        this.#fail(error instanceof SandsurfHostError ? error : new SandsurfHostError("protocol", "native bridge returned invalid binary output"));
+        return;
+      }
       try {
         if (value.kind === "rejected") pending.reject(new SandsurfHostError(text(value.category), text(value.message)));
         else pending.resolve(value);
