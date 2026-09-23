@@ -23,6 +23,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const READ_BUFFER: usize = sandsurf_protocol::MAX_STREAM_BYTES;
+const OUTPUT_COALESCE_MILLIS: i32 = 2;
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(500);
 const DEADLINE_TERMINATION_GRACE: Duration = Duration::from_secs(1);
 const MAX_PASSWD_BYTES: u64 = 1024 * 1024;
@@ -121,8 +122,11 @@ struct Spawned {
     child: Child,
     input: Input,
     terminal: Option<File>,
-    readers: Vec<(Box<dyn Read + Send>, Stream)>,
+    readers: Vec<(Box<dyn ReadFd>, Stream)>,
 }
+
+trait ReadFd: Read + AsRawFd + Send {}
+impl<T: Read + AsRawFd + Send> ReadFd for T {}
 
 impl ProcessSupervisor {
     pub fn create(
@@ -1273,7 +1277,7 @@ fn attach_current_process(attachment: Option<RawFd>) -> io::Result<()> {
 
 fn start_reader(
     entry: Arc<ProcessEntry>,
-    mut reader: Box<dyn Read + Send>,
+    mut reader: Box<dyn ReadFd>,
     stream: Stream,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1281,9 +1285,66 @@ fn start_reader(
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => {
-                    if entry.spool.append(stream, &buffer[..count]).is_err() {
+                Ok(initial) => {
+                    let mut count = initial;
+                    let mut ended = false;
+                    let mut failed = false;
+                    // One durable spool record per bounded burst, not per small
+                    // producer write. The short idle window keeps PTY feedback
+                    // responsive while collapsing chatty command output.
+                    while count < buffer.len() {
+                        let mut descriptor = libc::pollfd {
+                            fd: reader.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        // SAFETY: descriptor points to a live pollfd for this
+                        // thread's retained pipe or PTY descriptor.
+                        let ready =
+                            unsafe { libc::poll(&raw mut descriptor, 1, OUTPUT_COALESCE_MILLIS) };
+                        if ready == 0 {
+                            break;
+                        }
+                        if ready < 0 {
+                            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            failed = true;
+                            break;
+                        }
+                        if descriptor.revents & libc::POLLNVAL != 0 {
+                            failed = true;
+                            break;
+                        }
+                        if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0
+                        {
+                            break;
+                        }
+                        match reader.read(&mut buffer[count..]) {
+                            Ok(0) => {
+                                ended = true;
+                                break;
+                            }
+                            Ok(read) => count += read,
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error)
+                                if stream == Stream::Terminal
+                                    && error.raw_os_error() == Some(libc::EIO) =>
+                            {
+                                ended = true;
+                                break;
+                            }
+                            Err(_) => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if entry.spool.append(stream, &buffer[..count]).is_err() || failed {
                         entry.kill_owned();
+                        break;
+                    }
+                    if ended {
                         break;
                     }
                 }
@@ -1751,6 +1812,39 @@ mod tests {
         assert_eq!(one.chunks[0].bytes, b"one\0byte");
         assert_eq!(two.chunks[0].stream, Stream::Stderr);
         assert_eq!(two.chunks[0].bytes, b"two");
+    }
+
+    #[test]
+    fn tiny_writes_are_coalesced_without_losing_receipt_coverage() {
+        let root = Temp::new();
+        let supervisor =
+            ProcessSupervisor::create(&root.0, SandboxId::try_from("box").unwrap(), Counter::ONE)
+                .unwrap();
+        let id = ProcessId::try_from("chatty").unwrap();
+        supervisor
+            .spawn(request(
+                "chatty",
+                "i=0; while [ \"$i\" -lt 8192 ]; do printf x; i=$((i+1)); done",
+                StdioMode::Pipes,
+            ))
+            .unwrap();
+        let completion = supervisor.wait(&id, Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(completion.output.stdout_bytes.get(), 8192);
+        assert!(completion.output.chunks.get() < 128);
+        let page = supervisor.read_output(&id, Counter::ZERO, 8192).unwrap();
+        assert_eq!(page.available.get(), 8192);
+        assert_eq!(
+            page.chunks
+                .iter()
+                .map(|chunk| chunk.bytes.len())
+                .sum::<usize>(),
+            8192
+        );
+        assert!(
+            page.chunks
+                .iter()
+                .all(|chunk| chunk.bytes.iter().all(|byte| *byte == b'x'))
+        );
     }
 
     #[test]
