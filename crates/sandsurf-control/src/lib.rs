@@ -21,7 +21,9 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SERVICE_VERSION: u16 = 2;
+const SERVICE_VERSION: u16 = 3;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const OUTPUT_DATA_STREAM: u32 = 1;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -1025,7 +1027,9 @@ impl GuardianClient {
         let response = connection
             .read_frame(REQUEST_TIMEOUT)?
             .ok_or(Error::Protocol("guardian closed without a response"))?;
-        parse_response(response)
+        parse_response_stream(response, || {
+            connection.read_frame(REQUEST_TIMEOUT).map_err(Error::Io)
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1087,11 +1091,24 @@ pub fn serve_guardian<E: GuardianEffect>(
                         {
                             return;
                         }
-                        if let Ok(response) = response.recv()
-                            && let Ok(frame) = response_frame(sequence, &response)
-                        {
-                            // A lost response never reverses an admitted operation.
-                            let _ = connection.write_frame(&frame, REQUEST_TIMEOUT);
+                        if let Ok(response) = response.recv() {
+                            let frames = response_frames(sequence, response).or_else(|error| {
+                                response_frames(
+                                    sequence,
+                                    GuardianResponse::Rejected {
+                                        category: "protocol".into(),
+                                        message: error.to_string(),
+                                    },
+                                )
+                            });
+                            if let Ok(frames) = frames {
+                                // A lost response never reverses an admitted operation.
+                                for frame in frames {
+                                    if connection.write_frame(&frame, REQUEST_TIMEOUT).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     });
                 if let Err(error) = worker {
@@ -1192,6 +1209,53 @@ fn response_frame(sequence: Counter, response: &GuardianResponse) -> Result<Fram
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn response_frames(sequence: Counter, response: GuardianResponse) -> Result<Vec<Frame>> {
+    let (response, bytes) = match response {
+        GuardianResponse::Runtime {
+            response: RuntimeResponse::Output { page },
+        } => {
+            let (page, bytes) = page
+                .into_binary_parts()
+                .map_err(|_| Error::Protocol("guardian output page is invalid"))?;
+            (
+                GuardianResponse::Runtime {
+                    response: RuntimeResponse::OutputMetadata { page },
+                },
+                Some(bytes),
+            )
+        }
+        GuardianResponse::Runtime {
+            response: RuntimeResponse::OutputMetadata { .. },
+        } => return Err(Error::Protocol("guardian cannot originate output metadata")),
+        response => (response, None),
+    };
+    let mut frames = vec![response_frame(sequence, &response)?];
+    if let Some(bytes) = bytes {
+        for (index, payload) in bytes.into_iter().enumerate() {
+            frames.push(Frame {
+                kind: FrameKind::Data,
+                stream: OUTPUT_DATA_STREAM,
+                sequence: Counter::ONE
+                    .checked_add(index as u64)
+                    .map_err(|_| Error::Protocol("guardian output sequence overflow"))?,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload,
+            });
+        }
+        frames.push(Frame {
+            kind: FrameKind::End,
+            stream: OUTPUT_DATA_STREAM,
+            sequence: Counter::ONE
+                .checked_add((frames.len() - 1) as u64)
+                .map_err(|_| Error::Protocol("guardian output sequence overflow"))?,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: Vec::new(),
+        });
+    }
+    Ok(frames)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn parse_request(frame: Frame) -> Result<GuardianRequest> {
     require_control_frame(&frame)?;
     let (version, request): (u16, GuardianRequest) = serde_json::from_slice(&frame.payload)?;
@@ -1215,9 +1279,111 @@ fn parse_response(frame: Frame) -> Result<GuardianResponse> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn parse_response_stream(
+    frame: Frame,
+    mut next: impl FnMut() -> Result<Option<Frame>>,
+) -> Result<GuardianResponse> {
+    let response = parse_response(frame)?;
+    let GuardianResponse::Runtime {
+        response: RuntimeResponse::OutputMetadata { page },
+    } = response
+    else {
+        return Ok(response);
+    };
+    page.validate_lengths()
+        .map_err(|_| Error::Protocol("guardian output metadata is invalid"))?;
+    let mut bytes = Vec::with_capacity(page.chunks.len());
+    for (index, chunk) in page.chunks.iter().enumerate() {
+        let frame = next()?.ok_or(Error::Protocol("guardian output data is incomplete"))?;
+        if frame.kind != FrameKind::Data
+            || frame.stream != OUTPUT_DATA_STREAM
+            || frame.sequence.get() != index as u64 + 1
+            || frame.payload.len() != chunk.length as usize
+        {
+            return Err(Error::Protocol("guardian output data frame is invalid"));
+        }
+        bytes.push(frame.payload);
+    }
+    let end = next()?.ok_or(Error::Protocol("guardian output end is missing"))?;
+    if end.kind != FrameKind::End
+        || end.stream != OUTPUT_DATA_STREAM
+        || end.sequence.get() != bytes.len() as u64 + 1
+        || !end.payload.is_empty()
+    {
+        return Err(Error::Protocol("guardian output end is invalid"));
+    }
+    let page = page
+        .with_binary_parts(bytes)
+        .map_err(|_| Error::Protocol("guardian output data differs from metadata"))?;
+    Ok(GuardianResponse::Runtime {
+        response: RuntimeResponse::Output { page },
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn require_control_frame(frame: &Frame) -> Result<()> {
     if frame.kind != FrameKind::Control || frame.stream != 0 || frame.sequence == Counter::ZERO {
         return Err(Error::Protocol("invalid guardian control frame"));
     }
     Ok(())
+}
+
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod local_output_tests {
+    use super::*;
+
+    fn dense_response() -> GuardianResponse {
+        let bytes = vec![255; MAX_STREAM_BYTES];
+        let digest = bytes_digest(&bytes);
+        GuardianResponse::Runtime {
+            response: RuntimeResponse::Output {
+                page: EvidencePage {
+                    after: Counter::ZERO,
+                    cursor: (bytes.len() as u64).try_into().unwrap(),
+                    available: (bytes.len() as u64).try_into().unwrap(),
+                    chunks: vec![EvidenceChunk {
+                        sequence: Counter::ONE,
+                        offset: Counter::ZERO,
+                        stream: Stream::Stdout,
+                        bytes,
+                        bytes_digest: digest.clone(),
+                        chain_digest: digest,
+                    }],
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn guardian_output_uses_verified_binary_frames_at_the_control_bound() {
+        let response = dense_response();
+        let mut frames = response_frames(Counter::ONE, response.clone()).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].kind, FrameKind::Control);
+        assert_eq!(frames[1].kind, FrameKind::Data);
+        assert_eq!(frames[1].payload.len(), MAX_STREAM_BYTES);
+        let first = frames.remove(0);
+        let mut remaining = frames.into_iter();
+        assert_eq!(
+            parse_response_stream(first, || Ok(remaining.next())).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn guardian_output_rejects_corrupt_binary_data() {
+        let mut frames = response_frames(Counter::ONE, dense_response()).unwrap();
+        frames[1].payload[0] = 0;
+        let first = frames.remove(0);
+        let mut remaining = frames.into_iter();
+        assert!(matches!(
+            parse_response_stream(first, || Ok(remaining.next())),
+            Err(Error::Protocol(
+                "guardian output data differs from metadata"
+            ))
+        ));
+    }
 }

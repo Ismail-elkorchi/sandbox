@@ -119,6 +119,9 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       createHash("sha256").update(denseBinary.output).digest("hex"),
       createHash("sha256").update(Buffer.alloc(64 * 1024, 255)).digest("hex"),
     );
+    const denseReceipt = await denseBinary.process.receipt();
+    assert.ok(denseReceipt);
+    assert.ok(denseReceipt.receipt.output.chunks < 256, "tiny writes must not become hundreds of durable records");
 
     assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
     assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);
@@ -315,7 +318,7 @@ async function runResult(sandbox, argv, options = {}) {
     if (cursor === page.available) break;
     assert.ok(page.chunks.length > 0, "output pagination must advance until the receipt boundary");
   }
-  return { state: ended.state, output: Buffer.concat(parts) };
+  return { state: ended.state, output: Buffer.concat(parts), process };
 }
 
 function exitCode(state) {

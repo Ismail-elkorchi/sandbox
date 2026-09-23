@@ -357,7 +357,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         )
         .unwrap();
     let payload = serde_json::to_vec(&(
-        2_u16,
+        3_u16,
         GuardianRequest::Dispatch {
             authorization: authorization.clone(),
         },
