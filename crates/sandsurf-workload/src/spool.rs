@@ -12,6 +12,8 @@ const MAGIC: &[u8; 4] = b"SSO1";
 const HEADER_BYTES: usize = 4 + 8 + 1 + 4 + 32;
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_CHUNKS: u64 = 1_000_000;
+const INDEX_STRIDE: u64 = 128;
+const MAX_PAGE_CHUNKS: usize = 512;
 
 #[derive(Debug)]
 pub enum SpoolError {
@@ -48,8 +50,21 @@ pub struct OutputSpool {
 struct SpoolState {
     boundary: OutputBoundary,
     file_bytes: u64,
+    index: Vec<SpoolIndex>,
     failed: bool,
     finalized: Option<OutputBoundary>,
+}
+
+struct SpoolIndex {
+    cursor: u64,
+    offset: u64,
+}
+
+fn initial_index() -> Vec<SpoolIndex> {
+    vec![SpoolIndex {
+        cursor: 0,
+        offset: 0,
+    }]
 }
 
 impl OutputSpool {
@@ -78,6 +93,7 @@ impl OutputSpool {
                 boundary: initial_output_boundary(sandbox, process, epoch)
                     .map_err(|_| SpoolError::Invalid("output identity is invalid"))?,
                 file_bytes: 0,
+                index: initial_index(),
                 failed: false,
                 finalized: None,
             }),
@@ -110,9 +126,16 @@ impl OutputSpool {
         let mut boundary = initial_output_boundary(sandbox, process, epoch)
             .map_err(|_| SpoolError::Invalid("output identity is invalid"))?;
         let mut offset = 0u64;
+        let mut index = initial_index();
         while offset < length {
             if boundary.chunks.get() >= MAX_CHUNKS {
                 return Err(SpoolError::Capacity);
+            }
+            if boundary.chunks.get() > 0 && boundary.chunks.get() % INDEX_STRIDE == 0 {
+                index.push(SpoolIndex {
+                    cursor: boundary.final_cursor.get(),
+                    offset,
+                });
             }
             let mut header = [0u8; HEADER_BYTES];
             reader.read_exact(&mut header)?;
@@ -159,6 +182,7 @@ impl OutputSpool {
             state: Mutex::new(SpoolState {
                 boundary: boundary.clone(),
                 file_bytes: length,
+                index,
                 failed: false,
                 finalized: finalized.then_some(boundary),
             }),
@@ -207,6 +231,11 @@ impl OutputSpool {
             state.failed = true;
             return Err(error.into());
         }
+        if state.boundary.chunks.get() > 0 && state.boundary.chunks.get() % INDEX_STRIDE == 0 {
+            let cursor = state.boundary.final_cursor.get();
+            let offset = state.file_bytes;
+            state.index.push(SpoolIndex { cursor, offset });
+        }
         state.file_bytes = state
             .file_bytes
             .checked_add(record.len() as u64)
@@ -225,16 +254,22 @@ impl OutputSpool {
         }
         let expected_file_bytes = state.file_bytes;
         let available = state.boundary.final_cursor;
+        let start = state
+            .index
+            .partition_point(|entry| entry.cursor <= after.get())
+            - 1;
+        let start_cursor = state.index[start].cursor;
+        let start_offset = state.index[start].offset;
         drop(state);
 
         let mut file = self.file.try_clone()?;
         if file.metadata()?.len() != expected_file_bytes {
             return Err(SpoolError::Invalid("spool length changed unexpectedly"));
         }
-        file.seek(SeekFrom::Start(0))?;
-        let mut file_cursor = 0u64;
-        let mut content_cursor = 0u64;
-        let mut found = after == Counter::ZERO;
+        file.seek(SeekFrom::Start(start_offset))?;
+        let mut file_cursor = start_offset;
+        let mut content_cursor = start_cursor;
+        let mut found = after.get() == start_cursor;
         let mut retained = 0usize;
         let mut chunks = Vec::new();
         let mut required_bytes = None;
@@ -265,6 +300,9 @@ impl OutputSpool {
                 found = true;
             }
             if found && retained + length <= maximum {
+                if chunks.len() >= MAX_PAGE_CHUNKS {
+                    break;
+                }
                 chunks.push(RetainedChunk {
                     cursor: Counter::try_from(cursor).map_err(|_| SpoolError::Capacity)?,
                     stream,
@@ -417,6 +455,39 @@ mod tests {
         assert!(page.chunks.is_empty());
         assert_eq!(page.required_bytes.unwrap().get(), 10);
         assert_eq!(page.available.get(), 10);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sparse_seek_and_bounded_pages_survive_reopen() {
+        let path = path();
+        let spool = spool(&path, 1024);
+        for index in 0..600 {
+            spool.append(Stream::Stdout, &[index as u8]).unwrap();
+        }
+        assert_eq!(spool.state.lock().unwrap().index.len(), 5);
+        let first = spool.read(Counter::ZERO, 1024).unwrap();
+        assert_eq!(first.chunks.len(), MAX_PAGE_CHUNKS);
+        assert_eq!(first.available.get(), 600);
+        let second = spool.read(512u64.try_into().unwrap(), 1024).unwrap();
+        assert_eq!(second.chunks.len(), 88);
+        assert_eq!(second.chunks[0].bytes, [0]);
+        drop(spool);
+        let reopened = OutputSpool::open(
+            &path,
+            1024u64.try_into().unwrap(),
+            &SandboxId::try_from("box").unwrap(),
+            &ProcessId::try_from("process").unwrap(),
+            Counter::ONE,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reopened.state.lock().unwrap().index.len(), 5);
+        let last = reopened.read(599u64.try_into().unwrap(), 1024).unwrap();
+        assert_eq!(last.chunks.len(), 1);
+        assert_eq!(last.chunks[0].bytes, [87]);
+        assert!(reopened.read(601u64.try_into().unwrap(), 1024).is_err());
+        drop(reopened);
         fs::remove_file(path).unwrap();
     }
 }
