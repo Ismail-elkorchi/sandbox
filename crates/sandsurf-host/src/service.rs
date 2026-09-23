@@ -3232,7 +3232,8 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
                             return;
                         }
                         if let Ok(dispatch) = response.recv()
-                            && let Ok(frame) = host_response_frame(sequence, &dispatch.finish())
+                            && let Ok(frame) =
+                                bounded_host_response_frame(sequence, &dispatch.finish())
                         {
                             // A lost response never reverses an admitted operation.
                             let written = connection.write_frame(&frame, API_TIMEOUT).is_ok();
@@ -3437,6 +3438,11 @@ fn host_response_frame(sequence: Counter, response: &HostResponse) -> Result<Fra
         authentication: [0; AUTHENTICATION_BYTES],
         payload,
     })
+}
+
+fn bounded_host_response_frame(sequence: Counter, response: &HostResponse) -> Result<Frame> {
+    host_response_frame(sequence, response)
+        .or_else(|error| host_response_frame(sequence, &rejected(error)))
 }
 
 fn parse_host_response(frame: Frame) -> Result<HostResponse> {
@@ -3749,6 +3755,20 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn oversized_response_is_reported_instead_of_closing_the_connection() {
+        let oversized = HostResponse::Rejected {
+            category: "fixture".into(),
+            message: "x".repeat(MAX_CONTROL_BYTES),
+        };
+        let frame = bounded_host_response_frame(Counter::ONE, &oversized).unwrap();
+        assert!(matches!(
+            parse_host_response(frame).unwrap(),
+            HostResponse::Rejected { category, message }
+                if category == "protocol" && message.contains("control bound")
+        ));
+    }
 
     #[test]
     fn idle_client_cannot_block_other_host_requests() {
