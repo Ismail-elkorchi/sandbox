@@ -176,6 +176,11 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       lifetime: "sandbox",
     });
     await waitForOutput(restoredProcess, 4);
+    const [outputPages] = await Promise.all([
+      Promise.all(Array.from({ length: 24 }, () => restoredProcess.output.read({ maximum: 4096 }))),
+      sandbox.inspect(),
+    ]);
+    assert.ok(outputPages.every((page) => page.available >= 4));
     const suspended = await sandbox.suspend({ operationId: "suspend-full-state" });
     assert.equal(suspended.machine.value.state, "suspended");
     const restored = await sandbox.resume({ operationId: "restore-full-state" });

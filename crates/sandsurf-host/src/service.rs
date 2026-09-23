@@ -207,11 +207,86 @@ impl HostService {
     pub fn handle(&mut self, request: HostRequest) -> HostResponse {
         match self.handle_inner(request) {
             Ok(response) => response,
-            Err(error) => HostResponse::Rejected {
-                category: error_category(&error).into(),
-                message: error.to_string(),
-            },
+            Err(error) => rejected(error),
         }
+    }
+
+    fn route(&mut self, request: HostRequest) -> HostDispatch {
+        match self.defer_runtime_read(&request) {
+            Ok(Some(read)) => HostDispatch::Runtime(Box::new(read)),
+            Ok(None) => HostDispatch::Ready(Box::new(self.handle(request))),
+            Err(error) => HostDispatch::Ready(Box::new(rejected(error))),
+        }
+    }
+
+    fn defer_runtime_read(&mut self, request: &HostRequest) -> Result<Option<DeferredRuntimeRead>> {
+        let (sandbox_id, query) = match request {
+            HostRequest::ListEvents {
+                sandbox_id,
+                after,
+                maximum,
+            } => (
+                sandbox_id.clone(),
+                RuntimeRequest::Events {
+                    after: *after,
+                    maximum: *maximum,
+                },
+            ),
+            HostRequest::GetProcess {
+                sandbox_id,
+                process_id,
+            } => (
+                sandbox_id.clone(),
+                RuntimeRequest::Process {
+                    process_id: process_id.clone(),
+                },
+            ),
+            HostRequest::ListProcesses { sandbox_id } => {
+                (sandbox_id.clone(), RuntimeRequest::Processes)
+            }
+            HostRequest::GetReceipt {
+                sandbox_id,
+                process_id,
+            } => (
+                sandbox_id.clone(),
+                RuntimeRequest::Receipt {
+                    process_id: process_id.clone(),
+                },
+            ),
+            HostRequest::ReadEvidence {
+                sandbox_id,
+                process_id,
+                after,
+                maximum,
+            } => (
+                sandbox_id.clone(),
+                RuntimeRequest::ReadOutput {
+                    process_id: process_id.clone(),
+                    after: *after,
+                    maximum: *maximum,
+                },
+            ),
+            HostRequest::ReadPinnedEvidence {
+                sandbox_id,
+                pin_id,
+                after,
+                maximum,
+            } => (
+                sandbox_id.clone(),
+                RuntimeRequest::ReadPin {
+                    pin_id: pin_id.clone(),
+                    after: *after,
+                    maximum: *maximum,
+                },
+            ),
+            _ => return Ok(None),
+        };
+        self.provision_guardian(&sandbox_id)?;
+        Ok(Some(DeferredRuntimeRead {
+            endpoint: self.guardian_endpoint(&sandbox_id),
+            sandbox_id,
+            query,
+        }))
     }
 
     fn handle_inner(&mut self, request: HostRequest) -> Result<HostResponse> {
@@ -1901,80 +1976,15 @@ impl HostService {
                         .runtime(sandbox_id, RuntimeRequest::Operation { operation_id })?,
                 })
             }
-            HostRequest::ListEvents {
-                sandbox_id,
-                after,
-                maximum,
-            } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                        .runtime(sandbox_id, RuntimeRequest::Events { after, maximum })?,
-                })
-            }
-            HostRequest::GetProcess {
-                sandbox_id,
-                process_id,
-            } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                        .runtime(sandbox_id, RuntimeRequest::Process { process_id })?,
-                })
-            }
-            HostRequest::ListProcesses { sandbox_id } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                        .runtime(sandbox_id, RuntimeRequest::Processes)?,
-                })
-            }
-            HostRequest::GetReceipt {
-                sandbox_id,
-                process_id,
-            } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id))
-                        .runtime(sandbox_id, RuntimeRequest::Receipt { process_id })?,
-                })
-            }
-            HostRequest::ReadEvidence {
-                sandbox_id,
-                process_id,
-                after,
-                maximum,
-            } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
-                        sandbox_id,
-                        RuntimeRequest::ReadOutput {
-                            process_id,
-                            after,
-                            maximum,
-                        },
-                    )?,
-                })
-            }
-            HostRequest::ReadPinnedEvidence {
-                sandbox_id,
-                pin_id,
-                after,
-                maximum,
-            } => {
-                self.provision_guardian(&sandbox_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&sandbox_id)).runtime(
-                        sandbox_id,
-                        RuntimeRequest::ReadPin {
-                            pin_id,
-                            after,
-                            maximum,
-                        },
-                    )?,
-                })
-            }
+            request @ (HostRequest::ListEvents { .. }
+            | HostRequest::GetProcess { .. }
+            | HostRequest::ListProcesses { .. }
+            | HostRequest::GetReceipt { .. }
+            | HostRequest::ReadEvidence { .. }
+            | HostRequest::ReadPinnedEvidence { .. }) => self
+                .defer_runtime_read(&request)?
+                .ok_or(HostError::Invalid("runtime read route is unavailable"))?
+                .execute(),
             HostRequest::AcknowledgeReceipt {
                 sandbox_id,
                 operation_id,
@@ -3182,7 +3192,7 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
     std::thread::scope(|scope| {
         let stopped_accept = Arc::clone(&stopped);
         let active_accept = Arc::clone(&active);
-        scope.spawn(move || {
+        let accept_worker = scope.spawn(move || {
             while !stopped_accept.load(Ordering::Acquire) {
                 let connection = match listener.accept(Duration::from_secs(1)) {
                     Ok(value) => value,
@@ -3210,20 +3220,26 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
                         let sequence = frame.sequence;
                         let parsed = parse_host_request(frame);
                         let (reply, response) = mpsc::channel();
+                        let (completed, delivered) = mpsc::channel();
                         if sender
                             .send(HostIngress::Request {
                                 parsed: Box::new(parsed),
                                 reply,
+                                delivered,
                             })
                             .is_err()
                         {
                             return;
                         }
-                        if let Ok(response) = response.recv()
-                            && let Ok(frame) = host_response_frame(sequence, &response)
+                        if let Ok(dispatch) = response.recv()
+                            && let Ok(frame) = host_response_frame(sequence, &dispatch.finish())
                         {
                             // A lost response never reverses an admitted operation.
-                            let _ = connection.write_frame(&frame, API_TIMEOUT);
+                            let written = connection.write_frame(&frame, API_TIMEOUT).is_ok();
+                            drop(connection);
+                            if written {
+                                let _ = completed.send(());
+                            }
                         }
                     });
                 if let Err(error) = worker {
@@ -3234,18 +3250,19 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
         });
         let result = loop {
             match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(HostIngress::Request { parsed, reply }) => {
+                Ok(HostIngress::Request {
+                    parsed,
+                    reply,
+                    delivered,
+                }) => {
                     let stopping = matches!(&*parsed, Ok(HostRequest::StopService));
                     let response = (*parsed)
-                        .map(|request| service.handle(request))
-                        .unwrap_or_else(|error| HostResponse::Rejected {
-                            category: error_category(&error).into(),
-                            message: error.to_string(),
-                        });
-                    let _ = reply.send(response);
+                        .map(|request| service.route(request))
+                        .unwrap_or_else(|error| HostDispatch::Ready(Box::new(rejected(error))));
                     if stopping {
-                        break Ok(());
+                        break Ok((reply, delivered, response));
                     }
+                    let _ = reply.send(response);
                 }
                 Ok(HostIngress::Failed(error)) => break Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -3260,16 +3277,65 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
         };
         stopped.store(true, Ordering::Release);
         drop(receiver);
-        result
+        accept_worker
+            .join()
+            .map_err(|_| HostError::Invalid("host ingress accept worker panicked"))?;
+        // Terminal acknowledgement is published only after both the listening
+        // endpoint and the catalog writer have released their owned resources.
+        drop(service);
+        match result {
+            Ok((reply, delivered, response)) => {
+                let _ = reply.send(response);
+                let _ = delivered.recv_timeout(Duration::from_secs(10));
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     })
 }
 
 enum HostIngress {
     Request {
         parsed: Box<Result<HostRequest>>,
-        reply: mpsc::Sender<HostResponse>,
+        reply: mpsc::Sender<HostDispatch>,
+        delivered: mpsc::Receiver<()>,
     },
     Failed(io::Error),
+}
+
+enum HostDispatch {
+    Ready(Box<HostResponse>),
+    Runtime(Box<DeferredRuntimeRead>),
+}
+
+impl HostDispatch {
+    fn finish(self) -> HostResponse {
+        match self {
+            Self::Ready(response) => *response,
+            Self::Runtime(read) => (*read).execute().unwrap_or_else(rejected),
+        }
+    }
+}
+
+struct DeferredRuntimeRead {
+    endpoint: PathBuf,
+    sandbox_id: SandboxId,
+    query: RuntimeRequest,
+}
+
+impl DeferredRuntimeRead {
+    fn execute(self) -> Result<HostResponse> {
+        Ok(HostResponse::Runtime {
+            response: GuardianClient::new(self.endpoint).runtime(self.sandbox_id, self.query)?,
+        })
+    }
+}
+
+fn rejected(error: HostError) -> HostResponse {
+    HostResponse::Rejected {
+        category: error_category(&error).into(),
+        message: error.to_string(),
+    }
 }
 
 struct ActiveHostConnection(Arc<AtomicUsize>);
@@ -3311,6 +3377,7 @@ pub fn serve_sandbox_guardian(root: &Path, sandbox: SandboxId) -> Result<()> {
 
 pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
     let endpoint = root.join("api");
+    let stopping = matches!(request, HostRequest::StopService);
     if let Err(error) = fs::symlink_metadata(&endpoint)
         && error.kind() == io::ErrorKind::NotFound
     {
@@ -3340,7 +3407,13 @@ pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
     let frame = connection
         .read_frame(API_TIMEOUT)?
         .ok_or(HostError::Invalid("host closed without a response"))?;
-    parse_host_response(frame)
+    let response = parse_host_response(frame)?;
+    if stopping && connection.read_frame(Duration::from_secs(10))?.is_some() {
+        return Err(HostError::Invalid(
+            "host sent data after its terminal response",
+        ));
+    }
+    Ok(response)
 }
 
 fn parse_host_request(frame: Frame) -> Result<HostRequest> {
@@ -3679,8 +3752,15 @@ mod tests {
 
     #[test]
     fn idle_client_cannot_block_other_host_requests() {
-        let root = std::env::temp_dir().join(format!(
-            "sandsurf-host-ingress-{}-{}",
+        // Darwin's AF_UNIX address is short; use the stable sticky temp root
+        // rather than its long per-process TMPDIR alias for this IPC fixture.
+        let parent = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = parent.join(format!(
+            "ssing-{}-{}",
             std::process::id(),
             unix_millis().unwrap().get()
         ));
@@ -3704,7 +3784,14 @@ mod tests {
                 {
                     thread::sleep(Duration::from_millis(10))
                 }
-                Err(error) => panic!("host did not start: {error}"),
+                Err(error) => {
+                    let service = if server.is_finished() {
+                        format!("{:?}", server.join().unwrap())
+                    } else {
+                        "still starting".into()
+                    };
+                    panic!("host did not start: {error}; service: {service}");
+                }
             }
         };
         thread::sleep(Duration::from_millis(100));
