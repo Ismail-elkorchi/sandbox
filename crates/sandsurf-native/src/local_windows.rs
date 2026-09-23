@@ -69,6 +69,10 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 struct Handle(HANDLE);
+// SAFETY: this wrapper uniquely owns a real Win32 handle. Transferring it to
+// another thread does not duplicate ownership; all I/O is completed or drained
+// before the borrowed handle returns to its owner, and Drop closes it once.
+unsafe impl Send for Handle {}
 impl Handle {
     fn new(value: HANDLE) -> io::Result<Self> {
         if value.is_null() || value == INVALID_HANDLE_VALUE {
@@ -458,10 +462,6 @@ pub struct LocalConnection {
     peer: PeerIdentity,
     usable: bool,
 }
-// SAFETY: the connection uniquely owns its pipe handle. Frame I/O requires
-// &mut self and drains each overlapped operation before returning, so moving
-// the idle handle to a worker cannot race another user of the same handle.
-unsafe impl Send for LocalConnection {}
 impl LocalConnection {
     pub fn connect(directory: &Path, timeout: Duration) -> io::Result<Self> {
         let deadline = Deadline::new(timeout)?;
