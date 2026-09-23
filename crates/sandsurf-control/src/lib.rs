@@ -12,6 +12,12 @@ use sandsurf_state::{DispatchDecision, HostCatalog, RuntimeJournal};
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc,
+};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -22,6 +28,8 @@ const SERVICE_VERSION: u16 = 2;
 // Match the host's operation bound so transport timeout never implies that an
 // exact identity-bound operation stopped running.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const MAX_GUARDIAN_CONNECTIONS: usize = 32;
 
 #[derive(Debug)]
 pub enum Error {
@@ -1036,37 +1044,113 @@ pub fn serve_guardian<E: GuardianEffect>(
 ) -> Result<()> {
     use sandsurf_native::local::LocalListener;
     let listener = LocalListener::bind(endpoint)?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let active = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
     let mut last_request = std::time::Instant::now();
-    loop {
-        let mut connection = match listener.accept(Duration::from_secs(1)) {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                if let Err(error) = guardian.reconcile() {
-                    eprintln!("sandsurf guardian reconciliation deferred: {error}");
+    std::thread::scope(|scope| {
+        let stopped_accept = Arc::clone(&stopped);
+        let active_accept = Arc::clone(&active);
+        let accept_worker = scope.spawn(move || {
+            while !stopped_accept.load(Ordering::Acquire) {
+                let connection = match listener.accept(Duration::from_secs(1)) {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(error) => {
+                        let _ = sender.try_send(GuardianIngress::Failed(error));
+                        return;
+                    }
+                };
+                if active_accept.fetch_add(1, Ordering::AcqRel) >= MAX_GUARDIAN_CONNECTIONS {
+                    active_accept.fetch_sub(1, Ordering::AcqRel);
+                    continue;
                 }
-                if last_request.elapsed() >= Duration::from_secs(3) && guardian.can_retire()? {
-                    return Ok(());
+                let sender = sender.clone();
+                let active = Arc::clone(&active_accept);
+                let worker = std::thread::Builder::new()
+                    .name("sandsurf-guardian-client".into())
+                    .spawn(move || {
+                        let _active = ActiveGuardianConnection(active);
+                        let mut connection = connection;
+                        let frame = match connection.read_frame(REQUEST_TIMEOUT) {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) | Err(_) => return,
+                        };
+                        let sequence = frame.sequence;
+                        let (reply, response) = mpsc::channel();
+                        if sender
+                            .try_send(GuardianIngress::Request {
+                                parsed: Box::new(parse_request(frame)),
+                                reply,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Ok(response) = response.recv()
+                            && let Ok(frame) = response_frame(sequence, &response)
+                        {
+                            // A lost response never reverses an admitted operation.
+                            let _ = connection.write_frame(&frame, REQUEST_TIMEOUT);
+                        }
+                    });
+                if let Err(error) = worker {
+                    active_accept.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("sandsurf guardian connection rejected: {error}");
                 }
-                continue;
             }
-            Err(error) => return Err(error.into()),
+        });
+        let result = loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(GuardianIngress::Request { parsed, reply }) => {
+                    last_request = std::time::Instant::now();
+                    let response = match *parsed {
+                        Ok(request) => guardian.handle(request),
+                        Err(error) => GuardianResponse::Rejected {
+                            category: error_category(&error).to_owned(),
+                            message: error.to_string(),
+                        },
+                    };
+                    let _ = reply.send(response);
+                }
+                Ok(GuardianIngress::Failed(error)) => break Err(error.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = guardian.reconcile() {
+                        eprintln!("sandsurf guardian reconciliation deferred: {error}");
+                    }
+                    if last_request.elapsed() >= Duration::from_secs(3) && guardian.can_retire()? {
+                        break Ok(());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(Error::Protocol("guardian ingress stopped unexpectedly"));
+                }
+            }
         };
-        let frame = match connection.read_frame(REQUEST_TIMEOUT) {
-            Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => continue,
-        };
-        last_request = std::time::Instant::now();
-        let sequence = frame.sequence;
-        let response = match parse_request(frame) {
-            Ok(request) => guardian.handle(request),
-            Err(error) => GuardianResponse::Rejected {
-                category: error_category(&error).to_owned(),
-                message: error.to_string(),
-            },
-        };
-        let frame = response_frame(sequence, &response)?;
-        // A lost response never rolls back the durable dispatch decision.
-        let _ = connection.write_frame(&frame, REQUEST_TIMEOUT);
+        stopped.store(true, Ordering::Release);
+        drop(receiver);
+        accept_worker
+            .join()
+            .map_err(|_| Error::Protocol("guardian accept worker panicked"))?;
+        result
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum GuardianIngress {
+    Request {
+        parsed: Box<Result<GuardianRequest>>,
+        reply: mpsc::Sender<GuardianResponse>,
+    },
+    Failed(std::io::Error),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct ActiveGuardianConnection(Arc<AtomicUsize>);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+impl Drop for ActiveGuardianConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

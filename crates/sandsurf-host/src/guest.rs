@@ -183,11 +183,15 @@ impl<C: GuestChannel> GuestClient<C> {
 
 pub struct RemoteWorkloadDriver<C> {
     client: GuestClient<C>,
+    reconcile_cursor: usize,
 }
 
 impl<C> RemoteWorkloadDriver<C> {
     pub fn new(client: GuestClient<C>) -> Self {
-        Self { client }
+        Self {
+            client,
+            reconcile_cursor: 0,
+        }
     }
 }
 
@@ -228,61 +232,72 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
             Ok(GuestServiceResponse::Processes { processes }) => processes,
             _ => return Ok(()),
         };
-        for snapshot in processes {
+        // Reconciliation shares the guardian owner with lifecycle and control.
+        // Drain a bounded, rotating slice instead of allowing a chatty service
+        // to hold that owner until its entire spool has been copied.
+        const RECONCILE_PROCESS_BUDGET: usize = 8;
+        let process_count = processes.len();
+        if process_count == 0 {
+            self.reconcile_cursor = 0;
+            return Ok(());
+        }
+        let start = self.reconcile_cursor % process_count;
+        let count = process_count.min(RECONCILE_PROCESS_BUDGET);
+        self.reconcile_cursor = (start + count) % process_count;
+        for offset in 0..count {
+            let snapshot = &processes[(start + offset) % process_count];
             let process_id = &snapshot.request.process_id;
-            journal.observe_process(&snapshot)?;
+            journal.observe_process(snapshot)?;
+            if matches!(&snapshot.state, ProcessState::Exited(_))
+                && journal.receipt(process_id)?.is_some()
+            {
+                continue;
+            }
             let mut committed = journal.process_boundary(process_id)?;
-            loop {
-                let maximum = u32::try_from(sandsurf_protocol::MAX_STREAM_BYTES)
-                    .map_err(|_| sandsurf_state::Error::Corrupt("stream bound overflow"))?;
-                let page = match self.client.call(&GuestServiceRequest::ReadOutput {
-                    process_id: process_id.clone(),
-                    after: committed.final_cursor,
-                    maximum,
-                }) {
-                    Ok(GuestServiceResponse::Output { page }) => page,
-                    // Transport unavailability is not evidence corruption. The
-                    // bytes remain in the guest spool and reconciliation resumes
-                    // at the last committed cursor on the next pass.
-                    _ => return Ok(()),
-                };
-                if page.required_bytes.is_some() {
+            let maximum = u32::try_from(sandsurf_protocol::MAX_STREAM_BYTES)
+                .map_err(|_| sandsurf_state::Error::Corrupt("stream bound overflow"))?;
+            let page = match self.client.call(&GuestServiceRequest::ReadOutput {
+                process_id: process_id.clone(),
+                after: committed.final_cursor,
+                maximum,
+            }) {
+                Ok(GuestServiceResponse::Output { page }) => page,
+                // Transport unavailability is not evidence corruption. The
+                // bytes remain in the guest spool and reconciliation resumes
+                // at the last committed cursor on the next pass.
+                _ => return Ok(()),
+            };
+            if page.required_bytes.is_some() {
+                return Err(sandsurf_state::Error::Corrupt(
+                    "guest output chunk exceeds protocol bound",
+                ));
+            }
+            for chunk in page.chunks {
+                if chunk.cursor != committed.final_cursor {
                     return Err(sandsurf_state::Error::Corrupt(
-                        "guest output chunk exceeds protocol bound",
+                        "guest output cursor is not contiguous",
                     ));
                 }
-                if page.chunks.is_empty() {
-                    break;
-                }
-                for chunk in page.chunks {
-                    if chunk.cursor != committed.final_cursor {
+                committed = journal.append_output(
+                    process_id,
+                    committed.chunks.next()?,
+                    chunk.stream,
+                    &chunk.bytes,
+                )?;
+            }
+            if let ProcessState::Exited(completion) = &snapshot.state {
+                if committed != completion.output {
+                    if committed.final_cursor >= page.available {
                         return Err(sandsurf_state::Error::Corrupt(
-                            "guest output cursor is not contiguous",
+                            "guardian output does not cover guest completion",
                         ));
                     }
-                    committed = journal.append_output(
-                        process_id,
-                        committed.chunks.next()?,
-                        chunk.stream,
-                        &chunk.bytes,
-                    )?;
-                }
-                if committed.final_cursor >= page.available {
-                    break;
-                }
-            }
-            if let ProcessState::Exited(completion) = snapshot.state {
-                if committed != completion.output {
-                    return Err(sandsurf_state::Error::Corrupt(
-                        "guardian output does not cover guest completion",
-                    ));
-                }
-                if journal.receipt(process_id)?.is_none() {
+                } else if journal.receipt(process_id)?.is_none() {
                     journal.publish_receipt(
                         process_id,
-                        completion.outcome,
-                        completion.cleanup_digest,
-                        completion.accounting_digest,
+                        completion.outcome.clone(),
+                        completion.cleanup_digest.clone(),
+                        completion.accounting_digest.clone(),
                     )?;
                 }
             }

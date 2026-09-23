@@ -66,6 +66,24 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       await run(sandbox, ["/bin/sh", "-c", "printf '%s:%s:%s' \"$SANDSURF_ENVIRONMENT\" \"$(id -un)\" \"$PWD\""]),
       "persistent-config:agent:/workspace",
     );
+    const largeOutput = await sandbox.processes.spawn({
+      processId: "multipage-output",
+      argv: ["/bin/sh", "-c", "yes x | head -c 131072"],
+    });
+    assert.equal(exitCode((await largeOutput.wait()).state), 0);
+    let outputCursor = 0;
+    const outputParts = [];
+    while (outputCursor < 131072) {
+      const page = await largeOutput.output.read({ after: outputCursor, maximum: 64 * 1024 });
+      assert.ok(page.chunks.length > 0, "terminal receipt must cover every output page");
+      for (const chunk of page.chunks) {
+        assert.equal(chunk.cursor, outputCursor);
+        outputParts.push(Buffer.from(chunk.bytes));
+        outputCursor += chunk.bytes.byteLength;
+      }
+    }
+    assert.equal(outputCursor, 131072);
+    assert.equal(Buffer.concat(outputParts).toString(), "x\n".repeat(65536));
 
     const baseWorkspace = await sandbox.workspace.importFromHost({
       source: hostWorkspace,

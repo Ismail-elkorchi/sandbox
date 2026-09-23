@@ -363,6 +363,9 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         },
     ))
     .unwrap();
+    // A connected but idle client must not block a separate authorized
+    // dispatch or guardian journal reconciliation.
+    let idle = wait_for_guardian(&endpoint);
     let mut connection = wait_for_guardian(&endpoint);
     connection
         .write_frame(
@@ -377,6 +380,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         )
         .unwrap();
     wait_for(&fixture.root.0.join("effects.log"));
+    drop(idle);
     drop(connection); // The effect committed, but its reply is deliberately lost.
 
     let host_path = fixture.root.0.join("host");
