@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = 1;
+const BRIDGE_VERSION = 2;
 const MAX_BRIDGE_BYTES = 1024 * 1024;
 const MAX_BRIDGE_PENDING = 64;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -125,9 +125,20 @@ export class NativeHostClient {
         }
       }
       if (this.#buffer.byteLength < 4 || this.#buffer.byteLength < 4 + this.#buffer.readUInt32LE(0)) continue;
+      const frame = this.#buffer.subarray(4);
+      if (frame.byteLength < 4) {
+        this.#fail(new SandsurfHostError("protocol", "native bridge returned a truncated envelope"));
+        return;
+      }
+      const jsonLength = frame.readUInt32LE(0);
+      if (jsonLength === 0 || jsonLength > frame.byteLength - 4) {
+        this.#fail(new SandsurfHostError("protocol", "native bridge returned an invalid envelope length"));
+        return;
+      }
       let parsed: unknown;
-      try { parsed = JSON.parse(this.#buffer.subarray(4).toString("utf8")); }
+      try { parsed = JSON.parse(frame.subarray(4, 4 + jsonLength).toString("utf8")); }
       catch { this.#fail(new SandsurfHostError("protocol", "native bridge returned invalid JSON")); return; }
+      const binary = frame.subarray(4 + jsonLength);
       this.#buffer = Buffer.alloc(0);
       if (!Array.isArray(parsed) || parsed.length !== 3 || !Number.isSafeInteger(parsed[0]) || parsed[0] <= 0 || parsed[1] !== BRIDGE_VERSION || !record(parsed[2])) {
         this.#fail(new SandsurfHostError("protocol", "native host returned an invalid response"));
@@ -136,7 +147,9 @@ export class NativeHostClient {
       const pending = this.#pending.get(parsed[0]);
       if (pending === undefined) { this.#fail(new SandsurfHostError("protocol", "native bridge returned an unknown request identity")); return; }
       this.#pending.delete(parsed[0]);
-      const value = parsed[2];
+      let value: Record<string, unknown>;
+      try { value = decodeBridgeResponse(parsed[2], binary); }
+      catch { this.#fail(new SandsurfHostError("protocol", "native bridge returned invalid binary output")); return; }
       try {
         if (value.kind === "rejected") pending.reject(new SandsurfHostError(text(value.category), text(value.message)));
         else pending.resolve(value);
@@ -171,6 +184,36 @@ export class NativeHostClient {
       await this.close();
     }
   }
+}
+
+function decodeBridgeResponse(value: Record<string, unknown>, binary: Buffer): Record<string, unknown> {
+  if (value.kind !== "runtime" || !record(value.response) || value.response.kind !== "output-metadata") {
+    if (binary.byteLength !== 0) throw new SandsurfHostError("protocol", "unexpected native bridge data");
+    return value;
+  }
+  const response = value.response;
+  if (!record(response.page)) throw new SandsurfHostError("protocol", "invalid output metadata");
+  const page = response.page;
+  if (!Array.isArray(page.chunks)) throw new SandsurfHostError("protocol", "invalid output metadata");
+  const entries = page.chunks as unknown[];
+  const after = integer(page.after); const cursor = integer(page.cursor); const available = integer(page.available);
+  if (after > cursor || cursor > available || binary.byteLength > 256 * 1024) throw new SandsurfHostError("protocol", "invalid output page boundary");
+  let position = 0; let offset = after;
+  const chunks = entries.map((entry: unknown) => {
+    if (!record(entry)) throw new SandsurfHostError("protocol", "invalid output chunk metadata");
+    const length = integer(entry.length);
+    if (length < 1 || length > 64 * 1024 || integer(entry.offset) !== offset || position + length > binary.byteLength) {
+      throw new SandsurfHostError("protocol", "invalid output chunk boundary");
+    }
+    const bytes = binary.subarray(position, position + length);
+    if (createHash("sha256").update(bytes).digest("hex") !== text(entry.bytesDigest)) {
+      throw new SandsurfHostError("integrity", "native output chunk failed digest verification");
+    }
+    position += length; offset += length;
+    return { ...entry, bytes };
+  });
+  if (position !== binary.byteLength || offset !== cursor) throw new SandsurfHostError("protocol", "native output page coverage is incomplete");
+  return { kind: "runtime", response: { kind: "output", page: { ...page, chunks } } };
 }
 
 export async function resolveSandsurfNativeHost(): Promise<string> {

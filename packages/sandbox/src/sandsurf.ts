@@ -923,7 +923,24 @@ function runtimeEventBelongsToProcess(event: SandboxEvent, processId: string): b
   if ((value.kind === "output" || value.kind === "receipt" || value.kind === "evidence-release") && value.processId === processId) return true;
   return value.kind === "process" && record(value.process) && record(value.process.request) && value.process.request.processId === processId;
 }
-function parseEvidencePage(value: Record<string, unknown>): OutputPage { if (!Array.isArray(value.chunks)) throw protocol("output page"); const chunks = value.chunks as unknown[]; const after = integer(value.after); const cursor = integer(value.cursor); const available = integer(value.available); if (cursor < after || available < cursor) throw protocol("output page cursors"); return { after, available, chunks: chunks.map((chunk) => { if (!record(chunk) || !Array.isArray(chunk.bytes)) throw protocol("output chunk"); return { cursor: integer(chunk.offset), stream: text(chunk.stream) as OutputChunk["stream"], bytes: Uint8Array.from(chunk.bytes as number[]), digest: text(chunk.bytesDigest) }; }) }; }
+function parseEvidencePage(value: Record<string, unknown>): OutputPage {
+  if (!Array.isArray(value.chunks)) throw protocol("output page");
+  const after = integer(value.after); const cursor = integer(value.cursor); const available = integer(value.available);
+  if (cursor < after || available < cursor) throw protocol("output page cursors");
+  let expected = after;
+  const chunks = value.chunks.map((chunk: unknown) => {
+    if (!record(chunk) || (!Array.isArray(chunk.bytes) && !(chunk.bytes instanceof Uint8Array))) throw protocol("output chunk");
+    const offset = integer(chunk.offset); const stream = text(chunk.stream); const expectedDigest = digest(text(chunk.bytesDigest));
+    const bytes = chunk.bytes instanceof Uint8Array ? chunk.bytes : Uint8Array.from(chunk.bytes as number[]);
+    if (offset !== expected || bytes.byteLength === 0 || bytes.byteLength > 64 * 1024 ||
+        !["stdout", "stderr", "terminal"].includes(stream) ||
+        createHash("sha256").update(bytes).digest("hex") !== expectedDigest) throw protocol("output chunk coverage or digest");
+    expected += bytes.byteLength;
+    return { cursor: offset, stream: stream as OutputChunk["stream"], bytes, digest: expectedDigest };
+  });
+  if (expected !== cursor) throw protocol("output page coverage");
+  return { after, available, chunks };
+}
 function normalizeOutputRead(options: { readonly after?: number; readonly maximum?: number }): { readonly after: number; readonly maximum: number } { const after = options.after ?? 0; const maximum = options.maximum ?? 64 * 1024; if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("output cursor must be a nonnegative safe integer"); if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256 * 1024) throw new TypeError("output page size must be 1 through 256 KiB"); return { after, maximum }; }
 function capabilityScope(sandboxId: string, capability: SandsurfCapability): string { return sandsurfDigest("grant", ["sandsurf-sandbox-capability-v1", sandboxId, capability]); }
 async function ensureCapabilities(sandbox: Sandbox, capabilities: Partial<Record<SandsurfCapability, boolean>>, parentOperationId: string): Promise<void> {

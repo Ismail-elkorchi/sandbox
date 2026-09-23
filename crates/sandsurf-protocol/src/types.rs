@@ -658,6 +658,111 @@ pub struct EvidencePage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceChunkMetadata {
+    pub sequence: Counter,
+    pub offset: Counter,
+    pub stream: Stream,
+    pub length: u32,
+    pub bytes_digest: Digest,
+    pub chain_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidencePageMetadata {
+    pub after: Counter,
+    pub cursor: Counter,
+    pub available: Counter,
+    pub chunks: Vec<EvidenceChunkMetadata>,
+}
+
+impl EvidencePage {
+    pub fn into_binary_parts(self) -> Result<(EvidencePageMetadata, Vec<Vec<u8>>), crate::Invalid> {
+        let mut metadata = Vec::with_capacity(self.chunks.len());
+        let mut bytes = Vec::with_capacity(self.chunks.len());
+        for chunk in self.chunks {
+            metadata.push(EvidenceChunkMetadata {
+                sequence: chunk.sequence,
+                offset: chunk.offset,
+                stream: chunk.stream,
+                length: u32::try_from(chunk.bytes.len())
+                    .map_err(|_| crate::Invalid("evidence chunk exceeds length range"))?,
+                bytes_digest: chunk.bytes_digest,
+                chain_digest: chunk.chain_digest,
+            });
+            bytes.push(chunk.bytes);
+        }
+        let page = EvidencePageMetadata {
+            after: self.after,
+            cursor: self.cursor,
+            available: self.available,
+            chunks: metadata,
+        };
+        page.validate_lengths()?;
+        Ok((page, bytes))
+    }
+}
+
+impl EvidencePageMetadata {
+    pub fn validate_lengths(&self) -> Result<usize, crate::Invalid> {
+        if self.after > self.cursor || self.cursor > self.available {
+            return Err(crate::Invalid("evidence page cursor order is invalid"));
+        }
+        let mut expected = self.after.get();
+        let mut total = 0usize;
+        for chunk in &self.chunks {
+            let length = chunk.length as usize;
+            if length == 0 || length > crate::MAX_STREAM_BYTES || chunk.offset.get() != expected {
+                return Err(crate::Invalid("evidence chunk metadata is invalid"));
+            }
+            total = total
+                .checked_add(length)
+                .filter(|value| *value <= crate::MAX_CONTROL_BYTES)
+                .ok_or(crate::Invalid("evidence page exceeds byte bound"))?;
+            expected = expected
+                .checked_add(length as u64)
+                .ok_or(crate::Invalid("evidence cursor overflow"))?;
+        }
+        if expected != self.cursor.get() {
+            return Err(crate::Invalid("evidence page coverage is incomplete"));
+        }
+        Ok(total)
+    }
+
+    pub fn with_binary_parts(self, bytes: Vec<Vec<u8>>) -> Result<EvidencePage, crate::Invalid> {
+        self.validate_lengths()?;
+        if self.chunks.len() != bytes.len() {
+            return Err(crate::Invalid(
+                "evidence data frame count differs from metadata",
+            ));
+        }
+        let mut chunks = Vec::with_capacity(bytes.len());
+        for (chunk, bytes) in self.chunks.into_iter().zip(bytes) {
+            if bytes.len() != chunk.length as usize
+                || crate::bytes_digest(&bytes) != chunk.bytes_digest
+            {
+                return Err(crate::Invalid("evidence data frame differs from metadata"));
+            }
+            chunks.push(EvidenceChunk {
+                sequence: chunk.sequence,
+                offset: chunk.offset,
+                stream: chunk.stream,
+                bytes,
+                bytes_digest: chunk.bytes_digest,
+                chain_digest: chunk.chain_digest,
+            });
+        }
+        Ok(EvidencePage {
+            after: self.after,
+            cursor: self.cursor,
+            available: self.available,
+            chunks,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -737,6 +842,9 @@ pub enum RuntimeResponse {
     },
     Output {
         page: EvidencePage,
+    },
+    OutputMetadata {
+        page: EvidencePageMetadata,
     },
     Release {
         status: ReleaseStatus,

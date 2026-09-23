@@ -1,6 +1,6 @@
 use sandsurf_host::api::{HostRequest, HostResponse};
 use sandsurf_host::service::{HostError, host_call, serve_host, serve_sandbox_guardian};
-use sandsurf_protocol::SandboxId;
+use sandsurf_protocol::{RuntimeResponse, SandboxId};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 const MAX_BRIDGE_BYTES: usize = 1024 * 1024;
 const MAX_BRIDGE_PENDING: usize = 64;
 const BRIDGE_WORKERS: usize = 8;
-const BRIDGE_VERSION: u16 = 1;
+const BRIDGE_VERSION: u16 = 2;
 
 fn main() {
     if let Err(error) = run() {
@@ -85,7 +85,7 @@ fn bridge_loop_with_handler(
     std::thread::scope(|scope| {
         let (jobs, receiver) = mpsc::sync_channel::<Vec<u8>>(MAX_BRIDGE_PENDING);
         let receiver = Arc::new(Mutex::new(receiver));
-        let (responses, completed) = mpsc::channel::<Vec<u8>>();
+        let (responses, completed) = mpsc::sync_channel::<Vec<u8>>(MAX_BRIDGE_PENDING);
         for _ in 0..BRIDGE_WORKERS {
             let receiver = Arc::clone(&receiver);
             let responses = responses.clone();
@@ -169,7 +169,53 @@ fn bridge_response(
             message: format!("invalid bridge request: {error}"),
         },
     };
-    serde_json::to_vec(&(id, BRIDGE_VERSION, response)).expect("bridge response serialization")
+    let (response, data) = match response {
+        HostResponse::Runtime {
+            response: RuntimeResponse::Output { page },
+        } => match page.into_binary_parts() {
+            Ok((page, chunks)) => (
+                HostResponse::Runtime {
+                    response: RuntimeResponse::OutputMetadata { page },
+                },
+                chunks.into_iter().flatten().collect::<Vec<_>>(),
+            ),
+            Err(error) => (
+                HostResponse::Rejected {
+                    category: "protocol".into(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            ),
+        },
+        response => (response, Vec::new()),
+    };
+    let result = bridge_payload(id, &response, &data);
+    if result.len() <= MAX_BRIDGE_BYTES {
+        result
+    } else {
+        bridge_payload(
+            id,
+            &HostResponse::Rejected {
+                category: "protocol".into(),
+                message: "bridge response exceeds its byte bound".into(),
+            },
+            &[],
+        )
+    }
+}
+
+fn bridge_payload(id: u64, response: &HostResponse, data: &[u8]) -> Vec<u8> {
+    let json =
+        serde_json::to_vec(&(id, BRIDGE_VERSION, response)).expect("bridge response serialization");
+    let mut payload = Vec::with_capacity(4 + json.len() + data.len());
+    payload.extend_from_slice(
+        &u32::try_from(json.len())
+            .expect("bounded JSON")
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(&json);
+    payload.extend_from_slice(data);
+    payload
 }
 
 #[cfg(target_os = "windows")]
@@ -310,6 +356,12 @@ fn argument(values: &[std::ffi::OsString], name: &str) -> Result<PathBuf, &'stat
 mod tests {
     use super::*;
 
+    fn decode_response(bytes: &[u8]) -> (u64, u16, HostResponse, &[u8]) {
+        let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let (id, version, response) = serde_json::from_slice(&bytes[4..4 + json_len]).unwrap();
+        (id, version, response, &bytes[4 + json_len..])
+    }
+
     fn request(bytes: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
         frame.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
@@ -337,8 +389,8 @@ mod tests {
             cursor.read_exact(&mut length).unwrap();
             let mut bytes = vec![0_u8; u32::from_le_bytes(length) as usize];
             cursor.read_exact(&mut bytes).unwrap();
-            let (id, version, response): (u64, u16, HostResponse) =
-                serde_json::from_slice(&bytes).unwrap();
+            let (id, version, response, data) = decode_response(&bytes);
+            assert!(data.is_empty());
             assert_eq!(version, BRIDGE_VERSION);
             ids.push(id);
             assert!(
@@ -414,14 +466,59 @@ mod tests {
             cursor.read_exact(&mut length).unwrap();
             let mut bytes = vec![0_u8; u32::from_le_bytes(length) as usize];
             cursor.read_exact(&mut bytes).unwrap();
-            let (id, version, response): (u64, u16, HostResponse) =
-                serde_json::from_slice(&bytes).unwrap();
+            let (id, version, response, data) = decode_response(&bytes);
+            assert!(data.is_empty());
             assert_eq!(version, BRIDGE_VERSION);
             assert!(matches!(response, HostResponse::Complete));
             ids.push(id);
         }
         assert_eq!(ids, [2, 1]);
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn bridge_sends_full_binary_output_without_json_byte_expansion() {
+        use sandsurf_protocol::{Counter, EvidenceChunk, EvidencePage, Stream, bytes_digest};
+        let bytes = vec![255; 64 * 1024];
+        let digest = bytes_digest(&bytes);
+        let boundary = Counter::try_from(bytes.len() as u64).unwrap();
+        let page = EvidencePage {
+            after: Counter::ZERO,
+            cursor: boundary,
+            available: boundary,
+            chunks: vec![EvidenceChunk {
+                sequence: Counter::ONE,
+                offset: Counter::ZERO,
+                stream: Stream::Stdout,
+                bytes: bytes.clone(),
+                bytes_digest: digest.clone(),
+                chain_digest: digest,
+            }],
+        };
+        let input =
+            request(&serde_json::to_vec(&(1_u64, BRIDGE_VERSION, HostRequest::Inspect)).unwrap());
+        let mut output = Vec::new();
+        bridge_loop_with_handler(&mut input.as_slice(), &mut output, &|_| {
+            Ok(HostResponse::Runtime {
+                response: RuntimeResponse::Output { page: page.clone() },
+            })
+        })
+        .unwrap();
+        let mut outer = [0; 4];
+        output.as_slice().read_exact(&mut outer).unwrap();
+        assert_eq!(u32::from_le_bytes(outer) as usize, output.len() - 4);
+        let (id, version, response, raw) = decode_response(&output[4..]);
+        assert_eq!((id, version), (1, BRIDGE_VERSION));
+        let HostResponse::Runtime {
+            response: RuntimeResponse::OutputMetadata { page },
+        } = response
+        else {
+            panic!("bridge did not return binary output metadata");
+        };
+        assert_eq!(
+            page.with_binary_parts(vec![raw.to_vec()]).unwrap().chunks[0].bytes,
+            bytes
+        );
     }
 
     #[test]

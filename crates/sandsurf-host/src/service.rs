@@ -3231,12 +3231,11 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
                         {
                             return;
                         }
-                        if let Ok(dispatch) = response.recv()
-                            && let Ok(frame) =
-                                bounded_host_response_frame(sequence, &dispatch.finish())
-                        {
+                        if let Ok(dispatch) = response.recv() {
                             // A lost response never reverses an admitted operation.
-                            let written = connection.write_frame(&frame, API_TIMEOUT).is_ok();
+                            let written =
+                                write_host_response(&mut connection, sequence, dispatch.finish())
+                                    .is_ok();
                             drop(connection);
                             if written {
                                 let _ = completed.send(());
@@ -3408,7 +3407,23 @@ pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
     let frame = connection
         .read_frame(API_TIMEOUT)?
         .ok_or(HostError::Invalid("host closed without a response"))?;
-    let response = parse_host_response(frame)?;
+    let response = match parse_host_response(frame)? {
+        HostResponse::Runtime {
+            response: RuntimeResponse::OutputMetadata { page },
+        } => HostResponse::Runtime {
+            response: RuntimeResponse::Output {
+                page: read_host_output_frames(&mut connection, page)?,
+            },
+        },
+        HostResponse::Runtime {
+            response: RuntimeResponse::Output { .. },
+        } => {
+            return Err(HostError::Invalid(
+                "host output must use binary data frames",
+            ));
+        }
+        response => response,
+    };
     if stopping && connection.read_frame(Duration::from_secs(10))?.is_some() {
         return Err(HostError::Invalid(
             "host sent data after its terminal response",
@@ -3443,6 +3458,123 @@ fn host_response_frame(sequence: Counter, response: &HostResponse) -> Result<Fra
 fn bounded_host_response_frame(sequence: Counter, response: &HostResponse) -> Result<Frame> {
     host_response_frame(sequence, response)
         .or_else(|error| host_response_frame(sequence, &rejected(error)))
+}
+
+fn write_host_response(
+    connection: &mut LocalConnection,
+    sequence: Counter,
+    response: HostResponse,
+) -> Result<()> {
+    let HostResponse::Runtime {
+        response: RuntimeResponse::Output { page },
+    } = response
+    else {
+        connection.write_frame(
+            &bounded_host_response_frame(sequence, &response)?,
+            API_TIMEOUT,
+        )?;
+        return Ok(());
+    };
+    let (page, chunks) = match page.into_binary_parts() {
+        Ok(parts) => parts,
+        Err(error) => {
+            connection.write_frame(
+                &host_response_frame(sequence, &rejected(error.into()))?,
+                API_TIMEOUT,
+            )?;
+            return Ok(());
+        }
+    };
+    let total = page.validate_lengths()?;
+    connection.write_frame(
+        &host_response_frame(
+            sequence,
+            &HostResponse::Runtime {
+                response: RuntimeResponse::OutputMetadata { page },
+            },
+        )?,
+        API_TIMEOUT,
+    )?;
+    let credit = connection
+        .read_frame(API_TIMEOUT)?
+        .ok_or(HostError::Invalid("host output credit is missing"))?;
+    if credit.kind != FrameKind::Credit
+        || credit.stream != OUTPUT_DATA_STREAM
+        || credit.sequence != Counter::ONE
+        || credit.authentication != [0; AUTHENTICATION_BYTES]
+        || credit.payload != (total as u64).to_be_bytes()
+    {
+        return Err(HostError::Invalid("host output credit is invalid"));
+    }
+    let mut data_sequence = Counter::ZERO;
+    for bytes in chunks {
+        data_sequence = data_sequence.next()?;
+        connection.write_frame(
+            &Frame {
+                kind: FrameKind::Data,
+                stream: OUTPUT_DATA_STREAM,
+                sequence: data_sequence,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload: bytes,
+            },
+            API_TIMEOUT,
+        )?;
+    }
+    data_sequence = data_sequence.next()?;
+    connection.write_frame(
+        &Frame {
+            kind: FrameKind::End,
+            stream: OUTPUT_DATA_STREAM,
+            sequence: data_sequence,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: Vec::new(),
+        },
+        API_TIMEOUT,
+    )?;
+    Ok(())
+}
+
+fn read_host_output_frames(
+    connection: &mut LocalConnection,
+    metadata: EvidencePageMetadata,
+) -> Result<EvidencePage> {
+    let total = metadata.validate_lengths()?;
+    connection.write_frame(
+        &Frame {
+            kind: FrameKind::Credit,
+            stream: OUTPUT_DATA_STREAM,
+            sequence: Counter::ONE,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: (total as u64).to_be_bytes().to_vec(),
+        },
+        API_TIMEOUT,
+    )?;
+    let mut chunks = Vec::with_capacity(metadata.chunks.len());
+    for (index, chunk) in metadata.chunks.iter().enumerate() {
+        let frame = connection
+            .read_frame(API_TIMEOUT)?
+            .ok_or(HostError::Invalid("host output data is incomplete"))?;
+        if frame.kind != FrameKind::Data
+            || frame.stream != OUTPUT_DATA_STREAM
+            || frame.sequence != Counter::try_from(index as u64 + 1)?
+            || frame.authentication != [0; AUTHENTICATION_BYTES]
+            || frame.payload.len() != chunk.length as usize
+        {
+            return Err(HostError::Invalid("host output data frame is invalid"));
+        }
+        chunks.push(frame.payload);
+    }
+    let end = connection
+        .read_frame(API_TIMEOUT)?
+        .ok_or(HostError::Invalid("host output stream end is missing"))?;
+    if end.kind != FrameKind::End
+        || end.stream != OUTPUT_DATA_STREAM
+        || end.sequence != Counter::try_from(metadata.chunks.len() as u64 + 1)?
+        || end.authentication != [0; AUTHENTICATION_BYTES]
+    {
+        return Err(HostError::Invalid("host output stream end is invalid"));
+    }
+    Ok(metadata.with_binary_parts(chunks)?)
 }
 
 fn parse_host_response(frame: Frame) -> Result<HostResponse> {
@@ -3768,6 +3900,61 @@ mod tests {
             HostResponse::Rejected { category, message }
                 if category == "protocol" && message.contains("control bound")
         ));
+    }
+
+    #[test]
+    fn local_host_output_uses_credit_limited_binary_frames() {
+        let parent = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = parent.join(format!(
+            "ssout-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        prepare_directory(&root).unwrap();
+        let bytes = vec![255; 64 * 1024];
+        let content = bytes_digest(&bytes);
+        let boundary = Counter::try_from(bytes.len() as u64).unwrap();
+        let page = EvidencePage {
+            after: Counter::ZERO,
+            cursor: boundary,
+            available: boundary,
+            chunks: vec![EvidenceChunk {
+                sequence: Counter::ONE,
+                offset: Counter::ZERO,
+                stream: Stream::Stdout,
+                bytes: bytes.clone(),
+                bytes_digest: content.clone(),
+                chain_digest: content,
+            }],
+        };
+        prepare_directory(&root.join("api")).unwrap();
+        let listener = LocalListener::bind(&root.join("api")).unwrap();
+        let server = thread::spawn(move || {
+            let mut connection = listener.accept(Duration::from_secs(5)).unwrap();
+            let request = connection.read_frame(API_TIMEOUT).unwrap().unwrap();
+            write_host_response(
+                &mut connection,
+                request.sequence,
+                HostResponse::Runtime {
+                    response: RuntimeResponse::Output { page },
+                },
+            )
+            .unwrap();
+        });
+        let response = host_call(&root, HostRequest::Inspect).unwrap();
+        let HostResponse::Runtime {
+            response: RuntimeResponse::Output { page },
+        } = response
+        else {
+            panic!("host did not return binary output");
+        };
+        assert_eq!(page.chunks[0].bytes, bytes);
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

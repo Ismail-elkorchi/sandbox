@@ -3,6 +3,35 @@ use serde_json::json;
 use std::io::{self, Read};
 
 #[test]
+fn evidence_binary_metadata_binds_full_page_coverage_and_bytes() {
+    let bytes = vec![255; MAX_STREAM_BYTES];
+    let content = bytes_digest(&bytes);
+    let cursor = Counter::try_from(bytes.len() as u64).unwrap();
+    let page = EvidencePage {
+        after: Counter::ZERO,
+        cursor,
+        available: cursor,
+        chunks: vec![EvidenceChunk {
+            sequence: Counter::ONE,
+            offset: Counter::ZERO,
+            stream: Stream::Stdout,
+            bytes: bytes.clone(),
+            bytes_digest: content.clone(),
+            chain_digest: content,
+        }],
+    };
+    let (metadata, parts) = page.clone().into_binary_parts().unwrap();
+    assert!(serde_json::to_vec(&metadata).unwrap().len() < MAX_CONTROL_BYTES);
+    assert_eq!(metadata.clone().with_binary_parts(parts).unwrap(), page);
+    let mut changed = bytes;
+    changed[0] = 0;
+    assert!(metadata.clone().with_binary_parts(vec![changed]).is_err());
+    let mut gap = metadata;
+    gap.chunks[0].offset = Counter::ONE;
+    assert!(gap.validate_lengths().is_err());
+}
+
+#[test]
 fn identifiers_and_counters_are_strict() {
     for value in ["", ".", "..", "a/b", "a\\b", "hello world", "é", "a\0b"] {
         assert!(SandboxId::try_from(value).is_err());
