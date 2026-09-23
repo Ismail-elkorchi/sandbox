@@ -23,6 +23,9 @@ fn evidence_binary_metadata_binds_full_page_coverage_and_bytes() {
     let (metadata, parts) = page.clone().into_binary_parts().unwrap();
     assert!(serde_json::to_vec(&metadata).unwrap().len() < MAX_CONTROL_BYTES);
     assert_eq!(metadata.clone().with_binary_parts(parts).unwrap(), page);
+    let mut bad_source = page;
+    bad_source.chunks[0].bytes_digest = bytes_digest(b"different");
+    assert!(bad_source.into_binary_parts().is_err());
     let mut changed = bytes;
     changed[0] = 0;
     assert!(metadata.clone().with_binary_parts(vec![changed]).is_err());

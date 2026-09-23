@@ -682,6 +682,11 @@ impl EvidencePage {
         let mut metadata = Vec::with_capacity(self.chunks.len());
         let mut bytes = Vec::with_capacity(self.chunks.len());
         for chunk in self.chunks {
+            if crate::bytes_digest(&chunk.bytes) != chunk.bytes_digest {
+                return Err(crate::Invalid(
+                    "evidence chunk bytes disagree with their digest",
+                ));
+            }
             metadata.push(EvidenceChunkMetadata {
                 sequence: chunk.sequence,
                 offset: chunk.offset,
