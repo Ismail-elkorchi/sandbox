@@ -108,6 +108,26 @@ pub struct RetainedPage {
     pub required_bytes: Option<Counter>,
 }
 
+/// Bounded control metadata for a page whose original bytes travel in
+/// authenticated, credit-limited data frames on the guest channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedChunkMetadata {
+    pub cursor: Counter,
+    pub stream: Stream,
+    pub length: u32,
+    pub digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedPageMetadata {
+    pub after: Counter,
+    pub available: Counter,
+    pub chunks: Vec<RetainedChunkMetadata>,
+    pub required_bytes: Option<Counter>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProcessCompletion {
@@ -571,6 +591,9 @@ pub enum GuestServiceResponse {
     },
     Output {
         page: RetainedPage,
+    },
+    OutputMetadata {
+        page: RetainedPageMetadata,
     },
     File {
         response: FilesystemResponse,

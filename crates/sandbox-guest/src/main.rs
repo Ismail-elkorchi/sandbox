@@ -12,6 +12,7 @@ use sandsurf_protocol::{
     GuestFinish, GuestHandshake, GuestHello, SandboxId,
 };
 use sandsurf_protocol::{GuestServiceRequest, GuestServiceResponse, bytes_digest};
+use sandsurf_protocol::{OUTPUT_DATA_STREAM, RetainedChunkMetadata, RetainedPageMetadata};
 use sandsurf_workload::{
     CgroupLimits, CgroupManager, FilesystemService, PersistentWorkloadService, ProcessSupervisor,
 };
@@ -368,6 +369,42 @@ fn serve_connection(
         };
         drop(ordinary_generation);
         drop(rebind_generation);
+        let mut output_chunks = Vec::new();
+        let response = match response {
+            GuestServiceResponse::Output { page } => {
+                let mut metadata = Vec::with_capacity(page.chunks.len());
+                let mut total = 0usize;
+                for chunk in page.chunks {
+                    total = total.checked_add(chunk.bytes.len()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "output page length overflow")
+                    })?;
+                    if total > sandsurf_protocol::MAX_STREAM_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "output page exceeds data-frame credit bound",
+                        ));
+                    }
+                    metadata.push(RetainedChunkMetadata {
+                        cursor: chunk.cursor,
+                        stream: chunk.stream,
+                        length: u32::try_from(chunk.bytes.len())
+                            .map_err(|_| io::Error::other("output chunk length overflow"))?,
+                        digest: chunk.digest,
+                    });
+                    output_chunks.push(chunk.bytes);
+                }
+                GuestServiceResponse::OutputMetadata {
+                    page: RetainedPageMetadata {
+                        after: page.after,
+                        available: page.available,
+                        chunks: metadata,
+                        required_bytes: page.required_bytes,
+                    },
+                }
+            }
+            other => other,
+        };
+        let output_page = matches!(&response, GuestServiceResponse::OutputMetadata { .. });
         let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
         if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
             return Err(io::Error::new(
@@ -388,6 +425,9 @@ fn serve_connection(
             })
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         response.write(connection)?;
+        if output_page {
+            send_output_frames(connection, &mut codec, &output_chunks)?;
+        }
         outgoing = outgoing
             .next()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -408,6 +448,61 @@ fn serve_connection(
             break;
         }
     }
+    Ok(())
+}
+
+fn send_output_frames(
+    connection: &mut File,
+    codec: &mut sandsurf_protocol::SessionCodec,
+    chunks: &[Vec<u8>],
+) -> io::Result<()> {
+    let total: usize = chunks.iter().map(Vec::len).sum();
+    codec
+        .open_stream(OUTPUT_DATA_STREAM, false)
+        .map_err(io::Error::other)?;
+    let credit = Frame::read(connection)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "output credit is missing"))?;
+    let credit = codec.open(credit).map_err(io::Error::other)?;
+    if credit.kind != FrameKind::Credit
+        || credit.stream != OUTPUT_DATA_STREAM
+        || credit.payload != (total as u64).to_be_bytes()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "output credit does not match the declared page",
+        ));
+    }
+    codec
+        .accept_send_credit(OUTPUT_DATA_STREAM, total as u64)
+        .map_err(io::Error::other)?;
+    let mut sequence = Counter::ZERO;
+    for bytes in chunks {
+        sequence = sequence.next().map_err(io::Error::other)?;
+        codec
+            .seal(Frame {
+                kind: FrameKind::Data,
+                stream: OUTPUT_DATA_STREAM,
+                sequence,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload: bytes.clone(),
+            })
+            .map_err(io::Error::other)?
+            .write(connection)?;
+    }
+    sequence = sequence.next().map_err(io::Error::other)?;
+    codec
+        .seal(Frame {
+            kind: FrameKind::End,
+            stream: OUTPUT_DATA_STREAM,
+            sequence,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: Vec::new(),
+        })
+        .map_err(io::Error::other)?
+        .write(connection)?;
+    codec
+        .close_stream(OUTPUT_DATA_STREAM)
+        .map_err(io::Error::other)?;
     Ok(())
 }
 

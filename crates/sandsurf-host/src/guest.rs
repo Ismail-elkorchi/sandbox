@@ -8,6 +8,9 @@ use sandsurf_protocol::{
     ProcessState, SessionCodec,
 };
 use sandsurf_protocol::{Capability, Digest, SandboxId};
+use sandsurf_protocol::{
+    OUTPUT_DATA_STREAM, RetainedChunk, RetainedPage, RetainedPageMetadata, bytes_digest,
+};
 use sandsurf_state::RuntimeJournal;
 use std::fmt;
 use std::io;
@@ -164,7 +167,22 @@ impl<C: GuestChannel> GuestClient<C> {
                 "guest returned a non-control response",
             ));
         }
-        let response = serde_json::from_slice(&response.payload)?;
+        let response: GuestServiceResponse = serde_json::from_slice(&response.payload)?;
+        let response = match (request, response) {
+            (
+                GuestServiceRequest::ReadOutput { after, maximum, .. },
+                GuestServiceResponse::OutputMetadata { page },
+            ) if page.after == *after => GuestServiceResponse::Output {
+                page: read_output_frames(session, page, *maximum)?,
+            },
+            (_, GuestServiceResponse::OutputMetadata { .. })
+            | (_, GuestServiceResponse::Output { .. }) => {
+                return Err(GuestClientError::Protocol(
+                    "guest output did not use the requested binary stream",
+                ));
+            }
+            (_, response) => response,
+        };
         let completion = Frame::read(&mut *session.connection)?.ok_or(
             GuestClientError::Protocol("guest closed without protocol completion"),
         )?;
@@ -179,6 +197,93 @@ impl<C: GuestChannel> GuestClient<C> {
         }
         Ok(response)
     }
+}
+
+fn read_output_frames(
+    session: &mut GuestSession,
+    metadata: RetainedPageMetadata,
+    maximum: u32,
+) -> Result<RetainedPage, GuestClientError> {
+    let mut expected_cursor = metadata.after.get();
+    let mut total = 0usize;
+    for chunk in &metadata.chunks {
+        if chunk.length == 0
+            || chunk.length as usize > sandsurf_protocol::MAX_STREAM_BYTES
+            || chunk.cursor.get() != expected_cursor
+        {
+            return Err(GuestClientError::Protocol(
+                "guest output metadata is invalid",
+            ));
+        }
+        total = total
+            .checked_add(chunk.length as usize)
+            .ok_or(GuestClientError::Protocol(
+                "guest output page length overflow",
+            ))?;
+        expected_cursor = expected_cursor
+            .checked_add(chunk.length as u64)
+            .ok_or(GuestClientError::Protocol("guest output cursor overflow"))?;
+    }
+    if total > maximum as usize
+        || total > sandsurf_protocol::MAX_STREAM_BYTES
+        || expected_cursor > metadata.available.get()
+    {
+        return Err(GuestClientError::Protocol(
+            "guest output page exceeds its boundary",
+        ));
+    }
+    session.codec.open_stream(OUTPUT_DATA_STREAM, false)?;
+    session
+        .codec
+        .grant_receive_credit(OUTPUT_DATA_STREAM, total as u64)?;
+    session
+        .codec
+        .seal(Frame {
+            kind: FrameKind::Credit,
+            stream: OUTPUT_DATA_STREAM,
+            sequence: Counter::ONE,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: (total as u64).to_be_bytes().to_vec(),
+        })?
+        .write(&mut *session.connection)?;
+    let mut chunks = Vec::with_capacity(metadata.chunks.len());
+    for chunk in metadata.chunks {
+        let frame = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
+            "guest output data is incomplete",
+        ))?;
+        let frame = session.codec.open(frame)?;
+        if frame.kind != FrameKind::Data
+            || frame.stream != OUTPUT_DATA_STREAM
+            || frame.payload.len() != chunk.length as usize
+            || bytes_digest(&frame.payload) != chunk.digest
+        {
+            return Err(GuestClientError::Protocol(
+                "guest output data differs from metadata",
+            ));
+        }
+        chunks.push(RetainedChunk {
+            cursor: chunk.cursor,
+            stream: chunk.stream,
+            bytes: frame.payload,
+            digest: chunk.digest,
+        });
+    }
+    let end = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
+        "guest output stream end is missing",
+    ))?;
+    let end = session.codec.open(end)?;
+    if end.kind != FrameKind::End || end.stream != OUTPUT_DATA_STREAM {
+        return Err(GuestClientError::Protocol(
+            "guest output stream end is invalid",
+        ));
+    }
+    session.codec.close_stream(OUTPUT_DATA_STREAM)?;
+    Ok(RetainedPage {
+        after: metadata.after,
+        available: metadata.available,
+        chunks,
+        required_bytes: metadata.required_bytes,
+    })
 }
 
 pub struct RemoteWorkloadDriver<C> {
@@ -383,7 +488,10 @@ fn read_unauthed<T: serde::de::DeserializeOwned>(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use sandsurf_protocol::{GuestFinish, GuestHandshake, GuestHello};
+    use sandsurf_protocol::{
+        GuestFinish, GuestHandshake, GuestHello, RetainedChunkMetadata, RetainedPageMetadata,
+        Stream,
+    };
     use std::os::unix::net::UnixStream;
 
     struct PairChannel(Option<UnixStream>);
@@ -483,6 +591,144 @@ mod tests {
                 }
             );
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_output_uses_credit_limited_binary_frames() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let sandbox = SandboxId::try_from("binary-guest").unwrap();
+        let process = sandsurf_protocol::ProcessId::try_from("binary-process").unwrap();
+        let boot = bytes_digest(b"verified-binary-boot");
+        let capability = [9; 32];
+        let server_sandbox = sandbox.clone();
+        let server_boot = boot.clone();
+        let server_process = process.clone();
+        let server = std::thread::spawn(move || {
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let hello: GuestHello = read_unauthed(&mut server_stream).unwrap();
+            let (handshake, challenge) = GuestHandshake::accept(
+                BootCapability::from_bytes(capability),
+                &server_sandbox,
+                Counter::ONE,
+                &server_boot,
+                &hello,
+            )
+            .unwrap();
+            send_unauthed(&mut server_stream, &challenge);
+            let finish: GuestFinish = read_unauthed(&mut server_stream).unwrap();
+            let mut codec = handshake.finish(&finish).unwrap();
+            let request = codec
+                .open(Frame::read(&mut server_stream).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<GuestServiceRequest>(&request.payload).unwrap(),
+                GuestServiceRequest::ReadOutput {
+                    process_id: server_process,
+                    after: Counter::ZERO,
+                    maximum: 64,
+                }
+            );
+            let pieces = [vec![0, 255, 1], vec![3, 4]];
+            let metadata = RetainedPageMetadata {
+                after: Counter::ZERO,
+                available: 5u64.try_into().unwrap(),
+                chunks: vec![
+                    RetainedChunkMetadata {
+                        cursor: Counter::ZERO,
+                        stream: Stream::Stdout,
+                        length: 3,
+                        digest: bytes_digest(&pieces[0]),
+                    },
+                    RetainedChunkMetadata {
+                        cursor: 3u64.try_into().unwrap(),
+                        stream: Stream::Stderr,
+                        length: 2,
+                        digest: bytes_digest(&pieces[1]),
+                    },
+                ],
+                required_bytes: None,
+            };
+            codec.open_stream(OUTPUT_DATA_STREAM, false).unwrap();
+            codec
+                .seal(Frame {
+                    kind: FrameKind::Control,
+                    stream: 0,
+                    sequence: Counter::ONE,
+                    authentication: [0; AUTHENTICATION_BYTES],
+                    payload: serde_json::to_vec(&GuestServiceResponse::OutputMetadata {
+                        page: metadata,
+                    })
+                    .unwrap(),
+                })
+                .unwrap()
+                .write(&mut server_stream)
+                .unwrap();
+            let credit = codec
+                .open(Frame::read(&mut server_stream).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(credit.kind, FrameKind::Credit);
+            assert_eq!(credit.stream, OUTPUT_DATA_STREAM);
+            assert_eq!(credit.payload, 5u64.to_be_bytes());
+            codec.accept_send_credit(OUTPUT_DATA_STREAM, 5).unwrap();
+            for (index, bytes) in pieces.into_iter().enumerate() {
+                codec
+                    .seal(Frame {
+                        kind: FrameKind::Data,
+                        stream: OUTPUT_DATA_STREAM,
+                        sequence: ((index + 1) as u64).try_into().unwrap(),
+                        authentication: [0; AUTHENTICATION_BYTES],
+                        payload: bytes,
+                    })
+                    .unwrap()
+                    .write(&mut server_stream)
+                    .unwrap();
+            }
+            codec
+                .seal(Frame {
+                    kind: FrameKind::End,
+                    stream: OUTPUT_DATA_STREAM,
+                    sequence: 3u64.try_into().unwrap(),
+                    authentication: [0; AUTHENTICATION_BYTES],
+                    payload: Vec::new(),
+                })
+                .unwrap()
+                .write(&mut server_stream)
+                .unwrap();
+            codec.close_stream(OUTPUT_DATA_STREAM).unwrap();
+            codec
+                .seal(Frame {
+                    kind: FrameKind::Control,
+                    stream: 0,
+                    sequence: 2u64.try_into().unwrap(),
+                    authentication: [0; AUTHENTICATION_BYTES],
+                    payload: CONTROL_COMPLETE.to_vec(),
+                })
+                .unwrap()
+                .write(&mut server_stream)
+                .unwrap();
+        });
+        let mut client = GuestClient::new(
+            PairChannel(Some(client_stream)),
+            sandbox,
+            Counter::ONE,
+            boot,
+            capability,
+        );
+        let response = client
+            .call(&GuestServiceRequest::ReadOutput {
+                process_id: process,
+                after: Counter::ZERO,
+                maximum: 64,
+            })
+            .unwrap();
+        let GuestServiceResponse::Output { page } = response else {
+            panic!("guest did not return output");
+        };
+        assert_eq!(page.chunks[0].bytes, [0, 255, 1]);
+        assert_eq!(page.chunks[1].bytes, [3, 4]);
         server.join().unwrap();
     }
 }

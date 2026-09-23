@@ -310,13 +310,13 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
     {
         return Err(ImageError::Invalid("invalid version or identifier".into()));
     }
-    if manifest.boot_bundle.guest_agent.protocol_major != 2
-        || manifest.workload.compatible_protocol_major != 2
+    if manifest.boot_bundle.guest_agent.protocol_major != 3
+        || manifest.workload.compatible_protocol_major != 3
         || !manifest.boot_bundle.capabilities.vsock
         || !manifest.boot_bundle.capabilities.seccomp
     {
         return Err(ImageError::Invalid(
-            "guest must support protocol 2, vsock, and seccomp".into(),
+            "guest must support protocol 3, vsock, and seccomp".into(),
         ));
     }
     for digest in [
@@ -597,7 +597,7 @@ mod tests {
                 },
                 guest_agent: GuestAgentArtifact {
                     version: "1".into(),
-                    protocol_major: 2,
+                    protocol_major: 3,
                     protocol_minor: 3,
                     sha256: hex_sha256(b"guest-agent"),
                 },
@@ -630,7 +630,7 @@ mod tests {
                     source_digest: hex_sha256(b"source"),
                     materials: BTreeMap::from([("fixture".into(), hex_sha256(b"fixture"))]),
                 },
-                compatible_protocol_major: 2,
+                compatible_protocol_major: 3,
             },
             platform_artifacts: PlatformArtifacts::default(),
             signature: None,

@@ -68,7 +68,7 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     );
     const largeOutput = await sandbox.processes.spawn({
       processId: "multipage-output",
-      argv: ["/bin/sh", "-c", "yes x | head -c 131072"],
+      argv: ["/bin/sh", "-c", "head -c 131072 /dev/urandom > /workspace/binary-output; cat /workspace/binary-output"],
     });
     assert.equal(exitCode((await largeOutput.wait()).state), 0);
     let outputCursor = 0;
@@ -83,7 +83,8 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
       }
     }
     assert.equal(outputCursor, 131072);
-    assert.equal(Buffer.concat(outputParts).toString(), "x\n".repeat(65536));
+    const expectedOutputDigest = (await run(sandbox, ["/bin/busybox", "sha256sum", "/workspace/binary-output"])).slice(0, 64);
+    assert.equal(createHash("sha256").update(Buffer.concat(outputParts)).digest("hex"), expectedOutputDigest);
 
     const baseWorkspace = await sandbox.workspace.importFromHost({
       source: hostWorkspace,
