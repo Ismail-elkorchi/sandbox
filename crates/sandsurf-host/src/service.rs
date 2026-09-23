@@ -3232,14 +3232,18 @@ pub fn serve_sandbox_guardian(root: &Path, sandbox: SandboxId) -> Result<()> {
 }
 
 pub fn host_call(root: &Path, request: HostRequest) -> Result<HostResponse> {
+    let endpoint = root.join("api");
+    if let Err(error) = fs::symlink_metadata(&endpoint)
+        && error.kind() == io::ErrorKind::NotFound
+    {
+        return Err(HostError::EndpointUnavailable(error));
+    }
     let mut connection =
-        LocalConnection::connect(&root.join("api"), API_TIMEOUT).map_err(|error| {
-            match error.kind() {
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
-                    HostError::EndpointUnavailable(error)
-                }
-                _ => HostError::Io(error),
+        LocalConnection::connect(&endpoint, API_TIMEOUT).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                HostError::EndpointUnavailable(error)
             }
+            _ => HostError::Io(error),
         })?;
     let payload = serde_json::to_vec(&(HOST_API_VERSION, request))?;
     if payload.len() > MAX_CONTROL_BYTES {

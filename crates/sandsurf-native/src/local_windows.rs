@@ -493,7 +493,13 @@ impl LocalConnection {
                     }
                 }
                 Some(ERROR_FILE_NOT_FOUND) => {
-                    std::thread::sleep(deadline.remaining()?.min(Duration::from_millis(10)));
+                    // Absence is an immediate observation. The host/SDK owns
+                    // service startup and its retry policy; a pipe connect
+                    // must not hide absence behind an operation-length wait.
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "local pipe endpoint is unavailable",
+                    ));
                 }
                 _ => return Err(error),
             }
@@ -559,7 +565,7 @@ struct Deadline(Instant);
 impl Deadline {
     fn new(timeout: Duration) -> io::Result<Self> {
         if timeout.is_zero() || timeout > MAX_DEADLINE {
-            return Err(invalid("local transport deadline must be in (0, 60s]"));
+            return Err(invalid("local transport deadline must be in (0, 300s]"));
         }
         Ok(Self(Instant::now() + timeout))
     }

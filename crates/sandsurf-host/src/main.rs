@@ -278,10 +278,13 @@ mod tests {
             let mut bytes = vec![0_u8; u32::from_le_bytes(length) as usize];
             cursor.read_exact(&mut bytes).unwrap();
             let (_, response): (u16, HostResponse) = serde_json::from_slice(&bytes).unwrap();
-            assert!(matches!(
-                response,
-                HostResponse::Rejected { category, .. } if category == "unavailable"
-            ));
+            assert!(
+                matches!(
+                    &response,
+                    HostResponse::Rejected { category, .. } if category == "unavailable"
+                ),
+                "bridge should report an absent host endpoint as unavailable: {response:?}"
+            );
         }
         assert!(cursor.is_empty());
     }
