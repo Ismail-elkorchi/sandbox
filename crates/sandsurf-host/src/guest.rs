@@ -367,10 +367,29 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
                 maximum,
             }) {
                 Ok(GuestServiceResponse::Output { page }) => page,
+                Ok(_) => {
+                    return Err(sandsurf_state::Error::Corrupt(
+                        "guest output response kind is invalid",
+                    ));
+                }
+                Err(
+                    GuestClientError::Protocol(_)
+                    | GuestClientError::Contract(_)
+                    | GuestClientError::Json(_),
+                ) => {
+                    return Err(sandsurf_state::Error::Corrupt(
+                        "guest output response failed protocol validation",
+                    ));
+                }
+                Err(GuestClientError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                    return Err(sandsurf_state::Error::Corrupt(
+                        "guest output frame is malformed",
+                    ));
+                }
                 // Transport unavailability is not evidence corruption. The
                 // bytes remain in the guest spool and reconciliation resumes
                 // at the last committed cursor on the next pass.
-                _ => return Ok(()),
+                Err(_) => return Ok(()),
             };
             if page.required_bytes.is_some() {
                 return Err(sandsurf_state::Error::Corrupt(
