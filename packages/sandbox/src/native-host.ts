@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const API_VERSION = 3;
+const BRIDGE_VERSION = 1;
 const MAX_BRIDGE_BYTES = 1024 * 1024;
 const MAX_BRIDGE_PENDING = 64;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -24,9 +24,9 @@ export class NativeHostClient {
   readonly #exited: Promise<void>;
   #finishExit!: () => void;
   #buffer = Buffer.alloc(0);
-  #inFlight: { resolve: (value: string) => void; reject: (error: Error) => void } | undefined;
-  #queue: Promise<void> = Promise.resolve();
-  #queued = 0;
+  #pending = new Map<number, { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }>();
+  #drained: (() => void)[] = [];
+  #nextId = 1;
   #failed: SandsurfHostError | undefined;
   #closed = false;
 
@@ -87,35 +87,14 @@ export class NativeHostClient {
 
   async request(request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> {
     if (this.#closed) throw new SandsurfHostError("client", "Sandsurf client is closed");
-    const bytes = Buffer.from(JSON.stringify([API_VERSION, request]), "utf8");
+    if (this.#failed !== undefined) throw this.#failed;
+    if (this.#nextId > Number.MAX_SAFE_INTEGER) throw new SandsurfHostError("capacity", "native bridge request identity exhausted");
+    const id = this.#nextId++;
+    const bytes = Buffer.from(JSON.stringify([id, BRIDGE_VERSION, request]), "utf8");
     if (bytes.byteLength === 0 || bytes.byteLength > MAX_BRIDGE_BYTES) throw new SandsurfHostError("protocol", "native bridge request exceeds its byte bound");
-    if (this.#queued >= MAX_BRIDGE_PENDING) throw new SandsurfHostError("capacity", "native bridge request queue is full");
-    this.#queued += 1;
-    const task = this.#queue.then(() => this.#exchange(bytes));
-    this.#queue = task.then(() => undefined, () => undefined).finally(() => { this.#queued -= 1; });
-    const response = await task;
-    const parsed: unknown = JSON.parse(response);
-    if (!Array.isArray(parsed) || parsed.length !== 2 || parsed[0] !== API_VERSION || !record(parsed[1])) {
-      throw new SandsurfHostError("protocol", "native host returned an invalid response");
-    }
-    const value = parsed[1];
-    if (value.kind === "rejected") throw new SandsurfHostError(text(value.category), text(value.message));
-    return value;
-  }
-
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    await this.#queue;
-    this.#bridge.stdin.end();
-    await this.#exited;
-  }
-
-  #exchange(bytes: Buffer): Promise<string> {
-    if (this.#failed !== undefined) return Promise.reject(this.#failed);
-    if (this.#inFlight !== undefined) return Promise.reject(new SandsurfHostError("protocol", "native bridge request overlap"));
-    return new Promise((resolveExchange, rejectExchange) => {
-      this.#inFlight = { resolve: resolveExchange, reject: rejectExchange };
+    if (this.#pending.size >= MAX_BRIDGE_PENDING) throw new SandsurfHostError("capacity", "native bridge request queue is full");
+    return new Promise((resolveRequest, rejectRequest) => {
+      this.#pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
       const header = Buffer.allocUnsafe(4); header.writeUInt32LE(bytes.byteLength);
       this.#bridge.stdin.write(Buffer.concat([header, bytes]), (error?: Error | null) => {
         if (error !== undefined && error !== null) this.#fail(new SandsurfHostError("transport", `native bridge write failed: ${error.message}`));
@@ -123,33 +102,65 @@ export class NativeHostClient {
     });
   }
 
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    if (this.#pending.size !== 0) await new Promise<void>((resolveDrain) => { this.#drained.push(resolveDrain); });
+    this.#bridge.stdin.end();
+    await this.#exited;
+  }
+
   #read(chunk: Buffer): void {
-    if (this.#buffer.byteLength + chunk.byteLength > MAX_BRIDGE_BYTES + 4) {
-      this.#fail(new SandsurfHostError("protocol", "native bridge response exceeds its byte bound"));
-      return;
+    let position = 0;
+    while (position < chunk.byteLength) {
+      const target = this.#buffer.byteLength < 4 ? 4 : 4 + this.#buffer.readUInt32LE(0);
+      const take = Math.min(target - this.#buffer.byteLength, chunk.byteLength - position);
+      this.#buffer = Buffer.concat([this.#buffer, chunk.subarray(position, position + take)]);
+      position += take;
+      if (this.#buffer.byteLength === 4) {
+        const length = this.#buffer.readUInt32LE(0);
+        if (length === 0 || length > MAX_BRIDGE_BYTES) {
+          this.#fail(new SandsurfHostError("protocol", "native bridge returned an invalid frame"));
+          return;
+        }
+      }
+      if (this.#buffer.byteLength < 4 || this.#buffer.byteLength < 4 + this.#buffer.readUInt32LE(0)) continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(this.#buffer.subarray(4).toString("utf8")); }
+      catch { this.#fail(new SandsurfHostError("protocol", "native bridge returned invalid JSON")); return; }
+      this.#buffer = Buffer.alloc(0);
+      if (!Array.isArray(parsed) || parsed.length !== 3 || !Number.isSafeInteger(parsed[0]) || parsed[0] <= 0 || parsed[1] !== BRIDGE_VERSION || !record(parsed[2])) {
+        this.#fail(new SandsurfHostError("protocol", "native host returned an invalid response"));
+        return;
+      }
+      const pending = this.#pending.get(parsed[0]);
+      if (pending === undefined) { this.#fail(new SandsurfHostError("protocol", "native bridge returned an unknown request identity")); return; }
+      this.#pending.delete(parsed[0]);
+      const value = parsed[2];
+      try {
+        if (value.kind === "rejected") pending.reject(new SandsurfHostError(text(value.category), text(value.message)));
+        else pending.resolve(value);
+      } catch {
+        const error = new SandsurfHostError("protocol", "native bridge returned an invalid rejection");
+        pending.reject(error);
+        this.#fail(error);
+        return;
+      }
+      this.#notifyDrained();
     }
-    this.#buffer = Buffer.concat([this.#buffer, chunk]);
-    if (this.#buffer.byteLength < 4) return;
-    const length = this.#buffer.readUInt32LE(0);
-    if (length === 0 || length > MAX_BRIDGE_BYTES || this.#buffer.byteLength > length + 4) {
-      this.#fail(new SandsurfHostError("protocol", "native bridge returned an invalid frame"));
-      return;
-    }
-    if (this.#buffer.byteLength < length + 4) return;
-    const response = this.#buffer.subarray(4).toString("utf8");
-    this.#buffer = Buffer.alloc(0);
-    const pending = this.#inFlight;
-    this.#inFlight = undefined;
-    if (pending === undefined) this.#fail(new SandsurfHostError("protocol", "native bridge returned an unsolicited response"));
-    else pending.resolve(response);
   }
 
   #fail(error: SandsurfHostError): void {
     if (this.#failed !== undefined) return;
     this.#failed = error;
-    this.#inFlight?.reject(error);
-    this.#inFlight = undefined;
+    for (const pending of this.#pending.values()) pending.reject(error);
+    this.#pending.clear();
+    this.#notifyDrained();
     this.#bridge.kill();
+  }
+
+  #notifyDrained(): void {
+    if (this.#pending.size === 0) for (const resolveDrain of this.#drained.splice(0)) resolveDrain();
   }
 
   async stopService(): Promise<void> {

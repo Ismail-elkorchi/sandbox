@@ -62,6 +62,7 @@ fn supervisor_main() -> io::Result<()> {
     let boot_identity = read_boot_identity().map_err(|error| stage("read boot identity", error))?;
     let network_capability = Arc::new(RwLock::new(boot_identity.network_capability));
     let identity = Arc::new(RwLock::new(boot_identity));
+    let session_generation = Arc::new(RwLock::new(()));
     let listener = listen_vsock(GUEST_CONTROL_PORT)
         .map_err(|error| stage("listen on guest control", error))?;
     prepare_persistent_workload().map_err(|error| stage("prepare persistent workload", error))?;
@@ -112,6 +113,7 @@ fn supervisor_main() -> io::Result<()> {
         }
         let service = Arc::clone(&service);
         let identity = Arc::clone(&identity);
+        let session_generation = Arc::clone(&session_generation);
         let network_capability = Arc::clone(&network_capability);
         let connections = Arc::clone(&connections);
         std::thread::spawn(move || {
@@ -124,9 +126,13 @@ fn supervisor_main() -> io::Result<()> {
             let _guard = ConnectionGuard(connections);
             // SAFETY: this worker receives sole ownership of the accepted descriptor.
             let mut connection = unsafe { File::from_raw_fd(connection) };
-            if let Err(error) =
-                serve_connection(&mut connection, &identity, &network_capability, &service)
-            {
+            if let Err(error) = serve_connection(
+                &mut connection,
+                &identity,
+                &session_generation,
+                &network_capability,
+                &service,
+            ) {
                 eprintln!(
                     "sandsurf guest control connection failed: {}",
                     bounded(&error.to_string())
@@ -171,6 +177,7 @@ fn create_process_supervisor(
 fn serve_connection(
     connection: &mut File,
     identity: &Arc<RwLock<BootIdentity>>,
+    session_generation: &Arc<RwLock<()>>,
     network_capability: &Arc<RwLock<[u8; 32]>>,
     service: &PersistentWorkloadService,
 ) -> io::Result<()> {
@@ -204,6 +211,37 @@ fn serve_connection(
         let request: GuestServiceRequest = serde_json::from_slice(&frame.payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let rebinds_epoch = matches!(request, GuestServiceRequest::RebindEpoch { .. });
+        // The generation gate is held through dispatch. A stale session can
+        // neither race rebind nor make an effect after the new epoch commits.
+        let ordinary_generation = if rebinds_epoch {
+            None
+        } else {
+            Some(
+                session_generation
+                    .read()
+                    .map_err(|_| io::Error::other("guest generation gate is unavailable"))?,
+            )
+        };
+        let rebind_generation = if rebinds_epoch {
+            Some(
+                session_generation
+                    .write()
+                    .map_err(|_| io::Error::other("guest generation gate is unavailable"))?,
+            )
+        } else {
+            None
+        };
+        {
+            let current = identity
+                .read()
+                .map_err(|_| io::Error::other("boot identity lock is unavailable"))?;
+            if !session_matches_identity(&identity_snapshot, &current) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guest session belongs to a previous machine epoch",
+                ));
+            }
+        }
         let response = match request {
             GuestServiceRequest::PrepareStop => {
                 service.prepare_stop(std::time::Duration::from_secs(5), || {
@@ -328,6 +366,8 @@ fn serve_connection(
             }
             request => service.handle(request),
         };
+        drop(ordinary_generation);
+        drop(rebind_generation);
         let payload = serde_json::to_vec(&response).map_err(io::Error::other)?;
         if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
             return Err(io::Error::new(
@@ -405,6 +445,12 @@ fn accept_handshake(
         &hello,
     )
     .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))
+}
+
+fn session_matches_identity(session: &BootIdentity, current: &BootIdentity) -> bool {
+    session.sandbox_id == current.sandbox_id
+        && session.epoch == current.epoch
+        && session.boot_digest == current.boot_digest
 }
 
 fn read_unauthed<T: serde::de::DeserializeOwned>(connection: &mut File) -> io::Result<T> {
@@ -1149,5 +1195,26 @@ mod tests {
         assert_eq!(AUTHENTICATION_MAGIC.len(), 8);
         assert!(SandboxId::try_from("box-1").is_ok());
         assert!(Counter::try_from(1).is_ok());
+    }
+
+    #[test]
+    fn session_identity_is_bound_to_the_current_machine_generation() {
+        let session = BootIdentity {
+            sandbox_id: "box-1".try_into().unwrap(),
+            epoch: Counter::ONE,
+            boot_digest: bytes_digest(b"boot-one"),
+            capability: BootCapability::from_bytes([1; 32]),
+            network_capability: [2; 32],
+        };
+        assert!(session_matches_identity(&session, &session));
+        let mut current = session.clone();
+        current.epoch = Counter::try_from(2).unwrap();
+        assert!(!session_matches_identity(&session, &current));
+        current = session.clone();
+        current.sandbox_id = "fork-1".try_into().unwrap();
+        assert!(!session_matches_identity(&session, &current));
+        current = session.clone();
+        current.boot_digest = bytes_digest(b"boot-two");
+        assert!(!session_matches_identity(&session, &current));
     }
 }

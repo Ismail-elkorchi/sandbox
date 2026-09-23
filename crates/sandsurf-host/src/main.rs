@@ -1,10 +1,14 @@
-use sandsurf_host::api::{HOST_API_VERSION, HostRequest, HostResponse};
+use sandsurf_host::api::{HostRequest, HostResponse};
 use sandsurf_host::service::{HostError, host_call, serve_host, serve_sandbox_guardian};
 use sandsurf_protocol::SandboxId;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 
 const MAX_BRIDGE_BYTES: usize = 1024 * 1024;
+const MAX_BRIDGE_PENDING: usize = 64;
+const BRIDGE_WORKERS: usize = 8;
+const BRIDGE_VERSION: u16 = 1;
 
 fn main() {
     if let Err(error) = run() {
@@ -60,16 +64,64 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_bridge(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut input = io::stdin().lock();
-    let mut output = io::stdout().lock();
+    let mut input = io::stdin();
+    let mut output = io::stdout();
     bridge_loop(directory, &mut input, &mut output)
 }
 
 fn bridge_loop(
     directory: &Path,
-    input: &mut impl Read,
-    output: &mut impl Write,
+    input: &mut (impl Read + Send),
+    output: &mut (impl Write + Send),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    bridge_loop_with_handler(input, output, &|request| host_call(directory, request))
+}
+
+fn bridge_loop_with_handler(
+    input: &mut (impl Read + Send),
+    output: &mut (impl Write + Send),
+    handler: &(impl Fn(HostRequest) -> Result<HostResponse, HostError> + Sync),
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::scope(|scope| {
+        let (jobs, receiver) = mpsc::sync_channel::<Vec<u8>>(MAX_BRIDGE_PENDING);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let (responses, completed) = mpsc::channel::<Vec<u8>>();
+        for _ in 0..BRIDGE_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            let responses = responses.clone();
+            scope.spawn(move || {
+                loop {
+                    let job = receiver.lock().expect("bridge receiver poisoned").recv();
+                    let Ok(job) = job else { break };
+                    if responses.send(bridge_response(handler, &job)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(responses);
+        let writer = scope.spawn(move || -> io::Result<()> {
+            for bytes in completed {
+                let length = u32::try_from(bytes.len()).map_err(io::Error::other)?;
+                if bytes.is_empty() || bytes.len() > MAX_BRIDGE_BYTES {
+                    return Err(io::Error::other("bridge response exceeds its byte bound"));
+                }
+                output.write_all(&length.to_le_bytes())?;
+                output.write_all(&bytes)?;
+                output.flush()?;
+            }
+            Ok(())
+        });
+        let read_result = bridge_read(input, &jobs);
+        drop(jobs);
+        let write_result = writer.join().expect("bridge writer panicked");
+        read_result?;
+        write_result?;
+        Ok(())
+    })
+}
+
+fn bridge_read(input: &mut impl Read, jobs: &mpsc::SyncSender<Vec<u8>>) -> io::Result<()> {
     loop {
         let mut length = [0_u8; 4];
         if input.read(&mut length[..1])? == 0 {
@@ -78,12 +130,24 @@ fn bridge_loop(
         input.read_exact(&mut length[1..])?;
         let length = u32::from_le_bytes(length) as usize;
         if length == 0 || length > MAX_BRIDGE_BYTES {
-            return Err("bridge request exceeds its byte bound".into());
+            return Err(io::Error::other("bridge request exceeds its byte bound"));
         }
         let mut bytes = vec![0_u8; length];
         input.read_exact(&mut bytes)?;
-        let response = match serde_json::from_slice::<(u16, HostRequest)>(&bytes) {
-            Ok((HOST_API_VERSION, request)) => match host_call(directory, request) {
+        jobs.send(bytes)
+            .map_err(|_| io::Error::other("bridge workers stopped"))?;
+    }
+}
+
+fn bridge_response(
+    handler: &impl Fn(HostRequest) -> Result<HostResponse, HostError>,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let parsed = serde_json::from_slice::<(u64, u16, HostRequest)>(bytes);
+    let id = parsed.as_ref().map_or(0, |value| value.0);
+    let response = match parsed {
+        Ok((id, BRIDGE_VERSION, request)) if id > 0 && id <= 9_007_199_254_740_991 => {
+            match handler(request) {
                 Ok(response) => response,
                 Err(error) => HostResponse::Rejected {
                     category: if matches!(error, HostError::EndpointUnavailable(_)) {
@@ -94,25 +158,18 @@ fn bridge_loop(
                     .into(),
                     message: error.to_string(),
                 },
-            },
-            Ok(_) => HostResponse::Rejected {
-                category: "protocol".into(),
-                message: "host API version mismatch".into(),
-            },
-            Err(error) => HostResponse::Rejected {
-                category: "protocol".into(),
-                message: format!("invalid bridge request: {error}"),
-            },
-        };
-        let bytes = serde_json::to_vec(&(HOST_API_VERSION, response))?;
-        let length = u32::try_from(bytes.len())?;
-        if bytes.is_empty() || bytes.len() > MAX_BRIDGE_BYTES {
-            return Err("bridge response exceeds its byte bound".into());
+            }
         }
-        output.write_all(&length.to_le_bytes())?;
-        output.write_all(&bytes)?;
-        output.flush()?;
-    }
+        Ok(_) => HostResponse::Rejected {
+            category: "protocol".into(),
+            message: "bridge version or request identity mismatch".into(),
+        },
+        Err(error) => HostResponse::Rejected {
+            category: "protocol".into(),
+            message: format!("invalid bridge request: {error}"),
+        },
+    };
+    serde_json::to_vec(&(id, BRIDGE_VERSION, response)).expect("bridge response serialization")
 }
 
 #[cfg(target_os = "windows")]
@@ -262,9 +319,11 @@ mod tests {
 
     #[test]
     fn bridge_reuses_one_process_for_bounded_requests() {
-        let message = serde_json::to_vec(&(HOST_API_VERSION, HostRequest::Inspect)).unwrap();
-        let mut input = request(&message);
-        input.extend_from_slice(&request(&message));
+        let mut input =
+            request(&serde_json::to_vec(&(1_u64, BRIDGE_VERSION, HostRequest::Inspect)).unwrap());
+        input.extend_from_slice(&request(
+            &serde_json::to_vec(&(2_u64, BRIDGE_VERSION, HostRequest::Inspect)).unwrap(),
+        ));
         let mut output = Vec::new();
         let missing = std::env::temp_dir().join(format!(
             "sandsurf-host-endpoint-absent-{}",
@@ -272,12 +331,16 @@ mod tests {
         ));
         bridge_loop(&missing, &mut input.as_slice(), &mut output).unwrap();
         let mut cursor = output.as_slice();
+        let mut ids = Vec::new();
         for _ in 0..2 {
             let mut length = [0_u8; 4];
             cursor.read_exact(&mut length).unwrap();
             let mut bytes = vec![0_u8; u32::from_le_bytes(length) as usize];
             cursor.read_exact(&mut bytes).unwrap();
-            let (_, response): (u16, HostResponse) = serde_json::from_slice(&bytes).unwrap();
+            let (id, version, response): (u64, u16, HostResponse) =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(version, BRIDGE_VERSION);
+            ids.push(id);
             assert!(
                 matches!(
                     &response,
@@ -286,6 +349,78 @@ mod tests {
                 "bridge should report an absent host endpoint as unavailable: {response:?}"
             );
         }
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2]);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn bridge_routes_out_of_order_responses_by_request_identity() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        struct GateWriter {
+            bytes: Vec<u8>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Write for GateWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                let (lock, wake) = &*self.gate;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                Ok(())
+            }
+        }
+
+        let mut input =
+            request(&serde_json::to_vec(&(1_u64, BRIDGE_VERSION, HostRequest::Inspect)).unwrap());
+        input.extend_from_slice(&request(
+            &serde_json::to_vec(&(2_u64, BRIDGE_VERSION, HostRequest::StopService)).unwrap(),
+        ));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut output = GateWriter {
+            bytes: Vec::new(),
+            gate: Arc::clone(&gate),
+        };
+        bridge_loop_with_handler(
+            &mut input.as_slice(),
+            &mut output,
+            &|request| match request {
+                HostRequest::Inspect => {
+                    let (lock, wake) = &*gate;
+                    let released = lock.lock().unwrap();
+                    let (released, timeout) = wake
+                        .wait_timeout_while(released, Duration::from_secs(3), |value| !*value)
+                        .unwrap();
+                    assert!(
+                        !timeout.timed_out() && *released,
+                        "second request did not run concurrently"
+                    );
+                    Ok(HostResponse::Complete)
+                }
+                HostRequest::StopService => Ok(HostResponse::Complete),
+                _ => panic!("unexpected bridge request"),
+            },
+        )
+        .unwrap();
+        let mut cursor = output.bytes.as_slice();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut length = [0_u8; 4];
+            cursor.read_exact(&mut length).unwrap();
+            let mut bytes = vec![0_u8; u32::from_le_bytes(length) as usize];
+            cursor.read_exact(&mut bytes).unwrap();
+            let (id, version, response): (u64, u16, HostResponse) =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(version, BRIDGE_VERSION);
+            assert!(matches!(response, HostResponse::Complete));
+            ids.push(id);
+        }
+        assert_eq!(ids, [2, 1]);
         assert!(cursor.is_empty());
     }
 

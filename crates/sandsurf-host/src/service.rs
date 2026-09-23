@@ -22,6 +22,11 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
@@ -29,6 +34,7 @@ use zeroize::Zeroizing;
 // native recovery probes. Transport waits must cover that operation without
 // converting a still-running, identity-bound mutation into a client timeout.
 const API_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_HOST_CONNECTIONS: usize = 64;
 
 #[derive(Debug)]
 pub enum HostError {
@@ -3170,34 +3176,106 @@ impl HostService {
 pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
     let mut service = HostService::open(root, executable)?;
     let listener = LocalListener::bind(&service.endpoint())?;
-    loop {
-        let mut connection = match listener.accept(Duration::from_secs(1)) {
-            Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                if let Err(error) = service.reconcile_lifetime_policies() {
-                    eprintln!("sandsurf host reconciliation deferred: {error}");
+    let stopped = Arc::new(AtomicBool::new(false));
+    let active = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::sync_channel::<HostIngress>(MAX_HOST_CONNECTIONS);
+    std::thread::scope(|scope| {
+        let stopped_accept = Arc::clone(&stopped);
+        let active_accept = Arc::clone(&active);
+        scope.spawn(move || {
+            while !stopped_accept.load(Ordering::Acquire) {
+                let connection = match listener.accept(Duration::from_secs(1)) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(error) => {
+                        let _ = sender.send(HostIngress::Failed(error));
+                        return;
+                    }
+                };
+                if active_accept.fetch_add(1, Ordering::AcqRel) >= MAX_HOST_CONNECTIONS {
+                    active_accept.fetch_sub(1, Ordering::AcqRel);
+                    continue;
                 }
-                continue;
+                let sender = sender.clone();
+                let active = Arc::clone(&active_accept);
+                let worker = std::thread::Builder::new()
+                    .name("sandsurf-host-client".into())
+                    .spawn(move || {
+                        let _active = ActiveHostConnection(active);
+                        let mut connection = connection;
+                        let frame = match connection.read_frame(API_TIMEOUT) {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) | Err(_) => return,
+                        };
+                        let sequence = frame.sequence;
+                        let parsed = parse_host_request(frame);
+                        let (reply, response) = mpsc::channel();
+                        if sender
+                            .send(HostIngress::Request {
+                                parsed: Box::new(parsed),
+                                reply,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Ok(response) = response.recv()
+                            && let Ok(frame) = host_response_frame(sequence, &response)
+                        {
+                            // A lost response never reverses an admitted operation.
+                            let _ = connection.write_frame(&frame, API_TIMEOUT);
+                        }
+                    });
+                if let Err(error) = worker {
+                    active_accept.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("sandsurf host connection rejected: {error}");
+                }
             }
-            Err(error) => return Err(error.into()),
+        });
+        let result = loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(HostIngress::Request { parsed, reply }) => {
+                    let stopping = matches!(&*parsed, Ok(HostRequest::StopService));
+                    let response = (*parsed)
+                        .map(|request| service.handle(request))
+                        .unwrap_or_else(|error| HostResponse::Rejected {
+                            category: error_category(&error).into(),
+                            message: error.to_string(),
+                        });
+                    let _ = reply.send(response);
+                    if stopping {
+                        break Ok(());
+                    }
+                }
+                Ok(HostIngress::Failed(error)) => break Err(error.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(error) = service.reconcile_lifetime_policies() {
+                        eprintln!("sandsurf host reconciliation deferred: {error}");
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(HostError::Invalid("host ingress stopped unexpectedly"));
+                }
+            }
         };
-        let frame = match connection.read_frame(API_TIMEOUT) {
-            Ok(Some(value)) => value,
-            Ok(None) | Err(_) => continue,
-        };
-        let sequence = frame.sequence;
-        let parsed = parse_host_request(frame);
-        let stopping = matches!(&parsed, Ok(HostRequest::StopService));
-        let response = parsed
-            .map(|request| service.handle(request))
-            .unwrap_or_else(|error| HostResponse::Rejected {
-                category: error_category(&error).into(),
-                message: error.to_string(),
-            });
-        let _ = connection.write_frame(&host_response_frame(sequence, &response)?, API_TIMEOUT);
-        if stopping {
-            return Ok(());
-        }
+        stopped.store(true, Ordering::Release);
+        drop(receiver);
+        result
+    })
+}
+
+enum HostIngress {
+    Request {
+        parsed: Box<Result<HostRequest>>,
+        reply: mpsc::Sender<HostResponse>,
+    },
+    Failed(io::Error),
+}
+
+struct ActiveHostConnection(Arc<AtomicUsize>);
+impl Drop for ActiveHostConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -3596,6 +3674,58 @@ fn prepare_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn idle_client_cannot_block_other_host_requests() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-host-ingress-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        prepare_directory(&root).unwrap();
+        let service_root = root.clone();
+        let server =
+            thread::spawn(move || serve_host(&service_root, std::env::current_exe().unwrap()));
+        let endpoint = root.join("api");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let idle = loop {
+            match LocalConnection::connect(&endpoint, Duration::from_millis(100)) {
+                Ok(connection) => break connection,
+                Err(error)
+                    if std::time::Instant::now() < deadline
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound
+                                | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("host did not start: {error}"),
+            }
+        };
+        thread::sleep(Duration::from_millis(100));
+        let (ready, observed) = mpsc::channel();
+        let client_root = root.clone();
+        thread::spawn(move || {
+            let _ = ready.send(host_call(&client_root, HostRequest::Inspect));
+        });
+        let result = observed
+            .recv_timeout(Duration::from_secs(3))
+            .expect("idle client stalled the host")
+            .unwrap();
+        assert!(matches!(result, HostResponse::Inspection { .. }));
+        drop(idle);
+        assert!(matches!(
+            host_call(&root, HostRequest::StopService).unwrap(),
+            HostResponse::Complete
+        ));
+        server.join().unwrap().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     fn count(value: u64) -> Counter {
         value.try_into().unwrap()
