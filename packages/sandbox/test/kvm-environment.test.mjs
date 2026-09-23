@@ -112,6 +112,13 @@ test("persistent KVM environment enforces runtime capabilities", { skip: !enable
     assert.equal(outputCursor, 131072);
     const expectedOutputDigest = (await run(sandbox, ["/bin/busybox", "sha256sum", "/workspace/binary-output"])).slice(0, 64);
     assert.equal(createHash("sha256").update(Buffer.concat(outputParts)).digest("hex"), expectedOutputDigest);
+    const denseBinary = await runResult(sandbox, ["/bin/busybox", "awk", "BEGIN { for (i = 0; i < 65536; i++) printf \"%c\", 255 }"]);
+    assert.equal(exitCode(denseBinary.state), 0);
+    assert.equal(denseBinary.output.byteLength, 64 * 1024);
+    assert.equal(
+      createHash("sha256").update(denseBinary.output).digest("hex"),
+      createHash("sha256").update(Buffer.alloc(64 * 1024, 255)).digest("hex"),
+    );
 
     assert.match(await run(sandbox, ["/usr/bin/git", "--version"]), /^git version 2\.54\.0/u);
     assert.match(await run(sandbox, ["/sbin/apk", "--version"], { user: "root" }), /^apk-tools 3\.0\.8/u);
@@ -295,8 +302,20 @@ async function run(sandbox, argv, options = {}) {
 async function runResult(sandbox, argv, options = {}) {
   const process = await sandbox.processes.spawn({ argv, ...options });
   const ended = await process.wait();
-  const page = await process.output.read({ maximum: 256 * 1024 });
-  return { state: ended.state, output: Buffer.concat(page.chunks.map((chunk) => Buffer.from(chunk.bytes))) };
+  const parts = [];
+  let cursor = 0;
+  for (;;) {
+    const page = await process.output.read({ after: cursor, maximum: 256 * 1024 });
+    for (const chunk of page.chunks) {
+      assert.equal(chunk.cursor, cursor);
+      parts.push(Buffer.from(chunk.bytes));
+      cursor += chunk.bytes.byteLength;
+    }
+    assert.ok(cursor <= 256 * 1024, "integration command output exceeded its test bound");
+    if (cursor === page.available) break;
+    assert.ok(page.chunks.length > 0, "output pagination must advance until the receipt boundary");
+  }
+  return { state: ended.state, output: Buffer.concat(parts) };
 }
 
 function exitCode(state) {
