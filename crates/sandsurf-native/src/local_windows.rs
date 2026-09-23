@@ -458,6 +458,10 @@ pub struct LocalConnection {
     peer: PeerIdentity,
     usable: bool,
 }
+// SAFETY: the connection uniquely owns its pipe handle. Frame I/O requires
+// &mut self and drains each overlapped operation before returning, so moving
+// the idle handle to a worker cannot race another user of the same handle.
+unsafe impl Send for LocalConnection {}
 impl LocalConnection {
     pub fn connect(directory: &Path, timeout: Duration) -> io::Result<Self> {
         let deadline = Deadline::new(timeout)?;
@@ -722,21 +726,19 @@ fn wait_overlapped(
     // SAFETY: event is a live event handle and timeout is bounded.
     let wait = unsafe { WaitForSingleObject(event.0, deadline.millis()?) };
     if wait == WAIT_TIMEOUT {
-        // SAFETY: the operation belongs to this handle/OVERLAPPED. Completion is
-        // collected below before either stack object is released.
-        unsafe { CancelIoEx(pipe.0, overlapped) };
-        let mut ignored = 0_u32;
-        // SAFETY: waiting here only drains the cancelled operation.
-        unsafe { GetOverlappedResult(pipe.0, overlapped, &mut ignored, 1) };
+        drain_cancelled(pipe, overlapped);
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "local transport deadline elapsed",
         ));
     }
     if wait == WAIT_FAILED {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        drain_cancelled(pipe, overlapped);
+        return Err(error);
     }
     if wait != WAIT_OBJECT_0 {
+        drain_cancelled(pipe, overlapped);
         return Err(io::Error::other("unexpected local transport wait result"));
     }
     let mut transferred = 0_u32;
@@ -745,6 +747,16 @@ fn wait_overlapped(
         return pipe_error().map(|count| count as u32);
     }
     Ok(transferred)
+}
+
+fn drain_cancelled(pipe: &Handle, overlapped: &mut OVERLAPPED) {
+    // SAFETY: this operation belongs to the live pipe and stack OVERLAPPED.
+    // GetOverlappedResult drains completion even if cancellation lost the race;
+    // neither the event nor OVERLAPPED may be released while I/O remains live.
+    unsafe { CancelIoEx(pipe.0, overlapped) };
+    let mut ignored = 0_u32;
+    // SAFETY: waiting here only collects this exact in-flight operation.
+    unsafe { GetOverlappedResult(pipe.0, overlapped, &mut ignored, 1) };
 }
 
 fn pipe_error() -> io::Result<usize> {
