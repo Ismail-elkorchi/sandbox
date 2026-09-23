@@ -48,7 +48,11 @@ const imageBuild = architecture === "x64" ? {
 const alpineVersion = "3.24.2";
 const alpineSeries = "v3.24";
 const alpineRepository = `https://dl-cdn.alpinelinux.org/alpine/${alpineSeries}`;
-const alpineToolSha256 = "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
+if (process.arch !== "x64" && process.arch !== "arm64") throw new Error("the guest image builder requires an x64 or arm64 host");
+const toolArchitecture = process.arch === "arm64" ? "aarch64" : "x86_64";
+const alpineToolSha256 = toolArchitecture === "aarch64"
+  ? "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773"
+  : "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
 const expectedAlpinePackages = [
   "alpine-baselayout-data=3.7.2-r1", "alpine-baselayout=3.7.2-r1", "alpine-keys=2.6-r0",
   "alpine-release=3.24.2-r0", "apk-tools=3.0.8-r0", "brotli-libs=1.2.0-r1",
@@ -277,9 +281,9 @@ async function buildDevelopmentWorkload(
   output: string,
 ): Promise<{ sourceDigest: string; materials: Readonly<Record<string, string>> }> {
   const targetArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`);
-  const toolArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-x86_64.tar.gz`);
+  const toolArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${toolArchitecture}.tar.gz`);
   const targetUrl = `${alpineRepository}/releases/${imageBuild.alpineArchitecture}/alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`;
-  const toolUrl = `${alpineRepository}/releases/x86_64/alpine-minirootfs-${alpineVersion}-x86_64.tar.gz`;
+  const toolUrl = `${alpineRepository}/releases/${toolArchitecture}/alpine-minirootfs-${alpineVersion}-${toolArchitecture}.tar.gz`;
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", targetArchive, targetUrl]);
   if (sha256(await readFile(targetArchive)) !== imageBuild.alpineSha256) {
     throw new Error("Alpine development root digest mismatch");
@@ -302,7 +306,7 @@ async function buildDevelopmentWorkload(
     ]);
   }
   const apk = resolve(toolRoot, "sbin/apk");
-  const loader = resolve(toolRoot, "lib/ld-musl-x86_64.so.1");
+  const loader = resolve(toolRoot, `lib/ld-musl-${toolArchitecture}.so.1`);
   await run(loader, [
     "--library-path", `${resolve(toolRoot, "lib")}:${resolve(toolRoot, "usr/lib")}`,
     apk,
