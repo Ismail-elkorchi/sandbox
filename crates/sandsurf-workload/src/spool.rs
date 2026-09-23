@@ -260,7 +260,6 @@ impl OutputSpool {
             - 1;
         let start_cursor = state.index[start].cursor;
         let start_offset = state.index[start].offset;
-        drop(state);
 
         let mut file = self.file.try_clone()?;
         if file.metadata()?.len() != expected_file_bytes {
@@ -384,6 +383,7 @@ fn parse_stream(value: u8) -> Result<Stream, SpoolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -488,6 +488,27 @@ mod tests {
         assert_eq!(last.chunks[0].bytes, [87]);
         assert!(reopened.read(601u64.try_into().unwrap(), 1024).is_err());
         drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reader_observes_a_consistent_cursor_while_writer_appends() {
+        let path = path();
+        let spool = Arc::new(spool(&path, 1024));
+        let writing = Arc::clone(&spool);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..200 {
+                writing.append(Stream::Stdout, b"x").unwrap();
+            }
+        });
+        while !writer.is_finished() {
+            let page = spool.read(Counter::ZERO, 1024).unwrap();
+            assert_eq!(page.chunks.len(), page.available.get() as usize);
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        assert_eq!(spool.read(Counter::ZERO, 1024).unwrap().chunks.len(), 200);
+        drop(spool);
         fs::remove_file(path).unwrap();
     }
 }
