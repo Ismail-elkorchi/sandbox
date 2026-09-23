@@ -10,14 +10,14 @@
     },
     "bootstrap": {
       "path": "trusted-bootstrap.ext4",
-      "sha256": "f56bb3362b5dfe02cc256acbe44d244aeddb6581d6f635789e3ef2b2903f870a",
+      "sha256": "d1b06911c99fcc2ff94446f86f017fa080bf9ba6e87b8d69cbe83be4c3beaaf2",
       "format": "ext4"
     },
     "guestAgent": {
       "version": "0.1.0",
       "protocolMajor": 2,
       "protocolMinor": 0,
-      "sha256": "b71067e5945b6d8355f1f69dab22ce0be728744383741ce0395dc465759dcfcd"
+      "sha256": "864f6c98e5e659a576d8190c453eccd14e1248c340e0e372412a32fee0487b37"
     },
     "capabilities": {
       "overlayfs": true,
@@ -30,12 +30,12 @@
   "workload": {
     "rootfs": {
       "path": "development-workload.ext4",
-      "sha256": "95c38f769a25c26e77993d279c19d4d264b5e4b43d8fb01f73d925582b00e130",
+      "sha256": "8ab5e6388842d2d35de277a96ba9f6e99f83d5e61284caf54006b1c744438f80",
       "format": "ext4"
     },
     "stateTemplate": {
       "path": "empty-workspace.ext4",
-      "sha256": "6e3818582200ac0a24aa37362592b4e294b85f948d0805abcab502efd1ed7bfe",
+      "sha256": "4db750beb9a97973a5f74e81423086a81efe0d2e35b0fac205b7c4f1269f60d2",
       "format": "ext4"
     },
     "defaults": {
@@ -49,10 +49,10 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "7a332da262dd88a2f4a43fbb4b14f41de3db0de5e436d5a5676d59bfd5f757ea",
+      "sourceDigest": "623167f20c060e44d948d29c37dc86821e846e2584b635c1f3ae91a4b7d755da",
       "materials": {
         "alpine-minirootfs": "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
-        "alpine-packages": "3e0249dff59adfb2a7b0a909df5a944d1e96965035560525cd0522b057299ff8",
+        "alpine-packages": "45a37ce23d979ec3addae1a34a708e792434193064e2451c20008b71f829364a",
         "sandsurf-ext4-builder": "dc9c1246c767342b8208e721924dcd5d86c24211fa4bf11b1fc6c9f822dde80a"
       }
     },
