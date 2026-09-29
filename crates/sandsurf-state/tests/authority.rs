@@ -61,6 +61,22 @@ fn catalog_limits() -> CatalogLimits {
 }
 
 #[test]
+fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
+    let root = TempRoot::new();
+    let path = root.0.join("incompatible");
+    let host =
+        HostCatalog::create(&path, "version-test".try_into().unwrap(), catalog_limits()).unwrap();
+    drop(host);
+    let database = path.join("authority.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(connection);
+    let original = fs::read(&database).unwrap();
+    assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
+    assert_eq!(fs::read(&database).unwrap(), original);
+}
+
+#[test]
 fn machine_execution_defaults_is_host_owned_and_durable() {
     let root = TempRoot::new();
     let path = root.0.join("defaults-configuration-host");
@@ -1403,7 +1419,7 @@ fn interrupted_lifecycle_dispatch_is_reconciled_without_replay() {
 }
 
 #[test]
-fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() {
+fn newer_host_intent_supersedes_unapplied_work_without_replaying_it() {
     let mut f = Fixture::new();
     let pause: OperationId = "pause-before-next-intent".try_into().unwrap();
     let pause_digest = digest(
@@ -1425,27 +1441,6 @@ fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() 
         )
         .unwrap();
 
-    let stop: OperationId = "stop-overtaking-pause".try_into().unwrap();
-    let stop_digest = digest(
-        Domain::Operation,
-        &(&f.machine, &stop, n(3), DesiredState::Stopped),
-    )
-    .unwrap();
-    assert!(
-        f.host
-            .request_lifecycle(
-                &f.machine,
-                stop,
-                n(3),
-                DesiredState::Stopped,
-                Approval {
-                    id: "approve-overtaking-stop".try_into().unwrap(),
-                    request_digest: stop_digest,
-                },
-            )
-            .is_err()
-    );
-
     let authorization = f.host.authorize_lifecycle(&pause).unwrap();
     f.runtime.admit_lifecycle(authorization.clone()).unwrap();
     assert!(matches!(
@@ -1462,9 +1457,144 @@ fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() 
         )
         .unwrap();
     assert!(matches!(
-        f.runtime.begin_lifecycle(authorization).unwrap(),
+        f.runtime.begin_lifecycle(authorization.clone()).unwrap(),
         LifecycleDecision::Perform(_)
     ));
+    f.runtime
+        .record_lifecycle_delivery(
+            &pause,
+            &intent.request_digest,
+            Delivery::NotApplied,
+            Some(hash("pause-still-not-applied")),
+            None,
+        )
+        .unwrap();
+
+    let stop: OperationId = "stop-overtaking-pause".try_into().unwrap();
+    let stop_digest = digest(
+        Domain::Operation,
+        &(&f.machine, &stop, n(3), DesiredState::Stopped),
+    )
+    .unwrap();
+    let stop_intent = f
+        .host
+        .request_lifecycle(
+            &f.machine,
+            stop.clone(),
+            n(3),
+            DesiredState::Stopped,
+            Approval {
+                id: "approve-overtaking-stop".try_into().unwrap(),
+                request_digest: stop_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(stop_intent.revision, n(4));
+    assert!(f.host.authorize_lifecycle(&pause).is_err());
+    let stop_authorization = f.host.authorize_lifecycle(&stop).unwrap();
+    f.runtime
+        .admit_lifecycle(stop_authorization.clone())
+        .unwrap();
+    // Acceptance is durable, even before the newer operation has an effect.
+    drop(f.runtime);
+    f.runtime = RuntimeJournal::open(&f.root.0.join("runtime"), &f.machine).unwrap();
+    assert!(f.runtime.begin_lifecycle(authorization.clone()).is_err());
+    assert_eq!(
+        f.runtime.admit_lifecycle(authorization).unwrap().delivery,
+        Delivery::NotApplied
+    );
+    assert!(matches!(
+        f.runtime.begin_lifecycle(stop_authorization).unwrap(),
+        LifecycleDecision::Perform(_)
+    ));
+    let prior = f.runtime.last_observation().unwrap().unwrap();
+    let observed = f
+        .runtime
+        .observe(MachineObservation {
+            machine_id: f.machine.clone(),
+            generation: prior.value().generation,
+            sequence: prior.value().sequence.next().unwrap(),
+            state: MachineState::Stopped,
+            applied_revision: n(4),
+            operation_id: stop.clone(),
+            evidence_digest: hash("native-stop"),
+        })
+        .unwrap();
+    f.runtime
+        .record_lifecycle_delivery(
+            &stop,
+            &stop_intent.request_digest,
+            Delivery::Applied,
+            Some(hash("native-stop")),
+            Some(observed.reference().unwrap()),
+        )
+        .unwrap();
+    f.host.complete_intent(&observed).unwrap();
+    assert!(f.host.intent(&pause).unwrap().unwrap().completion.is_none());
+    assert!(f.host.intent(&stop).unwrap().unwrap().completion.is_some());
+}
+
+#[test]
+fn newer_configuration_can_skip_failed_revisions_but_old_authority_cannot_retry() {
+    let mut f = Fixture::new();
+    let configuration = f
+        .host
+        .machine(&f.machine)
+        .unwrap()
+        .unwrap()
+        .runtime_configuration;
+    let mut old = None;
+    for expected in 2..=3 {
+        let operation: OperationId = format!("configuration-gap-{expected}").try_into().unwrap();
+        let request_digest = hash(operation.as_str());
+        let admitted = f
+            .host
+            .set_runtime_configuration(
+                &f.machine,
+                &operation,
+                n(expected),
+                configuration.clone(),
+                request_digest.clone(),
+                Approval {
+                    id: format!("approve-configuration-gap-{expected}")
+                        .try_into()
+                        .unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        let authorized = f
+            .host
+            .authorize_configuration(&f.machine, admitted.revision)
+            .unwrap();
+        let guardian = f.runtime.admit_configuration(authorized.clone()).unwrap();
+        assert!(matches!(
+            f.runtime.begin_configuration(authorized.clone()).unwrap(),
+            ConfigurationDecision::Perform(_)
+        ));
+        f.runtime
+            .record_configuration_delivery(
+                &guardian.command.operation_id,
+                &guardian.command.request_digest,
+                Delivery::NotApplied,
+                Some(hash("not-applied")),
+                None,
+            )
+            .unwrap();
+        if let Some(old) = old.take() {
+            assert!(f.runtime.begin_configuration(old).is_err());
+        }
+        old = Some(authorized);
+    }
+    assert_eq!(
+        f.runtime
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .applied_revision,
+        n(2)
+    );
 }
 
 #[test]

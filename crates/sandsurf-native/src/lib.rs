@@ -6,9 +6,13 @@
 pub mod capacity;
 pub mod guest_channel;
 pub mod storage;
+#[cfg(unix)]
+mod unix_io;
 
 #[cfg(unix)]
 pub use guest_channel::DirectUnixChannel;
+#[cfg(unix)]
+pub use guest_channel::UnixGuestConnection;
 #[cfg(unix)]
 pub use guest_channel::UnixVsockChannel;
 pub use guest_channel::{GuestChannel, GuestChannelError, GuestConnection};

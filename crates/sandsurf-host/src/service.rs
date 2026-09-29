@@ -1061,7 +1061,11 @@ impl HostService {
                 desired,
                 approval_id,
             } => {
-                self.require_lifecycle_precondition(&machine_id, &operation_id, expected_revision)?;
+                self.require_revision_for_new_host_operation(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                )?;
                 let approval = Approval {
                     id: approval_id,
                     request_digest: digest(
@@ -1099,7 +1103,7 @@ impl HostService {
                 approval_id,
             } => {
                 policy.validate()?;
-                self.require_configuration_precondition(
+                self.require_revision_for_new_host_operation(
                     &machine_id,
                     &operation_id,
                     expected_revision,
@@ -1150,7 +1154,7 @@ impl HostService {
                 active,
                 approval_id,
             } => {
-                self.require_configuration_precondition(
+                self.require_revision_for_new_host_operation(
                     &machine_id,
                     &operation_id,
                     expected_revision,
@@ -1292,7 +1296,7 @@ impl HostService {
                         "native resource validation returned an unexpected response",
                     ));
                 }
-                self.require_configuration_precondition(
+                self.require_revision_for_new_host_operation(
                     &machine_id,
                     &operation_id,
                     expected_revision,
@@ -2410,67 +2414,6 @@ impl HostService {
         Ok(())
     }
 
-    /// A fresh host configuration change is admitted only from the revision
-    /// the guardian currently observes. Historical retries bypass this gate;
-    /// their catalog methods validate the immutable operation binding and
-    /// `apply_configuration_if_current` ensures they cannot roll a newer
-    /// guardian configuration backward.
-    fn require_configuration_precondition(
-        &mut self,
-        machine: &MachineId,
-        operation: &OperationId,
-        expected_revision: Counter,
-    ) -> Result<()> {
-        if self.catalog.operation(operation)?.is_some() {
-            return Ok(());
-        }
-        self.provision_guardian(machine)?;
-        let inspection =
-            GuardianClient::new(self.guardian_endpoint(machine)).inspect(machine.clone(), None)?;
-        let Observation::Current { value } = inspection.observation else {
-            return Err(HostError::Invalid(
-                "new configuration requires a current guardian observation",
-            ));
-        };
-        if value.applied_revision != expected_revision {
-            return Err(sandsurf_state::Error::Conflict(
-                "guardian has not applied the expected host configuration revision",
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Admit a fresh lifecycle command only from the configuration revision
-    /// the guardian currently observes. Exact historical retries are resolved
-    /// from their immutable host/guardian records instead of consulting current
-    /// machine state.
-    fn require_lifecycle_precondition(
-        &mut self,
-        machine: &MachineId,
-        operation: &OperationId,
-        expected_revision: Counter,
-    ) -> Result<()> {
-        if self.catalog.operation(operation)?.is_some() {
-            return Ok(());
-        }
-        self.provision_guardian(machine)?;
-        let inspection =
-            GuardianClient::new(self.guardian_endpoint(machine)).inspect(machine.clone(), None)?;
-        let Observation::Current { value } = inspection.observation else {
-            return Err(HostError::Invalid(
-                "new lifecycle intent requires a current guardian observation",
-            ));
-        };
-        if value.applied_revision != expected_revision {
-            return Err(sandsurf_state::Error::Conflict(
-                "guardian has not applied the expected host configuration revision",
-            )
-            .into());
-        }
-        Ok(())
-    }
-
     fn apply_configuration_if_current(
         &mut self,
         machine: &MachineId,
@@ -2507,11 +2450,6 @@ impl HostService {
         if value.applied_revision == record.configuration_revision {
             return Ok(());
         }
-        if value.applied_revision.next()? != record.configuration_revision {
-            return Err(HostError::Invalid(
-                "guardian configuration history has an unrecoverable gap",
-            ));
-        }
         self.apply_configuration(&record.id, record.configuration_revision)
     }
 
@@ -2532,7 +2470,33 @@ impl HostService {
                 if record.reservation == ReservationState::Released {
                     continue;
                 }
-                if record.latest_intent.completion.is_none() {
+                // Expiration is a current host decision, not contingent on an
+                // earlier command completing or guest management responding.
+                if let Some(expires) = record.lifetime.expires_at_unix_millis
+                    && now >= expires
+                {
+                    let desired = match record.lifetime.expiration_action {
+                        ExpirationAction::Stop => DesiredState::Stopped,
+                        ExpirationAction::Destroy => DesiredState::Destroyed,
+                    };
+                    if record.latest_intent.desired != desired
+                        && record.latest_intent.desired != DesiredState::Destroyed
+                    {
+                        self.apply_policy_lifecycle(record, desired, "expiration")?;
+                    } else if record.latest_intent.completion.is_none()
+                        && record.latest_intent.revision == record.configuration_revision
+                    {
+                        self.provision_guardian(&record.id)?;
+                        self.apply_lifecycle_intent(
+                            &record.latest_intent,
+                            self.guardian_endpoint(&record.id),
+                        )?;
+                    }
+                    continue;
+                }
+                if record.latest_intent.completion.is_none()
+                    && record.latest_intent.revision == record.configuration_revision
+                {
                     self.provision_guardian(&record.id)?;
                     let endpoint = self.guardian_endpoint(&record.id);
                     self.apply_lifecycle_intent(&record.latest_intent, endpoint)?;
@@ -2545,21 +2509,6 @@ impl HostService {
                 }
 
                 self.reconcile_configuration(&record)?;
-
-                if let Some(expires) = record.lifetime.expires_at_unix_millis
-                    && now >= expires
-                {
-                    let desired = match record.lifetime.expiration_action {
-                        ExpirationAction::Stop => DesiredState::Stopped,
-                        ExpirationAction::Destroy => DesiredState::Destroyed,
-                    };
-                    if record.latest_intent.desired != desired
-                        && !(record.latest_intent.desired == DesiredState::Destroyed)
-                    {
-                        self.apply_policy_lifecycle(record, desired, "expiration")?;
-                    }
-                    continue;
-                }
             }
             if after.is_none() {
                 break;

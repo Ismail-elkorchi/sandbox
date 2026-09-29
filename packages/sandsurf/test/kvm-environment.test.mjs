@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { createServer } from "node:net";
 import test from "node:test";
 import { Sandsurf } from "../dist/index.js";
 import { NativeHostClient } from "../dist/native-host.js";
@@ -135,7 +136,23 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal((await machine.inspect()).machine.value.state, "running", "management absence does not prove native shutdown");
     await machine.pause();
     assert.equal((await machine.inspect()).machine.value.state, "paused");
-    await machine.destroy();
+    context.diagnostic("native destruction supersedes failed host configuration");
+    const occupied = createServer();
+    await new Promise((resolve, reject) => {
+      occupied.once("error", reject);
+      occupied.listen(0, "127.0.0.1", resolve);
+    });
+    try {
+      const address = occupied.address();
+      assert.ok(address !== null && typeof address !== "string");
+      await assert.rejects(machine.ports.expose({ guestPort: 22, hostPort: address.port }));
+      const pending = await machine.inspect();
+      assert.ok(pending.machine.value.appliedRevision < pending.configurationRevision,
+        "the failure must leave an admitted but unapplied host revision");
+      await machine.destroy();
+    } finally {
+      await new Promise((done) => occupied.close(done));
+    }
     assertSameBytes(await output(execution), dense);
     const archivedReceipt = await execution.receipt();
     assert.ok(archivedReceipt);

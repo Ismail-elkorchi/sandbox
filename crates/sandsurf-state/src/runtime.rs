@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const SCHEMA: &str = "
-CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), machine TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
+CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), machine TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL, accepted_revision INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE management_reports(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -156,7 +156,7 @@ impl RuntimeJournal {
         let authority = AuthorityVerifier::new(binding)?;
         let db = Database::create(path, "guardian", SCHEMA)?;
         db.connection.execute(
-            "INSERT INTO configuration VALUES (1,?1,?2,?3)",
+            "INSERT INTO configuration(id,machine,limits,authority) VALUES (1,?1,?2,?3)",
             params![
                 machine.as_str(),
                 encode(&limits)?,
@@ -172,9 +172,6 @@ impl RuntimeJournal {
     }
     pub fn open(path: &Path, machine: &MachineId) -> Result<Self> {
         let db = Database::open(path, "guardian")?;
-        db.connection
-            .prepare("SELECT reservation_active FROM processes LIMIT 0")
-            .map_err(|_| Error::Corrupt("incompatible guardian journal; preserved intact"))?;
         let (identity, limits, binding): (String, String, String) = db.connection.query_row(
             "SELECT machine,limits,authority FROM configuration WHERE id=1",
             [],
@@ -465,6 +462,7 @@ impl RuntimeJournal {
         }
         runtime_operation_identity_available(&tx, &command.operation_id)?;
         require_lifecycle_state(&self.machine, observation(&tx)?.as_ref(), &command)?;
+        advance_authority_fence(&tx, command.revision)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = LifecycleOperation {
             command,
@@ -504,6 +502,7 @@ impl RuntimeJournal {
             return Ok(LifecycleDecision::Reconcile(value));
         }
         require_lifecycle_state(&self.machine, observation(&tx)?.as_ref(), command)?;
+        require_authority_fence(&tx, command.revision)?;
         value.delivery = Delivery::Dispatched;
         value.evidence_digest = None;
         value.observation = None;
@@ -638,6 +637,7 @@ impl RuntimeJournal {
         let tx = self.db.connection.transaction()?;
         runtime_operation_identity_available(&tx, &command.operation_id)?;
         require_configuration_state(&self.machine, observation(&tx)?.as_ref(), &command)?;
+        advance_authority_fence(&tx, command.revision)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = ConfigurationOperation {
             command,
@@ -689,6 +689,7 @@ impl RuntimeJournal {
             ));
         }
         require_configuration_state(&self.machine, observation(&tx)?.as_ref(), command)?;
+        require_authority_fence(&tx, command.revision)?;
         value.delivery = Delivery::Dispatched;
         tx.execute(
             "UPDATE configuration_operations SET value=?2 WHERE id=?1",
@@ -2104,12 +2105,17 @@ fn require_lifecycle_state(
         ));
     }
     match current {
-        None if command.revision == Counter::ONE && command.desired == DesiredState::Running => {
+        None if command.revision > Counter::ZERO
+            && matches!(
+                command.desired,
+                DesiredState::Running | DesiredState::Stopped | DesiredState::Destroyed
+            ) =>
+        {
             Ok(())
         }
         Some(observed)
             if observed.state != MachineState::Destroyed
-                && command.revision == observed.applied_revision.next()? =>
+                && command.revision > observed.applied_revision =>
         {
             Ok(())
         }
@@ -2131,7 +2137,7 @@ fn require_configuration_state(
     match current {
         Some(observed)
             if observed.state != MachineState::Destroyed
-                && command.revision == observed.applied_revision.next()? =>
+                && command.revision > observed.applied_revision =>
         {
             Ok(())
         }
@@ -2150,6 +2156,31 @@ fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
         return Err(Error::Capacity(
             "durable operation capacity exhausted; no evidence evicted",
         ));
+    }
+    Ok(())
+}
+
+/// A complete signed host decision can supersede an unapplied revision.
+/// Acceptance is an anti-replay fence, not evidence that any effect occurred.
+fn advance_authority_fence(db: &rusqlite::Connection, revision: Counter) -> Result<()> {
+    let changed = db.execute(
+        "UPDATE configuration SET accepted_revision=?1 WHERE id=1 AND accepted_revision<?1",
+        [revision.get()],
+    )?;
+    if changed != 1 {
+        return Err(Error::Conflict("host authority revision was superseded"));
+    }
+    Ok(())
+}
+
+fn require_authority_fence(db: &rusqlite::Connection, revision: Counter) -> Result<()> {
+    let accepted: u64 = db.query_row(
+        "SELECT accepted_revision FROM configuration WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    if accepted != revision.get() {
+        return Err(Error::Conflict("host authority revision was superseded"));
     }
     Ok(())
 }

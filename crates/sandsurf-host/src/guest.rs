@@ -551,7 +551,7 @@ fn write_unauthed<T: serde::Serialize>(
 }
 
 fn read_unauthed<T: serde::de::DeserializeOwned>(
-    connection: &mut dyn GuestConnection,
+    connection: &mut impl Read,
 ) -> Result<T, GuestClientError> {
     let frame = Frame::read(connection)?.ok_or(GuestClientError::Protocol(
         "guest handshake closed unexpectedly",
@@ -606,7 +606,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
         });
-        let mut connection = DeadlineConnection::new(Box::new(client), Duration::from_millis(25));
+        let connection =
+            sandsurf_native::UnixGuestConnection::new(client, Some(IO_TIMEOUT)).unwrap();
+        let mut connection =
+            DeadlineConnection::new(Box::new(connection), Duration::from_millis(25));
         let started = Instant::now();
         let error = Frame::read(&mut connection).unwrap_err();
         assert!(matches!(
@@ -622,8 +625,13 @@ mod tests {
         fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
             self.0
                 .take()
-                .map(|stream| Box::new(stream) as Box<dyn GuestConnection>)
                 .ok_or_else(|| GuestChannelError::Protocol("unexpected reconnect".into()))
+                .and_then(|stream| {
+                    Ok(Box::new(sandsurf_native::UnixGuestConnection::new(
+                        stream,
+                        Some(IO_TIMEOUT),
+                    )?) as Box<dyn GuestConnection>)
+                })
         }
     }
 

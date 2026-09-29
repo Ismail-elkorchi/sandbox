@@ -12,9 +12,10 @@
 //! or invalid frame poisons its connection. Callers must not retry commands on a
 //! replacement connection without reconciling their operation identities.
 
+use crate::unix_io::{DeadlineIo, wait_ready};
 use sandsurf_protocol::Frame;
 use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -413,7 +414,7 @@ impl LocalConnection {
         self.check()?;
         let result = Frame::read(&mut DeadlineIo {
             stream: &mut self.stream,
-            deadline,
+            deadline: Some(deadline.0),
         });
         if !matches!(&result, Ok(Some(_))) {
             self.poison();
@@ -425,7 +426,7 @@ impl LocalConnection {
         self.check()?;
         let result = frame.write(&mut DeadlineIo {
             stream: &mut self.stream,
-            deadline,
+            deadline: Some(deadline.0),
         });
         if result.is_err() {
             self.poison();
@@ -468,67 +469,7 @@ impl Deadline {
         }
     }
     fn poll(&self, fd: RawFd, events: libc::c_short) -> io::Result<()> {
-        loop {
-            let millis = self.remaining()?.as_millis().max(1) as i32;
-            let mut event = libc::pollfd {
-                fd,
-                events,
-                revents: 0,
-            };
-            // SAFETY: event is one initialized pollfd for the live owned handle.
-            let result = unsafe { libc::poll(&mut event, 1, millis) };
-            if result > 0 {
-                if event.revents & libc::POLLNVAL != 0 {
-                    return Err(io::Error::other("local transport handle is invalid"));
-                }
-                return Ok(()); // HUP/ERR are resolved by accept/read/SO_ERROR.
-            }
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        }
-    }
-}
-struct DeadlineIo<'a> {
-    // Keep the socket nonblocking and wait with poll. Darwin rejects setsockopt
-    // after peer shutdown, so per-read SO_RCVTIMEO updates can hide a real EOF.
-    stream: &'a mut UnixStream,
-    deadline: Deadline,
-}
-impl Read for DeadlineIo<'_> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        loop {
-            self.deadline.remaining()?;
-            match self.stream.read(bytes) {
-                Ok(count) => return Ok(count),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.deadline.poll(self.stream.as_raw_fd(), libc::POLLIN)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-impl Write for DeadlineIo<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            self.deadline.remaining()?;
-            match self.stream.write(bytes) {
-                Ok(count) => return Ok(count),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.deadline.poll(self.stream.as_raw_fd(), libc::POLLOUT)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(()) // Unix streams have no userspace buffering here.
+        wait_ready(fd, events, Some(self.0))
     }
 }
 

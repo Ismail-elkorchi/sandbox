@@ -75,7 +75,6 @@ pub struct FirecrackerDriver<F> {
     qualification: FirecrackerQualification,
     factory: F,
     process: Option<FirecrackerProcess>,
-    applied_revision: Option<Counter>,
     boot_resources: Option<sandsurf_protocol::Resources>,
     capture_paused: bool,
     full_capture_operation: Option<OperationId>,
@@ -97,7 +96,6 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
             qualification,
             factory,
             process: None,
-            applied_revision: None,
             boot_resources: None,
             capture_paused: false,
             full_capture_operation: None,
@@ -152,7 +150,6 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         self.full_snapshot = None;
         self.committed_suspend = None;
         self.staged_restore = None;
-        self.applied_revision = Some(command.revision);
         let booting = if generation == Counter::ONE {
             MachineState::Creating
         } else {
@@ -180,16 +177,19 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
     fn stop_process(
         &mut self,
         command: &LifecycleCommand,
-        current: &MachineObservation,
+        current: Option<&MachineObservation>,
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
+        let generation = current.map_or(Counter::ONE, |value| value.generation);
         if self.process.is_none() {
-            return if current.state == MachineState::Stopped {
+            return if current.is_none_or(|value| {
+                matches!(value.state, MachineState::Stopped | MachineState::Suspended)
+            }) {
                 MachineOutcome::Observed(vec![transition(
                     command,
-                    current.generation,
+                    generation,
                     MachineState::Stopped,
                     b"firecracker-already-stopped",
                 )])
@@ -220,7 +220,7 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         }
         MachineOutcome::Observed(vec![transition(
             command,
-            current.generation,
+            generation,
             MachineState::Stopped,
             b"firecracker-exit-confirmed",
         )])
@@ -348,7 +348,6 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         if let Some(mut process) = self.process.take() {
             contain(&mut process);
         }
-        self.applied_revision = None;
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
@@ -405,7 +404,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
             ));
         }
         if command.machine_id != self.machine_id
-            || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.process.is_some()
             || matches!(
@@ -422,7 +420,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
                 b"firecracker-configuration-state-mismatch",
             ));
         }
-        self.applied_revision = Some(command.revision);
         match digest(
             Domain::Authority,
             &(
@@ -449,16 +446,12 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
-        if self.process.is_none()
-            || self.applied_revision != Some(current.applied_revision)
-            || command.revision <= current.applied_revision
-        {
+        if self.process.is_none() || command.revision <= current.applied_revision {
             return Self::unavailable(b"firecracker-live-reconfiguration-not-supported");
         }
         // Grant policy is enforced by host/guardian services. The VM shape is
         // unchanged, so applying a newer authority revision is a control-plane
         // rebind rather than a reboot or unsupported resource hotplug.
-        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.generation,
@@ -625,7 +618,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         };
         self.process = Some(process);
         self.boot_resources = Some(command.configuration.resources.clone());
-        self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
@@ -648,33 +640,34 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         ])
     }
 
-    fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {
+    fn stop(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> MachineOutcome {
         self.stop_process(command, current)
     }
 
     fn destroy(
         &mut self,
         command: &LifecycleCommand,
-        current: &MachineObservation,
+        current: Option<&MachineObservation>,
     ) -> MachineOutcome {
-        if self.process.is_some() {
-            let stopped = self.stop_process(command, current);
-            if !matches!(stopped, MachineOutcome::Observed(_)) {
-                return stopped;
-            }
-        } else if current.state != MachineState::Stopped {
-            return MachineOutcome::Unknown;
+        let stopped = self.stop_process(command, current);
+        if !matches!(stopped, MachineOutcome::Observed(_)) {
+            return stopped;
         }
+        let generation = current.map_or(Counter::ONE, |value| value.generation);
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.generation,
+                generation,
                 MachineState::Destroying,
                 b"firecracker-destroying",
             ),
             transition(
                 command,
-                current.generation,
+                generation,
                 MachineState::Destroyed,
                 b"firecracker-owner-released",
             ),

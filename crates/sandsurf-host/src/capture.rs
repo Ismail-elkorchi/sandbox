@@ -120,13 +120,13 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut directory = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            directory.mode(0o700);
+            fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         }
-        directory.create(&root).unwrap();
+        #[cfg(windows)]
+        sandsurf_native::local::create_private_directory(&root).unwrap();
         let operation: OperationId = "capture".try_into().unwrap();
         let original =
             CaptureBoundary::begin(&root, operation.clone(), Counter::ONE, MachineState::Paused)

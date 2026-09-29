@@ -216,6 +216,21 @@ test("OCI conversion binds explicit boot artifacts into approval and admission",
   assert.equal(approvals.length, 1);
 });
 
+test("unapplied lifecycle retains host intent revision without inventing completion", async () => {
+  const requests = [];
+  const view = fixtureView();
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    return { kind: "lifecycle", machine: { ...view, configurationRevision: request.expectedRevision + 1 },
+      operation: { delivery: request.desired === "paused" ? "not-applied" : "applied" } };
+  }, 1, async () => true);
+  await assert.rejects(machine.pause(), (error) => error.category === "not-applied");
+  assert.equal(machine.revision, 100);
+  await machine.powerOff();
+  assert.equal(requests[1].expectedRevision, 100);
+  assert.equal(machine.revision, 101);
+});
+
 test("retained-output operations are fenced by receipts, not live machine revisions", async () => {
   const requests = [];
   const machine = fixtureMachine(async (request) => {

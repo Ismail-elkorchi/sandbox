@@ -1751,16 +1751,9 @@ impl HostCatalog {
         }
         host_operation_identity_available(&tx, &operation)?;
         require_revision(&tx, machine, expected)?;
-        let latest: String = tx.query_row(
-            "SELECT value FROM intents WHERE machine=?1 ORDER BY rowid DESC LIMIT 1",
-            [machine.as_str()],
-            |row| row.get(0),
-        )?;
-        if decode::<LifecycleIntent>(&latest)?.completion.is_none() {
-            return Err(Error::Conflict(
-                "a new lifecycle intent cannot overtake an incomplete intent",
-            ));
-        }
+        // A newer, explicitly authorized intent supersedes prior intent. An
+        // incomplete earlier operation stays incomplete in immutable history;
+        // it cannot hold machine termination hostage or be redispatched later.
         capacity(&tx, "intents", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let revision = expected.next()?;

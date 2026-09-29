@@ -92,11 +92,15 @@ pub trait MachineDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome;
-    fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome;
+    fn stop(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> MachineOutcome;
     fn destroy(
         &mut self,
         command: &LifecycleCommand,
-        current: &MachineObservation,
+        current: Option<&MachineObservation>,
     ) -> MachineOutcome;
 }
 
@@ -131,7 +135,9 @@ pub fn apply_lifecycle<D: MachineDriver>(
         (DesiredState::Paused, Some(value)) if value.state == MachineState::Running => {
             driver.pause(command, value)
         }
-        (DesiredState::Stopped, Some(value)) if value.state != MachineState::Destroyed => {
+        (DesiredState::Stopped, value)
+            if value.is_none_or(|value| value.state != MachineState::Destroyed) =>
+        {
             driver.stop(command, value)
         }
         (DesiredState::Suspended, Some(value))
@@ -139,7 +145,9 @@ pub fn apply_lifecycle<D: MachineDriver>(
         {
             driver.suspend(command, value)
         }
-        (DesiredState::Destroyed, Some(value)) if value.state != MachineState::Destroyed => {
+        (DesiredState::Destroyed, value)
+            if value.is_none_or(|value| value.state != MachineState::Destroyed) =>
+        {
             driver.destroy(command, value)
         }
         _ => {
@@ -148,7 +156,28 @@ pub fn apply_lifecycle<D: MachineDriver>(
             ));
         }
     };
-    validate_outcome(command, current, outcome)
+    let mut outcome = validate_outcome(command, current, outcome);
+    if current.is_none()
+        && matches!(
+            command.desired,
+            DesiredState::Stopped | DesiredState::Destroyed
+        )
+        && let MachineOutcome::Observed(transitions) = &mut outcome
+    {
+        // Creation identity does not claim a successful boot. It records the
+        // native owner boundary before confirming termination of a partial VM.
+        transitions.insert(
+            0,
+            MachineTransition {
+                generation: Counter::ONE,
+                state: MachineState::Creating,
+                evidence_digest: sandsurf_protocol::bytes_digest(
+                    b"native-unpublished-owner-contained",
+                ),
+            },
+        );
+    }
+    outcome
 }
 
 fn validate_outcome(
@@ -245,10 +274,14 @@ mod tests {
         fn restore(&mut self, _: &LifecycleCommand, _: &MachineObservation) -> MachineOutcome {
             self.take("restore")
         }
-        fn stop(&mut self, _: &LifecycleCommand, _: &MachineObservation) -> MachineOutcome {
+        fn stop(&mut self, _: &LifecycleCommand, _: Option<&MachineObservation>) -> MachineOutcome {
             self.take("stop")
         }
-        fn destroy(&mut self, _: &LifecycleCommand, _: &MachineObservation) -> MachineOutcome {
+        fn destroy(
+            &mut self,
+            _: &LifecycleCommand,
+            _: Option<&MachineObservation>,
+        ) -> MachineOutcome {
             self.take("destroy")
         }
     }
@@ -359,6 +392,40 @@ mod tests {
             let actual = apply_lifecycle(&mut driver, &command(desired), current.as_ref());
             assert!(matches!(actual, MachineOutcome::Observed(_)));
             assert_eq!(driver.called, Some(expected));
+        }
+    }
+
+    #[test]
+    fn unpublished_native_owner_can_be_terminated_without_a_boot_observation() {
+        for (desired, terminal, operation) in [
+            (DesiredState::Stopped, MachineState::Stopped, "stop"),
+            (DesiredState::Destroyed, MachineState::Destroyed, "destroy"),
+        ] {
+            let mut driver = Driver {
+                called: None,
+                output: Some(output(1, terminal)),
+            };
+            let MachineOutcome::Observed(transitions) =
+                apply_lifecycle(&mut driver, &command(desired), None)
+            else {
+                panic!("confirmed native containment must remain observable");
+            };
+            assert_eq!(driver.called, Some(operation));
+            assert_eq!(transitions.first().unwrap().state, MachineState::Creating);
+            assert_eq!(transitions.last().unwrap().state, terminal);
+            assert!(
+                transitions
+                    .iter()
+                    .all(|value| value.generation == Counter::ONE)
+            );
+            let mut uncertain = Driver {
+                called: None,
+                output: Some(MachineOutcome::Unknown),
+            };
+            assert_eq!(
+                apply_lifecycle(&mut uncertain, &command(desired), None),
+                MachineOutcome::Unknown
+            );
         }
     }
 

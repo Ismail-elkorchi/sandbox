@@ -74,7 +74,6 @@ pub enum AppleConfigError {
 pub struct AppleDriver {
     config: AppleConfig,
     owner: Option<HelperOwner>,
-    applied_revision: Option<Counter>,
     capture_paused: bool,
     full_capture_operation: Option<sandsurf_protocol::OperationId>,
     committed_suspend: Option<(sandsurf_protocol::OperationId, Digest)>,
@@ -161,7 +160,6 @@ impl AppleDriver {
         Ok(Self {
             config,
             owner: None,
-            applied_revision: None,
             capture_paused: false,
             full_capture_operation: None,
             committed_suspend: None,
@@ -228,7 +226,6 @@ impl AppleDriver {
                 if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
             {
                 self.owner = Some(owner);
-                self.applied_revision = Some(command.revision);
                 self.capture_paused = false;
                 self.committed_suspend = None;
                 MachineOutcome::Observed(vec![
@@ -506,7 +503,6 @@ impl MachineDriver for AppleDriver {
             ));
         }
         if command.machine_id != self.config.machine_id
-            || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.owner.is_some()
             || matches!(
@@ -523,7 +519,6 @@ impl MachineDriver for AppleDriver {
                 b"apple-configuration-state-mismatch",
             ));
         }
-        self.applied_revision = Some(command.revision);
         ConfigurationOutcome::Applied(bytes_digest(b"apple-configuration-installed"))
     }
 
@@ -539,13 +534,9 @@ impl MachineDriver for AppleDriver {
         if command.machine_id != self.config.machine_id {
             return Self::unavailable(b"apple-machine-identity-mismatch");
         }
-        if self.owner.is_none()
-            || self.applied_revision != Some(current.applied_revision)
-            || command.revision <= current.applied_revision
-        {
+        if self.owner.is_none() || command.revision <= current.applied_revision {
             return Self::unavailable(b"apple-live-reconfiguration-not-supported");
         }
-        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.generation,
@@ -672,7 +663,6 @@ impl MachineDriver for AppleDriver {
             return MachineOutcome::Unknown;
         }
         self.owner = Some(owner);
-        self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;
@@ -693,56 +683,50 @@ impl MachineDriver for AppleDriver {
         ])
     }
 
-    fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {
-        if current.state == MachineState::Suspended && self.owner.is_none() {
+    fn stop(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> MachineOutcome {
+        let generation = current.map_or(Counter::ONE, |value| value.generation);
+        if current.is_some_and(|value| value.state == MachineState::Suspended)
+            && self.owner.is_none()
+        {
             self.staged_restore = None;
             return MachineOutcome::Observed(vec![transition(
                 command,
-                current.generation,
+                generation,
                 MachineState::Stopped,
                 b"vz-suspended-state-detached",
             )]);
         }
         self.stop_owner(
             command,
-            current.generation,
-            current.state == MachineState::Stopped,
+            generation,
+            current.is_none_or(|value| value.state == MachineState::Stopped),
         )
     }
 
     fn destroy(
         &mut self,
         command: &LifecycleCommand,
-        current: &MachineObservation,
+        current: Option<&MachineObservation>,
     ) -> MachineOutcome {
-        let stopped = if current.state == MachineState::Suspended && self.owner.is_none() {
-            self.staged_restore = None;
-            MachineOutcome::Observed(vec![transition(
-                command,
-                current.generation,
-                MachineState::Stopped,
-                b"vz-suspended-state-detached",
-            )])
-        } else {
-            self.stop_owner(
-                command,
-                current.generation,
-                current.state == MachineState::Stopped,
-            )
-        };
+        let stopped = self.stop(command, current);
         if !matches!(stopped, MachineOutcome::Observed(_)) {
             return stopped;
         }
+        let generation = current.map_or(Counter::ONE, |value| value.generation);
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.generation,
+                generation,
                 MachineState::Destroying,
                 b"vz-destroying",
             ),
             transition(
                 command,
-                current.generation,
+                generation,
                 MachineState::Destroyed,
                 b"vz-owner-exited",
             ),

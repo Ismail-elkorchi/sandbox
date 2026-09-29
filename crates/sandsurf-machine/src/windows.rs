@@ -97,7 +97,6 @@ pub struct HyperVDriver {
     system: Option<SystemHandle>,
     granted_disks: Vec<PathBuf>,
     generation: Option<Counter>,
-    applied_revision: Option<Counter>,
     capture_paused: bool,
     full_capture_operation: Option<sandsurf_protocol::OperationId>,
     full_capture_state: Option<PathBuf>,
@@ -173,7 +172,6 @@ impl HyperVDriver {
             system: None,
             granted_disks: Vec::new(),
             generation: None,
-            applied_revision: None,
             capture_paused: false,
             full_capture_operation: None,
             full_capture_state: None,
@@ -428,7 +426,6 @@ impl HyperVDriver {
             return MachineOutcome::Unknown;
         }
         self.generation = Some(generation);
-        self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_capture_state = None;
@@ -713,7 +710,6 @@ impl MachineDriver for HyperVDriver {
             ));
         }
         if command.machine_id != self.config.machine_id
-            || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.system.is_some()
             || matches!(
@@ -730,7 +726,6 @@ impl MachineDriver for HyperVDriver {
                 b"hyper-v-configuration-state-mismatch",
             ));
         }
-        self.applied_revision = Some(command.revision);
         ConfigurationOutcome::Applied(bytes_digest(b"hyper-v-configuration-installed"))
     }
 
@@ -746,13 +741,9 @@ impl MachineDriver for HyperVDriver {
         if command.machine_id != self.config.machine_id {
             return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
-        if self.system.is_none()
-            || self.applied_revision != Some(current.applied_revision)
-            || command.revision <= current.applied_revision
-        {
+        if self.system.is_none() || command.revision <= current.applied_revision {
             return self.unavailable(b"hyper-v-live-reconfiguration-not-supported");
         }
-        self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
             current.generation,
@@ -891,7 +882,11 @@ impl MachineDriver for HyperVDriver {
         outcome
     }
 
-    fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {
+    fn stop(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> MachineOutcome {
         if command.machine_id != self.config.machine_id {
             return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
@@ -900,7 +895,7 @@ impl MachineDriver for HyperVDriver {
         }
         MachineOutcome::Observed(vec![transition(
             command,
-            current.generation,
+            current.map_or(Counter::ONE, |value| value.generation),
             MachineState::Stopped,
             b"hcs-exit-confirmed",
         )])
@@ -909,7 +904,7 @@ impl MachineDriver for HyperVDriver {
     fn destroy(
         &mut self,
         command: &LifecycleCommand,
-        current: &MachineObservation,
+        current: Option<&MachineObservation>,
     ) -> MachineOutcome {
         if command.machine_id != self.config.machine_id {
             return self.unavailable(b"hyper-v-machine-identity-mismatch");
@@ -920,13 +915,13 @@ impl MachineDriver for HyperVDriver {
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.generation,
+                current.map_or(Counter::ONE, |value| value.generation),
                 MachineState::Destroying,
                 b"hcs-destroying",
             ),
             transition(
                 command,
-                current.generation,
+                current.map_or(Counter::ONE, |value| value.generation),
                 MachineState::Destroyed,
                 b"hcs-exit-and-access-revocation-confirmed",
             ),

@@ -41,10 +41,12 @@ impl From<io::Error> for GuestChannelError {
 #[cfg(unix)]
 mod unix {
     use super::{GuestChannel, GuestChannelError, GuestConnection};
+    use crate::unix_io::DeadlineIo;
+    use std::cell::Cell;
     #[cfg(target_os = "linux")]
     use std::fs::File;
     use std::io;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
@@ -53,12 +55,57 @@ mod unix {
     #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    impl GuestConnection for UnixStream {
+    pub struct UnixGuestConnection {
+        stream: UnixStream,
+        timeout: Cell<Option<Duration>>,
+    }
+
+    impl UnixGuestConnection {
+        pub fn new(stream: UnixStream, timeout: Option<Duration>) -> io::Result<Self> {
+            stream.set_nonblocking(true)?;
+            let connection = Self {
+                stream,
+                timeout: Cell::new(None),
+            };
+            connection.set_io_timeout(timeout)?;
+            Ok(connection)
+        }
+        fn io(&mut self) -> DeadlineIo<'_> {
+            DeadlineIo {
+                stream: &mut self.stream,
+                deadline: self.timeout.get().map(|duration| Instant::now() + duration),
+            }
+        }
+    }
+
+    impl Read for UnixGuestConnection {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.io().read(bytes)
+        }
+    }
+    impl Write for UnixGuestConnection {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.io().write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.io().flush()
+        }
+    }
+
+    impl GuestConnection for UnixGuestConnection {
         fn set_io_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-            self.set_read_timeout(timeout)?;
-            self.set_write_timeout(timeout)
+            if timeout
+                .is_some_and(|value| value.is_zero() || Instant::now().checked_add(value).is_none())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "guest I/O timeout is invalid",
+                ));
+            }
+            self.timeout.set(timeout);
+            Ok(())
         }
     }
 
@@ -71,10 +118,10 @@ mod unix {
 
     impl GuestChannel for DirectUnixChannel {
         fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
-            let stream = connect_socket(&self.socket_path)?;
-            stream.set_read_timeout(Some(self.timeout))?;
-            stream.set_write_timeout(Some(self.timeout))?;
-            Ok(Box::new(stream))
+            Ok(Box::new(UnixGuestConnection::new(
+                connect_socket(&self.socket_path)?,
+                Some(self.timeout),
+            )?))
         }
     }
 
@@ -92,25 +139,25 @@ mod unix {
                     "invalid guest vsock port".into(),
                 ));
             }
-            let mut stream = connect_socket(&self.socket_path)?;
-            stream.set_read_timeout(Some(self.timeout))?;
-            stream.set_write_timeout(Some(self.timeout))?;
+            let mut stream =
+                UnixGuestConnection::new(connect_socket(&self.socket_path)?, Some(self.timeout))?;
             writeln!(stream, "CONNECT {}", self.guest_port)?;
             stream.flush()?;
-            let mut reader = BufReader::new(stream.try_clone()?);
             let mut response = String::new();
-            reader.read_line(&mut response)?;
+            BufReader::new((&mut stream).take(128)).read_line(&mut response)?;
             let assigned_port = response
                 .trim()
                 .strip_prefix("OK ")
                 .and_then(|value| value.parse::<u32>().ok());
-            if response.len() > 128 || assigned_port.is_none_or(|port| port < 1024) {
+            if response.len() >= 128
+                || !response.ends_with('\n')
+                || assigned_port.is_none_or(|port| port < 1024)
+            {
                 return Err(GuestChannelError::Protocol(
                     "Firecracker vsock connection acknowledgement is invalid".into(),
                 ));
             }
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
+            stream.set_io_timeout(None)?;
             Ok(Box::new(stream))
         }
     }
@@ -174,6 +221,27 @@ mod unix {
         }
 
         #[test]
+        fn buffered_bytes_and_eof_survive_deadline_changes_after_peer_shutdown() {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let mut connection =
+                UnixGuestConnection::new(client, Some(Duration::from_secs(10))).unwrap();
+            server.write_all(b"retained-response").unwrap();
+            server.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(server);
+            connection
+                .set_io_timeout(Some(Duration::new(9, 999_865_209)))
+                .unwrap();
+            let mut bytes = [0; 17];
+            connection.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"retained-response");
+            connection
+                .set_io_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
+            assert_eq!(connection.read(&mut bytes).unwrap(), 0);
+            assert!(connection.set_io_timeout(Some(Duration::ZERO)).is_err());
+        }
+
+        #[test]
         fn direct_channel_transports_bytes() {
             use std::fs;
             use std::io::{Read, Write};
@@ -232,6 +300,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::DirectUnixChannel;
+#[cfg(unix)]
+pub use unix::UnixGuestConnection;
 #[cfg(unix)]
 pub use unix::UnixVsockChannel;
 

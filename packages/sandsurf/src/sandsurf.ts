@@ -310,7 +310,9 @@ export class Machine {
   async [authorize](change: AuthorityChange): Promise<string> { return this.#host[authorize](change); }
   async #lifecycle(desired: DesiredMachineState, options: MachineLifecycleOptions): Promise<MachineInspection> {
     const operationId = validateIdentity(options.operationId ?? identity(desired)); const expectedRevision = await resolveRevisionPrecondition(this, options.expectedRevision); const approvalId = await this.#host[authorize]({ kind: "lifecycle", machineId: this.id, operationId, request: { desired, expectedRevision } });
-    return this[observe](machineViewFrom(await this.#host[transport]({ kind: "lifecycle", machineId: this.id, operationId, expectedRevision, desired, approvalId })));
+    const response = await this.#host[transport]({ kind: "lifecycle", machineId: this.id, operationId, expectedRevision, desired, approvalId });
+    if (response.kind === "lifecycle") this[observe](parseView(response.machine));
+    return machineViewFrom(response);
   }
 }
 
