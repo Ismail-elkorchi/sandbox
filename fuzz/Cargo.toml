@@ -16,6 +16,16 @@ sandsurf-image = { path = "../crates/sandsurf-image" }
 sandsurf-network = { path = "../crates/sandsurf-network" }
 sandsurf-protocol = { path = "../crates/sandsurf-protocol" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+sandsurf-machine = { path = "../crates/sandsurf-machine" }
+
+[[bin]]
+name = "firecracker_api"
+path = "fuzz_targets/firecracker_api.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "sandsurf_protocol"
 path = "fuzz_targets/sandsurf_protocol.rs"

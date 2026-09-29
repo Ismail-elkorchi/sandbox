@@ -20,7 +20,7 @@ pub(crate) fn require_time(deadline: Option<Instant>) -> io::Result<()> {
 /// Establish a native Unix stream without allowing backlog admission to block
 /// a host worker indefinitely. Callers resolve the address relative to their
 /// retained directory; authentication remains the protocol owner's job.
-pub(crate) fn connect_socket(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+pub fn connect_socket(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     // SAFETY: sockaddr_un is a plain C struct; zero is valid initial storage.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     let bytes = path.as_os_str().as_bytes();
@@ -113,7 +113,7 @@ pub(crate) fn wait_ready(
     }
 }
 
-pub(crate) struct DeadlineIo<'a> {
+pub struct DeadlineIo<'a> {
     // Darwin rejects setsockopt after peer shutdown. Nonblocking I/O plus poll
     // preserves buffered responses and EOF without mutating socket options.
     pub stream: &'a mut UnixStream,

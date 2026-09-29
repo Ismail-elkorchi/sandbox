@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -31,15 +32,27 @@ const metadata = parseMetadata(metadataValue);
 const packages = new Map(metadata.packages.map((package_) => [package_.id, package_]));
 const nodes = new Map(metadata.nodes.map((node) => [node.id, node]));
 
-await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), [
-  {
+const nativeRoot = resolve("packages/sandsurf/native");
+const nativeManifest: unknown = JSON.parse(await readFile(resolve(nativeRoot, "manifest.json"), "utf8"));
+if (!isRecord(nativeManifest) || !isRecord(nativeManifest.files)) throw new Error("invalid native manifest");
+const nativeComponents: Component[] = [];
+for (const [path, expected] of Object.entries(nativeManifest.files)) {
+  const match = /^linux-(x64|arm64)\/firecracker-v([0-9]+\.[0-9]+\.[0-9]+)-(x86_64|aarch64)$/u.exec(path);
+  if (match === null) continue;
+  const architecture = match[1]!;
+  if ((architecture === "x64") !== (match[3] === "x86_64")) throw new Error("Firecracker architecture mismatch");
+  const actual = createHash("sha256").update(await readFile(resolve(nativeRoot, path))).digest("hex");
+  if (expected !== actual) throw new Error(`native supply-chain digest mismatch: ${path}`);
+  nativeComponents.push({
     type: "application",
     name: "firecracker",
-    version: "1.16.1",
+    version: match[2]!,
+    purl: `pkg:generic/firecracker@${match[2]}?arch=${architecture}`,
     licenses: [{ license: { id: "Apache-2.0" } }],
-    hashes: [{ alg: "SHA-256", content: "2fd0171309af7e24cf8dafc8a6f921c1434c49b5f9349bb996b7ed0a4deb8aa7" }],
-  },
-]);
+    hashes: [{ alg: "SHA-256", content: actual }],
+  });
+}
+await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), nativeComponents);
 
 async function generate(rootNames: readonly string[], npmName: string, destination: string, additional: readonly Component[]): Promise<void> {
   const roots = rootNames.map((rootName) => {

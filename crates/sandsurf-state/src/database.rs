@@ -221,7 +221,7 @@ pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    crate::windows::sync_directory(path)?;
+    sandsurf_native::storage::sync_directory(path)?;
     Ok(())
 }
 

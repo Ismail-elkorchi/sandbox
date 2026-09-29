@@ -23,7 +23,9 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1712,28 +1714,17 @@ fn random_suffix() -> Result<String> {
 
 #[cfg(unix)]
 fn create_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "transfer directory is not private",
-        ));
-    }
-    Ok(())
+    sandsurf_native::filesystem::require_private_directory(path)
 }
 #[cfg(windows)]
 fn create_private_directory(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-        Err(error) => Err(error),
-    }
+    sandsurf_native::local::ensure_private_directory(path)
 }
 
 #[cfg(unix)]
@@ -1757,20 +1748,15 @@ fn private_file(path: &Path, create: bool) -> io::Result<File> {
 }
 #[cfg(windows)]
 fn private_file(path: &Path, create: bool) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(create)
-        .open(path)
+    if create {
+        sandsurf_native::local::create_private_file(path)
+    } else {
+        sandsurf_native::local::open_private_file(path)
+    }
 }
 
-#[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-#[cfg(windows)]
-fn sync_directory(_: &Path) -> io::Result<()> {
-    Ok(())
+    sandsurf_native::storage::sync_directory(path)
 }
 
 #[cfg(test)]
@@ -1783,6 +1769,16 @@ mod tests {
             std::env::temp_dir().join(format!("sandsurf-tree-{name}-{}", random_suffix().unwrap()));
         create_private_directory(&path).unwrap();
         path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn artifact_store_never_adopts_an_unprotected_directory() {
+        let root =
+            std::env::temp_dir().join(format!("sandsurf-unprotected-{}", random_suffix().unwrap()));
+        fs::create_dir(&root).unwrap();
+        assert!(ArtifactStore::open(&root).is_err());
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

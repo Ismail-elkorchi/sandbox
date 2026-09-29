@@ -237,23 +237,6 @@ pub(crate) fn private_file(path: &Path, create: bool) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
-    let directory = open_directory(path)?;
-    let information = information(&directory)?;
-    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "state publication directory is a reparse point or not a directory",
-        ));
-    }
-    // NTFS/ReFS directory metadata is journaled; Windows exposes no supported
-    // directory-handle equivalent of POSIX fsync. Files and SQLite are flushed
-    // separately before their references become authoritative.
-    Ok(())
-}
-
 fn open_directory(path: &Path) -> io::Result<File> {
     let path = wide_os(path)?;
     // Omit FILE_SHARE_DELETE so this live handle fences replacement while checked.

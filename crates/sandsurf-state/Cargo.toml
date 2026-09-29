@@ -20,6 +20,7 @@ zeroize.workspace = true
 sandsurf-native = { path = "../sandsurf-native" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+sandsurf-native = { path = "../sandsurf-native" }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",

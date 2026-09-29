@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const COPY_BUFFER: usize = 1024 * 1024;
@@ -777,41 +777,27 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    sandsurf_native::storage::sync_directory(path)?;
     Ok(())
 }
 
 #[cfg(unix)]
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let metadata = fs::symlink_metadata(path)?;
-    let owner = path
-        .parent()
-        .map(fs::symlink_metadata)
-        .transpose()?
-        .map_or(metadata.uid(), |value| value.uid());
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != owner
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(SnapshotError::Invalid("snapshot directory is not private"));
-    }
+    sandsurf_native::filesystem::require_private_directory(path)?;
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use sandsurf_protocol::{
         Counter, Resources, SnapshotKind, SnapshotPhase, SnapshotRequest, bytes_digest,
     };
-    use std::os::unix::fs::DirBuilderExt;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -826,7 +812,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            private_directory(&path).unwrap();
             Self(path)
         }
     }
@@ -873,7 +859,7 @@ mod tests {
     fn capture_fork_and_rollback_are_verified_independent_copies() {
         let temp = Temp::new();
         let root = temp.0.join("snapshots");
-        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        private_directory(&root).unwrap();
         let source = temp.0.join("source.raw");
         fs::write(&source, vec![7_u8; 4096]).unwrap();
         let mut snapshot = snapshot();
@@ -893,10 +879,7 @@ mod tests {
         );
 
         let target_directory = temp.0.join("target");
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&target_directory)
-            .unwrap();
+        private_directory(&target_directory).unwrap();
         let target = target_directory.join("system.ext4");
         fs::write(&target, vec![9_u8; 4096]).unwrap();
         rollback(&root, &snapshot, &target, &"rollback".try_into().unwrap()).unwrap();
@@ -927,6 +910,6 @@ mod tests {
 
 #[cfg(windows)]
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
-    sandsurf_native::local::create_private_directory(path)?;
+    sandsurf_native::local::ensure_private_directory(path)?;
     Ok(())
 }

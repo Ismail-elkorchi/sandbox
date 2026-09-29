@@ -409,6 +409,7 @@ dependencies = [
  "libfuzzer-sys",
  "sandsurf-format",
  "sandsurf-image",
+ "sandsurf-machine",
  "sandsurf-network",
  "sandsurf-protocol",
  "serde_json",
@@ -541,6 +542,19 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+]
+
+[[package]]
+name = "sandsurf-machine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sandsurf-native",
+ "sandsurf-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows-sys",
 ]
 
 [[package]]

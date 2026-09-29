@@ -25,6 +25,44 @@ pub fn publish_new_file(staged: &Path, destination: &Path) -> io::Result<()> {
     publish(staged, destination)
 }
 
+/// Flush publication metadata where the OS provides a directory fsync. On
+/// Windows, validate the directory handle without claiming a POSIX-style
+/// directory flush: payload files and the authoritative journal are flushed
+/// independently, and interrupted publications are recovered from that journal.
+#[cfg(unix)]
+pub fn sync_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(windows)]
+pub fn sync_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    use std::os::windows::fs::MetadataExt;
+    let attributes = file.metadata()?.file_attributes();
+    if attributes & FILE_ATTRIBUTE_DIRECTORY == 0 || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "publication target is a reparse point or not a directory",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
     // A hard link is a no-replace publication on the same filesystem. If the
@@ -61,4 +99,34 @@ fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn publication_directory_validation_rejects_files_and_missing_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-publication-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        sync_directory(&root).unwrap();
+        let file = root.join("file");
+        fs::write(&file, b"payload").unwrap();
+        assert!(sync_directory(&file).is_err());
+        assert!(sync_directory(&root.join("missing")).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            assert!(sync_directory(&link).is_err());
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

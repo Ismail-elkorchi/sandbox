@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
@@ -353,7 +353,7 @@ impl FirecrackerProcess {
     fn wait_for_api(&self) -> Result<(), FirecrackerError> {
         let deadline = Instant::now() + API_TIMEOUT;
         loop {
-            match self.api_connection() {
+            match self.api_connection(deadline) {
                 Ok(_) => return Ok(()),
                 Err(error) if Instant::now() < deadline => {
                     if !matches!(
@@ -375,7 +375,7 @@ impl FirecrackerProcess {
         }
     }
 
-    fn api_connection(&self) -> Result<UnixStream, FirecrackerError> {
+    fn api_connection(&self, deadline: Instant) -> Result<UnixStream, FirecrackerError> {
         // Persistent Machine roots can exceed AF_UNIX's 108-byte pathname
         // bound. Resolve the already-owned state directory through a short
         // proc-fd path rather than requiring callers to choose a short root.
@@ -390,10 +390,10 @@ impl FirecrackerProcess {
             "/proc/self/fd/{}/firecracker.socket",
             api_directory.as_raw_fd()
         ));
-        let connection = UnixStream::connect(short_api_path)?;
-        connection.set_read_timeout(Some(API_TIMEOUT))?;
-        connection.set_write_timeout(Some(API_TIMEOUT))?;
-        Ok(connection)
+        Ok(sandsurf_native::unix_io::connect_socket(
+            &short_api_path,
+            deadline,
+        )?)
     }
 
     fn api_request(
@@ -412,7 +412,12 @@ impl FirecrackerProcess {
                 "Firecracker API request is malformed".into(),
             ));
         }
-        let mut connection = self.api_connection()?;
+        let deadline = Instant::now() + API_TIMEOUT;
+        let mut stream = self.api_connection(deadline)?;
+        let mut connection = sandsurf_native::unix_io::DeadlineIo {
+            stream: &mut stream,
+            deadline: Some(deadline),
+        };
         write!(
             connection,
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -420,63 +425,7 @@ impl FirecrackerProcess {
         )?;
         connection.write_all(body)?;
         connection.flush()?;
-        let mut response = Vec::new();
-        let mut byte = [0_u8; 1];
-        while !response.ends_with(b"\r\n\r\n") {
-            if response.len() == API_HEADER_LIMIT {
-                return Err(FirecrackerError::Setup(
-                    "Firecracker API response headers exceed 64 KiB".into(),
-                ));
-            }
-            connection.read_exact(&mut byte)?;
-            response.push(byte[0]);
-        }
-        let Some(line_end) = response.windows(2).position(|value| value == b"\r\n") else {
-            return Err(FirecrackerError::Setup(
-                "Firecracker API response has no status line".into(),
-            ));
-        };
-        let status = std::str::from_utf8(&response[..line_end])
-            .map_err(|_| FirecrackerError::Setup("Firecracker API status is not UTF-8".into()))?;
-        let status_code = status
-            .split_ascii_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u16>().ok());
-        let mut content_length = 0usize;
-        for line in response[..response.len() - 4]
-            .split(|value| *value == b'\n')
-            .skip(1)
-        {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let Some(separator) = line.iter().position(|byte| *byte == b':') else {
-                return Err(FirecrackerError::Setup(
-                    "Firecracker API response header is malformed".into(),
-                ));
-            };
-            let (name, value) = (&line[..separator], &line[separator + 1..]);
-            if name.eq_ignore_ascii_case(b"content-length") {
-                let value = std::str::from_utf8(value)
-                    .map_err(|_| FirecrackerError::Setup("invalid content length".into()))?
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| FirecrackerError::Setup("invalid content length".into()))?;
-                if value > API_BODY_LIMIT {
-                    return Err(FirecrackerError::Setup(
-                        "Firecracker API response body exceeds 1 MiB".into(),
-                    ));
-                }
-                content_length = value;
-            }
-        }
-        let mut response_body = vec![0_u8; content_length];
-        connection.read_exact(&mut response_body)?;
-        if status_code != Some(expected_status) {
-            return Err(FirecrackerError::Setup(format!(
-                "Firecracker API rejected {method} {path}: {status}: {}",
-                String::from_utf8_lossy(&response_body)
-            )));
-        }
-        Ok(response_body)
+        read_api_response(BufReader::with_capacity(4096, connection), expected_status)
     }
 
     #[must_use]
@@ -642,6 +591,140 @@ impl From<io::Error> for FirecrackerError {
     }
 }
 
+/// Bounded native-control decoding. The caller supplies the transport's single
+/// absolute deadline; buffering does not admit unbounded lines or chunked data.
+pub fn read_api_response(
+    mut reader: impl BufRead,
+    expected_status: u16,
+) -> Result<Vec<u8>, FirecrackerError> {
+    let mut response = Vec::new();
+    loop {
+        let remaining = API_HEADER_LIMIT - response.len();
+        let count = (&mut reader)
+            .take(remaining as u64)
+            .read_until(b'\n', &mut response)?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete native API headers",
+            )
+            .into());
+        }
+        if count < 2 || !response.ends_with(b"\r\n") {
+            return Err(FirecrackerError::Setup(
+                "native API requires CRLF-delimited headers".into(),
+            ));
+        }
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if response.len() == API_HEADER_LIMIT {
+            return Err(FirecrackerError::Setup(
+                "native API headers exceed 64 KiB".into(),
+            ));
+        }
+    }
+    let mut lines = response[..response.len() - 4].split(|byte| *byte == b'\n');
+    let status = lines
+        .next()
+        .ok_or_else(|| FirecrackerError::Setup("native API status missing".into()))?;
+    let status = status.strip_suffix(b"\r").unwrap_or(status);
+    if status
+        .iter()
+        .any(|byte| (*byte < 32 && *byte != b'\t') || *byte >= 127)
+    {
+        return Err(FirecrackerError::Setup(
+            "native API status contains invalid bytes".into(),
+        ));
+    }
+    let status = std::str::from_utf8(status)
+        .map_err(|_| FirecrackerError::Setup("native API status is not UTF-8".into()))?;
+    let mut status_fields = status.split_ascii_whitespace();
+    let protocol = status_fields.next();
+    let code = status_fields
+        .next()
+        .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code));
+    if protocol != Some("HTTP/1.1") || code.is_none() {
+        return Err(FirecrackerError::Setup(
+            "native API status line is invalid".into(),
+        ));
+    }
+    let mut content_length = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let separator = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| FirecrackerError::Setup("native API header is invalid".into()))?;
+        let (name, value) = (&line[..separator], &line[separator + 1..]);
+        if name.is_empty()
+            || !name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+            || value
+                .iter()
+                .any(|byte| (*byte < 32 && *byte != b'\t') || *byte == 127)
+        {
+            return Err(FirecrackerError::Setup(
+                "native API header contains invalid bytes".into(),
+            ));
+        }
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return Err(FirecrackerError::Setup(
+                "native API transfer encoding is unsupported".into(),
+            ));
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if content_length.is_some() {
+                return Err(FirecrackerError::Setup(
+                    "native API content length is duplicated".into(),
+                ));
+            }
+            let digits = std::str::from_utf8(value)
+                .map_err(|_| {
+                    FirecrackerError::Setup("native API content length is invalid".into())
+                })?
+                .trim();
+            let length = (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| digits.parse::<usize>().ok())
+                .flatten()
+                .filter(|length| *length <= API_BODY_LIMIT)
+                .ok_or_else(|| {
+                    FirecrackerError::Setup(
+                        "native API body exceeds 1 MiB or has invalid length".into(),
+                    )
+                })?;
+            content_length = Some(length);
+        }
+    }
+    let length = match (code, content_length) {
+        (Some(204), None | Some(0)) => 0,
+        (Some(204), _) => {
+            return Err(FirecrackerError::Setup(
+                "native API 204 response carries a body".into(),
+            ));
+        }
+        (_, Some(length)) => length,
+        _ => {
+            return Err(FirecrackerError::Setup(
+                "native API response length missing".into(),
+            ));
+        }
+    };
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    if code != Some(expected_status) {
+        return Err(FirecrackerError::Setup(format!(
+            "native API rejected request: {}: {}",
+            status.trim(),
+            String::from_utf8_lossy(&body[..body.len().min(4096)])
+        )));
+    }
+    Ok(body)
+}
+
 fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
     if config.guest_cid < 3
         || config.guest_port < 1024
@@ -761,4 +844,79 @@ struct MachineConfig {
 struct Vsock {
     guest_cid: u32,
     uds_path: String,
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn native_http_response_is_binary_exact_strict_and_bounded() {
+        let body = b"\0\xff\x80\x01";
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".to_vec();
+        response.extend_from_slice(body);
+        assert_eq!(
+            read_api_response(Cursor::new(&response), 200).unwrap(),
+            body
+        );
+        assert!(read_api_response(Cursor::new(&response), 204).is_err());
+        assert!(
+            read_api_response(Cursor::new(b"HTTP/1.1 204 No Content\r\n\r\n"), 204)
+                .unwrap()
+                .is_empty()
+        );
+        for malformed in [
+            &b"HTTP/1.1 200 OK\nContent-Length: 0\n\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\nx"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc"[..],
+            &b"HTTP/1.1 200 OK\r\n\r\n"[..],
+            &b"HTTP/1.1 200 \0\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 000 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n"[..],
+        ] {
+            assert!(
+                read_api_response(Cursor::new(malformed), 200).is_err(),
+                "{malformed:?}"
+            );
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nX-Header: ".to_vec();
+        oversized.resize(API_HEADER_LIMIT + 4096, b'x');
+        let mut cursor = Cursor::new(&oversized);
+        assert!(read_api_response(&mut cursor, 200).is_err());
+        assert_eq!(
+            cursor.position(),
+            API_HEADER_LIMIT as u64,
+            "do not read past the header allocation bound"
+        );
+    }
+
+    #[test]
+    fn slow_native_response_has_one_operation_deadline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let writer = std::thread::spawn(move || {
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" {
+                if server.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let start = Instant::now();
+        let transport = sandsurf_native::unix_io::DeadlineIo {
+            stream: &mut client,
+            deadline: Some(start + Duration::from_millis(100)),
+        };
+        assert!(
+            matches!(read_api_response(BufReader::new(transport), 200), Err(FirecrackerError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(client);
+        writer.join().unwrap();
+    }
 }
