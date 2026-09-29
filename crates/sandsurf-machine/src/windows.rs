@@ -1232,7 +1232,7 @@ mod tests {
             memory_mib: 2048,
             vcpus: 2,
             kernel: PathBuf::from(r"C:\Sandsurf\kernel"),
-            command_line: "console=ttyS0 root=/dev/sda ro init=/sbin/sandsurf-guest".into(),
+            command_line: "console=ttyS0 root=/dev/sda rw init=/sbin/init".into(),
             disks: vec![HyperVDisk {
                 path: PathBuf::from(r"C:\Sandsurf\box\boot.vhdx"),
                 read_only: false,

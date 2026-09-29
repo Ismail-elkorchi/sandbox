@@ -145,17 +145,93 @@ test("retained artifacts publish without a live machine, revision or redundant u
   assert.equal(approvals[0].request.changeSetDigest, requests[0].changeSet.digest);
 });
 
-function fixtureMachine(request, generation = 1) {
-  const host = new Sandsurf({ request }, async () => { throw new Error("ordinary guest access requested host approval"); });
-  return new Machine(host, {
+function fixtureMachine(request, generation = 1, authorizer = async () => { throw new Error("ordinary guest access requested host approval"); }) {
+  const host = new Sandsurf({ request }, authorizer);
+  return new Machine(host, fixtureView(generation));
+}
+
+function fixtureView(generation = 1) {
+  return {
     id: "box", imageDigest: "a".repeat(64),
     resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 },
     runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 } },
-    configurationRevision: 99, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { generation } },
+    configurationRevision: 99, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { generation, sequence: 1 } },
+    management: { kind: "unavailable", lastKnown: null },
     executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace", entrypoint: [], command: [] },
     lifetime: { expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
-  });
+  };
 }
+
+test("authority-changing responses advance cached revisions without inspection", async () => {
+  let view = fixtureView();
+  const requests = [];
+  const exposure = { id: "web", machineId: "box", revision: 102,
+    spec: { guestAddress: "127.0.0.1", guestPort: 8080, hostAddress: "127.0.0.1", hostPort: 8080, public: false },
+    active: true, boundPort: 8080 };
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    if (request.kind === "get-machine") return { kind: "machine", value: view };
+    assert.equal(request.expectedRevision, view.configurationRevision);
+    view = { ...view, configurationRevision: view.configurationRevision + 1 };
+    if (request.kind === "set-exposure") return { kind: "exposure", machine: view, exposure };
+    if (request.kind === "lifecycle") return { kind: "lifecycle", machine: view, operation: { delivery: "applied" } };
+    return { kind: "configuration", machine: view };
+  }, 1, async () => true);
+  const original = view;
+  await machine.network.denyAll({ operationId: "network" });
+  await machine.resources.update(view.resources, { operationId: "resources" });
+  await machine.ports.expose({ guestPort: 8080 }, { id: "web", operationId: "expose" });
+  await machine.powerOff({ operationId: "stop" });
+  assert.equal(machine.revision, 103);
+  assert.deepEqual(requests.map((request) => request.kind), ["set-network-policy", "update-resources", "set-exposure", "lifecycle"]);
+  view = { ...view, machine: { kind: "current", value: { generation: 2, sequence: 1 } } };
+  await machine.inspect();
+  assert.equal(machine.generation, 2);
+  // A delayed response is an observation, not permission to rewind authority.
+  view = original;
+  await machine.inspect();
+  assert.equal(machine.revision, 103);
+  assert.equal(machine.generation, 2);
+});
+
+test("OCI conversion binds explicit boot artifacts into approval and admission", async () => {
+  const requests = [];
+  const approvals = [];
+  const image = { digest: "b".repeat(64), sourceDigest: "c".repeat(64),
+    platform: "linux", architecture: "amd64", logicalBytes: 1024,
+    storageBytes: 1024, provenanceDigest: "d".repeat(64), sensitive: false };
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request);
+    assert.equal(request.kind, "import-oci");
+    return { kind: "image-import", operation: { image } };
+  } }, async (change) => { approvals.push(change); return true; });
+  const options = { source: { kind: "layout", path: "/images/source" },
+    platform: "linux/amd64", operationId: "build-machine",
+    recipe: { bootImage: "a".repeat(64) } };
+  assert.equal((await host.images.importOCI(options)).id, image.digest);
+  assert.deepEqual(requests[0].recipe, { bootImageDigest: "a".repeat(64) });
+  assert.deepEqual(approvals[0].request.recipe, requests[0].recipe);
+  await assert.rejects(host.images.importOCI({ ...options, recipe: undefined }), TypeError);
+  assert.equal(requests.length, 1);
+  assert.equal(approvals.length, 1);
+});
+
+test("retained-output operations are fenced by receipts, not live machine revisions", async () => {
+  const requests = [];
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    assert.equal("expectedRevision" in request, false);
+    return { kind: "runtime", response: request.kind === "release-evidence"
+      ? { kind: "release", status: { requestDigest: "a".repeat(64), cleanupPending: false } }
+      : { kind: "complete" } };
+  });
+  const execution = new Execution(machine, "retained", 1);
+  await execution.acknowledge("b".repeat(64));
+  await execution.pin("retained-copy", "b".repeat(64));
+  await execution.release({ digest: "b".repeat(64), receipt: { output: {} } },
+    { kind: "continuing-retention", pin: "retained-copy" });
+  assert.deepEqual(requests.map((request) => request.kind), ["acknowledge-receipt", "pin-evidence", "release-evidence"]);
+});
 
 test("ordinary command and file queries use cached generations without grants or inspection", async () => {
   const requests = [];

@@ -665,13 +665,20 @@ impl HostService {
             }
             HostRequest::ImportOci {
                 source,
+                recipe,
                 platform,
                 operation_id,
                 approval_id,
             } => {
                 let request_digest = digest(
                     Domain::Image,
-                    &("sandsurf-import-oci-v1", &source, &platform, &operation_id),
+                    &(
+                        "sandsurf-import-oci-v2",
+                        &source,
+                        &recipe,
+                        &platform,
+                        &operation_id,
+                    ),
                 )?;
                 let admitted = self.catalog.admit_image_import(
                     operation_id.clone(),
@@ -704,8 +711,11 @@ impl HostService {
                 let image = crate::images::import_oci(
                     &self.root,
                     &self.executable,
-                    &source,
-                    &platform,
+                    crate::images::OciBuildInput {
+                        source: &source,
+                        recipe: &recipe,
+                        platform: &platform,
+                    },
                     &operation_id,
                     &request_digest,
                     registry_credential.as_ref().map(|value| value.as_slice()),
@@ -1376,7 +1386,6 @@ impl HostService {
                 operation_id,
                 execution_id,
                 receipt_digest,
-                expected_revision,
             } => {
                 self.provision_guardian(&machine_id)?;
                 let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
@@ -1402,8 +1411,6 @@ impl HostService {
                     }
                     None => {}
                 }
-                self.catalog
-                    .require_revision(&machine_id, expected_revision)?;
                 Ok(HostResponse::Runtime {
                     response: client.runtime(
                         machine_id,
@@ -1421,7 +1428,6 @@ impl HostService {
                 execution_id,
                 receipt_digest,
                 pin_id,
-                expected_revision,
             } => {
                 self.provision_guardian(&machine_id)?;
                 let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
@@ -1449,8 +1455,6 @@ impl HostService {
                     }
                     None => {}
                 }
-                self.catalog
-                    .require_revision(&machine_id, expected_revision)?;
                 Ok(HostResponse::Runtime {
                     response: client.runtime(
                         machine_id,
@@ -1467,7 +1471,6 @@ impl HostService {
                 machine_id,
                 execution_id,
                 request,
-                expected_revision,
                 loss_approval_id,
             } => {
                 self.provision_guardian(&machine_id)?;
@@ -1491,8 +1494,6 @@ impl HostService {
                     }
                     None => {}
                 }
-                self.catalog
-                    .require_revision(&machine_id, expected_revision)?;
                 match (&request.disposition, loss_approval_id) {
                     (ReleaseDisposition::AuthorizedLoss { authorization }, Some(approval_id))
                         if *authorization == approval_id =>

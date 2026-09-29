@@ -98,23 +98,34 @@ impl DeadlineConnection {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::TimedOut, "guest operation deadline exceeded")
             })?;
-        self.inner.set_io_timeout(Some(remaining))
+        self.inner.set_io_timeout(Some(remaining)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("guest transport timeout setup ({remaining:?}): {error}"),
+            )
+        })
     }
 }
 impl Read for DeadlineConnection {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.bound()?;
-        self.inner.read(bytes)
+        self.inner
+            .read(bytes)
+            .map_err(|error| io::Error::new(error.kind(), format!("guest transport read: {error}")))
     }
 }
 impl Write for DeadlineConnection {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.bound()?;
-        self.inner.write(bytes)
+        self.inner.write(bytes).map_err(|error| {
+            io::Error::new(error.kind(), format!("guest transport write: {error}"))
+        })
     }
     fn flush(&mut self) -> io::Result<()> {
         self.bound()?;
-        self.inner.flush()
+        self.inner.flush().map_err(|error| {
+            io::Error::new(error.kind(), format!("guest transport flush: {error}"))
+        })
     }
 }
 impl GuestConnection for DeadlineConnection {

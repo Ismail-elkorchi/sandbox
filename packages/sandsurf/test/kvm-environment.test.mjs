@@ -137,6 +137,14 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal((await machine.inspect()).machine.value.state, "paused");
     await machine.destroy();
     assertSameBytes(await output(execution), dense);
+    const archivedReceipt = await execution.receipt();
+    assert.ok(archivedReceipt);
+    await execution.acknowledge(archivedReceipt.digest);
+    const pinned = await execution.pin("archive-copy", archivedReceipt.digest);
+    const released = await execution.release(archivedReceipt, { kind: "continuing-retention", pin: pinned.id });
+    assert.equal((await execution.cleanupReleased(released.requestDigest)).cleanupPending, false);
+    const retainedPage = await pinned.read({ maximum: dense.byteLength });
+    assertSameBytes(Buffer.concat(retainedPage.chunks.map((chunk) => Buffer.from(chunk.bytes))), dense);
     const retained = await host.artifacts.get(identity, artifact.id);
     await writeFile(join(destination, "unrelated"), "preserved");
     await retained.applyToHost({ destination });

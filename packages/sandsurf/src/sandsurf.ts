@@ -9,6 +9,7 @@ const authorize = Symbol("host approval");
 const dispatchGuest = Symbol("guest command");
 const queryGuest = Symbol("guest query");
 const observed = Symbol("cached observation");
+const observe = Symbol("observe host response");
 const executionFence = Symbol("execution generation fence");
 
 export type DesiredMachineState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
@@ -68,7 +69,12 @@ export interface SecretRevocation {
   };
 }
 export type OciImageSource = { readonly kind: "layout"; readonly path: string } | { readonly kind: "archive"; readonly path: string } | { readonly kind: "registry"; readonly reference: string; readonly credential?: SecretVersion };
-export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly platform?: string; readonly operationId?: string; }
+/** Validate a complete OCI OS filesystem against explicit native boot artifacts.
+ * OCI entrypoint/command does not control machine lifetime. Guest integration
+ * must be installed in the source OS; it is never inferred from the boot image.
+ */
+export interface MachineImageRecipe { readonly bootImage: string | Image; }
+export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly recipe: MachineImageRecipe; readonly platform?: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
 export interface Receipt { readonly machineId: string; readonly generation: number; readonly executionId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
@@ -145,11 +151,12 @@ export class ImageCollection {
   constructor(host: Sandsurf) { this.#host = host; }
   async importOCI(options: ImageImportOptions): Promise<Image> {
     const operationId = validateIdentity(options.operationId ?? identity("image"));
-    const inspection = await this.#host.inspect();
-    const platform = options.platform ?? inspection.guestPlatform;
+    if (!record(options.recipe)) throw new TypeError("OCI conversion requires an explicit machine-image recipe");
+    const recipe = { bootImageDigest: digest(typeof options.recipe.bootImage === "string" ? options.recipe.bootImage : options.recipe.bootImage.id) };
+    const platform = options.platform ?? (await this.#host.inspect()).guestPlatform;
     const source = normalizeOciSource(options);
-    const approvalId = await this.#host[authorize]({ kind: "image-import", machineId: "host", operationId, request: { source, platform } });
-    const response = await this.#host[transport]({ kind: "import-oci", source, platform, operationId, approvalId });
+    const approvalId = await this.#host[authorize]({ kind: "image-import", machineId: "host", operationId, request: { source, recipe, platform } });
+    const response = await this.#host[transport]({ kind: "import-oci", source, recipe, platform, operationId, approvalId });
     if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("image import response");
     return new Image(parseImage(response.operation.image));
   }
@@ -258,7 +265,7 @@ export class Machine {
   get revision(): number { return this.#view.configurationRevision; }
   get generation(): number | undefined { return this.#view.machine.kind === "current" && record(this.#view.machine.value) ? integer(this.#view.machine.value.generation) : undefined; }
   retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
-  async inspect(): Promise<MachineInspection> { this.#view = machineViewFrom(await this.#host[transport]({ kind: "get-machine", machineId: this.id })); return this.#view; }
+  async inspect(): Promise<MachineInspection> { return this[observe](machineViewFrom(await this.#host[transport]({ kind: "get-machine", machineId: this.id }))); }
   async start(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("running", options); }
   async powerOff(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("stopped", options); }
   exec(options: ExecOptions): Promise<ExecResult> { return this.executions.exec(options); }
@@ -269,6 +276,18 @@ export class Machine {
   async suspend(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("suspended", options); }
   async destroy(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("destroyed", options); }
   get [observed](): MachineInspection { return this.#view; }
+  [observe](view: MachineInspection): MachineInspection {
+    if (view.id !== this.id) throw protocol("host response belongs to another machine");
+    const oldNative = nativeObservationOrder(this.#view.machine);
+    const newNative = nativeObservationOrder(view.machine);
+    const retainNative = oldNative[0] > newNative[0] ||
+      (oldNative[0] === newNative[0] && oldNative[1] > newNative[1]);
+    const authority = view.configurationRevision >= this.#view.configurationRevision ? view : this.#view;
+    this.#view = { ...authority,
+      machine: retainNative ? this.#view.machine : view.machine,
+      management: retainNative ? this.#view.management : view.management };
+    return view;
+  }
   async [dispatchGuest](request: Readonly<Record<string, unknown>>, operationId: string, precondition: MachineGenerationPrecondition = {}): Promise<Record<string, unknown>> {
     const authority = resolveGenerationPrecondition(this, precondition);
     const response = await this.#host[transport]({ kind: "dispatch-guest", machineId: this.id, generation: authority.expectedGeneration, operationId, request });
@@ -291,7 +310,7 @@ export class Machine {
   async [authorize](change: AuthorityChange): Promise<string> { return this.#host[authorize](change); }
   async #lifecycle(desired: DesiredMachineState, options: MachineLifecycleOptions): Promise<MachineInspection> {
     const operationId = validateIdentity(options.operationId ?? identity(desired)); const expectedRevision = await resolveRevisionPrecondition(this, options.expectedRevision); const approvalId = await this.#host[authorize]({ kind: "lifecycle", machineId: this.id, operationId, request: { desired, expectedRevision } });
-    this.#view = machineViewFrom(await this.#host[transport]({ kind: "lifecycle", machineId: this.id, operationId, expectedRevision, desired, approvalId })); return this.#view;
+    return this[observe](machineViewFrom(await this.#host[transport]({ kind: "lifecycle", machineId: this.id, operationId, expectedRevision, desired, approvalId })));
   }
 }
 
@@ -325,7 +344,7 @@ export class MachineNetwork {
     const approvalId = await this.#machine[authorize]({ kind: "network-access", machineId: this.#machine.id, operationId, request: { expectedRevision, policy: normalized } });
     const response = await this.#machine[transport]({ kind: "set-network-policy", machineId: this.#machine.id, operationId, expectedRevision, policy: normalized, approvalId });
     if (response.kind !== "configuration" || !record(response.machine)) throw protocol("network configuration response");
-    return parseView(response.machine).runtimeConfiguration;
+    return this.#machine[observe](parseView(response.machine)).runtimeConfiguration;
   }
   async denyAll(options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<RuntimeConfiguration> { return this.configure({ rules: [] }, options); }
   async inspect(): Promise<NetworkPolicy> { return (await this.#machine.inspect()).runtimeConfiguration.network; }
@@ -339,7 +358,8 @@ export class MachinePorts {
     const normalized = normalizeExposure(spec);
     const approvalId = await this.#machine[authorize]({ kind: "port-exposure", machineId: this.#machine.id, operationId, request: { exposureId, expectedRevision, spec: normalized, active: true } });
     const response = await this.#machine[transport]({ kind: "set-exposure", machineId: this.#machine.id, operationId, expectedRevision, exposureId, spec: normalized, active: true, approvalId });
-    if (response.kind !== "exposure" || !record(response.exposure)) throw protocol("port exposure response");
+    if (response.kind !== "exposure" || !record(response.exposure) || !record(response.machine)) throw protocol("port exposure response");
+    this.#machine[observe](parseView(response.machine));
     return parseExposure(response.exposure);
   }
   async revoke(id: string, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<Exposure> {
@@ -347,7 +367,8 @@ export class MachinePorts {
     if (existing === undefined) throw new SandsurfHostError("missing", `Exposure ${exposureId} does not exist`);
     const approvalId = await this.#machine[authorize]({ kind: "port-exposure", machineId: this.#machine.id, operationId, request: { exposureId, expectedRevision, spec: existing.spec, active: false } });
     const response = await this.#machine[transport]({ kind: "set-exposure", machineId: this.#machine.id, operationId, expectedRevision, exposureId, spec: existing.spec, active: false, approvalId });
-    if (response.kind !== "exposure" || !record(response.exposure)) throw protocol("port exposure revocation response");
+    if (response.kind !== "exposure" || !record(response.exposure) || !record(response.machine)) throw protocol("port exposure revocation response");
+    this.#machine[observe](parseView(response.machine));
     return parseExposure(response.exposure);
   }
   async list(): Promise<readonly Exposure[]> { return (await this.#machine.inspect()).runtimeConfiguration.exposures; }
@@ -366,7 +387,7 @@ export class MachineResources {
     const approvalId = await this.#machine[authorize]({ kind: "resource-increase", machineId: this.#machine.id, operationId, request: { expectedRevision, resources: normalized } });
     const response = await this.#machine[transport]({ kind: "update-resources", machineId: this.#machine.id, operationId, expectedRevision, resources: normalized, approvalId });
     if (response.kind !== "configuration" || !record(response.machine)) throw protocol("resource update response");
-    return parseView(response.machine);
+    return this.#machine[observe](parseView(response.machine));
   }
 }
 
@@ -576,15 +597,15 @@ export class Execution {
     if (!record(response.response.receipt) || typeof response.response.digest !== "string") throw protocol("receipt record");
     return { receipt: response.response.receipt as unknown as Receipt, digest: digest(response.response.digest) };
   }
-  async acknowledge(receiptDigest: string, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<void> { await this.#evidenceGuestCommand("acknowledge-receipt", { receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("acknowledge")), options); }
-  async pin(pinId: string, receiptDigest: string, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<PinnedOutput> { const id = validateIdentity(pinId); await this.#evidenceGuestCommand("pin-evidence", { pinId: id, receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("pin")), options); return new PinnedOutput(this.#machine, id); }
-  async release(receipt: ReceiptView, disposition: ReleaseDisposition, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<ReleaseStatus> {
+  async acknowledge(receiptDigest: string, options: { readonly operationId?: string } = {}): Promise<void> { await this.#evidenceCommand("acknowledge-receipt", { receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("acknowledge"))); }
+  async pin(pinId: string, receiptDigest: string, options: { readonly operationId?: string } = {}): Promise<PinnedOutput> { const id = validateIdentity(pinId); await this.#evidenceCommand("pin-evidence", { pinId: id, receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("pin"))); return new PinnedOutput(this.#machine, id); }
+  async release(receipt: ReceiptView, disposition: ReleaseDisposition, options: { readonly operationId?: string } = {}): Promise<ReleaseStatus> {
     const operationId = validateIdentity(options.operationId ?? identity("release-evidence"));
-    const expectedRevision = await resolveRevisionPrecondition(this.#machine, options.expectedRevision); let lossApprovalId: string | null = null; let normalized: Readonly<Record<string, unknown>>;
+    let lossApprovalId: string | null = null; let normalized: Readonly<Record<string, unknown>>;
     if (disposition.kind === "complete-capture") normalized = { kind: disposition.kind, commitment: disposition.commitment };
     else if (disposition.kind === "continuing-retention") normalized = { kind: disposition.kind, pin: validateIdentity(disposition.pin) };
     else { const lossOperationId = childIdentity(operationId, "loss-authorization"); lossApprovalId = disposition.authorization === undefined ? await this.#machine[authorize]({ kind: "evidence-loss", machineId: this.#machine.id, operationId: lossOperationId, request: { executionId: this.id, receiptDigest: receipt.digest, output: receipt.receipt.output } }) : validateIdentity(disposition.authorization); normalized = { kind: disposition.kind, authorization: lossApprovalId }; }
-    const response = await this.#machine[transport]({ kind: "release-evidence", machineId: this.#machine.id, executionId: this.id, request: { operationId, receiptDigest: receipt.digest, output: receipt.receipt.output, disposition: normalized }, expectedRevision, lossApprovalId });
+    const response = await this.#machine[transport]({ kind: "release-evidence", machineId: this.#machine.id, executionId: this.id, request: { operationId, receiptDigest: receipt.digest, output: receipt.receipt.output, disposition: normalized }, lossApprovalId });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "release" || !record(response.response.status)) throw protocol("release response");
     return parseReleaseStatus(response.response.status);
   }
@@ -598,8 +619,8 @@ export class Execution {
   async signal(signal: number, options: ExecutionSignalOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "signal", executionId: this.id, signal, group: options.group ?? true }, validateIdentity(options.operationId ?? identity("signal")), this[executionFence](options)); }
   async terminate(options: ExecutionTerminateOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "terminate", executionId: this.id, graceMillis: options.graceMillis ?? 1000 }, validateIdentity(options.operationId ?? identity("terminate")), this[executionFence](options)); }
   async resize(size: TerminalSize, options: ExecutionOperationOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "resize-terminal", executionId: this.id, size: { columns: size.columns, rows: size.rows, pixelWidth: size.pixelWidth ?? 0, pixelHeight: size.pixelHeight ?? 0 } }, validateIdentity(options.operationId ?? identity("resize")), this[executionFence](options)); }
-  async #evidenceGuestCommand(kind: "acknowledge-receipt" | "pin-evidence", fields: Readonly<Record<string, unknown>>, operationId: string, precondition: MachineRevisionPrecondition): Promise<void> {
-    const expectedRevision = await resolveRevisionPrecondition(this.#machine, precondition.expectedRevision); const response = await this.#machine[transport]({ kind, machineId: this.#machine.id, executionId: this.id, operationId, ...fields, expectedRevision });
+  async #evidenceCommand(kind: "acknowledge-receipt" | "pin-evidence", fields: Readonly<Record<string, unknown>>, operationId: string): Promise<void> {
+    const response = await this.#machine[transport]({ kind, machineId: this.#machine.id, executionId: this.id, operationId, ...fields });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "complete") throw protocol("evidence command response");
   }
 }
@@ -968,6 +989,11 @@ function normalizeLifetime(value: MachineLifetimePolicy | undefined): Readonly<{
 function machineViewFrom(response: Record<string, unknown>): MachineInspection { if (response.kind === "lifecycle") { if (!record(response.operation) || typeof response.operation.delivery !== "string") throw protocol("lifecycle operation"); if (response.operation.delivery !== "applied") throw new SandsurfHostError(response.operation.delivery === "not-applied" ? "not-applied" : "ambiguous", `Lifecycle operation was ${response.operation.delivery}`); } const value = response.kind === "machine" ? response.value : response.kind === "lifecycle" ? response.machine : undefined; if (!record(value)) throw protocol("machine response"); return parseView(value); }
 function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
 function currentMachine(view: MachineInspection): { readonly generation: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Machine machine observation is unavailable"); return { generation: integer(view.machine.value.generation) }; }
+function nativeObservationOrder(observation: Readonly<Record<string, unknown>>): readonly [number, number] {
+  const value = observation.kind === "current" ? observation.value : observation.lastKnown;
+  if (!record(value)) return [0, 0];
+  return [integer(value.generation), integer(value.sequence)];
+}
 function expectedCounter(value: number | undefined, name: string): number | undefined { if (value === undefined) return undefined; if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`); return value; }
 async function resolveRevisionPrecondition(machine: Machine, supplied: number | undefined): Promise<number> { const expected = expectedCounter(supplied, "expected revision"); return expected ?? machine[observed].configurationRevision; }
 function resolveGenerationPrecondition(machine: Machine, supplied: MachineGenerationPrecondition): { readonly expectedGeneration: number } {

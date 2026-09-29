@@ -98,6 +98,21 @@ fn private_storage_refuses_aliases_shared_files_and_replaceable_parents() {
 }
 
 #[test]
+fn private_directory_creation_resolves_ancestor_aliases_but_rejects_final_links() {
+    use sandsurf_native::local::ensure_private_directory;
+    let root = Root::new();
+    let alias = root.0.join("parent-alias");
+    symlink(&root.0, &alias).unwrap();
+    let child = alias.join("private-child");
+    ensure_private_directory(&child).unwrap();
+    assert_eq!(fs::metadata(&child).unwrap().mode() & 0o777, 0o700);
+    ensure_private_directory(&child).unwrap();
+    let final_alias = root.0.join("final-alias");
+    symlink(&child, &final_alias).unwrap();
+    assert!(ensure_private_directory(&final_alias).is_err());
+}
+
+#[test]
 fn private_endpoint_authenticates_both_peers_and_preserves_binary_frames() {
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();

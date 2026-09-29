@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 3;
+pub const HOST_API_VERSION: u16 = 4;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -59,6 +59,15 @@ pub enum OciSource {
         reference: String,
         credential: Option<sandsurf_protocol::SecretVersion>,
     },
+}
+
+/// OCI supplies an operating-system filesystem. Boot artifacts are an
+/// explicit, independently verified recipe input rather than implicit state
+/// inherited from whichever development image happens to ship with the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MachineImageRecipe {
+    pub boot_image_digest: Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +211,7 @@ pub enum HostRequest {
     },
     ImportOci {
         source: OciSource,
+        recipe: MachineImageRecipe,
         platform: String,
         operation_id: OperationId,
         approval_id: CommitmentId,
@@ -377,7 +387,6 @@ pub enum HostRequest {
         operation_id: OperationId,
         execution_id: ExecutionId,
         receipt_digest: Digest,
-        expected_revision: Counter,
     },
     PinEvidence {
         machine_id: MachineId,
@@ -385,13 +394,11 @@ pub enum HostRequest {
         execution_id: ExecutionId,
         receipt_digest: Digest,
         pin_id: PinId,
-        expected_revision: Counter,
     },
     ReleaseEvidence {
         machine_id: MachineId,
         execution_id: ExecutionId,
         request: ReleaseRequest,
-        expected_revision: Counter,
         loss_approval_id: Option<CommitmentId>,
     },
     CleanupReleasedEvidence {

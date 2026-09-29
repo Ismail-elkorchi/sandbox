@@ -44,6 +44,22 @@ for await (const chunk of execution.output.follow()) {
 await host.close();
 ```
 
+OCI conversion accepts a complete Linux OS filesystem with an executable
+`/sbin/init` and an explicit boot-image recipe:
+
+```ts
+const image = await host.images.importOCI({
+  source: { kind: "layout", path: "/absolute/oci-layout" },
+  recipe: { bootImage: "<verified-boot-image-sha256>" },
+});
+```
+
+The recipe selects verified native kernel artifacts. OCI `ENTRYPOINT` and
+`CMD` do not become PID 1. The source filesystem must supply its own guest
+management integration if guest APIs are needed. Conversion does not run
+package scripts on the host. Journaled OCI conversion currently requires a
+Linux builder; other hosts report that limitation explicitly.
+
 Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 
 ```ts

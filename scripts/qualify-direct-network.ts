@@ -1,16 +1,10 @@
 import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
-import { networkInterfaces, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
-import { Sandsurf, type Execution } from "../packages/sandsurf/dist/index.js";
+import { networkInterfaces } from "node:os";
+import { Sandsurf, type Execution, type Machine } from "../packages/sandsurf/dist/index.js";
 import { NativeHostClient } from "../packages/sandsurf/dist/native-host.js";
 
 if (process.platform !== "linux") throw new Error("direct network qualification requires Linux/KVM");
-const localManifest = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
-const emptyDisk = process.env.SANDSURF_EMPTY_DISK_IMAGE;
-if (localManifest === undefined || !isAbsolute(localManifest) || emptyDisk === undefined || !isAbsolute(emptyDisk)) {
-  throw new Error("SANDSURF_LOCAL_IMAGE_MANIFEST and SANDSURF_EMPTY_DISK_IMAGE must be absolute");
-}
 const hostAddress = Object.values(networkInterfaces()).flat().find((value) =>
   value !== undefined && value.family === "IPv4" && !value.internal,
 )?.address;
@@ -26,18 +20,19 @@ await new Promise<void>((resolveListen, rejectListen) => {
 const bound = upstream.address();
 if (bound === null || typeof bound === "string") throw new Error("qualification server did not bind TCP");
 
-const directory = await mkdtemp(join(tmpdir(), "sandsurf-direct-network-"));
+const directory = await mkdtemp("/var/tmp/sandsurf-direct-network-");
 let host: Sandsurf | undefined;
+let machine: Machine | undefined;
+const executions: Execution[] = [];
+let outputReleased = false;
 try {
   host = await Sandsurf.open({ directory, authorizer: async () => true });
-  const image = await host.images.importOCI({
-    source: { kind: "registry", reference: "alpine:3.22" },
-    operationId: "direct-image-import",
-  });
-  const machine = await host.machines.create({
+  const image = (await host.inspect()).defaultImageDigest;
+  if (image === null) throw new Error("qualification requires an installed machine image");
+  machine = await host.machines.create({
     id: "direct-network",
     operationId: "direct-create",
-    image: image.id,
+    image,
     resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 * 1024 * 1024, managedExecutions: 64 },
   });
   await machine.network.configure({
@@ -47,7 +42,11 @@ try {
       ports: [bound.port],
     }],
   }, { operationId: "direct-policy" });
-  await machine.start({ operationId: "direct-start" });
+  for (const deadline = Date.now() + 30_000; ; ) {
+    if ((await machine.inspect()).management.kind === "current") break;
+    if (Date.now() >= deadline) throw new Error("guest management did not become available");
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 100));
+  }
 
   const allowed = await machine.executions.start({
     operationId: "direct-allowed",
@@ -56,6 +55,7 @@ try {
     cwd: "/",
     user: "root",
   });
+  executions.push(allowed);
   const allowedState = (await allowed.waitCapture()).state;
   const allowedOutput = await output(allowed);
   if (exitCode(allowedState) !== 0) {
@@ -73,6 +73,7 @@ try {
     cwd: "/",
     user: "root",
   });
+  executions.push(denied);
   const deniedState = (await denied.waitCapture()).state;
   if (exitCode(deniedState) === undefined || exitCode(deniedState) === 0) {
     throw new Error(`non-allowlisted direct TCP was not rejected: ${JSON.stringify(deniedState)}`);
@@ -92,6 +93,7 @@ try {
     cwd: "/",
     user: "root",
   });
+  executions.push(crossPlane);
   const crossPlaneState = (await crossPlane.waitCapture()).state;
   if (exitCode(crossPlaneState) === undefined || exitCode(crossPlaneState) === 0) {
     throw new Error(`named-proxy authority leaked into direct TCP: ${JSON.stringify(crossPlaneState)}`);
@@ -103,9 +105,21 @@ try {
   }
   await machine.powerOff({ operationId: "direct-stop" });
   await machine.destroy({ operationId: "direct-destroy" });
+  await releaseTestOutput();
+  machine = undefined;
   process.stdout.write(`${JSON.stringify({ hostAddress, port: bound.port, usage }, null, 2)}\n`);
 } finally {
   upstream.close();
+  if (machine !== undefined) {
+    try {
+      await machine.powerOff();
+      await machine.destroy();
+      await releaseTestOutput();
+      machine = undefined;
+    } catch {
+      process.stderr.write(`qualification state retained at ${directory}\n`);
+    }
+  }
   await host?.close();
   try {
     const native = await NativeHostClient.open(directory);
@@ -113,7 +127,20 @@ try {
   } catch {
     // A failed qualification may stop the service before cleanup begins.
   }
-  await rm(directory, { recursive: true, force: true });
+  if (machine === undefined && outputReleased) await rm(directory, { recursive: true, force: true });
+  else process.stderr.write(`qualification state and output retained at ${directory}\n`);
+}
+
+async function releaseTestOutput(): Promise<void> {
+  for (const execution of executions) {
+    const receipt = await execution.receipt();
+    if (receipt === undefined) throw new Error(`output receipt not captured for ${execution.id}`);
+    const released = await execution.release(receipt, { kind: "authorized-loss" });
+    if ((await execution.cleanupReleased(released.requestDigest)).cleanupPending) {
+      throw new Error(`output cleanup is still pending for ${execution.id}`);
+    }
+  }
+  outputReleased = true;
 }
 
 async function output(process: Execution): Promise<Buffer> {

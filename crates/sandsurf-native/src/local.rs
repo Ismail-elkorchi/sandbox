@@ -68,11 +68,30 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
             Directory::open(path)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            path.parent()
+            let parent = path
+                .parent()
                 .ok_or_else(|| invalid("private directory requires a parent"))?;
-            crate::filesystem::require_protected_ancestors(path)?;
-            fs::DirBuilder::new().mode(0o700).create(path)?;
-            Directory::open(path)?;
+            // Resolve the same system aliases accepted by Directory::open
+            // before validating ancestry. Keep the parent identity through
+            // creation so /tmp and /var are treated consistently on Darwin.
+            let canonical_parent = fs::canonicalize(parent)?;
+            let held = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&canonical_parent)?;
+            let canonical = canonical_parent.join(
+                path.file_name()
+                    .ok_or_else(|| invalid("private directory requires a name"))?,
+            );
+            crate::filesystem::require_protected_ancestors(&canonical)?;
+            if identity(&fs::metadata(parent)?) != identity(&held.metadata()?) {
+                return Err(denied("private directory parent changed before creation"));
+            }
+            fs::DirBuilder::new().mode(0o700).create(&canonical)?;
+            Directory::open(&canonical)?;
+            if identity(&fs::metadata(parent)?) != identity(&held.metadata()?) {
+                return Err(denied("private directory parent changed during creation"));
+            }
         }
         Err(error) => return Err(error),
     }

@@ -13,7 +13,7 @@ struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
         let value = std::env::temp_dir().join(format!(
-            "sandsurf-workload-service-{}-{}",
+            "sandsurf-management-service-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

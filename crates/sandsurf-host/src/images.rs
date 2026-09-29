@@ -1,7 +1,7 @@
 //! Cross-platform OCI-to-VM image publication. The conversion never mounts
 //! the source tree or generated filesystem in the host kernel.
 
-use crate::api::OciSource;
+use crate::api::{MachineImageRecipe, OciSource};
 #[cfg(target_os = "linux")]
 use sandsurf_image::ext4::{finalize_journaled_seed, materialize_tar};
 use sandsurf_image::oci::{
@@ -87,15 +87,25 @@ pub fn qualification() -> Qualification {
     }
 }
 
-pub fn import_oci(
+pub(crate) struct OciBuildInput<'a> {
+    pub source: &'a OciSource,
+    pub recipe: &'a MachineImageRecipe,
+    pub platform: &'a str,
+}
+
+pub(crate) fn import_oci(
     host_root: &Path,
     executable: &Path,
-    source: &OciSource,
-    platform: &str,
+    input: OciBuildInput<'_>,
     operation: &OperationId,
     request_digest: &Digest,
     registry_credential: Option<&[u8]>,
 ) -> Result<ImageRecord, LinuxError> {
+    let OciBuildInput {
+        source,
+        recipe,
+        platform,
+    } = input;
     let requested = parse_platform(platform)?;
     let expected_architecture = match crate::service::native_guest_architecture() {
         sandsurf_machine::GuestArchitecture::Amd64 => "amd64",
@@ -104,6 +114,17 @@ pub fn import_oci(
     if requested.os != "linux" || requested.architecture != expected_architecture {
         return Err(LinuxError::Invalid(
             "OCI platform must exactly match the native Linux guest architecture".into(),
+        ));
+    }
+    let base = resolve_recipe_boot_image(host_root, executable, &recipe.boot_image_digest)?;
+    let architecture = match requested.architecture.as_str() {
+        "amd64" => Architecture::X64,
+        "arm64" => Architecture::Arm64,
+        _ => return Err(LinuxError::Invalid("unsupported OCI architecture".into())),
+    };
+    if base.manifest.architecture != architecture {
+        return Err(LinuxError::Invalid(
+            "recipe boot image architecture differs from the OCI filesystem".into(),
         ));
     }
     let imports = host_root.join("images/imports");
@@ -176,7 +197,6 @@ pub fn import_oci(
     prepare_private_directory(&artifact)?;
     let system_path = artifact.join("oci-system.ext4");
     let builder = materialize_ext4(&filesystem_tar, &system_path, rootfs_bytes)?;
-    let (base, _) = resolve_source_bundle(executable)?;
     let kernel_name = "boot-kernel";
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
     let platform_artifacts =
@@ -191,8 +211,9 @@ pub fn import_oci(
     let conversion_digest = digest(
         Domain::Image,
         &(
-            "sandsurf-oci-ext4-v1",
+            "sandsurf-oci-machine-v2",
             &tree.manifest_digest,
+            recipe,
             &builder,
             rootfs_bytes,
         ),
@@ -202,11 +223,7 @@ pub fn import_oci(
         format_version: 3,
         id: format!("oci-{}", short_digest(&tree.source.manifest_digest)?),
         version: short_digest(&tree.source.config_digest)?.to_owned(),
-        architecture: match requested.architecture.as_str() {
-            "amd64" => Architecture::X64,
-            "arm64" => Architecture::Arm64,
-            _ => return Err(LinuxError::Invalid("unsupported OCI architecture".into())),
-        },
+        architecture,
         boot_bundle: base.manifest.boot_bundle.clone(),
         system: SystemDiskManifest {
             rootfs: RootfsArtifact {
@@ -465,6 +482,38 @@ fn parse_platform(value: &str) -> Result<GuestPlatform, LinuxError> {
         os: os.into(),
         variant,
     })
+}
+
+fn resolve_recipe_boot_image(
+    host_root: &Path,
+    executable: &Path,
+    expected: &Digest,
+) -> Result<VerifiedImage, LinuxError> {
+    let installed = host_root.join("images").join(expected.as_str());
+    let image = match fs::symlink_metadata(&installed) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => verify_image(
+            &installed.join("manifest.json"),
+            ImageTrust::Pinned {
+                manifest_digest: expected.as_str(),
+            },
+        )?,
+        Ok(_) => {
+            return Err(LinuxError::Invalid(
+                "recipe boot image is not an owned image directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let (image, _) = resolve_source_bundle(executable)?;
+            if image.manifest_digest != expected.as_str() {
+                return Err(LinuxError::Invalid(
+                    "recipe boot image is unavailable".into(),
+                ));
+            }
+            image
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(image)
 }
 
 /// Container roots without an OS init require an isolated build recipe. They

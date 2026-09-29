@@ -12,9 +12,21 @@ const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) enum DiskFormat {
+    #[cfg(any(unix, test))]
     Raw,
     #[cfg(windows)]
     Vhdx,
+}
+
+impl DiskFormat {
+    fn is_raw(self) -> bool {
+        match self {
+            #[cfg(any(unix, test))]
+            Self::Raw => true,
+            #[cfg(windows)]
+            Self::Vhdx => false,
+        }
+    }
 }
 
 /// `prepare_seed` may interpret only a verified, never-booted creation seed.
@@ -51,7 +63,7 @@ pub(crate) fn materialize(
     {
         return Err(invalid("creation seed must be a bounded regular file"));
     }
-    if matches!(format, DiskFormat::Raw) && source_metadata.len() > bytes {
+    if format.is_raw() && source_metadata.len() > bytes {
         return Err(invalid(
             "creation seed exceeds the authorized disk capacity",
         ));
@@ -69,7 +81,7 @@ pub(crate) fn materialize(
     if io::copy(&mut input, &mut output)? != source_metadata.len() {
         return Err(invalid("creation seed changed during materialization"));
     }
-    if matches!(format, DiskFormat::Raw) {
+    if format.is_raw() {
         output.set_len(bytes)?;
     }
     output.sync_all()?;
@@ -96,6 +108,7 @@ fn validate_disk(path: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> 
         return Err(invalid("persistent disk is not a regular file"));
     }
     let actual = match format {
+        #[cfg(any(unix, test))]
         DiskFormat::Raw => metadata.len(),
         #[cfg(windows)]
         DiskFormat::Vhdx => sandsurf_native::virtual_disk::virtual_disk_size(path)?,

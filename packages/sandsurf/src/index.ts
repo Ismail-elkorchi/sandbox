@@ -29,6 +29,7 @@ export type {
   ExposureSpec,
   HostInspection,
   ImageImportOptions,
+  MachineImageRecipe,
   ImageInspection,
   ImageReleaseInspection,
   NetworkDestination,
