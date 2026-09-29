@@ -3,27 +3,6 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// Private storage belongs to the service account, independently of the owner
-/// of a protected ancestor such as root-owned sticky /tmp.
-pub fn require_private_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: geteuid has no pointer or resource-ownership preconditions.
-    let owner = unsafe { libc::geteuid() };
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "storage directory is not private to the service account",
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    crate::macos::require_private_path_acl(path)?;
-    require_protected_ancestors(&fs::canonicalize(path)?)
-}
-
 /// Select a root-owned host executable without trusting PATH or writable
 /// ancestors. These are host tools, never executables from a guest filesystem.
 pub fn protected_tool(candidates: &[&str]) -> io::Result<PathBuf> {

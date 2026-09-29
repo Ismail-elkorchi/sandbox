@@ -1,5 +1,6 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+use sandsurf_native::PrivateFileAccess;
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, Counter, Frame, FrameKind, HEADER_BYTES, MAX_CONTROL_BYTES,
@@ -96,16 +97,16 @@ fn private_storage_refuses_aliases_shared_files_and_replaceable_parents() {
     drop(file);
     assert_eq!(fs::read(&path).unwrap(), b"private bytes");
     assert!(create_private_file(&path).is_err());
-    assert!(open_private_file(&path).is_ok());
+    assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_ok());
     let alias = root.0.join("hard-link");
     fs::hard_link(&path, &alias).unwrap();
-    assert!(open_private_file(&path).is_err());
+    assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_err());
     fs::remove_file(&alias).unwrap();
     let link = root.0.join("symlink");
     symlink(&path, &link).unwrap();
-    assert!(open_private_file(&link).is_err());
+    assert!(open_private_file(&link, PrivateFileAccess::ReadOnly).is_err());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(open_private_file(&path).is_err());
+    assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_err());
     let shared = root.0.join("shared-directory");
     fs::create_dir(&shared).unwrap();
     fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();

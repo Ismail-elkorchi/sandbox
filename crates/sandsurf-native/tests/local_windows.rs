@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+use sandsurf_native::PrivateFileAccess;
 use sandsurf_native::local::{LocalConnection, LocalListener, create_private_directory};
 use sandsurf_protocol::{AUTHENTICATION_BYTES, Counter, Frame, FrameKind};
 use std::fs;
@@ -65,9 +66,9 @@ fn private_storage_is_owner_only_and_refuses_hard_link_aliases() {
     file.sync_all().unwrap();
     drop(file);
     assert!(create_private_file(&path).is_err());
-    assert!(open_private_file(&path).is_ok());
+    assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_ok());
     fs::hard_link(&path, root.0.join("alias")).unwrap();
-    assert!(open_private_file(&path).is_err());
+    assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_err());
 }
 
 #[test]

@@ -3,8 +3,6 @@ use sandsurf_protocol::{Counter, Digest, SecretId, SecretVersion, SecretVersionI
 use sha2::Sha256;
 use std::fmt;
 use std::fs;
-#[cfg(unix)]
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -56,12 +54,15 @@ impl SecretAuthority {
             let temporary = root.join(format!(".integrity-key-{}.pending", random_nonce()?));
             let mut file = sandsurf_native::local::create_private_file(&temporary)?;
             file.write_all(&*key)?;
-            file.sync_all()?;
+            sandsurf_native::storage::sync_file(&file)?;
             drop(file);
             fs::rename(&temporary, &key_path)?;
             sync_directory(root)?;
         }
-        let mut file = sandsurf_native::local::open_private_file(&key_path)?;
+        let mut file = sandsurf_native::local::open_private_file(
+            &key_path,
+            sandsurf_native::PrivateFileAccess::ReadOnly,
+        )?;
         if file.metadata()?.len() != 32 {
             return Err(SecretError::Invalid(
                 "secret integrity key is malformed; store preserved",
@@ -130,7 +131,7 @@ impl SecretAuthority {
             file.write_all(&self.mac(&id, &version, bytes).finalize().into_bytes())?;
             file.write_all(&(bytes.len() as u64).to_be_bytes())?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            sandsurf_native::storage::sync_file(&file)?;
             drop(file);
             // The exclusively owned host catalog admits the version before publication.
             fs::rename(&temporary, &path)?;
@@ -147,6 +148,7 @@ impl SecretAuthority {
     pub fn read(&self, id: &SecretId, version: &SecretVersionId) -> Result<Vec<u8>, SecretError> {
         let mut file = sandsurf_native::local::open_private_file(
             &self.root.join(id.as_str()).join(version.as_str()),
+            sandsurf_native::PrivateFileAccess::ReadOnly,
         )?;
         let length = file.metadata()?.len();
         if length <= HEADER_BYTES as u64 || length > (MAX_SECRET_BYTES + HEADER_BYTES) as u64 {
@@ -183,13 +185,8 @@ fn random_nonce() -> Result<String, SecretError> {
         .map_err(|_| SecretError::Invalid("secret publication entropy unavailable"))?;
     Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
 }
-#[cfg(unix)]
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-#[cfg(windows)]
-fn sync_directory(_: &Path) -> io::Result<()> {
-    Ok(())
+    sandsurf_native::storage::sync_directory(path)
 }
 
 #[cfg(test)]

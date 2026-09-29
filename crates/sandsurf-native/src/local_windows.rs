@@ -282,6 +282,10 @@ pub fn create_private_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub fn canonical_private_directory(path: &Path) -> io::Result<PathBuf> {
+    Ok(Directory::open(path)?.path)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     volume: u32,
@@ -357,13 +361,14 @@ impl Lease {
     }
 }
 
-pub fn open_private_file(path: &Path) -> io::Result<File> {
+pub fn open_private_file(path: &Path, access: crate::PrivateFileAccess) -> io::Result<File> {
     Directory::open(
         path.parent()
             .ok_or_else(|| invalid("private file requires a parent"))?,
     )?;
     let file = OpenOptions::new()
         .read(true)
+        .write(access == crate::PrivateFileAccess::ReadWrite)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
@@ -875,13 +880,7 @@ fn validate_private_path(
 }
 
 fn validate_private(file: &File, directory: bool, protected: bool) -> io::Result<FileIdentity> {
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain output storage initialized by
-    // GetFileInformationByHandle before any field is observed.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
-    // SAFETY: information is writable and file owns a live handle.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let information = file_information(file)?;
     if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
         || (!directory && information.nNumberOfLinks != 1)
@@ -895,6 +894,34 @@ fn validate_private(file: &File, directory: bool, protected: bool) -> io::Result
         volume: information.dwVolumeSerialNumber,
         file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     })
+}
+
+fn file_information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain output storage initialized by
+    // GetFileInformationByHandle before any field is observed.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    // SAFETY: information is writable and file owns a live handle.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information)
+}
+
+/// Host captures also observe public source/destination directories. Identity
+/// observation rejects reparse objects but does not confer private ownership.
+pub fn directory_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let information = file_information(&open_directory(path)?)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(denied(
+            "directory identity requires a non-reparse directory",
+        ));
+    }
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 fn validate_acl(file: &File, protected: bool) -> io::Result<()> {

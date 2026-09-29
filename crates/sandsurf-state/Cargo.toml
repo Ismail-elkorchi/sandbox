@@ -10,7 +10,6 @@ sandsurf-protocol = { path = "../sandsurf-protocol" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-libc.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
@@ -21,10 +20,6 @@ sandsurf-native = { path = "../sandsurf-native" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 sandsurf-native = { path = "../sandsurf-native" }
-windows-sys = { workspace = true, features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Security_Authorization",
-  "Win32_Storage_FileSystem",
-  "Win32_System_Threading",
-] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

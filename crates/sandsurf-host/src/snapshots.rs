@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const COPY_BUFFER: usize = 1024 * 1024;
@@ -671,7 +671,7 @@ pub(crate) fn copy_and_verify(
         // Seeking over the final zero extent does not change file length.
         destination.set_len(length)?;
     }
-    destination.sync_all()?;
+    sandsurf_native::storage::sync_file(&destination)?;
     let actual = file_digest(destination_path, length)?;
     if expected.is_some_and(|value| value != &actual) {
         return Err(SnapshotError::Invalid(
@@ -709,7 +709,7 @@ fn write_manifest(path: &Path, manifest: &SnapshotManifest) -> Result<()> {
     file.set_len(0)?;
     serde_json::to_writer(&mut file, manifest)?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
+    sandsurf_native::storage::sync_file(&file)?;
     Ok(())
 }
 
@@ -781,14 +781,8 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    sandsurf_native::filesystem::require_private_directory(path)?;
+    sandsurf_native::local::ensure_private_directory(path)?;
     Ok(())
 }
 
@@ -906,10 +900,4 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(metadata.blocks() * 512 < metadata.len() / 2);
     }
-}
-
-#[cfg(windows)]
-pub(crate) fn private_directory(path: &Path) -> Result<()> {
-    sandsurf_native::local::ensure_private_directory(path)?;
-    Ok(())
 }

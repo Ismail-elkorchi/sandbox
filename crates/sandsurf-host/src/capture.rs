@@ -76,7 +76,7 @@ impl CaptureBoundary {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let mut file = options.open(&temporary)?;
         file.write_all(&serde_json::to_vec(&boundary)?)?;
-        file.sync_all()?;
+        sandsurf_native::storage::sync_file(&file)?;
         fs::rename(&temporary, directory.join("capture-boundary.json"))?;
         crate::snapshots::sync_directory(&directory)
             .map_err(|_| Error::Protocol("native capture boundary durability failed"))?;

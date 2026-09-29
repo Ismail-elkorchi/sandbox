@@ -6,6 +6,14 @@
 pub mod capacity;
 pub mod guest_channel;
 pub mod storage;
+
+/// Access requested for an account-private file. Validation never repairs or
+/// adopts a foreign ACL, mode, owner, link, or reparse identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateFileAccess {
+    ReadOnly,
+    ReadWrite,
+}
 #[cfg(unix)]
 pub mod unix_io;
 

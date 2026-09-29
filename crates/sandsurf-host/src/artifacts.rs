@@ -23,8 +23,6 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt;
-#[cfg(unix)]
-use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -593,7 +591,7 @@ impl ArtifactStore {
                 return Err(ArtifactError::Conflict("guest file length changed"));
             }
             let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
-            output.sync_all()?;
+            sandsurf_native::storage::sync_file(&output)?;
             let destination = self.blob_path(&digest);
             if destination.exists() {
                 verify_blob(&destination, &digest, length)?;
@@ -756,7 +754,7 @@ impl ArtifactStore {
                 "capture file length changed while copying",
             ));
         }
-        output.sync_all()?;
+        sandsurf_native::storage::sync_file(&output)?;
         let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
         let destination = self.blob_path(&digest);
         if destination.exists() {
@@ -1109,7 +1107,7 @@ impl ArtifactStore {
                     let _ = root.remove_file(&temporary);
                     return Err(ArtifactError::Conflict("host blob length changed"));
                 }
-                output.sync_all()?;
+                sandsurf_native::storage::sync_file(&output.into_std())?;
                 set_mode(root, &temporary, entry.mode)?;
                 replace_with_temporary(root, &temporary, &entry.path)?;
                 sync_cap_parent(root, &entry.path)?;
@@ -1196,12 +1194,15 @@ impl ArtifactStore {
         let path = self.root.join(format!("{namespace}-{identity}.lock"));
         let file = match sandsurf_native::local::create_private_file(&path) {
             Ok(file) => {
-                file.sync_all()?;
+                sandsurf_native::storage::sync_file(&file)?;
                 sync_directory(&self.root)?;
                 file
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                sandsurf_native::local::open_private_file(&path)?
+                sandsurf_native::local::open_private_file(
+                    &path,
+                    sandsurf_native::PrivateFileAccess::ReadWrite,
+                )?
             }
             Err(error) => return Err(error.into()),
         };
@@ -1462,7 +1463,7 @@ fn native_identity(_: &Path, metadata: &fs::Metadata) -> io::Result<NativeIdenti
 }
 #[cfg(windows)]
 fn native_identity(path: &Path, _: &fs::Metadata) -> io::Result<NativeIdentity> {
-    let (volume, file) = sandsurf_state::native_directory_identity(path)?;
+    let (volume, file) = sandsurf_native::local::directory_identity(path)?;
     Ok(NativeIdentity {
         first: volume,
         second: file,
@@ -1694,7 +1695,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut output = BufWriter::new(file);
     serde_json::to_writer(&mut output, value)?;
     output.flush()?;
-    output.get_ref().sync_all()?;
+    sandsurf_native::storage::sync_file(output.get_ref())?;
     Ok(())
 }
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -1712,46 +1713,18 @@ fn random_suffix() -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-#[cfg(unix)]
-fn create_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    sandsurf_native::filesystem::require_private_directory(path)
-}
-#[cfg(windows)]
 fn create_private_directory(path: &Path) -> io::Result<()> {
     sandsurf_native::local::ensure_private_directory(path)
 }
 
-#[cfg(unix)]
-fn private_file(path: &Path, create: bool) -> io::Result<File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "transfer file is not private",
-        ));
-    }
-    Ok(file)
-}
-#[cfg(windows)]
 fn private_file(path: &Path, create: bool) -> io::Result<File> {
     if create {
         sandsurf_native::local::create_private_file(path)
     } else {
-        sandsurf_native::local::open_private_file(path)
+        sandsurf_native::local::open_private_file(
+            path,
+            sandsurf_native::PrivateFileAccess::ReadOnly,
+        )
     }
 }
 

@@ -1,4 +1,4 @@
-#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_code)]
 
 //! Internal persistence mechanisms, not an executable host service or VM backend.
 //!
@@ -16,18 +16,9 @@ mod authority;
 mod catalog;
 mod database;
 mod runtime;
-#[cfg(target_os = "windows")]
-mod windows;
 
 pub use catalog::*;
 pub use runtime::*;
-
-/// Return the stable filesystem identity of a non-reparse Windows directory.
-/// The handle excludes delete sharing while the identity is observed.
-#[cfg(target_os = "windows")]
-pub fn native_directory_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
-    windows::directory_identity(path)
-}
 
 use sandsurf_protocol::Invalid;
 use serde::{Serialize, de::DeserializeOwned};

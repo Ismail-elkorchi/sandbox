@@ -1,8 +1,6 @@
 use crate::{Error, Result};
 use rusqlite::{Connection, OpenFlags, limits::Limit};
 use std::fs::File;
-#[cfg(unix)]
-use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,114 +112,37 @@ pub(crate) fn lock(file: &File) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    // macOS system paths such as /var are aliases. Resolve ancestors once at
-    // admission, keeping SQLite's all-components NOFOLLOW check enabled. The
-    // supplied state directory itself must still be private and not a symlink.
-    validate_directory(path)?;
-    let before = fs::symlink_metadata(path)?;
-    let canonical = fs::canonicalize(path)?;
-    validate_directory(&canonical)?;
-    let after = fs::symlink_metadata(&canonical)?;
-    if before.dev() != after.dev() || before.ino() != after.ino() {
-        return Err(Error::Conflict("state directory changed during resolution"));
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    sandsurf_native::filesystem::require_protected_ancestors(&canonical)?;
-    Ok(canonical)
+    Ok(sandsurf_native::local::canonical_private_directory(path)?)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    validate_directory(path)
-}
-
-#[cfg(unix)]
-fn validate_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path)?;
-    // SAFETY: geteuid takes no pointers, allocates no resources, and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    if !path.is_absolute()
-        || !metadata.is_dir()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != uid
-    {
-        return Err(Error::Conflict(
-            "state root must be an owned private directory, not a symlink",
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    sandsurf_native::macos::require_private_path_acl(path)?;
+    sandsurf_native::local::create_private_directory(path)?;
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    // SAFETY: geteuid takes no pointers, allocates no resources, and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != uid
-    {
-        return Err(Error::Conflict(
-            "state file must be private, owned and singly linked",
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    sandsurf_native::macos::require_private_file_acl(&file)?;
-    Ok(file)
+    Ok(if create {
+        sandsurf_native::local::create_private_file(path)?
+    } else {
+        sandsurf_native::local::open_private_file(
+            path,
+            sandsurf_native::PrivateFileAccess::ReadWrite,
+        )?
+    })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "windows"))]
 pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    sandsurf_native::storage::sync_directory(path)?;
     Ok(())
 }
 
 pub(crate) fn sync_file(file: &File) -> Result<()> {
-    file.sync_all()?;
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: F_FULLFSYNC operates on this live owned file without pointer arguments.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
-    crate::windows::create_private_directory(path)?;
-    Ok(())
-}
-#[cfg(target_os = "windows")]
-fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    Ok(crate::windows::canonical_directory(path)?)
-}
-#[cfg(target_os = "windows")]
-pub(crate) fn private_file(path: &Path, create: bool) -> Result<File> {
-    Ok(crate::windows::private_file(path, create)?)
-}
-#[cfg(target_os = "windows")]
-pub(crate) fn sync_directory(path: &Path) -> Result<()> {
-    sandsurf_native::storage::sync_directory(path)?;
+    sandsurf_native::storage::sync_file(file)?;
     Ok(())
 }
 
