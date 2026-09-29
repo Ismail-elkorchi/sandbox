@@ -2,7 +2,9 @@ use hmac::{Hmac, Mac};
 use sandsurf_protocol::{Counter, Digest, SecretId, SecretVersion, SecretVersionId};
 use sha2::Sha256;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;

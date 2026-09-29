@@ -1420,28 +1420,13 @@ struct ImageIndex {
 }
 
 fn ensure_mutable_disk(source: &Path, destination: &Path, bytes: u64) -> Result<(), AppleError> {
-    let source_bytes = fs::metadata(source)?.len();
-    if bytes < source_bytes || !bytes.is_multiple_of(4096) || bytes > 128 * 1024 * 1024 * 1024 {
-        return Err(AppleError::Invalid(
-            "persistent disk geometry is outside the ext4 envelope".into(),
-        ));
-    }
-    if !destination.exists() {
-        copy_artifact(source, destination)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(destination)?;
-        file.set_len(bytes)?;
-        file.sync_all()?;
-    }
-    let metadata = fs::symlink_metadata(destination)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != bytes {
-        return Err(AppleError::Invalid(
-            "persistent disk geometry or type changed".into(),
-        ));
-    }
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+    crate::storage::materialize(
+        source,
+        destination,
+        bytes,
+        crate::storage::DiskFormat::Raw,
+        |_| Ok(()),
+    )?;
     Ok(())
 }
 
@@ -1493,21 +1478,6 @@ fn ensure_private_directory(path: &Path) -> Result<(), AppleError> {
             "Apple private state directory is not protected".into(),
         ));
     }
-    Ok(())
-}
-
-fn copy_artifact(source: &Path, destination: &Path) -> Result<(), AppleError> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
-    io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
     Ok(())
 }
 

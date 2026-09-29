@@ -5,6 +5,7 @@
 
 pub mod capacity;
 pub mod guest_channel;
+pub mod storage;
 
 #[cfg(unix)]
 pub use guest_channel::DirectUnixChannel;

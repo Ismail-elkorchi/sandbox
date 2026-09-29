@@ -123,17 +123,6 @@
     {
       "type": "library",
       "name": "bitflags",
-      "version": "2.13.2",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/bitflags@2.13.2"
-    },
-    {
-      "type": "library",
-      "name": "bitflags",
       "version": "1.3.2",
       "licenses": [
         {
@@ -141,6 +130,17 @@
         }
       ],
       "purl": "pkg:cargo/bitflags@1.3.2"
+    },
+    {
+      "type": "library",
+      "name": "bitflags",
+      "version": "2.13.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/bitflags@2.13.2"
     },
     {
       "type": "library",
@@ -1318,17 +1318,6 @@
     {
       "type": "library",
       "name": "rand_core",
-      "version": "0.10.1",
-      "licenses": [
-        {
-          "expression": "MIT OR Apache-2.0"
-        }
-      ],
-      "purl": "pkg:cargo/rand_core@0.10.1"
-    },
-    {
-      "type": "library",
-      "name": "rand_core",
       "version": "0.6.4",
       "licenses": [
         {
@@ -1336,6 +1325,17 @@
         }
       ],
       "purl": "pkg:cargo/rand_core@0.6.4"
+    },
+    {
+      "type": "library",
+      "name": "rand_core",
+      "version": "0.10.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/rand_core@0.10.1"
     },
     {
       "type": "library",

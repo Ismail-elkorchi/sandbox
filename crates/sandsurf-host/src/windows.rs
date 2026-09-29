@@ -9,7 +9,7 @@ use sandsurf_machine::windows::{
     HyperVConfig, HyperVDisk, HyperVDriver, HyperVQualification, HyperVRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
-use sandsurf_native::{GuestChannel, HyperVChannel, virtual_disk};
+use sandsurf_native::{HyperVChannel, virtual_disk};
 use sandsurf_network::windows::{WindowsNetworkBridge, WindowsPortGateway};
 use sandsurf_protocol::{
     AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
@@ -1366,16 +1366,13 @@ fn ensure_mutable_vhdx(source: &Path, destination: &Path, bytes: u64) -> Result<
             "persistent VHDX geometry is outside the envelope".into(),
         ));
     }
-    if !destination.exists() {
-        copy_artifact(source, destination)?;
-        virtual_disk::grow_virtual_disk(destination, bytes)?;
-    }
-    let actual = virtual_disk::virtual_disk_size(destination)?;
-    if actual != bytes {
-        return Err(WindowsError::Invalid(format!(
-            "persistent VHDX virtual size changed: expected {bytes}, observed {actual}"
-        )));
-    }
+    crate::storage::materialize(
+        source,
+        destination,
+        bytes,
+        crate::storage::DiskFormat::Vhdx,
+        |staged| virtual_disk::grow_virtual_disk(staged, bytes),
+    )?;
     Ok(())
 }
 
@@ -1431,20 +1428,6 @@ struct ImageIndex {
     #[serde(rename = "buildId")]
     _build_id: String,
     files: BTreeMap<String, String>,
-}
-
-fn copy_artifact(source: &Path, destination: &Path) -> Result<(), WindowsError> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    Ok(())
 }
 
 fn deterministic_vm_id(host_root: &Path, machine_id: &MachineId) -> String {
@@ -1513,15 +1496,6 @@ fn decode_hex(value: &str) -> Result<[u8; 32], WindowsError> {
             .map_err(|_| WindowsError::Invalid("digest is malformed".into()))?;
     }
     Ok(bytes)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("hex formatting cannot fail");
-    }
-    output
 }
 
 #[cfg(test)]

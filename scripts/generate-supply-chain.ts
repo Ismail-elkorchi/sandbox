@@ -31,7 +31,7 @@ const metadata = parseMetadata(metadataValue);
 const packages = new Map(metadata.packages.map((package_) => [package_.id, package_]));
 const nodes = new Map(metadata.nodes.map((node) => [node.id, node]));
 
-await generate(["sandsurf-host", "sandsurf-guest", "sandsurf-control"], "sandsurf", resolve("packages/sandsurf"), [
+await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), [
   {
     type: "application",
     name: "firecracker",

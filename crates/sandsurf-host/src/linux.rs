@@ -1554,100 +1554,50 @@ struct ImageIndex {
     files: std::collections::BTreeMap<String, String>,
 }
 
-fn copy_artifact(source: &Path, destination: &Path) -> Result<(), LinuxError> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)?;
-    io::copy(&mut input, &mut output)?;
-    output.sync_all()?;
-    Ok(())
-}
-
 fn ensure_mutable_disk(
     source: &Path,
     destination: &Path,
     requested_bytes: u64,
 ) -> Result<(), LinuxError> {
-    let source_metadata = fs::metadata(source)?;
-    if requested_bytes < source_metadata.len()
-        || !requested_bytes.is_multiple_of(4096)
-        || requested_bytes > 128 * 1024 * 1024 * 1024
-    {
-        return Err(LinuxError::Invalid(
-            "persistent disk geometry is outside the supported ext4 envelope".into(),
-        ));
-    }
-    if destination.exists() {
-        let current = fs::symlink_metadata(destination)?;
-        if !current.is_file()
-            || current.file_type().is_symlink()
-            || current.len() != requested_bytes
-        {
-            return Err(LinuxError::Invalid(
-                "persistent disk geometry or type changed".into(),
-            ));
-        }
-    } else {
-        // Only a verified, never-booted seed is resized by a host tool. The
-        // administrator-controlled disk is published atomically and is never
-        // passed to e2fsprogs on a later guardian restart.
-        let staged = destination.with_extension("ext4.building");
-        if let Ok(previous) = fs::symlink_metadata(&staged) {
-            if !previous.is_file() || previous.file_type().is_symlink() {
-                return Err(LinuxError::Invalid(
-                    "interrupted disk build has an invalid staging type".into(),
-                ));
+    crate::storage::materialize(
+        source,
+        destination,
+        requested_bytes,
+        crate::storage::DiskFormat::Raw,
+        |staged| {
+            reserve_disk_capacity(staged, requested_bytes).map_err(io::Error::other)?;
+            if requested_bytes > fs::metadata(source)?.len() {
+                let resize = protected_tool(&["/usr/sbin/resize2fs", "/sbin/resize2fs"])
+                    .map_err(io::Error::other)?;
+                let status = std::process::Command::new(resize)
+                    .arg(staged)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()?;
+                if !status.success() {
+                    return Err(io::Error::other(
+                        "trusted seed could not be expanded to the reserved disk geometry",
+                    ));
+                }
             }
-            fs::remove_file(&staged)?;
-        }
-        copy_artifact(source, &staged)?;
-        let file = OpenOptions::new().read(true).write(true).open(&staged)?;
-        file.set_len(requested_bytes)?;
-        file.sync_all()?;
-        reserve_disk_capacity(&staged, requested_bytes)?;
-        if requested_bytes > source_metadata.len() {
-            let resize = protected_tool(&["/usr/sbin/resize2fs", "/sbin/resize2fs"])?;
-            let status = std::process::Command::new(resize)
-                .arg(&staged)
+            let check =
+                protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"]).map_err(io::Error::other)?;
+            let status = std::process::Command::new(check)
+                .args(["-fn"])
+                .arg(staged)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()?;
             if !status.success() {
-                return Err(LinuxError::Invalid(
-                    "trusted seed could not be expanded to the reserved disk geometry".into(),
+                return Err(io::Error::other(
+                    "trusted seed failed ext4 verification before publication",
                 ));
             }
-        }
-        let check = protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])?;
-        let status = std::process::Command::new(check)
-            .args(["-fn"])
-            .arg(&staged)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(LinuxError::Invalid(
-                "trusted seed failed ext4 verification before publication".into(),
-            ));
-        }
-        File::open(&staged)?.sync_all()?;
-        fs::hard_link(&staged, destination)?;
-        fs::remove_file(&staged)?;
-        File::open(
-            destination
-                .parent()
-                .ok_or_else(|| LinuxError::Invalid("disk has no parent".into()))?,
-        )?
-        .sync_all()?;
-    }
+            Ok(())
+        },
+    )?;
     reserve_disk_capacity(destination, requested_bytes)
 }
 

@@ -1,0 +1,52 @@
+{
+  "formatVersion": 3,
+  "id": "sandsurf-development",
+  "version": "3.24.2",
+  "architecture": "arm64",
+  "bootBundle": {
+    "kernel": {
+      "path": "vmlinux-6.18.41",
+      "sha256": "b2054e82c9d1120519882c39485a17b29657b77c93ed8c9d412996de6ba9711c"
+    },
+    "guestAgent": {
+      "version": "0.1.0",
+      "protocolMajor": 4,
+      "protocolMinor": 0,
+      "sha256": "aa4d06fc3ce37bf9e315e7fa117a25ff106fe649401dee65d06adf1914e5d589"
+    },
+    "capabilities": {
+      "overlayfs": true,
+      "vsock": true,
+      "seccomp": true,
+      "cgroupV2": true,
+      "devpts": true
+    }
+  },
+  "system": {
+    "rootfs": {
+      "path": "system.ext4",
+      "sha256": "f8330071f706188260348c8591c9b2e4dce29c994bbeae6ee9586e2ff2d07fc9",
+      "format": "ext4"
+    },
+    "defaults": {
+      "environment": {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "user": "agent",
+      "workingDirectory": "/home/agent"
+    },
+    "provenance": {
+      "kind": "source-built",
+      "sourceDigest": "1bce03aaf90911564048541ea4e6c74fdeb64b293478da47624df28952223473",
+      "materials": {
+        "alpine-minirootfs": "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
+        "alpine-packages": "ccccec8ae4a7bb3800e23509667a979a37de313afa9a71f87f20157ff1b8d6b3",
+        "sandsurf-ext4-builder": "d3e9b3804eadd70b71d2084236655d7963f579fc10943ff74b163b58e3ce75ac",
+        "sandsurf-system-recipe": "6e4068c95c6b3753beb037e602cbf9abb1183dbbbb34e2b70d75f0986e228ee2",
+        "sandsurf-management": "aa4d06fc3ce37bf9e315e7fa117a25ff106fe649401dee65d06adf1914e5d589"
+      }
+    }
+  },
+  "platformArtifacts": {},
+  "signature": null
+}

@@ -16,5 +16,6 @@ mod registry;
 pub mod secrets;
 pub mod service;
 mod snapshots;
+mod storage;
 #[cfg(target_os = "windows")]
 pub mod windows;
