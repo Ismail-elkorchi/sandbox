@@ -1,6 +1,6 @@
 use crate::{
     AUTHENTICATION_BYTES, Counter, Digest, Frame, FrameKind, Invalid, MAX_CREDIT, MAX_STREAMS,
-    SandboxId, bytes_digest,
+    MachineId, bytes_digest,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -54,8 +54,8 @@ impl Drop for BootCapability {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GuestHello {
     pub version: u16,
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
+    pub machine_id: MachineId,
+    pub generation: Counter,
     pub boot_identity: Digest,
     pub client_nonce: Vec<u8>,
 }
@@ -86,30 +86,30 @@ pub struct GuestHandshake {
 impl HostHandshake {
     pub fn start(
         capability: BootCapability,
-        sandbox_id: SandboxId,
-        epoch: Counter,
+        machine_id: MachineId,
+        generation: Counter,
         boot_identity: Digest,
     ) -> Result<(Self, GuestHello), Invalid> {
         let mut nonce = [0; NONCE_BYTES];
         getrandom::getrandom(&mut nonce)
             .map_err(|_| Invalid("guest handshake entropy unavailable"))?;
-        Self::start_with_nonce(capability, sandbox_id, epoch, boot_identity, nonce)
+        Self::start_with_nonce(capability, machine_id, generation, boot_identity, nonce)
     }
 
     pub fn start_with_nonce(
         capability: BootCapability,
-        sandbox_id: SandboxId,
-        epoch: Counter,
+        machine_id: MachineId,
+        generation: Counter,
         boot_identity: Digest,
         nonce: [u8; NONCE_BYTES],
     ) -> Result<(Self, GuestHello), Invalid> {
-        if epoch == Counter::ZERO {
-            return Err(Invalid("guest handshake epoch must be positive"));
+        if generation == Counter::ZERO {
+            return Err(Invalid("guest handshake generation must be positive"));
         }
         let hello = GuestHello {
             version: HANDSHAKE_VERSION,
-            sandbox_id,
-            epoch,
+            machine_id,
+            generation,
             boot_identity,
             client_nonce: nonce.to_vec(),
         };
@@ -157,8 +157,8 @@ impl HostHandshake {
 impl GuestHandshake {
     pub fn accept(
         capability: BootCapability,
-        expected_sandbox: &SandboxId,
-        expected_epoch: Counter,
+        expected_machine: &MachineId,
+        expected_generation: Counter,
         expected_boot: &Digest,
         hello: &GuestHello,
     ) -> Result<(Self, GuestChallenge), Invalid> {
@@ -167,8 +167,8 @@ impl GuestHandshake {
             .map_err(|_| Invalid("guest handshake entropy unavailable"))?;
         Self::accept_with_nonce(
             capability,
-            expected_sandbox,
-            expected_epoch,
+            expected_machine,
+            expected_generation,
             expected_boot,
             hello,
             nonce,
@@ -177,8 +177,8 @@ impl GuestHandshake {
 
     pub fn accept_with_nonce(
         capability: BootCapability,
-        expected_sandbox: &SandboxId,
-        expected_epoch: Counter,
+        expected_machine: &MachineId,
+        expected_generation: Counter,
         expected_boot: &Digest,
         hello: &GuestHello,
         nonce: [u8; NONCE_BYTES],
@@ -186,11 +186,11 @@ impl GuestHandshake {
         if hello.version != HANDSHAKE_VERSION {
             return Err(Invalid("guest handshake version mismatch"));
         }
-        if &hello.sandbox_id != expected_sandbox {
-            return Err(Invalid("guest handshake sandbox identity mismatch"));
+        if &hello.machine_id != expected_machine {
+            return Err(Invalid("guest handshake machine identity mismatch"));
         }
-        if hello.epoch != expected_epoch {
-            return Err(Invalid("guest handshake epoch mismatch"));
+        if hello.generation != expected_generation {
+            return Err(Invalid("guest handshake generation mismatch"));
         }
         if &hello.boot_identity != expected_boot {
             return Err(Invalid("guest handshake boot identity mismatch"));
@@ -449,22 +449,22 @@ mod tests {
     use super::*;
     use crate::{FrameKind, MAX_STREAM_BYTES};
 
-    fn sessions(epoch: u64) -> (SessionCodec, SessionCodec) {
-        let sandbox = SandboxId::try_from("box").unwrap();
+    fn sessions(generation: u64) -> (SessionCodec, SessionCodec) {
+        let machine = MachineId::try_from("box").unwrap();
         let boot = bytes_digest(b"verified-boot");
         let capability = [7; 32];
         let (host, hello) = HostHandshake::start_with_nonce(
             BootCapability::from_bytes(capability),
-            sandbox.clone(),
-            epoch.try_into().unwrap(),
+            machine.clone(),
+            generation.try_into().unwrap(),
             boot.clone(),
             [1; 32],
         )
         .unwrap();
         let (guest, challenge) = GuestHandshake::accept_with_nonce(
             BootCapability::from_bytes(capability),
-            &sandbox,
-            epoch.try_into().unwrap(),
+            &machine,
+            generation.try_into().unwrap(),
             &boot,
             &hello,
             [2; 32],
@@ -487,18 +487,18 @@ mod tests {
     }
 
     #[test]
-    fn handshake_binds_identity_epoch_and_rotates_reconnect_session() {
+    fn handshake_binds_identity_generation_and_rotates_reconnect_session() {
         let (first, _) = sessions(1);
         let (second, _) = sessions(2);
         assert_ne!(first.id(), second.id());
         let (third, _) = sessions(1);
         assert_eq!(first.id(), third.id());
 
-        let sandbox = SandboxId::try_from("box").unwrap();
+        let machine = MachineId::try_from("box").unwrap();
         let boot = bytes_digest(b"verified-boot");
         let (_, hello) = HostHandshake::start_with_nonce(
             BootCapability::from_bytes([7; 32]),
-            sandbox.clone(),
+            machine.clone(),
             Counter::ONE,
             boot.clone(),
             [1; 32],
@@ -507,7 +507,7 @@ mod tests {
         assert!(
             GuestHandshake::accept_with_nonce(
                 BootCapability::from_bytes([7; 32]),
-                &sandbox,
+                &machine,
                 2_u64.try_into().unwrap(),
                 &boot,
                 &hello,
@@ -545,11 +545,11 @@ mod tests {
         sealed.payload[0] ^= 1;
         assert!(guest.open(sealed).is_err());
 
-        let sandbox = SandboxId::try_from("box").unwrap();
+        let machine = MachineId::try_from("box").unwrap();
         let boot = bytes_digest(b"verified-boot");
         let (host, hello) = HostHandshake::start_with_nonce(
             BootCapability::from_bytes([1; 32]),
-            sandbox.clone(),
+            machine.clone(),
             Counter::ONE,
             boot.clone(),
             [1; 32],
@@ -557,7 +557,7 @@ mod tests {
         .unwrap();
         let (_, challenge) = GuestHandshake::accept_with_nonce(
             BootCapability::from_bytes([2; 32]),
-            &sandbox,
+            &machine,
             Counter::ONE,
             &boot,
             &hello,

@@ -3,20 +3,16 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"SSF1";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const HEADER_BYTES: usize = 56;
 pub const AUTHENTICATION_BYTES: usize = 32;
 pub const MAX_CONTROL_BYTES: usize = 256 * 1024;
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
-/// Byte vectors carried inside JSON control messages need worst-case decimal
-/// expansion space until they move to binary data frames.
-pub const MAX_CONTROL_BYTE_PAGE: usize = 48 * 1024;
 pub const MAX_STREAMS: usize = 256;
 pub const MAX_CREDIT: u64 = 1024 * 1024;
-pub const OUTPUT_DATA_STREAM: u32 = 2;
 /// Authenticated terminal payload for one request/response control exchange.
 /// This acknowledges protocol completion; it is intentionally distinct from
-/// application acceptance, which is expressed by the response itself.
+/// application acceptance, which remains an application-owned decision.
 pub const CONTROL_COMPLETE: &[u8] = b"sandsurf-control-complete-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

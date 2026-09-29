@@ -1,0 +1,3 @@
+[build]
+# Native image and virtualization builds must not exhaust the agent's host.
+jobs = 1

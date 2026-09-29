@@ -2,8 +2,8 @@ import { rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
-await rm(resolve("packages/sandbox/dist"), { recursive: true, force: true });
-await rm(resolve("packages/sandbox/tsconfig.tsbuildinfo"), { force: true });
+await rm(resolve("packages/sandsurf/dist"), { recursive: true, force: true });
+await rm(resolve("packages/sandsurf/tsconfig.tsbuildinfo"), { force: true });
 const compiler = resolve("node_modules/typescript/bin/tsc");
 await run(process.execPath, [compiler, "-b"]);
 await run(process.execPath, [compiler, "-p", "scripts/tsconfig.json"]);

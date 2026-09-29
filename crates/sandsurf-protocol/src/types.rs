@@ -27,20 +27,22 @@ macro_rules! identifier {
 
 identifier!(
     HostId,
-    SandboxId,
-    ProcessId,
+    MachineId,
+    ExecutionId,
     OperationId,
-    GrantId,
     CommitmentId,
     StoreId,
     PinId,
     DiskId,
     TerminalId,
-    CheckpointId,
+    SnapshotId,
     ExposureId,
     TransferId,
     ImageId,
     SecretId,
+    SecretVersionId,
+    GuestBootId,
+    ManagementInstanceId,
     WatcherId
 );
 
@@ -231,7 +233,7 @@ impl MachineState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleIntent {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub operation_id: OperationId,
     pub desired: DesiredState,
     pub revision: Counter,
@@ -245,7 +247,7 @@ pub struct LifecycleIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LifecycleCommand {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub operation_id: OperationId,
     pub desired: DesiredState,
     pub revision: Counter,
@@ -261,7 +263,7 @@ pub struct LifecycleCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConfigurationCommand {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub operation_id: OperationId,
     pub revision: Counter,
     pub request_digest: Digest,
@@ -273,8 +275,8 @@ pub struct ConfigurationCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationRef {
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
+    pub machine_id: MachineId,
+    pub generation: Counter,
     pub sequence: Counter,
     pub digest: Digest,
 }
@@ -282,8 +284,8 @@ pub struct ObservationRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MachineObservation {
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
+    pub machine_id: MachineId,
+    pub generation: Counter,
     pub sequence: Counter,
     pub state: MachineState,
     pub applied_revision: Counter,
@@ -304,149 +306,119 @@ pub enum Observation<T> {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Capability {
-    Spawn,
-    ReadFiles,
-    WriteFiles,
-    WorkloadAdmin,
-    Network,
-    ExposePort,
-    DeliverSecret,
-    ApplyToHost,
-    IncreaseResources,
-    Checkpoint,
-    Fork,
-    ReleaseEvidence,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Grant {
-    pub id: GrantId,
-    pub sandbox_id: SandboxId,
-    pub capability: Capability,
-    /// Binds the normalized scope, not a model-supplied policy label.
-    pub scope_digest: Digest,
-    pub revision: Counter,
-    pub revoked: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Mutation {
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
+pub struct GuestCommand {
+    pub machine_id: MachineId,
+    pub generation: Counter,
     pub operation_id: OperationId,
-    pub grant_id: GrantId,
-    pub expected_revision: Counter,
-    pub request: WorkloadRequest,
+    pub request: GuestRequest,
     pub request_digest: Digest,
 }
 
-impl Mutation {
+impl GuestCommand {
     pub fn new(
-        sandbox_id: SandboxId,
-        epoch: Counter,
+        machine_id: MachineId,
+        generation: Counter,
         operation_id: OperationId,
-        grant_id: GrantId,
-        expected_revision: Counter,
-        request: WorkloadRequest,
+        request: GuestRequest,
     ) -> Result<Self, Invalid> {
         request.validate()?;
-        let request_digest = mutation_digest(
-            &sandbox_id,
-            epoch,
-            &operation_id,
-            &grant_id,
-            expected_revision,
-            &request,
-        )?;
+        let request_digest = command_digest(&machine_id, generation, &operation_id, &request)?;
         Ok(Self {
-            sandbox_id,
-            epoch,
+            machine_id,
+            generation,
             operation_id,
-            grant_id,
-            expected_revision,
             request,
             request_digest,
         })
     }
 
     pub fn validate(&self) -> Result<(), Invalid> {
-        if self.epoch == Counter::ZERO || self.expected_revision == Counter::ZERO {
-            return Err(Invalid("mutation epoch and revision must be positive"));
-        }
+        self.validate_identity()?;
         self.request.validate()?;
-        if let WorkloadRequest::Spawn { request } = &self.request
-            && (request.sandbox_id != self.sandbox_id
-                || request.epoch != self.epoch
-                || request.operation_id != self.operation_id)
-        {
-            return Err(Invalid("spawn identity does not match its mutation"));
-        }
-        let expected = mutation_digest(
-            &self.sandbox_id,
-            self.epoch,
+        let expected = command_digest(
+            &self.machine_id,
+            self.generation,
             &self.operation_id,
-            &self.grant_id,
-            self.expected_revision,
             &self.request,
         )?;
         if self.request_digest != expected {
-            return Err(Invalid("mutation digest does not bind its request"));
+            return Err(Invalid("command digest does not bind its request"));
         }
         Ok(())
     }
 
-    pub fn required_capability(&self) -> Capability {
-        self.request.required_capability()
+    /// Durable admission contains metadata and byte commitments, never payloads.
+    /// Only the original fully assembled command can receive a dispatch permit.
+    pub fn admission(&self) -> Result<crate::RequestEnvelope<Self>, Invalid> {
+        self.validate()?;
+        let (admission, _) = crate::RequestEnvelope::split(self.clone())?;
+        Ok(admission)
     }
-}
 
-impl WorkloadRequest {
-    pub fn required_capability(&self) -> Capability {
-        match self {
-            WorkloadRequest::Spawn { request }
-                if request.user.as_deref().is_some_and(is_root_user) =>
-            {
-                Capability::WorkloadAdmin
-            }
-            WorkloadRequest::Spawn { .. }
-            | WorkloadRequest::WriteInput { .. }
-            | WorkloadRequest::CloseInput { .. }
-            | WorkloadRequest::AcquireTerminalInput { .. }
-            | WorkloadRequest::ReleaseTerminalInput { .. }
-            | WorkloadRequest::ResizeTerminal { .. }
-            | WorkloadRequest::Signal { .. }
-            | WorkloadRequest::Terminate { .. } => Capability::Spawn,
-            WorkloadRequest::Filesystem { request } => request.required_capability(),
+    fn validate_identity(&self) -> Result<(), Invalid> {
+        if self.generation == Counter::ZERO {
+            return Err(Invalid("execution generation must be positive"));
         }
+        if let GuestRequest::Spawn { request } = &self.request
+            && (request.machine_id != self.machine_id
+                || request.generation != self.generation
+                || request.operation_id != self.operation_id)
+        {
+            return Err(Invalid("spawn identity does not match its command"));
+        }
+        Ok(())
     }
 }
 
-fn is_root_user(value: &str) -> bool {
-    value == "root" || value == "0" || value.starts_with("0:")
+impl crate::RequestEnvelope<GuestCommand> {
+    pub fn validate_admission(&mut self) -> Result<(), Invalid> {
+        let length = self
+            .descriptor()?
+            .map(|chunks| crate::validate_binary(chunks, crate::MAX_STREAM_BYTES))
+            .transpose()?;
+        self.request.validate_identity()?;
+        self.request.request.validate_metadata(length)?;
+        let expected = command_metadata_digest(
+            &self.request.machine_id,
+            self.request.generation,
+            &self.request.operation_id,
+            &crate::RequestEnvelope {
+                request: self.request.request.clone(),
+                binary: self.binary.clone(),
+            },
+        )?;
+        if self.request.request_digest != expected {
+            return Err(Invalid("admission digest does not bind its metadata"));
+        }
+        Ok(())
+    }
 }
 
-fn mutation_digest(
-    sandbox_id: &SandboxId,
-    epoch: Counter,
+fn command_digest(
+    machine_id: &MachineId,
+    generation: Counter,
     operation_id: &OperationId,
-    grant_id: &GrantId,
-    expected_revision: Counter,
-    request: &WorkloadRequest,
+    request: &GuestRequest,
+) -> Result<Digest, Invalid> {
+    let (metadata, _) = crate::RequestEnvelope::split(request.clone())?;
+    command_metadata_digest(machine_id, generation, operation_id, &metadata)
+}
+
+fn command_metadata_digest(
+    machine_id: &MachineId,
+    generation: Counter,
+    operation_id: &OperationId,
+    request: &crate::RequestEnvelope<GuestRequest>,
 ) -> Result<Digest, Invalid> {
     crate::digest(
         crate::Domain::Operation,
         &(
-            "sandsurf-workload-mutation-v1",
-            sandbox_id,
-            epoch,
+            "sandsurf-guest-command-v2",
+            machine_id,
+            generation,
             operation_id,
-            grant_id,
-            expected_revision,
             request,
         ),
     )
@@ -459,28 +431,6 @@ pub struct AuthorityBinding {
     pub host_id: HostId,
     pub key_id: Digest,
     pub public_key: AuthorityPublicKey,
-}
-
-/// Exact, immutable authority for one mutation. Only the host service sends this
-/// over its private guardian channel; applications retain operation/grant IDs and
-/// expected revisions, never this envelope as independently exercisable authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AuthorizedMutationStatement {
-    pub version: u16,
-    pub host_id: HostId,
-    pub key_id: Digest,
-    pub mutation: Mutation,
-    pub capability: Capability,
-    pub scope_digest: Digest,
-    pub grant_revision: Counter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AuthorizedMutation {
-    pub statement: AuthorizedMutationStatement,
-    pub signature: AuthoritySignature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,8 +481,8 @@ pub struct AuthorizedLossStatement {
     pub version: u16,
     pub host_id: HostId,
     pub key_id: Digest,
-    pub sandbox_id: SandboxId,
-    pub process_id: ProcessId,
+    pub machine_id: MachineId,
+    pub execution_id: ExecutionId,
     pub receipt_digest: Digest,
     pub output: OutputBoundary,
     pub approval_id: CommitmentId,
@@ -555,11 +505,11 @@ pub struct AuthorizedLoss {
 )]
 pub enum GuardianRequest {
     Inspect {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: Option<OperationId>,
     },
     Dispatch {
-        authorization: AuthorizedMutation,
+        command: GuestCommand,
     },
     Transition {
         authorization: AuthorizedLifecycle,
@@ -568,15 +518,20 @@ pub enum GuardianRequest {
         authorization: AuthorizedConfiguration,
     },
     Guest {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         request: crate::GuestServiceRequest,
     },
-    NativeCheckpoint {
-        sandbox_id: SandboxId,
-        request: crate::NativeCheckpointRequest,
+    QueryGuest {
+        machine_id: MachineId,
+        generation: Counter,
+        request: crate::GuestServiceRequest,
+    },
+    NativeSnapshot {
+        machine_id: MachineId,
+        request: crate::NativeSnapshotRequest,
     },
     Runtime {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         request: RuntimeRequest,
     },
 }
@@ -589,33 +544,37 @@ pub enum GuardianRequest {
     deny_unknown_fields
 )]
 pub enum RuntimeRequest {
+    ValidateResources {
+        resources: Resources,
+    },
+    Usage,
     Events {
         after: Counter,
         maximum: u16,
     },
     Process {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
     },
     Processes,
     Operation {
         operation_id: OperationId,
     },
     Receipt {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
     },
     ReadOutput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         after: Counter,
         maximum: u32,
     },
     AcknowledgeReceipt {
         operation_id: OperationId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
     },
     Pin {
         operation_id: OperationId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
         pin_id: PinId,
     },
@@ -628,11 +587,11 @@ pub enum RuntimeRequest {
         authorization: AuthorizedLoss,
     },
     Release {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         request: ReleaseRequest,
     },
     CleanupReleased {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         request_digest: Digest,
     },
 }
@@ -778,7 +737,7 @@ pub enum RuntimeEventValue {
     Machine {
         observation: MachineObservation,
     },
-    WorkloadOperation {
+    GuestOperation {
         operation: Operation,
     },
     LifecycleOperation {
@@ -788,18 +747,18 @@ pub enum RuntimeEventValue {
         operation: ConfigurationOperation,
     },
     Process {
-        process: crate::ProcessSnapshot,
+        process: crate::ExecutionSnapshot,
     },
     Output {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         boundary: OutputBoundary,
     },
     Receipt {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
     },
     EvidenceRelease {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         request_digest: Digest,
         cleanup_pending: bool,
     },
@@ -829,14 +788,18 @@ pub struct RuntimeEventPage {
     deny_unknown_fields
 )]
 pub enum RuntimeResponse {
+    Usage {
+        usage: crate::ResourceUsage,
+    },
     Events {
         page: RuntimeEventPage,
     },
     Process {
-        process: Option<Observation<crate::ProcessSnapshot>>,
+        process: Box<Option<Observation<crate::ExecutionSnapshot>>>,
+        request: crate::SpawnRequest,
     },
     Processes {
-        processes: Vec<Observation<crate::ProcessSnapshot>>,
+        processes: Vec<Observation<crate::ExecutionSnapshot>>,
     },
     Operation {
         operation: Option<RuntimeOperationRecord>,
@@ -857,7 +820,49 @@ pub enum RuntimeResponse {
     Complete,
 }
 
-/// Immutable guardian-owned mutation history. These records support
+impl RuntimeResponse {
+    pub fn into_wire_parts(self) -> Result<crate::WireParts<Self>, crate::Invalid> {
+        match self {
+            Self::Output { page } => {
+                let (page, bytes) = page.into_binary_parts()?;
+                Ok((Self::OutputMetadata { page }, Some(bytes)))
+            }
+            Self::OutputMetadata { .. } => Err(crate::Invalid("cannot originate output metadata")),
+            response => Ok((response, None)),
+        }
+    }
+
+    pub fn binary_descriptor(&self) -> Result<Option<Vec<crate::BinaryChunk>>, crate::Invalid> {
+        match self {
+            Self::OutputMetadata { page } => {
+                page.validate_lengths()?;
+                let chunks = page
+                    .chunks
+                    .iter()
+                    .map(|chunk| crate::BinaryChunk {
+                        length: chunk.length,
+                        digest: chunk.bytes_digest.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                crate::validate_binary(&chunks, crate::MAX_CONTROL_BYTES)?;
+                Ok(Some(chunks))
+            }
+            Self::Output { .. } => Err(crate::Invalid("output bytes must use data frames")),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn with_wire_bytes(self, bytes: Vec<Vec<u8>>) -> Result<Self, crate::Invalid> {
+        match self {
+            Self::OutputMetadata { page } => Ok(Self::Output {
+                page: page.with_binary_parts(bytes)?,
+            }),
+            _ => Err(crate::Invalid("response does not describe binary data")),
+        }
+    }
+}
+
+/// Immutable guardian-owned command history. These records support
 /// reconciliation only; acknowledgement is not acceptance and none of the
 /// evidence variants delegate the grant that originally admitted them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -868,22 +873,22 @@ pub enum RuntimeResponse {
     deny_unknown_fields
 )]
 pub enum RuntimeOperationRecord {
-    Workload {
+    Guest {
         operation: Operation,
     },
     ReceiptAcknowledgement {
         operation_id: OperationId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
     },
     EvidencePin {
         operation_id: OperationId,
         pin_id: PinId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
     },
     EvidenceRelease {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         request: ReleaseRequest,
         status: ReleaseStatus,
     },
@@ -892,8 +897,9 @@ pub enum RuntimeOperationRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GuardianInspection {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub observation: Observation<MachineObservation>,
+    pub management: Observation<crate::GuestManagementReport>,
     pub operation: Option<Operation>,
     pub lifecycle_operation: Option<LifecycleOperation>,
     pub configuration_operation: Option<ConfigurationOperation>,
@@ -922,8 +928,8 @@ pub enum GuardianResponse {
     Guest {
         response: crate::GuestServiceResponse,
     },
-    NativeCheckpoint {
-        response: crate::NativeCheckpointResponse,
+    NativeSnapshot {
+        response: crate::NativeSnapshotResponse,
     },
     Runtime {
         response: RuntimeResponse,
@@ -932,6 +938,40 @@ pub enum GuardianResponse {
         category: String,
         message: String,
     },
+}
+
+impl GuardianResponse {
+    pub fn into_wire_parts(self) -> Result<crate::WireParts<Self>, crate::Invalid> {
+        match self {
+            Self::Runtime { response } => {
+                let (response, bytes) = response.into_wire_parts()?;
+                Ok((Self::Runtime { response }, bytes))
+            }
+            Self::Guest { response } => {
+                let (response, bytes) = response.into_wire_parts()?;
+                Ok((Self::Guest { response }, bytes))
+            }
+            response => Ok((response, None)),
+        }
+    }
+    pub fn binary_descriptor(&self) -> Result<Option<Vec<crate::BinaryChunk>>, crate::Invalid> {
+        match self {
+            Self::Runtime { response } => response.binary_descriptor(),
+            Self::Guest { response } => response.binary_descriptor(),
+            _ => Ok(None),
+        }
+    }
+    pub fn with_wire_bytes(self, bytes: Vec<Vec<u8>>) -> Result<Self, crate::Invalid> {
+        match self {
+            Self::Runtime { response } => Ok(Self::Runtime {
+                response: response.with_wire_bytes(bytes)?,
+            }),
+            Self::Guest { response } => Ok(Self::Guest {
+                response: response.with_wire_bytes(bytes)?,
+            }),
+            _ => Err(crate::Invalid("response does not describe binary data")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -947,8 +987,7 @@ pub enum Delivery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Operation {
-    pub request: Mutation,
-    pub capability: Capability,
+    pub admission: crate::RequestEnvelope<GuestCommand>,
     pub delivery: Delivery,
     pub evidence_digest: Option<Digest>,
 }
@@ -970,14 +1009,7 @@ pub struct Resources {
     pub memory_mib: Counter,
     pub disk_bytes: Counter,
     pub output_bytes: Counter,
-    pub processes: Counter,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProcessLifetime {
-    Job,
-    Sandbox,
+    pub managed_executions: Counter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1008,9 +1040,9 @@ impl TerminalSize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpawnRequest {
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
-    pub process_id: ProcessId,
+    pub machine_id: MachineId,
+    pub generation: Counter,
+    pub execution_id: ExecutionId,
     pub operation_id: OperationId,
     pub argv: Vec<String>,
     pub cwd: String,
@@ -1018,7 +1050,6 @@ pub struct SpawnRequest {
     pub user: Option<String>,
     pub stdio: StdioMode,
     pub terminal_size: Option<TerminalSize>,
-    pub lifetime: ProcessLifetime,
     /// Elapsed workload time after which the supervisor terminates this
     /// process group. This is part of execution semantics, not a client wait
     /// timeout, and therefore survives client disconnects.
@@ -1038,38 +1069,38 @@ pub struct SpawnRequest {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum WorkloadRequest {
+pub enum GuestRequest {
     Spawn {
         request: Box<SpawnRequest>,
     },
     CloseInput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         terminal_lease_id: Option<TerminalId>,
     },
     WriteInput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         terminal_lease_id: Option<TerminalId>,
         bytes: Vec<u8>,
     },
     AcquireTerminalInput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         terminal_lease_id: TerminalId,
     },
     ReleaseTerminalInput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         terminal_lease_id: TerminalId,
     },
     ResizeTerminal {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         size: TerminalSize,
     },
     Signal {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         signal: u8,
         group: bool,
     },
     Terminate {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         grace_millis: u32,
     },
     Filesystem {
@@ -1077,7 +1108,20 @@ pub enum WorkloadRequest {
     },
 }
 
-impl WorkloadRequest {
+impl GuestRequest {
+    pub(crate) fn validate_metadata(&self, length: Option<usize>) -> Result<(), Invalid> {
+        match (self, length) {
+            (Self::WriteInput { bytes, .. }, Some(length))
+                if bytes.is_empty() && length > 0 && length <= crate::MAX_STREAM_BYTES =>
+            {
+                Ok(())
+            }
+            (Self::Filesystem { request }, length) => request.validate_metadata(length),
+            (_, None) => self.validate(),
+            _ => Err(Invalid("command metadata has an invalid byte descriptor")),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), Invalid> {
         match self {
             Self::Spawn { request } => request.validate(),
@@ -1167,32 +1211,18 @@ impl SpawnRequest {
 }
 
 fn validate_guest_path(value: &str) -> Result<(), Invalid> {
-    if value.is_empty()
-        || value.len() > 4096
-        || value.contains('\0')
-        || !value.starts_with('/')
-        || value.split('/').any(|part| part == "..")
-    {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') || !value.starts_with('/') {
         return Err(Invalid(
-            "guest path must be absolute, bounded, and normalized",
+            "guest path must be absolute, bounded, and NUL-free",
         ));
     }
     Ok(())
 }
 
 fn validate_guest_path_bytes(value: &[u8]) -> Result<(), Invalid> {
-    if value.is_empty()
-        || value.len() > 4096
-        || value[0] != b'/'
-        || value.contains(&0)
-        || (value.len() > 1 && value.ends_with(b"/"))
-        || value
-            .split(|byte| *byte == b'/')
-            .skip(1)
-            .any(|part| part.is_empty() || matches!(part, b"." | b".."))
-    {
+    if value.is_empty() || value.len() > 4096 || value[0] != b'/' || value.contains(&0) {
         return Err(Invalid(
-            "guest path bytes must be absolute, bounded, and normalized",
+            "guest path bytes must be absolute, bounded, and NUL-free",
         ));
     }
     Ok(())
@@ -1204,7 +1234,7 @@ impl Resources {
             self.memory_mib,
             self.disk_bytes,
             self.output_bytes,
-            self.processes,
+            self.managed_executions,
         ]
         .contains(&Counter::ZERO)
         {
@@ -1218,7 +1248,9 @@ impl Resources {
             memory_mib: self.memory_mib.checked_add(other.memory_mib.get())?,
             disk_bytes: self.disk_bytes.checked_add(other.disk_bytes.get())?,
             output_bytes: self.output_bytes.checked_add(other.output_bytes.get())?,
-            processes: self.processes.checked_add(other.processes.get())?,
+            managed_executions: self
+                .managed_executions
+                .checked_add(other.managed_executions.get())?,
         })
     }
     pub fn within(&self, limit: &Self) -> bool {
@@ -1226,7 +1258,7 @@ impl Resources {
             && self.memory_mib <= limit.memory_mib
             && self.disk_bytes <= limit.disk_bytes
             && self.output_bytes <= limit.output_bytes
-            && self.processes <= limit.processes
+            && self.managed_executions <= limit.managed_executions
     }
     pub fn zero() -> Self {
         Self {
@@ -1234,7 +1266,7 @@ impl Resources {
             memory_mib: Counter::ZERO,
             disk_bytes: Counter::ZERO,
             output_bytes: Counter::ZERO,
-            processes: Counter::ZERO,
+            managed_executions: Counter::ZERO,
         }
     }
 }
@@ -1261,7 +1293,7 @@ pub struct OutputBoundary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ProcessOutcome {
+pub enum ExecutionOutcome {
     Exit { code: i32 },
     Signal { signal: u32 },
     DeadlineExceeded,
@@ -1272,12 +1304,12 @@ pub enum ProcessOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Receipt {
-    pub sandbox_id: SandboxId,
-    pub epoch: Counter,
-    pub process_id: ProcessId,
+    pub machine_id: MachineId,
+    pub generation: Counter,
+    pub execution_id: ExecutionId,
     pub operation_id: OperationId,
     pub request_digest: Digest,
-    pub outcome: ProcessOutcome,
+    pub outcome: ExecutionOutcome,
     pub output: OutputBoundary,
     pub cleanup_digest: Digest,
     pub accounting_digest: Digest,

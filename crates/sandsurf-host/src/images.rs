@@ -1,20 +1,20 @@
 //! Cross-platform OCI-to-VM image publication. The conversion never mounts
 //! the source tree or generated filesystem in the host kernel.
 
-use crate::api::{DerivedImageInclusion, OciSource};
-use sandbox_image::ext4::{BUILDER_ID as EXT4_BUILDER_ID, materialize_tar};
-use sandbox_image::oci::{
+use crate::api::OciSource;
+use sandsurf_image::ext4::materialize_tar;
+use sandsurf_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
     unpack_layout_archive, write_filesystem_tar,
 };
-use sandbox_image::{
-    Architecture, ImageManifest, ImageTrust, PlatformArtifacts, RootfsArtifact, RootfsFormat,
-    VerifiedImage, WorkloadDefaults, WorkloadImageManifest, WorkloadProvenance, verify_image,
+use sandsurf_image::{
+    Architecture, ImageDefaults, ImageManifest, ImageProvenance, ImageTrust, PlatformArtifacts,
+    RootfsArtifact, RootfsFormat, SystemDiskManifest, VerifiedImage, verify_image,
 };
 #[cfg(target_os = "windows")]
-use sandbox_image::{ImageArtifact, WindowsArtifacts};
+use sandsurf_image::{ImageArtifact, WindowsArtifacts};
 use sandsurf_protocol::{
-    Checkpoint, CheckpointPhase, Counter, Digest, Domain, OperationId, Qualification, digest,
+    Counter, Digest, Domain, OperationId, Qualification, Snapshot, SnapshotPhase, digest,
 };
 use sandsurf_state::ImageRecord;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ pub fn bundled_image_digest() -> Option<Digest> {
 pub enum ImageBuildError {
     Io(io::Error),
     Json(serde_json::Error),
-    Image(sandbox_image::ImageError),
+    Image(sandsurf_image::ImageError),
     Invalid(String),
 }
 
@@ -65,8 +65,8 @@ impl From<serde_json::Error> for ImageBuildError {
         Self::Json(value)
     }
 }
-impl From<sandbox_image::ImageError> for ImageBuildError {
-    fn from(value: sandbox_image::ImageError) -> Self {
+impl From<sandsurf_image::ImageError> for ImageBuildError {
+    fn from(value: sandsurf_image::ImageError) -> Self {
         Self::Image(value)
     }
 }
@@ -81,21 +81,8 @@ struct ImportResult {
 }
 
 pub fn qualification() -> Qualification {
-    let result = digest(
-        Domain::Image,
-        &(
-            "sandsurf-portable-oci-builder-v1",
-            EXT4_BUILDER_ID,
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        ),
-    )
-    .map_err(|error| LinuxError::Invalid(error.to_string()));
-    match result {
-        Ok(evidence) => Qualification::Qualified { evidence },
-        Err(error) => Qualification::Unqualified {
-            reasons: vec![error.to_string()],
-        },
+    Qualification::Unqualified {
+        reasons: vec!["machine-image boot, administration and native publication have no retained hardware qualification for this exact build/profile".into()],
     }
 }
 
@@ -179,22 +166,20 @@ pub fn import_oci(
     let tree = layout
         .convert(resolved, &tree_root)
         .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    require_os_init(&tree)?;
     let filesystem_tar = stage.join("rootfs.tar");
     write_filesystem_tar(&tree_root, &tree, &filesystem_tar)
         .map_err(|error| LinuxError::Invalid(error.to_string()))?;
     let rootfs_bytes = rootfs_size(&tree)?;
     let artifact = stage.join("artifact");
     prepare_private_directory(&artifact)?;
-    let workload_path = artifact.join("oci-workload.ext4");
-    let builder = materialize_ext4(&filesystem_tar, &workload_path, rootfs_bytes)?;
-    let (base, template) = resolve_source_bundle(executable)?;
+    let system_path = artifact.join("oci-system.ext4");
+    let builder = materialize_ext4(&filesystem_tar, &system_path, rootfs_bytes)?;
+    let (base, _) = resolve_source_bundle(executable)?;
     let kernel_name = "boot-kernel";
-    let bootstrap_name = "trusted-bootstrap.ext4";
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
-    copy_regular(&base.bootstrap_path, &artifact.join(bootstrap_name))?;
-    copy_regular(&template, &artifact.join("empty-workspace.ext4"))?;
     let platform_artifacts =
-        materialize_platform_artifacts(&base, &workload_path, &artifact, rootfs_bytes)?;
+        materialize_platform_artifacts(&base, &system_path, &artifact, rootfs_bytes)?;
     let mut environment = BTreeMap::new();
     for assignment in &tree.source.defaults.environment {
         let (name, value) = assignment
@@ -213,7 +198,7 @@ pub fn import_oci(
     )
     .map_err(|error| LinuxError::Invalid(error.to_string()))?;
     let mut manifest = ImageManifest {
-        format_version: 2,
+        format_version: 3,
         id: format!("oci-{}", short_digest(&tree.source.manifest_digest)?),
         version: short_digest(&tree.source.config_digest)?.to_owned(),
         architecture: match requested.architecture.as_str() {
@@ -222,37 +207,29 @@ pub fn import_oci(
             _ => return Err(LinuxError::Invalid("unsupported OCI architecture".into())),
         },
         boot_bundle: base.manifest.boot_bundle.clone(),
-        workload: WorkloadImageManifest {
+        system: SystemDiskManifest {
             rootfs: RootfsArtifact {
-                path: "oci-workload.ext4".into(),
-                sha256: sha256_file(&workload_path, MAX_ROOTFS_BYTES)?,
+                path: "oci-system.ext4".into(),
+                sha256: sha256_file(&system_path, MAX_ROOTFS_BYTES)?,
                 format: RootfsFormat::Ext4,
             },
-            state_template: Some(RootfsArtifact {
-                path: "empty-workspace.ext4".into(),
-                sha256: sha256_file(&artifact.join("empty-workspace.ext4"), MAX_ROOTFS_BYTES)?,
-                format: RootfsFormat::Ext4,
-            }),
-            defaults: WorkloadDefaults {
+            defaults: ImageDefaults {
                 environment,
                 user: tree.source.defaults.user.clone(),
                 working_directory: tree.source.defaults.working_directory.clone(),
-                entrypoint: tree.source.defaults.entrypoint.clone(),
-                command: tree.source.defaults.command.clone(),
             },
-            provenance: WorkloadProvenance::Oci {
+            provenance: ImageProvenance::Oci {
                 index_digest: bare_digest(&tree.source.source_index_digest)?.to_owned(),
                 manifest_digest: bare_digest(&tree.source.manifest_digest)?.to_owned(),
                 config_digest: bare_digest(&tree.source.config_digest)?.to_owned(),
                 conversion_digest: conversion_digest.as_str().to_owned(),
             },
-            compatible_protocol_major: base.manifest.workload.compatible_protocol_major,
         },
         platform_artifacts,
         signature: None,
     };
     manifest.boot_bundle.kernel.path = kernel_name.into();
-    manifest.boot_bundle.bootstrap.path = bootstrap_name.into();
+    manifest.boot_bundle.guest_agent = None;
     let manifest_path = artifact.join("manifest.json");
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let mut manifest_file = create_private_file(&manifest_path)?;
@@ -297,29 +274,24 @@ pub fn import_oci(
     Ok(image)
 }
 
-pub fn publish_checkpoint(
+pub fn publish_snapshot(
     host_root: &Path,
-    checkpoint: &Checkpoint,
-    inclusion: DerivedImageInclusion,
+    snapshot: &Snapshot,
+    allow_sensitive: bool,
     operation: &OperationId,
     request_digest: &Digest,
 ) -> Result<ImageRecord, LinuxError> {
-    if checkpoint.phase != CheckpointPhase::Ready
-        || checkpoint.workload_disk_digest.is_none()
-        || checkpoint.manifest_digest.is_none()
+    if snapshot.phase != SnapshotPhase::Ready
+        || snapshot.system_disk_digest.is_none()
+        || snapshot.manifest_digest.is_none()
     {
         return Err(LinuxError::Invalid(
-            "derived image requires a ready filesystem checkpoint".into(),
+            "derived image requires a ready filesystem snapshot".into(),
         ));
     }
-    if !inclusion.workspace || !inclusion.home {
+    if snapshot.sensitive && !allow_sensitive {
         return Err(LinuxError::Invalid(
-            "the current VM-native publisher requires explicit workspace and home inclusion".into(),
-        ));
-    }
-    if checkpoint.sensitive && !inclusion.secrets {
-        return Err(LinuxError::Invalid(
-            "a secret-tainted checkpoint requires explicit secret inclusion".into(),
+            "publishing this complete system disk requires explicit sensitive publication authority".into(),
         ));
     }
 
@@ -349,49 +321,39 @@ pub fn publish_checkpoint(
 
     let source_root = host_root
         .join("images")
-        .join(checkpoint.image_digest.as_str());
+        .join(snapshot.image_digest.as_str());
     let source = verify_image(
         &source_root.join("manifest.json"),
         ImageTrust::ExplicitLocal,
     )?;
-    if source.manifest_digest != checkpoint.image_digest.as_str() {
+    if source.manifest_digest != snapshot.image_digest.as_str() {
         return Err(LinuxError::Invalid(
-            "checkpoint source image identity changed".into(),
+            "snapshot source image identity changed".into(),
         ));
     }
     let artifact = stage.join("artifact");
     prepare_private_directory(&artifact)?;
     let kernel = artifact.join("boot-kernel");
-    let bootstrap = artifact.join("trusted-bootstrap.ext4");
-    let workload = artifact.join("derived-workload.ext4");
-    let template = artifact.join("empty-workspace.ext4");
+    let template = artifact.join("derived-system.ext4");
     copy_regular(&source.kernel_path, &kernel)?;
-    copy_regular(&source.bootstrap_path, &bootstrap)?;
-    copy_regular(&source.workload_path, &workload)?;
-    crate::checkpoints::materialize_image_template(
-        &host_root.join("checkpoints"),
-        checkpoint,
-        &template,
-    )
-    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    crate::snapshots::materialize_image_template(&host_root.join("snapshots"), snapshot, &template)
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
 
-    let checkpoint_manifest = checkpoint
+    let snapshot_manifest = snapshot
         .manifest_digest
         .as_ref()
-        .expect("ready checkpoint manifest was checked");
+        .expect("ready snapshot manifest was checked");
     let provenance_digest = digest(
         Domain::Image,
         &(
-            "sandsurf-derived-image-v1",
-            &checkpoint.image_digest,
-            checkpoint_manifest,
-            checkpoint
-                .workload_disk_digest
+            "sandsurf-derived-image-v2",
+            &snapshot.image_digest,
+            snapshot_manifest,
+            snapshot
+                .system_disk_digest
                 .as_ref()
-                .expect("ready checkpoint disk was checked"),
-            inclusion.workspace,
-            inclusion.home,
-            inclusion.secrets,
+                .expect("ready snapshot disk was checked"),
+            snapshot.sensitive,
         ),
     )
     .map_err(|error| LinuxError::Invalid(error.to_string()))?;
@@ -399,29 +361,20 @@ pub fn publish_checkpoint(
         &source,
         &template,
         &artifact,
-        checkpoint.workload_disk_bytes.get(),
+        snapshot.system_disk_bytes.get(),
     )?;
     let mut manifest = source.manifest;
     manifest.id = format!("derived-{}", &provenance_digest.as_str()[..16]);
-    manifest.version = checkpoint_manifest.as_str()[..16].to_owned();
+    manifest.version = snapshot_manifest.as_str()[..16].to_owned();
     manifest.boot_bundle.kernel.path = "boot-kernel".into();
     manifest.boot_bundle.kernel.sha256 = sha256_file(&kernel, MAX_ROOTFS_BYTES)?;
-    manifest.boot_bundle.bootstrap.path = "trusted-bootstrap.ext4".into();
-    manifest.boot_bundle.bootstrap.sha256 = sha256_file(&bootstrap, MAX_ROOTFS_BYTES)?;
-    manifest.workload.rootfs.path = "derived-workload.ext4".into();
-    manifest.workload.rootfs.sha256 = sha256_file(&workload, MAX_ROOTFS_BYTES)?;
-    manifest.workload.state_template = Some(RootfsArtifact {
-        path: "empty-workspace.ext4".into(),
-        sha256: sha256_file(&template, MAX_ROOTFS_BYTES)?,
-        format: RootfsFormat::Ext4,
-    });
+    manifest.system.rootfs.path = "derived-system.ext4".into();
+    manifest.system.rootfs.sha256 = sha256_file(&template, MAX_ROOTFS_BYTES)?;
     manifest.platform_artifacts = platform_artifacts;
-    manifest.workload.provenance = WorkloadProvenance::Derived {
-        source_image_digest: checkpoint.image_digest.as_str().to_owned(),
-        checkpoint_manifest_digest: checkpoint_manifest.as_str().to_owned(),
-        include_workspace: inclusion.workspace,
-        include_home: inclusion.home,
-        include_secrets: inclusion.secrets,
+    manifest.system.provenance = ImageProvenance::Derived {
+        source_image_digest: snapshot.image_digest.as_str().to_owned(),
+        snapshot_manifest_digest: snapshot_manifest.as_str().to_owned(),
+        sensitive: snapshot.sensitive,
     };
     manifest.signature = None;
     let manifest_path = artifact.join("manifest.json");
@@ -430,7 +383,6 @@ pub fn publish_checkpoint(
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
     let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
-    let workload_bytes = fs::metadata(&workload)?.len();
     let final_root = host_root.join("images").join(&verified.manifest_digest);
     if final_root.exists() {
         let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
@@ -449,18 +401,14 @@ pub fn publish_checkpoint(
         Architecture::X64 => "amd64",
         Architecture::Arm64 => "arm64",
     };
-    let logical_bytes = checkpoint
-        .workload_disk_bytes
-        .get()
-        .checked_add(workload_bytes)
-        .ok_or_else(|| LinuxError::Invalid("derived image size overflow".into()))?;
+    let logical_bytes = snapshot.system_disk_bytes.get();
     let image = ImageRecord {
         digest: Digest::try_from(verified.manifest_digest)
             .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-        source_digest: checkpoint
-            .workload_disk_digest
+        source_digest: snapshot
+            .system_disk_digest
             .as_ref()
-            .expect("ready checkpoint disk was checked")
+            .expect("ready snapshot disk was checked")
             .clone(),
         platform: "linux".into(),
         architecture: architecture.into(),
@@ -469,7 +417,7 @@ pub fn publish_checkpoint(
         storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
             .map_err(|error| LinuxError::Invalid(error.to_string()))?,
         provenance_digest,
-        sensitive: checkpoint.sensitive,
+        sensitive: snapshot.sensitive,
     };
     write_json(
         &result_path,
@@ -485,14 +433,10 @@ pub fn publish_checkpoint(
 fn remove_derived_artifact(path: &Path) -> Result<(), LinuxError> {
     for name in [
         "manifest.json",
-        "empty-workspace.ext4",
-        "derived-workload.ext4",
-        "trusted-bootstrap.ext4",
+        "derived-system.ext4",
         "boot-kernel",
         "windows-kernel",
-        "windows-bootstrap.vhdx",
-        "windows-workload.vhdx",
-        "windows-state-template.vhdx",
+        "windows-system.vhdx",
     ] {
         match fs::remove_file(path.join(name)) {
             Ok(()) => {}
@@ -520,6 +464,65 @@ fn parse_platform(value: &str) -> Result<GuestPlatform, LinuxError> {
         os: os.into(),
         variant,
     })
+}
+
+/// Container roots without an OS init require an isolated build recipe. They
+/// must not be silently booted as a chroot under a protected supervisor.
+fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
+    let mut path = "sbin/init".to_owned();
+    for _ in 0..32 {
+        let entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path.trim_start_matches('/') == path)
+            .ok_or_else(|| {
+                LinuxError::Invalid(
+                    "OCI input has no bootable /sbin/init; an isolated OS build recipe is required"
+                        .into(),
+                )
+            })?;
+        match entry.kind {
+            TreeEntryKind::Regular if entry.mode & 0o111 != 0 && entry.size > 0 => return Ok(()),
+            TreeEntryKind::Symlink | TreeEntryKind::Hardlink => {
+                let target = entry
+                    .link_target
+                    .as_ref()
+                    .ok_or_else(|| LinuxError::Invalid("OS init link has no target".into()))?;
+                let joined = if target.starts_with('/') || entry.kind == TreeEntryKind::Hardlink {
+                    PathBuf::from(target.trim_start_matches('/'))
+                } else {
+                    Path::new(&path)
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .join(target)
+                };
+                let mut components = Vec::new();
+                for component in joined.components() {
+                    match component {
+                        std::path::Component::Normal(value) => components.push(value.to_owned()),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir if !components.is_empty() => {
+                            components.pop();
+                        }
+                        _ => {
+                            return Err(LinuxError::Invalid(
+                                "OS init link escapes the machine root".into(),
+                            ));
+                        }
+                    }
+                }
+                path = components
+                    .into_iter()
+                    .collect::<PathBuf>()
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            _ => return Err(LinuxError::Invalid("OCI OS init is not executable".into())),
+        }
+    }
+    Err(LinuxError::Invalid(
+        "OCI OS init link resolution exceeds its bound".into(),
+    ))
 }
 
 fn rootfs_size(tree: &ConvertedTree) -> Result<u64, LinuxError> {
@@ -589,7 +592,7 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
             ));
         }
         let image = verify_image(&path, ImageTrust::ExplicitLocal)?;
-        let template = state_template_path(&image)?;
+        let template = image.system_path.clone();
         return Ok((image, template));
     }
     let package = executable
@@ -622,28 +625,14 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
             manifest_digest: pinned,
         },
     )?;
-    let template = state_template_path(&image)?;
+    let template = image.system_path.clone();
     Ok((image, template))
-}
-
-fn state_template_path(image: &VerifiedImage) -> Result<PathBuf, LinuxError> {
-    let template = image
-        .manifest
-        .workload
-        .state_template
-        .as_ref()
-        .ok_or_else(|| LinuxError::Invalid("image has no writable-state template".into()))?;
-    Ok(image
-        .manifest_path
-        .parent()
-        .ok_or_else(|| LinuxError::Invalid("image manifest has no parent".into()))?
-        .join(&template.path))
 }
 
 #[cfg(target_os = "windows")]
 fn materialize_platform_artifacts(
     base: &VerifiedImage,
-    workload: &Path,
+    defaults: &Path,
     destination: &Path,
     bytes: u64,
 ) -> Result<PlatformArtifacts, LinuxError> {
@@ -651,19 +640,13 @@ fn materialize_platform_artifacts(
         LinuxError::Invalid("packaged boot bundle has no Windows artifacts".into())
     })?;
     let kernel = destination.join("windows-kernel");
-    let bootstrap = destination.join("windows-bootstrap.vhdx");
-    let workload_vhdx = destination.join("windows-workload.vhdx");
-    let state = destination.join("windows-state-template.vhdx");
+    let workload_vhdx = destination.join("windows-system.vhdx");
     copy_regular(&windows.kernel_path, &kernel)?;
-    copy_regular(&windows.bootstrap_path, &bootstrap)?;
-    copy_regular(&windows.state_template_path, &state)?;
-    sandsurf_native::virtual_disk::import_raw(workload, &workload_vhdx, bytes)?;
+    sandsurf_native::virtual_disk::import_raw(defaults, &workload_vhdx, bytes)?;
     Ok(PlatformArtifacts {
         windows_x64: Some(WindowsArtifacts {
             kernel: image_artifact(&kernel, "windows-kernel")?,
-            bootstrap: image_artifact(&bootstrap, "windows-bootstrap.vhdx")?,
-            workload: image_artifact(&workload_vhdx, "windows-workload.vhdx")?,
-            state_template: image_artifact(&state, "windows-state-template.vhdx")?,
+            system: image_artifact(&workload_vhdx, "windows-system.vhdx")?,
         }),
     })
 }
@@ -678,43 +661,13 @@ fn materialize_platform_artifacts(
     Ok(PlatformArtifacts::default())
 }
 
-#[cfg(target_os = "windows")]
 fn materialize_derived_platform_artifacts(
     source: &VerifiedImage,
-    state_template: &Path,
+    system: &Path,
     destination: &Path,
-    state_bytes: u64,
+    bytes: u64,
 ) -> Result<PlatformArtifacts, LinuxError> {
-    let windows = source
-        .windows_x64
-        .as_ref()
-        .ok_or_else(|| LinuxError::Invalid("source image has no Windows artifacts".into()))?;
-    let kernel = destination.join("windows-kernel");
-    let bootstrap = destination.join("windows-bootstrap.vhdx");
-    let workload = destination.join("windows-workload.vhdx");
-    let state = destination.join("windows-state-template.vhdx");
-    copy_regular(&windows.kernel_path, &kernel)?;
-    copy_regular(&windows.bootstrap_path, &bootstrap)?;
-    copy_regular(&windows.workload_path, &workload)?;
-    sandsurf_native::virtual_disk::import_raw(state_template, &state, state_bytes)?;
-    Ok(PlatformArtifacts {
-        windows_x64: Some(WindowsArtifacts {
-            kernel: image_artifact(&kernel, "windows-kernel")?,
-            bootstrap: image_artifact(&bootstrap, "windows-bootstrap.vhdx")?,
-            workload: image_artifact(&workload, "windows-workload.vhdx")?,
-            state_template: image_artifact(&state, "windows-state-template.vhdx")?,
-        }),
-    })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn materialize_derived_platform_artifacts(
-    _source: &VerifiedImage,
-    _state_template: &Path,
-    _destination: &Path,
-    _state_bytes: u64,
-) -> Result<PlatformArtifacts, LinuxError> {
-    Ok(PlatformArtifacts::default())
+    materialize_platform_artifacts(source, system, destination, bytes)
 }
 
 #[cfg(target_os = "windows")]

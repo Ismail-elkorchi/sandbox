@@ -1,5 +1,5 @@
 [package]
-name = "sandbox-cargo-fuzz"
+name = "machine-cargo-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -11,12 +11,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.145"
-sandbox-digest = { path = "../crates/sandbox-digest" }
-sandbox-image = { path = "../crates/sandbox-image" }
-sandbox-network-broker = { path = "../crates/sandbox-network-broker" }
-sandbox-policy = { path = "../crates/sandbox-policy" }
+sandsurf-format = { path = "../crates/sandsurf-format" }
+sandsurf-image = { path = "../crates/sandsurf-image" }
+sandsurf-network = { path = "../crates/sandsurf-network" }
 sandsurf-protocol = { path = "../crates/sandsurf-protocol" }
-sandbox-vm = { path = "../crates/sandbox-vm" }
 
 [[bin]]
 name = "sandsurf_protocol"

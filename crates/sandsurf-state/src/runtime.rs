@@ -13,13 +13,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const SCHEMA: &str = "
-CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), sandbox TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
+CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), machine TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE management_reports(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
-CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), epoch INTEGER NOT NULL, output_origin_epoch INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), generation INTEGER NOT NULL, output_origin_generation INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
@@ -27,22 +28,20 @@ CREATE TABLE acknowledgement_operations(id TEXT PRIMARY KEY, process TEXT NOT NU
 CREATE TABLE pin_operations(id TEXT PRIMARY KEY, pin TEXT NOT NULL REFERENCES pins(id), process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
 CREATE TABLE release_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), request_digest TEXT NOT NULL) STRICT;
 CREATE TABLE loss_authorizations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL, approval_digest TEXT NOT NULL) STRICT;
-CREATE TABLE disks(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, request TEXT NOT NULL, request_digest TEXT NOT NULL, phase TEXT NOT NULL, cleanup_digest TEXT) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeLimits {
     pub identities: Counter,
+    /// Concurrent admitted executions, not guest Linux PIDs.
+    pub managed_executions: Counter,
     pub operations: Counter,
     pub observations: Counter,
     pub events: Counter,
     pub chunks: Counter,
     pub pins: Counter,
     pub output_bytes: Counter,
-    pub disks: Counter,
-    pub disk_bytes: Counter,
-    pub disk_headroom_bytes: Counter,
 }
 
 /// Created only after a guardian journal commit. Host callers cannot construct/deserialise it.
@@ -53,8 +52,8 @@ impl CommittedObservation {
     }
     pub fn reference(&self) -> Result<ObservationRef> {
         Ok(ObservationRef {
-            sandbox_id: self.0.sandbox_id.clone(),
-            epoch: self.0.epoch,
+            machine_id: self.0.machine_id.clone(),
+            generation: self.0.generation,
             sequence: self.0.sequence,
             digest: digest(Domain::Operation, &self.0)?,
         })
@@ -80,7 +79,7 @@ pub struct OutputPage {
 
 pub struct RuntimeJournal {
     pub(crate) db: Database,
-    pub(crate) sandbox: SandboxId,
+    pub(crate) machine: MachineId,
     pub(crate) limits: RuntimeLimits,
     authority: AuthorityVerifier,
 }
@@ -91,10 +90,9 @@ pub enum DispatchDecision<'guardian> {
     Reconcile(Operation),
 }
 
-/// One dispatch from a verified host envelope. The envelope is exact-operation,
-/// one-way service traffic, not an application-held capability or grant cache.
+/// One generation-fenced dispatch received on the authenticated host channel.
 pub struct DispatchPermit<'guardian> {
-    authority: AuthorizedMutation,
+    command: GuestCommand,
     _guardian: &'guardian mut RuntimeJournal,
 }
 
@@ -129,31 +127,27 @@ impl LifecyclePermit<'_> {
     }
 }
 impl DispatchPermit<'_> {
-    pub fn perform<T>(self, effect: impl FnOnce(&Mutation, &Capability) -> T) -> T {
-        effect(
-            &self.authority.statement.mutation,
-            &self.authority.statement.capability,
-        )
+    pub fn perform<T>(self, effect: impl FnOnce(&GuestCommand) -> T) -> T {
+        effect(&self.command)
     }
 }
 
 impl RuntimeJournal {
     pub fn create(
         path: &Path,
-        sandbox: SandboxId,
+        machine: MachineId,
         limits: RuntimeLimits,
         binding: AuthorityBinding,
     ) -> Result<Self> {
         if [
             limits.identities,
+            limits.managed_executions,
             limits.operations,
             limits.observations,
             limits.events,
             limits.chunks,
             limits.pins,
             limits.output_bytes,
-            limits.disks,
-            limits.disk_bytes,
         ]
         .contains(&Counter::ZERO)
         {
@@ -164,34 +158,34 @@ impl RuntimeJournal {
         db.connection.execute(
             "INSERT INTO configuration VALUES (1,?1,?2,?3)",
             params![
-                sandbox.as_str(),
+                machine.as_str(),
                 encode(&limits)?,
                 encode(authority.binding())?
             ],
         )?;
         Ok(Self {
             db,
-            sandbox,
+            machine,
             limits,
             authority,
         })
     }
-    pub fn open(path: &Path, sandbox: &SandboxId) -> Result<Self> {
+    pub fn open(path: &Path, machine: &MachineId) -> Result<Self> {
         let db = Database::open(path, "guardian")?;
         db.connection
             .prepare("SELECT reservation_active FROM processes LIMIT 0")
             .map_err(|_| Error::Corrupt("incompatible guardian journal; preserved intact"))?;
         let (identity, limits, binding): (String, String, String) = db.connection.query_row(
-            "SELECT sandbox,limits,authority FROM configuration WHERE id=1",
+            "SELECT machine,limits,authority FROM configuration WHERE id=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if identity != sandbox.as_str() {
-            return Err(Error::Conflict("guardian sandbox identity mismatch"));
+        if identity != machine.as_str() {
+            return Err(Error::Conflict("guardian machine identity mismatch"));
         }
         Ok(Self {
             db,
-            sandbox: sandbox.clone(),
+            machine: machine.clone(),
             limits: decode(&limits)?,
             authority: AuthorityVerifier::new(decode(&binding)?)?,
         })
@@ -199,9 +193,35 @@ impl RuntimeJournal {
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
     }
-    pub fn sandbox_id(&self) -> &SandboxId {
-        &self.sandbox
+    pub fn machine_id(&self) -> &MachineId {
+        &self.machine
     }
+    pub fn last_management_report(&self) -> Result<Option<GuestManagementReport>> {
+        self.db
+            .connection
+            .query_row(
+                "SELECT value FROM management_reports WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| decode(&raw))
+            .transpose()
+    }
+
+    pub fn record_management_report(&mut self, report: GuestManagementReport) -> Result<()> {
+        if self
+            .last_observation()?
+            .is_none_or(|current| current.value().generation != report.generation)
+        {
+            return Err(Error::Conflict(
+                "management report belongs to another execution generation",
+            ));
+        }
+        self.db.connection.execute("INSERT INTO management_reports VALUES (1,?1) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [encode(&report)?])?;
+        Ok(())
+    }
+
     pub fn last_observation(&self) -> Result<Option<CommittedObservation>> {
         Ok(observation(&self.db.connection)?.map(CommittedObservation))
     }
@@ -212,8 +232,8 @@ impl RuntimeJournal {
             |r| r.get(0),
         )?;
         let value: MachineObservation = decode(&raw)?;
-        if reference.sandbox_id != self.sandbox
-            || reference.epoch != value.epoch
+        if reference.machine_id != self.machine
+            || reference.generation != value.generation
             || reference.digest != digest(Domain::Operation, &value)?
         {
             return Err(Error::Conflict(
@@ -223,8 +243,8 @@ impl RuntimeJournal {
         Ok(CommittedObservation(value))
     }
     pub fn observe(&mut self, value: MachineObservation) -> Result<CommittedObservation> {
-        if value.sandbox_id != self.sandbox {
-            return Err(Error::Conflict("observation belongs to another sandbox"));
+        if value.machine_id != self.machine {
+            return Err(Error::Conflict("observation belongs to another machine"));
         }
         let tx = self.db.connection.transaction()?;
         if let Some(old) = observation(&tx)? {
@@ -232,8 +252,8 @@ impl RuntimeJournal {
                 return Ok(CommittedObservation(old));
             }
             if value.sequence != old.sequence.next()?
-                || value.epoch < old.epoch
-                || value.epoch > old.epoch.next()?
+                || value.generation < old.generation
+                || value.generation > old.generation.next()?
                 || value.applied_revision < old.applied_revision
                 || old.state == MachineState::Destroyed
             {
@@ -241,23 +261,23 @@ impl RuntimeJournal {
                     "stale, skipped, or rewound guardian observation",
                 ));
             }
-            if value.epoch != old.epoch
+            if value.generation != old.generation
                 && !matches!(
                     value.state,
                     MachineState::Starting | MachineState::Restoring
                 )
             {
                 return Err(Error::Conflict(
-                    "new epoch requires an explicit boot/restore transition",
+                    "new generation requires an explicit boot/restore transition",
                 ));
             }
             if !valid_transition(&old, &value) {
                 return Err(Error::Conflict(
-                    "machine observation requires a valid lifecycle/epoch transition",
+                    "machine observation requires a valid lifecycle/generation transition",
                 ));
             }
         } else if value.sequence != Counter::ONE
-            || value.epoch != Counter::ONE
+            || value.generation != Counter::ONE
             || value.state != MachineState::Creating
         {
             return Err(Error::Conflict(
@@ -271,7 +291,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::Machine {
                 observation: value.clone(),
@@ -288,7 +308,7 @@ impl RuntimeJournal {
         let db = &self.db.connection;
         let mut records = Vec::new();
         if let Some(operation) = operation(db, id)? {
-            records.push(RuntimeOperationRecord::Workload { operation });
+            records.push(RuntimeOperationRecord::Guest { operation });
         }
         if let Some((process, receipt_digest)) = db
             .query_row(
@@ -300,7 +320,7 @@ impl RuntimeJournal {
         {
             records.push(RuntimeOperationRecord::ReceiptAcknowledgement {
                 operation_id: id.clone(),
-                process_id: process.try_into()?,
+                execution_id: process.try_into()?,
                 receipt_digest: receipt_digest.try_into()?,
             });
         }
@@ -321,7 +341,7 @@ impl RuntimeJournal {
             records.push(RuntimeOperationRecord::EvidencePin {
                 operation_id: id.clone(),
                 pin_id: pin.try_into()?,
-                process_id: process.try_into()?,
+                execution_id: process.try_into()?,
                 receipt_digest: receipt_digest.try_into()?,
             });
         }
@@ -349,7 +369,7 @@ impl RuntimeJournal {
                 return Err(Error::Corrupt("release operation binding is invalid"));
             }
             records.push(RuntimeOperationRecord::EvidenceRelease {
-                process_id: process.try_into()?,
+                execution_id: process.try_into()?,
                 request,
                 status: ReleaseStatus {
                     request_digest: expected,
@@ -361,7 +381,7 @@ impl RuntimeJournal {
             0 => Ok(None),
             1 => Ok(records.pop()),
             _ => Err(Error::Corrupt(
-                "runtime operation identity is bound to multiple mutations",
+                "runtime operation identity is bound to multiple commands",
             )),
         }
     }
@@ -398,7 +418,7 @@ impl RuntimeJournal {
                 return Err(Error::Corrupt("runtime event history has a gap"));
             }
             let value: RuntimeEventValue = decode(&raw)?;
-            let event_digest = runtime_event_digest(&self.sandbox, sequence, &value)?;
+            let event_digest = runtime_event_digest(&self.machine, sequence, &value)?;
             if event_digest.as_str() != stored_digest {
                 return Err(Error::Corrupt("runtime event digest mismatch"));
             }
@@ -444,7 +464,7 @@ impl RuntimeJournal {
             };
         }
         runtime_operation_identity_available(&tx, &command.operation_id)?;
-        require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
+        require_lifecycle_state(&self.machine, observation(&tx)?.as_ref(), &command)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = LifecycleOperation {
             command,
@@ -458,7 +478,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::LifecycleOperation {
                 operation: value.clone(),
@@ -483,7 +503,7 @@ impl RuntimeJournal {
         if !matches!(value.delivery, Delivery::Admitted | Delivery::NotApplied) {
             return Ok(LifecycleDecision::Reconcile(value));
         }
-        require_lifecycle_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
+        require_lifecycle_state(&self.machine, observation(&tx)?.as_ref(), command)?;
         value.delivery = Delivery::Dispatched;
         value.evidence_digest = None;
         value.observation = None;
@@ -493,7 +513,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::LifecycleOperation {
                 operation: value.clone(),
@@ -555,7 +575,7 @@ impl RuntimeJournal {
                     .value();
                 if evidence.is_none()
                     || observation.operation_id != value.command.operation_id
-                    || observation.sandbox_id != value.command.sandbox_id
+                    || observation.machine_id != value.command.machine_id
                     || observation.applied_revision != value.command.revision
                     || !observation.state.satisfies(value.command.desired)
                 {
@@ -589,7 +609,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::LifecycleOperation {
                 operation: value.clone(),
@@ -605,8 +625,7 @@ impl RuntimeJournal {
     ) -> Result<ConfigurationOperation> {
         self.authority.verify_configuration(&authorization)?;
         let command = authorization.statement.command;
-        let tx = self.db.connection.transaction()?;
-        if let Some(old) = configuration_operation(&tx, &command.operation_id)? {
+        if let Some(old) = self.configuration_operation(&command.operation_id)? {
             return if old.command == command {
                 Ok(old)
             } else {
@@ -615,8 +634,10 @@ impl RuntimeJournal {
                 ))
             };
         }
+        self.validate_resource_envelope(&command.configuration.resources)?;
+        let tx = self.db.connection.transaction()?;
         runtime_operation_identity_available(&tx, &command.operation_id)?;
-        require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), &command)?;
+        require_configuration_state(&self.machine, observation(&tx)?.as_ref(), &command)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = ConfigurationOperation {
             command,
@@ -630,7 +651,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::ConfigurationOperation {
                 operation: value.clone(),
@@ -667,7 +688,7 @@ impl RuntimeJournal {
                 "configuration operation has an invalid retry state",
             ));
         }
-        require_configuration_state(&self.sandbox, observation(&tx)?.as_ref(), command)?;
+        require_configuration_state(&self.machine, observation(&tx)?.as_ref(), command)?;
         value.delivery = Delivery::Dispatched;
         tx.execute(
             "UPDATE configuration_operations SET value=?2 WHERE id=?1",
@@ -675,7 +696,7 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::ConfigurationOperation {
                 operation: value.clone(),
@@ -739,7 +760,7 @@ impl RuntimeJournal {
                     .value();
                 if evidence.is_none()
                     || observation.operation_id != value.command.operation_id
-                    || observation.sandbox_id != value.command.sandbox_id
+                    || observation.machine_id != value.command.machine_id
                     || observation.applied_revision != value.command.revision
                 {
                     return Err(Error::Conflict(
@@ -763,6 +784,17 @@ impl RuntimeJournal {
             }
             Delivery::Admitted | Delivery::Dispatched => unreachable!(),
         }
+        let mut applied_limits = None;
+        if delivery == Delivery::Applied {
+            let mut limits = self.limits.clone();
+            limits.output_bytes = value.command.configuration.resources.output_bytes;
+            limits.managed_executions = value.command.configuration.resources.managed_executions;
+            tx.execute(
+                "UPDATE configuration SET limits=?1 WHERE id=1",
+                [encode(&limits)?],
+            )?;
+            applied_limits = Some(limits);
+        }
         value.delivery = delivery;
         value.evidence_digest = evidence;
         value.observation = observed;
@@ -772,29 +804,47 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::ConfigurationOperation {
                 operation: value.clone(),
             },
         )?;
         tx.commit()?;
+        if let Some(limits) = applied_limits {
+            self.limits = limits;
+        }
         Ok(value)
     }
 
-    pub fn admit(&mut self, authorization: AuthorizedMutation) -> Result<Operation> {
-        self.authority.verify_mutation(&authorization)?;
-        let statement = authorization.statement;
-        let request = statement.mutation;
-        request.validate()?;
-        if request.required_capability() != statement.capability {
-            return Err(Error::Conflict(
-                "authorized mutation capability does not match its request",
+    /// Unsettled executions keep their reservations even when management is unavailable.
+    pub fn validate_resource_envelope(&self, resources: &Resources) -> Result<()> {
+        resources.validate()?;
+        let (active, reserved): (u64, u64) = self.db.connection.query_row(
+            "SELECT count(*),coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let retained: u64 = self.db.connection.query_row(
+            "SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0",
+            [], |row| row.get(0),
+        )?;
+        if active > resources.managed_executions.get()
+            || reserved
+                .checked_add(retained)
+                .is_none_or(|bytes| bytes > resources.output_bytes.get())
+        {
+            return Err(Error::Capacity(
+                "resource reduction excludes retained bytes or active reservations",
             ));
         }
+        Ok(())
+    }
+
+    pub fn admit(&mut self, request: GuestCommand) -> Result<Operation> {
+        let admission = request.admission()?;
         let tx = self.db.connection.transaction()?;
         if let Some(old) = operation(&tx, &request.operation_id)? {
-            if old.request == request && old.capability == statement.capability {
+            if old.admission == admission {
                 return Ok(old);
             }
             return Err(Error::Conflict("runtime operation identity already bound"));
@@ -802,31 +852,32 @@ impl RuntimeJournal {
         runtime_operation_identity_available(&tx, &request.operation_id)?;
         let observed =
             observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
-        if request.sandbox_id != self.sandbox
-            || request.epoch != observed.epoch
-            || request.expected_revision != observed.applied_revision
+        if request.machine_id != self.machine
+            || request.generation != observed.generation
             || observed.state != MachineState::Running
         {
             return Err(Error::Conflict(
-                "machine epoch, applied revision or state does not admit work",
+                "machine generation or power state does not admit work",
             ));
         }
         operation_capacity(&tx, self.limits.operations)?;
         let value = Operation {
-            request,
-            capability: statement.capability,
+            admission,
             delivery: Delivery::Admitted,
             evidence_digest: None,
         };
         tx.execute(
             "INSERT INTO operations VALUES (?1,?2)",
-            params![value.request.operation_id.as_str(), encode(&value)?],
+            params![
+                value.admission.request.operation_id.as_str(),
+                encode(&value)?
+            ],
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
-            RuntimeEventValue::WorkloadOperation {
+            RuntimeEventValue::GuestOperation {
                 operation: value.clone(),
             },
         )?;
@@ -834,33 +885,26 @@ impl RuntimeJournal {
         Ok(value)
     }
 
-    /// Recheck current host authority and guardian state, then durably gate one effect.
+    /// Recheck native power and generation, then durably gate one effect.
     /// A crash after this commit requires reconciliation even if no effect took place.
     pub fn begin_dispatch<'guardian>(
         &'guardian mut self,
-        authorization: AuthorizedMutation,
+        command: GuestCommand,
     ) -> Result<DispatchDecision<'guardian>> {
-        self.authority.verify_mutation(&authorization)?;
         let tx = self.db.connection.transaction()?;
-        let request = &authorization.statement.mutation;
+        let request = &command;
         request.validate()?;
-        if request.required_capability() != authorization.statement.capability {
-            return Err(Error::Conflict(
-                "authorized mutation capability does not match its request",
-            ));
-        }
         let mut value = operation(&tx, &request.operation_id)?
             .ok_or(Error::Missing("dispatch operation is not admitted"))?;
-        if value.request != *request || value.capability != authorization.statement.capability {
-            return Err(Error::Conflict("dispatch identity or authority mismatch"));
+        if value.admission != request.admission()? {
+            return Err(Error::Conflict("dispatch identity mismatch"));
         }
         if value.delivery != Delivery::Admitted {
             return Ok(DispatchDecision::Reconcile(value));
         }
         let current = observation(&tx)?.ok_or(Error::Missing("machine observation unavailable"))?;
-        if request.sandbox_id != self.sandbox
-            || request.epoch != current.epoch
-            || request.expected_revision != current.applied_revision
+        if request.machine_id != self.machine
+            || request.generation != current.generation
             || current.state != MachineState::Running
         {
             return Err(Error::Conflict("machine no longer admits dispatch"));
@@ -872,15 +916,15 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
-            RuntimeEventValue::WorkloadOperation {
+            RuntimeEventValue::GuestOperation {
                 operation: value.clone(),
             },
         )?;
         tx.commit()?;
         Ok(DispatchDecision::Perform(DispatchPermit {
-            authority: authorization,
+            command,
             _guardian: self,
         }))
     }
@@ -900,7 +944,7 @@ impl RuntimeJournal {
         }
         let tx = self.db.connection.transaction()?;
         let mut value = operation(&tx, id)?.ok_or(Error::Missing("operation missing"))?;
-        if value.request.request_digest != *request {
+        if value.admission.request.request_digest != *request {
             return Err(Error::Conflict("operation digest mismatch"));
         }
         if value.delivery == delivery && value.evidence_digest == evidence {
@@ -923,7 +967,7 @@ impl RuntimeJournal {
             ));
         }
         if delivery == Delivery::NotApplied
-            && matches!(&value.request.request, WorkloadRequest::Spawn { .. })
+            && matches!(&value.admission.request.request, GuestRequest::Spawn { .. })
         {
             let progressed: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM processes p WHERE p.operation=?1 AND (p.snapshot IS NOT NULL OR p.receipt IS NOT NULL OR EXISTS(SELECT 1 FROM chunks c WHERE c.process=p.id)))",
@@ -948,9 +992,9 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
-            RuntimeEventValue::WorkloadOperation {
+            RuntimeEventValue::GuestOperation {
                 operation: value.clone(),
             },
         )?;
@@ -960,7 +1004,7 @@ impl RuntimeJournal {
 
     pub fn admit_process(
         &mut self,
-        id: ProcessId,
+        id: ExecutionId,
         operation_id: &OperationId,
         output_limit: Counter,
         terminal: bool,
@@ -971,17 +1015,12 @@ impl RuntimeJournal {
         let tx = self.db.connection.transaction()?;
         let op =
             operation(&tx, operation_id)?.ok_or(Error::Missing("process operation missing"))?;
-        if !matches!(op.capability, Capability::Spawn | Capability::WorkloadAdmin) {
-            return Err(Error::Conflict(
-                "process creation requires spawn or workload-administration authority",
-            ));
-        }
-        let WorkloadRequest::Spawn { request } = &op.request.request else {
+        let GuestRequest::Spawn { request } = &op.admission.request.request else {
             return Err(Error::Conflict(
                 "process reservation requires a spawn request",
             ));
         };
-        if request.process_id != id
+        if request.execution_id != id
             || request.operation_id != *operation_id
             || request.output_bytes != output_limit
             || (request.stdio == StdioMode::Terminal) != terminal
@@ -990,9 +1029,9 @@ impl RuntimeJournal {
                 "process reservation does not match the authorized spawn request",
             ));
         }
-        if let Some((old_operation, old_epoch, old_limit, old_terminal, released)) = tx
+        if let Some((old_operation, old_generation, old_limit, old_terminal, released)) = tx
             .query_row(
-                "SELECT operation,epoch,output_limit,terminal_mode,release FROM processes WHERE id=?1",
+                "SELECT operation,generation,output_limit,terminal_mode,release FROM processes WHERE id=?1",
                 [id.as_str()],
                 |row| {
                     Ok((
@@ -1010,7 +1049,7 @@ impl RuntimeJournal {
                 return Err(Error::Conflict("process evidence identity was retired"));
             }
             return if old_operation == operation_id.as_str()
-                && old_epoch == op.request.epoch.get()
+                && old_generation == op.admission.request.generation.get()
                 && old_limit == output_limit.get()
                 && old_terminal == terminal
             {
@@ -1023,6 +1062,14 @@ impl RuntimeJournal {
             return Err(Error::Conflict("process must be reserved before dispatch"));
         }
         capacity(&tx, "processes", self.limits.identities)?;
+        let active: u64 = tx.query_row(
+            "SELECT count(*) FROM processes WHERE reservation_active=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if active >= self.limits.managed_executions.get() {
+            return Err(Error::Capacity("managed execution reservations exhausted"));
+        }
         // Live producers reserve their full limit. Settled processes consume
         // only their actual retained bytes; unused headroom returns at the
         // same commit that publishes a terminal receipt.
@@ -1043,13 +1090,13 @@ impl RuntimeJournal {
         {
             return Err(Error::Capacity("output reservations exhausted"));
         }
-        let boundary = empty_boundary(&self.sandbox, &id, op.request.epoch)?;
-        tx.execute("INSERT INTO processes(id,operation,epoch,output_origin_epoch,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.request.epoch.get(), output_limit.get(), terminal, encode(&boundary)?])?;
+        let boundary = empty_boundary(&self.machine, &id, op.admission.request.generation)?;
+        tx.execute("INSERT INTO processes(id,operation,generation,output_origin_generation,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.admission.request.generation.get(), output_limit.get(), terminal, encode(&boundary)?])?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn process_boundary(&self, id: &ProcessId) -> Result<OutputBoundary> {
+    pub fn process_boundary(&self, id: &ExecutionId) -> Result<OutputBoundary> {
         let raw: String = self.db.connection.query_row(
             "SELECT boundary FROM processes WHERE id=?1",
             [id.as_str()],
@@ -1058,45 +1105,52 @@ impl RuntimeJournal {
         decode(&raw)
     }
 
-    pub fn observe_process(&mut self, snapshot: &ProcessSnapshot) -> Result<()> {
+    pub fn observe_process(&mut self, snapshot: &ExecutionSnapshot) -> Result<()> {
         let tx = self.db.connection.transaction()?;
-        let (operation_id, epoch, old, receipt): (String, u64, Option<String>, Option<String>) = tx
-            .query_row(
-                "SELECT operation,epoch,snapshot,receipt FROM processes WHERE id=?1",
-                [snapshot.request.process_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+        let (operation_id, generation, old, receipt): (
+            String,
+            u64,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT operation,generation,snapshot,receipt FROM processes WHERE id=?1",
+            [snapshot.request.execution_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
         let operation_id: OperationId = operation_id.try_into()?;
         let admitted =
             operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
-        let WorkloadRequest::Spawn { request } = &admitted.request.request else {
+        let GuestRequest::Spawn { request } = &admitted.admission.request.request else {
             return Err(Error::Corrupt("process operation is not a spawn"));
         };
         let admitted_matches = if **request == snapshot.request {
             true
         } else if let Some(lineage) = &snapshot.lineage {
             let mut restored = (**request).clone();
-            restored.sandbox_id = snapshot.request.sandbox_id.clone();
-            restored.epoch = snapshot.request.epoch;
-            lineage.source_sandbox_id == request.sandbox_id
-                && lineage.source_epoch == request.epoch
+            restored.machine_id = snapshot.request.machine_id.clone();
+            restored.generation = snapshot.request.generation;
+            lineage.source_machine_id == request.machine_id
+                && lineage.source_generation == request.generation
                 && restored == snapshot.request
         } else {
             false
         };
-        if !admitted_matches || snapshot.request.epoch.get() != epoch || snapshot.guest_pid == 0 {
+        if !admitted_matches
+            || snapshot.request.generation.get() != generation
+            || snapshot.guest_pid == 0
+        {
             return Err(Error::Conflict(
                 "process observation does not match admitted spawn",
             ));
         }
         if let Some(old) = old {
-            let old: ProcessSnapshot = decode(&old)?;
+            let old: ExecutionSnapshot = decode(&old)?;
             if old.request != snapshot.request || old.guest_pid != snapshot.guest_pid {
                 return Err(Error::Conflict("process observation identity changed"));
             }
             if matches!(
                 old.state,
-                ProcessState::Exited(_) | ProcessState::Unknown { .. }
+                ExecutionState::Exited(_) | ExecutionState::Unknown { .. }
             ) && old.state != snapshot.state
             {
                 return Err(Error::Conflict("terminal process observation changed"));
@@ -1104,7 +1158,7 @@ impl RuntimeJournal {
         }
         if let Some(receipt) = receipt {
             let receipt: Receipt = decode(&receipt)?;
-            let expected = ProcessState::Exited(ProcessCompletion {
+            let expected = ExecutionState::Exited(ExecutionCompletion {
                 outcome: receipt.outcome,
                 output: receipt.output,
                 cleanup_digest: receipt.cleanup_digest,
@@ -1118,11 +1172,11 @@ impl RuntimeJournal {
         }
         tx.execute(
             "UPDATE processes SET snapshot=?2 WHERE id=?1",
-            params![snapshot.request.process_id.as_str(), encode(snapshot)?],
+            params![snapshot.request.execution_id.as_str(), encode(snapshot)?],
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::Process {
                 process: snapshot.clone(),
@@ -1132,7 +1186,7 @@ impl RuntimeJournal {
         Ok(())
     }
 
-    pub fn process_snapshot(&self, id: &ProcessId) -> Result<Option<ProcessSnapshot>> {
+    pub fn process_snapshot(&self, id: &ExecutionId) -> Result<Option<ExecutionSnapshot>> {
         let raw: Option<String> = self.db.connection.query_row(
             "SELECT snapshot FROM processes WHERE id=?1",
             [id.as_str()],
@@ -1141,7 +1195,27 @@ impl RuntimeJournal {
         raw.map(|value| decode(&value)).transpose()
     }
 
-    pub fn process_snapshots(&self) -> Result<Vec<ProcessSnapshot>> {
+    pub fn process_request(&self, id: &ExecutionId) -> Result<sandsurf_protocol::SpawnRequest> {
+        let operation_id: String = self.db.connection.query_row(
+            "SELECT operation FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        let operation_id: OperationId = operation_id.try_into()?;
+        let operation = operation(&self.db.connection, &operation_id)?
+            .ok_or(Error::Corrupt("reserved process has no admission"))?;
+        let GuestRequest::Spawn { request } = operation.admission.request.request else {
+            return Err(Error::Corrupt("reserved process has no spawn request"));
+        };
+        if request.execution_id != *id {
+            return Err(Error::Corrupt(
+                "process identity differs from its admission",
+            ));
+        }
+        Ok(*request)
+    }
+
+    pub fn process_snapshots(&self) -> Result<Vec<ExecutionSnapshot>> {
         let mut statement = self
             .db
             .connection
@@ -1154,21 +1228,40 @@ impl RuntimeJournal {
         Ok(values)
     }
 
+    /// Admission facts are available before a guest has reported its first snapshot.
+    pub fn unsettled_execution_boundaries(
+        &self,
+        generation: Counter,
+    ) -> Result<Vec<(ExecutionId, OutputBoundary)>> {
+        let mut statement = self.db.connection.prepare(
+            "SELECT id,boundary FROM processes WHERE generation=?1 AND receipt IS NULL AND release IS NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([generation.get()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, boundary) = row?;
+            Ok((id.try_into()?, decode(&boundary)?))
+        })
+        .collect()
+    }
+
     /// Rebind process observations after a trusted full-state restore. Host
     /// operations and receipts remain historical; only the current process
-    /// handle epoch and explicit checkpoint lineage move forward.
+    /// handle generation and explicit snapshot lineage move forward.
     pub fn rebind_processes(
         &mut self,
-        checkpoint_id: &CheckpointId,
-        source_sandbox_id: &SandboxId,
-        source_epoch: Counter,
-        epoch: Counter,
+        snapshot_id: &SnapshotId,
+        source_machine_id: &MachineId,
+        source_generation: Counter,
+        generation: Counter,
     ) -> Result<()> {
-        if epoch == Counter::ZERO || epoch == source_epoch {
-            return Err(Error::Conflict("restored process epoch is invalid"));
+        if generation == Counter::ZERO || generation == source_generation {
+            return Err(Error::Conflict("restored process generation is invalid"));
         }
         let tx = self.db.connection.transaction()?;
-        let mut statement = tx.prepare("SELECT id,epoch,snapshot FROM processes ORDER BY id")?;
+        let mut statement =
+            tx.prepare("SELECT id,generation,snapshot FROM processes ORDER BY id")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1178,42 +1271,42 @@ impl RuntimeJournal {
         })?;
         let mut updates = Vec::new();
         for row in rows {
-            let (id, old_epoch, snapshot) = row?;
-            if Counter::try_from(old_epoch)? != source_epoch {
-                // Historical processes from earlier cold-boot epochs are not
+            let (id, old_generation, snapshot) = row?;
+            if Counter::try_from(old_generation)? != source_generation {
+                // Historical processes from earlier cold-boot generations are not
                 // live in this captured VM and retain their original identity.
                 continue;
             }
             let snapshot = snapshot
-                .map(|value| decode::<ProcessSnapshot>(&value))
+                .map(|value| decode::<ExecutionSnapshot>(&value))
                 .transpose()?;
             let Some(mut snapshot) = snapshot else {
                 return Err(Error::Corrupt(
                     "captured process reservation has no observation",
                 ));
             };
-            if snapshot.request.sandbox_id != *source_sandbox_id
-                || snapshot.request.epoch != source_epoch
-                || snapshot.request.process_id.as_str() != id
+            if snapshot.request.machine_id != *source_machine_id
+                || snapshot.request.generation != source_generation
+                || snapshot.request.execution_id.as_str() != id
             {
                 return Err(Error::Conflict(
                     "captured process identity does not match restore lineage",
                 ));
             }
-            snapshot.request.sandbox_id = self.sandbox.clone();
-            snapshot.request.epoch = epoch;
-            snapshot.lineage = Some(ProcessLineage {
-                source_sandbox_id: source_sandbox_id.clone(),
-                source_epoch,
-                checkpoint_id: checkpoint_id.clone(),
+            snapshot.request.machine_id = self.machine.clone();
+            snapshot.request.generation = generation;
+            snapshot.lineage = Some(ExecutionLineage {
+                source_machine_id: source_machine_id.clone(),
+                source_generation,
+                snapshot_id: snapshot_id.clone(),
             });
             updates.push((id, encode(&snapshot)?));
         }
         drop(statement);
         for (id, snapshot) in updates {
             tx.execute(
-                "UPDATE processes SET epoch=?2,snapshot=?3 WHERE id=?1",
-                params![id, epoch.get(), snapshot],
+                "UPDATE processes SET generation=?2,snapshot=?3 WHERE id=?1",
+                params![id, generation.get(), snapshot],
             )?;
         }
         tx.commit()?;
@@ -1234,7 +1327,7 @@ impl RuntimeJournal {
 
     pub fn append_output(
         &mut self,
-        id: &ProcessId,
+        id: &ExecutionId,
         sequence: Counter,
         stream: Stream,
         bytes: &[u8],
@@ -1340,10 +1433,10 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::Output {
-                process_id: id.clone(),
+                execution_id: id.clone(),
                 boundary: boundary.clone(),
             },
         )?;
@@ -1353,7 +1446,7 @@ impl RuntimeJournal {
 
     pub fn read_output(
         &self,
-        id: &ProcessId,
+        id: &ExecutionId,
         after: Counter,
         max_bytes: usize,
     ) -> Result<OutputPage> {
@@ -1383,7 +1476,7 @@ impl RuntimeJournal {
 
     fn read_retained(
         &self,
-        id: &ProcessId,
+        id: &ExecutionId,
         boundary: OutputBoundary,
         after: Counter,
         max_bytes: usize,
@@ -1440,12 +1533,12 @@ impl RuntimeJournal {
             let take = (length - skip).min(remaining);
             let stream: Stream = decode(&stream)?;
             let previous = if sequence == 1 {
-                let epoch: u64 = self.db.connection.query_row(
-                    "SELECT output_origin_epoch FROM processes WHERE id=?1",
+                let generation: u64 = self.db.connection.query_row(
+                    "SELECT output_origin_generation FROM processes WHERE id=?1",
                     [id.as_str()],
                     |r| r.get(0),
                 )?;
-                empty_boundary(&self.sandbox, id, epoch.try_into()?)?.final_hash
+                empty_boundary(&self.machine, id, generation.try_into()?)?.final_hash
             } else {
                 let previous: String = self.db.connection.query_row(
                     "SELECT chain_digest FROM chunks WHERE process=?1 AND sequence=?2",
@@ -1496,18 +1589,18 @@ impl RuntimeJournal {
 
     pub fn publish_receipt(
         &mut self,
-        id: &ProcessId,
-        outcome: ProcessOutcome,
+        id: &ExecutionId,
+        outcome: ExecutionOutcome,
         cleanup: Digest,
         accounting: Digest,
     ) -> Result<(Receipt, Digest)> {
         let tx = self.db.connection.transaction()?;
-        let (operation_id, epoch, boundary, old): (String, u64, String, Option<String>) = tx
+        let (operation_id, generation, boundary, old): (String, u64, String, Option<String>) = tx
             .query_row(
-                "SELECT operation,epoch,boundary,receipt FROM processes WHERE id=?1",
-                [id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
+            "SELECT operation,generation,boundary,receipt FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
         let operation_id: OperationId = operation_id.try_into()?;
         let mut op =
             operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
@@ -1520,11 +1613,11 @@ impl RuntimeJournal {
             ));
         }
         let receipt = Receipt {
-            sandbox_id: self.sandbox.clone(),
-            epoch: epoch.try_into()?,
-            process_id: id.clone(),
+            machine_id: self.machine.clone(),
+            generation: generation.try_into()?,
+            execution_id: id.clone(),
             operation_id,
-            request_digest: op.request.request_digest.clone(),
+            request_digest: op.admission.request.request_digest.clone(),
             outcome,
             output: decode(&boundary)?,
             cleanup_digest: cleanup,
@@ -1538,11 +1631,11 @@ impl RuntimeJournal {
             return Ok((receipt, receipt_digest));
         }
         let delivery = match receipt.outcome {
-            ProcessOutcome::Exit { .. }
-            | ProcessOutcome::Signal { .. }
-            | ProcessOutcome::DeadlineExceeded => Delivery::Applied,
-            ProcessOutcome::SpawnFailed { .. } => Delivery::NotApplied,
-            ProcessOutcome::Interrupted { .. } => op.delivery,
+            ExecutionOutcome::Exit { .. }
+            | ExecutionOutcome::Signal { .. }
+            | ExecutionOutcome::DeadlineExceeded => Delivery::Applied,
+            ExecutionOutcome::SpawnFailed { .. } => Delivery::NotApplied,
+            ExecutionOutcome::Interrupted { .. } => op.delivery,
         };
         if matches!(
             (op.delivery, delivery),
@@ -1556,7 +1649,7 @@ impl RuntimeJournal {
         op.evidence_digest = Some(receipt_digest.clone());
         tx.execute(
             "UPDATE operations SET value=?2 WHERE id=?1",
-            params![op.request.operation_id.as_str(), encode(&op)?],
+            params![op.admission.request.operation_id.as_str(), encode(&op)?],
         )?;
         tx.execute(
             "UPDATE processes SET receipt=?2,receipt_digest=?3,reservation_active=0 WHERE id=?1",
@@ -1564,18 +1657,18 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
-            RuntimeEventValue::WorkloadOperation {
+            RuntimeEventValue::GuestOperation {
                 operation: op.clone(),
             },
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::Receipt {
-                process_id: id.clone(),
+                execution_id: id.clone(),
                 receipt_digest: receipt_digest.clone(),
             },
         )?;
@@ -1583,14 +1676,14 @@ impl RuntimeJournal {
         Ok((receipt, receipt_digest))
     }
 
-    pub fn receipt(&self, id: &ProcessId) -> Result<Option<(Receipt, Digest)>> {
+    pub fn receipt(&self, id: &ExecutionId) -> Result<Option<(Receipt, Digest)>> {
         receipt(&self.db.connection, id)
     }
 
     pub fn acknowledge_receipt(
         &mut self,
         operation: &OperationId,
-        id: &ProcessId,
+        id: &ExecutionId,
         expected: &Digest,
     ) -> Result<()> {
         let tx = self.db.connection.transaction()?;
@@ -1628,7 +1721,7 @@ impl RuntimeJournal {
     pub fn pin(
         &mut self,
         operation: &OperationId,
-        id: &ProcessId,
+        id: &ExecutionId,
         expected: &Digest,
         pin: PinId,
     ) -> Result<()> {
@@ -1720,7 +1813,7 @@ impl RuntimeJournal {
             [pin.as_str()],
             |r| r.get(0),
         )?;
-        let id: ProcessId = id.try_into()?;
+        let id: ExecutionId = id.try_into()?;
         let (receipt, _) = self
             .receipt(&id)?
             .ok_or(Error::Corrupt("retention receipt is missing"))?;
@@ -1731,14 +1824,14 @@ impl RuntimeJournal {
     pub fn record_loss_authorization(&mut self, authorized: AuthorizedLoss) -> Result<()> {
         self.authority.verify_loss(&authorized)?;
         let statement = authorized.statement;
-        let id = &statement.process_id;
+        let id = &statement.execution_id;
         let expected = &statement.receipt_digest;
         let receipt = require_receipt(&self.db.connection, id, expected)?;
         let binding = digest(
             Domain::Release,
-            &(&self.sandbox, id, expected, &receipt.output, "loss"),
+            &(&self.machine, id, expected, &receipt.output, "loss"),
         )?;
-        if statement.sandbox_id != self.sandbox
+        if statement.machine_id != self.machine
             || statement.output != receipt.output
             || statement.request_digest != binding
         {
@@ -1776,7 +1869,7 @@ impl RuntimeJournal {
     }
 
     /// Commits retirement only; cleanup is deliberately a second, retryable operation.
-    pub fn release(&mut self, id: &ProcessId, request: ReleaseRequest) -> Result<ReleaseStatus> {
+    pub fn release(&mut self, id: &ExecutionId, request: ReleaseRequest) -> Result<ReleaseStatus> {
         let identity = digest(Domain::Release, &request)?;
         let tx = self.db.connection.transaction()?;
         if let Some((old_process, old_digest)) = tx
@@ -1861,10 +1954,10 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::EvidenceRelease {
-                process_id: id.clone(),
+                execution_id: id.clone(),
                 request_digest: identity.clone(),
                 cleanup_pending: true,
             },
@@ -1878,7 +1971,7 @@ impl RuntimeJournal {
 
     pub fn cleanup_released(
         &mut self,
-        id: &ProcessId,
+        id: &ExecutionId,
         release_digest: &Digest,
     ) -> Result<ReleaseStatus> {
         let tx = self.db.connection.transaction()?;
@@ -1916,10 +2009,10 @@ impl RuntimeJournal {
         )?;
         append_event(
             &tx,
-            &self.sandbox,
+            &self.machine,
             self.limits.events,
             RuntimeEventValue::EvidenceRelease {
-                process_id: id.clone(),
+                execution_id: id.clone(),
                 request_digest: release_digest.clone(),
                 cleanup_pending: false,
             },
@@ -1945,7 +2038,7 @@ fn observation(db: &rusqlite::Connection) -> Result<Option<MachineObservation>> 
 
 fn append_event(
     db: &rusqlite::Connection,
-    sandbox: &SandboxId,
+    machine: &MachineId,
     limit: Counter,
     value: RuntimeEventValue,
 ) -> Result<()> {
@@ -1955,7 +2048,7 @@ fn append_event(
             row.get(0)
         })?;
     let sequence = Counter::try_from(previous)?.next()?;
-    let event_digest = runtime_event_digest(sandbox, sequence, &value)?;
+    let event_digest = runtime_event_digest(machine, sequence, &value)?;
     db.execute(
         "INSERT INTO events VALUES (?1,?2,?3)",
         params![sequence.get(), encode(&value)?, event_digest.as_str()],
@@ -1964,19 +2057,19 @@ fn append_event(
 }
 
 fn runtime_event_digest(
-    sandbox: &SandboxId,
+    machine: &MachineId,
     cursor: Counter,
     value: &RuntimeEventValue,
 ) -> Result<Digest> {
     Ok(digest(
         Domain::Operation,
-        &("sandsurf-runtime-event-v1", sandbox, cursor, value),
+        &("sandsurf-runtime-event-v1", machine, cursor, value),
     )?)
 }
 
 fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool {
     use MachineState::*;
-    if old.epoch != new.epoch {
+    if old.generation != new.generation {
         return matches!(old.state, Stopped | Failed | Suspended)
             && matches!(new.state, Starting | Restoring);
     }
@@ -2001,13 +2094,13 @@ fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool 
     )
 }
 fn require_lifecycle_state(
-    sandbox: &SandboxId,
+    machine: &MachineId,
     current: Option<&MachineObservation>,
     command: &LifecycleCommand,
 ) -> Result<()> {
-    if &command.sandbox_id != sandbox {
+    if &command.machine_id != machine {
         return Err(Error::Conflict(
-            "lifecycle command belongs to another sandbox",
+            "lifecycle command belongs to another machine",
         ));
     }
     match current {
@@ -2026,13 +2119,13 @@ fn require_lifecycle_state(
     }
 }
 fn require_configuration_state(
-    sandbox: &SandboxId,
+    machine: &MachineId,
     current: Option<&MachineObservation>,
     command: &ConfigurationCommand,
 ) -> Result<()> {
-    if &command.sandbox_id != sandbox {
+    if &command.machine_id != machine {
         return Err(Error::Conflict(
-            "configuration command belongs to another sandbox",
+            "configuration command belongs to another machine",
         ));
     }
     match current {
@@ -2062,7 +2155,7 @@ fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
 }
 fn runtime_operation_identity_available(db: &rusqlite::Connection, id: &OperationId) -> Result<()> {
     let conflicting: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM disks WHERE operation=?1) OR EXISTS(SELECT 1 FROM acknowledgement_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM pin_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM release_operations WHERE id=?1)",
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM acknowledgement_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM pin_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM release_operations WHERE id=?1)",
         [id.as_str()],
         |row| row.get(0),
     )?;
@@ -2080,7 +2173,11 @@ fn operation(db: &rusqlite::Connection, id: &OperationId) -> Result<Option<Opera
         |r| r.get::<_, String>(0),
     )
     .optional()?
-    .map(|s| decode(&s))
+    .map(|s| {
+        let mut value: Operation = decode(&s)?;
+        value.admission.validate_admission()?;
+        Ok(value)
+    })
     .transpose()
 }
 fn lifecycle_operation(
@@ -2109,7 +2206,7 @@ fn configuration_operation(
     .map(|value| decode(&value))
     .transpose()
 }
-fn receipt(db: &rusqlite::Connection, id: &ProcessId) -> Result<Option<(Receipt, Digest)>> {
+fn receipt(db: &rusqlite::Connection, id: &ExecutionId) -> Result<Option<(Receipt, Digest)>> {
     let (raw, expected): (Option<String>, Option<String>) = db.query_row(
         "SELECT receipt,receipt_digest FROM processes WHERE id=?1",
         [id.as_str()],
@@ -2130,7 +2227,7 @@ fn receipt(db: &rusqlite::Connection, id: &ProcessId) -> Result<Option<(Receipt,
 }
 fn require_receipt(
     db: &rusqlite::Connection,
-    id: &ProcessId,
+    id: &ExecutionId,
     expected: &Digest,
 ) -> Result<Receipt> {
     let (value, actual) =
@@ -2140,6 +2237,10 @@ fn require_receipt(
     }
     Ok(value)
 }
-fn empty_boundary(sandbox: &SandboxId, id: &ProcessId, epoch: Counter) -> Result<OutputBoundary> {
-    Ok(initial_output_boundary(sandbox, id, epoch)?)
+fn empty_boundary(
+    machine: &MachineId,
+    id: &ExecutionId,
+    generation: Counter,
+) -> Result<OutputBoundary> {
+    Ok(initial_output_boundary(machine, id, generation)?)
 }

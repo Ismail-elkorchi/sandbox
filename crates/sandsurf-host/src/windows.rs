@@ -1,25 +1,25 @@
 //! Windows guardian integration for one retained Hyper-V/HCS Linux VM.
 
-use crate::guest::{GuestClient, RemoteWorkloadDriver};
-use crate::windows_network::{WindowsNetworkBridge, WindowsPortGateway};
-use sandbox_guest::{
-    AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
-    NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
+use crate::guardian::{
+    EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
-use sandbox_image::{Architecture, ImageTrust, VerifiedImage, verify_image};
-use sandsurf_control::{
-    EffectOutcome, Error as ControlError, GuardianEffect, Result as ControlResult, WorkloadDriver,
-};
+use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
+use sandsurf_image::{Architecture, ImageTrust, VerifiedImage, verify_image};
 use sandsurf_machine::windows::{
     HyperVConfig, HyperVDisk, HyperVDriver, HyperVQualification, HyperVRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::{GuestChannel, HyperVChannel, virtual_disk};
+use sandsurf_network::windows::{WindowsNetworkBridge, WindowsPortGateway};
 use sandsurf_protocol::{
-    Capability, CheckpointArtifact, CheckpointProcessWatermark, Counter, Digest, Domain,
-    GuestServiceRequest, GuestServiceResponse, LifecycleCommand, MachineObservation, MachineState,
-    Mutation, NativeCheckpointRequest, NativeCheckpointResponse, NetworkDestination, NetworkPolicy,
-    Resources, RuntimeConfiguration, SandboxId, VmEngine, bytes_digest, digest,
+    AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
+    NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
+};
+use sandsurf_protocol::{
+    Counter, Digest, Domain, GuestCommand, GuestServiceRequest, GuestServiceResponse,
+    LifecycleCommand, MachineId, MachineObservation, MachineState, NativeSnapshotRequest,
+    NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources, RuntimeConfiguration,
+    SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const CONFIG_VERSION: u16 = 1;
 const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -41,7 +41,7 @@ const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
 pub enum WindowsError {
     Io(io::Error),
     Json(serde_json::Error),
-    Image(sandbox_image::ImageError),
+    Image(sandsurf_image::ImageError),
     Invalid(String),
 }
 
@@ -66,8 +66,8 @@ impl From<serde_json::Error> for WindowsError {
         Self::Json(value)
     }
 }
-impl From<sandbox_image::ImageError> for WindowsError {
-    fn from(value: sandbox_image::ImageError) -> Self {
+impl From<sandsurf_image::ImageError> for WindowsError {
+    fn from(value: sandsurf_image::ImageError) -> Self {
         Self::Image(value)
     }
 }
@@ -76,7 +76,7 @@ impl From<sandbox_image::ImageError> for WindowsError {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WindowsGuardianConfig {
     format_version: u16,
-    sandbox_id: SandboxId,
+    machine_id: MachineId,
     image_digest: Digest,
     resources: Resources,
     image_manifest: PathBuf,
@@ -87,19 +87,19 @@ pub struct WindowsGuardianConfig {
 pub fn prepare_config(
     host_root: &Path,
     executable: &Path,
-    sandbox_id: &SandboxId,
+    machine_id: &MachineId,
     image_digest: &Digest,
     resources: &Resources,
 ) -> Result<WindowsGuardianConfig, WindowsError> {
     let path = host_root
-        .join("sandboxes")
-        .join(sandbox_id.as_str())
+        .join("machines")
+        .join(machine_id.as_str())
         .join("guardian/config.json");
     if path.exists() {
-        let existing = read_config(&path, sandbox_id)?;
-        if existing.image_digest != *image_digest || existing.resources != *resources {
+        let existing = read_config(&path, machine_id)?;
+        if existing.image_digest != *image_digest {
             return Err(WindowsError::Invalid(
-                "existing Sandbox configuration conflicts with create request".into(),
+                "existing Machine configuration conflicts with create request".into(),
             ));
         }
         return Ok(existing);
@@ -121,11 +121,11 @@ pub fn prepare_config(
     }
     Ok(WindowsGuardianConfig {
         format_version: CONFIG_VERSION,
-        sandbox_id: sandbox_id.clone(),
+        machine_id: machine_id.clone(),
         image_digest: image_digest.clone(),
         resources: resources.clone(),
         image_manifest: image.manifest_path,
-        vm_id: deterministic_vm_id(host_root, sandbox_id),
+        vm_id: deterministic_vm_id(host_root, machine_id),
         hvsock_security_descriptor: sandsurf_native::local::current_user_sddl()?,
     })
 }
@@ -149,10 +149,10 @@ pub fn write_config(path: &Path, config: &WindowsGuardianConfig) -> Result<(), W
 
 pub fn read_config(
     path: &Path,
-    sandbox_id: &SandboxId,
+    machine_id: &MachineId,
 ) -> Result<WindowsGuardianConfig, WindowsError> {
     let value: WindowsGuardianConfig = read_json(path, 1024 * 1024)?;
-    if value.format_version != CONFIG_VERSION || value.sandbox_id != *sandbox_id {
+    if value.format_version != CONFIG_VERSION || value.machine_id != *machine_id {
         return Err(WindowsError::Invalid(
             "guardian configuration identity is invalid".into(),
         ));
@@ -166,10 +166,10 @@ pub fn read_config(
     Ok(value)
 }
 
-pub fn workload_defaults(
+pub fn execution_defaults(
     host_root: &Path,
     image_digest: &Digest,
-) -> Result<crate::api::WorkloadDefaultsView, WindowsError> {
+) -> Result<crate::api::ImageDefaultsView, WindowsError> {
     let image = verify_image(
         &host_root
             .join("images")
@@ -182,21 +182,19 @@ pub fn workload_defaults(
             "installed image identity changed".into(),
         ));
     }
-    let defaults = image.manifest.workload.defaults;
-    Ok(crate::api::WorkloadDefaultsView {
+    let defaults = image.manifest.system.defaults;
+    Ok(crate::api::ImageDefaultsView {
         environment: defaults.environment,
         user: defaults.user,
         working_directory: defaults.working_directory,
-        entrypoint: defaults.entrypoint,
-        command: defaults.command,
     })
 }
 
 pub struct WindowsGuardianEffect {
-    sandbox_root: PathBuf,
+    machine_root: PathBuf,
     config: WindowsGuardianConfig,
     machine: HyperVDriver,
-    workload: WindowsWorkload,
+    guest_binding: Arc<Mutex<Option<ActiveGuest>>>,
     pending: Option<PendingGuest>,
     network: Arc<Mutex<Option<WindowsNetworkBridge>>>,
     network_usage: NetworkUsage,
@@ -204,14 +202,15 @@ pub struct WindowsGuardianEffect {
     installed_runtime: Option<InstalledRuntime>,
     restore_lineage: Option<RestoreLineage>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
-    capture_origin_was_paused: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
+    rebind: Option<ManagementRebind>,
+    bootstrap: Option<Vec<u8>>,
     vm_id: String,
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    machine_id: MachineId,
+    generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
     network_capability: [u8; 32],
@@ -222,19 +221,19 @@ struct PendingGuest {
     authentication: Vec<u8>,
 }
 
-struct WindowsWorkload {
+struct WindowsGuest {
     active: Arc<Mutex<Option<ActiveGuest>>>,
-    remote: Option<(ActiveGuest, RemoteWorkloadDriver<HyperVChannel>)>,
+    remote: Option<(ActiveGuest, ManagedGuestClient<HyperVChannel>)>,
 }
 
 struct InstalledRuntime {
-    epoch: Counter,
+    generation: Counter,
     configuration: RuntimeConfiguration,
     evidence: Digest,
 }
 
 struct RestoreLineage {
-    checkpoint_id: sandsurf_protocol::CheckpointId,
+    snapshot_id: sandsurf_protocol::SnapshotId,
     source: ReconnectState,
     staged_state: PathBuf,
     generation_seed: [u8; 32],
@@ -249,7 +248,7 @@ struct NetworkUsageValue {
 
 type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
 
-fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broker::BrokerReport) {
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::BrokerReport) {
     if let Ok(mut usage) = usage.lock() {
         usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
         usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
@@ -258,28 +257,22 @@ fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broke
 }
 
 impl WindowsGuardianEffect {
-    pub fn open(sandbox_root: &Path, config: WindowsGuardianConfig) -> Result<Self, WindowsError> {
+    fn management_binding(&self) -> Option<ActiveGuest> {
+        self.guest_binding.lock().ok()?.clone()
+    }
+    pub fn open(machine_root: &Path, config: WindowsGuardianConfig) -> Result<Self, WindowsError> {
         let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
         let windows = image
             .windows_x64
             .ok_or_else(|| WindowsError::Invalid("image has no Windows boot artifacts".into()))?;
-        let disks = sandbox_root.join("disks");
+        let disks = machine_root.join("disks");
         fs::create_dir_all(&disks)?;
-        let workload_state = disks.join("workload-state.vhdx");
-        let control_state = disks.join("control-state.vhdx");
+        let system_disk = disks.join("system.vhdx");
         ensure_mutable_vhdx(
-            &windows.state_template_path,
-            &workload_state,
+            &windows.system_path,
+            &system_disk,
             config.resources.disk_bytes.get(),
         )?;
-        let control_bytes = config
-            .resources
-            .output_bytes
-            .get()
-            .checked_add(64 * 1024 * 1024)
-            .ok_or_else(|| WindowsError::Invalid("control disk size overflow".into()))?
-            .max(128 * 1024 * 1024);
-        ensure_mutable_vhdx(&windows.state_template_path, &control_state, control_bytes)?;
         let ports = vec![
             GUEST_BOOTSTRAP_PORT,
             GUEST_CONTROL_PORT,
@@ -290,33 +283,18 @@ impl WindowsGuardianEffect {
             NETWORK_DNS_UDP_PORT,
         ];
         let machine = HyperVDriver::new(HyperVConfig {
-            sandbox_id: config.sandbox_id.clone(),
+            machine_id: config.machine_id.clone(),
             vm_id: config.vm_id.clone(),
             guest_architecture: crate::service::native_guest_architecture(),
             memory_mib: config.resources.memory_mib.get(),
             vcpus: u32::try_from(config.resources.vcpus.get())
                 .map_err(|_| WindowsError::Invalid("vCPU count overflow".into()))?,
             kernel: windows.kernel_path,
-            command_line:
-                "console=ttyS0 reboot=k panic=1 root=/dev/sda ro init=/sbin/sandbox-guest".into(),
-            disks: vec![
-                HyperVDisk {
-                    path: windows.bootstrap_path,
-                    read_only: true,
-                },
-                HyperVDisk {
-                    path: windows.workload_path,
-                    read_only: true,
-                },
-                HyperVDisk {
-                    path: workload_state,
-                    read_only: false,
-                },
-                HyperVDisk {
-                    path: control_state,
-                    read_only: false,
-                },
-            ],
+            command_line: "console=ttyS0 reboot=k panic=1 root=/dev/sda rw init=/sbin/init".into(),
+            disks: vec![HyperVDisk {
+                path: system_disk,
+                read_only: false,
+            }],
             hvsock_security_descriptor: config.hvsock_security_descriptor.clone(),
             hvsock_ports: ports,
             operation_timeout: HyperVDriver::default_timeout(),
@@ -328,13 +306,10 @@ impl WindowsGuardianEffect {
         .map_err(|error| WindowsError::Invalid(format!("invalid Hyper-V VM: {error:?}")))?;
         let active = Arc::new(Mutex::new(None));
         Ok(Self {
-            sandbox_root: sandbox_root.to_path_buf(),
+            machine_root: machine_root.to_path_buf(),
             config,
             machine,
-            workload: WindowsWorkload {
-                active,
-                remote: None,
-            },
+            guest_binding: active,
             pending: None,
             network: Arc::new(Mutex::new(None)),
             network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),
@@ -342,11 +317,14 @@ impl WindowsGuardianEffect {
             installed_runtime: None,
             restore_lineage: None,
             suspend_capture_operation: None,
-            capture_origin_was_paused: false,
         })
     }
 
-    fn prepare_boot(&mut self, command: &LifecycleCommand, epoch: Counter) -> Result<(), Digest> {
+    fn prepare_boot(
+        &mut self,
+        command: &LifecycleCommand,
+        generation: Counter,
+    ) -> Result<(), Digest> {
         let capability = random_bytes().map_err(|_| bytes_digest(b"hyper-v-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"hyper-v-network-entropy"))?;
@@ -354,15 +332,15 @@ impl WindowsGuardianEffect {
             Domain::Image,
             &(
                 "sandsurf-hyper-v-boot-v1",
-                &command.sandbox_id,
-                sandbox_guest::GUEST_PROTOCOL_MAJOR,
-                sandbox_guest::GUEST_PROTOCOL_MINOR,
+                &command.machine_id,
+                sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
+                sandsurf_protocol::GUEST_PROTOCOL_MINOR,
             ),
         )
         .map_err(|_| bytes_digest(b"hyper-v-boot-identity"))?;
         let authentication = authentication_record(
-            &command.sandbox_id,
-            epoch,
+            &command.machine_id,
+            generation,
             &boot_identity,
             &capability,
             &network_capability,
@@ -371,64 +349,30 @@ impl WindowsGuardianEffect {
         self.pending = Some(PendingGuest {
             active: ActiveGuest {
                 vm_id: self.machine.vm_id().to_owned(),
-                sandbox_id: command.sandbox_id.clone(),
-                epoch,
+                machine_id: command.machine_id.clone(),
+                generation,
                 boot_identity,
                 capability,
                 network_capability,
+                rebind: None,
+                bootstrap: None,
             },
             authentication,
         });
         Ok(())
     }
 
-    fn authenticate_pending(&mut self) -> Result<ActiveGuest, Digest> {
+    fn bind_pending(&mut self) -> Result<ActiveGuest, Digest> {
         let pending = self
             .pending
             .take()
-            .ok_or_else(|| bytes_digest(b"hyper-v-pending-guest-missing"))?;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let provisioned = HyperVChannel {
-                vm_id: pending.active.vm_id.clone(),
-                guest_port: GUEST_BOOTSTRAP_PORT,
-                timeout: Duration::from_secs(10),
-            }
-            .connect()
-            .and_then(|mut stream| {
-                stream.write_all(&pending.authentication)?;
-                stream.flush()?;
-                Ok(())
-            });
-            if provisioned.is_ok() {
-                break;
-            }
-            if !self.machine.has_live_owner() || Instant::now() >= deadline {
-                return Err(bytes_digest(b"hyper-v-bootstrap-timeout"));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        loop {
-            match guest_client(&pending.active).call(&GuestServiceRequest::ProbeIdentity) {
-                Ok(GuestServiceResponse::Identity {
-                    sandbox_id,
-                    epoch,
-                    boot_identity,
-                }) if sandbox_id == pending.active.sandbox_id
-                    && epoch == pending.active.epoch
-                    && boot_identity == pending.active.boot_identity =>
-                {
-                    return Ok(pending.active);
-                }
-                _ if !self.machine.has_live_owner() || Instant::now() >= deadline => {
-                    return Err(bytes_digest(b"hyper-v-guest-authentication-timeout"));
-                }
-                _ => std::thread::sleep(Duration::from_millis(25)),
-            }
-        }
+            .ok_or_else(|| bytes_digest(b"hyper-v-pending-binding-missing"))?;
+        let mut active = pending.active;
+        active.bootstrap = Some(pending.authentication);
+        Ok(active)
     }
 
-    fn authenticate_restored(&mut self, epoch: Counter) -> Result<ActiveGuest, Digest> {
+    fn bind_restored(&mut self, generation: Counter) -> Result<ActiveGuest, Digest> {
         let lineage = self
             .restore_lineage
             .as_ref()
@@ -436,153 +380,95 @@ impl WindowsGuardianEffect {
         let pending = self
             .pending
             .take()
-            .ok_or_else(|| bytes_digest(b"hyper-v-restore-target-capability-missing"))?;
-        let active = pending.active;
-        if active.epoch != epoch {
-            return Err(bytes_digest(b"hyper-v-restore-target-epoch-mismatch"));
+            .ok_or_else(|| bytes_digest(b"hyper-v-restore-binding-missing"))?;
+        let mut active = pending.active;
+        if active.generation != generation {
+            return Err(bytes_digest(b"hyper-v-restore-binding-generation-mismatch"));
         }
-        let source = ActiveGuest {
-            vm_id: self.machine.vm_id().to_owned(),
-            sandbox_id: lineage.source.sandbox_id.clone(),
-            epoch: lineage.source.epoch,
+        active.bootstrap = None;
+        active.rebind = Some(ManagementRebind {
+            machine_id: lineage.source.machine_id.clone(),
+            generation: lineage.source.generation,
             boot_identity: lineage.source.boot_identity.clone(),
             capability: lineage.source.capability,
-            network_capability: lineage.source.network_capability,
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let response = guest_client(&source).call(&GuestServiceRequest::RebindEpoch {
-                checkpoint_id: lineage.checkpoint_id.clone(),
+            request: GuestServiceRequest::RebindGeneration {
+                snapshot_id: lineage.snapshot_id.clone(),
                 capture_operation_id: lineage.source.capture_operation_id.clone(),
-                sandbox_id: active.sandbox_id.clone(),
-                previous_epoch: lineage.source.epoch,
-                epoch,
+                machine_id: active.machine_id.clone(),
+                previous_generation: lineage.source.generation,
+                generation,
                 boot_identity: active.boot_identity.clone(),
                 capability: active.capability,
                 network_capability: active.network_capability,
                 generation_seed: lineage.generation_seed,
-            });
-            if matches!(response, Ok(GuestServiceResponse::EpochRebound { .. }))
-                || restored_identity_matches(&active)
-            {
-                break;
-            }
-            if !self.machine.has_live_owner() || Instant::now() >= deadline {
-                return Err(bytes_digest(b"hyper-v-guest-restore-rebind-timeout"));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if restored_identity_matches(&active) {
-                return Ok(active);
-            }
-            if !self.machine.has_live_owner() || Instant::now() >= deadline {
-                return Err(bytes_digest(b"hyper-v-restored-guest-capability-rejected"));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+            },
+        });
+        Ok(active)
     }
 
-    fn finish_filesystem_capture(
+    fn prepare_capture_boundary(
         &mut self,
         operation_id: sandsurf_protocol::OperationId,
-    ) -> ControlResult<GuestServiceResponse> {
-        let request = GuestServiceRequest::FinishFilesystemCapture { operation_id };
-        let mut last = None;
-        for attempt in 0..3 {
-            match self.workload.query(request.clone()) {
-                Ok(response) => return Ok(response),
-                Err(error) => last = Some(error),
-            }
-            if attempt != 2 {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        Err(last.expect("capture finish is attempted at least once"))
+        journal: &RuntimeJournal,
+    ) -> ControlResult<()> {
+        let observation = journal.last_observation()?.ok_or(ControlError::Protocol(
+            "capture has no native machine observation",
+        ))?;
+        let boundary = crate::capture::CaptureBoundary::begin(
+            &self.machine_root,
+            operation_id,
+            observation.value().generation,
+            observation.value().state,
+        )?;
+        let result = if boundary.preserve_pause {
+            self.machine.adopt_pause_for_capture()
+        } else {
+            self.machine.pause_for_capture()
+        };
+        result.map_err(|_| ControlError::Unsupported("native capture pause failed"))
+    }
+
+    fn finish_native_capture(&mut self) -> ControlResult<()> {
+        let Some(boundary) = crate::capture::CaptureBoundary::read(&self.machine_root)? else {
+            return Ok(());
+        };
+        // Re-adopt the held native pause after an interrupted request before
+        // releasing it; a missing management connection is irrelevant.
+        self.machine
+            .adopt_pause_for_capture()
+            .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
+        let result = if boundary.preserve_pause {
+            self.machine.finish_capture_preserving_pause()
+        } else {
+            self.machine.resume_after_capture()
+        };
+        result.map_err(|_| ControlError::Unsupported("native capture completion failed"))?;
+        crate::capture::CaptureBoundary::clear(&self.machine_root)
     }
 
     fn prepare_full_capture(
         &mut self,
-        checkpoint_id: sandsurf_protocol::CheckpointId,
+        snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeCheckpointResponse> {
-        let state = journal
-            .last_observation()
-            .map_err(ControlError::State)?
-            .ok_or(ControlError::Protocol(
-                "full capture has no machine observation",
-            ))?
-            .value()
-            .state;
-        if !matches!(state, MachineState::Running | MachineState::Paused) {
-            return Err(ControlError::Unsupported(
-                "full capture requires a running or paused machine",
-            ));
-        }
-        let public_paused = state == MachineState::Paused;
-        let directory = hyperv_full_capture_directory(&self.sandbox_root, &operation_id);
+    ) -> ControlResult<NativeSnapshotResponse> {
+        self.prepare_capture_boundary(operation_id.clone(), journal)?;
+        let directory = hyperv_full_capture_directory(&self.machine_root, &operation_id);
         if directory.join("capture.json").exists() {
-            self.capture_origin_was_paused = public_paused;
             let capture = read_json(&directory.join("capture.json"), 1024 * 1024)
                 .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeCheckpointResponse::Prepared {
+            return Ok(NativeSnapshotResponse::Prepared {
                 capture,
                 processes: process_watermarks(journal)?,
             });
         }
-        if public_paused {
-            self.machine
-                .resume_public_pause_for_capture()
-                .map_err(|_| {
-                    ControlError::Unsupported(
-                        "Hyper-V VM could not coordinate capture from a published pause",
-                    )
-                })?;
-            self.capture_origin_was_paused = true;
-        }
-        let response = match self
-            .workload
-            .query(GuestServiceRequest::PrepareFilesystemCapture {
-                operation_id: operation_id.clone(),
-            }) {
-            Ok(value) => value,
-            Err(error) => {
-                if public_paused {
-                    let _ = self.machine.restore_public_pause_after_capture();
-                    self.capture_origin_was_paused = false;
-                }
-                return Err(error);
-            }
-        };
-        if !matches!(
-            response,
-            GuestServiceResponse::FilesystemCapturePrepared { .. }
-        ) {
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
-            return Err(ControlError::Protocol(
-                "guest did not establish a full capture barrier",
-            ));
-        }
-        if let Err(error) = self.workload.reconcile(journal) {
-            let _ = self.finish_filesystem_capture(operation_id.clone());
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
-            return Err(ControlError::State(error));
-        }
-        crate::checkpoints::private_directory(
+        crate::snapshots::private_directory(
             directory
                 .parent()
                 .ok_or(ControlError::Protocol("capture root has no parent"))?,
         )
         .map_err(|_| ControlError::Protocol("full capture root is not private"))?;
-        crate::checkpoints::private_directory(&directory)
+        crate::snapshots::private_directory(&directory)
             .map_err(|_| ControlError::Protocol("full capture directory is not private"))?;
         let saved_state = directory.join("snapshot.vmstate");
         for path in [&saved_state, &directory.join("reconnect.json")] {
@@ -597,26 +483,21 @@ impl WindowsGuardianEffect {
             .save_full_state(&operation_id, &saved_state)
             .is_err()
         {
-            let _ = self.machine.resume_after_capture();
-            let _ = self.finish_filesystem_capture(operation_id);
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
+            let _ = self.finish_native_capture();
             return Err(ControlError::Unsupported(
                 "HCS could not save full machine state",
             ));
         }
         let result = (|| -> Result<sandsurf_protocol::NativeFullCapture, WindowsError> {
-            let active = self.workload.endpoint().ok_or_else(|| {
+            let active = self.management_binding().ok_or_else(|| {
                 WindowsError::Invalid("guest reconnect state is unavailable".into())
             })?;
             let reconnect = ReconnectState {
                 format_version: 1,
-                checkpoint_id: checkpoint_id.clone(),
+                snapshot_id: snapshot_id.clone(),
                 capture_operation_id: operation_id.clone(),
-                sandbox_id: active.sandbox_id,
-                epoch: active.epoch,
+                machine_id: active.machine_id,
+                generation: active.generation,
                 boot_identity: active.boot_identity,
                 capability: active.capability,
                 network_capability: active.network_capability,
@@ -637,19 +518,18 @@ impl WindowsGuardianEffect {
                     "saved-state artifact exceeds its bound".into(),
                 ));
             }
-            let state_digest = crate::checkpoints::file_digest(&saved_state, state_bytes)
+            let state_digest = crate::snapshots::file_digest(&saved_state, state_bytes)
                 .map_err(|error| WindowsError::Invalid(error.to_string()))?;
             let reconnect_bytes = fs::metadata(&reconnect_path)?.len();
-            let reconnect_digest =
-                crate::checkpoints::file_digest(&reconnect_path, reconnect_bytes)
-                    .map_err(|error| WindowsError::Invalid(error.to_string()))?;
+            let reconnect_digest = crate::snapshots::file_digest(&reconnect_path, reconnect_bytes)
+                .map_err(|error| WindowsError::Invalid(error.to_string()))?;
             let configuration_digest = hyperv_configuration_digest(&self.config)
                 .map_err(|error| WindowsError::Invalid(error.to_string()))?;
             let generation = digest(
-                Domain::Checkpoint,
+                Domain::Snapshot,
                 &(
                     "sandsurf-hyper-v-full-capture-generation-v1",
-                    &checkpoint_id,
+                    &snapshot_id,
                     &operation_id,
                     &state_digest,
                     &reconnect_digest,
@@ -661,13 +541,13 @@ impl WindowsGuardianEffect {
                 engine_version: "hcs-schema-2.2-save-v1".into(),
                 architecture: "amd64".into(),
                 configuration_digest,
-                snapshot_state: CheckpointArtifact {
+                snapshot_state: SnapshotArtifact {
                     digest: state_digest,
                     bytes: Counter::try_from(state_bytes)
                         .map_err(|error| WindowsError::Invalid(error.to_string()))?,
                 },
                 memory: None,
-                reconnect_state: CheckpointArtifact {
+                reconnect_state: SnapshotArtifact {
                     digest: reconnect_digest,
                     bytes: Counter::try_from(reconnect_bytes)
                         .map_err(|error| WindowsError::Invalid(error.to_string()))?,
@@ -678,19 +558,14 @@ impl WindowsGuardianEffect {
             Ok(capture)
         })();
         match result {
-            Ok(capture) => Ok(NativeCheckpointResponse::Prepared {
+            Ok(capture) => Ok(NativeSnapshotResponse::Prepared {
                 capture,
                 processes: process_watermarks(journal)?,
             }),
             Err(error) => {
-                let _ = self.machine.resume_after_capture();
-                let _ = self.finish_filesystem_capture(operation_id);
-                if public_paused {
-                    let _ = self.machine.restore_public_pause_after_capture();
-                    self.capture_origin_was_paused = false;
-                }
+                let _ = self.finish_native_capture();
                 Err(ControlError::Rejected {
-                    category: "checkpoint".into(),
+                    category: "snapshot".into(),
                     message: error.to_string(),
                 })
             }
@@ -699,11 +574,11 @@ impl WindowsGuardianEffect {
 
     fn stage_full_restore(
         &mut self,
-        checkpoint_id: sandsurf_protocol::CheckpointId,
+        snapshot_id: sandsurf_protocol::SnapshotId,
         manifest_digest: Digest,
-        workload_disk: CheckpointArtifact,
-        expected: sandsurf_protocol::FullCheckpointMetadata,
-    ) -> ControlResult<NativeCheckpointResponse> {
+        system_disk: SnapshotArtifact,
+        expected: sandsurf_protocol::FullSnapshotMetadata,
+    ) -> ControlResult<NativeSnapshotResponse> {
         let configuration_digest = hyperv_configuration_digest(&self.config)
             .map_err(|_| ControlError::Protocol("restore configuration digest failed"))?;
         if expected.engine != VmEngine::HyperV
@@ -713,62 +588,51 @@ impl WindowsGuardianEffect {
             || expected.memory.is_some()
         {
             return Err(ControlError::Unsupported(
-                "full checkpoint is incompatible with this Hyper-V configuration",
+                "full snapshot is incompatible with this Hyper-V configuration",
             ));
         }
         let host_root = self
-            .sandbox_root
+            .machine_root
             .parent()
             .and_then(Path::parent)
-            .ok_or(ControlError::Protocol("sandbox root has no host root"))?;
-        let directory = host_root.join("checkpoints").join(checkpoint_id.as_str());
+            .ok_or(ControlError::Protocol("machine root has no host root"))?;
+        let directory = host_root.join("snapshots").join(snapshot_id.as_str());
         for (name, artifact) in [
-            ("workload-state.ext4", &workload_disk),
-            ("control-state.ext4", &expected.control_disk),
+            ("system.ext4", &system_disk),
             ("snapshot.vmstate", &expected.snapshot_state),
             ("reconnect.json", &expected.reconnect_state),
         ] {
-            let actual =
-                crate::checkpoints::file_digest(&directory.join(name), artifact.bytes.get())
-                    .map_err(|_| ControlError::Protocol("full checkpoint artifact is corrupt"))?;
+            let actual = crate::snapshots::file_digest(&directory.join(name), artifact.bytes.get())
+                .map_err(|_| ControlError::Protocol("full snapshot artifact is corrupt"))?;
             if actual != artifact.digest {
                 return Err(ControlError::Protocol(
-                    "full checkpoint artifact digest mismatch",
+                    "full snapshot artifact digest mismatch",
                 ));
             }
         }
-        for (path, artifact) in [
-            (
-                self.sandbox_root.join("disks/workload-state.vhdx"),
-                &workload_disk,
-            ),
-            (
-                self.sandbox_root.join("disks/control-state.vhdx"),
-                &expected.control_disk,
-            ),
-        ] {
-            if crate::checkpoints::current_disk_digest(&path, artifact.bytes.get())
+        for (path, artifact) in [(self.machine_root.join("disks/system.vhdx"), &system_disk)] {
+            if crate::snapshots::current_disk_digest(&path, artifact.bytes.get())
                 .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
                 != artifact.digest
             {
                 return Err(ControlError::Unsupported(
-                    "mutable disks no longer match the suspended full checkpoint",
+                    "mutable disks no longer match the suspended full snapshot",
                 ));
             }
         }
         let reconnect: ReconnectState =
             read_json(&directory.join("reconnect.json"), 1024 * 1024)
                 .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
-        if reconnect.format_version != 1 || reconnect.checkpoint_id != checkpoint_id {
+        if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
-                "restore reconnect identity does not match checkpoint",
+                "restore reconnect identity does not match snapshot",
             ));
         }
-        let restore_root = self.sandbox_root.join("guardian/restores");
-        crate::checkpoints::private_directory(&restore_root)
+        let restore_root = self.machine_root.join("guardian/restores");
+        crate::snapshots::private_directory(&restore_root)
             .map_err(|_| ControlError::Protocol("restore staging root is not private"))?;
         let staged_state = restore_root.join(format!("{}.vmrs", manifest_digest.as_str()));
-        crate::checkpoints::copy_and_verify(
+        crate::snapshots::copy_and_verify(
             &directory.join("snapshot.vmstate"),
             &staged_state,
             expected.snapshot_state.bytes.get(),
@@ -782,18 +646,18 @@ impl WindowsGuardianEffect {
             })
             .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
         self.restore_lineage = Some(RestoreLineage {
-            checkpoint_id: checkpoint_id.clone(),
+            snapshot_id: snapshot_id.clone(),
             source: reconnect,
             staged_state,
             generation_seed: random_bytes()
                 .map_err(|_| ControlError::Protocol("restore entropy unavailable"))?,
         });
-        Ok(NativeCheckpointResponse::Complete {
+        Ok(NativeSnapshotResponse::Complete {
             evidence: digest(
-                Domain::Checkpoint,
+                Domain::Snapshot,
                 &(
                     "sandsurf-hyper-v-restore-staged-v1",
-                    checkpoint_id,
+                    snapshot_id,
                     manifest_digest,
                     expected.generation,
                 ),
@@ -803,11 +667,11 @@ impl WindowsGuardianEffect {
     }
 
     fn install_runtime(&mut self, configuration: &RuntimeConfiguration) -> RuntimeInstallation {
-        let Some(active) = self.workload.endpoint() else {
+        let Some(active) = self.management_binding() else {
             return RuntimeInstallation::Unknown;
         };
         if let Some(installed) = self.installed_runtime.as_ref()
-            && installed.epoch == active.epoch
+            && installed.generation == active.generation
             && installed.configuration == *configuration
         {
             return RuntimeInstallation::Applied(installed.evidence.clone());
@@ -861,18 +725,11 @@ impl WindowsGuardianEffect {
         };
         *exposures = Some(gateway);
         drop(exposures);
-        let resource_evidence =
-            match guest_client(&active).call(&GuestServiceRequest::ApplyResources {
-                resources: configuration.resources.clone(),
-            }) {
-                Ok(GuestServiceResponse::ResourcesApplied { evidence }) => evidence,
-                _ => {
-                    self.stop_data_planes();
-                    return RuntimeInstallation::Unknown;
-                }
-            };
+        let resource_evidence = digest(Domain::Resource, &configuration.resources)
+            .map_err(|_| ())
+            .ok();
         match digest(
-            Domain::Grant,
+            Domain::Authority,
             &(
                 "sandsurf-hyper-v-runtime-configuration-v1",
                 resource_evidence,
@@ -881,7 +738,7 @@ impl WindowsGuardianEffect {
         ) {
             Ok(evidence) => {
                 self.installed_runtime = Some(InstalledRuntime {
-                    epoch: active.epoch,
+                    generation: active.generation,
                     configuration: configuration.clone(),
                     evidence: evidence.clone(),
                 });
@@ -909,7 +766,7 @@ impl WindowsGuardianEffect {
     fn contain_unpublished(&mut self) {
         self.machine.contain_unobserved();
         self.pending = None;
-        if let Ok(mut active) = self.workload.active.lock() {
+        if let Ok(mut active) = self.guest_binding.lock() {
             *active = None;
         }
         self.stop_data_planes();
@@ -922,12 +779,12 @@ enum RuntimeInstallation {
     Unknown,
 }
 
-impl WindowsWorkload {
+impl WindowsGuest {
     fn endpoint(&self) -> Option<ActiveGuest> {
         self.active.lock().ok()?.clone()
     }
 
-    fn driver(&mut self) -> Option<&mut RemoteWorkloadDriver<HyperVChannel>> {
+    fn driver(&mut self) -> Option<&mut ManagedGuestClient<HyperVChannel>> {
         let active = self.endpoint();
         let Some(active) = active else {
             self.remote = None;
@@ -938,28 +795,45 @@ impl WindowsWorkload {
             .as_ref()
             .is_none_or(|(cached, _)| cached != &active)
         {
-            self.remote = Some((
-                active.clone(),
-                RemoteWorkloadDriver::new(guest_client(&active)),
-            ));
+            if let Some(authentication) = &active.bootstrap {
+                let ready = guest_client(&active)
+                    .call(&GuestServiceRequest::ProbeIdentity)
+                    .is_ok();
+                if !ready
+                    && crate::guest::deliver_bootstrap(
+                        HyperVChannel {
+                            vm_id: active.vm_id.clone(),
+                            guest_port: GUEST_BOOTSTRAP_PORT,
+                            timeout: Duration::from_secs(10),
+                        },
+                        authentication,
+                    )
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+            self.remote = Some((active.clone(), managed_guest(&active)));
         }
         self.remote.as_mut().map(|(_, driver)| driver)
     }
 }
 
-impl WorkloadDriver for WindowsWorkload {
-    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
+impl GuestDriver for WindowsGuest {
+    fn dispatch(&mut self, command: &GuestCommand) -> EffectOutcome {
         let Some(driver) = self.driver() else {
             return EffectOutcome::NotApplied(bytes_digest(b"hyper-v-guest-not-running"));
         };
-        driver.dispatch(mutation, capability)
+        driver.dispatch(command)
     }
 
-    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if let Some(driver) = self.driver() {
-            driver.reconcile(journal)?;
-        }
-        Ok(())
+    fn poll(
+        &mut self,
+        hints: &crate::guest_worker::ExecutionHints,
+    ) -> ControlResult<crate::guest_worker::GuestPoll> {
+        self.driver()
+            .ok_or(ControlError::Unsupported("guest management unavailable"))?
+            .poll(hints)
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
@@ -971,8 +845,14 @@ impl WorkloadDriver for WindowsWorkload {
 }
 
 impl GuardianEffect for WindowsGuardianEffect {
-    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
-        self.workload.dispatch(mutation, capability)
+    fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
+        Box::new(WindowsGuest {
+            active: Arc::clone(&self.guest_binding),
+            remote: None,
+        })
+    }
+    fn guest_poll_allowed(&self) -> bool {
+        !self.machine.capture_is_paused()
     }
 
     fn transition(
@@ -986,15 +866,18 @@ impl GuardianEffect for WindowsGuardianEffect {
             });
         let restoring = command.desired == sandsurf_protocol::DesiredState::Running
             && current.is_some_and(|value| value.state == MachineState::Suspended);
+        if cold_boot {
+            self.config.resources = command.configuration.resources.clone();
+        }
         if cold_boot || restoring {
-            let epoch = match current {
-                Some(value) => match value.epoch.next() {
+            let generation = match current {
+                Some(value) => match value.generation.next() {
                     Ok(value) => value,
                     Err(_) => return MachineOutcome::Unknown,
                 },
                 None => Counter::ONE,
             };
-            if let Err(evidence) = self.prepare_boot(command, epoch) {
+            if let Err(evidence) = self.prepare_boot(command, generation) {
                 return MachineOutcome::NotApplied(evidence);
             }
         }
@@ -1006,21 +889,21 @@ impl GuardianEffect for WindowsGuardianEffect {
         );
         if running {
             if cold_boot || restoring {
-                let epoch = match &outcome {
+                let generation = match &outcome {
                     MachineOutcome::Observed(values) => values
                         .last()
-                        .map(|value| value.epoch)
+                        .map(|value| value.generation)
                         .unwrap_or(Counter::ONE),
                     _ => Counter::ONE,
                 };
                 let authenticated = if restoring {
-                    self.authenticate_restored(epoch)
+                    self.bind_restored(generation)
                 } else {
-                    self.authenticate_pending()
+                    self.bind_pending()
                 };
                 match authenticated {
                     Ok(active) => {
-                        if let Ok(mut endpoint) = self.workload.active.lock() {
+                        if let Ok(mut endpoint) = self.guest_binding.lock() {
                             *endpoint = Some(active);
                         } else {
                             self.contain_unpublished();
@@ -1048,7 +931,7 @@ impl GuardianEffect for WindowsGuardianEffect {
                 && let Some(last) = values.last_mut()
             {
                 match digest(
-                    Domain::Grant,
+                    Domain::Authority,
                     &(
                         "sandsurf-hyper-v-running-with-configuration-v1",
                         &last.evidence_digest,
@@ -1063,30 +946,13 @@ impl GuardianEffect for WindowsGuardianEffect {
                     }
                 }
             }
-            if restoring {
-                let Some(operation_id) = self
-                    .restore_lineage
-                    .as_ref()
-                    .map(|lineage| lineage.source.capture_operation_id.clone())
-                else {
-                    self.contain_unpublished();
-                    return MachineOutcome::Unknown;
-                };
-                match self.finish_filesystem_capture(operation_id) {
-                    Ok(GuestServiceResponse::FilesystemCaptureFinished { .. }) => {}
-                    Ok(_) | Err(_) => {
-                        self.contain_unpublished();
-                        return MachineOutcome::Unknown;
-                    }
-                }
-            }
         }
         if matches!(
             &outcome,
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| matches!(value.state, MachineState::Stopped | MachineState::Suspended | MachineState::Destroyed))
         ) {
-            if let Ok(mut active) = self.workload.active.lock() {
+            if let Ok(mut active) = self.guest_binding.lock() {
                 *active = None;
             }
             self.stop_data_planes();
@@ -1096,7 +962,7 @@ impl GuardianEffect for WindowsGuardianEffect {
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| value.state == MachineState::Suspended)
         ) && let Some(operation_id) = self.suspend_capture_operation.take()
-            && let Err(error) = remove_hyperv_full_capture(&self.sandbox_root, &operation_id)
+            && let Err(error) = remove_hyperv_full_capture(&self.machine_root, &operation_id)
         {
             eprintln!("sandsurf retained Hyper-V suspend staging after cleanup failure: {error}");
         }
@@ -1104,10 +970,35 @@ impl GuardianEffect for WindowsGuardianEffect {
             &outcome,
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| matches!(value.state, MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed))
-        ) {
-            self.capture_origin_was_paused = false;
+        ) && let Err(error) = crate::capture::CaptureBoundary::clear(&self.machine_root)
+        {
+            eprintln!("sandsurf capture cleanup deferred: {error}");
         }
         outcome
+    }
+
+    fn validate_resources(
+        &self,
+        resources: &Resources,
+        current: &MachineObservation,
+    ) -> ControlResult<()> {
+        resources
+            .validate()
+            .map_err(|_| ControlError::Protocol("invalid native resource envelope"))?;
+        if resources.disk_bytes != self.config.resources.disk_bytes {
+            return Err(ControlError::Unsupported(
+                "disk capacity changes require the storage replacement capability",
+            ));
+        }
+        if (resources.vcpus != self.config.resources.vcpus
+            || resources.memory_mib != self.config.resources.memory_mib)
+            && current.state != MachineState::Stopped
+        {
+            return Err(ControlError::Unsupported(
+                "RAM and vCPU changes require a powered-off computer",
+            ));
+        }
+        Ok(())
     }
 
     fn configure(
@@ -1115,11 +1006,28 @@ impl GuardianEffect for WindowsGuardianEffect {
         command: &sandsurf_protocol::ConfigurationCommand,
         current: &MachineObservation,
     ) -> EffectOutcome {
+        if self
+            .validate_resources(&command.configuration.resources, current)
+            .is_err()
+        {
+            return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
+        }
+        if current.state == MachineState::Stopped {
+            return match self.machine.configure(command, current) {
+                sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
+                    EffectOutcome::Applied(evidence)
+                }
+                sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
+                    EffectOutcome::NotApplied(evidence)
+                }
+                sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
+            };
+        }
         match self.machine.configure(command, current) {
             sandsurf_machine::ConfigurationOutcome::Applied(machine) => {
                 match self.install_runtime(&command.configuration) {
                     RuntimeInstallation::Applied(runtime) => digest(
-                        Domain::Grant,
+                        Domain::Authority,
                         &(
                             "sandsurf-hyper-v-configuration-applied-v1",
                             machine,
@@ -1139,110 +1047,73 @@ impl GuardianEffect for WindowsGuardianEffect {
         }
     }
 
-    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if journal
-            .last_observation()?
-            .is_some_and(|value| value.value().state == MachineState::Running)
-            && !self.machine.capture_is_paused()
-        {
-            self.workload.reconcile(journal)?;
-        }
-        Ok(())
+    fn resource_usage(&mut self) -> ControlResult<sandsurf_protocol::ResourceUsage> {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ControlError::Protocol("host clock unavailable"))?
+            .as_millis();
+        let observed = Counter::try_from(
+            u64::try_from(millis).map_err(|_| ControlError::Protocol("host time overflow"))?,
+        )
+        .map_err(|_| ControlError::Protocol("host time overflow"))?;
+        let mut usage =
+            sandsurf_protocol::ResourceUsage::host_observation("host-native-windows", observed);
+        let accumulated = self
+            .network_usage
+            .lock()
+            .map_err(|_| ControlError::Protocol("network usage lock poisoned"))?;
+        let current = self
+            .network
+            .lock()
+            .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
+            .as_ref()
+            .map_or_else(Default::default, WindowsNetworkBridge::snapshot);
+        usage.network_rx_bytes =
+            Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
+                .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
+        usage.network_tx_bytes =
+            Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes))
+                .map_err(|_| ControlError::Protocol("network transmit accounting overflow"))?;
+        usage.network_connections =
+            Counter::try_from(accumulated.connections.saturating_add(current.connections))
+                .map_err(|_| ControlError::Protocol("network connection accounting overflow"))?;
+        Ok(usage)
     }
 
-    fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        if let GuestServiceRequest::PrepareFilesystemCapture { operation_id } = &request {
-            let operation_id = operation_id.clone();
-            let response = self.workload.query(request)?;
-            if !matches!(
-                response,
-                GuestServiceResponse::FilesystemCapturePrepared { .. }
-            ) {
-                return Ok(response);
-            }
-            if self.machine.pause_for_capture().is_err() {
-                let _ = self
-                    .workload
-                    .query(GuestServiceRequest::FinishFilesystemCapture { operation_id });
-                return Err(ControlError::Unsupported(
-                    "Hyper-V VM could not establish the filesystem capture pause",
-                ));
-            }
-            return Ok(response);
-        }
-        if let GuestServiceRequest::FinishFilesystemCapture { operation_id } = request {
-            self.machine.resume_after_capture().map_err(|_| {
-                ControlError::Unsupported("Hyper-V VM could not leave the filesystem capture pause")
-            })?;
-            return self.finish_filesystem_capture(operation_id);
-        }
-        let usage_requested = matches!(request, GuestServiceRequest::ResourceUsage);
-        let mut response = self.workload.query(request)?;
-        if usage_requested && let GuestServiceResponse::ResourceUsage { usage } = &mut response {
-            let accumulated = self
-                .network_usage
-                .lock()
-                .map_err(|_| ControlError::Protocol("network usage lock poisoned"))?;
-            let current = self
-                .network
-                .lock()
-                .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
-                .as_ref()
-                .map_or_else(Default::default, WindowsNetworkBridge::snapshot);
-            usage.network_rx_bytes =
-                Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
-                    .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
-            usage.network_tx_bytes =
-                Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes))
-                    .map_err(|_| ControlError::Protocol("network transmit accounting overflow"))?;
-            usage.network_connections =
-                Counter::try_from(accumulated.connections.saturating_add(current.connections))
-                    .map_err(|_| {
-                        ControlError::Protocol("network connection accounting overflow")
-                    })?;
-        }
-        Ok(response)
-    }
-
-    fn native_checkpoint(
+    fn native_snapshot(
         &mut self,
-        request: NativeCheckpointRequest,
+        request: NativeSnapshotRequest,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeCheckpointResponse> {
+    ) -> ControlResult<NativeSnapshotResponse> {
         match request {
-            NativeCheckpointRequest::PrepareFull {
-                checkpoint_id,
+            NativeSnapshotRequest::PrepareDisk { operation_id } => {
+                self.prepare_capture_boundary(operation_id, journal)?;
+                Ok(NativeSnapshotResponse::Complete {
+                    evidence: bytes_digest(b"native-computer-paused-for-disk-capture-v1"),
+                })
+            }
+            NativeSnapshotRequest::FinishDisk { operation_id } => {
+                crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
+                self.finish_native_capture()?;
+                Ok(NativeSnapshotResponse::Complete {
+                    evidence: bytes_digest(b"native-disk-capture-released-v1"),
+                })
+            }
+            NativeSnapshotRequest::PrepareFull {
+                snapshot_id,
                 operation_id,
-            } => self.prepare_full_capture(checkpoint_id, operation_id, journal),
-            NativeCheckpointRequest::FinishFull { operation_id } => {
-                self.machine.resume_after_capture().map_err(|_| {
+            } => self.prepare_full_capture(snapshot_id, operation_id, journal),
+            NativeSnapshotRequest::FinishFull { operation_id } => {
+                crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
+                self.finish_native_capture().map_err(|_| {
                     ControlError::Unsupported("Hyper-V VM could not resume after full capture")
                 })?;
-                let response = self.finish_filesystem_capture(operation_id.clone())?;
-                if !matches!(
-                    response,
-                    GuestServiceResponse::FilesystemCaptureFinished { .. }
-                ) {
-                    return Err(ControlError::Protocol(
-                        "guest did not release the full capture barrier",
-                    ));
-                }
-                if self.capture_origin_was_paused {
-                    self.machine
-                        .restore_public_pause_after_capture()
-                        .map_err(|_| {
-                            ControlError::Unsupported(
-                                "Hyper-V VM could not restore the published pause",
-                            )
-                        })?;
-                    self.capture_origin_was_paused = false;
-                }
-                remove_hyperv_full_capture(&self.sandbox_root, &operation_id)?;
-                Ok(NativeCheckpointResponse::Complete {
+                remove_hyperv_full_capture(&self.machine_root, &operation_id)?;
+                Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"hyper-v-full-capture-finished-v1"),
                 })
             }
-            NativeCheckpointRequest::CommitSuspend {
+            NativeSnapshotRequest::CommitSuspend {
                 operation_id,
                 manifest_digest,
             } => {
@@ -1254,9 +1125,9 @@ impl GuardianEffect for WindowsGuardianEffect {
                         )
                     })?;
                 self.suspend_capture_operation = Some(operation_id.clone());
-                Ok(NativeCheckpointResponse::Complete {
+                Ok(NativeSnapshotResponse::Complete {
                     evidence: digest(
-                        Domain::Checkpoint,
+                        Domain::Snapshot,
                         &(
                             "sandsurf-hyper-v-suspend-commit-v1",
                             operation_id,
@@ -1266,19 +1137,19 @@ impl GuardianEffect for WindowsGuardianEffect {
                     .map_err(|_| ControlError::Protocol("suspend evidence digest failed"))?,
                 })
             }
-            NativeCheckpointRequest::StageRestore {
-                checkpoint_id,
+            NativeSnapshotRequest::StageRestore {
+                snapshot_id,
                 manifest_digest,
-                workload_disk,
+                system_disk,
                 expected,
-            } => self.stage_full_restore(checkpoint_id, manifest_digest, workload_disk, *expected),
+            } => self.stage_full_restore(snapshot_id, manifest_digest, system_disk, *expected),
         }
     }
 
     fn rebind_restored_runtime(
         &mut self,
         journal: &mut RuntimeJournal,
-        epoch: Counter,
+        generation: Counter,
     ) -> sandsurf_state::Result<()> {
         let lineage = self
             .restore_lineage
@@ -1287,10 +1158,10 @@ impl GuardianEffect for WindowsGuardianEffect {
                 "restored Hyper-V VM has no staged process lineage",
             ))?;
         journal.rebind_processes(
-            &lineage.checkpoint_id,
-            &lineage.source.sandbox_id,
-            lineage.source.epoch,
-            epoch,
+            &lineage.snapshot_id,
+            &lineage.source.machine_id,
+            lineage.source.generation,
+            generation,
         )?;
         match fs::remove_file(&lineage.staged_state) {
             Ok(()) => {}
@@ -1311,38 +1182,25 @@ impl GuardianEffect for WindowsGuardianEffect {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReconnectState {
     format_version: u16,
-    checkpoint_id: sandsurf_protocol::CheckpointId,
+    snapshot_id: sandsurf_protocol::SnapshotId,
     capture_operation_id: sandsurf_protocol::OperationId,
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    machine_id: MachineId,
+    generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
     network_capability: [u8; 32],
 }
 
-fn restored_identity_matches(active: &ActiveGuest) -> bool {
-    matches!(
-        guest_client(active).call(&GuestServiceRequest::ProbeIdentity),
-        Ok(GuestServiceResponse::Identity {
-            sandbox_id,
-            epoch,
-            boot_identity,
-        }) if sandbox_id == active.sandbox_id
-            && epoch == active.epoch
-            && boot_identity == active.boot_identity
-    )
-}
-
-fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<CheckpointProcessWatermark>> {
+fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<SnapshotProcessWatermark>> {
     journal
         .process_snapshots()
         .map_err(ControlError::State)?
         .into_iter()
         .map(|snapshot| {
             let output = journal
-                .process_boundary(&snapshot.request.process_id)
+                .process_boundary(&snapshot.request.execution_id)
                 .map_err(ControlError::State)?;
-            Ok(CheckpointProcessWatermark { snapshot, output })
+            Ok(SnapshotProcessWatermark { snapshot, output })
         })
         .collect()
 }
@@ -1351,32 +1209,32 @@ fn hyperv_configuration_digest(
     config: &WindowsGuardianConfig,
 ) -> Result<Digest, sandsurf_protocol::Invalid> {
     digest(
-        Domain::Checkpoint,
+        Domain::Snapshot,
         &(
             "sandsurf-hyper-v-configuration-v1",
             &config.image_digest,
             &config.resources,
             &config.vm_id,
-            sandbox_guest::GUEST_PROTOCOL_MAJOR,
-            sandbox_guest::GUEST_PROTOCOL_MINOR,
+            sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
+            sandsurf_protocol::GUEST_PROTOCOL_MINOR,
         ),
     )
 }
 
 fn hyperv_full_capture_directory(
-    sandbox_root: &Path,
+    machine_root: &Path,
     operation_id: &sandsurf_protocol::OperationId,
 ) -> PathBuf {
-    sandbox_root
+    machine_root
         .join("guardian/full-captures")
         .join(operation_id.as_str())
 }
 
 fn remove_hyperv_full_capture(
-    sandbox_root: &Path,
+    machine_root: &Path,
     operation_id: &sandsurf_protocol::OperationId,
 ) -> ControlResult<()> {
-    let directory = hyperv_full_capture_directory(sandbox_root, operation_id);
+    let directory = hyperv_full_capture_directory(machine_root, operation_id);
     for name in ["capture.json", "reconnect.json", "snapshot.vmstate"] {
         match fs::remove_file(directory.join(name)) {
             Ok(()) => {}
@@ -1399,6 +1257,22 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), Windows
     Ok(())
 }
 
+fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<HyperVChannel> {
+    let pending = active.rebind.as_ref().map(|binding| {
+        let source = ActiveGuest {
+            machine_id: binding.machine_id.clone(),
+            generation: binding.generation,
+            boot_identity: binding.boot_identity.clone(),
+            capability: binding.capability,
+            rebind: None,
+            bootstrap: None,
+            ..active.clone()
+        };
+        PendingRebind::new(guest_client(&source), binding.request.clone())
+    });
+    ManagedGuestClient::new(guest_client(active), pending)
+}
+
 fn guest_client(active: &ActiveGuest) -> GuestClient<HyperVChannel> {
     GuestClient::new(
         HyperVChannel {
@@ -1406,28 +1280,28 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<HyperVChannel> {
             guest_port: GUEST_CONTROL_PORT,
             timeout: Duration::from_secs(10),
         },
-        active.sandbox_id.clone(),
-        active.epoch,
+        active.machine_id.clone(),
+        active.generation,
         active.boot_identity.clone(),
         active.capability,
     )
 }
 
 fn authentication_record(
-    sandbox_id: &SandboxId,
-    epoch: Counter,
+    machine_id: &MachineId,
+    generation: Counter,
     boot_identity: &Digest,
     capability: &[u8; 32],
     network_capability: &[u8; 32],
 ) -> Result<Vec<u8>, WindowsError> {
-    let identity = sandbox_id.as_str().as_bytes();
+    let identity = machine_id.as_str().as_bytes();
     let size = u16::try_from(identity.len())
-        .map_err(|_| WindowsError::Invalid("sandbox identity is too long".into()))?;
+        .map_err(|_| WindowsError::Invalid("machine identity is too long".into()))?;
     let mut bytes = Vec::with_capacity(512);
     bytes.extend_from_slice(AUTHENTICATION_MAGIC);
     bytes.extend_from_slice(&size.to_be_bytes());
     bytes.extend_from_slice(identity);
-    bytes.extend_from_slice(&epoch.get().to_be_bytes());
+    bytes.extend_from_slice(&generation.get().to_be_bytes());
     bytes.extend_from_slice(&decode_hex(boot_identity.as_str())?);
     bytes.extend_from_slice(capability);
     bytes.extend_from_slice(network_capability);
@@ -1435,27 +1309,25 @@ fn authentication_record(
     Ok(bytes)
 }
 
-fn network_rules(
-    policy: &NetworkPolicy,
-) -> Result<sandbox_network_broker::BrokerPolicy, WindowsError> {
+fn network_rules(policy: &NetworkPolicy) -> Result<sandsurf_network::BrokerPolicy, WindowsError> {
     policy
         .validate()
         .map_err(|error| WindowsError::Invalid(error.to_string()))?;
-    let mut rules = sandbox_network_broker::BrokerPolicy::default();
+    let mut rules = sandsurf_network::BrokerPolicy::default();
     for rule in &policy.rules {
         let destination = match &rule.destination {
             NetworkDestination::Dns {
                 name,
                 include_subdomains,
                 allow_private_addresses,
-            } => sandbox_policy::ManagedNetworkDestination::Dns {
-                name: sandbox_policy::normalize_dns_name(name)
+            } => sandsurf_network::policy::ManagedNetworkDestination::Dns {
+                name: sandsurf_network::policy::normalize_dns_name(name)
                     .map_err(|error| WindowsError::Invalid(error.to_string()))?,
                 include_subdomains: *include_subdomains,
                 allow_private_addresses: *allow_private_addresses,
             },
             NetworkDestination::Ip { cidr } => {
-                sandbox_policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
+                sandsurf_network::policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
             }
         };
         let ports = rule
@@ -1463,16 +1335,16 @@ fn network_rules(
             .iter()
             .map(|range| {
                 if range.from == range.to {
-                    sandbox_policy::ManagedNetworkPort::Single(range.from)
+                    sandsurf_network::policy::ManagedNetworkPort::Single(range.from)
                 } else {
-                    sandbox_policy::ManagedNetworkPort::Range {
+                    sandsurf_network::policy::ManagedNetworkPort::Range {
                         from: range.from,
                         to: range.to,
                     }
                 }
             })
             .collect();
-        let managed = sandbox_policy::ManagedNetworkRule {
+        let managed = sandsurf_network::policy::ManagedNetworkRule {
             transport: "tcp".into(),
             destination,
             ports,
@@ -1544,7 +1416,7 @@ fn resolve_source_bundle(
             manifest_digest: pinned,
         },
     )?;
-    let installed = install_image(host_root, &image)?;
+    let installed = sandsurf_image::install_image(&host_root.join("images"), &image)?;
     Ok(verify_image(
         &installed.join("manifest.json"),
         ImageTrust::ExplicitLocal,
@@ -1561,71 +1433,6 @@ struct ImageIndex {
     files: BTreeMap<String, String>,
 }
 
-fn install_image(host_root: &Path, image: &VerifiedImage) -> Result<PathBuf, WindowsError> {
-    let root = host_root.join("images").join(&image.manifest_digest);
-    if root.exists() {
-        return Ok(root);
-    }
-    let staging = host_root
-        .join("images")
-        .join(format!("stage-{}", hex(&random_bytes()?)));
-    fs::create_dir(&staging)?;
-    let result = (|| -> Result<(), WindowsError> {
-        copy_artifact(&image.manifest_path, &staging.join("manifest.json"))?;
-        copy_artifact(
-            &image.kernel_path,
-            &staging.join(&image.manifest.boot_bundle.kernel.path),
-        )?;
-        copy_artifact(
-            &image.bootstrap_path,
-            &staging.join(&image.manifest.boot_bundle.bootstrap.path),
-        )?;
-        copy_artifact(
-            &image.workload_path,
-            &staging.join(&image.manifest.workload.rootfs.path),
-        )?;
-        if let Some(template) = &image.manifest.workload.state_template {
-            let source = image
-                .manifest_path
-                .parent()
-                .ok_or_else(|| WindowsError::Invalid("image manifest has no parent".into()))?
-                .join(&template.path);
-            copy_artifact(&source, &staging.join(&template.path))?;
-        }
-        let windows = image
-            .windows_x64
-            .as_ref()
-            .ok_or_else(|| WindowsError::Invalid("Windows artifacts are absent".into()))?;
-        let manifest = image
-            .manifest
-            .platform_artifacts
-            .windows_x64
-            .as_ref()
-            .ok_or_else(|| WindowsError::Invalid("Windows artifact metadata is absent".into()))?;
-        for (source, relative) in [
-            (&windows.kernel_path, &manifest.kernel.path),
-            (&windows.bootstrap_path, &manifest.bootstrap.path),
-            (&windows.workload_path, &manifest.workload.path),
-            (&windows.state_template_path, &manifest.state_template.path),
-        ] {
-            copy_artifact(source, &staging.join(relative))?;
-        }
-        let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        if copied.manifest_digest != image.manifest_digest {
-            return Err(WindowsError::Invalid(
-                "copied image identity changed".into(),
-            ));
-        }
-        fs::rename(&staging, &root)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    result?;
-    Ok(root)
-}
-
 fn copy_artifact(source: &Path, destination: &Path) -> Result<(), WindowsError> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -1640,8 +1447,8 @@ fn copy_artifact(source: &Path, destination: &Path) -> Result<(), WindowsError> 
     Ok(())
 }
 
-fn deterministic_vm_id(host_root: &Path, sandbox_id: &SandboxId) -> String {
-    let hash = Sha256::digest(format!("{}\0{}", host_root.display(), sandbox_id.as_str()));
+fn deterministic_vm_id(host_root: &Path, machine_id: &MachineId) -> String {
+    let hash = Sha256::digest(format!("{}\0{}", host_root.display(), machine_id.as_str()));
     let mut raw = [0_u8; 16];
     raw.copy_from_slice(&hash[..16]);
     raw[6] = (raw[6] & 0x0f) | 0x50;
@@ -1723,9 +1530,9 @@ mod tests {
 
     #[test]
     fn vm_identity_is_stable_and_canonical() {
-        let sandbox: SandboxId = "box".try_into().unwrap();
-        let first = deterministic_vm_id(Path::new(r"C:\Sandsurf"), &sandbox);
-        let second = deterministic_vm_id(Path::new(r"C:\Sandsurf"), &sandbox);
+        let machine: MachineId = "box".try_into().unwrap();
+        let first = deterministic_vm_id(Path::new(r"C:\Sandsurf"), &machine);
+        let second = deterministic_vm_id(Path::new(r"C:\Sandsurf"), &machine);
         assert_eq!(first, second);
         assert_eq!(first.len(), 36);
         assert_eq!(&first[14..15], "5");

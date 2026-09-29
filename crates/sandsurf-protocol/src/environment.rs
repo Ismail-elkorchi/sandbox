@@ -1,25 +1,24 @@
-use crate::{Counter, Digest, ExposureId, GrantId, Invalid, ProcessId, SandboxId, SecretId};
+use crate::{
+    Counter, ExecutionId, ExposureId, Invalid, MachineId, Resources, SecretId, SecretVersionId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Persistent per-Sandbox overrides layered over immutable image defaults.
-/// This is workload configuration, not authority over the trusted supervisor.
+/// Persistent per-Machine overrides layered over immutable image defaults.
+/// Guest defaults are OS preferences, not a compartment or host authority.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkloadConfiguration {
+pub struct ExecutionDefaults {
     pub environment: BTreeMap<String, String>,
     pub user: Option<String>,
     pub working_directory: Option<String>,
 }
 
-/// Host-owned persistent-environment lifetime policy. No value means no
-/// automatic cutoff. Idle time advances only while a running machine has no
-/// live or uncertain workload process; absolute expiration advances while the
-/// machine is running, paused, suspended, or stopped.
+/// Explicit host-owned absolute expiration. An empty SDK execution inventory
+/// says nothing about arbitrary Linux services and never implies idleness.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SandboxLifetime {
-    pub idle_stop_after_millis: Option<Counter>,
+pub struct MachineLifetime {
     pub expires_at_unix_millis: Option<Counter>,
     pub expiration_action: ExpirationAction,
 }
@@ -32,28 +31,19 @@ pub enum ExpirationAction {
     Destroy,
 }
 
-impl SandboxLifetime {
+impl MachineLifetime {
     pub fn validate(&self) -> Result<(), Invalid> {
-        const MAX_IDLE_MILLIS: u64 = 365 * 24 * 60 * 60 * 1000;
-        if self
-            .idle_stop_after_millis
-            .is_some_and(|value| value.get() < 1_000 || value.get() > MAX_IDLE_MILLIS)
-        {
-            return Err(Invalid(
-                "idle shutdown must be between one second and 365 days",
-            ));
-        }
         if self
             .expires_at_unix_millis
             .is_some_and(|value| value == Counter::ZERO)
         {
-            return Err(Invalid("absolute Sandbox expiration must be positive"));
+            return Err(Invalid("absolute Machine expiration must be positive"));
         }
         Ok(())
     }
 }
 
-impl WorkloadConfiguration {
+impl ExecutionDefaults {
     pub fn validate(&self) -> Result<(), Invalid> {
         if self.environment.len() > 4096 {
             return Err(Invalid("workload environment exceeds 4096 entries"));
@@ -75,10 +65,7 @@ impl WorkloadConfiguration {
             return Err(Invalid("workload user is malformed"));
         }
         if self.working_directory.as_ref().is_some_and(|value| {
-            value.len() > 4096
-                || !value.starts_with('/')
-                || value.contains('\0')
-                || value.split('/').any(|part| part == "..")
+            value.len() > 4096 || !value.starts_with('/') || value.contains('\0')
         }) {
             return Err(Invalid("workload working directory is malformed"));
         }
@@ -221,8 +208,7 @@ impl ExposureSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Exposure {
     pub id: ExposureId,
-    pub sandbox_id: SandboxId,
-    pub grant_id: GrantId,
+    pub machine_id: MachineId,
     pub revision: Counter,
     pub spec: ExposureSpec,
     pub active: bool,
@@ -233,7 +219,7 @@ pub struct Exposure {
 #[serde(rename_all = "kebab-case")]
 pub enum SecretLifetime {
     Process,
-    Sandbox,
+    Machine,
     UntilRevoked,
 }
 
@@ -253,7 +239,8 @@ pub enum SecretDestination {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretVersion {
     pub id: SecretId,
-    pub version: Digest,
+    /// Opaque identity; neither a plaintext digest nor an erasure guarantee.
+    pub version: SecretVersionId,
     pub bytes: Counter,
 }
 
@@ -263,21 +250,28 @@ pub struct SecretDelivery {
     pub secret: SecretVersion,
     pub destination: SecretDestination,
     pub lifetime: SecretLifetime,
-    pub process_id: Option<crate::ProcessId>,
+    pub execution_id: Option<crate::ExecutionId>,
 }
 
-/// Exact guest-side enforcement established for one host-owned revocation.
-/// Removing an installed binding is distinct from proving that no workload
-/// copied the bytes while it held them.
+/// Host-owned transport disclosure state, independent of any guest erasure report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretDisclosure {
+    NotSent,
+    Possible,
+    GuestReportedReceived,
+}
+
+/// Cooperative guest observations; root can forge them and retain secret copies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SecretRevocationEvidence {
+pub struct SecretCleanupReport {
     pub files_removed: Counter,
     pub environment_bindings_removed: Counter,
-    pub recipients_terminated: Vec<ProcessId>,
-    pub recipients_already_stopped: Vec<ProcessId>,
+    pub recipients_terminated: Vec<ExecutionId>,
+    pub recipients_already_stopped: Vec<ExecutionId>,
     pub residual_copies_possible: bool,
-    pub enforcement_complete: bool,
+    pub actions_reported_complete: bool,
 }
 
 impl SecretDelivery {
@@ -299,10 +293,12 @@ impl SecretDelivery {
             {
                 Err(Invalid("secret environment name is malformed"))
             }
-            SecretDestination::Environment { .. } if self.process_id.is_none() => Err(Invalid(
+            SecretDestination::Environment { .. } if self.execution_id.is_none() => Err(Invalid(
                 "environment secret delivery requires a process identity",
             )),
-            _ if matches!(self.lifetime, SecretLifetime::Process) && self.process_id.is_none() => {
+            _ if matches!(self.lifetime, SecretLifetime::Process)
+                && self.execution_id.is_none() =>
+            {
                 Err(Invalid(
                     "process secret lifetime requires a process identity",
                 ))
@@ -314,33 +310,10 @@ impl SecretDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LiveResourceLimits {
-    pub workload_memory_bytes: Counter,
-    pub workload_processes: Counter,
-    /// CPU quota and period in microseconds; `None` means the boot envelope.
-    pub cpu_max: Option<(Counter, Counter)>,
-}
-
-impl LiveResourceLimits {
-    pub fn validate(&self) -> Result<(), Invalid> {
-        if self.workload_memory_bytes == Counter::ZERO || self.workload_processes == Counter::ZERO {
-            return Err(Invalid("live workload quotas must be positive"));
-        }
-        if self.cpu_max.is_some_and(|(quota, period)| {
-            quota == Counter::ZERO || !(1_000..=1_000_000).contains(&period.get())
-        }) {
-            return Err(Invalid("live CPU quota is malformed"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeConfiguration {
     pub network: NetworkPolicy,
     pub exposures: Vec<Exposure>,
-    pub resources: LiveResourceLimits,
+    pub resources: Resources,
 }
 
 impl Default for RuntimeConfiguration {
@@ -348,10 +321,12 @@ impl Default for RuntimeConfiguration {
         Self {
             network: NetworkPolicy { rules: Vec::new() },
             exposures: Vec::new(),
-            resources: LiveResourceLimits {
-                workload_memory_bytes: Counter::ONE,
-                workload_processes: Counter::ONE,
-                cpu_max: None,
+            resources: Resources {
+                vcpus: Counter::ONE,
+                memory_mib: Counter::try_from(128).expect("static memory bound"),
+                disk_bytes: Counter::try_from(64 * 1024 * 1024).expect("static disk bound"),
+                output_bytes: Counter::ONE,
+                managed_executions: Counter::ONE,
             },
         }
     }
@@ -374,19 +349,43 @@ impl RuntimeConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceUsage {
-    pub cpu_micros: Counter,
-    pub memory_current: Counter,
-    pub memory_peak: Counter,
+    pub cpu_micros: Option<Counter>,
+    pub memory_current: Option<Counter>,
+    pub memory_peak: Option<Counter>,
     pub disk_logical_bytes: Counter,
     pub disk_allocated_bytes: Counter,
-    pub io_read_bytes: Counter,
-    pub io_write_bytes: Counter,
+    pub io_read_bytes: Option<Counter>,
+    pub io_write_bytes: Option<Counter>,
     pub output_retained_bytes: Counter,
     pub network_rx_bytes: Counter,
     pub network_tx_bytes: Counter,
     pub network_connections: Counter,
-    pub processes_current: Counter,
+    /// Managed execution bookkeeping, not the root-controlled Linux PID count.
+    pub executions_current: Counter,
     pub complete: bool,
     pub source: String,
     pub observed_unix_millis: Counter,
+}
+
+impl ResourceUsage {
+    /// Unsupported native measurements are absent, never manufactured zeroes.
+    pub fn host_observation(source: &str, observed_unix_millis: Counter) -> Self {
+        Self {
+            cpu_micros: None,
+            memory_current: None,
+            memory_peak: None,
+            io_read_bytes: None,
+            io_write_bytes: None,
+            disk_logical_bytes: Counter::ZERO,
+            disk_allocated_bytes: Counter::ZERO,
+            output_retained_bytes: Counter::ZERO,
+            network_rx_bytes: Counter::ZERO,
+            network_tx_bytes: Counter::ZERO,
+            network_connections: Counter::ZERO,
+            executions_current: Counter::ZERO,
+            complete: false,
+            source: source.to_owned(),
+            observed_unix_millis,
+        }
+    }
 }

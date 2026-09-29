@@ -1,9 +1,8 @@
 use sandsurf_protocol::{
-    Capability, Checkpoint, CheckpointId, CheckpointRequest, CommitmentId, Counter, Digest, Grant,
-    GrantId, GuestServiceRequest, GuestServiceResponse, LifecycleIntent, LifecycleOperation,
-    MachineObservation, Observation, Operation, OperationId, PinId, ProcessId, Qualification,
-    ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, SandboxId, SandboxLifetime,
-    TransferId, VmEngine, WorkloadConfiguration,
+    CommitmentId, Counter, Digest, ExecutionDefaults, ExecutionId, GuestServiceRequest,
+    GuestServiceResponse, LifecycleIntent, LifecycleOperation, MachineId, MachineLifetime,
+    MachineObservation, Observation, Operation, OperationId, PinId, Qualification, ReleaseRequest,
+    Resources, RollbackRecord, RuntimeResponse, Snapshot, SnapshotId, SnapshotRequest, VmEngine,
 };
 use sandsurf_state::{
     HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord,
@@ -13,6 +12,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const HOST_API_VERSION: u16 = 3;
+
+impl sandsurf_protocol::RpcRequest for HostRequest {
+    fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
+        match self {
+            Self::PutSecret { bytes, .. } => Some((bytes, sandsurf_protocol::MAX_RPC_DATA_BYTES)),
+            Self::DispatchGuest { request, .. } => request.binary_field(),
+            Self::Guest { request, .. } => request.binary_field(),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -26,7 +36,7 @@ pub struct HostInspection {
     pub full_state: Qualification,
     pub images: Qualification,
     pub guest_platform: String,
-    /// Verified workload image packaged for this host architecture. Source
+    /// Verified defaults image packaged for this host architecture. Source
     /// builds without packaged artifacts report `None` explicitly.
     pub default_image_digest: Option<Digest>,
 }
@@ -52,14 +62,6 @@ pub enum OciSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DerivedImageInclusion {
-    pub workspace: bool,
-    pub home: bool,
-    pub secrets: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReservationView {
     Held,
@@ -68,28 +70,28 @@ pub enum ReservationView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SandboxView {
-    pub id: SandboxId,
+pub struct MachineView {
+    pub id: MachineId,
     pub image_digest: Digest,
     pub resources: Resources,
     pub runtime_configuration: sandsurf_protocol::RuntimeConfiguration,
     pub configuration_revision: Counter,
     pub reservation: ReservationView,
+    pub known_sensitive: bool,
     pub lifecycle_intent: LifecycleIntent,
     pub machine: Observation<MachineObservation>,
-    pub workload_defaults: WorkloadDefaultsView,
-    pub lifetime: SandboxLifetime,
+    pub management: Observation<sandsurf_protocol::GuestManagementReport>,
+    pub execution_defaults: ImageDefaultsView,
+    pub lifetime: MachineLifetime,
     pub last_activity_unix_millis: Counter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkloadDefaultsView {
+pub struct ImageDefaultsView {
     pub environment: BTreeMap<String, String>,
     pub user: Option<String>,
     pub working_directory: Option<String>,
-    pub entrypoint: Vec<String>,
-    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,19 +117,11 @@ pub struct HostTreeEntry {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostTreeCapture {
     pub operation_id: OperationId,
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub request_digest: Digest,
     pub manifest_digest: Digest,
     pub entries: Counter,
     pub bytes: Counter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HostBlobTransfer {
-    pub id: TransferId,
-    pub length: Counter,
-    pub digest: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,17 +131,17 @@ pub struct HostBlobTransfer {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum HostWorkspaceChange {
+pub enum HostTreeChange {
     Upsert { entry: HostTreeEntry },
     Delete { path: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HostWorkspaceChangeSet {
+pub struct HostChangeSet {
     pub base_manifest_digest: Digest,
     pub base: Vec<HostTreeEntry>,
-    pub changes: Vec<HostWorkspaceChange>,
+    pub changes: Vec<HostTreeChange>,
     pub digest: Digest,
 }
 
@@ -170,24 +164,15 @@ pub struct HostApplyReport {
 pub enum HostRequest {
     Inspect,
     StopService,
-    ListSandboxes {
-        after: Option<SandboxId>,
+    ListMachines {
+        after: Option<MachineId>,
         maximum: Counter,
     },
-    GetSandbox {
-        sandbox_id: SandboxId,
+    GetMachine {
+        machine_id: MachineId,
     },
     GetHostOperation {
         operation_id: OperationId,
-    },
-    ListGrants {
-        sandbox_id: SandboxId,
-        after: Option<GrantId>,
-        maximum: Counter,
-    },
-    GetGrant {
-        sandbox_id: SandboxId,
-        grant_id: GrantId,
     },
     ListImages {
         after: Option<Digest>,
@@ -204,16 +189,15 @@ pub enum HostRequest {
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
-    ListCheckpoints {
-        after: Option<CheckpointId>,
+    ListSnapshots {
+        after: Option<SnapshotId>,
         maximum: Counter,
     },
-    GetCheckpoint {
-        checkpoint_id: CheckpointId,
+    GetSnapshot {
+        snapshot_id: SnapshotId,
     },
-    CreateCheckpoint {
-        request: CheckpointRequest,
-        scope_digest: Digest,
+    CreateSnapshot {
+        request: SnapshotRequest,
         approval_id: CommitmentId,
     },
     ImportOci {
@@ -222,127 +206,90 @@ pub enum HostRequest {
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
-    PublishCheckpointImage {
-        checkpoint_id: CheckpointId,
-        inclusion: DerivedImageInclusion,
+    PublishSnapshotImage {
+        snapshot_id: SnapshotId,
+        allow_sensitive: bool,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
     CaptureHostTree {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
-        scope_digest: Digest,
         source: PathBuf,
         exclusions: Vec<String>,
         maximum_bytes: Counter,
         approval_id: CommitmentId,
     },
     CaptureGuestTree {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
+        source: sandsurf_protocol::GuestPath,
         operation_id: OperationId,
-        expected_epoch: Counter,
+        expected_generation: Counter,
         expected_revision: Counter,
-        scope_digest: Digest,
         maximum_bytes: Counter,
     },
     ListHostTree {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         after: Counter,
         maximum: Counter,
     },
     ReadHostTreeBlob {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         digest: Digest,
         offset: Counter,
         maximum: u32,
     },
-    BeginHostBlob {
-        sandbox_id: SandboxId,
+    ApplyArtifactToHost {
+        machine_id: MachineId,
+        artifact_id: OperationId,
         operation_id: OperationId,
-        expected_revision: Counter,
-        scope_digest: Digest,
-        transfer: HostBlobTransfer,
-        approval_id: CommitmentId,
-    },
-    WriteHostBlob {
-        sandbox_id: SandboxId,
-        operation_id: OperationId,
-        expected_revision: Counter,
-        scope_digest: Digest,
-        transfer: HostBlobTransfer,
-        offset: Counter,
-        bytes: Vec<u8>,
-    },
-    CommitHostBlob {
-        sandbox_id: SandboxId,
-        operation_id: OperationId,
-        expected_revision: Counter,
-        scope_digest: Digest,
-        transfer: HostBlobTransfer,
-    },
-    ApplyHostWorkspace {
-        sandbox_id: SandboxId,
-        operation_id: OperationId,
-        expected_revision: Counter,
-        scope_digest: Digest,
         destination: PathBuf,
-        change_set: HostWorkspaceChangeSet,
+        change_set: HostChangeSet,
         approval_id: CommitmentId,
     },
-    CreateSandbox {
-        sandbox_id: SandboxId,
+    CreateMachine {
+        machine_id: MachineId,
         image_digest: Digest,
         resources: Resources,
-        workload_configuration: WorkloadConfiguration,
-        lifetime: SandboxLifetime,
+        execution_defaults: ExecutionDefaults,
+        lifetime: MachineLifetime,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
-    ForkSandbox {
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
+    ForkMachine {
+        machine_id: MachineId,
+        snapshot_id: SnapshotId,
         resources: Resources,
-        lifetime: SandboxLifetime,
+        lifetime: MachineLifetime,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
     RollbackFilesystem {
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
+        machine_id: MachineId,
+        snapshot_id: SnapshotId,
         operation_id: OperationId,
         expected_revision: Counter,
-        scope_digest: Digest,
         approval_id: CommitmentId,
     },
     Lifecycle {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
         desired: sandsurf_protocol::DesiredState,
         approval_id: CommitmentId,
     },
-    SetGrant {
-        sandbox_id: SandboxId,
-        operation_id: OperationId,
-        grant_id: GrantId,
-        expected_revision: Counter,
-        capability: Capability,
-        scope_digest: Digest,
-        revoked: bool,
-        approval_id: CommitmentId,
-    },
     SetNetworkPolicy {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
         policy: sandsurf_protocol::NetworkPolicy,
         approval_id: CommitmentId,
     },
     SetExposure {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
         exposure_id: sandsurf_protocol::ExposureId,
@@ -352,20 +299,20 @@ pub enum HostRequest {
     },
     PutSecret {
         secret_id: sandsurf_protocol::SecretId,
+        version: sandsurf_protocol::SecretVersionId,
         bytes: Vec<u8>,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },
     DeliverSecret {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
-        scope_digest: Digest,
         delivery: sandsurf_protocol::SecretDelivery,
         approval_id: CommitmentId,
     },
     RevokeSecret {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
         secret: sandsurf_protocol::SecretVersion,
@@ -373,91 +320,83 @@ pub enum HostRequest {
         approval_id: CommitmentId,
     },
     UpdateResources {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
         expected_revision: Counter,
         resources: Resources,
-        live: sandsurf_protocol::LiveResourceLimits,
         approval_id: CommitmentId,
     },
     GetUsage {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
     },
-    Workload {
-        sandbox_id: SandboxId,
-        epoch: Counter,
+    DispatchGuest {
+        machine_id: MachineId,
+        generation: Counter,
         operation_id: OperationId,
-        expected_revision: Counter,
-        request: sandsurf_protocol::WorkloadRequest,
-        scope_digest: Digest,
+        request: sandsurf_protocol::GuestRequest,
     },
     Guest {
-        sandbox_id: SandboxId,
-        expected_revision: Counter,
-        capability: Capability,
-        scope_digest: Digest,
+        machine_id: MachineId,
+        generation: Counter,
         request: GuestServiceRequest,
     },
     GetProcess {
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
     },
     ListProcesses {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
     },
     ListEvents {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         after: Counter,
         maximum: u16,
     },
     GetOperation {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
     },
     GetReceipt {
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
     },
     ReadEvidence {
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
         after: Counter,
         maximum: u32,
     },
     ReadPinnedEvidence {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         pin_id: PinId,
         after: Counter,
         maximum: u32,
     },
     AcknowledgeReceipt {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
         expected_revision: Counter,
-        scope_digest: Digest,
     },
     PinEvidence {
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         operation_id: OperationId,
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
         pin_id: PinId,
         expected_revision: Counter,
-        scope_digest: Digest,
     },
     ReleaseEvidence {
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
         request: ReleaseRequest,
         expected_revision: Counter,
-        scope_digest: Digest,
         loss_approval_id: Option<CommitmentId>,
     },
     CleanupReleasedEvidence {
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
         request_digest: Digest,
     },
 }
@@ -474,11 +413,11 @@ pub enum HostResponse {
     Inspection {
         value: HostInspection,
     },
-    Sandboxes {
-        values: Vec<SandboxView>,
+    Machines {
+        values: Vec<MachineView>,
     },
-    Sandbox {
-        value: SandboxView,
+    Machine {
+        value: MachineView,
     },
     HostOperation {
         value: Option<HostOperationRecord>,
@@ -495,11 +434,11 @@ pub enum HostResponse {
     ImageRelease {
         operation: ImageReleaseRecord,
     },
-    Checkpoints {
-        values: Vec<Checkpoint>,
+    Snapshots {
+        values: Vec<Snapshot>,
     },
-    Checkpoint {
-        value: Checkpoint,
+    Snapshot {
+        value: Snapshot,
     },
     Rollback {
         value: RollbackRecord,
@@ -518,29 +457,32 @@ pub enum HostResponse {
         eof: bool,
         digest: Digest,
     },
+    HostBlobMetadata {
+        offset: Counter,
+        eof: bool,
+        digest: Digest,
+        chunks: Vec<sandsurf_protocol::BinaryChunk>,
+    },
     HostApply {
         report: HostApplyReport,
     },
     Lifecycle {
         operation: LifecycleOperation,
-        sandbox: SandboxView,
-    },
-    Grant {
-        grant: Grant,
-    },
-    Grants {
-        values: Vec<Grant>,
+        machine: MachineView,
     },
     Configuration {
         revision: Counter,
-        sandbox: SandboxView,
+        machine: MachineView,
     },
     Exposure {
         exposure: sandsurf_protocol::Exposure,
-        sandbox: SandboxView,
+        machine: MachineView,
     },
     Secret {
         secret: sandsurf_protocol::SecretVersion,
+    },
+    SecretDelivery {
+        delivery: sandsurf_state::SecretDeliveryRecord,
     },
     SecretRevocation {
         revocation: SecretRevocationRecord,
@@ -561,4 +503,97 @@ pub enum HostResponse {
         category: String,
         message: String,
     },
+}
+
+impl HostResponse {
+    pub fn into_wire_parts(
+        self,
+    ) -> Result<sandsurf_protocol::WireParts<Self>, sandsurf_protocol::Invalid> {
+        match self {
+            Self::Runtime { response } => {
+                let (response, bytes) = response.into_wire_parts()?;
+                Ok((Self::Runtime { response }, bytes))
+            }
+            Self::Guest { response } => {
+                let (response, bytes) = response.into_wire_parts()?;
+                Ok((Self::Guest { response }, bytes))
+            }
+            Self::HostBlob {
+                offset,
+                bytes,
+                eof,
+                digest,
+            } => {
+                let bytes = if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![bytes]
+                };
+                let chunks = sandsurf_protocol::describe_binary(&bytes)?;
+                sandsurf_protocol::validate_binary(&chunks, sandsurf_protocol::MAX_STREAM_BYTES)?;
+                Ok((
+                    Self::HostBlobMetadata {
+                        offset,
+                        eof,
+                        digest,
+                        chunks,
+                    },
+                    Some(bytes),
+                ))
+            }
+            Self::HostBlobMetadata { .. } => {
+                Err(sandsurf_protocol::Invalid("cannot originate blob metadata"))
+            }
+            response => Ok((response, None)),
+        }
+    }
+
+    pub fn binary_descriptor(
+        &self,
+    ) -> Result<Option<Vec<sandsurf_protocol::BinaryChunk>>, sandsurf_protocol::Invalid> {
+        match self {
+            Self::Runtime { response } => response.binary_descriptor(),
+            Self::Guest { response } => response.binary_descriptor(),
+            Self::HostBlobMetadata { chunks, .. } => {
+                sandsurf_protocol::validate_binary(chunks, sandsurf_protocol::MAX_STREAM_BYTES)?;
+                Ok(Some(chunks.clone()))
+            }
+            Self::HostBlob { .. } => Err(sandsurf_protocol::Invalid(
+                "blob bytes must use data frames",
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn with_wire_bytes(self, bytes: Vec<Vec<u8>>) -> Result<Self, sandsurf_protocol::Invalid> {
+        match self {
+            Self::Runtime { response } => Ok(Self::Runtime {
+                response: response.with_wire_bytes(bytes)?,
+            }),
+            Self::Guest { response } => Ok(Self::Guest {
+                response: response.with_wire_bytes(bytes)?,
+            }),
+            Self::HostBlobMetadata {
+                offset,
+                eof,
+                digest,
+                chunks,
+            } => {
+                if sandsurf_protocol::describe_binary(&bytes)? != chunks {
+                    return Err(sandsurf_protocol::Invalid(
+                        "blob bytes differ from metadata",
+                    ));
+                }
+                Ok(Self::HostBlob {
+                    offset,
+                    bytes: bytes.into_iter().flatten().collect(),
+                    eof,
+                    digest,
+                })
+            }
+            _ => Err(sandsurf_protocol::Invalid(
+                "response does not describe binary data",
+            )),
+        }
+    }
 }

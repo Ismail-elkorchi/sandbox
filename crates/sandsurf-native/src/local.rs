@@ -9,7 +9,7 @@
 //!
 //! This is bounded synchronous transport, not the service scheduler. Each frame
 //! has an absolute deadline (including fragmented reads); a partially transferred
-//! or invalid frame poisons its connection. Callers must not retry mutations on a
+//! or invalid frame poisons its connection. Callers must not retry commands on a
 //! replacement connection without reconciling their operation identities.
 
 use sandsurf_protocol::Frame;
@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -56,6 +56,68 @@ fn private(metadata: &Metadata) -> io::Result<()> {
 struct Directory {
     path: PathBuf,
     held: File,
+}
+
+/// Reopen only an owned private directory, or create one below protected ancestry.
+pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(invalid("private directory must be absolute"));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            Directory::open(path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            path.parent()
+                .ok_or_else(|| invalid("private directory requires a parent"))?;
+            crate::filesystem::require_protected_ancestors(path)?;
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+            Directory::open(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn validate_private_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    private(&metadata)?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(denied(
+            "private object is not a uniquely owned regular file",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    crate::macos::require_private_file_acl(file)?;
+    Ok(())
+}
+
+pub fn open_private_file(path: &Path) -> io::Result<File> {
+    Directory::open(
+        path.parent()
+            .ok_or_else(|| invalid("private file requires a parent"))?,
+    )?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    validate_private_file(&file)?;
+    Ok(file)
+}
+
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    Directory::open(
+        path.parent()
+            .ok_or_else(|| invalid("private file requires a parent"))?,
+    )?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    validate_private_file(&file)?;
+    Ok(file)
 }
 impl Directory {
     fn open(path: &Path) -> io::Result<Self> {

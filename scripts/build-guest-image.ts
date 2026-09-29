@@ -12,15 +12,20 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
-import { packImageSources } from "./image-sources.ts";
+import { packImageSources, writeImageIndex } from "./image-sources.ts";
 
 process.umask(0o022);
+
+const buildProfile = process.env.SANDSURF_IMAGE_PROFILE ?? "debug";
+if (buildProfile !== "debug" && buildProfile !== "release") throw new Error("SANDSURF_IMAGE_PROFILE must be debug or release");
+const profileArguments = buildProfile === "release" ? ["--release"] : [];
 
 const requestedArchitecture = process.env.SANDSURF_IMAGE_ARCHITECTURE
   ?? (process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : undefined);
@@ -45,6 +50,8 @@ const imageBuild = architecture === "x64" ? {
   alpineSha256: "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
   elfMachine: 183,
 };
+const guestTarget = process.env.SANDSURF_GUEST_RUST_TARGET ?? imageBuild.rustTarget;
+if (![imageBuild.rustTarget, `${architecture === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`].includes(guestTarget)) throw new Error("guest target must be GNU or musl Linux for the selected image architecture");
 const alpineVersion = "3.24.2";
 const alpineSeries = "v3.24";
 const alpineRepository = `https://dl-cdn.alpinelinux.org/alpine/${alpineSeries}`;
@@ -54,16 +61,23 @@ const alpineToolSha256 = toolArchitecture === "aarch64"
   ? "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773"
   : "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
 const expectedAlpinePackages = [
+  "alpine-base=3.24.2-r0", "alpine-conf=3.22.0-r0",
   "alpine-baselayout-data=3.7.2-r1", "alpine-baselayout=3.7.2-r1", "alpine-keys=2.6-r0",
   "alpine-release=3.24.2-r0", "apk-tools=3.0.8-r0", "brotli-libs=1.2.0-r1",
   "busybox-binsh=1.37.0-r31", "busybox-extras=1.37.0-r31", "busybox=1.37.0-r31", "c-ares=1.34.8-r0",
   "ca-certificates-bundle=20260909-r0", "ca-certificates=20260909-r0",
   "git-init-template=2.54.0-r0", "git=2.54.0-r0", "libapk=3.0.8-r0",
-  "libcrypto3=3.5.8-r0", "libcurl=8.22.0-r0", "libexpat=2.8.4-r0",
+  "libcrypto3=3.5.8-r0", "libcurl=8.22.0-r0", "libexpat=2.8.5-r0",
   "libidn2=2.3.8-r0", "libpsl=0.21.5-r3", "libssl3=3.5.8-r0",
   "libunistring=1.4.2-r0", "musl-utils=1.2.6-r2", "musl=1.2.6-r2",
   "nghttp2-libs=1.69.0-r0", "pcre2=10.48-r0", "scanelf=1.3.9-r1",
   "ssl_client=1.37.0-r31", "zlib=1.3.2-r0", "zstd-libs=1.5.7-r2",
+  "bridge=1.5-r5", "e2fsprogs=1.47.4-r0", "e2fsprogs-extra=1.47.4-r0",
+  "e2fsprogs-libs=1.47.4-r0", "ifupdown-ng=0.13.0-r0", "libblkid=2.42.3-r1",
+  "libcap2=2.78-r0", "libcom_err=1.47.4-r0", "libeconf=0.8.3-r0",
+  "libuuid=2.42.3-r1", "openrc=0.63.2-r0", "openrc-user=0.63.2-r0",
+  "sudo=1.9.17_p2-r1",
+  "busybox-mdev-openrc=1.37.0-r31", "busybox-openrc=1.37.0-r31", "busybox-suid=1.37.0-r31", "mdev-conf=4.10-r0",
 ] as const;
 const kernelName = "vmlinux-6.18.41";
 const kernelBaseUrl = `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/${imageBuild.kernelArchitecture}`;
@@ -87,7 +101,7 @@ if (!localBuild) {
   if (releaseSeed.byteLength !== 32) throw new Error("the image signing seed must contain exactly 32 bytes");
 }
 const releasePublicKey = "495b4a26a65df66f7090065ed23a30a29ad3b53e0ed90d6506a2d6c8c0aba684";
-const guestProtocolSource = await readFile(resolve("crates/sandbox-guest/src/lib.rs"), "utf8");
+const guestProtocolSource = await readFile(resolve("crates/sandsurf-protocol/src/ports.rs"), "utf8");
 const guestProtocolMajor = Number(/GUEST_PROTOCOL_MAJOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
 const guestProtocolMinor = Number(/GUEST_PROTOCOL_MINOR: u16 = ([0-9]+);/u.exec(guestProtocolSource)?.[1]);
 if (!Number.isSafeInteger(guestProtocolMajor) || !Number.isSafeInteger(guestProtocolMinor)) throw new Error("guest protocol version is not declared");
@@ -96,35 +110,24 @@ if (process.platform !== "linux") {
   throw new Error("the guest image builder requires Linux");
 }
 
-const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-guest-image-"));
+const temporary = await mkdtemp(resolve(tmpdir(), "sandsurf-guest-image-"));
 try {
-  await run("cargo", ["build", "--release", "-p", "sandbox-guest", "--target", imageBuild.rustTarget], process.cwd(), {
-    [`CARGO_TARGET_${imageBuild.rustTarget.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld",
+  await run("cargo", ["build", ...profileArguments, "-p", "sandsurf-guest", "--target", guestTarget], process.cwd(), {
+    ...(guestTarget.endsWith("-musl") ? { [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" } : {}),
+    [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`]: "-C target-feature=+crt-static",
   });
-  const guestAgent = resolve("target", imageBuild.rustTarget, "release/sandbox-guest");
+  const guestAgent = resolve("target", guestTarget, buildProfile, "sandsurf-guest");
   const guestBytes = await readFile(guestAgent);
   assertElfArchitecture(guestBytes, "guest agent");
-
-  const root = resolve(temporary, "bootstrap");
-  for (const path of [
-    "dev", "proc", "run", "sandsurf/control", "sandsurf/lower", "sandsurf/state",
-    "sandsurf/workload", "sbin", "sys/fs/cgroup", "tmp",
-  ]) {
-    await mkdir(resolve(root, path), { recursive: true });
+  const programOffset = Number(guestBytes.readBigUInt64LE(32));
+  const programSize = guestBytes.readUInt16LE(54); const programCount = guestBytes.readUInt16LE(56);
+  if (!Number.isSafeInteger(programOffset) || programSize < 56 || programCount > 128 || programOffset + programSize * programCount > guestBytes.length) throw new Error("guest agent program table is malformed");
+  for (let index = 0; index < programCount; index++) {
+    if (guestBytes.readUInt32LE(programOffset + index * programSize) === 3) throw new Error("guest management executable must be statically linked");
   }
-  await copyFile(guestAgent, resolve(root, "sbin/sandbox-guest"));
-  await chmod(resolve(root, "sbin/sandbox-guest"), 0o755);
-  await normalizeTimestamps(root);
 
-  const rootfs = resolve(temporary, "trusted-bootstrap.ext4");
-  await materializeTree(root, rootfs, 128 * 1024 * 1024, temporary, "trusted-bootstrap");
-  const workload = resolve(temporary, "development-workload.ext4");
-  const workloadMaterials = await buildDevelopmentWorkload(temporary, workload);
-  const workspace = resolve(temporary, "empty-workspace.ext4");
-  const empty = resolve(temporary, "empty");
-  await mkdir(empty);
-  await normalizeTimestamps(empty);
-  await materializeTree(empty, workspace, 128 * 1024 * 1024, temporary, "empty-workspace");
+  const system = resolve(temporary, "system.ext4");
+  const systemMaterials = await buildLinuxSystem(temporary, system, guestAgent);
 
   const kernel = resolve(temporary, kernelName);
   await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
@@ -144,20 +147,15 @@ try {
   const explicitOutput = process.env.SANDSURF_IMAGE_OUTPUT_DIRECTORY;
   if (explicitOutput !== undefined && !isAbsolute(explicitOutput)) throw new Error("SANDSURF_IMAGE_OUTPUT_DIRECTORY must be absolute");
   const imageDirectory = `development-${architecture}`;
-  const destination = explicitOutput ?? resolve("packages/sandbox/images", imageDirectory);
+  const destination = explicitOutput ?? resolve("packages/sandsurf/images", imageDirectory);
   await mkdir(destination, { recursive: true });
-  for (const retired of ["minimal-rootfs.ext4", "minimal-workload.ext4", "vmlinux-6.1.177"]) {
-    await rm(resolve(destination, retired), { force: true });
-  }
   await replaceArtifact(kernel, resolve(destination, kernelName));
-  await replaceArtifact(rootfs, resolve(destination, "trusted-bootstrap.ext4"));
-  await replaceArtifact(workload, resolve(destination, "development-workload.ext4"));
-  await replaceArtifact(workspace, resolve(destination, "empty-workspace.ext4"));
+  await replaceArtifact(system, resolve(destination, "system.ext4"));
 
   let platformArtifacts: Record<string, unknown> = {};
   if (architecture === "x64") {
     const hypervKernelSource = process.env.SANDSURF_HYPERV_KERNEL_FILE
-      ?? resolve("packages/sandbox/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
+      ?? resolve("packages/sandsurf/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
     if (!isAbsolute(hypervKernelSource)) {
       throw new Error("SANDSURF_HYPERV_KERNEL_FILE must be absolute");
     }
@@ -177,9 +175,7 @@ try {
     assertElfOrBzImage(hypervKernelBytes, "Hyper-V kernel");
     const qemuImg = process.env.SANDSURF_QEMU_IMG ?? "qemu-img";
     const conversions = [
-      [rootfs, resolve(destination, "trusted-bootstrap.vhdx")],
-      [workload, resolve(destination, "development-workload.vhdx")],
-      [workspace, resolve(destination, "empty-workspace.vhdx")],
+      [system, resolve(destination, "system.vhdx")],
     ] as const;
     for (const [source, output] of conversions) {
       const staging = `${output}.new-${process.pid}`;
@@ -199,25 +195,18 @@ try {
     platformArtifacts = {
       windowsX64: {
         kernel: { path: "hyperv-vmlinuz-6.18.41", sha256: sha256(hypervKernelBytes) },
-        bootstrap: { path: "trusted-bootstrap.vhdx", sha256: sha256(await readFile(conversions[0][1])) },
-        workload: { path: "development-workload.vhdx", sha256: sha256(await readFile(conversions[1][1])) },
-        stateTemplate: { path: "empty-workspace.vhdx", sha256: sha256(await readFile(conversions[2][1])) },
+        system: { path: "system.vhdx", sha256: sha256(await readFile(conversions[0][1])) },
       },
     };
   }
 
   const unsigned = {
-    formatVersion: 2,
+    formatVersion: 3,
     id: "sandsurf-development",
     version: alpineVersion,
     architecture,
     bootBundle: {
       kernel: { path: kernelName, sha256: kernelSha256 },
-      bootstrap: {
-        path: "trusted-bootstrap.ext4",
-        sha256: sha256(await readFile(rootfs)),
-        format: "ext4",
-      },
       guestAgent: {
         version: "0.1.0",
         protocolMajor: guestProtocolMajor,
@@ -226,30 +215,22 @@ try {
       },
       capabilities: { overlayfs: true, vsock: true, seccomp: true, cgroupV2: true, devpts: true },
     },
-    workload: {
+    system: {
       rootfs: {
-        path: "development-workload.ext4",
-        sha256: sha256(await readFile(workload)),
-        format: "ext4",
-      },
-      stateTemplate: {
-        path: "empty-workspace.ext4",
-        sha256: sha256(await readFile(workspace)),
+        path: "system.ext4",
+        sha256: sha256(await readFile(system)),
         format: "ext4",
       },
       defaults: {
         environment: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
         user: "agent",
-        workingDirectory: "/workspace",
-        entrypoint: [],
-        command: [],
+        workingDirectory: "/home/agent",
       },
       provenance: {
         kind: "source-built",
-        sourceDigest: workloadMaterials.sourceDigest,
-        materials: workloadMaterials.materials,
+        sourceDigest: systemMaterials.sourceDigest,
+        materials: systemMaterials.materials,
       },
-      compatibleProtocolMajor: guestProtocolMajor,
     },
     platformArtifacts,
   } as const;
@@ -269,16 +250,17 @@ try {
   const manifest = { ...unsigned, signature };
   await writeFile(resolve(destination, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
   if (explicitOutput === undefined) {
-    await writeImageIndex(resolve("packages/sandbox/images"));
+    await writeImageIndex(resolve("packages/sandsurf/images"));
     await packImageSources(architecture);
   }
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
 
-async function buildDevelopmentWorkload(
+async function buildLinuxSystem(
   temporary: string,
   output: string,
+  guestAgent: string,
 ): Promise<{ sourceDigest: string; materials: Readonly<Record<string, string>> }> {
   const targetArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`);
   const toolArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${toolArchitecture}.tar.gz`);
@@ -295,11 +277,11 @@ async function buildDevelopmentWorkload(
     throw new Error("Alpine package-tool root digest mismatch");
   }
 
-  const workloadRoot = resolve(temporary, "development-root");
+  const systemRoot = resolve(temporary, "development-root");
   const toolRoot = resolve(temporary, "apk-tool-root");
-  await mkdir(workloadRoot);
+  await mkdir(systemRoot);
   await mkdir(toolRoot);
-  for (const [archive, destination] of [[targetArchive, workloadRoot], [toolArchive, toolRoot]] as const) {
+  for (const [archive, destination] of [[targetArchive, systemRoot], [toolArchive, toolRoot]] as const) {
     await run("tar", [
       "--extract", "--gzip", "--file", archive, "--directory", destination,
       "--no-same-owner",
@@ -310,19 +292,24 @@ async function buildDevelopmentWorkload(
   await run(loader, [
     "--library-path", `${resolve(toolRoot, "lib")}:${resolve(toolRoot, "usr/lib")}`,
     apk,
-    "--root", workloadRoot,
+    "--root", systemRoot,
     "--arch", imageBuild.alpineArchitecture,
     "--no-cache",
     "--no-scripts",
     "--repository", `${alpineRepository}/main`,
     "--repository", `${alpineRepository}/community`,
     "add",
+    "alpine-base=3.24.2-r0",
     "ca-certificates=20260909-r0",
     "busybox-extras=1.37.0-r31",
     "git=2.54.0-r0",
+    "openrc=0.63.2-r0",
+    "sudo=1.9.17_p2-r1",
+    "e2fsprogs=1.47.4-r0",
+    "e2fsprogs-extra=1.47.4-r0",
   ]);
 
-  const installed = await readFile(resolve(workloadRoot, "lib/apk/db/installed"), "utf8");
+  const installed = await readFile(resolve(systemRoot, "lib/apk/db/installed"), "utf8");
   const packages = parseInstalledPackages(installed);
   if (JSON.stringify(packages) !== JSON.stringify([...expectedAlpinePackages].sort())) {
     throw new Error("installed Alpine package closure differs from the reviewed development image lock");
@@ -333,11 +320,11 @@ async function buildDevelopmentWorkload(
     ["sbin/apk", "apk"],
     ["usr/bin/git", "Git"],
   ] as const) {
-    const bytes = await boundedRegularFile(resolve(workloadRoot, relative), 64 * 1024 * 1024, label, true);
+    const bytes = await boundedRegularFile(resolve(systemRoot, relative), 64 * 1024 * 1024, label, true);
     assertElfArchitecture(bytes, label);
   }
   const caBundle = await boundedRegularFile(
-    resolve(workloadRoot, "etc/ssl/certs/ca-certificates.crt"),
+    resolve(systemRoot, "etc/ssl/certs/ca-certificates.crt"),
     4 * 1024 * 1024,
     "Alpine CA bundle",
     true,
@@ -345,42 +332,70 @@ async function buildDevelopmentWorkload(
   if (caBundle.includes(0) || !caBundle.includes(Buffer.from("-----BEGIN CERTIFICATE-----", "ascii"))) {
     throw new Error("Alpine CA bundle is not a PEM certificate bundle");
   }
-  await appendAccount(resolve(workloadRoot, "etc/passwd"), "agent", "agent:x:1000:1000:agent:/home/agent:/bin/sh");
-  await appendAccount(resolve(workloadRoot, "etc/group"), "agent", "agent:x:1000:");
-  await normalizeTimestamps(workloadRoot);
+  await appendAccount(resolve(systemRoot, "etc/passwd"), "agent", "agent:x:1000:1000:agent:/home/agent:/bin/sh");
+  await appendAccount(resolve(systemRoot, "etc/group"), "agent", "agent:x:1000:");
+  await configureLinuxSystem(systemRoot, guestAgent);
+  await normalizeTimestamps(systemRoot);
 
+  await mkdir(resolve(systemRoot, "home/agent"), { recursive: true, mode: 0o775 });
+  await mkdir(resolve(systemRoot, "workspace"), { recursive: true, mode: 0o775 });
   const canonicalTar = resolve(temporary, "development-root.tar");
-  await run("tar", [
-    "--create", "--file", canonicalTar,
-    "--format=gnu", "--sort=name", "--mtime=@1700000000",
-    "--owner=0", "--group=0", "--numeric-owner",
-    "--directory", workloadRoot, ".",
-  ]);
-  const agentRoot = resolve(temporary, "agent-directories");
-  await mkdir(resolve(agentRoot, "home/agent"), { recursive: true, mode: 0o775 });
-  await mkdir(resolve(agentRoot, "workspace"), { mode: 0o775 });
-  await normalizeTimestamps(agentRoot);
-  await run("tar", [
-    "--append", "--file", canonicalTar,
-    "--format=gnu", "--sort=name", "--mtime=@1700000000",
-    "--owner=1000", "--group=1000", "--numeric-owner",
-    "--directory", agentRoot, "home/agent", "workspace",
+  await run("cargo", [
+    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "archive_system", "--",
+    systemRoot, canonicalTar,
   ]);
   await run("cargo", [
-    "run", "--locked", "--release", "-p", "sandbox-image", "--example", "materialize_ext4", "--",
+    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "materialize_ext4", "--",
     canonicalTar, output, String(128 * 1024 * 1024),
   ]);
+  await run("tune2fs", ["-O", "has_journal", output]);
+  await run("cargo", [
+    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "finalize_journaled_ext4", "--", output,
+  ]);
+  await run("e2fsck", ["-fn", output]);
 
   const packageLock = Buffer.from(`${packages.join("\n")}\n`, "utf8");
-  const builderIdentity = Buffer.from("arcbox-ext4-0.1.2+sandsurf-deterministic-v2", "utf8");
-  return {
-    sourceDigest: sha256(Buffer.concat([await readFile(targetArchive), packageLock, builderIdentity])),
-    materials: {
-      "alpine-minirootfs": imageBuild.alpineSha256,
-      "alpine-packages": sha256(packageLock),
-      "sandsurf-ext4-builder": sha256(builderIdentity),
-    },
+  const builderIdentity = Buffer.from("arcbox-ext4-0.1.2+sandsurf-journaled-v3", "utf8");
+  const recipeFiles = ["scripts/build-guest-image.ts", "crates/sandsurf-image/examples/archive_system.rs", "crates/sandsurf-image/examples/finalize_journaled_ext4.rs", "crates/sandsurf-image/src/ext4.rs",
+    ...["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/sudoers.d/agent"].map((path) => `scripts/guest-image/${path}`)];
+  const recipe = Object.fromEntries(await Promise.all(recipeFiles.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
+  const materials = {
+    "alpine-minirootfs": imageBuild.alpineSha256,
+    "alpine-packages": sha256(packageLock),
+    "sandsurf-ext4-builder": sha256(builderIdentity),
+    "sandsurf-system-recipe": identityDigest(recipe),
+    "sandsurf-management": sha256(await readFile(guestAgent)),
   };
+  return {
+    sourceDigest: identityDigest(materials),
+    materials,
+  };
+}
+
+async function configureLinuxSystem(root: string, guestAgent: string): Promise<void> {
+  for (const directory of ["usr/sbin", "var/lib/sandsurf", "var/log", "etc/sudoers.d", "dev/pts", "run"]) {
+    await mkdir(resolve(root, directory), { recursive: true });
+  }
+  await copyFile(guestAgent, resolve(root, "usr/sbin/sandsurf-guest"));
+  await chmod(resolve(root, "usr/sbin/sandsurf-guest"), 0o755);
+  for (const relative of ["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/sudoers.d/agent"]) {
+    await copyFile(resolve("scripts/guest-image", relative), resolve(root, relative));
+    await chmod(resolve(root, relative), relative.startsWith("etc/init.d/") ? 0o755 : relative.includes("sudoers") ? 0o440 : 0o644);
+  }
+  // These are ordinary guest OS permissions, changeable by its administrator.
+  await chmod(resolve(root, "usr/bin/sudo"), 0o4755);
+  await writeFile(resolve(root, "etc/rc.conf"), 'rc_cgroup_mode="unified"\n', { mode: 0o644 });
+  const runlevels = {
+    sysinit: ["devfs", "procfs", "sysfs", "mdev", "cgroups"],
+    boot: ["root", "localmount", "bootmisc", "machine-id", "hostname", "loopback"],
+    default: ["sandsurf-management"],
+    shutdown: ["killprocs", "mount-ro"],
+  } as const;
+  for (const [runlevel, services] of Object.entries(runlevels)) {
+    const directory = resolve(root, "etc/runlevels", runlevel);
+    await mkdir(directory, { recursive: true });
+    for (const service of services) await symlink(`../../init.d/${service}`, resolve(directory, service));
+  }
 }
 
 function parseInstalledPackages(database: string): string[] {
@@ -414,25 +429,6 @@ function assertElfOrBzImage(bytes: Buffer, label: string): void {
   if (!elf && !bzImage) throw new Error(`${label} is neither an ELF kernel nor an x86 bzImage`);
 }
 
-async function writeImageIndex(root: string): Promise<void> {
-  const files: Record<string, string> = {};
-  for (const name of (await readdir(root)).sort()) {
-    if (!/^development-(x64|arm64)$/u.test(name)) continue;
-    const path = resolve(root, name, "manifest.json");
-    try {
-      files[`${name}/manifest.json`] = sha256(await readFile(path));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-  if (Object.keys(files).length === 0) throw new Error("no guest image manifests were built");
-  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
-    formatVersion: 1,
-    buildId: "sandsurf-images-0.1.0",
-    files,
-  }, null, 2)}\n`, { mode: 0o644 });
-}
-
 async function boundedRegularFile(
   path: string,
   maximum: number,
@@ -455,30 +451,6 @@ async function normalizeTimestamps(path: string): Promise<void> {
   else await utimes(path, 1_700_000_000, 1_700_000_000);
 }
 
-async function materializeTree(
-  root: string,
-  image: string,
-  bytes: number,
-  temporary: string,
-  label: string,
-): Promise<void> {
-  const archive = resolve(temporary, `${label}.tar`);
-  await run("tar", [
-    "--create", "--file", archive,
-    "--format=gnu", "--sort=name", "--mtime=@1700000000",
-    "--owner=0", "--group=0", "--numeric-owner",
-    "--directory", root, ".",
-  ]);
-  await run("cargo", [
-    "run", "--locked", "--release", "-p", "sandbox-image", "--example", "materialize_ext4", "--",
-    archive, image, String(bytes),
-  ]);
-}
-
-function sha256(bytes: Buffer): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
 async function replaceArtifact(source: string, destination: string): Promise<void> {
   const temporaryPath = `${destination}.new-${process.pid}`;
   await rm(temporaryPath, { force: true });
@@ -497,6 +469,10 @@ function identityDigest(value: unknown): string {
   putBytes(chunks, Buffer.from("IDENTITY"));
   encodeCanonical(chunks, value);
   return sha256(Buffer.concat(chunks));
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function encodeCanonical(chunks: Buffer[], value: unknown): void {

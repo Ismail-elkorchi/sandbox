@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+description="Optional Sandsurf execution and filesystem management"
+supervisor="supervise-daemon"
+command="/usr/sbin/sandsurf-guest"
+output_log="/var/log/sandsurf-management.log"
+error_log="/var/log/sandsurf-management.log"
+respawn_delay=1
+
+depend() {
+    need localmount
+}

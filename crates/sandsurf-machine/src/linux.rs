@@ -1,21 +1,20 @@
 //! Guardian-owned Firecracker/KVM machine controller.
 //!
 //! This adapter reuses the verified VMM launch/confinement mechanism while
-//! moving lifetime to a persistent guardian. A machine is not observed running
-//! until the trusted guest control channel has authenticated for its epoch.
+//! moving lifetime to a persistent guardian. Native power observations are
+//! independent of the availability of guest-owned management software.
 
+use crate::firecracker::{
+    FirecrackerConfig, FirecrackerError, FirecrackerProcess, FirecrackerRestore,
+    FirecrackerSnapshot,
+};
 use crate::{
     ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
     MachineTransition,
 };
-use sandbox_vm::{
-    FirecrackerConfig, FirecrackerError, FirecrackerProcess, FirecrackerRestore,
-    FirecrackerSnapshot,
-};
 use sandsurf_protocol::{
-    CheckpointId, ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand,
-    MachineObservation, MachineState, OperationId, Qualification, SandboxId, VmEngine,
-    bytes_digest, digest,
+    ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand, MachineId, MachineObservation,
+    MachineState, OperationId, Qualification, SnapshotId, VmEngine, bytes_digest, digest,
 };
 use std::fs;
 
@@ -27,60 +26,57 @@ pub struct FirecrackerQualification {
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerRestoreSource {
-    pub checkpoint_id: CheckpointId,
+    pub snapshot_id: SnapshotId,
     pub capture_operation_id: OperationId,
-    pub source_sandbox_id: SandboxId,
-    pub source_epoch: Counter,
+    pub source_machine_id: MachineId,
+    pub source_generation: Counter,
     pub manifest_digest: Digest,
     pub snapshot_state: std::path::PathBuf,
     pub snapshot_memory: std::path::PathBuf,
     pub reconnect_state: std::path::PathBuf,
 }
 
-/// Supplies one fresh, already verified epoch configuration and authenticates
-/// the trusted guest supervisor. The factory may create an epoch authentication
-/// disk, but it cannot publish a guardian observation.
-pub trait FirecrackerEpochFactory {
+/// Supplies a verified native boot configuration and binds the optional guest
+/// management endpoint. Possession of guest-held keys is not guest attestation.
+/// Endpoint availability never defines native machine power state.
+pub trait FirecrackerGenerationFactory {
     fn configuration(
         &mut self,
-        sandbox_id: &SandboxId,
-        epoch: Counter,
+        machine_id: &MachineId,
+        generation: Counter,
+        resources: &sandsurf_protocol::Resources,
     ) -> Result<FirecrackerConfig, Digest>;
 
-    fn authenticate(
+    fn bind_management(
         &mut self,
-        sandbox_id: &SandboxId,
-        epoch: Counter,
+        machine_id: &MachineId,
+        generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest>;
 
-    /// Establishes the guest's durable stop boundary before VMM termination.
-    /// Returning an error leaves the live machine owned by this driver.
-    fn prepare_stop(&mut self, sandbox_id: &SandboxId, epoch: Counter) -> Result<Digest, Digest>;
-
     fn restore_configuration(
         &mut self,
-        sandbox_id: &SandboxId,
-        epoch: Counter,
+        machine_id: &MachineId,
+        generation: Counter,
         source: &FirecrackerRestoreSource,
     ) -> Result<(FirecrackerConfig, FirecrackerRestore), Digest>;
 
-    fn authenticate_restore(
+    fn bind_restored_management(
         &mut self,
-        sandbox_id: &SandboxId,
-        epoch: Counter,
+        machine_id: &MachineId,
+        generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest>;
 }
 
 pub struct FirecrackerDriver<F> {
-    sandbox_id: SandboxId,
+    machine_id: MachineId,
     guest_architecture: GuestArchitecture,
     qualification: FirecrackerQualification,
     factory: F,
     process: Option<FirecrackerProcess>,
-    stop_quiesce: Option<Digest>,
     applied_revision: Option<Counter>,
+    boot_resources: Option<sandsurf_protocol::Resources>,
     capture_paused: bool,
     full_capture_operation: Option<OperationId>,
     full_snapshot: Option<FirecrackerSnapshot>,
@@ -88,21 +84,21 @@ pub struct FirecrackerDriver<F> {
     staged_restore: Option<FirecrackerRestoreSource>,
 }
 
-impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
+impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
     pub fn new(
-        sandbox_id: SandboxId,
+        machine_id: MachineId,
         guest_architecture: GuestArchitecture,
         qualification: FirecrackerQualification,
         factory: F,
     ) -> Self {
         Self {
-            sandbox_id,
+            machine_id,
             guest_architecture,
             qualification,
             factory,
             process: None,
-            stop_quiesce: None,
             applied_revision: None,
+            boot_resources: None,
             capture_paused: false,
             full_capture_operation: None,
             full_snapshot: None,
@@ -116,17 +112,21 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
     }
 
     fn identity_matches(&self, command: &LifecycleCommand) -> bool {
-        command.sandbox_id == self.sandbox_id
+        command.machine_id == self.machine_id
     }
 
-    fn boot(&mut self, command: &LifecycleCommand, epoch: Counter) -> MachineOutcome {
+    fn boot(&mut self, command: &LifecycleCommand, generation: Counter) -> MachineOutcome {
         if !self.identity_matches(command) {
-            return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+            return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
         if self.process.is_some() {
             return MachineOutcome::Unknown;
         }
-        let configuration = match self.factory.configuration(&self.sandbox_id, epoch) {
+        let configuration = match self.factory.configuration(
+            &self.machine_id,
+            generation,
+            &command.configuration.resources,
+        ) {
             Ok(value) => value,
             Err(evidence) => return MachineOutcome::NotApplied(evidence),
         };
@@ -137,43 +137,39 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
                 return MachineOutcome::Unknown;
             }
         };
-        let authentication = match self
+        if let Err(error) = self
             .factory
-            .authenticate(&self.sandbox_id, epoch, &mut process)
+            .bind_management(&self.machine_id, generation, &mut process)
         {
-            Ok(value) => value,
-            Err(evidence) => {
-                eprintln!("sandsurf guest authentication failed: {evidence:?}");
-                contain(&mut process);
-                return MachineOutcome::Unknown;
-            }
-        };
+            eprintln!(
+                "sandsurf management endpoint unavailable; native computer remains running: {error:?}"
+            );
+        }
         self.process = Some(process);
-        self.stop_quiesce = None;
+        self.boot_resources = Some(command.configuration.resources.clone());
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
         self.committed_suspend = None;
         self.staged_restore = None;
         self.applied_revision = Some(command.revision);
-        let booting = if epoch == Counter::ONE {
+        let booting = if generation == Counter::ONE {
             MachineState::Creating
         } else {
             MachineState::Starting
         };
         MachineOutcome::Observed(vec![
-            transition(command, epoch, booting, b"firecracker-created"),
-            transition_with_digest(
+            transition(command, generation, booting, b"firecracker-created"),
+            transition(
                 command,
-                epoch,
+                generation,
                 MachineState::Running,
-                b"guest-authenticated",
-                &authentication,
+                b"native-machine-running",
             ),
         ])
     }
 
-    /// Whether this guardian still owns a live VMM for the current epoch. This
+    /// Whether this guardian still owns a live VMM for the current generation. This
     /// is reachability evidence only; it never changes host lifecycle intent.
     pub fn has_live_owner(&mut self) -> bool {
         self.process
@@ -187,44 +183,23 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         current: &MachineObservation,
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
-            return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+            return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
-        let Some(process) = self.process.as_ref() else {
+        if self.process.is_none() {
             return if current.state == MachineState::Stopped {
                 MachineOutcome::Observed(vec![transition(
                     command,
-                    current.epoch,
+                    current.generation,
                     MachineState::Stopped,
                     b"firecracker-already-stopped",
                 )])
             } else {
                 MachineOutcome::Unknown
             };
-        };
-        if (current.state == MachineState::Paused || self.capture_paused)
-            && process.resume().is_err()
-        {
-            return MachineOutcome::Unknown;
         }
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;
-        if self.remove_full_snapshot().is_err() {
-            return MachineOutcome::Unknown;
-        }
-        let quiesce = if let Some(evidence) = self.stop_quiesce.clone() {
-            evidence
-        } else {
-            let evidence = match self.factory.prepare_stop(&self.sandbox_id, current.epoch) {
-                Ok(value) => value,
-                Err(evidence) => {
-                    eprintln!("sandsurf guest stop barrier failed: {evidence:?}");
-                    return MachineOutcome::Unknown;
-                }
-            };
-            self.stop_quiesce = Some(evidence.clone());
-            evidence
-        };
         let Some(mut process) = self.process.take() else {
             return MachineOutcome::Unknown;
         };
@@ -243,17 +218,15 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             }
             return MachineOutcome::Unknown;
         }
-        self.stop_quiesce = None;
-        MachineOutcome::Observed(vec![transition_with_digest(
+        MachineOutcome::Observed(vec![transition(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Stopped,
             b"firecracker-exit-confirmed",
-            &quiesce,
         )])
     }
 
-    /// A checkpoint pause is internal to one capture transaction. It does not
+    /// A snapshot pause is internal to one capture transaction. It does not
     /// manufacture a host lifecycle intent or guardian machine observation.
     pub fn pause_for_capture(&mut self) -> Result<(), Digest> {
         if self.capture_paused {
@@ -270,31 +243,21 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
         Ok(())
     }
 
-    /// Temporarily run a machine whose published lifecycle state is paused so
-    /// the trusted guest can establish a capture barrier. The guardian does
-    /// not publish this internal coordination step.
-    pub fn resume_public_pause_for_capture(&mut self) -> Result<(), Digest> {
-        if self.capture_paused || self.process.is_none() {
-            return Err(bytes_digest(b"firecracker-public-pause-capture-state"));
+    /// Adopt an already published native pause without executing guest code.
+    pub fn adopt_pause_for_capture(&mut self) -> Result<(), Digest> {
+        if self.process.is_none() {
+            return Err(bytes_digest(b"native-capture-owner-unavailable"));
         }
-        self.process
-            .as_ref()
-            .expect("process checked above")
-            .resume()
-            .map_err(|_| bytes_digest(b"firecracker-public-pause-capture-resume"))
+        self.capture_paused = true;
+        Ok(())
     }
 
-    /// Restore the published paused state after an ordinary checkpoint has
-    /// released its guest barrier.
-    pub fn restore_public_pause_after_capture(&mut self) -> Result<(), Digest> {
-        if self.capture_paused || self.process.is_none() {
-            return Err(bytes_digest(b"firecracker-public-pause-restore-state"));
-        }
-        self.process
-            .as_ref()
-            .expect("process checked above")
-            .pause()
-            .map_err(|_| bytes_digest(b"firecracker-public-pause-restore"))
+    /// Finish a capture without silently resuming a publicly paused machine.
+    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), Digest> {
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        self.remove_full_snapshot()
     }
 
     /// Create engine state for the exact already-frozen workload boundary.
@@ -386,7 +349,6 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
             contain(&mut process);
         }
         self.applied_revision = None;
-        self.stop_quiesce = None;
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.full_snapshot = None;
@@ -409,7 +371,7 @@ impl<F: FirecrackerEpochFactory> FirecrackerDriver<F> {
     }
 }
 
-impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
+impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
     fn qualification(&self) -> DriverQualification {
         DriverQualification {
             engine: VmEngine::Firecracker,
@@ -431,7 +393,18 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         current: &MachineObservation,
     ) -> ConfigurationOutcome {
         let live = matches!(current.state, MachineState::Running | MachineState::Paused);
-        if command.sandbox_id != self.sandbox_id
+        if live
+            && self.boot_resources.as_ref().is_none_or(|resources| {
+                resources.vcpus != command.configuration.resources.vcpus
+                    || resources.memory_mib != command.configuration.resources.memory_mib
+                    || resources.disk_bytes != command.configuration.resources.disk_bytes
+            })
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"live-machine-geometry-change-unsupported",
+            ));
+        }
+        if command.machine_id != self.machine_id
             || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.process.is_some()
@@ -451,10 +424,10 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         }
         self.applied_revision = Some(command.revision);
         match digest(
-            Domain::Grant,
+            Domain::Authority,
             &(
                 "firecracker-configuration-installed-v1",
-                &command.sandbox_id,
+                &command.machine_id,
                 command.revision,
                 &command.request_digest,
             ),
@@ -474,7 +447,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         current: &MachineObservation,
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
-            return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+            return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
         if self.process.is_none()
             || self.applied_revision != Some(current.applied_revision)
@@ -488,7 +461,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Running,
             b"firecracker-already-running",
         )])
@@ -499,10 +472,10 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
-        self.boot(command, epoch)
+        self.boot(command, generation)
     }
 
     fn pause(
@@ -511,7 +484,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         current: &MachineObservation,
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
-            return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+            return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
         if self.capture_paused {
             return Self::unavailable(b"firecracker-filesystem-capture-active");
@@ -522,7 +495,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         match process.pause() {
             Ok(()) => MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Paused,
                 b"firecracker-pause-complete",
             )]),
@@ -536,7 +509,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         current: &MachineObservation,
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
-            return Self::unavailable(b"firecracker-sandbox-identity-mismatch");
+            return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
         if self.capture_paused {
             return Self::unavailable(b"firecracker-filesystem-capture-active");
@@ -547,7 +520,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         match process.resume() {
             Ok(()) => MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Running,
                 b"firecracker-resume-complete",
             )]),
@@ -597,7 +570,7 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         }
         MachineOutcome::Observed(vec![transition_with_digest(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Suspended,
             b"firecracker-snapshot-committed-and-vmm-released",
             &manifest,
@@ -615,13 +588,13 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         let Some(source) = self.staged_restore.take() else {
             return Self::unavailable(b"firecracker-restore-not-staged");
         };
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
         let (configuration, restore) =
             match self
                 .factory
-                .restore_configuration(&self.sandbox_id, epoch, &source)
+                .restore_configuration(&self.machine_id, generation, &source)
             {
                 Ok(value) => value,
                 Err(evidence) => return MachineOutcome::NotApplied(evidence),
@@ -637,20 +610,21 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
             contain(&mut process);
             return MachineOutcome::Unknown;
         }
-        let authentication =
-            match self
-                .factory
-                .authenticate_restore(&self.sandbox_id, epoch, &mut process)
-            {
-                Ok(value) => value,
-                Err(evidence) => {
-                    eprintln!("sandsurf restored guest rebind failed: {evidence:?}");
-                    contain(&mut process);
-                    return MachineOutcome::Unknown;
-                }
-            };
+        let binding = match self.factory.bind_restored_management(
+            &self.machine_id,
+            generation,
+            &mut process,
+        ) {
+            Ok(value) => value,
+            Err(evidence) => {
+                eprintln!(
+                    "sandsurf restored management binding unavailable: {evidence:?}; native computer remains running"
+                );
+                evidence
+            }
+        };
         self.process = Some(process);
-        self.stop_quiesce = None;
+        self.boot_resources = Some(command.configuration.resources.clone());
         self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;
@@ -659,17 +633,17 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         MachineOutcome::Observed(vec![
             transition_with_digest(
                 command,
-                epoch,
+                generation,
                 MachineState::Restoring,
                 b"firecracker-snapshot-loaded-paused",
                 &source.manifest_digest,
             ),
             transition_with_digest(
                 command,
-                epoch,
+                generation,
                 MachineState::Running,
-                b"firecracker-restored-guest-rebound",
-                &authentication,
+                b"firecracker-native-restored",
+                &binding,
             ),
         ])
     }
@@ -694,13 +668,13 @@ impl<F: FirecrackerEpochFactory> MachineDriver for FirecrackerDriver<F> {
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroying,
                 b"firecracker-destroying",
             ),
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroyed,
                 b"firecracker-owner-released",
             ),
@@ -732,16 +706,22 @@ fn qualification(evidence: Option<Digest>, reason: &str) -> Qualification {
 
 fn transition(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     evidence: &[u8],
 ) -> MachineTransition {
-    transition_with_digest(command, epoch, state, evidence, &command.request_digest)
+    transition_with_digest(
+        command,
+        generation,
+        state,
+        evidence,
+        &command.request_digest,
+    )
 }
 
 fn transition_with_digest(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     evidence: &[u8],
     extra: &Digest,
@@ -751,7 +731,7 @@ fn transition_with_digest(
     value.extend_from_slice(command.request_digest.as_str().as_bytes());
     value.extend_from_slice(extra.as_str().as_bytes());
     MachineTransition {
-        epoch,
+        generation,
         state,
         evidence_digest: bytes_digest(&value),
     }

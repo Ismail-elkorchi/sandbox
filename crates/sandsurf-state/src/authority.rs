@@ -66,29 +66,6 @@ impl HostAuthority {
         &self.binding
     }
 
-    pub(crate) fn authorize_mutation(
-        &self,
-        mutation: Mutation,
-        capability: Capability,
-        scope_digest: Digest,
-        grant_revision: Counter,
-    ) -> Result<AuthorizedMutation> {
-        let statement = AuthorizedMutationStatement {
-            version: AUTHORITY_VERSION,
-            host_id: self.binding.host_id.clone(),
-            key_id: self.binding.key_id.clone(),
-            mutation,
-            capability,
-            scope_digest,
-            grant_revision,
-        };
-        let signature = self.sign("host-authorized-mutation-v1", &statement)?;
-        Ok(AuthorizedMutation {
-            statement,
-            signature,
-        })
-    }
-
     pub(crate) fn authorize_lifecycle(
         &self,
         command: LifecycleCommand,
@@ -125,8 +102,8 @@ impl HostAuthority {
 
     pub(crate) fn authorize_loss(
         &self,
-        sandbox_id: SandboxId,
-        process_id: ProcessId,
+        machine_id: MachineId,
+        execution_id: ExecutionId,
         receipt_digest: Digest,
         output: OutputBoundary,
         approval_id: CommitmentId,
@@ -136,8 +113,8 @@ impl HostAuthority {
             version: AUTHORITY_VERSION,
             host_id: self.binding.host_id.clone(),
             key_id: self.binding.key_id.clone(),
-            sandbox_id,
-            process_id,
+            machine_id,
+            execution_id,
             receipt_digest,
             output,
             approval_id,
@@ -180,17 +157,6 @@ impl AuthorityVerifier {
 
     pub(crate) fn binding(&self) -> &AuthorityBinding {
         &self.binding
-    }
-
-    pub(crate) fn verify_mutation(&self, value: &AuthorizedMutation) -> Result<()> {
-        self.verify_statement(
-            value.statement.version,
-            &value.statement.host_id,
-            &value.statement.key_id,
-            "host-authorized-mutation-v1",
-            &value.statement,
-            &value.signature,
-        )
     }
 
     pub(crate) fn verify_lifecycle(&self, value: &AuthorizedLifecycle) -> Result<()> {

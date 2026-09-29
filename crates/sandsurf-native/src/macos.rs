@@ -54,7 +54,7 @@ pub fn require_private_path_acl(path: &Path) -> io::Result<()> {
     check_path(path, 0)
 }
 
-/// Ancestors may grant read/search, but not replacement, metadata mutation or
+/// Ancestors may grant read/search, but not replacement, metadata command or
 /// ownership/security changes. Mode/ownership/sticky-bit checks are also required.
 pub fn require_protected_ancestor_acl(path: &Path) -> io::Result<()> {
     check_path(path, READ_ONLY_PERMISSIONS)

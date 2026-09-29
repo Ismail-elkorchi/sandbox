@@ -18,8 +18,8 @@ This report records the platform constraints and the proof still required before
 
 ## Proposed implementation boundary
 
-The per-Sandbox guardian owns the HCS system and operation handles, verified VM-native images, persistent writable disks, Hyper-V socket listener, and cleanup journal. Inputs and outputs use the bounded Sandsurf guest and transfer protocols. No host path is directly mounted into the guest.
+The per-Machine guardian owns the HCS system and operation handles, verified VM-native images, persistent writable disks, Hyper-V socket listener, and cleanup journal. Inputs and outputs use the bounded Sandsurf guest and transfer protocols. No host path is directly mounted into the guest.
 
 ## Release blockers
 
-The engine remains unqualified until Windows 11 and Windows Server hosts pass feature probing, Linux image boot, no-adapter bypass, authenticated control-plane denial, HCS-owner crash recovery, forced termination, disk/ACL cleanup, concurrent process/PTY replay, filesystem transfer, checkpoints, installed-package, and packed-install tests. Administrator-only Hyper-V socket service registration must be an explicit setup action, never an implicit runtime mutation.
+The engine remains unqualified until Windows 11 and Windows Server hosts pass feature probing, Linux image boot, no-adapter bypass, authenticated control-plane denial, HCS-owner crash recovery, forced termination, disk/ACL cleanup, concurrent process/PTY replay, filesystem transfer, snapshots, installed-package, and packed-install tests. Administrator-only Hyper-V socket service registration must be an explicit setup action, never an implicit runtime command.

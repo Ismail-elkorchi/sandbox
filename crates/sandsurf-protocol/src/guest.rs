@@ -1,8 +1,26 @@
 use crate::{
-    Capability, CheckpointId, Counter, Digest, GuestPath, Mutation, OperationId, OutputBoundary,
-    ProcessId, ProcessOutcome, SandboxId, SpawnRequest, Stream, TransferId, WatcherId,
+    Counter, Digest, ExecutionId, ExecutionOutcome, GuestCommand, GuestPath, MachineId,
+    OperationId, OutputBoundary, SnapshotId, SpawnRequest, Stream, TransferId, WatcherId,
 };
 use serde::{Deserialize, Serialize};
+
+/// Reported by guest software. Authentication binds transport, not truthful
+/// kernel identity or management state when the guest administrator is untrusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuestManagementIdentity {
+    pub boot_id: crate::GuestBootId,
+    pub instance_id: crate::ManagementInstanceId,
+}
+
+/// Host timestamp and generation fence around a guest-controlled report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuestManagementReport {
+    pub generation: Counter,
+    pub identity: GuestManagementIdentity,
+    pub observed_unix_millis: Counter,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,17 +76,74 @@ pub struct FileRange {
     pub offset: u64,
     pub bytes: Vec<u8>,
     pub eof: bool,
-    pub revision: FileRevision,
+    pub observation: FileReadObservation,
 }
 
-/// Capture-only bytes. The host computes the content digest while the exact
-/// filesystem freeze is held; ordinary reads retain their revision contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FrozenFileRange {
+pub struct FileRangeMetadata {
     pub offset: u64,
-    pub bytes: Vec<u8>,
     pub eof: bool,
+    pub observation: FileReadObservation,
+    pub chunks: Vec<crate::BinaryChunk>,
+}
+
+impl FileRange {
+    pub fn into_binary_parts(self) -> Result<(FileRangeMetadata, Vec<Vec<u8>>), crate::Invalid> {
+        if self.bytes.len() > crate::MAX_STREAM_BYTES {
+            return Err(crate::Invalid("file range exceeds its byte bound"));
+        }
+        let bytes = if self.bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.bytes]
+        };
+        let metadata = FileRangeMetadata {
+            offset: self.offset,
+            eof: self.eof,
+            observation: self.observation,
+            chunks: crate::describe_binary(&bytes)?,
+        };
+        metadata.validate()?;
+        Ok((metadata, bytes))
+    }
+}
+impl FileRangeMetadata {
+    pub fn validate(&self) -> Result<usize, crate::Invalid> {
+        let length = crate::validate_binary(&self.chunks, crate::MAX_STREAM_BYTES)?;
+        let end = self
+            .offset
+            .checked_add(length as u64)
+            .ok_or(crate::Invalid("file range overflow"))?;
+        if end > self.observation.size
+            || self.eof != (end == self.observation.size)
+            || (length == 0 && !self.eof)
+        {
+            return Err(crate::Invalid("file range coverage is invalid"));
+        }
+        Ok(length)
+    }
+    pub fn with_binary_parts(self, bytes: Vec<Vec<u8>>) -> Result<FileRange, crate::Invalid> {
+        self.validate()?;
+        if crate::describe_binary(&bytes)? != self.chunks {
+            return Err(crate::Invalid("file data differs from metadata"));
+        }
+        Ok(FileRange {
+            offset: self.offset,
+            bytes: bytes.into_iter().flatten().collect(),
+            eof: self.eof,
+            observation: self.observation,
+        })
+    }
+}
+
+/// A guest-reported metadata token for detecting changes during a live read.
+/// It is not a content digest, a point-in-time snapshot, or host attestation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileReadObservation {
+    pub size: u64,
+    pub token: Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +159,7 @@ pub enum WatchEventKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WatchEvent {
     pub watcher_id: WatcherId,
-    pub epoch: Counter,
+    pub generation: Counter,
     pub sequence: Counter,
     pub kind: WatchEventKind,
     pub path: Option<GuestPath>,
@@ -128,10 +203,103 @@ pub struct RetainedPageMetadata {
     pub required_bytes: Option<Counter>,
 }
 
+impl RetainedPage {
+    pub fn into_binary_parts(self) -> Result<(RetainedPageMetadata, Vec<Vec<u8>>), crate::Invalid> {
+        let mut chunks = Vec::with_capacity(self.chunks.len());
+        let mut data = Vec::with_capacity(self.chunks.len());
+        for chunk in self.chunks {
+            if crate::bytes_digest(&chunk.bytes) != chunk.digest {
+                return Err(crate::Invalid("retained chunk digest mismatch"));
+            }
+            chunks.push(RetainedChunkMetadata {
+                cursor: chunk.cursor,
+                stream: chunk.stream,
+                length: u32::try_from(chunk.bytes.len())
+                    .map_err(|_| crate::Invalid("retained chunk length overflow"))?,
+                digest: chunk.digest,
+            });
+            data.push(chunk.bytes);
+        }
+        let metadata = RetainedPageMetadata {
+            after: self.after,
+            available: self.available,
+            chunks,
+            required_bytes: self.required_bytes,
+        };
+        metadata.validate_lengths()?;
+        Ok((metadata, data))
+    }
+}
+
+impl RetainedPageMetadata {
+    pub fn validate_lengths(&self) -> Result<usize, crate::Invalid> {
+        if self.after > self.available
+            || self.chunks.len() > 256
+            || (!self.chunks.is_empty() && self.required_bytes.is_some())
+        {
+            return Err(crate::Invalid("retained page bounds invalid"));
+        }
+        let mut cursor = self.after;
+        let mut total = 0_usize;
+        for chunk in &self.chunks {
+            if chunk.cursor != cursor
+                || chunk.length == 0
+                || chunk.length as usize > crate::MAX_STREAM_BYTES
+            {
+                return Err(crate::Invalid("retained page is not contiguous"));
+            }
+            cursor = cursor.checked_add(u64::from(chunk.length))?;
+            total = total
+                .checked_add(chunk.length as usize)
+                .filter(|value| *value <= crate::MAX_CONTROL_BYTES)
+                .ok_or(crate::Invalid("retained page byte bound exceeded"))?;
+        }
+        if cursor > self.available
+            || self.required_bytes.is_some_and(|value| {
+                value == Counter::ZERO || value.get() > crate::MAX_STREAM_BYTES as u64
+            })
+        {
+            return Err(crate::Invalid("retained page cursor invalid"));
+        }
+        Ok(total)
+    }
+
+    pub fn with_binary_parts(self, data: Vec<Vec<u8>>) -> Result<RetainedPage, crate::Invalid> {
+        self.validate_lengths()?;
+        if self.chunks.len() != data.len() {
+            return Err(crate::Invalid("retained page chunk count mismatch"));
+        }
+        let chunks = self
+            .chunks
+            .into_iter()
+            .zip(data)
+            .map(|(chunk, bytes)| {
+                if bytes.len() != chunk.length as usize
+                    || crate::bytes_digest(&bytes) != chunk.digest
+                {
+                    return Err(crate::Invalid("retained page bytes mismatch"));
+                }
+                Ok(RetainedChunk {
+                    cursor: chunk.cursor,
+                    stream: chunk.stream,
+                    bytes,
+                    digest: chunk.digest,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RetainedPage {
+            after: self.after,
+            available: self.available,
+            chunks,
+            required_bytes: self.required_bytes,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessCompletion {
-    pub outcome: ProcessOutcome,
+pub struct ExecutionCompletion {
+    pub outcome: ExecutionOutcome,
     pub output: OutputBoundary,
     pub cleanup_digest: Digest,
     pub accounting_digest: Digest,
@@ -144,28 +312,36 @@ pub struct ProcessCompletion {
     rename_all_fields = "camelCase",
     deny_unknown_fields
 )]
-pub enum ProcessState {
+pub enum ExecutionState {
     Running,
-    Exited(ProcessCompletion),
-    Unknown { evidence: Digest },
+    /// The command leader has exited. Inherited output descriptors may still
+    /// belong to independent Linux processes, so capture is not yet complete.
+    Draining {
+        outcome: ExecutionOutcome,
+        accounting_digest: Digest,
+    },
+    Exited(ExecutionCompletion),
+    Unknown {
+        evidence: Digest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessSnapshot {
+pub struct ExecutionSnapshot {
     pub request: SpawnRequest,
     pub guest_pid: u32,
-    pub state: ProcessState,
+    pub state: ExecutionState,
     #[serde(default)]
-    pub lineage: Option<ProcessLineage>,
+    pub lineage: Option<ExecutionLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProcessLineage {
-    pub source_sandbox_id: SandboxId,
-    pub source_epoch: Counter,
-    pub checkpoint_id: CheckpointId,
+pub struct ExecutionLineage {
+    pub source_machine_id: MachineId,
+    pub source_generation: Counter,
+    pub snapshot_id: SnapshotId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,48 +352,15 @@ pub struct ProcessLineage {
     deny_unknown_fields
 )]
 pub enum GuestServiceRequest {
-    /// Guardian-only machine shutdown barrier. The host API never forwards
-    /// this request from an application.
-    PrepareStop,
-    /// Guardian-only disk/full-state capture barrier. The workload cgroup is
-    /// frozen and its persistent filesystem synchronized; the guardian then
-    /// pauses the VM before copying mutable disk or memory state.
-    PrepareFilesystemCapture {
-        operation_id: OperationId,
-    },
-    /// Guardian-only release after the VM has resumed from disk/full capture.
-    FinishFilesystemCapture {
-        operation_id: OperationId,
-    },
-    /// Freeze workload writers for a host-owned immutable tree transfer while
-    /// leaving the guest supervisor running to serve bounded file reads.
-    PrepareGuestTreeCapture {
-        operation_id: OperationId,
-    },
-    FinishGuestTreeCapture {
-        operation_id: OperationId,
-    },
-    /// Trusted capture worker reads the frozen workload tree under the exact
-    /// barrier identity. Applications cannot route this request directly.
-    CaptureFilesystemQuery {
-        operation_id: OperationId,
-        request: FilesystemRequest,
-    },
-    CaptureFilesystemRead {
-        operation_id: OperationId,
-        path: GuestPath,
-        offset: u64,
-        maximum: u32,
-    },
     /// Guardian-only restore handshake sent over the captured boot capability.
     /// The response is sealed under that old session; all later connections
-    /// require the new epoch and capability.
-    RebindEpoch {
-        checkpoint_id: CheckpointId,
+    /// require the new generation and capability.
+    RebindGeneration {
+        snapshot_id: SnapshotId,
         capture_operation_id: OperationId,
-        sandbox_id: SandboxId,
-        previous_epoch: Counter,
-        epoch: Counter,
+        machine_id: MachineId,
+        previous_generation: Counter,
+        generation: Counter,
         boot_identity: Digest,
         capability: [u8; 32],
         network_capability: [u8; 32],
@@ -237,27 +380,22 @@ pub enum GuestServiceRequest {
     RevokeSecret {
         operation_id: OperationId,
         secret_id: crate::SecretId,
-        version: Digest,
+        version: crate::SecretVersionId,
         deliveries: Vec<crate::SecretDelivery>,
         terminate_recipients: bool,
     },
-    ApplyResources {
-        resources: crate::LiveResourceLimits,
-    },
-    ResourceUsage,
     FilesystemQuery {
         request: FilesystemRequest,
     },
     Dispatch {
-        mutation: Mutation,
-        capability: Capability,
+        command: GuestCommand,
     },
     Process {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
     },
     Processes,
     ReadOutput {
-        process_id: ProcessId,
+        execution_id: ExecutionId,
         after: Counter,
         maximum: u32,
     },
@@ -309,9 +447,6 @@ pub enum FilesystemRequest {
     AbortWrite {
         transfer: FileTransfer,
     },
-    Transaction {
-        transaction: FileTransaction,
-    },
     Mkdir {
         path: GuestPath,
         recursive: bool,
@@ -337,22 +472,54 @@ pub enum FilesystemRequest {
     },
     Watch {
         watcher_id: WatcherId,
-        epoch: Counter,
+        generation: Counter,
         path: GuestPath,
         recursive: bool,
     },
     PollWatch {
         watcher_id: WatcherId,
-        epoch: Counter,
+        generation: Counter,
         maximum: u16,
     },
     Unwatch {
         watcher_id: WatcherId,
-        epoch: Counter,
+        generation: Counter,
     },
 }
 
 impl FilesystemRequest {
+    pub(crate) fn validate_metadata(&self, length: Option<usize>) -> Result<(), crate::Invalid> {
+        match (self, length) {
+            (Self::Write { bytes, mode, .. }, Some(length))
+                if bytes.is_empty() && length <= crate::MAX_STREAM_BYTES && mode & !0o7777 == 0 =>
+            {
+                Ok(())
+            }
+            (
+                Self::WriteChunk {
+                    transfer,
+                    offset,
+                    bytes,
+                },
+                Some(length),
+            ) if bytes.is_empty()
+                && transfer.validate().is_ok()
+                && length > 0
+                && length <= crate::MAX_STREAM_BYTES
+                && offset
+                    .checked_add(length as u64)
+                    .is_some_and(|end| end <= transfer.length) =>
+            {
+                Ok(())
+            }
+            (Self::Write { .. } | Self::WriteChunk { .. }, _) => Err(crate::Invalid(
+                "filesystem metadata has an invalid byte descriptor",
+            )),
+            (_, None) => self.validate(),
+            _ => Err(crate::Invalid("filesystem metadata has unexpected bytes")),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), crate::Invalid> {
         match self {
             Self::List { maximum, .. } | Self::PollWatch { maximum, .. }
@@ -392,9 +559,6 @@ impl FilesystemRequest {
             {
                 return Err(crate::Invalid("filesystem transfer chunk is invalid"));
             }
-            Self::Transaction { transaction } if transaction.validate().is_err() => {
-                return Err(crate::Invalid("filesystem transaction is invalid"));
-            }
             Self::Chmod { mode, .. } if mode & !0o7777 != 0 => {
                 return Err(crate::Invalid("filesystem mode is invalid"));
             }
@@ -408,29 +572,6 @@ impl FilesystemRequest {
         Ok(())
     }
 
-    pub fn required_capability(&self) -> Capability {
-        match self {
-            Self::Stat { .. }
-            | Self::List { .. }
-            | Self::Read { .. }
-            | Self::Readlink { .. }
-            | Self::Watch { .. }
-            | Self::PollWatch { .. }
-            | Self::Unwatch { .. } => Capability::ReadFiles,
-            Self::Write { .. }
-            | Self::BeginWrite { .. }
-            | Self::WriteChunk { .. }
-            | Self::CommitWrite { .. }
-            | Self::AbortWrite { .. }
-            | Self::Transaction { .. }
-            | Self::Mkdir { .. }
-            | Self::Rename { .. }
-            | Self::Remove { .. }
-            | Self::Chmod { .. }
-            | Self::Symlink { .. } => Capability::WriteFiles,
-        }
-    }
-
     pub fn is_query(&self) -> bool {
         matches!(
             self,
@@ -441,73 +582,6 @@ impl FilesystemRequest {
                 | Self::PollWatch { .. }
         )
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct FileTransaction {
-    pub id: OperationId,
-    pub mutations: Vec<FileMutation>,
-}
-
-impl FileTransaction {
-    pub fn validate(&self) -> Result<(), crate::Invalid> {
-        if self.mutations.is_empty() || self.mutations.len() > 1024 {
-            return Err(crate::Invalid(
-                "filesystem transaction mutation count is invalid",
-            ));
-        }
-        let mut bytes = 0_usize;
-        let mut paths = std::collections::BTreeSet::new();
-        for mutation in &self.mutations {
-            let path = match mutation {
-                FileMutation::Write {
-                    path,
-                    bytes: value,
-                    mode,
-                    ..
-                } => {
-                    bytes = bytes
-                        .checked_add(value.len())
-                        .ok_or(crate::Invalid("filesystem transaction is oversized"))?;
-                    if *mode & !0o7777 != 0 {
-                        return Err(crate::Invalid("filesystem transaction mode is invalid"));
-                    }
-                    path
-                }
-                FileMutation::Remove { path, .. } => path,
-            };
-            if !paths.insert(path.as_bytes()) {
-                return Err(crate::Invalid(
-                    "filesystem transaction repeats a destination",
-                ));
-            }
-        }
-        if bytes > crate::MAX_STREAM_BYTES {
-            return Err(crate::Invalid("filesystem transaction is oversized"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum FileMutation {
-    Write {
-        path: GuestPath,
-        bytes: Vec<u8>,
-        mode: u32,
-        expected: FileExpectation,
-    },
-    Remove {
-        path: GuestPath,
-        expected: FileExpectation,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,7 +614,6 @@ impl FileTransfer {
 pub enum FileExpectation {
     Any,
     Absent,
-    Matches { size: u64, digest: Digest },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,43 +624,29 @@ pub enum FileExpectation {
     deny_unknown_fields
 )]
 pub enum GuestServiceResponse {
-    ReadyToStop {
-        evidence: Digest,
-    },
-    FilesystemCapturePrepared {
-        evidence: Digest,
-    },
-    FilesystemCaptureFinished {
-        evidence: Digest,
-    },
-    EpochRebound {
+    GenerationRebound {
         evidence: Digest,
     },
     Identity {
-        sandbox_id: SandboxId,
-        epoch: Counter,
+        machine_id: MachineId,
+        generation: Counter,
         boot_identity: Digest,
+        management: GuestManagementIdentity,
     },
     SecretInstalled {
         evidence: Digest,
     },
-    SecretRevoked {
-        evidence: crate::SecretRevocationEvidence,
-    },
-    ResourcesApplied {
-        evidence: Digest,
-    },
-    ResourceUsage {
-        usage: crate::ResourceUsage,
+    SecretCleanupReported {
+        report: crate::SecretCleanupReport,
     },
     Effect {
         outcome: GuestEffectOutcome,
     },
     Process {
-        process: Box<ProcessSnapshot>,
+        process: Box<ExecutionSnapshot>,
     },
     Processes {
-        processes: Vec<ProcessSnapshot>,
+        processes: Vec<ExecutionSnapshot>,
     },
     Output {
         page: RetainedPage,
@@ -598,13 +657,86 @@ pub enum GuestServiceResponse {
     File {
         response: FilesystemResponse,
     },
-    FilesystemCaptureRead {
-        range: FrozenFileRange,
-    },
     Error {
         code: String,
         message: String,
     },
+}
+
+impl GuestServiceResponse {
+    pub fn into_wire_parts(self) -> Result<crate::WireParts<Self>, crate::Invalid> {
+        match self {
+            Self::Output { page } => {
+                let (page, bytes) = page.into_binary_parts()?;
+                if page.validate_lengths()? > crate::MAX_STREAM_BYTES {
+                    return Err(crate::Invalid("guest output exceeds its response credit"));
+                }
+                Ok((Self::OutputMetadata { page }, Some(bytes)))
+            }
+            Self::File {
+                response: FilesystemResponse::Read { range },
+            } => {
+                let (range, bytes) = range.into_binary_parts()?;
+                Ok((
+                    Self::File {
+                        response: FilesystemResponse::ReadMetadata { range },
+                    },
+                    Some(bytes),
+                ))
+            }
+            Self::OutputMetadata { .. }
+            | Self::File {
+                response: FilesystemResponse::ReadMetadata { .. },
+            } => Err(crate::Invalid(
+                "internal response cannot originate wire-only metadata",
+            )),
+            other => Ok((other, None)),
+        }
+    }
+    pub fn binary_descriptor(&self) -> Result<Option<Vec<crate::BinaryChunk>>, crate::Invalid> {
+        match self {
+            Self::OutputMetadata { page } => {
+                if page.validate_lengths()? > crate::MAX_STREAM_BYTES {
+                    return Err(crate::Invalid("guest output exceeds its response credit"));
+                }
+                Ok(Some(
+                    page.chunks
+                        .iter()
+                        .map(|chunk| crate::BinaryChunk {
+                            length: chunk.length,
+                            digest: chunk.digest.clone(),
+                        })
+                        .collect(),
+                ))
+            }
+            Self::File {
+                response: FilesystemResponse::ReadMetadata { range },
+            } => {
+                range.validate()?;
+                Ok(Some(range.chunks.clone()))
+            }
+            Self::Output { .. }
+            | Self::File {
+                response: FilesystemResponse::Read { .. },
+            } => Err(crate::Invalid("RPC bytes must use binary data frames")),
+            _ => Ok(None),
+        }
+    }
+    pub fn with_wire_bytes(self, bytes: Vec<Vec<u8>>) -> Result<Self, crate::Invalid> {
+        match self {
+            Self::OutputMetadata { page } => Ok(Self::Output {
+                page: page.with_binary_parts(bytes)?,
+            }),
+            Self::File {
+                response: FilesystemResponse::ReadMetadata { range },
+            } => Ok(Self::File {
+                response: FilesystemResponse::Read {
+                    range: range.with_binary_parts(bytes)?,
+                },
+            }),
+            _ => Err(crate::Invalid("response has no binary metadata")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,26 +763,9 @@ pub enum FilesystemResponse {
     Stat { value: FileStat },
     List { page: DirectoryPage },
     Read { range: FileRange },
+    ReadMetadata { range: FileRangeMetadata },
     Written { revision: FileRevision },
     Link { target: Vec<u8> },
     Watch { events: Vec<WatchEvent> },
     Complete,
-}
-
-#[cfg(test)]
-mod capture_frame_tests {
-    use super::*;
-
-    #[test]
-    fn worst_case_frozen_chunk_fits_one_control_frame() {
-        let response = GuestServiceResponse::FilesystemCaptureRead {
-            range: FrozenFileRange {
-                offset: u64::MAX,
-                bytes: vec![255; crate::MAX_CONTROL_BYTE_PAGE],
-                eof: false,
-            },
-        };
-        let bytes = serde_json::to_vec(&response).unwrap();
-        assert!(bytes.len() < crate::MAX_CONTROL_BYTES);
-    }
 }

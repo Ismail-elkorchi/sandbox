@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, lstat, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -8,11 +8,40 @@ import { fileURLToPath } from "node:url";
 import { createGunzip, createGzip } from "node:zlib";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const images = resolve(repository, "packages/sandbox/images");
+const images = resolve(repository, "packages/sandsurf/images");
 const sources = resolve(repository, "image-sources");
 const maximumImageBytes = 8 * 1024 ** 3;
 
 type ImageEntry = { readonly raw: string; readonly compressed: string; readonly sha256: string };
+
+export async function writeImageIndex(root = images, required: readonly string[] = []): Promise<void> {
+  const missing = new Set(required);
+  for (const architecture of missing) if (architecture !== "x64" && architecture !== "arm64") {
+    throw new Error(`unsupported required guest architecture ${architecture}`);
+  }
+  const files: Record<string, string> = {};
+  for (const directory of (await readdir(root, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+    const match = /^development-(x64|arm64)$/u.exec(directory.name);
+    if (!directory.isDirectory() || match === null) continue;
+    const relative = `${directory.name}/manifest.json`;
+    const path = resolve(root, relative);
+    let metadata;
+    try { metadata = await lstat(path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 ** 2) throw new Error(`${relative} is not a bounded regular manifest`);
+    const bytes = await readFile(path);
+    const manifest: unknown = JSON.parse(bytes.toString("utf8"));
+    if (!record(manifest) || manifest.formatVersion !== 3 || manifest.architecture !== match[1]
+      || !record(manifest.system) || !record(manifest.system.rootfs) || !record(manifest.bootBundle)) {
+      throw new Error(`${relative} is not a current machine image`);
+    }
+    files[relative] = createHash("sha256").update(bytes).digest("hex");
+    missing.delete(match[1]!);
+  }
+  if (missing.size !== 0) throw new Error(`required guest images are absent: ${[...missing].join(", ")}`);
+  if (Object.keys(files).length === 0) throw new Error("no machine images were found");
+  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({ formatVersion: 1, buildId: "sandsurf-images-0.1.0", files }, null, 2)}\n`, { mode: 0o644 });
+}
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21,10 +50,11 @@ function record(value: unknown): value is Record<string, unknown> {
 async function entries(architecture: "x64" | "arm64"): Promise<ImageEntry[]> {
   const directory = `development-${architecture}`;
   const manifest: unknown = JSON.parse(await readFile(resolve(images, directory, "manifest.json"), "utf8"));
-  if (!record(manifest) || !record(manifest.bootBundle) || !record(manifest.workload)) {
+  if (!record(manifest) || !record(manifest.bootBundle) || !record(manifest.system)) {
     throw new Error(`${directory} image manifest is malformed`);
   }
-  const artifacts = [manifest.bootBundle.bootstrap, manifest.workload.rootfs, manifest.workload.stateTemplate];
+  if (manifest.formatVersion !== 3) throw new Error(`${directory} is not a machine image`);
+  const artifacts = [manifest.system.rootfs];
   return artifacts.map((artifact) => {
     if (!record(artifact) || typeof artifact.path !== "string" ||
         !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.ext4$/u.test(artifact.path) ||

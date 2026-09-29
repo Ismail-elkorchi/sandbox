@@ -15,13 +15,11 @@
 mod authority;
 mod catalog;
 mod database;
-mod disks;
 mod runtime;
 #[cfg(target_os = "windows")]
 mod windows;
 
 pub use catalog::*;
-pub use disks::*;
 pub use runtime::*;
 
 /// Return the stable filesystem identity of a non-reparse Windows directory.

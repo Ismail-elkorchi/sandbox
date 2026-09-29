@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const nativeRoot = resolve("packages/sandbox/native");
+const nativeRoot = resolve("packages/sandsurf/native");
 const files: Record<string, string> = {};
 await collect("");
 if (Object.keys(files).length === 0) throw new Error("no native runtimes were found");

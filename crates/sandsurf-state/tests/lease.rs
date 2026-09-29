@@ -19,7 +19,6 @@ fn intentional_writer_close_releases_a_fork_inherited_lease() {
     let limits = CatalogLimits {
         identities: Counter::ONE,
         operations: Counter::ONE,
-        grants: Counter::ONE,
         usage_records: Counter::ONE,
         image_bytes: Counter::ONE,
         resources: Resources {
@@ -27,7 +26,7 @@ fn intentional_writer_close_releases_a_fork_inherited_lease() {
             memory_mib: Counter::ONE,
             disk_bytes: Counter::ONE,
             output_bytes: Counter::ONE,
-            processes: Counter::ONE,
+            managed_executions: Counter::ONE,
         },
     };
     let host =

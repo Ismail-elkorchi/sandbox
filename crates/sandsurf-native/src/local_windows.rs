@@ -205,7 +205,7 @@ fn require_current_user(process_id: u32) -> io::Result<()> {
 
 /// SDDL granting generic-all only to LocalSystem and the current account.
 /// HCS uses this for the per-VM Hyper-V socket service table; guest protocol
-/// authentication remains a separate, epoch-bound boundary.
+/// authentication remains a separate, generation-bound boundary.
 pub fn current_user_sddl() -> io::Result<String> {
     Ok(format!(
         "D:P(A;;GA;;;SY)(A;;GA;;;{})",
@@ -253,6 +253,17 @@ impl SecurityDescriptor {
 
 /// Atomically provision a protected current-user directory suitable for a local
 /// endpoint. Existing paths are never adopted or chmodded.
+pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            Directory::open(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_directory(path),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn create_private_directory(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(invalid("local endpoint root must be absolute"));
@@ -346,7 +357,25 @@ impl Lease {
     }
 }
 
-fn open_or_create_private_file(path: &Path) -> io::Result<File> {
+pub fn open_private_file(path: &Path) -> io::Result<File> {
+    Directory::open(
+        path.parent()
+            .ok_or_else(|| invalid("private file requires a parent"))?,
+    )?;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    validate_private(&file, false, false)?;
+    Ok(file)
+}
+
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    Directory::open(
+        path.parent()
+            .ok_or_else(|| invalid("private file requires a parent"))?,
+    )?;
     let descriptor = SecurityDescriptor::current_user(false)?;
     let attributes = descriptor.attributes();
     let path_wide = wide_os(path)?;
@@ -363,23 +392,28 @@ fn open_or_create_private_file(path: &Path) -> io::Result<File> {
             null_mut(),
         )
     };
-    let file = if handle == INVALID_HANDLE_VALUE {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error);
-        }
-        OpenOptions::new()
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned one newly owned file-compatible handle.
+    let file = unsafe { File::from_raw_handle(handle.cast()) };
+    validate_private(&file, false, false)?;
+    drop(descriptor);
+    Ok(file)
+}
+
+fn open_or_create_private_file(path: &Path) -> io::Result<File> {
+    let file = match create_private_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
             .read(true)
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?
-    } else {
-        // SAFETY: CreateFileW returned one newly owned file-compatible handle.
-        unsafe { File::from_raw_handle(handle.cast()) }
+            .open(path)?,
+        Err(error) => return Err(error),
     };
     validate_private(&file, false, false)?;
-    drop(descriptor);
     Ok(file)
 }
 impl Drop for Lease {

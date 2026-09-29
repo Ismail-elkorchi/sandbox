@@ -1,0 +1,15 @@
+[package]
+name = "sandsurf-fuzz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandsurf-fuzz-smoke"
+path = "src/main.rs"
+
+[dependencies]
+sandsurf-network = { path = "../sandsurf-network" }
+sandsurf-protocol = { path = "../sandsurf-protocol" }
+serde_json.workspace = true

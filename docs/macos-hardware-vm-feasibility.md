@@ -17,8 +17,8 @@ This report records the platform constraints and the proof still required before
 
 ## Proposed implementation boundary
 
-The per-Sandbox guardian owns the signed Swift helper, validated image files, persistent writable disks, the `VZVirtualMachine`, and Virtio socket connections. There is no shared-directory device: host inputs use bounded import and outputs use explicit change sets, preserving the common Linux Sandbox filesystem semantics.
+The per-Machine guardian owns the signed Swift helper, validated image files, persistent writable disks, the `VZVirtualMachine`, and Virtio socket connections. There is no shared-directory device: host inputs use bounded import and outputs use explicit change sets, preserving the common Linux Machine filesystem semantics.
 
 ## Release blockers
 
-The engine remains unqualified until signed Intel and Apple-silicon artifacts pass image boot, no-NIC bypass, authenticated-channel isolation, guardian/helper crash containment, persistent disk recovery, concurrent process/PTY replay, filesystem transfer, networking, checkpoint, installed-package, install-from-tarball, and notarization tests. A hosted runner where `VZVirtualMachine.isSupported` is false can validate builds but cannot produce this evidence.
+The engine remains unqualified until signed Intel and Apple-silicon artifacts pass image boot, no-NIC bypass, authenticated-channel isolation, guardian/helper crash containment, persistent disk recovery, concurrent process/PTY replay, filesystem transfer, networking, snapshot, installed-package, install-from-tarball, and notarization tests. A hosted runner where `VZVirtualMachine.isSupported` is false can validate builds but cannot produce this evidence.

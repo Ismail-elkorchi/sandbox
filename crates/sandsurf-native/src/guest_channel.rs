@@ -358,7 +358,7 @@ mod windows {
                 unsafe { closesocket(accepted) };
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "Hyper-V socket peer is not the owned Sandbox VM",
+                    "Hyper-V socket peer is not the owned Machine VM",
                 ));
             }
             // SAFETY: ownership of the accepted Winsock socket transfers once.

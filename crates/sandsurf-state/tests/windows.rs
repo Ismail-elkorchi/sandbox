@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use sandsurf_protocol::{
-    AuthorityBinding, Counter, DiskId, OperationId, Resources, SandboxId, bytes_digest,
+    AuthorityBinding, Counter, DiskId, MachineId, OperationId, Resources, bytes_digest,
 };
 use sandsurf_state::{
     CatalogLimits, DiskCopy, DiskPhase, DiskPurpose, HostCatalog, RuntimeJournal, RuntimeLimits,
@@ -20,7 +20,6 @@ fn windows_private_state_is_owner_only_reopenable_and_writer_exclusive() {
         CatalogLimits {
             identities: one,
             operations: one,
-            grants: one,
             usage_records: one,
             image_bytes: one,
             resources: Resources {
@@ -28,7 +27,7 @@ fn windows_private_state_is_owner_only_reopenable_and_writer_exclusive() {
                 memory_mib: one,
                 disk_bytes: one,
                 output_bytes: one,
-                processes: one,
+                managed_executions: one,
             },
         },
     )
@@ -58,10 +57,10 @@ fn windows_retained_disk_copy_is_verified_and_attachable() {
     let source_path = path.join("source.raw");
     fs::write(&source_path, &bytes).unwrap();
     let source = File::open(&source_path).unwrap();
-    let sandbox = SandboxId::try_from("windows-disk-box").unwrap();
+    let machine = MachineId::try_from("windows-disk-box").unwrap();
     let mut journal = RuntimeJournal::create(
         &path.join("runtime"),
-        sandbox,
+        machine,
         RuntimeLimits {
             identities: Counter::try_from(8).unwrap(),
             operations: Counter::try_from(8).unwrap(),
@@ -70,9 +69,6 @@ fn windows_retained_disk_copy_is_verified_and_attachable() {
             chunks: Counter::try_from(8).unwrap(),
             pins: Counter::try_from(8).unwrap(),
             output_bytes: Counter::try_from(1024).unwrap(),
-            disks: Counter::try_from(8).unwrap(),
-            disk_bytes: Counter::try_from(1024 * 1024).unwrap(),
-            disk_headroom_bytes: Counter::try_from(1024 * 1024).unwrap(),
         },
         AuthorityBinding {
             host_id: "windows-disk-host".try_into().unwrap(),
@@ -89,8 +85,8 @@ fn windows_retained_disk_copy_is_verified_and_attachable() {
     )
     .unwrap();
     let request = DiskCopy {
-        id: DiskId::try_from("workload").unwrap(),
-        operation_id: OperationId::try_from("copy-workload").unwrap(),
+        id: DiskId::try_from("defaults").unwrap(),
+        operation_id: OperationId::try_from("copy-defaults").unwrap(),
         source_digest: bytes_digest(&bytes),
         bytes: Counter::try_from(bytes.len() as u64).unwrap(),
         purpose: DiskPurpose::Workload,

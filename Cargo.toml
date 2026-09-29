@@ -6,17 +6,12 @@ members = [
   "crates/sandsurf-state",
   "crates/sandsurf-native",
   "crates/sandsurf-machine",
-  "crates/sandsurf-control",
-  "crates/sandsurf-workload",
   "crates/sandsurf-host",
-  "crates/sandbox-digest",
-  "crates/sandbox-policy",
-  "crates/sandbox-launcher-linux",
-  "crates/sandbox-network-broker",
-  "crates/sandbox-fuzz",
-  "crates/sandbox-image",
-  "crates/sandbox-vm",
-  "crates/sandbox-guest",
+  "crates/sandsurf-format",
+  "crates/sandsurf-network",
+  "crates/sandsurf-fuzz",
+  "crates/sandsurf-image",
+  "crates/sandsurf-guest",
 ]
 
 [workspace.package]
@@ -51,3 +46,8 @@ overflow-checks = true
 strip = "symbols"
 lto = "thin"
 codegen-units = 1
+
+# Debug host/image validation hashes whole disks. Optimize the small hashing
+# implementation without imposing release/LTO memory costs on native builds.
+[profile.dev.package.sha2]
+opt-level = 3

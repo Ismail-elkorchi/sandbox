@@ -1,20 +1,19 @@
-use sandsurf_control::{
-    EffectOutcome, Error as ControlError, Result as ControlResult, WorkloadDriver,
-};
+use crate::guardian::{EffectOutcome, Error as ControlError, GuestDriver, Result as ControlResult};
+use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 use sandsurf_native::{GuestChannel, GuestChannelError, GuestConnection};
 use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, CONTROL_COMPLETE, Counter, Frame, FrameKind,
-    GuestChallenge, GuestServiceRequest, GuestServiceResponse, HostHandshake, Mutation,
-    ProcessState, SessionCodec,
+    GuestChallenge, GuestCommand, GuestServiceRequest, GuestServiceResponse, HostHandshake,
+    SessionCodec,
 };
-use sandsurf_protocol::{Capability, Digest, SandboxId};
 use sandsurf_protocol::{
-    OUTPUT_DATA_STREAM, RetainedChunk, RetainedPage, RetainedPageMetadata, bytes_digest,
+    AuthenticatedFrameChannel, FilesystemRequest, FilesystemResponse, RequestEnvelope,
+    bytes_digest, receive_binary, send_binary,
 };
-use sandsurf_state::RuntimeJournal;
+use sandsurf_protocol::{Digest, MachineId};
 use std::fmt;
-use std::io;
-use std::time::Duration;
+use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -63,31 +62,95 @@ impl From<serde_json::Error> for GuestClientError {
 
 pub struct GuestClient<C> {
     channel: C,
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    machine_id: MachineId,
+    generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
     session: Option<GuestSession>,
 }
 
 struct GuestSession {
-    connection: Box<dyn GuestConnection>,
+    connection: DeadlineConnection,
     codec: SessionCodec,
     outgoing: Counter,
+}
+
+/// A fragmented frame has one absolute I/O deadline, not one per byte/read.
+struct DeadlineConnection {
+    inner: Box<dyn GuestConnection>,
+    deadline: Instant,
+}
+impl DeadlineConnection {
+    fn new(inner: Box<dyn GuestConnection>, timeout: Duration) -> Self {
+        Self {
+            inner,
+            deadline: Instant::now() + timeout,
+        }
+    }
+    fn renew(&mut self, timeout: Duration) {
+        self.deadline = Instant::now() + timeout;
+    }
+    fn bound(&self) -> io::Result<()> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "guest operation deadline exceeded")
+            })?;
+        self.inner.set_io_timeout(Some(remaining))
+    }
+}
+impl Read for DeadlineConnection {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.bound()?;
+        self.inner.read(bytes)
+    }
+}
+impl Write for DeadlineConnection {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bound()?;
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.bound()?;
+        self.inner.flush()
+    }
+}
+impl GuestConnection for DeadlineConnection {
+    fn set_io_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        self.bound()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn deliver_bootstrap(
+    mut channel: impl GuestChannel,
+    bytes: &[u8],
+) -> Result<(), GuestClientError> {
+    if bytes.len() > 4096 {
+        return Err(GuestClientError::Protocol(
+            "guest bootstrap exceeds its bound",
+        ));
+    }
+    let mut connection = DeadlineConnection::new(channel.connect()?, IO_TIMEOUT);
+    connection.write_all(bytes)?;
+    connection.flush()?;
+    Ok(())
 }
 
 impl<C: GuestChannel> GuestClient<C> {
     pub fn new(
         channel: C,
-        sandbox_id: SandboxId,
-        epoch: Counter,
+        machine_id: MachineId,
+        generation: Counter,
         boot_identity: Digest,
         capability: [u8; 32],
     ) -> Self {
         Self {
             channel,
-            sandbox_id,
-            epoch,
+            machine_id,
+            generation,
             boot_identity,
             capability,
             session: None,
@@ -102,30 +165,24 @@ impl<C: GuestChannel> GuestClient<C> {
             self.session = Some(self.connect()?);
         }
         let result = self.call_session(request);
-        if result.is_err()
-            || matches!(
-                request,
-                GuestServiceRequest::RebindEpoch { .. } | GuestServiceRequest::PrepareStop
-            )
-        {
+        if result.is_err() || matches!(request, GuestServiceRequest::RebindGeneration { .. }) {
             self.session = None;
         }
         result
     }
 
     fn connect(&mut self) -> Result<GuestSession, GuestClientError> {
-        let mut connection = self.channel.connect()?;
-        connection.set_io_timeout(Some(IO_TIMEOUT))?;
+        let mut connection = DeadlineConnection::new(self.channel.connect()?, IO_TIMEOUT);
         let (handshake, hello) = HostHandshake::start(
             BootCapability::from_bytes(self.capability),
-            self.sandbox_id.clone(),
-            self.epoch,
+            self.machine_id.clone(),
+            self.generation,
             self.boot_identity.clone(),
         )?;
-        write_unauthed(&mut *connection, &hello)?;
-        let challenge: GuestChallenge = read_unauthed(&mut *connection)?;
+        write_unauthed(&mut connection, &hello)?;
+        let challenge: GuestChallenge = read_unauthed(&mut connection)?;
         let (finish, codec) = handshake.finish(&challenge)?;
-        write_unauthed(&mut *connection, &finish)?;
+        write_unauthed(&mut connection, &finish)?;
         Ok(GuestSession {
             connection,
             codec,
@@ -141,7 +198,9 @@ impl<C: GuestChannel> GuestClient<C> {
             .session
             .as_mut()
             .ok_or(GuestClientError::Protocol("guest session is unavailable"))?;
-        let payload = serde_json::to_vec(request)?;
+        session.connection.renew(IO_TIMEOUT);
+        let (wire, bytes) = RequestEnvelope::split(request.clone())?;
+        let payload = serde_json::to_vec(&wire)?;
         if payload.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
             return Err(GuestClientError::Protocol(
                 "guest request exceeds control bound",
@@ -157,8 +216,17 @@ impl<C: GuestChannel> GuestClient<C> {
                 authentication: [0; AUTHENTICATION_BYTES],
                 payload,
             })?
-            .write(&mut *session.connection)?;
-        let response = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
+            .write(&mut session.connection)?;
+        if let Some(bytes) = bytes {
+            send_binary(
+                &mut AuthenticatedFrameChannel {
+                    io: &mut session.connection,
+                    codec: &mut session.codec,
+                },
+                bytes,
+            )?;
+        }
+        let response = Frame::read(&mut session.connection)?.ok_or(GuestClientError::Protocol(
             "guest closed without a response",
         ))?;
         let response = session.codec.open(response)?;
@@ -168,22 +236,42 @@ impl<C: GuestChannel> GuestClient<C> {
             ));
         }
         let response: GuestServiceResponse = serde_json::from_slice(&response.payload)?;
-        let response = match (request, response) {
-            (
-                GuestServiceRequest::ReadOutput { after, maximum, .. },
-                GuestServiceResponse::OutputMetadata { page },
-            ) if page.after == *after => GuestServiceResponse::Output {
-                page: read_output_frames(session, page, *maximum)?,
-            },
-            (_, GuestServiceResponse::OutputMetadata { .. })
-            | (_, GuestServiceResponse::Output { .. }) => {
-                return Err(GuestClientError::Protocol(
-                    "guest output did not use the requested binary stream",
-                ));
-            }
-            (_, response) => response,
+        let response = if let Some(metadata) = response.binary_descriptor()? {
+            let maximum = match (request, &response) {
+                (
+                    GuestServiceRequest::ReadOutput { after, maximum, .. },
+                    GuestServiceResponse::OutputMetadata { page },
+                ) if page.after == *after => *maximum as usize,
+                (
+                    GuestServiceRequest::FilesystemQuery {
+                        request:
+                            FilesystemRequest::Read {
+                                offset, maximum, ..
+                            },
+                    },
+                    GuestServiceResponse::File {
+                        response: FilesystemResponse::ReadMetadata { range },
+                    },
+                ) if range.offset == *offset => *maximum as usize,
+                _ => {
+                    return Err(GuestClientError::Protocol(
+                        "unexpected binary guest response",
+                    ));
+                }
+            };
+            let bytes = receive_binary(
+                &mut AuthenticatedFrameChannel {
+                    io: &mut session.connection,
+                    codec: &mut session.codec,
+                },
+                &metadata,
+                maximum,
+            )?;
+            response.with_wire_bytes(bytes)?
+        } else {
+            response
         };
-        let completion = Frame::read(&mut *session.connection)?.ok_or(
+        let completion = Frame::read(&mut session.connection)?.ok_or(
             GuestClientError::Protocol("guest closed without protocol completion"),
         )?;
         let completion = session.codec.open(completion)?;
@@ -199,112 +287,94 @@ impl<C: GuestChannel> GuestClient<C> {
     }
 }
 
-fn read_output_frames(
-    session: &mut GuestSession,
-    metadata: RetainedPageMetadata,
-    maximum: u32,
-) -> Result<RetainedPage, GuestClientError> {
-    let mut expected_cursor = metadata.after.get();
-    let mut total = 0usize;
-    for chunk in &metadata.chunks {
-        if chunk.length == 0
-            || chunk.length as usize > sandsurf_protocol::MAX_STREAM_BYTES
-            || chunk.cursor.get() != expected_cursor
-        {
-            return Err(GuestClientError::Protocol(
-                "guest output metadata is invalid",
-            ));
-        }
-        total = total
-            .checked_add(chunk.length as usize)
-            .ok_or(GuestClientError::Protocol(
-                "guest output page length overflow",
-            ))?;
-        expected_cursor = expected_cursor
-            .checked_add(chunk.length as u64)
-            .ok_or(GuestClientError::Protocol("guest output cursor overflow"))?;
-    }
-    if total > maximum as usize
-        || total > sandsurf_protocol::MAX_STREAM_BYTES
-        || expected_cursor > metadata.available.get()
-    {
-        return Err(GuestClientError::Protocol(
-            "guest output page exceeds its boundary",
-        ));
-    }
-    session.codec.open_stream(OUTPUT_DATA_STREAM, false)?;
-    session
-        .codec
-        .grant_receive_credit(OUTPUT_DATA_STREAM, total as u64)?;
-    session
-        .codec
-        .seal(Frame {
-            kind: FrameKind::Credit,
-            stream: OUTPUT_DATA_STREAM,
-            sequence: Counter::ONE,
-            authentication: [0; AUTHENTICATION_BYTES],
-            payload: (total as u64).to_be_bytes().to_vec(),
-        })?
-        .write(&mut *session.connection)?;
-    let mut chunks = Vec::with_capacity(metadata.chunks.len());
-    for chunk in metadata.chunks {
-        let frame = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
-            "guest output data is incomplete",
-        ))?;
-        let frame = session.codec.open(frame)?;
-        if frame.kind != FrameKind::Data
-            || frame.stream != OUTPUT_DATA_STREAM
-            || frame.payload.len() != chunk.length as usize
-            || bytes_digest(&frame.payload) != chunk.digest
-        {
-            return Err(GuestClientError::Protocol(
-                "guest output data differs from metadata",
-            ));
-        }
-        chunks.push(RetainedChunk {
-            cursor: chunk.cursor,
-            stream: chunk.stream,
-            bytes: frame.payload,
-            digest: chunk.digest,
-        });
-    }
-    let end = Frame::read(&mut *session.connection)?.ok_or(GuestClientError::Protocol(
-        "guest output stream end is missing",
-    ))?;
-    let end = session.codec.open(end)?;
-    if end.kind != FrameKind::End || end.stream != OUTPUT_DATA_STREAM {
-        return Err(GuestClientError::Protocol(
-            "guest output stream end is invalid",
-        ));
-    }
-    session.codec.close_stream(OUTPUT_DATA_STREAM)?;
-    Ok(RetainedPage {
-        after: metadata.after,
-        available: metadata.available,
-        chunks,
-        required_bytes: metadata.required_bytes,
-    })
-}
-
-pub struct RemoteWorkloadDriver<C> {
+pub struct ManagedGuestClient<C> {
     client: GuestClient<C>,
     reconcile_cursor: usize,
+    rebind: Option<PendingRebind<C>>,
 }
 
-impl<C> RemoteWorkloadDriver<C> {
-    pub fn new(client: GuestClient<C>) -> Self {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ManagementRebind {
+    pub machine_id: MachineId,
+    pub generation: Counter,
+    pub boot_identity: Digest,
+    pub capability: [u8; 32],
+    pub request: GuestServiceRequest,
+}
+
+pub struct PendingRebind<C> {
+    pub source: GuestClient<C>,
+    pub request: GuestServiceRequest,
+    attempted: bool,
+}
+impl<C> PendingRebind<C> {
+    pub fn new(source: GuestClient<C>, request: GuestServiceRequest) -> Self {
+        Self {
+            source,
+            request,
+            attempted: false,
+        }
+    }
+}
+
+impl<C> ManagedGuestClient<C> {
+    pub fn new(client: GuestClient<C>, rebind: Option<PendingRebind<C>>) -> Self {
         Self {
             client,
             reconcile_cursor: 0,
+            rebind,
         }
     }
 }
 
-impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
-    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
+impl<C: GuestChannel> ManagedGuestClient<C> {
+    fn ensure_bound(&mut self) -> ControlResult<()> {
+        let Some(pending) = self.rebind.as_mut() else {
+            return Ok(());
+        };
+        let current = |response: &GuestServiceResponse, client: &GuestClient<C>| {
+            matches!(response,
+            GuestServiceResponse::Identity { machine_id, generation, boot_identity, .. }
+            if machine_id == &client.machine_id && generation == &client.generation && boot_identity == &client.boot_identity)
+        };
+        if self
+            .client
+            .call(&GuestServiceRequest::ProbeIdentity)
+            .is_ok_and(|response| current(&response, &self.client))
+        {
+            self.rebind = None;
+            return Ok(());
+        }
+        if !pending.attempted {
+            // Delivery is ambiguous after transport failure. Never blindly replay
+            // the generation change; subsequent jobs probe the target identity.
+            pending.attempted = true;
+            let _ = pending.source.call(&pending.request);
+        }
+        if self
+            .client
+            .call(&GuestServiceRequest::ProbeIdentity)
+            .is_ok_and(|response| current(&response, &self.client))
+        {
+            self.rebind = None;
+            Ok(())
+        } else {
+            Err(ControlError::Unsupported(
+                "restored management binding unavailable; native computer remains running",
+            ))
+        }
+    }
+}
+
+impl<C: GuestChannel + Send> GuestDriver for ManagedGuestClient<C> {
+    fn dispatch(&mut self, command: &GuestCommand) -> EffectOutcome {
+        if self.ensure_bound().is_err() {
+            return EffectOutcome::NotApplied(bytes_digest(
+                b"management-binding-unavailable-before-command-delivery",
+            ));
+        }
         match self.client.call(&GuestServiceRequest::Dispatch {
-            mutation: mutation.clone(),
-            capability,
+            command: command.clone(),
         }) {
             Ok(GuestServiceResponse::Effect { outcome }) => effect(outcome),
             Ok(GuestServiceResponse::File { .. }) => EffectOutcome::Applied(
@@ -312,144 +382,127 @@ impl<C: GuestChannel> WorkloadDriver for RemoteWorkloadDriver<C> {
                     sandsurf_protocol::Domain::Operation,
                     &(
                         "guest-filesystem-applied-v1",
-                        &mutation.operation_id,
-                        &mutation.request_digest,
+                        &command.operation_id,
+                        &command.request_digest,
                     ),
                 )
                 .unwrap_or_else(|_| sandsurf_protocol::bytes_digest(b"guest-filesystem-applied")),
             ),
             Ok(GuestServiceResponse::Error { .. }) => EffectOutcome::NotApplied(
-                sandsurf_protocol::bytes_digest(b"guest-rejected-workload-operation"),
+                sandsurf_protocol::bytes_digest(b"guest-rejected-defaults-operation"),
             ),
             Ok(other) => {
-                eprintln!("sandsurf guest mutation returned an unexpected response: {other:?}");
+                eprintln!("sandsurf guest command returned an unexpected response: {other:?}");
                 EffectOutcome::Unknown
             }
             Err(error) => {
-                eprintln!("sandsurf guest mutation transport failed: {error}");
+                eprintln!("sandsurf guest command transport failed: {error}");
                 EffectOutcome::Unknown
             }
         }
     }
 
-    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        let processes = match self.client.call(&GuestServiceRequest::Processes) {
-            Ok(GuestServiceResponse::Processes { processes }) => processes,
-            _ => return Ok(()),
-        };
-        // Reconciliation shares the guardian owner with lifecycle and control.
-        // Drain a bounded, rotating slice instead of allowing a chatty service
-        // to hold that owner until its entire spool has been copied.
-        const RECONCILE_PROCESS_BUDGET: usize = 8;
-        let process_count = processes.len();
-        if process_count == 0 {
-            self.reconcile_cursor = 0;
-            return Ok(());
-        }
-        let start = self.reconcile_cursor % process_count;
-        let count = process_count.min(RECONCILE_PROCESS_BUDGET);
-        self.reconcile_cursor = (start + count) % process_count;
-        for offset in 0..count {
-            let snapshot = &processes[(start + offset) % process_count];
-            let process_id = &snapshot.request.process_id;
-            journal.observe_process(snapshot)?;
-            if matches!(&snapshot.state, ProcessState::Exited(_))
-                && journal.receipt(process_id)?.is_some()
+    fn poll(&mut self, hints: &ExecutionHints) -> ControlResult<GuestPoll> {
+        self.ensure_bound()?;
+        let identity = match self.client.call(&GuestServiceRequest::ProbeIdentity) {
+            Ok(GuestServiceResponse::Identity {
+                machine_id,
+                generation,
+                boot_identity,
+                management,
+            }) if machine_id == self.client.machine_id
+                && generation == self.client.generation
+                && boot_identity == self.client.boot_identity =>
             {
-                continue;
+                management
             }
-            let mut committed = journal.process_boundary(process_id)?;
-            let maximum = u32::try_from(sandsurf_protocol::MAX_STREAM_BYTES)
-                .map_err(|_| sandsurf_state::Error::Corrupt("stream bound overflow"))?;
-            let page = match self.client.call(&GuestServiceRequest::ReadOutput {
-                process_id: process_id.clone(),
-                after: committed.final_cursor,
-                maximum,
-            }) {
-                Ok(GuestServiceResponse::Output { page }) => page,
-                Ok(_) => {
-                    return Err(sandsurf_state::Error::Corrupt(
-                        "guest output response kind is invalid",
-                    ));
-                }
-                Err(
-                    GuestClientError::Protocol(_)
-                    | GuestClientError::Contract(_)
-                    | GuestClientError::Json(_),
-                ) => {
-                    return Err(sandsurf_state::Error::Corrupt(
-                        "guest output response failed protocol validation",
-                    ));
-                }
-                Err(GuestClientError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
-                    return Err(sandsurf_state::Error::Corrupt(
-                        "guest output frame is malformed",
-                    ));
-                }
-                // Transport unavailability is not evidence corruption. The
-                // bytes remain in the guest spool and reconciliation resumes
-                // at the last committed cursor on the next pass.
-                Err(_) => return Ok(()),
-            };
-            if page.required_bytes.is_some() {
-                return Err(sandsurf_state::Error::Corrupt(
-                    "guest output chunk exceeds protocol bound",
+            Ok(_) => {
+                return Err(ControlError::Protocol(
+                    "guest management report has a different binding",
                 ));
             }
-            for chunk in page.chunks {
-                if chunk.cursor != committed.final_cursor {
-                    return Err(sandsurf_state::Error::Corrupt(
-                        "guest output cursor is not contiguous",
-                    ));
-                }
-                committed = journal.append_output(
-                    process_id,
-                    committed.chunks.next()?,
-                    chunk.stream,
-                    &chunk.bytes,
-                )?;
+            Err(error) => {
+                return Err(ControlError::Rejected {
+                    category: "guest-unavailable".into(),
+                    message: error.to_string(),
+                });
             }
-            if let ProcessState::Exited(completion) = &snapshot.state {
-                if committed != completion.output {
-                    if committed.final_cursor >= page.available {
-                        return Err(sandsurf_state::Error::Corrupt(
-                            "guardian output does not cover guest completion",
-                        ));
-                    }
-                } else if journal.receipt(process_id)?.is_none() {
-                    journal.publish_receipt(
-                        process_id,
-                        completion.outcome.clone(),
-                        completion.cleanup_digest.clone(),
-                        completion.accounting_digest.clone(),
-                    )?;
-                }
+        };
+        let processes = match self.client.call(&GuestServiceRequest::Processes) {
+            Ok(GuestServiceResponse::Processes { processes }) => processes,
+            Ok(_) => {
+                return Err(ControlError::Protocol(
+                    "guest execution inventory is malformed",
+                ));
             }
+            Err(error) => {
+                return Err(ControlError::Rejected {
+                    category: "guest-unavailable".into(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        const BUDGET: usize = 8;
+        let mut progress = Vec::new();
+        if processes.is_empty() {
+            self.reconcile_cursor = 0;
+            return Ok(GuestPoll {
+                identity: Some(identity),
+                executions: progress,
+            });
         }
-        Ok(())
+        let start = self.reconcile_cursor % processes.len();
+        let count = processes.len().min(BUDGET);
+        self.reconcile_cursor = (start + count) % processes.len();
+        for offset in 0..count {
+            let snapshot = &processes[(start + offset) % processes.len()];
+            let Some(hint) = hints.get(&snapshot.request.execution_id) else {
+                continue;
+            };
+            if hint.generation != snapshot.request.generation {
+                continue;
+            }
+            let output = if hint.settled {
+                None
+            } else {
+                let response = self
+                    .client
+                    .call(&GuestServiceRequest::ReadOutput {
+                        execution_id: snapshot.request.execution_id.clone(),
+                        after: hint.boundary.final_cursor,
+                        maximum: sandsurf_protocol::MAX_STREAM_BYTES as u32,
+                    })
+                    .map_err(|error| ControlError::Rejected {
+                        category: "guest-unavailable".into(),
+                        message: error.to_string(),
+                    })?;
+                let GuestServiceResponse::Output { page } = response else {
+                    return Err(ControlError::Protocol("guest output response is malformed"));
+                };
+                page.clone()
+                    .into_binary_parts()
+                    .map_err(|_| ControlError::Protocol("guest output page is malformed"))?;
+                Some(page)
+            };
+            progress.push(GuestProgress {
+                snapshot: snapshot.clone(),
+                output,
+            });
+        }
+        Ok(GuestPoll {
+            identity: Some(identity),
+            executions: progress,
+        })
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        let mut last = None;
-        // Query requests are either observations or exact identity-bound,
-        // idempotent supervisor operations. A Firecracker local-init vsock
-        // connection can fail before guest delivery, so reconnect without
-        // changing the request identity.
-        for attempt in 0..3 {
-            match self.client.call(&request) {
-                Ok(response) => return Ok(response),
-                Err(error) => last = Some(error),
-            }
-            if attempt != 2 {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        let error = last.expect("guest query is attempted at least once");
-        eprintln!("sandsurf guest query transport failed: {error}");
-        Err(ControlError::Rejected {
-            category: "guest".into(),
-            message: error.to_string(),
-        })
+        self.ensure_bound()?;
+        self.client
+            .call(&request)
+            .map_err(|error| ControlError::Rejected {
+                category: "guest-unavailable".into(),
+                message: error.to_string(),
+            })
     }
 }
 
@@ -508,12 +561,51 @@ fn read_unauthed<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use sandsurf_protocol::{
-        GuestFinish, GuestHandshake, GuestHello, RetainedChunkMetadata, RetainedPageMetadata,
-        Stream,
+        GuestFinish, GuestHandshake, GuestHello, RPC_DATA_STREAM, RetainedChunkMetadata,
+        RetainedPageMetadata, Stream,
     };
     use std::os::unix::net::UnixStream;
 
+    fn test_management_identity() -> sandsurf_protocol::GuestManagementIdentity {
+        sandsurf_protocol::GuestManagementIdentity {
+            boot_id: "test-linux-boot".try_into().unwrap(),
+            instance_id: "test-management-instance".try_into().unwrap(),
+        }
+    }
+
     struct PairChannel(Option<UnixStream>);
+
+    #[test]
+    fn slowly_fragmented_guest_frame_cannot_extend_its_deadline() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let frame = Frame {
+                kind: FrameKind::Control,
+                stream: 0,
+                sequence: Counter::ONE,
+                authentication: [0; AUTHENTICATION_BYTES],
+                payload: vec![42; 1024],
+            };
+            let mut bytes = Vec::new();
+            frame.write(&mut bytes).unwrap();
+            for byte in bytes {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let mut connection = DeadlineConnection::new(Box::new(client), Duration::from_millis(25));
+        let started = Instant::now();
+        let error = Frame::read(&mut connection).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(connection);
+        writer.join().unwrap();
+    }
 
     impl GuestChannel for PairChannel {
         fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
@@ -539,10 +631,10 @@ mod tests {
     #[test]
     fn authenticated_guest_session_serves_multiple_requests() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-        let sandbox = SandboxId::try_from("persistent-guest").unwrap();
+        let machine = MachineId::try_from("persistent-guest").unwrap();
         let boot = sandsurf_protocol::bytes_digest(b"verified-boot");
         let capability = [7; 32];
-        let expected_sandbox = sandbox.clone();
+        let expected_machine = machine.clone();
         let expected_boot = boot.clone();
         let server = std::thread::spawn(move || {
             server_stream
@@ -551,7 +643,7 @@ mod tests {
             let hello: GuestHello = read_unauthed(&mut server_stream).unwrap();
             let (handshake, challenge) = GuestHandshake::accept(
                 BootCapability::from_bytes(capability),
-                &expected_sandbox,
+                &expected_machine,
                 Counter::ONE,
                 &expected_boot,
                 &hello,
@@ -566,14 +658,20 @@ mod tests {
                     .open(Frame::read(&mut server_stream).unwrap().unwrap())
                     .unwrap();
                 assert_eq!(
-                    serde_json::from_slice::<GuestServiceRequest>(&request.payload).unwrap(),
+                    serde_json::from_slice::<RequestEnvelope<GuestServiceRequest>>(
+                        &request.payload
+                    )
+                    .unwrap()
+                    .assemble(None)
+                    .unwrap(),
                     GuestServiceRequest::ProbeIdentity
                 );
                 for payload in [
                     serde_json::to_vec(&GuestServiceResponse::Identity {
-                        sandbox_id: expected_sandbox.clone(),
-                        epoch: Counter::ONE,
+                        machine_id: expected_machine.clone(),
+                        generation: Counter::ONE,
                         boot_identity: expected_boot.clone(),
+                        management: test_management_identity(),
                     })
                     .unwrap(),
                     CONTROL_COMPLETE.to_vec(),
@@ -595,7 +693,7 @@ mod tests {
         });
         let mut client = GuestClient::new(
             PairChannel(Some(client_stream)),
-            sandbox.clone(),
+            machine.clone(),
             Counter::ONE,
             boot.clone(),
             capability,
@@ -604,9 +702,10 @@ mod tests {
             assert_eq!(
                 client.call(&GuestServiceRequest::ProbeIdentity).unwrap(),
                 GuestServiceResponse::Identity {
-                    sandbox_id: sandbox.clone(),
-                    epoch: Counter::ONE,
+                    machine_id: machine.clone(),
+                    generation: Counter::ONE,
                     boot_identity: boot.clone(),
+                    management: test_management_identity(),
                 }
             );
         }
@@ -616,11 +715,11 @@ mod tests {
     #[test]
     fn authenticated_output_uses_credit_limited_binary_frames() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-        let sandbox = SandboxId::try_from("binary-guest").unwrap();
-        let process = sandsurf_protocol::ProcessId::try_from("binary-process").unwrap();
+        let machine = MachineId::try_from("binary-guest").unwrap();
+        let process = sandsurf_protocol::ExecutionId::try_from("binary-process").unwrap();
         let boot = bytes_digest(b"verified-binary-boot");
         let capability = [9; 32];
-        let server_sandbox = sandbox.clone();
+        let server_machine = machine.clone();
         let server_boot = boot.clone();
         let server_process = process.clone();
         let server = std::thread::spawn(move || {
@@ -630,7 +729,7 @@ mod tests {
             let hello: GuestHello = read_unauthed(&mut server_stream).unwrap();
             let (handshake, challenge) = GuestHandshake::accept(
                 BootCapability::from_bytes(capability),
-                &server_sandbox,
+                &server_machine,
                 Counter::ONE,
                 &server_boot,
                 &hello,
@@ -643,9 +742,12 @@ mod tests {
                 .open(Frame::read(&mut server_stream).unwrap().unwrap())
                 .unwrap();
             assert_eq!(
-                serde_json::from_slice::<GuestServiceRequest>(&request.payload).unwrap(),
+                serde_json::from_slice::<RequestEnvelope<GuestServiceRequest>>(&request.payload)
+                    .unwrap()
+                    .assemble(None)
+                    .unwrap(),
                 GuestServiceRequest::ReadOutput {
-                    process_id: server_process,
+                    execution_id: server_process,
                     after: Counter::ZERO,
                     maximum: 64,
                 }
@@ -670,7 +772,7 @@ mod tests {
                 ],
                 required_bytes: None,
             };
-            codec.open_stream(OUTPUT_DATA_STREAM, false).unwrap();
+            codec.open_stream(RPC_DATA_STREAM, true).unwrap();
             codec
                 .seal(Frame {
                     kind: FrameKind::Control,
@@ -689,14 +791,14 @@ mod tests {
                 .open(Frame::read(&mut server_stream).unwrap().unwrap())
                 .unwrap();
             assert_eq!(credit.kind, FrameKind::Credit);
-            assert_eq!(credit.stream, OUTPUT_DATA_STREAM);
+            assert_eq!(credit.stream, RPC_DATA_STREAM);
             assert_eq!(credit.payload, 5u64.to_be_bytes());
-            codec.accept_send_credit(OUTPUT_DATA_STREAM, 5).unwrap();
+            codec.accept_send_credit(RPC_DATA_STREAM, 5).unwrap();
             for (index, bytes) in pieces.into_iter().enumerate() {
                 codec
                     .seal(Frame {
                         kind: FrameKind::Data,
-                        stream: OUTPUT_DATA_STREAM,
+                        stream: RPC_DATA_STREAM,
                         sequence: ((index + 1) as u64).try_into().unwrap(),
                         authentication: [0; AUTHENTICATION_BYTES],
                         payload: bytes,
@@ -708,7 +810,7 @@ mod tests {
             codec
                 .seal(Frame {
                     kind: FrameKind::End,
-                    stream: OUTPUT_DATA_STREAM,
+                    stream: RPC_DATA_STREAM,
                     sequence: 3u64.try_into().unwrap(),
                     authentication: [0; AUTHENTICATION_BYTES],
                     payload: Vec::new(),
@@ -716,7 +818,7 @@ mod tests {
                 .unwrap()
                 .write(&mut server_stream)
                 .unwrap();
-            codec.close_stream(OUTPUT_DATA_STREAM).unwrap();
+            codec.close_stream(RPC_DATA_STREAM).unwrap();
             codec
                 .seal(Frame {
                     kind: FrameKind::Control,
@@ -731,14 +833,14 @@ mod tests {
         });
         let mut client = GuestClient::new(
             PairChannel(Some(client_stream)),
-            sandbox,
+            machine,
             Counter::ONE,
             boot,
             capability,
         );
         let response = client
             .call(&GuestServiceRequest::ReadOutput {
-                process_id: process,
+                execution_id: process,
                 after: Counter::ZERO,
                 maximum: 64,
             })

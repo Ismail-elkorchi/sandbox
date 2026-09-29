@@ -6,6 +6,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SANDSURF_IMAGE_PROFILE: release
+
 jobs:
   images:
     strategy:
@@ -36,6 +39,6 @@ jobs:
         with:
           name: development-image-${{ matrix.architecture }}
           path: |
-            packages/sandbox/images/development-${{ matrix.architecture }}
+            packages/sandsurf/images/development-${{ matrix.architecture }}
             image-sources/development-${{ matrix.architecture }}
           if-no-files-found: error

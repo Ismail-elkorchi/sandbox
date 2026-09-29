@@ -22,7 +22,6 @@ fn macos_acl_grants_make_authority_unavailable_without_repair_or_deletion() {
     let limits = CatalogLimits {
         identities: one,
         operations: one,
-        grants: one,
         usage_records: one,
         image_bytes: one,
         resources: Resources {
@@ -30,7 +29,7 @@ fn macos_acl_grants_make_authority_unavailable_without_repair_or_deletion() {
             memory_mib: one,
             disk_bytes: one,
             output_bytes: one,
-            processes: one,
+            managed_executions: one,
         },
     };
     drop(HostCatalog::create(&catalog, "acl-host".try_into().unwrap(), limits).unwrap());

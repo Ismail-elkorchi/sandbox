@@ -41,14 +41,13 @@ fn resources() -> Resources {
         memory_mib: n(4096),
         disk_bytes: n(100_000),
         output_bytes: n(1000),
-        processes: n(8),
+        managed_executions: n(8),
     }
 }
 fn catalog_limits() -> CatalogLimits {
     CatalogLimits {
         identities: n(10),
         operations: n(100),
-        grants: n(100),
         usage_records: n(100),
         image_bytes: n(400_000),
         resources: Resources {
@@ -56,35 +55,34 @@ fn catalog_limits() -> CatalogLimits {
             memory_mib: n(16384),
             disk_bytes: n(400_000),
             output_bytes: n(4000),
-            processes: n(32),
+            managed_executions: n(32),
         },
     }
 }
 
 #[test]
-fn sandbox_workload_configuration_is_host_owned_and_durable() {
+fn machine_execution_defaults_is_host_owned_and_durable() {
     let root = TempRoot::new();
-    let path = root.0.join("workload-configuration-host");
-    let sandbox: SandboxId = "configured-box".try_into().unwrap();
+    let path = root.0.join("defaults-configuration-host");
+    let machine: MachineId = "configured-box".try_into().unwrap();
     let operation: OperationId = "create-configured-box".try_into().unwrap();
     let image = hash("configured-image");
-    let workload = WorkloadConfiguration {
+    let defaults = ExecutionDefaults {
         environment: std::collections::BTreeMap::from([("MODE".into(), "agent".into())]),
         user: Some("agent".into()),
         working_directory: Some("/workspace".into()),
     };
-    let lifetime = SandboxLifetime {
-        idle_stop_after_millis: Some(n(60_000)),
+    let lifetime = MachineLifetime {
         expires_at_unix_millis: Some(n(9_000_000_000_000)),
         expiration_action: ExpirationAction::Destroy,
     };
     let request_digest = digest(
-        Domain::Sandbox,
+        Domain::Machine,
         &(
-            &sandbox,
+            &machine,
             &image,
             resources(),
-            &workload,
+            &defaults,
             &lifetime,
             &operation,
         ),
@@ -96,12 +94,12 @@ fn sandbox_workload_configuration_is_host_owned_and_durable() {
         catalog_limits(),
     )
     .unwrap();
-    host.create_sandbox(
-        SandboxAdmission {
-            id: sandbox.clone(),
+    host.create_machine(
+        MachineAdmission {
+            id: machine.clone(),
             image,
             resources: resources(),
-            workload: workload.clone(),
+            defaults: defaults.clone(),
             lifetime: lifetime.clone(),
             operation,
         },
@@ -111,53 +109,53 @@ fn sandbox_workload_configuration_is_host_owned_and_durable() {
         },
     )
     .unwrap();
-    let created = host.sandbox(&sandbox).unwrap().unwrap();
-    assert_eq!(created.workload_configuration, workload);
+    let created = host.machine(&machine).unwrap().unwrap();
+    assert_eq!(created.execution_defaults, defaults);
     assert_eq!(created.lifetime, lifetime);
     let later = created.last_activity_unix_millis.next().unwrap();
-    host.observe_activity(&sandbox, later).unwrap();
-    host.observe_activity(&sandbox, created.last_activity_unix_millis)
+    host.observe_activity(&machine, later).unwrap();
+    host.observe_activity(&machine, created.last_activity_unix_millis)
         .unwrap();
     drop(host);
     let reopened = HostCatalog::open(&path)
         .unwrap()
-        .sandbox(&sandbox)
+        .machine(&machine)
         .unwrap()
         .unwrap();
-    assert_eq!(reopened.workload_configuration, workload);
+    assert_eq!(reopened.execution_defaults, defaults);
     assert_eq!(reopened.lifetime, lifetime);
     assert_eq!(reopened.last_activity_unix_millis, later);
 }
 
 #[test]
-fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforcement() {
+fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() {
     let root = TempRoot::new();
     let path = root.0.join("host");
     let mut host =
         HostCatalog::create(&path, "secret-host".try_into().unwrap(), catalog_limits()).unwrap();
-    let sandbox: SandboxId = "secret-box".try_into().unwrap();
+    let machine: MachineId = "secret-box".try_into().unwrap();
     let create: OperationId = "create-secret-box".try_into().unwrap();
     let image = hash("secret-image");
-    let workload = WorkloadConfiguration::default();
+    let defaults = ExecutionDefaults::default();
     let create_digest = digest(
-        Domain::Sandbox,
+        Domain::Machine,
         &(
-            &sandbox,
+            &machine,
             &image,
             resources(),
-            &workload,
-            &SandboxLifetime::default(),
+            &defaults,
+            &MachineLifetime::default(),
             &create,
         ),
     )
     .unwrap();
-    host.create_sandbox(
-        SandboxAdmission {
-            id: sandbox.clone(),
+    host.create_machine(
+        MachineAdmission {
+            id: machine.clone(),
             image,
             resources: resources(),
-            workload,
-            lifetime: SandboxLifetime::default(),
+            defaults,
+            lifetime: MachineLifetime::default(),
             operation: create,
         },
         Approval {
@@ -168,7 +166,7 @@ fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforceme
     .unwrap();
     let secret = SecretVersion {
         id: "credential".try_into().unwrap(),
-        version: hash("secret-bytes"),
+        version: "opaque-secret-version".try_into().unwrap(),
         bytes: n(12),
     };
     let delivery = SecretDelivery {
@@ -178,39 +176,42 @@ fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforceme
             mode: 0o600,
         },
         lifetime: SecretLifetime::UntilRevoked,
-        process_id: None,
+        execution_id: None,
     };
     let delivery_digest = hash("delivery-request");
     let delivery_operation: OperationId = "deliver-credential".try_into().unwrap();
     host.admit_secret_delivery(
         SecretDeliveryRecord {
             operation_id: delivery_operation.clone(),
-            sandbox_id: sandbox.clone(),
+            machine_id: machine.clone(),
             request_digest: delivery_digest.clone(),
             delivery: delivery.clone(),
-            applied: false,
+            disclosure: SecretDisclosure::NotSent,
             revocation_operation: None,
             revoked: false,
         },
+        Counter::ONE,
         Approval {
             id: "approve-delivery".try_into().unwrap(),
             request_digest: delivery_digest.clone(),
         },
     )
     .unwrap();
+    host.begin_secret_disclosure(&delivery_operation, &delivery_digest)
+        .unwrap();
     host.complete_secret_delivery(&delivery_operation, &delivery_digest)
         .unwrap();
-    assert_eq!(host.active_secret_deliveries(&sandbox).unwrap().len(), 1);
+    assert!(!host.secret_version_revoked(&machine, &secret).unwrap());
 
     let revoke_operation: OperationId = "revoke-credential".try_into().unwrap();
     let revoke_digest = hash("revocation-request");
     let pending = host
         .admit_secret_revocation(
             SecretRevocationAdmission {
-                sandbox_id: sandbox.clone(),
+                machine_id: machine.clone(),
                 operation_id: revoke_operation.clone(),
                 expected_revision: Counter::ONE,
-                secret,
+                secret: secret.clone(),
                 terminate_recipients: true,
                 request_digest: revoke_digest.clone(),
             },
@@ -221,25 +222,230 @@ fn secret_revocation_is_host_owned_durable_and_gates_redelivery_before_enforceme
         )
         .unwrap();
     assert_eq!(pending.deliveries, vec![delivery]);
-    assert!(pending.evidence.is_none());
-    assert!(host.active_secret_deliveries(&sandbox).unwrap().is_empty());
-    let evidence = SecretRevocationEvidence {
+    assert!(pending.guest_cleanup_report.is_none());
+    assert!(host.secret_version_revoked(&machine, &secret).unwrap());
+    assert!(host.secret_deliveries(&machine).unwrap()[0].revoked);
+    assert!(host.machine(&machine).unwrap().unwrap().known_sensitive);
+    let evidence = SecretCleanupReport {
         files_removed: Counter::ONE,
         environment_bindings_removed: Counter::ZERO,
         recipients_terminated: Vec::new(),
         recipients_already_stopped: Vec::new(),
         residual_copies_possible: true,
-        enforcement_complete: true,
+        actions_reported_complete: true,
     };
     let completed = host
-        .complete_secret_revocation(&revoke_operation, &revoke_digest, evidence.clone())
+        .record_secret_cleanup_report(&revoke_operation, &revoke_digest, evidence.clone())
         .unwrap();
-    assert_eq!(completed.evidence, Some(evidence));
+    assert_eq!(completed.guest_cleanup_report, Some(evidence));
     drop(host);
 
     let host = HostCatalog::open(&path).unwrap();
-    assert!(host.active_secret_deliveries(&sandbox).unwrap().is_empty());
-    assert_eq!(host.secret_revocations(&sandbox).unwrap(), vec![completed]);
+    assert!(host.secret_version_revoked(&machine, &secret).unwrap());
+    assert_eq!(host.secret_revocations(&machine).unwrap(), vec![completed]);
+}
+
+#[test]
+fn possible_disclosure_is_sticky_across_fork_clean_rollback_and_host_restart() {
+    fn capture(
+        host: &mut HostCatalog,
+        machine: &MachineId,
+        revision: Counter,
+        id: &str,
+    ) -> Snapshot {
+        let request = SnapshotRequest {
+            id: id.try_into().unwrap(),
+            operation_id: format!("capture-{id}").try_into().unwrap(),
+            machine_id: machine.clone(),
+            expected_generation: Counter::ONE,
+            expected_revision: revision,
+            kind: SnapshotKind::Disk,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+        let snapshot = host
+            .admit_snapshot(
+                request,
+                Approval {
+                    id: format!("approve-{id}").try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        host.begin_snapshot(&snapshot.request.id, &request_digest)
+            .unwrap();
+        host.complete_snapshot(
+            &snapshot.request.id,
+            &request_digest,
+            hash(id),
+            hash(&format!("manifest-{id}")),
+            SnapshotConsistency::Crash,
+        )
+        .unwrap()
+    }
+    let mut f = Fixture::new();
+    let clean = capture(&mut f.host, &f.machine, n(2), "clean");
+    assert!(!clean.sensitive);
+    let operation: OperationId = "ambiguous-disclosure".try_into().unwrap();
+    let request = hash("ambiguous-secret-request");
+    f.host
+        .admit_secret_delivery(
+            SecretDeliveryRecord {
+                operation_id: operation.clone(),
+                machine_id: f.machine.clone(),
+                request_digest: request.clone(),
+                delivery: SecretDelivery {
+                    secret: SecretVersion {
+                        id: "credential".try_into().unwrap(),
+                        version: "opaque-one".try_into().unwrap(),
+                        bytes: n(6),
+                    },
+                    destination: SecretDestination::File {
+                        path: "/root/credential".try_into().unwrap(),
+                        mode: 0o600,
+                    },
+                    lifetime: SecretLifetime::UntilRevoked,
+                    execution_id: None,
+                },
+                disclosure: SecretDisclosure::NotSent,
+                revocation_operation: None,
+                revoked: false,
+            },
+            n(2),
+            Approval {
+                id: "approve-ambiguous".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    assert!(!f.host.machine(&f.machine).unwrap().unwrap().known_sensitive);
+    f.host
+        .begin_secret_disclosure(&operation, &request)
+        .unwrap();
+    // No acknowledgement is necessary: a lost reply cannot make copies public.
+    assert!(
+        f.host
+            .begin_secret_disclosure(&operation, &request)
+            .is_err()
+    );
+    let sensitive = capture(&mut f.host, &f.machine, n(2), "sensitive");
+    assert!(sensitive.sensitive);
+    let fork: MachineId = "sensitive-fork".try_into().unwrap();
+    let fork_operation: OperationId = "fork-sensitive".try_into().unwrap();
+    let fork_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-fork-v1",
+            &sensitive.request.id,
+            &fork,
+            resources(),
+            &MachineLifetime::default(),
+            &fork_operation,
+        ),
+    )
+    .unwrap();
+    f.host
+        .create_machine_from_snapshot(
+            fork.clone(),
+            &sensitive.request.id,
+            resources(),
+            MachineLifetime::default(),
+            fork_operation,
+            Approval {
+                id: "approve-sensitive-fork".try_into().unwrap(),
+                request_digest: fork_digest,
+            },
+        )
+        .unwrap();
+    assert!(f.host.secret_deliveries(&fork).unwrap().is_empty());
+    assert!(capture(&mut f.host, &fork, Counter::ONE, "fork-capture").sensitive);
+    let rollback: OperationId = "rollback-clean".try_into().unwrap();
+    let rollback_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-rollback-v1",
+            &f.machine,
+            &clean.request.id,
+            &rollback,
+            n(2),
+        ),
+    )
+    .unwrap();
+    f.host
+        .admit_rollback(
+            &f.machine,
+            &clean.request.id,
+            rollback.clone(),
+            n(2),
+            Approval {
+                id: "approve-clean-rollback".try_into().unwrap(),
+                request_digest: rollback_digest.clone(),
+            },
+        )
+        .unwrap();
+    f.host
+        .complete_rollback(&rollback, &rollback_digest, hash("restored-clean"))
+        .unwrap();
+    assert!(capture(&mut f.host, &f.machine, n(2), "post-rollback").sensitive);
+    drop(f.host);
+    let host = HostCatalog::open(&f.root.0.join("host")).unwrap();
+    assert!(host.machine(&f.machine).unwrap().unwrap().known_sensitive);
+    assert!(host.machine(&fork).unwrap().unwrap().known_sensitive);
+}
+
+#[test]
+fn new_machine_inherits_sensitive_image_classification() {
+    let mut f = Fixture::new();
+    let image_operation: OperationId = "publish-sensitive".try_into().unwrap();
+    let request = hash("sensitive-image-request");
+    f.host
+        .admit_image_import(
+            image_operation.clone(),
+            request.clone(),
+            Approval {
+                id: "approve-sensitive-image".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    let mut image = image("sensitive-image", 1000);
+    image.sensitive = true;
+    f.host
+        .complete_image_import(&image_operation, &request, image.clone())
+        .unwrap();
+    let id: MachineId = "from-sensitive-image".try_into().unwrap();
+    let operation: OperationId = "create-from-sensitive-image".try_into().unwrap();
+    let defaults = ExecutionDefaults::default();
+    let lifetime = MachineLifetime::default();
+    let request = digest(
+        Domain::Machine,
+        &(
+            &id,
+            &image.digest,
+            resources(),
+            &defaults,
+            &lifetime,
+            &operation,
+        ),
+    )
+    .unwrap();
+    f.host
+        .create_machine(
+            MachineAdmission {
+                id: id.clone(),
+                image: image.digest,
+                resources: resources(),
+                defaults,
+                lifetime,
+                operation,
+            },
+            Approval {
+                id: "approve-from-sensitive-image".try_into().unwrap(),
+                request_digest: request,
+            },
+        )
+        .unwrap();
+    assert!(f.host.machine(&id).unwrap().unwrap().known_sensitive);
 }
 
 #[test]
@@ -428,15 +634,13 @@ fn private_catalog_cannot_be_admitted_below_replaceable_ancestry() {
 fn runtime_limits() -> RuntimeLimits {
     RuntimeLimits {
         identities: n(16),
+        managed_executions: n(8),
         operations: n(64),
         observations: n(1000),
         events: n(4096),
         chunks: n(1000),
         pins: n(64),
         output_bytes: n(1000),
-        disks: n(8),
-        disk_bytes: n(1024 * 1024),
-        disk_headroom_bytes: n(1024 * 1024),
     }
 }
 
@@ -444,9 +648,9 @@ struct Fixture {
     runtime: RuntimeJournal,
     host: HostCatalog,
     root: TempRoot,
-    sandbox: SandboxId,
-    process: ProcessId,
-    mutation: Mutation,
+    machine: MachineId,
+    process: ExecutionId,
+    command: GuestCommand,
 }
 impl Fixture {
     fn new() -> Self {
@@ -457,29 +661,29 @@ impl Fixture {
             catalog_limits(),
         )
         .unwrap();
-        let sandbox: SandboxId = "box".try_into().unwrap();
+        let machine: MachineId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
-        let workload = WorkloadConfiguration::default();
+        let defaults = ExecutionDefaults::default();
         let request_digest = digest(
-            Domain::Sandbox,
+            Domain::Machine,
             &(
-                &sandbox,
+                &machine,
                 &image,
                 resources(),
-                &workload,
-                &SandboxLifetime::default(),
+                &defaults,
+                &MachineLifetime::default(),
                 &create,
             ),
         )
         .unwrap();
-        host.create_sandbox(
-            SandboxAdmission {
-                id: sandbox.clone(),
+        host.create_machine(
+            MachineAdmission {
+                id: machine.clone(),
                 image,
                 resources: resources(),
-                workload,
-                lifetime: SandboxLifetime::default(),
+                defaults,
+                lifetime: MachineLifetime::default(),
                 operation: create.clone(),
             },
             Approval {
@@ -490,15 +694,15 @@ impl Fixture {
         .unwrap();
         let mut runtime = RuntimeJournal::create(
             &root.0.join("runtime"),
-            sandbox.clone(),
+            machine.clone(),
             runtime_limits(),
             host.authority_binding().clone(),
         )
         .unwrap();
         runtime
             .observe(MachineObservation {
-                sandbox_id: sandbox.clone(),
-                epoch: n(1),
+                machine_id: machine.clone(),
+                generation: n(1),
                 sequence: n(1),
                 state: MachineState::Creating,
                 applied_revision: n(1),
@@ -508,8 +712,8 @@ impl Fixture {
             .unwrap();
         let evidence = runtime
             .observe(MachineObservation {
-                sandbox_id: sandbox.clone(),
-                epoch: n(1),
+                machine_id: machine.clone(),
+                generation: n(1),
                 sequence: n(2),
                 state: MachineState::Running,
                 applied_revision: n(1),
@@ -518,35 +722,20 @@ impl Fixture {
             })
             .unwrap();
         host.complete_intent(&evidence).unwrap();
-        let grant_id: GrantId = "spawn".try_into().unwrap();
-        let grant_operation: OperationId = "grant-spawn".try_into().unwrap();
-        let scope = hash("workload");
-        let request_digest = digest(
-            Domain::Grant,
-            &(
-                "sandsurf-grant-change-v1",
-                &sandbox,
-                &grant_operation,
-                &grant_id,
-                n(1),
-                Capability::Spawn,
-                &scope,
-                false,
-            ),
-        )
-        .unwrap();
-        host.set_grant(
-            GrantChange {
-                sandbox_id: sandbox.clone(),
-                operation_id: grant_operation,
-                id: grant_id.clone(),
-                expected_revision: n(1),
-                capability: Capability::Spawn,
-                scope_digest: scope,
-                revoked: false,
-            },
+        let configuration = host
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .runtime_configuration;
+        let request_digest = hash("fixture-configuration");
+        host.set_runtime_configuration(
+            &machine,
+            &"configure-fixture".try_into().unwrap(),
+            n(1),
+            configuration,
+            request_digest.clone(),
             Approval {
-                id: "approve-spawn".try_into().unwrap(),
+                id: "approve-configuration".try_into().unwrap(),
                 request_digest,
             },
         )
@@ -557,17 +746,15 @@ impl Fixture {
         observed.evidence_digest = hash("installed-revision");
         runtime.observe(observed).unwrap();
         let operation_id: OperationId = "command".try_into().unwrap();
-        let mutation = Mutation::new(
-            sandbox.clone(),
+        let command = GuestCommand::new(
+            machine.clone(),
             n(1),
             operation_id.clone(),
-            grant_id,
-            n(2),
-            WorkloadRequest::Spawn {
+            GuestRequest::Spawn {
                 request: Box::new(SpawnRequest {
-                    sandbox_id: sandbox.clone(),
-                    epoch: n(1),
-                    process_id: "process".try_into().unwrap(),
+                    machine_id: machine.clone(),
+                    generation: n(1),
+                    execution_id: "process".try_into().unwrap(),
                     operation_id,
                     argv: vec!["/bin/true".into()],
                     cwd: "/workspace".into(),
@@ -575,7 +762,6 @@ impl Fixture {
                     user: Some("agent".into()),
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
-                    lifetime: ProcessLifetime::Job,
                     active_deadline_millis: None,
                     elapsed_deadline_unix_millis: None,
                     output_bytes: n(100),
@@ -583,22 +769,20 @@ impl Fixture {
             },
         )
         .unwrap();
-        let authorization = host
-            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-            .unwrap();
+        let authorization = command.clone();
         runtime.admit(authorization).unwrap();
-        let process: ProcessId = "process".try_into().unwrap();
+        let process: ExecutionId = "process".try_into().unwrap();
         runtime
-            .admit_process(process.clone(), &mutation.operation_id, n(100), false)
+            .admit_process(process.clone(), &command.operation_id, n(100), false)
             .unwrap();
-        dispatch(&mut runtime, &host, &mutation);
+        dispatch(&mut runtime, &command);
         Self {
             runtime,
             host,
             root,
-            sandbox,
+            machine,
             process,
-            mutation,
+            command,
         }
     }
     fn terminal(&mut self) -> (Receipt, Digest) {
@@ -611,7 +795,7 @@ impl Fixture {
         self.runtime
             .publish_receipt(
                 &self.process,
-                ProcessOutcome::Exit { code: 0 },
+                ExecutionOutcome::Exit { code: 0 },
                 hash("reaped"),
                 hash("accounted"),
             )
@@ -681,7 +865,7 @@ fn runtime_events_are_digest_bound_paginated_and_replayable_after_reopen() {
     assert!(
         values
             .iter()
-            .any(|value| matches!(value, RuntimeEventValue::WorkloadOperation { .. }))
+            .any(|value| matches!(value, RuntimeEventValue::GuestOperation { .. }))
     );
     assert!(
         values
@@ -696,88 +880,85 @@ fn runtime_events_are_digest_bound_paginated_and_replayable_after_reopen() {
 
     let path = fixture.root.0.join("runtime");
     drop(fixture.runtime);
-    let reopened = RuntimeJournal::open(&path, &fixture.sandbox).unwrap();
+    let reopened = RuntimeJournal::open(&path, &fixture.machine).unwrap();
     let tail = reopened.events(Counter::ZERO, 256).unwrap();
     assert_eq!(tail.cursor, cursor);
     assert_eq!(tail.available, cursor);
 }
 
-fn dispatch(runtime: &mut RuntimeJournal, host: &HostCatalog, mutation: &Mutation) {
-    let authorization = host
-        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+fn dispatch(runtime: &mut RuntimeJournal, command: &GuestCommand) {
+    let authorization = command.clone();
     match runtime.begin_dispatch(authorization).unwrap() {
-        DispatchDecision::Perform(permit) => permit.perform(|actual, capability| {
-            assert_eq!(actual, mutation);
-            assert_eq!(*capability, Capability::Spawn);
+        DispatchDecision::Perform(permit) => permit.perform(|actual| {
+            assert_eq!(actual, command);
         }),
         DispatchDecision::Reconcile(_) => panic!("first dispatch unexpectedly reconciled"),
     }
 }
 
 #[test]
-fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
+fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     let mut fixture = Fixture::new();
-    let checkpoint_id: CheckpointId = "checkpoint-one".try_into().unwrap();
-    let checkpoint_operation: OperationId = "capture-filesystem".try_into().unwrap();
-    let request = CheckpointRequest {
-        id: checkpoint_id.clone(),
-        operation_id: checkpoint_operation,
-        sandbox_id: fixture.sandbox.clone(),
-        expected_epoch: n(1),
+    let snapshot_id: SnapshotId = "snapshot-one".try_into().unwrap();
+    let snapshot_operation: OperationId = "capture-filesystem".try_into().unwrap();
+    let request = SnapshotRequest {
+        id: snapshot_id.clone(),
+        operation_id: snapshot_operation,
+        machine_id: fixture.machine.clone(),
+        expected_generation: n(1),
         expected_revision: n(2),
-        kind: CheckpointKind::Filesystem,
+        kind: SnapshotKind::Disk,
         parent: None,
     };
-    let request_digest = digest(Domain::Checkpoint, &("sandsurf-checkpoint-v1", &request)).unwrap();
+    let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
     let admitted = fixture
         .host
-        .admit_checkpoint(
+        .admit_snapshot(
             request,
             Approval {
-                id: "approve-checkpoint".try_into().unwrap(),
+                id: "approve-snapshot".try_into().unwrap(),
                 request_digest: request_digest.clone(),
             },
         )
         .unwrap();
-    assert_eq!(admitted.phase, CheckpointPhase::Admitted);
+    assert_eq!(admitted.phase, SnapshotPhase::Admitted);
     fixture
         .host
-        .begin_checkpoint(&checkpoint_id, &request_digest)
+        .begin_snapshot(&snapshot_id, &request_digest)
         .unwrap();
     let ready = fixture
         .host
-        .complete_checkpoint(
-            &checkpoint_id,
+        .complete_snapshot(
+            &snapshot_id,
             &request_digest,
             hash("captured-disk"),
-            hash("checkpoint-manifest"),
-            CheckpointConsistency::Filesystem,
+            hash("snapshot-manifest"),
+            SnapshotConsistency::Crash,
         )
         .unwrap();
-    assert_eq!(ready.phase, CheckpointPhase::Ready);
+    assert_eq!(ready.phase, SnapshotPhase::Ready);
 
-    let fork_id: SandboxId = "forked-box".try_into().unwrap();
-    let fork_operation: OperationId = "fork-checkpoint".try_into().unwrap();
+    let fork_id: MachineId = "forked-box".try_into().unwrap();
+    let fork_operation: OperationId = "fork-snapshot".try_into().unwrap();
     let fork_digest = digest(
-        Domain::Checkpoint,
+        Domain::Snapshot,
         &(
             "sandsurf-filesystem-fork-v1",
-            &checkpoint_id,
+            &snapshot_id,
             &fork_id,
             resources(),
-            &SandboxLifetime::default(),
+            &MachineLifetime::default(),
             &fork_operation,
         ),
     )
     .unwrap();
     fixture
         .host
-        .create_sandbox_from_checkpoint(
+        .create_machine_from_snapshot(
             fork_id.clone(),
-            &checkpoint_id,
+            &snapshot_id,
             resources(),
-            SandboxLifetime::default(),
+            MachineLifetime::default(),
             fork_operation,
             Approval {
                 id: "approve-fork".try_into().unwrap(),
@@ -788,26 +969,23 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     assert_eq!(
         fixture
             .host
-            .sandbox(&fork_id)
+            .machine(&fork_id)
             .unwrap()
             .unwrap()
             .image_digest,
         ready.image_digest
     );
-    assert!(
-        fixture
-            .host
-            .active_grant(&fork_id, n(1), Capability::Spawn, &hash("workload"))
-            .is_err()
-    );
+    let fork = fixture.host.machine(&fork_id).unwrap().unwrap();
+    assert!(fork.runtime_configuration.network.rules.is_empty());
+    assert!(fork.runtime_configuration.exposures.is_empty());
 
-    let rollback_operation: OperationId = "rollback-checkpoint".try_into().unwrap();
+    let rollback_operation: OperationId = "rollback-snapshot".try_into().unwrap();
     let rollback_digest = digest(
-        Domain::Checkpoint,
+        Domain::Snapshot,
         &(
             "sandsurf-filesystem-rollback-v1",
-            &fixture.sandbox,
-            &checkpoint_id,
+            &fixture.machine,
+            &snapshot_id,
             &rollback_operation,
             n(2),
         ),
@@ -816,8 +994,8 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     let rollback = fixture
         .host
         .admit_rollback(
-            &fixture.sandbox,
-            &checkpoint_id,
+            &fixture.machine,
+            &snapshot_id,
             rollback_operation.clone(),
             n(2),
             Approval {
@@ -835,7 +1013,7 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     assert_eq!(
         fixture
             .host
-            .sandbox(&fixture.sandbox)
+            .machine(&fixture.machine)
             .unwrap()
             .unwrap()
             .configuration_revision,
@@ -844,74 +1022,72 @@ fn checkpoint_fork_and_rollback_keep_authority_and_lineage_host_owned() {
 }
 
 #[test]
-fn live_usage_stays_monotonic_across_a_new_machine_epoch() {
+fn live_usage_stays_monotonic_across_a_new_machine_generation() {
     let mut fixture = Fixture::new();
     let sample = |cpu, network, peak| ResourceUsage {
-        cpu_micros: n(cpu),
-        memory_current: n(10),
-        memory_peak: n(peak),
+        cpu_micros: Some(n(cpu)),
+        memory_current: Some(n(10)),
+        memory_peak: Some(n(peak)),
         disk_logical_bytes: n(100),
         disk_allocated_bytes: n(80),
-        io_read_bytes: n(cpu),
-        io_write_bytes: n(cpu * 2),
+        io_read_bytes: Some(n(cpu)),
+        io_write_bytes: Some(n(cpu * 2)),
         output_retained_bytes: n(5),
         network_rx_bytes: n(network),
         network_tx_bytes: n(network * 2),
         network_connections: n(network),
-        processes_current: n(1),
+        executions_current: n(1),
         complete: false,
         source: "guest".into(),
         observed_unix_millis: n(1000 + cpu),
     };
     let first = fixture
         .host
-        .observe_usage(&fixture.sandbox, n(1), sample(10, 20, 30))
+        .observe_usage(&fixture.machine, n(1), sample(10, 20, 30))
         .unwrap();
-    assert_eq!(first.cpu_micros, n(10));
-    let same_epoch = fixture
+    assert_eq!(first.cpu_micros, Some(n(10)));
+    let same_generation = fixture
         .host
-        .observe_usage(&fixture.sandbox, n(1), sample(15, 24, 40))
+        .observe_usage(&fixture.machine, n(1), sample(15, 24, 40))
         .unwrap();
-    assert_eq!(same_epoch.cpu_micros, n(15));
-    assert_eq!(same_epoch.network_rx_bytes, n(24));
-    let next_epoch = fixture
+    assert_eq!(same_generation.cpu_micros, Some(n(15)));
+    assert_eq!(same_generation.network_rx_bytes, n(24));
+    let next_generation = fixture
         .host
-        .observe_usage(&fixture.sandbox, n(2), sample(3, 25, 12))
+        .observe_usage(&fixture.machine, n(2), sample(3, 25, 12))
         .unwrap();
-    assert_eq!(next_epoch.cpu_micros, n(18));
-    assert_eq!(next_epoch.io_write_bytes, n(36));
-    assert_eq!(next_epoch.network_rx_bytes, n(25));
-    assert_eq!(next_epoch.memory_peak, n(40));
+    assert_eq!(next_generation.cpu_micros, Some(n(18)));
+    assert_eq!(next_generation.io_write_bytes, Some(n(36)));
+    assert_eq!(next_generation.network_rx_bytes, n(25));
+    assert_eq!(next_generation.memory_peak, Some(n(40)));
 }
 
-fn rebind_mutation(value: &Mutation, identity: &str) -> Mutation {
+fn rebind_command(value: &GuestCommand, identity: &str) -> GuestCommand {
     let operation_id: OperationId = identity.try_into().unwrap();
     let mut request = value.request.clone();
-    if let WorkloadRequest::Spawn { request } = &mut request {
+    if let GuestRequest::Spawn { request } = &mut request {
         request.operation_id = operation_id.clone();
-        request.process_id = identity.try_into().unwrap();
+        request.execution_id = identity.try_into().unwrap();
     }
-    Mutation::new(
-        value.sandbox_id.clone(),
-        value.epoch,
+    GuestCommand::new(
+        value.machine_id.clone(),
+        value.generation,
         operation_id,
-        value.grant_id.clone(),
-        value.expected_revision,
         request,
     )
     .unwrap()
 }
 
-fn process_mutation(
-    value: &Mutation,
+fn process_command(
+    value: &GuestCommand,
     identity: &str,
     output_bytes: Counter,
     stdio: StdioMode,
-) -> Mutation {
-    let rebound = rebind_mutation(value, identity);
+) -> GuestCommand {
+    let rebound = rebind_command(value, identity);
     let mut request = rebound.request.clone();
-    let WorkloadRequest::Spawn { request: spawn } = &mut request else {
-        panic!("fixture mutation is not a spawn");
+    let GuestRequest::Spawn { request: spawn } = &mut request else {
+        panic!("fixture command is not a spawn");
     };
     spawn.output_bytes = output_bytes;
     spawn.stdio = stdio;
@@ -921,12 +1097,10 @@ fn process_mutation(
         pixel_width: 0,
         pixel_height: 0,
     });
-    Mutation::new(
-        rebound.sandbox_id,
-        rebound.epoch,
+    GuestCommand::new(
+        rebound.machine_id,
+        rebound.generation,
         rebound.operation_id,
-        rebound.grant_id,
-        rebound.expected_revision,
         request,
     )
     .unwrap()
@@ -935,30 +1109,26 @@ fn process_mutation(
 #[test]
 fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
     let mut f = Fixture::new();
-    let mutation = rebind_mutation(&f.mutation, "once");
-    let authorize = || {
-        f.host
-            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-            .unwrap()
-    };
+    let command = rebind_command(&f.command, "once");
+    let authorize = || command.clone();
     f.runtime.admit(authorize()).unwrap();
     let mut effects = 0;
     match f.runtime.begin_dispatch(authorize()).unwrap() {
-        DispatchDecision::Perform(permit) => permit.perform(|_, _| effects += 1),
+        DispatchDecision::Perform(permit) => permit.perform(|_| effects += 1),
         DispatchDecision::Reconcile(_) => panic!("first dispatch must be new"),
     }
     assert_eq!(effects, 1);
     let path = f.root.0.join("runtime");
     drop(f.runtime);
-    let mut reopened = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let mut reopened = RuntimeJournal::open(&path, &f.machine).unwrap();
     match reopened.begin_dispatch(authorize()).unwrap() {
         DispatchDecision::Perform(_) => panic!("dispatched operation cannot execute twice"),
         DispatchDecision::Reconcile(old) => assert_eq!(old.delivery, Delivery::Dispatched),
     }
     reopened
         .record_delivery(
-            &mutation.operation_id,
-            &mutation.request_digest,
+            &command.operation_id,
+            &command.request_digest,
             Delivery::Unknown,
             None,
         )
@@ -973,80 +1143,84 @@ fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
 }
 
 #[test]
-fn host_signed_authority_survives_api_restart_and_rejects_tampering() {
+fn ordinary_commands_are_digest_bound_without_grant_envelopes() {
     let mut f = Fixture::new();
-    let mutation = rebind_mutation(&f.mutation, "signed-across-restart");
-    let authorized = f
-        .host
-        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
-
-    let mut changed_scope = authorized.clone();
-    changed_scope.statement.scope_digest = hash("broader-scope");
-    assert!(f.runtime.admit(changed_scope).is_err());
-
-    let mut changed_signature = authorized.clone();
-    changed_signature.signature = "0".repeat(128).try_into().unwrap();
-    assert!(f.runtime.admit(changed_signature).is_err());
-
-    let host_path = f.root.0.join("host");
-    let binding = f.host.authority_binding().clone();
-    drop(f.host);
-    assert_eq!(f.runtime.authority_binding(), &binding);
+    let command = rebind_command(&f.command, "ordinary-command");
+    let mut corrupted = command.clone();
+    corrupted.request_digest = hash("not-the-command");
+    assert!(f.runtime.admit(corrupted).is_err());
     assert_eq!(
-        f.runtime.admit(authorized).unwrap().delivery,
-        Delivery::Admitted
-    );
-
-    let host = HostCatalog::open(&host_path).unwrap();
-    assert_eq!(host.authority_binding(), &binding);
-    let after_restart = rebind_mutation(&mutation, "signed-after-restart");
-    let authorized = host
-        .authorize(after_restart, Capability::Spawn, &hash("workload"))
-        .unwrap();
-    assert_eq!(
-        f.runtime.admit(authorized).unwrap().delivery,
+        f.runtime.admit(command).unwrap().delivery,
         Delivery::Admitted
     );
 }
 
 #[test]
+fn dense_binary_admission_retains_commitments_and_never_replays_bytes_after_restart() {
+    let mut f = Fixture::new();
+    let command = GuestCommand::new(
+        f.machine.clone(),
+        Counter::ONE,
+        "dense-input".try_into().unwrap(),
+        GuestRequest::WriteInput {
+            execution_id: "execution".try_into().unwrap(),
+            terminal_lease_id: None,
+            bytes: vec![255; MAX_STREAM_BYTES],
+        },
+    )
+    .unwrap();
+    let value = f.runtime.admit(command.clone()).unwrap();
+    assert!(serde_json::to_vec(&value).unwrap().len() < 2048);
+    assert_eq!(
+        value.admission.binary.as_ref().unwrap()[0].length as usize,
+        MAX_STREAM_BYTES
+    );
+    assert!(value.admission.request.validate().is_err());
+    match f.runtime.begin_dispatch(command.clone()).unwrap() {
+        DispatchDecision::Perform(permit) => permit.perform(|actual| {
+            assert_eq!(actual, &command);
+        }),
+        DispatchDecision::Reconcile(_) => panic!("fresh admission must dispatch"),
+    }
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let mut reopened = RuntimeJournal::open(&path, &f.machine).unwrap();
+    assert!(matches!(
+        reopened.begin_dispatch(command.clone()).unwrap(),
+        DispatchDecision::Reconcile(_)
+    ));
+    let mut substituted = command;
+    let GuestRequest::WriteInput { bytes, .. } = &mut substituted.request else {
+        unreachable!()
+    };
+    bytes[0] = 0;
+    let changed = GuestCommand::new(
+        substituted.machine_id,
+        substituted.generation,
+        substituted.operation_id,
+        substituted.request,
+    )
+    .unwrap();
+    assert!(reopened.admit(changed).is_err());
+}
+
+#[test]
 fn dropped_dispatch_permission_preserves_uncertainty_instead_of_retrying() {
     let mut f = Fixture::new();
-    let mutation = rebind_mutation(&f.mutation, "interrupted-native-dispatch");
-    f.runtime
-        .admit(
-            f.host
-                .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-                .unwrap(),
-        )
-        .unwrap();
+    let command = rebind_command(&f.command, "interrupted-native-dispatch");
+    f.runtime.admit(command.clone()).unwrap();
     // The durable dispatch commit can precede a crash before any native effect.
-    drop(
-        f.runtime
-            .begin_dispatch(
-                f.host
-                    .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-                    .unwrap(),
-            )
-            .unwrap(),
-    );
+    drop(f.runtime.begin_dispatch(command.clone()).unwrap());
     assert_eq!(
         f.runtime
-            .operation(&mutation.operation_id)
+            .operation(&command.operation_id)
             .unwrap()
             .unwrap()
             .delivery,
         Delivery::Dispatched
     );
     assert!(matches!(
-        f.runtime
-            .begin_dispatch(
-                f.host
-                    .authorize(mutation, Capability::Spawn, &hash("workload"))
-                    .unwrap()
-            )
-            .unwrap(),
+        f.runtime.begin_dispatch(command).unwrap(),
         DispatchDecision::Reconcile(_)
     ));
 }
@@ -1054,14 +1228,8 @@ fn dropped_dispatch_permission_preserves_uncertainty_instead_of_retrying() {
 #[test]
 fn admitted_work_does_not_bypass_a_later_machine_barrier() {
     let mut f = Fixture::new();
-    let mutation = rebind_mutation(&f.mutation, "queued");
-    f.runtime
-        .admit(
-            f.host
-                .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-                .unwrap(),
-        )
-        .unwrap();
+    let command = rebind_command(&f.command, "queued");
+    f.runtime.admit(command.clone()).unwrap();
     let mut observation = f
         .runtime
         .last_observation()
@@ -1072,18 +1240,10 @@ fn admitted_work_does_not_bypass_a_later_machine_barrier() {
     observation.sequence = n(4);
     observation.state = MachineState::Paused;
     f.runtime.observe(observation).unwrap();
-    assert!(
-        f.runtime
-            .begin_dispatch(
-                f.host
-                    .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-                    .unwrap()
-            )
-            .is_err()
-    );
+    assert!(f.runtime.begin_dispatch(command.clone()).is_err());
     assert_eq!(
         f.runtime
-            .operation(&mutation.operation_id)
+            .operation(&command.operation_id)
             .unwrap()
             .unwrap()
             .delivery,
@@ -1123,10 +1283,10 @@ fn system_ancestor_aliases_do_not_disable_final_component_protection() {
 fn exclusive_writers_and_role_separation() {
     let fixture = Fixture::new();
     assert!(HostCatalog::open(&fixture.root.0.join("host")).is_err());
-    assert!(RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.sandbox).is_err());
+    assert!(RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.machine).is_err());
     let path = fixture.root.0.join("host");
     drop(fixture.host);
-    assert!(RuntimeJournal::open(&path, &fixture.sandbox).is_err());
+    assert!(RuntimeJournal::open(&path, &fixture.machine).is_err());
     assert_eq!(HostCatalog::open(&path).unwrap().host_id().as_str(), "host");
 }
 
@@ -1136,13 +1296,13 @@ fn stop_intent_is_not_stopped_observation() {
     let operation: OperationId = "stop".try_into().unwrap();
     let request_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &operation, n(2), DesiredState::Stopped),
+        &(&f.machine, &operation, n(2), DesiredState::Stopped),
     )
     .unwrap();
     let intent = f
         .host
         .request_lifecycle(
-            &f.sandbox,
+            &f.machine,
             operation.clone(),
             n(2),
             DesiredState::Stopped,
@@ -1168,13 +1328,7 @@ fn stop_intent_is_not_stopped_observation() {
         }),
         LifecycleDecision::Reconcile(_) => panic!("first lifecycle dispatch must be new"),
     }
-    let mut fresh = f.mutation.clone();
-    fresh.expected_revision = n(3);
-    assert!(
-        f.host
-            .authorize(fresh, Capability::Spawn, &hash("workload"))
-            .is_err()
-    );
+    assert!(f.host.require_guest_access(&f.machine).is_err());
     let old = f.runtime.last_observation().unwrap().unwrap();
     assert_eq!(old.value().state, MachineState::Running);
     let mut observation = old.value().clone();
@@ -1217,12 +1371,12 @@ fn interrupted_lifecycle_dispatch_is_reconciled_without_replay() {
     let operation: OperationId = "pause-with-lost-response".try_into().unwrap();
     let request_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &operation, n(2), DesiredState::Paused),
+        &(&f.machine, &operation, n(2), DesiredState::Paused),
     )
     .unwrap();
     f.host
         .request_lifecycle(
-            &f.sandbox,
+            &f.machine,
             operation.clone(),
             n(2),
             DesiredState::Paused,
@@ -1254,13 +1408,13 @@ fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() 
     let pause: OperationId = "pause-before-next-intent".try_into().unwrap();
     let pause_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &pause, n(2), DesiredState::Paused),
+        &(&f.machine, &pause, n(2), DesiredState::Paused),
     )
     .unwrap();
     let intent = f
         .host
         .request_lifecycle(
-            &f.sandbox,
+            &f.machine,
             pause.clone(),
             n(2),
             DesiredState::Paused,
@@ -1274,13 +1428,13 @@ fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() 
     let stop: OperationId = "stop-overtaking-pause".try_into().unwrap();
     let stop_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &stop, n(3), DesiredState::Stopped),
+        &(&f.machine, &stop, n(3), DesiredState::Stopped),
     )
     .unwrap();
     assert!(
         f.host
             .request_lifecycle(
-                &f.sandbox,
+                &f.machine,
                 stop,
                 n(3),
                 DesiredState::Stopped,
@@ -1314,162 +1468,23 @@ fn incomplete_lifecycle_intents_cannot_be_overtaken_and_not_applied_can_retry() 
 }
 
 #[test]
-fn revoked_grants_and_stale_revisions_cannot_authorize() {
-    let mut f = Fixture::new();
-    let scope = hash("workload");
-    let revoke: OperationId = "revoke-spawn".try_into().unwrap();
-    let request_digest = digest(
-        Domain::Grant,
-        &(
-            "sandsurf-grant-change-v1",
-            &f.sandbox,
-            &revoke,
-            &f.mutation.grant_id,
-            n(2),
-            Capability::Spawn,
-            &scope,
-            true,
-        ),
-    )
-    .unwrap();
-    let revoked = f
-        .host
-        .set_grant(
-            GrantChange {
-                sandbox_id: f.sandbox.clone(),
-                operation_id: revoke.clone(),
-                id: f.mutation.grant_id.clone(),
-                expected_revision: n(2),
-                capability: Capability::Spawn,
-                scope_digest: scope.clone(),
-                revoked: true,
-            },
-            Approval {
-                id: "revoke".try_into().unwrap(),
-                request_digest: request_digest.clone(),
-            },
-        )
-        .unwrap();
-    assert!(revoked.revoked);
-    assert_eq!(
-        f.host
-            .set_grant(
-                GrantChange {
-                    sandbox_id: f.sandbox.clone(),
-                    operation_id: revoke,
-                    id: f.mutation.grant_id.clone(),
-                    expected_revision: n(2),
-                    capability: Capability::Spawn,
-                    scope_digest: scope.clone(),
-                    revoked: true,
-                },
-                Approval {
-                    id: "revoke-retry".try_into().unwrap(),
-                    request_digest,
-                },
-            )
-            .unwrap(),
-        revoked
-    );
-    assert_eq!(
-        f.host.grants(&f.sandbox, None, n(10)).unwrap(),
-        vec![revoked]
-    );
-    let original_operation: OperationId = "grant-spawn".try_into().unwrap();
-    let original_digest = digest(
-        Domain::Grant,
-        &(
-            "sandsurf-grant-change-v1",
-            &f.sandbox,
-            &original_operation,
-            &f.mutation.grant_id,
-            n(1),
-            Capability::Spawn,
-            &scope,
-            false,
-        ),
-    )
-    .unwrap();
-    let historical = f
-        .host
-        .set_grant(
-            GrantChange {
-                sandbox_id: f.sandbox.clone(),
-                operation_id: original_operation,
-                id: f.mutation.grant_id.clone(),
-                expected_revision: n(1),
-                capability: Capability::Spawn,
-                scope_digest: scope.clone(),
-                revoked: false,
-            },
-            Approval {
-                id: "observe-original-grant".try_into().unwrap(),
-                request_digest: original_digest,
-            },
-        )
-        .unwrap();
-    assert_eq!(historical.revision, n(2));
-    assert!(!historical.revoked);
-    assert!(f.host.grant(&f.mutation.grant_id).unwrap().unwrap().revoked);
-    assert!(
-        f.host
-            .authorize(f.mutation.clone(), Capability::Spawn, &scope)
-            .is_err()
-    );
-    f.mutation.expected_revision = n(3);
-    assert!(
-        f.host
-            .authorize(f.mutation.clone(), Capability::Spawn, &scope)
-            .is_err()
-    );
-    let revive: OperationId = "revive-spawn".try_into().unwrap();
-    let request_digest = digest(
-        Domain::Grant,
-        &(
-            "sandsurf-grant-change-v1",
-            &f.sandbox,
-            &revive,
-            &f.mutation.grant_id,
-            n(3),
-            Capability::Spawn,
-            &scope,
-            false,
-        ),
-    )
-    .unwrap();
-    assert!(
-        f.host
-            .set_grant(
-                GrantChange {
-                    sandbox_id: f.sandbox.clone(),
-                    operation_id: revive,
-                    id: f.mutation.grant_id.clone(),
-                    expected_revision: n(3),
-                    capability: Capability::Spawn,
-                    scope_digest: scope,
-                    revoked: false
-                },
-                Approval {
-                    id: "revive".try_into().unwrap(),
-                    request_digest
-                }
-            )
-            .is_err()
-    );
-}
-
-#[test]
 fn host_configuration_operations_replay_immutable_results_without_reapplying_old_state() {
     let mut f = Fixture::new();
-    let original = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    let original = f.host.machine(&f.machine).unwrap().unwrap();
     let first_operation: OperationId = "configure-first".try_into().unwrap();
     let first_digest = hash("configure-first-request");
     let mut first_configuration = original.runtime_configuration.clone();
-    first_configuration.resources.cpu_max = Some((n(10_000), n(100_000)));
+    first_configuration.network.rules = vec![NetworkRule {
+        plane: NetworkPlane::DirectTcp,
+        destination: NetworkDestination::Ip {
+            cidr: "198.51.100.0/24".into(),
+        },
+        ports: vec![PortRange { from: 443, to: 443 }],
+    }];
     let first = f
         .host
         .set_runtime_configuration(
-            &f.sandbox,
+            &f.machine,
             &first_operation,
             n(2),
             first_configuration.clone(),
@@ -1485,11 +1500,11 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
     let second_operation: OperationId = "configure-second".try_into().unwrap();
     let second_digest = hash("configure-second-request");
     let mut second_configuration = first_configuration.clone();
-    second_configuration.resources.cpu_max = Some((n(20_000), n(100_000)));
+    second_configuration.network.rules[0].ports = vec![PortRange { from: 80, to: 80 }];
     let second = f
         .host
         .set_runtime_configuration(
-            &f.sandbox,
+            &f.machine,
             &second_operation,
             n(3),
             second_configuration.clone(),
@@ -1505,7 +1520,7 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
     assert_eq!(
         f.host
             .set_runtime_configuration(
-                &f.sandbox,
+                &f.machine,
                 &first_operation,
                 n(2),
                 first_configuration,
@@ -1518,7 +1533,7 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
             .unwrap(),
         first
     );
-    let current = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    let current = f.host.machine(&f.machine).unwrap().unwrap();
     assert_eq!(current.configuration_revision, n(4));
     assert_eq!(current.runtime_configuration, second_configuration);
     assert_eq!(
@@ -1528,7 +1543,7 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
     assert!(
         f.host
             .set_runtime_configuration(
-                &f.sandbox,
+                &f.machine,
                 &first_operation,
                 n(2),
                 current.runtime_configuration,
@@ -1540,37 +1555,21 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
             )
             .is_err()
     );
-    let conflicting_grant: GrantId = "conflicting-host-operation".try_into().unwrap();
-    let scope = hash("conflicting-host-operation-scope");
-    let grant_digest = digest(
-        Domain::Grant,
-        &(
-            "sandsurf-grant-change-v1",
-            &f.sandbox,
-            &first_operation,
-            &conflicting_grant,
-            n(4),
-            Capability::ReadFiles,
-            &scope,
-            false,
-        ),
+    let conflict = digest(
+        Domain::Machine,
+        &(&f.machine, &first_operation, n(4), DesiredState::Stopped),
     )
     .unwrap();
     assert!(
         f.host
-            .set_grant(
-                GrantChange {
-                    sandbox_id: f.sandbox.clone(),
-                    operation_id: first_operation,
-                    id: conflicting_grant,
-                    expected_revision: n(4),
-                    capability: Capability::ReadFiles,
-                    scope_digest: scope,
-                    revoked: false,
-                },
+            .request_lifecycle(
+                &f.machine,
+                first_operation,
+                n(4),
+                DesiredState::Stopped,
                 Approval {
                     id: "approve-conflicting-host-operation".try_into().unwrap(),
-                    request_digest: grant_digest,
+                    request_digest: conflict
                 },
             )
             .is_err()
@@ -1584,14 +1583,20 @@ fn guardian_retries_only_configuration_dispatches_proven_not_applied() {
     let request_digest = hash("configure-retry-request");
     let mut configuration = f
         .host
-        .sandbox(&f.sandbox)
+        .machine(&f.machine)
         .unwrap()
         .unwrap()
         .runtime_configuration;
-    configuration.resources.cpu_max = Some((n(10_000), n(100_000)));
+    configuration.network.rules = vec![NetworkRule {
+        plane: NetworkPlane::DirectTcp,
+        destination: NetworkDestination::Ip {
+            cidr: "198.51.100.0/24".into(),
+        },
+        ports: vec![PortRange { from: 443, to: 443 }],
+    }];
     f.host
         .set_runtime_configuration(
-            &f.sandbox,
+            &f.machine,
             &operation,
             n(2),
             configuration,
@@ -1602,7 +1607,7 @@ fn guardian_retries_only_configuration_dispatches_proven_not_applied() {
             },
         )
         .unwrap();
-    let authorization = f.host.authorize_configuration(&f.sandbox, n(3)).unwrap();
+    let authorization = f.host.authorize_configuration(&f.machine, n(3)).unwrap();
     let command = authorization.statement.command.clone();
     f.runtime
         .admit_configuration(authorization.clone())
@@ -1635,18 +1640,18 @@ fn host_transfer_operations_reconcile_admission_completion_and_cross_kind_identi
     let request = hash("host-transfer-request");
     let admitted = f
         .host
-        .admit_transfer_operation(operation.clone(), f.sandbox.clone(), request.clone())
+        .admit_transfer_operation(operation.clone(), f.machine.clone(), request.clone(), None)
         .unwrap();
     assert!(!admitted.applied);
     assert_eq!(
         f.host
-            .admit_transfer_operation(operation.clone(), f.sandbox.clone(), request.clone())
+            .admit_transfer_operation(operation.clone(), f.machine.clone(), request.clone(), None)
             .unwrap(),
         admitted
     );
     assert!(
         f.host
-            .admit_transfer_operation(operation.clone(), f.sandbox.clone(), hash("changed"))
+            .admit_transfer_operation(operation.clone(), f.machine.clone(), hash("changed"), None)
             .is_err()
     );
     let completed = f
@@ -1667,13 +1672,13 @@ fn host_transfer_operations_reconcile_admission_completion_and_cross_kind_identi
 
     let lifecycle_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &operation, n(2), DesiredState::Paused),
+        &(&f.machine, &operation, n(2), DesiredState::Paused),
     )
     .unwrap();
     assert!(
         f.host
             .request_lifecycle(
-                &f.sandbox,
+                &f.machine,
                 operation,
                 n(2),
                 DesiredState::Paused,
@@ -1687,13 +1692,73 @@ fn host_transfer_operations_reconcile_admission_completion_and_cross_kind_identi
 }
 
 #[test]
+fn host_file_authority_approval_binds_the_complete_transfer_and_one_identity() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "external-files".try_into().unwrap();
+    let request = hash("complete-host-path-and-file-scope");
+    let approval = Approval {
+        id: "approve-external-files".try_into().unwrap(),
+        request_digest: request.clone(),
+    };
+    let admitted = f
+        .host
+        .admit_transfer_operation(
+            operation.clone(),
+            f.machine.clone(),
+            request.clone(),
+            Some(approval.clone()),
+        )
+        .unwrap();
+    assert_eq!(admitted.approval_id, Some(approval.id.clone()));
+    assert_eq!(
+        f.host
+            .admit_transfer_operation(
+                operation.clone(),
+                f.machine.clone(),
+                request.clone(),
+                Some(approval.clone())
+            )
+            .unwrap(),
+        admitted
+    );
+    assert!(
+        f.host
+            .admit_transfer_operation(operation, f.machine.clone(), request.clone(), None)
+            .is_err()
+    );
+    assert!(
+        f.host
+            .admit_transfer_operation(
+                "reuse-approval".try_into().unwrap(),
+                f.machine.clone(),
+                request.clone(),
+                Some(approval)
+            )
+            .is_err()
+    );
+    assert!(
+        f.host
+            .admit_transfer_operation(
+                "wrong-scope".try_into().unwrap(),
+                f.machine,
+                request,
+                Some(Approval {
+                    id: "wrong-scope-approval".try_into().unwrap(),
+                    request_digest: hash("unrelated")
+                })
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn host_secret_put_operation_is_durable_and_distinct_from_delivery() {
     let mut f = Fixture::new();
     let operation: OperationId = "put-secret-version".try_into().unwrap();
     let request = hash("put-secret-request");
     let secret = SecretVersion {
         id: "registry-credential".try_into().unwrap(),
-        version: hash("secret-originals"),
+        version: "opaque-originals-version".try_into().unwrap(),
         bytes: n(16),
     };
     let admitted = f
@@ -1734,7 +1799,7 @@ fn host_secret_put_operation_is_durable_and_distinct_from_delivery() {
     );
     assert!(
         f.host
-            .admit_transfer_operation(operation, f.sandbox, hash("not-a-secret-put"))
+            .admit_transfer_operation(operation, f.machine, hash("not-a-secret-put"), None)
             .is_err()
     );
 }
@@ -1744,19 +1809,16 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
     let mut f = Fixture::new();
     f.runtime
         .record_delivery(
-            &f.mutation.operation_id,
-            &f.mutation.request_digest,
+            &f.command.operation_id,
+            &f.command.request_digest,
             Delivery::Unknown,
             None,
         )
         .unwrap();
     let path = f.root.0.join("runtime");
     drop(f.runtime);
-    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
-    let authorization = f
-        .host
-        .authorize(f.mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    let authorization = f.command.clone();
     assert_eq!(
         runtime.admit(authorization).unwrap().delivery,
         Delivery::Unknown
@@ -1764,8 +1826,8 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
     assert!(
         runtime
             .record_delivery(
-                &f.mutation.operation_id,
-                &f.mutation.request_digest,
+                &f.command.operation_id,
+                &f.command.request_digest,
                 Delivery::Dispatched,
                 None
             )
@@ -1774,8 +1836,8 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
     assert!(
         runtime
             .record_delivery(
-                &f.mutation.operation_id,
-                &f.mutation.request_digest,
+                &f.command.operation_id,
+                &f.command.request_digest,
                 Delivery::Applied,
                 None
             )
@@ -1783,8 +1845,8 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
     );
     runtime
         .record_delivery(
-            &f.mutation.operation_id,
-            &f.mutation.request_digest,
+            &f.command.operation_id,
+            &f.command.request_digest,
             Delivery::Applied,
             Some(hash("guest-completion")),
         )
@@ -1794,33 +1856,33 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
 #[test]
 fn admission_reservations_are_transactional_and_no_eviction_occurs() {
     let mut f = Fixture::new();
-    let sandbox: SandboxId = "over-budget".try_into().unwrap();
+    let machine: MachineId = "over-budget".try_into().unwrap();
     let operation: OperationId = "over-budget".try_into().unwrap();
     let mut resources = resources();
     resources.vcpus = n(8);
     let image = hash("image");
-    let workload = WorkloadConfiguration::default();
+    let defaults = ExecutionDefaults::default();
     let request_digest = digest(
-        Domain::Sandbox,
+        Domain::Machine,
         &(
-            &sandbox,
+            &machine,
             &image,
             &resources,
-            &workload,
-            &SandboxLifetime::default(),
+            &defaults,
+            &MachineLifetime::default(),
             &operation,
         ),
     )
     .unwrap();
     assert!(
         f.host
-            .create_sandbox(
-                SandboxAdmission {
-                    id: sandbox,
+            .create_machine(
+                MachineAdmission {
+                    id: machine,
                     image,
                     resources,
-                    workload,
-                    lifetime: SandboxLifetime::default(),
+                    defaults,
+                    lifetime: MachineLifetime::default(),
                     operation: operation.clone(),
                 },
                 Approval {
@@ -1858,7 +1920,7 @@ fn acknowledgement_and_disconnect_never_release_bytes() {
         .unwrap();
     let path = f.root.0.join("runtime");
     drop(f.runtime);
-    let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
     assert_eq!(
         runtime.receipt(&f.process).unwrap(),
         Some((receipt, identity))
@@ -1870,7 +1932,7 @@ fn acknowledgement_and_disconnect_never_release_bytes() {
 }
 
 #[test]
-fn evidence_mutation_identities_are_exact_retry_safe_and_globally_fenced() {
+fn evidence_command_identities_are_exact_retry_safe_and_globally_fenced() {
     let mut f = Fixture::new();
     let mut release = f.capture_release();
     let receipt_digest = release.receipt_digest.clone();
@@ -1882,7 +1944,7 @@ fn evidence_mutation_identities_are_exact_retry_safe_and_globally_fenced() {
         f.runtime.runtime_operation(&acknowledgement).unwrap(),
         Some(RuntimeOperationRecord::ReceiptAcknowledgement {
             operation_id: acknowledgement.clone(),
-            process_id: f.process.clone(),
+            execution_id: f.process.clone(),
             receipt_digest: receipt_digest.clone(),
         })
     );
@@ -1915,7 +1977,7 @@ fn evidence_mutation_identities_are_exact_retry_safe_and_globally_fenced() {
         Some(RuntimeOperationRecord::EvidencePin {
             operation_id: pin_operation.clone(),
             pin_id: pin.clone(),
-            process_id: f.process.clone(),
+            execution_id: f.process.clone(),
             receipt_digest: receipt_digest.clone(),
         })
     );
@@ -2027,7 +2089,7 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
     assert_eq!(
         f.runtime.runtime_operation(&request.operation_id).unwrap(),
         Some(RuntimeOperationRecord::EvidenceRelease {
-            process_id: f.process.clone(),
+            execution_id: f.process.clone(),
             request: request.clone(),
             status: status.clone(),
         })
@@ -2035,7 +2097,7 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
     assert!(f.root.0.join("runtime/process.output").exists());
     let path = f.root.0.join("runtime");
     drop(f.runtime);
-    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
     assert_eq!(
         runtime.release(&f.process, request.clone()).unwrap(),
         status
@@ -2062,17 +2124,14 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
         authorization: "changed".try_into().unwrap(),
     };
     assert!(runtime.release(&f.process, conflict).is_err());
-    let authorization = f
-        .host
-        .authorize(f.mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let authorization = f.command.clone();
     assert_eq!(
         runtime.admit(authorization).unwrap().delivery,
         Delivery::Applied
     );
     assert!(
         runtime
-            .admit_process(f.process, &f.mutation.operation_id, n(100), false)
+            .admit_process(f.process, &f.command.operation_id, n(100), false)
             .is_err()
     );
 }
@@ -2101,7 +2160,7 @@ fn continuing_retention_keeps_actual_originals_after_source_release() {
     let path = f.root.0.join("runtime");
     drop(f.runtime);
     assert_eq!(
-        RuntimeJournal::open(&path, &f.sandbox)
+        RuntimeJournal::open(&path, &f.machine)
             .unwrap()
             .read_pin(&pin, n(0), 64)
             .unwrap()
@@ -2120,7 +2179,7 @@ fn explicit_loss_is_exactly_scoped_and_recorded() {
         request_digest: digest(
             Domain::Release,
             &(
-                &f.sandbox,
+                &f.machine,
                 &f.process,
                 &request.receipt_digest,
                 &request.output,
@@ -2132,7 +2191,7 @@ fn explicit_loss_is_exactly_scoped_and_recorded() {
     let authorized = f
         .host
         .authorize_output_loss(
-            &f.sandbox,
+            &f.machine,
             &f.process,
             &request.receipt_digest,
             &request.output,
@@ -2193,7 +2252,7 @@ fn stream_label_corruption_is_detected() {
     db.execute("UPDATE chunks SET stream='\"stderr\"' WHERE sequence=1", [])
         .unwrap();
     drop(db);
-    let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
     assert_eq!(runtime.receipt(&f.process).unwrap(), Some(receipt));
     assert!(runtime.read_output(&f.process, n(0), 64).is_err());
 }
@@ -2214,7 +2273,7 @@ fn uncommitted_output_tail_is_not_exposed_and_is_reconciled_before_append() {
     file.write_all(b"uncommitted").unwrap();
     file.sync_all().unwrap();
     drop(file);
-    let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+    let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
     assert_eq!(
         runtime.read_output(&f.process, n(0), 64).unwrap().cursor,
         n(9)
@@ -2232,10 +2291,10 @@ fn uncommitted_output_tail_is_not_exposed_and_is_reconciled_before_append() {
 fn usage_is_monotonic_and_duplicate_delivery_does_not_double_charge() {
     let mut f = Fixture::new();
     let id: OperationId = "usage-1".try_into().unwrap();
-    f.host.account(&id, &f.sandbox, n(10), n(20)).unwrap();
-    f.host.account(&id, &f.sandbox, n(10), n(20)).unwrap();
-    assert!(f.host.account(&id, &f.sandbox, n(11), n(20)).is_err());
-    assert_eq!(f.host.usage(&f.sandbox).unwrap(), (n(10), n(20)));
+    f.host.account(&id, &f.machine, n(10), n(20)).unwrap();
+    f.host.account(&id, &f.machine, n(10), n(20)).unwrap();
+    assert!(f.host.account(&id, &f.machine, n(11), n(20)).is_err());
+    assert_eq!(f.host.usage(&f.machine).unwrap(), (n(10), n(20)));
 }
 
 #[test]
@@ -2275,24 +2334,24 @@ fn historical_intent_references_resolve_after_new_observations() {
 #[test]
 fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observation() {
     let mut f = Fixture::new();
-    let record = f.host.sandbox(&f.sandbox).unwrap().unwrap();
-    assert_eq!(record.id, f.sandbox);
+    let record = f.host.machine(&f.machine).unwrap().unwrap();
+    assert_eq!(record.id, f.machine);
     assert_eq!(record.configuration_revision, n(2));
     assert_eq!(record.reservation, ReservationState::Held);
     assert_eq!(record.latest_intent.desired, DesiredState::Running);
-    assert_eq!(f.host.sandboxes(None, n(10)).unwrap(), vec![record]);
-    assert!(f.host.sandboxes(None, Counter::ZERO).is_err());
-    assert!(f.host.sandboxes(None, n(257)).is_err());
+    assert_eq!(f.host.machines(None, n(10)).unwrap(), vec![record]);
+    assert!(f.host.machines(None, Counter::ZERO).is_err());
+    assert!(f.host.machines(None, n(257)).is_err());
 
     let operation: OperationId = "destroy-machine".try_into().unwrap();
     let request_digest = digest(
         Domain::Operation,
-        &(&f.sandbox, &operation, n(2), DesiredState::Destroyed),
+        &(&f.machine, &operation, n(2), DesiredState::Destroyed),
     )
     .unwrap();
     f.host
         .request_lifecycle(
-            &f.sandbox,
+            &f.machine,
             operation.clone(),
             n(2),
             DesiredState::Destroyed,
@@ -2302,7 +2361,7 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
             },
         )
         .unwrap();
-    let pending = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    let pending = f.host.machine(&f.machine).unwrap().unwrap();
     assert_eq!(pending.reservation, ReservationState::Held);
     assert_eq!(pending.latest_intent.desired, DesiredState::Destroyed);
     assert_eq!(pending.latest_intent.completion, None);
@@ -2321,7 +2380,7 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     observation.evidence_digest = hash("destroying");
     f.runtime.observe(observation.clone()).unwrap();
     assert_eq!(
-        f.host.sandbox(&f.sandbox).unwrap().unwrap().reservation,
+        f.host.machine(&f.machine).unwrap().unwrap().reservation,
         ReservationState::Held
     );
     observation.sequence = n(5);
@@ -2329,14 +2388,14 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     observation.evidence_digest = hash("runtime-and-disks-cleaned");
     let destroyed = f.runtime.observe(observation).unwrap();
     f.host.complete_intent(&destroyed).unwrap();
-    let retired = f.host.sandbox(&f.sandbox).unwrap().unwrap();
+    let retired = f.host.machine(&f.machine).unwrap().unwrap();
     assert_eq!(retired.reservation, ReservationState::Released);
     assert!(retired.latest_intent.completion.is_some());
-    assert!(f.host.revision(&f.sandbox).is_err());
+    assert!(f.host.revision(&f.machine).is_err());
 }
 
 #[test]
-fn machine_restart_fences_old_epoch_without_rewinding_history() {
+fn machine_restart_fences_old_generation_without_rewinding_history() {
     let mut f = Fixture::new();
     let mut value = f
         .runtime
@@ -2352,33 +2411,27 @@ fn machine_restart_fences_old_epoch_without_rewinding_history() {
     value.state = MachineState::Running;
     assert!(f.runtime.observe(value.clone()).is_err());
     value.state = MachineState::Starting;
-    value.epoch = n(2);
+    value.generation = n(2);
     f.runtime.observe(value.clone()).unwrap();
     value.sequence = n(6);
     value.state = MachineState::Running;
     f.runtime.observe(value).unwrap();
-    let stale = rebind_mutation(&f.mutation, "stale-after-boot");
-    let authorization = f
-        .host
-        .authorize(stale, Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let stale = rebind_command(&f.command, "stale-after-boot");
+    let authorization = stale;
     assert!(f.runtime.admit(authorization).is_err());
 }
 
 #[test]
 fn independent_jobs_and_pty_streams_have_separate_reservations() {
     let mut f = Fixture::new();
-    let mutation = process_mutation(&f.mutation, "terminal", n(200), StdioMode::Terminal);
-    let authorization = f
-        .host
-        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let command = process_command(&f.command, "terminal", n(200), StdioMode::Terminal);
+    let authorization = command.clone();
     f.runtime.admit(authorization).unwrap();
-    let terminal: ProcessId = "terminal".try_into().unwrap();
+    let terminal: ExecutionId = "terminal".try_into().unwrap();
     f.runtime
-        .admit_process(terminal.clone(), &mutation.operation_id, n(200), true)
+        .admit_process(terminal.clone(), &command.operation_id, n(200), true)
         .unwrap();
-    dispatch(&mut f.runtime, &f.host, &mutation);
+    dispatch(&mut f.runtime, &command);
     assert!(
         f.runtime
             .append_output(&terminal, n(1), Stream::Stdout, b"wrong stream")
@@ -2399,24 +2452,21 @@ fn completed_jobs_return_unused_output_headroom_without_releasing_bytes() {
     let mut f = Fixture::new();
     for index in 0..12 {
         let identity = format!("short-job-{index}");
-        let mutation = process_mutation(&f.mutation, &identity, n(100), StdioMode::Pipes);
-        let authorization = f
-            .host
-            .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-            .unwrap();
+        let command = process_command(&f.command, &identity, n(100), StdioMode::Pipes);
+        let authorization = command.clone();
         f.runtime.admit(authorization).unwrap();
-        let process: ProcessId = identity.try_into().unwrap();
+        let process: ExecutionId = identity.try_into().unwrap();
         f.runtime
-            .admit_process(process.clone(), &mutation.operation_id, n(100), false)
+            .admit_process(process.clone(), &command.operation_id, n(100), false)
             .unwrap();
-        dispatch(&mut f.runtime, &f.host, &mutation);
+        dispatch(&mut f.runtime, &command);
         f.runtime
             .append_output(&process, n(1), Stream::Stdout, b"x")
             .unwrap();
         f.runtime
             .publish_receipt(
                 &process,
-                ProcessOutcome::Exit { code: 0 },
+                ExecutionOutcome::Exit { code: 0 },
                 hash("reaped"),
                 hash("accounted"),
             )
@@ -2426,25 +2476,19 @@ fn completed_jobs_return_unused_output_headroom_without_releasing_bytes() {
             b"x"
         );
     }
-    let mutation = process_mutation(&f.mutation, "large-job", n(880), StdioMode::Pipes);
-    let authorization = f
-        .host
-        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let command = process_command(&f.command, "large-job", n(880), StdioMode::Pipes);
+    let authorization = command.clone();
     f.runtime.admit(authorization).unwrap();
     f.runtime
         .admit_process(
             "large-job".try_into().unwrap(),
-            &mutation.operation_id,
+            &command.operation_id,
             n(880),
             false,
         )
         .unwrap();
-    let excessive = process_mutation(&f.mutation, "too-large-job", n(10), StdioMode::Pipes);
-    let authorization = f
-        .host
-        .authorize(excessive.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let excessive = process_command(&f.command, "too-large-job", n(10), StdioMode::Pipes);
+    let authorization = excessive.clone();
     f.runtime.admit(authorization).unwrap();
     assert!(
         f.runtime
@@ -2461,11 +2505,8 @@ fn completed_jobs_return_unused_output_headroom_without_releasing_bytes() {
 #[test]
 fn confirmed_non_application_returns_output_reservation() {
     let mut f = Fixture::new();
-    let failed = process_mutation(&f.mutation, "rejected-job", n(850), StdioMode::Pipes);
-    let authorization = f
-        .host
-        .authorize(failed.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let failed = process_command(&f.command, "rejected-job", n(850), StdioMode::Pipes);
+    let authorization = failed.clone();
     f.runtime.admit(authorization).unwrap();
     f.runtime
         .admit_process(
@@ -2483,11 +2524,8 @@ fn confirmed_non_application_returns_output_reservation() {
             Some(hash("rejected")),
         )
         .unwrap();
-    let next = process_mutation(&f.mutation, "next-job", n(900), StdioMode::Pipes);
-    let authorization = f
-        .host
-        .authorize(next.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let next = process_command(&f.command, "next-job", n(900), StdioMode::Pipes);
+    let authorization = next.clone();
     f.runtime.admit(authorization).unwrap();
     f.runtime
         .admit_process(
@@ -2506,10 +2544,10 @@ fn abrupt_writer_child() {
         return;
     };
     let root = PathBuf::from(root);
-    let sandbox: SandboxId = "box".try_into().unwrap();
-    let process: ProcessId = "process".try_into().unwrap();
+    let machine: MachineId = "box".try_into().unwrap();
+    let process: ExecutionId = "process".try_into().unwrap();
     let mode = std::env::var("SANDSURF_TEST_CRASH_MODE").unwrap();
-    let mut runtime = RuntimeJournal::open(&root.join("runtime"), &sandbox).unwrap();
+    let mut runtime = RuntimeJournal::open(&root.join("runtime"), &machine).unwrap();
     match mode.as_str() {
         "after-output" => {
             runtime
@@ -2570,7 +2608,7 @@ fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
             "{}",
             String::from_utf8_lossy(&status.stderr)
         );
-        let mut runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+        let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
         if let Some(request) = release {
             let status = runtime.release(&f.process, request).unwrap();
             assert!(status.cleanup_pending);
@@ -2589,7 +2627,7 @@ fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
             );
             assert_eq!(
                 runtime
-                    .operation(&f.mutation.operation_id)
+                    .operation(&f.command.operation_id)
                     .unwrap()
                     .unwrap()
                     .delivery,
@@ -2603,17 +2641,14 @@ fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
 #[test]
 fn output_pages_bound_record_count_as_well_as_original_bytes() {
     let mut f = Fixture::new();
-    let mutation = process_mutation(&f.mutation, "many-chunks", n(400), StdioMode::Pipes);
-    let authorization = f
-        .host
-        .authorize(mutation.clone(), Capability::Spawn, &hash("workload"))
-        .unwrap();
+    let command = process_command(&f.command, "many-chunks", n(400), StdioMode::Pipes);
+    let authorization = command.clone();
     f.runtime.admit(authorization).unwrap();
-    let process: ProcessId = "many-chunks".try_into().unwrap();
+    let process: ExecutionId = "many-chunks".try_into().unwrap();
     f.runtime
-        .admit_process(process.clone(), &mutation.operation_id, n(400), false)
+        .admit_process(process.clone(), &command.operation_id, n(400), false)
         .unwrap();
-    dispatch(&mut f.runtime, &f.host, &mutation);
+    dispatch(&mut f.runtime, &command);
     for sequence in 1..=300 {
         f.runtime
             .append_output(&process, n(sequence), Stream::Stdout, b"x")
@@ -2647,7 +2682,7 @@ fn malformed_output_index_is_unavailable_without_panicking_or_erasing_receipt() 
         let database = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
         database.execute(corruption, []).unwrap();
         drop(database);
-        let runtime = RuntimeJournal::open(&path, &f.sandbox).unwrap();
+        let runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
         assert_eq!(runtime.receipt(&f.process).unwrap(), Some(receipt));
         assert!(runtime.read_output(&f.process, n(0), 64).is_err());
     }

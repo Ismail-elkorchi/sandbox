@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-package-test-"));
+const temporary = await mkdtemp(resolve(tmpdir(), "machine-package-test-"));
 const npmCli = requiredEnvironment("npm_execpath");
 const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
@@ -21,7 +21,7 @@ try {
     for (const imagePath of expectedImages) {
       if (!paths.includes(imagePath)) throw new Error(`${tarball} is missing ${imagePath}`);
     }
-    if (paths.some((path) => path.includes("/minimal-") || path.endsWith("vmlinux-6.1.177"))) {
+    if (paths.some((path) => /(?:minimal-|trusted-bootstrap|development-workload|empty-workspace)/u.test(path))) {
       throw new Error(`${tarball} contains a retired guest image artifact`);
     }
   }
@@ -30,7 +30,29 @@ try {
   if (originalUmask !== undefined) process.umask(0o002);
   await run(process.execPath, [npmCli, "init", "--yes"], consumer);
   await run(process.execPath, [npmCli, "install", "--ignore-scripts", core], consumer);
-  await run("node", ["--input-type=module", "--eval", "await import('sandsurf')"], consumer);
+  await run(process.execPath, ["--input-type=module", "--eval", `
+    import assert from "node:assert/strict";
+    import { Sandsurf } from "sandsurf";
+    import { NativeHostClient } from "./node_modules/sandsurf/dist/native-host.js";
+    const directory = ${JSON.stringify(resolve(temporary, "installed-native-state"))};
+    let host = await Sandsurf.open({ directory, authorizer: () => true });
+    try {
+      const before = await host.inspect();
+      assert.ok(before.defaultImageDigest);
+      const secret = await host.secrets.put("installed-binary-secret", Buffer.alloc(1024 ** 2, 255), { operationId: "installed-put" });
+      assert.equal(secret.bytes, 1024 ** 2);
+      await host.close();
+      host = await Sandsurf.open({ directory, service: "connect" });
+      assert.equal((await host.inspect()).hostId, before.hostId);
+      const retained = await host.operations.get("installed-put");
+      assert.equal(retained.kind, "secret-put");
+      assert.equal(retained.value.secret.version, secret.version);
+      assert.equal((await host.machines.list()).length, 0);
+    } finally {
+      await host.close();
+      await (await NativeHostClient.open(directory)).stopService();
+    }
+  `], consumer);
   await copyFile(resolve("scripts/package-consumer.mts"), resolve(consumer, "package-consumer.mts"));
   await run(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "--strict", "--noEmit", "--module", "NodeNext", "--target", "ES2024",
     "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer);
@@ -42,7 +64,7 @@ try {
 }
 
 async function packagedImagePaths(): Promise<readonly string[]> {
-  const root = resolve("packages/sandbox/images");
+  const root = resolve("packages/sandsurf/images");
   const index: unknown = JSON.parse(await readFile(resolve(root, "manifest.json"), "utf8"));
   if (!record(index) || !record(index.files)) throw new Error("guest image index is malformed");
   const paths = ["package/images/manifest.json"];
@@ -54,13 +76,13 @@ async function packagedImagePaths(): Promise<readonly string[]> {
     const manifest: unknown = JSON.parse(await readFile(resolve(root, relative), "utf8"));
     if (!record(manifest) || manifest.id !== "sandsurf-development" || manifest.version !== "3.24.2" ||
         !record(manifest.bootBundle) || !record(manifest.bootBundle.kernel) ||
-        !record(manifest.bootBundle.bootstrap) || !record(manifest.workload) ||
-        !record(manifest.workload.rootfs) || !record(manifest.workload.stateTemplate) ||
-        !record(manifest.workload.provenance) || !record(manifest.workload.provenance.materials)) {
+        manifest.formatVersion !== 3 || !record(manifest.system) ||
+        !record(manifest.system.rootfs) ||
+        !record(manifest.system.provenance) || !record(manifest.system.provenance.materials)) {
       throw new Error(`${relative} is malformed`);
     }
     paths.push(`package/images/${relative}`);
-    for (const artifact of [manifest.bootBundle.kernel, manifest.bootBundle.bootstrap, manifest.workload.rootfs, manifest.workload.stateTemplate]) {
+    for (const artifact of [manifest.bootBundle.kernel, manifest.system.rootfs]) {
       if (typeof artifact.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(artifact.path)) throw new Error(`${relative} has an unsafe artifact path`);
       paths.push(`package/images/${match[1]}/${artifact.path}`);
     }

@@ -1,14 +1,15 @@
 use sandsurf_host::api::{HostRequest, HostResponse};
-use sandsurf_host::service::{HostError, host_call, serve_host, serve_sandbox_guardian};
-use sandsurf_protocol::{RuntimeResponse, SandboxId};
+use sandsurf_host::service::{HostError, host_call, serve_host, serve_machine_guardian};
+use sandsurf_protocol::MachineId;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
-const MAX_BRIDGE_BYTES: usize = 1024 * 1024;
+const MAX_BRIDGE_BYTES: usize =
+    sandsurf_protocol::MAX_RPC_DATA_BYTES + sandsurf_protocol::MAX_CONTROL_BYTES + 4;
 const MAX_BRIDGE_PENDING: usize = 64;
 const BRIDGE_WORKERS: usize = 8;
-const BRIDGE_VERSION: u16 = 2;
+const BRIDGE_VERSION: u16 = 3;
 
 fn main() {
     if let Err(error) = run() {
@@ -26,19 +27,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("missing Sandsurf host mode")?;
     #[cfg(target_os = "linux")]
     if mode == "--linux-vmm-launcher" {
-        std::process::exit(sandbox_launcher_linux::vmm_launcher_main());
+        std::process::exit(sandsurf_machine::launcher::vmm_launcher_main());
     }
     #[cfg(target_os = "linux")]
     if mode == "--linux-vmm-isolated" {
-        std::process::exit(sandbox_launcher_linux::vmm_isolated_main(arguments.next()));
+        std::process::exit(sandsurf_machine::launcher::vmm_isolated_main(
+            arguments.next(),
+        ));
     }
     #[cfg(target_os = "linux")]
     if mode == "--linux-kernel-probe" {
-        std::process::exit(sandbox_launcher_linux::probe_main());
+        std::process::exit(sandsurf_machine::launcher::probe_main());
     }
     #[cfg(target_os = "linux")]
     if mode == "--linux-namespace-probe" {
-        std::process::exit(sandbox_launcher_linux::namespace_probe_main());
+        std::process::exit(sandsurf_machine::launcher::namespace_probe_main());
     }
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;
@@ -50,12 +53,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             windows_service::run(directory, service_name, std::env::current_exe()?)?;
         }
         "guardian" => {
-            let sandbox: SandboxId = argument(&values, "--sandbox")?
+            let machine: MachineId = argument(&values, "--machine")?
                 .into_os_string()
                 .into_string()
-                .map_err(|_| "sandbox identity is not UTF-8")?
+                .map_err(|_| "machine identity is not UTF-8")?
                 .try_into()?;
-            serve_sandbox_guardian(&directory, sandbox)?;
+            serve_machine_guardian(&directory, machine)?;
         }
         "bridge" => run_bridge(&directory)?,
         _ => return Err("invalid Sandsurf host mode".into()),
@@ -139,11 +142,54 @@ fn bridge_read(input: &mut impl Read, jobs: &mpsc::SyncSender<Vec<u8>>) -> io::R
     }
 }
 
+fn parse_bridge_request(
+    bytes: &[u8],
+) -> Result<(u64, u16, HostRequest), Box<dyn std::error::Error>> {
+    let header: [u8; 4] = bytes
+        .get(..4)
+        .ok_or("bridge metadata length missing")?
+        .try_into()?;
+    let length = u32::from_le_bytes(header) as usize;
+    if length > sandsurf_protocol::MAX_CONTROL_BYTES {
+        return Err("bridge metadata exceeds control bound".into());
+    }
+    let json = bytes
+        .get(4..4 + length)
+        .ok_or("bridge metadata is incomplete")?;
+    let (id, version, mut wire): (u64, u16, sandsurf_protocol::RequestEnvelope<HostRequest>) =
+        serde_json::from_slice(json)?;
+    let binary = &bytes[4 + length..];
+    let data = if let Some(metadata) = wire.descriptor()? {
+        let mut position = 0;
+        let mut chunks = Vec::with_capacity(metadata.len());
+        for chunk in metadata {
+            let end = position + chunk.length as usize;
+            chunks.push(
+                binary
+                    .get(position..end)
+                    .ok_or("bridge data is incomplete")?
+                    .to_vec(),
+            );
+            position = end;
+        }
+        if position != binary.len() {
+            return Err("bridge data coverage differs from descriptor".into());
+        }
+        Some(chunks)
+    } else {
+        if !binary.is_empty() {
+            return Err("bridge data is unexpected".into());
+        }
+        None
+    };
+    Ok((id, version, wire.assemble(data)?))
+}
+
 fn bridge_response(
     handler: &impl Fn(HostRequest) -> Result<HostResponse, HostError>,
     bytes: &[u8],
 ) -> Vec<u8> {
-    let parsed = serde_json::from_slice::<(u64, u16, HostRequest)>(bytes);
+    let parsed = parse_bridge_request(bytes);
     let id = parsed.as_ref().map_or(0, |value| value.0);
     let response = match parsed {
         Ok((id, BRIDGE_VERSION, request)) if id > 0 && id <= 9_007_199_254_740_991 => {
@@ -169,25 +215,22 @@ fn bridge_response(
             message: format!("invalid bridge request: {error}"),
         },
     };
-    let (response, data) = match response {
-        HostResponse::Runtime {
-            response: RuntimeResponse::Output { page },
-        } => match page.into_binary_parts() {
-            Ok((page, chunks)) => (
-                HostResponse::Runtime {
-                    response: RuntimeResponse::OutputMetadata { page },
-                },
-                chunks.into_iter().flatten().collect::<Vec<_>>(),
-            ),
-            Err(error) => (
-                HostResponse::Rejected {
-                    category: "protocol".into(),
-                    message: error.to_string(),
-                },
-                Vec::new(),
-            ),
-        },
-        response => (response, Vec::new()),
+    let (response, data) = match response.into_wire_parts() {
+        Ok((response, bytes)) => (
+            response,
+            bytes
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => (
+            HostResponse::Rejected {
+                category: "protocol".into(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
     };
     let result = bridge_payload(id, &response, &data);
     if result.len() <= MAX_BRIDGE_BYTES {
@@ -363,9 +406,17 @@ mod tests {
     }
 
     fn request(bytes: &[u8]) -> Vec<u8> {
+        let (id, version, request): (u64, u16, HostRequest) =
+            serde_json::from_slice(bytes).unwrap();
+        let (wire, data) = sandsurf_protocol::RequestEnvelope::split(request).unwrap();
+        let json = serde_json::to_vec(&(id, version, wire)).unwrap();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&json);
+        payload.extend(data.unwrap_or_default().into_iter().flatten());
         let mut frame = Vec::new();
-        frame.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
-        frame.extend_from_slice(bytes);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend(payload);
         frame
     }
 
@@ -478,7 +529,9 @@ mod tests {
 
     #[test]
     fn bridge_sends_full_binary_output_without_json_byte_expansion() {
-        use sandsurf_protocol::{Counter, EvidenceChunk, EvidencePage, Stream, bytes_digest};
+        use sandsurf_protocol::{
+            Counter, EvidenceChunk, EvidencePage, RuntimeResponse, Stream, bytes_digest,
+        };
         let bytes = vec![255; 64 * 1024];
         let digest = bytes_digest(&bytes);
         let boundary = Counter::try_from(bytes.len() as u64).unwrap();
@@ -519,6 +572,82 @@ mod tests {
             page.with_binary_parts(vec![raw.to_vec()]).unwrap().chunks[0].bytes,
             bytes
         );
+    }
+
+    #[test]
+    fn bridge_accepts_a_complete_mebibyte_secret_without_json_expansion() {
+        let secret = vec![255; 1024 * 1024];
+        let input = request(
+            &serde_json::to_vec(&(
+                7_u64,
+                BRIDGE_VERSION,
+                HostRequest::PutSecret {
+                    secret_id: "credential".try_into().unwrap(),
+                    version: "version-a".try_into().unwrap(),
+                    bytes: secret.clone(),
+                    operation_id: "publish-credential".try_into().unwrap(),
+                    approval_id: "approve-credential".try_into().unwrap(),
+                },
+            ))
+            .unwrap(),
+        );
+        assert!(input.len() < secret.len() + 4096);
+        let mut output = Vec::new();
+        bridge_loop_with_handler(&mut input.as_slice(), &mut output, &|request| {
+            let HostRequest::PutSecret { bytes, .. } = request else {
+                panic!("wrong request")
+            };
+            assert_eq!(bytes, secret);
+            Ok(HostResponse::Complete)
+        })
+        .unwrap();
+        let (id, _, response, data) = decode_response(&output[4..]);
+        assert_eq!(id, 7);
+        assert!(matches!(response, HostResponse::Complete));
+        assert!(data.is_empty());
+        let mut corrupt = input[4..].to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(parse_bridge_request(&corrupt).is_err());
+    }
+
+    #[test]
+    fn bridge_file_and_artifact_reads_keep_dense_bytes_outside_control_json() {
+        use sandsurf_protocol::{
+            Counter, FileRange, FileReadObservation, FilesystemResponse, GuestServiceResponse,
+            bytes_digest,
+        };
+        let bytes = vec![255; 64 * 1024];
+        let request =
+            request(&serde_json::to_vec(&(1_u64, BRIDGE_VERSION, HostRequest::Inspect)).unwrap());
+        for response in [
+            HostResponse::HostBlob {
+                offset: Counter::ZERO,
+                eof: true,
+                digest: bytes_digest(&bytes),
+                bytes: bytes.clone(),
+            },
+            HostResponse::Guest {
+                response: GuestServiceResponse::File {
+                    response: FilesystemResponse::Read {
+                        range: FileRange {
+                            offset: 0,
+                            eof: true,
+                            bytes: bytes.clone(),
+                            observation: FileReadObservation {
+                                size: bytes.len() as u64,
+                                token: bytes_digest(&bytes),
+                            },
+                        },
+                    },
+                },
+            },
+        ] {
+            let encoded = bridge_response(&|_| Ok(response.clone()), &request[4..]);
+            let (_, _, wire, raw) = decode_response(&encoded);
+            assert_eq!(raw, bytes);
+            assert!(encoded.len() < bytes.len() + 1024);
+            assert_eq!(wire.with_wire_bytes(vec![raw.to_vec()]).unwrap(), response);
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ const archives: Readonly<Record<string, string>> = {
 };
 const expectedArchive = archives[architecture];
 if (expectedArchive === undefined) throw new Error(`no reviewed ${version} archive digest for ${architecture}`);
-const temporary = await mkdtemp(resolve(tmpdir(), "sandbox-firecracker-"));
+const temporary = await mkdtemp(resolve(tmpdir(), "machine-firecracker-"));
 try {
   const archive = resolve(temporary, "firecracker.tgz");
   await run("curl", [
@@ -33,7 +33,7 @@ try {
   await run("tar", ["-xzf", archive, "-C", temporary]);
   const release = resolve(temporary, `release-${version}-${architecture}`);
   await run("sha256sum", ["--check", "SHA256SUMS", "--ignore-missing"], release);
-  const destination = resolve("packages/sandbox/native", `linux-${requestedArchitecture}`);
+  const destination = resolve("packages/sandsurf/native", `linux-${requestedArchitecture}`);
   await mkdir(destination, { recursive: true });
   for (const [source, name] of [
     [`firecracker-${version}-${architecture}`, `firecracker-${version}-${architecture}`],

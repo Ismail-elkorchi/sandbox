@@ -1348,7 +1348,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-digest"
+name = "sandsurf-format"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -1357,97 +1357,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-fuzz"
+name = "sandsurf-fuzz"
 version = "0.1.0"
 dependencies = [
- "sandbox-policy",
+ "sandsurf-network",
  "sandsurf-protocol",
  "serde_json",
 ]
 
 [[package]]
-name = "sandbox-guest"
+name = "sandsurf-guest"
 version = "0.1.0"
 dependencies = [
+ "cap-std",
  "futures",
+ "getrandom 0.2.17",
  "libc",
  "netstack-smoltcp",
  "sandsurf-protocol",
- "sandsurf-workload",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
-]
-
-[[package]]
-name = "sandbox-image"
-version = "0.1.0"
-dependencies = [
- "arcbox-ext4",
- "ed25519-dalek",
- "flate2",
- "ruzstd",
- "sandbox-digest",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "uuid",
-]
-
-[[package]]
-name = "sandbox-launcher-linux"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandsurf-native",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "sandbox-network-broker"
-version = "0.1.0"
-dependencies = [
- "sandbox-policy",
-]
-
-[[package]]
-name = "sandbox-policy"
-version = "0.1.0"
-dependencies = [
- "idna",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-vm"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-image",
- "sandbox-launcher-linux",
- "sandbox-network-broker",
- "sandbox-policy",
- "sandsurf-native",
- "sandsurf-protocol",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "sandsurf-control"
-version = "0.1.0"
-dependencies = [
- "sandsurf-machine",
- "sandsurf-native",
- "sandsurf-protocol",
- "sandsurf-state",
- "serde_json",
 ]
 
 [[package]]
@@ -1456,17 +1387,13 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "getrandom 0.2.17",
+ "hmac",
  "libc",
  "reqwest",
- "sandbox-guest",
- "sandbox-image",
- "sandbox-launcher-linux",
- "sandbox-network-broker",
- "sandbox-policy",
- "sandbox-vm",
- "sandsurf-control",
+ "sandsurf-image",
  "sandsurf-machine",
  "sandsurf-native",
+ "sandsurf-network",
  "sandsurf-protocol",
  "sandsurf-state",
  "serde",
@@ -1478,13 +1405,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandsurf-image"
+version = "0.1.0"
+dependencies = [
+ "arcbox-ext4",
+ "ed25519-dalek",
+ "flate2",
+ "ruzstd",
+ "sandsurf-format",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "uuid",
+]
+
+[[package]]
 name = "sandsurf-machine"
 version = "0.1.0"
 dependencies = [
- "sandbox-vm",
+ "libc",
+ "sandsurf-native",
  "sandsurf-protocol",
  "serde",
  "serde_json",
+ "sha2",
  "windows-sys 0.61.2",
 ]
 
@@ -1498,12 +1443,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandsurf-network"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "libc",
+ "sandsurf-native",
+ "sandsurf-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sandsurf-protocol"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
- "sandbox-digest",
+ "sandsurf-format",
  "serde",
  "serde_json",
  "sha2",
@@ -1525,20 +1482,6 @@ dependencies = [
  "sha2",
  "windows-sys 0.61.2",
  "zeroize",
-]
-
-[[package]]
-name = "sandsurf-workload"
-version = "0.1.0"
-dependencies = [
- "cap-std",
- "libc",
- "sandsurf-control",
- "sandsurf-protocol",
- "sandsurf-state",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

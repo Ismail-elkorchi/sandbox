@@ -6,7 +6,7 @@ Install Node.js 24 or newer and the unscoped package:
 npm install sandsurf
 ```
 
-Open an explicit private state directory and install an application authorizer. The authorizer is called for authority-changing operations; it is not called for every ordinary process or file request inside an already granted envelope.
+Use a private state directory and an application authorizer for host-authority changes. Ordinary commands and guest filesystem operations do not request new host authority.
 
 ```ts
 import { Sandsurf } from "sandsurf";
@@ -15,56 +15,49 @@ const host = await Sandsurf.open({
   directory: "/private/application-state/sandsurf",
   authorizer: async (change) => approveInApplication(change),
 });
-
 const support = await host.inspect();
-if (support.lifecycle.kind !== "qualified") {
-  throw new Error(support.lifecycle.reasons.join("; "));
-}
+console.dir(support); // Unsupported mechanisms and unqualified ones are distinct.
 
-const image = await host.images.importOCI({
-  reference: "registry.example/dev@sha256:<digest>",
-  platform: support.guestPlatform,
-});
-
-const box = await host.sandboxes.create({
-  image: image.id,
+const machine = await host.machines.create({
+  image: "<verified-machine-image-sha256>",
   resources: {
     vcpus: 2,
     memoryMiB: 4096,
     diskBytes: 20 * 1024 ** 3,
     outputBytes: 1024 ** 3,
-    processes: 512,
-  },
-  capabilities: {
-    spawn: true,
-    "read-files": true,
-    "write-files": true,
-    "release-evidence": true,
+    managedExecutions: 512,
   },
 });
 
-await box.workspace.importFromHost({ source: "/absolute/project" });
-const process = await box.processes.spawn({
+await machine.artifacts.importFromHost({
+  source: "/absolute/project",
+  destination: "/workspace",
+});
+const execution = await machine.executions.start({
   argv: ["npm", "test"],
   cwd: "/workspace",
 });
-const completion = await process.wait();
-
-for await (const chunk of process.output.follow()) {
+const completion = await execution.waitCapture();
+for await (const chunk of execution.output.follow()) {
   consume(chunk.stream, chunk.bytes);
 }
+await host.close();
 ```
 
-A Sandbox is persistent. `host.close()` detaches the client; it does not stop the machine or its sandbox-lifetime processes. Reopen the same state directory and reconnect by the durable Sandbox and process identities:
+Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 
 ```ts
 const next = await Sandsurf.open({ directory, authorizer });
-const resumed = await next.sandboxes.connect(box.id);
-const sameProcess = await resumed.processes.get(process.id);
+const reconnected = await next.machines.connect(machine.id);
+const sameExecution = await reconnected.executions.get(execution.id);
 ```
 
-Use `box.fs` for guest paths and `box.workspace` for explicit host import, diff, export, and conflict-checked apply. Host paths never become ordinary guest file paths. Network policy, inbound ports, secrets, resources, checkpoints, forks, rollback, and image publication are independent capabilities rather than a required workflow.
+The default guest account obtains root through ordinary `sudo`. Root can change the OS and disable management. Management failure is reported independently of native power state; `powerOff()` and `destroy()` do not require a responsive management service. Guest process results are observations, not host attestations.
 
-Terminal processes use `stdio: "terminal"`; their replay stream is `terminal`, not guessed stdout/stderr. Cancelling a client wait does not terminate a process. Call `terminate()` or `signal()` explicitly.
+Use `machine.fs` for guest paths. Artifact import, capture, comparison and host application operate on explicitly selected content. Host publication requires approval of immutable retained content and its destination. Snapshots, forks, rollback, networking, secrets and publication are independent capabilities, not a prescribed workflow.
 
-Terminal receipts, acknowledgement, output capture, and evidence release are distinct. Before `complete-capture` release, persist every byte through the receipt's final cursor together with the capture manifest. A receipt reference alone does not preserve output. Use a retention pin to keep bytes in Sandsurf, or obtain explicit authorization for loss.
+Terminals are PTY executions with replayable `terminal` output. Detaching or cancelling a wait does not terminate an execution. Leader exit and output completion are separate; descendants may continue to hold streams open.
+
+Receipt acknowledgement does not release output or express application acceptance. Release requires complete capture elsewhere, continuing retention of the actual bytes, or explicitly authorized loss. A receipt reference alone preserves no bytes. Machine destruction must not release retained output.
+
+The breaking redesign remains incomplete. Native network attachments, unified storage recovery, full-state execution lineage and platform hardware qualification still require implementation or qualification; consult the reported capabilities and [security scope](../SECURITY.md).

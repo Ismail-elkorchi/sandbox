@@ -53,6 +53,24 @@ fn frame() -> Frame {
 }
 
 #[test]
+fn private_storage_is_owner_only_and_refuses_hard_link_aliases() {
+    use sandsurf_native::local::{
+        create_private_file, ensure_private_directory, open_private_file,
+    };
+    let root = Root::new();
+    ensure_private_directory(&root.0).unwrap();
+    let path = root.0.join("private-object");
+    let mut file = create_private_file(&path).unwrap();
+    file.write_all(b"private bytes").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(create_private_file(&path).is_err());
+    assert!(open_private_file(&path).is_ok());
+    fs::hard_link(&path, root.0.join("alias")).unwrap();
+    assert!(open_private_file(&path).is_err());
+}
+
+#[test]
 fn private_pipe_authenticates_both_peers_and_preserves_binary_frames() {
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();

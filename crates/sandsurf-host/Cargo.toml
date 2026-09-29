@@ -12,34 +12,21 @@ apple-source-check = ["sandsurf-machine/apple-source-check"]
 getrandom.workspace = true
 cap-std = "=4.0.3"
 libc.workspace = true
-sandsurf-control = { path = "../sandsurf-control" }
 sandsurf-machine = { path = "../sandsurf-machine" }
 sandsurf-native = { path = "../sandsurf-native" }
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-state = { path = "../sandsurf-state" }
-sandbox-image = { path = "../sandbox-image" }
+sandsurf-image = { path = "../sandsurf-image" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 unicode-normalization.workspace = true
 zeroize.workspace = true
 reqwest.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-sandbox-network-broker = { path = "../sandbox-network-broker" }
-sandbox-launcher-linux = { path = "../sandbox-launcher-linux" }
-sandbox-policy = { path = "../sandbox-policy" }
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-sandbox-guest = { path = "../sandbox-guest" }
-sandbox-network-broker = { path = "../sandbox-network-broker" }
-sandbox-policy = { path = "../sandbox-policy" }
-sandbox-vm = { path = "../sandbox-vm" }
+sandsurf-network = { path = "../sandsurf-network" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-sandbox-guest = { path = "../sandbox-guest" }
-sandbox-network-broker = { path = "../sandbox-network-broker" }
-sandbox-policy = { path = "../sandbox-policy" }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Services"] }
 
 [[bin]]

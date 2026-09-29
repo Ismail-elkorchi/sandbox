@@ -12,6 +12,10 @@ use sandsurf_protocol::{
 };
 
 #[cfg(target_os = "linux")]
+pub mod firecracker;
+#[cfg(target_os = "linux")]
+pub mod launcher;
+#[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(any(target_os = "macos", feature = "apple-source-check"))]
 pub mod macos;
@@ -34,7 +38,7 @@ pub struct DriverQualification {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineTransition {
-    pub epoch: Counter,
+    pub generation: Counter,
     pub state: MachineState,
     pub evidence_digest: Digest,
 }
@@ -103,9 +107,9 @@ pub fn apply_lifecycle<D: MachineDriver>(
     command: &LifecycleCommand,
     current: Option<&MachineObservation>,
 ) -> MachineOutcome {
-    if current.is_some_and(|value| value.sandbox_id != command.sandbox_id) {
+    if current.is_some_and(|value| value.machine_id != command.machine_id) {
         return MachineOutcome::NotApplied(sandsurf_protocol::bytes_digest(
-            b"native-lifecycle-sandbox-mismatch",
+            b"native-lifecycle-machine-mismatch",
         ));
     }
     let outcome = match (command.desired, current) {
@@ -158,7 +162,7 @@ fn validate_outcome(
     if transitions.is_empty() || transitions.len() > 8 {
         return MachineOutcome::Unknown;
     }
-    let expected_epoch = match current {
+    let expected_generation = match current {
         None => Counter::ONE,
         Some(value)
             if command.desired == DesiredState::Running
@@ -167,16 +171,16 @@ fn validate_outcome(
                     MachineState::Stopped | MachineState::Failed | MachineState::Suspended
                 ) =>
         {
-            let Ok(next) = value.epoch.next() else {
+            let Ok(next) = value.generation.next() else {
                 return MachineOutcome::Unknown;
             };
             next
         }
-        Some(value) => value.epoch,
+        Some(value) => value.generation,
     };
     if transitions
         .iter()
-        .any(|transition| transition.epoch != expected_epoch)
+        .any(|transition| transition.generation != expected_generation)
         || !transitions
             .last()
             .is_some_and(|last| last.state.satisfies(command.desired))
@@ -189,7 +193,7 @@ fn validate_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sandsurf_protocol::{OperationId, SandboxId, bytes_digest};
+    use sandsurf_protocol::{MachineId, OperationId, bytes_digest};
 
     #[derive(Default)]
     struct Driver {
@@ -254,7 +258,7 @@ mod tests {
     }
     fn command(desired: DesiredState) -> LifecycleCommand {
         LifecycleCommand {
-            sandbox_id: SandboxId::try_from("box").unwrap(),
+            machine_id: MachineId::try_from("box").unwrap(),
             operation_id: OperationId::try_from("operation").unwrap(),
             desired,
             revision: Counter::ONE,
@@ -262,10 +266,10 @@ mod tests {
             configuration: sandsurf_protocol::RuntimeConfiguration::default(),
         }
     }
-    fn observation(state: MachineState, epoch: u64) -> MachineObservation {
+    fn observation(state: MachineState, generation: u64) -> MachineObservation {
         MachineObservation {
-            sandbox_id: SandboxId::try_from("box").unwrap(),
-            epoch: epoch.try_into().unwrap(),
+            machine_id: MachineId::try_from("box").unwrap(),
+            generation: generation.try_into().unwrap(),
             sequence: Counter::ONE,
             state,
             applied_revision: Counter::ONE,
@@ -273,9 +277,9 @@ mod tests {
             evidence_digest: hash("old"),
         }
     }
-    fn output(epoch: u64, state: MachineState) -> MachineOutcome {
+    fn output(generation: u64, state: MachineState) -> MachineOutcome {
         MachineOutcome::Observed(vec![MachineTransition {
-            epoch: epoch.try_into().unwrap(),
+            generation: generation.try_into().unwrap(),
             state,
             evidence_digest: hash("native"),
         }])
@@ -283,7 +287,7 @@ mod tests {
 
     #[test]
     fn routes_each_lifecycle_without_cold_boot_substitution() {
-        for (desired, current, expected, epoch, terminal) in [
+        for (desired, current, expected, generation, terminal) in [
             (
                 DesiredState::Running,
                 None,
@@ -350,7 +354,7 @@ mod tests {
         ] {
             let mut driver = Driver {
                 called: None,
-                output: Some(output(epoch, terminal)),
+                output: Some(output(generation, terminal)),
             };
             let actual = apply_lifecycle(&mut driver, &command(desired), current.as_ref());
             assert!(matches!(actual, MachineOutcome::Observed(_)));
@@ -380,13 +384,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cross_sandbox_observations_before_driver_dispatch() {
+    fn rejects_cross_machine_observations_before_driver_dispatch() {
         let mut driver = Driver {
             called: None,
             output: Some(output(1, MachineState::Stopped)),
         };
         let mut current = observation(MachineState::Running, 1);
-        current.sandbox_id = SandboxId::try_from("other").unwrap();
+        current.machine_id = MachineId::try_from("other").unwrap();
         assert!(matches!(
             apply_lifecycle(&mut driver, &command(DesiredState::Stopped), Some(&current)),
             MachineOutcome::NotApplied(_)

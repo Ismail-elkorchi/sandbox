@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  SANDSURF_NATIVE_PROFILE: release
+  SANDSURF_IMAGE_PROFILE: release
+
 jobs:
   images:
     strategy:
@@ -45,7 +49,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: guest-image-${{ matrix.architecture }}
-          path: packages/sandbox/images/development-${{ matrix.architecture }}
+          path: packages/sandsurf/images/development-${{ matrix.architecture }}
           if-no-files-found: error
 
   native:
@@ -83,19 +87,19 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: guest-image-${{ matrix.image_architecture }}
-          path: packages/sandbox/images/development-${{ matrix.image_architecture }}
+          path: packages/sandsurf/images/development-${{ matrix.image_architecture }}
       - run: npm run manifest:images
       - if: startsWith(matrix.artifact, 'linux-')
         run: npm run fetch:firecracker
       - run: npm run build:ts
       - run: npm run build:native
-      - run: node --test packages/sandbox/test/*.test.mjs
+      - run: node --test packages/sandsurf/test/*.test.mjs
       - if: startsWith(matrix.artifact, 'linux-')
         run: node scripts/qualify-linux-backend.ts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-${{ matrix.artifact }}
-          path: packages/sandbox/native/${{ matrix.artifact }}
+          path: packages/sandsurf/native/${{ matrix.artifact }}
           if-no-files-found: error
 
   assemble:
@@ -117,18 +121,18 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: guest-image-x64
-          path: packages/sandbox/images/development-x64
+          path: packages/sandsurf/images/development-x64
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: guest-image-arm64
-          path: packages/sandbox/images/development-arm64
+          path: packages/sandsurf/images/development-arm64
       - name: Assemble platform directories
         shell: bash
         run: |
           for directory in staged-runtimes/runtime-*; do
             platform="${directory##*/runtime-}"
-            mkdir -p "packages/sandbox/native/$platform"
-            cp -a "$directory/." "packages/sandbox/native/$platform/"
+            mkdir -p "packages/sandsurf/native/$platform"
+            cp -a "$directory/." "packages/sandsurf/native/$platform/"
           done
       - run: node scripts/rebuild-native-manifest.ts
       - run: npm run manifest:images
@@ -148,8 +152,8 @@ jobs:
           name: npm-tarballs-and-supply-chain
           path: |
             release/*.tgz
-            packages/sandbox/SBOM.cdx.json
-            packages/sandbox/THIRD-PARTY
+            packages/sandsurf/SBOM.cdx.json
+            packages/sandsurf/THIRD-PARTY
             Cargo.lock
             package-lock.json
           if-no-files-found: error

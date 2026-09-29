@@ -6,10 +6,10 @@ import { fileURLToPath } from "node:url";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await verifyManifest(resolve(repository, "native/manifest.json"), resolve(repository, "native"));
 await verifyManifest(
-  resolve(repository, "packages/sandbox/native/manifest.json"),
-  resolve(repository, "packages/sandbox/native"),
+  resolve(repository, "packages/sandsurf/native/manifest.json"),
+  resolve(repository, "packages/sandsurf/native"),
 );
-const imagesRoot = resolve(repository, "packages/sandbox/images");
+const imagesRoot = resolve(repository, "packages/sandsurf/images");
 const imageIndexPath = resolve(imagesRoot, "manifest.json");
 await verifyManifest(imageIndexPath, imagesRoot);
 const imageIndex: unknown = JSON.parse(await readFile(imageIndexPath, "utf8"));
@@ -25,25 +25,23 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
   required.delete(architecture);
   const imageRoot = resolve(imagesRoot, `development-${architecture}`);
   const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
-  if (!isRecord(imageManifest) || imageManifest.formatVersion !== 2 || imageManifest.id !== "sandsurf-development" ||
+  if (!isRecord(imageManifest) || imageManifest.formatVersion !== 3 || imageManifest.id !== "sandsurf-development" ||
       imageManifest.version !== "3.24.2" || imageManifest.architecture !== architecture ||
       !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
-      !isRecord(imageManifest.bootBundle.bootstrap) || !isRecord(imageManifest.workload) ||
-      !isRecord(imageManifest.workload.rootfs) || !isRecord(imageManifest.workload.stateTemplate) ||
-      !isRecord(imageManifest.workload.provenance) || imageManifest.workload.provenance.kind !== "source-built" ||
-      !isRecord(imageManifest.workload.provenance.materials)) {
+      !isRecord(imageManifest.system) ||
+      !isRecord(imageManifest.system.rootfs) ||
+      !isRecord(imageManifest.system.provenance) || imageManifest.system.provenance.kind !== "source-built" ||
+      !isRecord(imageManifest.system.provenance.materials)) {
     throw new Error(`${architecture} VM image manifest has an invalid shape`);
   }
   for (const material of ["alpine-minirootfs", "alpine-packages", "sandsurf-ext4-builder"]) {
-    if (!validDigest(imageManifest.workload.provenance.materials[material])) {
+    if (!validDigest(imageManifest.system.provenance.materials[material])) {
       throw new Error(`${architecture} VM image is missing ${material} provenance`);
     }
   }
   for (const [label, entry] of [
     ["VM kernel", imageManifest.bootBundle.kernel],
-    ["trusted VM bootstrap", imageManifest.bootBundle.bootstrap],
-    ["VM workload root", imageManifest.workload.rootfs],
-    ["VM writable-state template", imageManifest.workload.stateTemplate],
+    ["VM system seed", imageManifest.system.rootfs],
   ] as const) {
     if (typeof entry.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(entry.path)) {
       throw new Error(`${architecture} ${label} path is invalid`);

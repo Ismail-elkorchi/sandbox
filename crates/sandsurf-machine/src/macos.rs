@@ -8,8 +8,8 @@ use crate::{
     MachineTransition,
 };
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineObservation, MachineState,
-    Qualification, SandboxId, VmEngine, bytes_digest,
+    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineId, MachineObservation,
+    MachineState, Qualification, VmEngine, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -37,7 +37,7 @@ pub struct AppleDisk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppleConfig {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     pub helper: PathBuf,
     pub helper_digest: Digest,
     pub guest_architecture: GuestArchitecture,
@@ -177,9 +177,9 @@ impl AppleDriver {
         MachineOutcome::NotApplied(bytes_digest(reason))
     }
 
-    fn helper_create(&self, sandbox_id: SandboxId) -> HelperCreate {
+    fn helper_create(&self, machine_id: MachineId) -> HelperCreate {
         HelperCreate {
-            sandbox_id,
+            machine_id,
             kernel: self.config.kernel.clone(),
             initial_ramdisk: self.config.initial_ramdisk.clone(),
             command_line: self.config.command_line.clone(),
@@ -192,13 +192,26 @@ impl AppleDriver {
         }
     }
 
-    fn create_and_start(&mut self, command: &LifecycleCommand, epoch: Counter) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return Self::unavailable(b"apple-sandbox-identity-mismatch");
+    fn create_and_start(
+        &mut self,
+        command: &LifecycleCommand,
+        generation: Counter,
+    ) -> MachineOutcome {
+        if command.machine_id != self.config.machine_id {
+            return Self::unavailable(b"apple-machine-identity-mismatch");
         }
         if self.owner.is_some() {
             return MachineOutcome::Unknown;
         }
+        let resources = &command.configuration.resources;
+        let Some(memory_bytes) = resources.memory_mib.get().checked_mul(1024 * 1024) else {
+            return Self::unavailable(b"apple-memory-overflow");
+        };
+        let Ok(vcpus) = u32::try_from(resources.vcpus.get()) else {
+            return Self::unavailable(b"apple-vcpu-overflow");
+        };
+        self.config.memory_bytes = memory_bytes;
+        self.config.vcpus = vcpus;
         if !file_digest_matches(&self.config.helper, &self.config.helper_digest) {
             return Self::unavailable(b"apple-helper-integrity-mismatch");
         }
@@ -208,7 +221,7 @@ impl AppleDriver {
             Err(_) => return Self::unavailable(b"apple-helper-not-started"),
         };
         let response = owner.request(&HelperRequest::Create(Box::new(
-            self.helper_create(command.sandbox_id.clone()),
+            self.helper_create(command.machine_id.clone()),
         )));
         match response {
             Ok(value)
@@ -221,11 +234,16 @@ impl AppleDriver {
                 MachineOutcome::Observed(vec![
                     transition(
                         command,
-                        epoch,
+                        generation,
                         MachineState::Creating,
                         b"vz-create-complete",
                     ),
-                    transition(command, epoch, MachineState::Running, b"vz-start-complete"),
+                    transition(
+                        command,
+                        generation,
+                        MachineState::Running,
+                        b"vz-start-complete",
+                    ),
                 ])
             }
             Ok(value) if value.kind == ResponseKind::NotApplied => {
@@ -241,20 +259,20 @@ impl AppleDriver {
     fn transition_owner(
         &mut self,
         command: &LifecycleCommand,
-        epoch: Counter,
+        generation: Counter,
         request: HelperRequest,
         expected: MachineState,
         evidence: &'static [u8],
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return Self::unavailable(b"apple-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return Self::unavailable(b"apple-machine-identity-mismatch");
         }
         let Some(owner) = self.owner.as_mut() else {
             return Self::unavailable(b"apple-machine-owner-unavailable");
         };
         match owner.request(&request) {
             Ok(value) if value.kind == ResponseKind::Observed && value.state == expected => {
-                MachineOutcome::Observed(vec![transition(command, epoch, expected, evidence)])
+                MachineOutcome::Observed(vec![transition(command, generation, expected, evidence)])
             }
             Ok(value) if value.kind == ResponseKind::NotApplied => {
                 Self::unavailable(b"apple-transition-not-applied")
@@ -266,17 +284,17 @@ impl AppleDriver {
     fn stop_owner(
         &mut self,
         command: &LifecycleCommand,
-        epoch: Counter,
+        generation: Counter,
         already_stopped: bool,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return Self::unavailable(b"apple-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return Self::unavailable(b"apple-machine-identity-mismatch");
         }
         let Some(mut owner) = self.owner.take() else {
             return if already_stopped {
                 MachineOutcome::Observed(vec![transition(
                     command,
-                    epoch,
+                    generation,
                     MachineState::Stopped,
                     b"vz-already-stopped",
                 )])
@@ -292,7 +310,7 @@ impl AppleDriver {
             {
                 MachineOutcome::Observed(vec![transition(
                     command,
-                    epoch,
+                    generation,
                     MachineState::Stopped,
                     b"vz-stop-complete",
                 )])
@@ -341,40 +359,21 @@ impl AppleDriver {
         }
     }
 
-    pub fn resume_public_pause_for_capture(&mut self) -> Result<(), AppleRuntimeError> {
-        if self.capture_paused {
-            return Err(AppleRuntimeError::InvalidCaptureState);
+    /// Adopt an already published native pause without executing guest code.
+    pub fn adopt_pause_for_capture(&mut self) -> Result<(), AppleRuntimeError> {
+        if self.owner.is_none() {
+            return Err(AppleRuntimeError::OwnerUnavailable);
         }
-        let owner = self
-            .owner
-            .as_mut()
-            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
-        match owner.request(&HelperRequest::Resume) {
-            Ok(value)
-                if value.kind == ResponseKind::Observed && value.state == MachineState::Running =>
-            {
-                Ok(())
-            }
-            _ => Err(AppleRuntimeError::TransitionFailed),
-        }
+        self.capture_paused = true;
+        Ok(())
     }
 
-    pub fn restore_public_pause_after_capture(&mut self) -> Result<(), AppleRuntimeError> {
-        if self.capture_paused {
-            return Err(AppleRuntimeError::InvalidCaptureState);
-        }
-        let owner = self
-            .owner
-            .as_mut()
-            .ok_or(AppleRuntimeError::OwnerUnavailable)?;
-        match owner.request(&HelperRequest::Pause) {
-            Ok(value)
-                if value.kind == ResponseKind::Observed && value.state == MachineState::Paused =>
-            {
-                Ok(())
-            }
-            _ => Err(AppleRuntimeError::TransitionFailed),
-        }
+    /// Finish a capture without silently resuming a publicly paused machine.
+    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), AppleRuntimeError> {
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        Ok(())
     }
 
     pub fn save_full_state(
@@ -492,7 +491,21 @@ impl MachineDriver for AppleDriver {
         current: &MachineObservation,
     ) -> ConfigurationOutcome {
         let live = matches!(current.state, MachineState::Running | MachineState::Paused);
-        if command.sandbox_id != self.config.sandbox_id
+        if live
+            && (command
+                .configuration
+                .resources
+                .memory_mib
+                .get()
+                .checked_mul(1024 * 1024)
+                != Some(self.config.memory_bytes)
+                || command.configuration.resources.vcpus.get() != u64::from(self.config.vcpus))
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"live-machine-geometry-change-unsupported",
+            ));
+        }
+        if command.machine_id != self.config.machine_id
             || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.owner.is_some()
@@ -523,8 +536,8 @@ impl MachineDriver for AppleDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return Self::unavailable(b"apple-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return Self::unavailable(b"apple-machine-identity-mismatch");
         }
         if self.owner.is_none()
             || self.applied_revision != Some(current.applied_revision)
@@ -535,7 +548,7 @@ impl MachineDriver for AppleDriver {
         self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Running,
             b"vz-already-running",
         )])
@@ -546,10 +559,10 @@ impl MachineDriver for AppleDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
-        self.create_and_start(command, epoch)
+        self.create_and_start(command, generation)
     }
 
     fn pause(
@@ -559,7 +572,7 @@ impl MachineDriver for AppleDriver {
     ) -> MachineOutcome {
         self.transition_owner(
             command,
-            current.epoch,
+            current.generation,
             HelperRequest::Pause,
             MachineState::Paused,
             b"vz-pause-complete",
@@ -573,7 +586,7 @@ impl MachineDriver for AppleDriver {
     ) -> MachineOutcome {
         self.transition_owner(
             command,
-            current.epoch,
+            current.generation,
             HelperRequest::Resume,
             MachineState::Running,
             b"vz-resume-complete",
@@ -585,7 +598,7 @@ impl MachineDriver for AppleDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id
+        if command.machine_id != self.config.machine_id
             || !self.capture_paused
             || self.full_capture_operation.is_none()
             || self.committed_suspend.is_none()
@@ -615,7 +628,7 @@ impl MachineDriver for AppleDriver {
         self.full_capture_operation = None;
         MachineOutcome::Observed(vec![transition_with_digest(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Suspended,
             b"vz-saved-state-committed-and-owner-released",
             &manifest,
@@ -627,13 +640,13 @@ impl MachineDriver for AppleDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id || self.owner.is_some() {
+        if command.machine_id != self.config.machine_id || self.owner.is_some() {
             return Self::unavailable(b"apple-restore-state-mismatch");
         }
         let Some(source) = self.staged_restore.take() else {
             return Self::unavailable(b"apple-restore-not-staged");
         };
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
         if !file_digest_matches(&self.config.helper, &self.config.helper_digest) {
@@ -645,7 +658,7 @@ impl MachineDriver for AppleDriver {
             Err(_) => return Self::unavailable(b"apple-helper-not-started"),
         };
         let response = owner.request(&HelperRequest::Restore(Box::new(HelperRestore {
-            machine: self.helper_create(command.sandbox_id.clone()),
+            machine: self.helper_create(command.machine_id.clone()),
             saved_state: source.saved_state,
         })));
         if !matches!(
@@ -666,14 +679,14 @@ impl MachineDriver for AppleDriver {
         MachineOutcome::Observed(vec![
             transition_with_digest(
                 command,
-                epoch,
+                generation,
                 MachineState::Restoring,
                 b"vz-saved-state-loaded-paused",
                 &source.manifest_digest,
             ),
             transition(
                 command,
-                epoch,
+                generation,
                 MachineState::Running,
                 b"vz-saved-state-resumed",
             ),
@@ -685,14 +698,14 @@ impl MachineDriver for AppleDriver {
             self.staged_restore = None;
             return MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Stopped,
                 b"vz-suspended-state-detached",
             )]);
         }
         self.stop_owner(
             command,
-            current.epoch,
+            current.generation,
             current.state == MachineState::Stopped,
         )
     }
@@ -706,14 +719,14 @@ impl MachineDriver for AppleDriver {
             self.staged_restore = None;
             MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Stopped,
                 b"vz-suspended-state-detached",
             )])
         } else {
             self.stop_owner(
                 command,
-                current.epoch,
+                current.generation,
                 current.state == MachineState::Stopped,
             )
         };
@@ -723,13 +736,13 @@ impl MachineDriver for AppleDriver {
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroying,
                 b"vz-destroying",
             ),
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroyed,
                 b"vz-owner-exited",
             ),
@@ -889,7 +902,7 @@ enum HelperRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HelperCreate {
-    sandbox_id: SandboxId,
+    machine_id: MachineId,
     kernel: PathBuf,
     initial_ramdisk: Option<PathBuf>,
     command_line: String,
@@ -942,7 +955,7 @@ fn qualification(evidence: Option<Digest>, reason: &str) -> Qualification {
 
 fn transition(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     native_evidence: &[u8],
 ) -> MachineTransition {
@@ -950,7 +963,7 @@ fn transition(
     evidence.extend_from_slice(native_evidence);
     evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
     MachineTransition {
-        epoch,
+        generation,
         state,
         evidence_digest: bytes_digest(&evidence),
     }
@@ -958,7 +971,7 @@ fn transition(
 
 fn transition_with_digest(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     native_evidence: &[u8],
     bound: &Digest,
@@ -968,7 +981,7 @@ fn transition_with_digest(
     evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
     evidence.extend_from_slice(bound.as_str().as_bytes());
     MachineTransition {
-        epoch,
+        generation,
         state,
         evidence_digest: bytes_digest(&evidence),
     }
@@ -981,7 +994,7 @@ mod tests {
     #[test]
     fn rejects_relative_owner_and_disk_paths() {
         let value = AppleConfig {
-            sandbox_id: "box".try_into().unwrap(),
+            machine_id: "box".try_into().unwrap(),
             helper: PathBuf::from("helper"),
             helper_digest: bytes_digest(b"helper"),
             guest_architecture: GuestArchitecture::Arm64,
@@ -1024,7 +1037,7 @@ mod tests {
     #[test]
     fn create_request_keeps_the_flat_helper_contract() {
         let machine = HelperCreate {
-            sandbox_id: "box".try_into().unwrap(),
+            machine_id: "box".try_into().unwrap(),
             kernel: "/kernel".into(),
             initial_ramdisk: None,
             command_line: "root=/dev/vda".into(),
@@ -1041,17 +1054,17 @@ mod tests {
         let request = HelperRequest::Create(Box::new(machine.clone()));
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["kind"], "create");
-        assert_eq!(value["sandboxId"], "box");
+        assert_eq!(value["machineId"], "box");
         assert_eq!(value["hostConnectPorts"][0], 10_789);
 
         let restore = serde_json::to_value(HelperRequest::Restore(Box::new(HelperRestore {
             machine,
-            saved_state: "/private/tmp/checkpoint.vmstate".into(),
+            saved_state: "/private/tmp/snapshot.vmstate".into(),
         })))
         .unwrap();
         assert_eq!(restore["kind"], "restore");
-        assert_eq!(restore["sandboxId"], "box");
-        assert_eq!(restore["savedState"], "/private/tmp/checkpoint.vmstate");
+        assert_eq!(restore["machineId"], "box");
+        assert_eq!(restore["savedState"], "/private/tmp/snapshot.vmstate");
     }
 
     #[test]

@@ -37,10 +37,10 @@ fn evidence_binary_metadata_binds_full_page_coverage_and_bytes() {
 #[test]
 fn identifiers_and_counters_are_strict() {
     for value in ["", ".", "..", "a/b", "a\\b", "hello world", "é", "a\0b"] {
-        assert!(SandboxId::try_from(value).is_err());
+        assert!(MachineId::try_from(value).is_err());
     }
-    assert!(SandboxId::try_from("x".repeat(129)).is_err());
-    assert!(SandboxId::try_from("test-01_A").is_ok());
+    assert!(MachineId::try_from("x".repeat(129)).is_err());
+    assert!(MachineId::try_from("test-01_A").is_ok());
     assert!(Counter::try_from(Counter::MAX).unwrap().next().is_err());
     for invalid in [
         json!(-1),
@@ -53,7 +53,7 @@ fn identifiers_and_counters_are_strict() {
 }
 
 #[test]
-fn guest_paths_preserve_non_utf8_bytes_and_reject_aliases() {
+fn guest_paths_preserve_linux_resolution_and_non_utf8_bytes() {
     let path = GuestPath::try_from(vec![b'/', b'w', b'/', 0xff]).unwrap();
     assert_eq!(path.as_bytes(), &[b'/', b'w', b'/', 0xff]);
     assert_eq!(path.to_utf8(), None);
@@ -61,30 +61,33 @@ fn guest_paths_preserve_non_utf8_bytes_and_reject_aliases() {
         serde_json::from_str::<GuestPath>(&serde_json::to_string(&path).unwrap()).unwrap(),
         path
     );
-    for invalid in [
-        Vec::new(),
-        b"relative".to_vec(),
-        b"/trailing/".to_vec(),
-        b"/duplicate//name".to_vec(),
-        b"/dot/./name".to_vec(),
-        b"/parent/../name".to_vec(),
-        b"/nul\0name".to_vec(),
-    ] {
+    for invalid in [Vec::new(), b"relative".to_vec(), b"/nul\0name".to_vec()] {
         assert!(GuestPath::try_from(invalid).is_err());
+    }
+    for path in [
+        "/trailing/",
+        "/duplicate//name",
+        "/dot/./name",
+        "/parent/../name",
+    ] {
+        assert_eq!(
+            GuestPath::try_from(path).unwrap().as_bytes(),
+            path.as_bytes()
+        );
     }
 }
 
 #[test]
 fn digest_domains_are_disjoint_and_stable() {
     let domains = [
-        Domain::Sandbox,
-        Domain::Grant,
+        Domain::Machine,
+        Domain::Authority,
         Domain::Operation,
         Domain::Receipt,
         Domain::Output,
         Domain::Release,
         Domain::Image,
-        Domain::Checkpoint,
+        Domain::Snapshot,
         Domain::Transfer,
     ];
     let mut seen = std::collections::HashSet::new();
@@ -98,19 +101,17 @@ fn digest_domains_are_disjoint_and_stable() {
 }
 
 #[test]
-fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
-    let mutation = serde_json::to_value(
-        Mutation::new(
+fn unknown_command_fields_and_reference_only_release_are_rejected() {
+    let command = serde_json::to_value(
+        GuestCommand::new(
             "box".try_into().unwrap(),
             Counter::ONE,
             "op".try_into().unwrap(),
-            "grant".try_into().unwrap(),
-            Counter::ONE,
-            WorkloadRequest::Spawn {
+            GuestRequest::Spawn {
                 request: Box::new(SpawnRequest {
-                    sandbox_id: "box".try_into().unwrap(),
-                    epoch: Counter::ONE,
-                    process_id: "process".try_into().unwrap(),
+                    machine_id: "box".try_into().unwrap(),
+                    generation: Counter::ONE,
+                    execution_id: "process".try_into().unwrap(),
                     operation_id: "op".try_into().unwrap(),
                     argv: vec!["/bin/true".into()],
                     cwd: "/workspace".into(),
@@ -118,7 +119,6 @@ fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
                     user: Some("agent".into()),
                     stdio: StdioMode::Pipes,
                     terminal_size: None,
-                    lifetime: ProcessLifetime::Job,
                     active_deadline_millis: None,
                     elapsed_deadline_unix_millis: None,
                     output_bytes: Counter::ONE,
@@ -128,10 +128,10 @@ fn unknown_mutation_fields_and_reference_only_release_are_rejected() {
         .unwrap(),
     )
     .unwrap();
-    assert!(serde_json::from_value::<Mutation>(mutation.clone()).is_ok());
-    let mut invalid = mutation;
+    assert!(serde_json::from_value::<GuestCommand>(command.clone()).is_ok());
+    let mut invalid = command;
     invalid["currentGrants"] = json!([]);
-    assert!(serde_json::from_value::<Mutation>(invalid).is_err());
+    assert!(serde_json::from_value::<GuestCommand>(invalid).is_err());
     assert!(
         serde_json::from_value::<ReleaseRequest>(json!({"receiptDigest":"a".repeat(64)})).is_err()
     );
@@ -146,7 +146,7 @@ fn authority_and_guardian_messages_are_strict_and_bounded() {
     assert!(
         serde_json::from_value::<GuardianRequest>(json!({
             "kind": "inspect",
-            "sandboxId": "box",
+            "machineId": "box",
             "operationId": null,
             "currentGrants": []
         }))
@@ -193,7 +193,7 @@ fn reject_oversize_headers_without_reading_payload() {
     encoded[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
     let error = Frame::read(&mut &encoded[..]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    for (offset, value) in [(0, b'X'), (5, 3), (6, 255), (7, 1), (11, 1)] {
+    for (offset, value) in [(0, b'X'), (5, 4), (6, 255), (7, 1), (11, 1)] {
         let mut invalid = Vec::new();
         frame.write(&mut invalid).unwrap();
         invalid[offset] = value;
@@ -261,7 +261,7 @@ fn fuzz_bounded_headers_and_json_never_panic() {
             *byte = seed as u8;
         }
         let _ = Frame::read(&mut &bytes[..]);
-        let _ = serde_json::from_slice::<Mutation>(&bytes);
+        let _ = serde_json::from_slice::<GuestCommand>(&bytes);
         let _ = serde_json::from_slice::<ReleaseRequest>(&bytes);
     }
 }

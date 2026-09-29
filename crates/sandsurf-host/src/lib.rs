@@ -3,16 +3,18 @@
 pub mod api;
 #[cfg(any(target_os = "macos", feature = "apple-source-check"))]
 pub mod apple;
-mod checkpoints;
+pub mod artifacts;
+mod capture;
+pub mod guardian;
 pub mod guest;
+mod guest_worker;
 pub mod images;
+mod ipc_frames;
 #[cfg(target_os = "linux")]
 pub mod linux;
 mod registry;
 pub mod secrets;
 pub mod service;
+mod snapshots;
 #[cfg(target_os = "windows")]
 pub mod windows;
-#[cfg(target_os = "windows")]
-mod windows_network;
-pub mod workspace;

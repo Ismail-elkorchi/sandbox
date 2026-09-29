@@ -67,6 +67,37 @@ fn current_uid() -> u32 {
 }
 
 #[test]
+fn private_storage_refuses_aliases_shared_files_and_replaceable_parents() {
+    use sandsurf_native::local::{
+        create_private_file, ensure_private_directory, open_private_file,
+    };
+    let root = Root::new();
+    let path = root.0.join("private-object");
+    let mut file = create_private_file(&path).unwrap();
+    file.write_all(b"private bytes").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(fs::read(&path).unwrap(), b"private bytes");
+    assert!(create_private_file(&path).is_err());
+    assert!(open_private_file(&path).is_ok());
+    let alias = root.0.join("hard-link");
+    fs::hard_link(&path, &alias).unwrap();
+    assert!(open_private_file(&path).is_err());
+    fs::remove_file(&alias).unwrap();
+    let link = root.0.join("symlink");
+    symlink(&path, &link).unwrap();
+    assert!(open_private_file(&link).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(open_private_file(&path).is_err());
+    let shared = root.0.join("shared-directory");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let child = shared.join("must-not-be-created");
+    assert!(ensure_private_directory(&child).is_err());
+    assert!(!child.exists());
+}
+
+#[test]
 fn private_endpoint_authenticates_both_peers_and_preserves_binary_frames() {
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();

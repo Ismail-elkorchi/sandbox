@@ -1,25 +1,25 @@
 //! macOS guardian integration for one retained Virtualization.framework VM.
 
-use crate::guest::{GuestClient, RemoteWorkloadDriver};
-use sandbox_guest::{
-    AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT, NETWORK_DNS_TCP_PORT,
-    NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
+use crate::guardian::{
+    EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
-use sandbox_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
-use sandbox_vm::{VmNetworkBridge, VmPortGateway};
-use sandsurf_control::{
-    EffectOutcome, Error as ControlError, GuardianEffect, Result as ControlResult, WorkloadDriver,
-};
+use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
+use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
 use sandsurf_machine::macos::{
     AppleConfig, AppleDisk, AppleDriver, AppleQualification, AppleRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::UnixVsockChannel;
+use sandsurf_network::{VmNetworkBridge, VmPortGateway};
 use sandsurf_protocol::{
-    Capability, CheckpointArtifact, CheckpointProcessWatermark, Counter, Digest, Domain,
-    GuestServiceRequest, GuestServiceResponse, LifecycleCommand, MachineObservation, MachineState,
-    Mutation, NativeCheckpointRequest, NativeCheckpointResponse, NetworkDestination, NetworkPolicy,
-    Resources, RuntimeConfiguration, SandboxId, VmEngine, bytes_digest, digest,
+    AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT, NETWORK_DNS_TCP_PORT,
+    NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
+};
+use sandsurf_protocol::{
+    Counter, Digest, Domain, GuestCommand, GuestServiceRequest, GuestServiceResponse,
+    LifecycleCommand, MachineId, MachineObservation, MachineState, NativeSnapshotRequest,
+    NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources, RuntimeConfiguration,
+    SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const CONFIG_VERSION: u16 = 1;
 const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
@@ -40,7 +40,7 @@ const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
 pub enum AppleError {
     Io(io::Error),
     Json(serde_json::Error),
-    Image(sandbox_image::ImageError),
+    Image(sandsurf_image::ImageError),
     Invalid(String),
 }
 
@@ -65,8 +65,8 @@ impl From<serde_json::Error> for AppleError {
         Self::Json(value)
     }
 }
-impl From<sandbox_image::ImageError> for AppleError {
-    fn from(value: sandbox_image::ImageError) -> Self {
+impl From<sandsurf_image::ImageError> for AppleError {
+    fn from(value: sandsurf_image::ImageError) -> Self {
         Self::Image(value)
     }
 }
@@ -75,33 +75,33 @@ impl From<sandbox_image::ImageError> for AppleError {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppleGuardianConfig {
     format_version: u16,
-    sandbox_id: SandboxId,
+    machine_id: MachineId,
     image_digest: Digest,
     resources: Resources,
     helper: PathBuf,
     helper_digest: Digest,
     image_manifest: PathBuf,
-    disk_template: PathBuf,
-    disk_template_sha256: String,
+    system_seed: PathBuf,
+    system_seed_sha256: String,
     control_socket: PathBuf,
 }
 
 pub fn prepare_config(
     host_root: &Path,
     executable: &Path,
-    sandbox_id: &SandboxId,
+    machine_id: &MachineId,
     image_digest: &Digest,
     resources: &Resources,
 ) -> Result<AppleGuardianConfig, AppleError> {
     let existing_path = host_root
-        .join("sandboxes")
-        .join(sandbox_id.as_str())
+        .join("machines")
+        .join(machine_id.as_str())
         .join("guardian/config.json");
     if existing_path.exists() {
-        let existing = read_config(&existing_path, sandbox_id)?;
-        if existing.image_digest != *image_digest || existing.resources != *resources {
+        let existing = read_config(&existing_path, machine_id)?;
+        if existing.image_digest != *image_digest {
             return Err(AppleError::Invalid(
-                "existing Sandbox configuration conflicts with create request".into(),
+                "existing Machine configuration conflicts with create request".into(),
             ));
         }
         return Ok(existing);
@@ -113,8 +113,7 @@ pub fn prepare_config(
         } else {
             Architecture::X64
         }
-        || verified.manifest.boot_bundle.bootstrap.format != RootfsFormat::Ext4
-        || verified.manifest.workload.rootfs.format != RootfsFormat::Ext4
+        || verified.manifest.system.rootfs.format != RootfsFormat::Ext4
         || !verified.manifest.boot_bundle.capabilities.overlayfs
         || !verified.manifest.boot_bundle.capabilities.cgroup_v2
         || !verified.manifest.boot_bundle.capabilities.devpts
@@ -146,20 +145,20 @@ pub fn prepare_config(
         ));
     }
     let socket_identity =
-        bytes_digest(format!("{}:{}", host_root.display(), sandbox_id.as_str()).as_bytes());
+        bytes_digest(format!("{}:{}", host_root.display(), machine_id.as_str()).as_bytes());
     let socket_root =
         std::env::temp_dir().join(format!("sandsurf-vz-{}", &socket_identity.as_str()[..24]));
     ensure_private_directory(&socket_root)?;
     Ok(AppleGuardianConfig {
         format_version: CONFIG_VERSION,
-        sandbox_id: sandbox_id.clone(),
+        machine_id: machine_id.clone(),
         image_digest: image_digest.clone(),
         resources: resources.clone(),
         helper_digest: file_digest(&helper, 64 * 1024 * 1024)?,
         helper,
         image_manifest: verified.manifest_path,
-        disk_template_sha256: sha256_file(&template, 128 * 1024 * 1024 * 1024)?,
-        disk_template: template,
+        system_seed_sha256: sha256_file(&template, 128 * 1024 * 1024 * 1024)?,
+        system_seed: template,
         control_socket: socket_root.join("control.sock"),
     })
 }
@@ -191,9 +190,9 @@ pub fn write_config(path: &Path, config: &AppleGuardianConfig) -> Result<(), App
     Ok(())
 }
 
-pub fn read_config(path: &Path, sandbox_id: &SandboxId) -> Result<AppleGuardianConfig, AppleError> {
+pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<AppleGuardianConfig, AppleError> {
     let value: AppleGuardianConfig = read_json(path, 1024 * 1024)?;
-    if value.format_version != CONFIG_VERSION || value.sandbox_id != *sandbox_id {
+    if value.format_version != CONFIG_VERSION || value.machine_id != *machine_id {
         return Err(AppleError::Invalid(
             "guardian configuration identity is invalid".into(),
         ));
@@ -201,8 +200,7 @@ pub fn read_config(path: &Path, sandbox_id: &SandboxId) -> Result<AppleGuardianC
     let image = verify_image(&value.image_manifest, ImageTrust::ExplicitLocal)?;
     if image.manifest_digest != value.image_digest.as_str()
         || file_digest(&value.helper, 64 * 1024 * 1024)? != value.helper_digest
-        || sha256_file(&value.disk_template, 128 * 1024 * 1024 * 1024)?
-            != value.disk_template_sha256
+        || sha256_file(&value.system_seed, 128 * 1024 * 1024 * 1024)? != value.system_seed_sha256
     {
         return Err(AppleError::Invalid(
             "guardian configuration artifact identity changed".into(),
@@ -217,10 +215,10 @@ pub fn read_config(path: &Path, sandbox_id: &SandboxId) -> Result<AppleGuardianC
     Ok(value)
 }
 
-pub fn workload_defaults(
+pub fn execution_defaults(
     host_root: &Path,
     image_digest: &Digest,
-) -> Result<crate::api::WorkloadDefaultsView, AppleError> {
+) -> Result<crate::api::ImageDefaultsView, AppleError> {
     let image = verify_image(
         &host_root
             .join("images")
@@ -233,21 +231,19 @@ pub fn workload_defaults(
             "installed image identity changed".into(),
         ));
     }
-    let defaults = image.manifest.workload.defaults;
-    Ok(crate::api::WorkloadDefaultsView {
+    let defaults = image.manifest.system.defaults;
+    Ok(crate::api::ImageDefaultsView {
         environment: defaults.environment,
         user: defaults.user,
         working_directory: defaults.working_directory,
-        entrypoint: defaults.entrypoint,
-        command: defaults.command,
     })
 }
 
 pub struct AppleGuardianEffect {
-    sandbox_root: PathBuf,
+    machine_root: PathBuf,
     config: AppleGuardianConfig,
     machine: AppleDriver,
-    workload: AppleWorkload,
+    guest_binding: Arc<Mutex<Option<ActiveGuest>>>,
     pending: Option<ActiveGuest>,
     authentication_disk: PathBuf,
     control_socket: PathBuf,
@@ -257,32 +253,32 @@ pub struct AppleGuardianEffect {
     installed_runtime: Option<InstalledRuntime>,
     restore_lineage: Option<RestoreLineage>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
-    capture_origin_was_paused: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
+    rebind: Option<ManagementRebind>,
     socket: PathBuf,
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    machine_id: MachineId,
+    generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
     network_capability: [u8; 32],
 }
 
-struct AppleWorkload {
+struct AppleGuest {
     active: Arc<Mutex<Option<ActiveGuest>>>,
-    remote: Option<(ActiveGuest, RemoteWorkloadDriver<UnixVsockChannel>)>,
+    remote: Option<(ActiveGuest, ManagedGuestClient<UnixVsockChannel>)>,
 }
 
 struct InstalledRuntime {
-    epoch: Counter,
+    generation: Counter,
     configuration: RuntimeConfiguration,
     evidence: Digest,
 }
 
 struct RestoreLineage {
-    checkpoint_id: sandsurf_protocol::CheckpointId,
+    snapshot_id: sandsurf_protocol::SnapshotId,
     source: ReconnectState,
     staged_state: PathBuf,
     generation_seed: [u8; 32],
@@ -297,7 +293,7 @@ struct NetworkUsageValue {
 
 type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
 
-fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broker::BrokerReport) {
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::BrokerReport) {
     if let Ok(mut usage) = usage.lock() {
         usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
         usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
@@ -306,50 +302,31 @@ fn accumulate_network_usage(usage: &NetworkUsage, report: &sandbox_network_broke
 }
 
 impl AppleGuardianEffect {
-    pub fn open(sandbox_root: &Path, config: AppleGuardianConfig) -> Result<Self, AppleError> {
+    fn management_binding(&self) -> Option<ActiveGuest> {
+        self.guest_binding.lock().ok()?.clone()
+    }
+    pub fn open(machine_root: &Path, config: AppleGuardianConfig) -> Result<Self, AppleError> {
         let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
-        let disks = sandbox_root.join("disks");
+        let disks = machine_root.join("disks");
         ensure_private_directory(&disks)?;
-        let workload_state = disks.join("workload-state.ext4");
-        let control_state = disks.join("control-state.ext4");
+        let system_disk = disks.join("system.ext4");
         ensure_mutable_disk(
-            &config.disk_template,
-            &workload_state,
+            &config.system_seed,
+            &system_disk,
             config.resources.disk_bytes.get(),
         )?;
-        let control_bytes = config
-            .resources
-            .output_bytes
-            .get()
-            .checked_add(64 * 1024 * 1024)
-            .ok_or_else(|| AppleError::Invalid("control disk size overflow".into()))?
-            .max(128 * 1024 * 1024);
-        ensure_mutable_disk(&config.disk_template, &control_state, control_bytes)?;
-        let authentication_disk = sandbox_root.join("guardian/auth.img");
+        let authentication_disk = machine_root.join("guardian/auth.img");
         let apple = AppleConfig {
-            sandbox_id: config.sandbox_id.clone(),
+            machine_id: config.machine_id.clone(),
             helper: config.helper.clone(),
             helper_digest: config.helper_digest.clone(),
             guest_architecture: crate::service::native_guest_architecture(),
             kernel: image.kernel_path,
             initial_ramdisk: None,
-            command_line: "console=hvc0 reboot=k panic=1 root=/dev/vda ro init=/sbin/sandbox-guest"
-                .into(),
+            command_line: "console=hvc0 reboot=k panic=1 root=/dev/vda rw init=/sbin/init".into(),
             disks: vec![
                 AppleDisk {
-                    path: image.bootstrap_path,
-                    read_only: true,
-                },
-                AppleDisk {
-                    path: image.workload_path,
-                    read_only: true,
-                },
-                AppleDisk {
-                    path: workload_state,
-                    read_only: false,
-                },
-                AppleDisk {
-                    path: control_state,
+                    path: system_disk,
                     read_only: false,
                 },
                 AppleDisk {
@@ -382,14 +359,11 @@ impl AppleGuardianEffect {
         let active = Arc::new(Mutex::new(None));
         let network_usage = Arc::new(Mutex::new(NetworkUsageValue::default()));
         Ok(Self {
-            sandbox_root: sandbox_root.to_path_buf(),
+            machine_root: machine_root.to_path_buf(),
             config: config.clone(),
             machine: AppleDriver::new(apple)
                 .map_err(|error| AppleError::Invalid(format!("invalid Apple VM: {error:?}")))?,
-            workload: AppleWorkload {
-                active: Arc::clone(&active),
-                remote: None,
-            },
+            guest_binding: active,
             pending: None,
             authentication_disk,
             control_socket: config.control_socket,
@@ -399,11 +373,14 @@ impl AppleGuardianEffect {
             installed_runtime: None,
             restore_lineage: None,
             suspend_capture_operation: None,
-            capture_origin_was_paused: false,
         })
     }
 
-    fn prepare_boot(&mut self, command: &LifecycleCommand, epoch: Counter) -> Result<(), Digest> {
+    fn prepare_boot(
+        &mut self,
+        command: &LifecycleCommand,
+        generation: Counter,
+    ) -> Result<(), Digest> {
         let capability = random_bytes().map_err(|_| bytes_digest(b"apple-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"apple-network-entropy"))?;
@@ -411,16 +388,16 @@ impl AppleGuardianEffect {
             Domain::Image,
             &(
                 "sandsurf-apple-boot-v1",
-                &command.sandbox_id,
-                sandbox_guest::GUEST_PROTOCOL_MAJOR,
-                sandbox_guest::GUEST_PROTOCOL_MINOR,
+                &command.machine_id,
+                sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
+                sandsurf_protocol::GUEST_PROTOCOL_MINOR,
             ),
         )
         .map_err(|_| bytes_digest(b"apple-boot-identity"))?;
         write_authentication(
             &self.authentication_disk,
-            &command.sandbox_id,
-            epoch,
+            &command.machine_id,
+            generation,
             &boot_identity,
             &capability,
             &network_capability,
@@ -428,195 +405,117 @@ impl AppleGuardianEffect {
         .map_err(|_| bytes_digest(b"apple-authentication-disk"))?;
         self.pending = Some(ActiveGuest {
             socket: self.control_socket.clone(),
-            sandbox_id: command.sandbox_id.clone(),
-            epoch,
+            machine_id: command.machine_id.clone(),
+            generation,
             boot_identity,
             capability,
             network_capability,
+            rebind: None,
         });
         Ok(())
     }
 
-    fn authenticate_pending(&mut self) -> Result<ActiveGuest, Digest> {
-        let active = self
-            .pending
+    fn bind_pending(&mut self) -> Result<ActiveGuest, Digest> {
+        self.pending
             .take()
-            .ok_or_else(|| bytes_digest(b"apple-pending-guest-missing"))?;
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            match guest_client(&active).call(&GuestServiceRequest::ProbeIdentity) {
-                Ok(GuestServiceResponse::Identity {
-                    sandbox_id,
-                    epoch,
-                    boot_identity,
-                }) if sandbox_id == active.sandbox_id
-                    && epoch == active.epoch
-                    && boot_identity == active.boot_identity =>
-                {
-                    return Ok(active);
-                }
-                _ if !self.machine.has_live_owner() || Instant::now() >= deadline => {
-                    return Err(bytes_digest(b"apple-guest-authentication-timeout"));
-                }
-                _ => std::thread::sleep(Duration::from_millis(25)),
-            }
-        }
+            .ok_or_else(|| bytes_digest(b"apple-pending-binding-missing"))
     }
 
-    fn authenticate_restored(&mut self, epoch: Counter) -> Result<ActiveGuest, Digest> {
+    fn bind_restored(&mut self, generation: Counter) -> Result<ActiveGuest, Digest> {
         let lineage = self
             .restore_lineage
             .as_ref()
             .ok_or_else(|| bytes_digest(b"apple-restore-lineage-missing"))?;
-        let active = self
+        let mut active = self
             .pending
             .take()
-            .ok_or_else(|| bytes_digest(b"apple-restore-target-capability-missing"))?;
-        if active.epoch != epoch {
-            return Err(bytes_digest(b"apple-restore-target-epoch-mismatch"));
+            .ok_or_else(|| bytes_digest(b"apple-restore-binding-missing"))?;
+        if active.generation != generation {
+            return Err(bytes_digest(b"apple-restore-binding-generation-mismatch"));
         }
-        let source = ActiveGuest {
-            socket: self.control_socket.clone(),
-            sandbox_id: lineage.source.sandbox_id.clone(),
-            epoch: lineage.source.epoch,
+        active.rebind = Some(ManagementRebind {
+            machine_id: lineage.source.machine_id.clone(),
+            generation: lineage.source.generation,
             boot_identity: lineage.source.boot_identity.clone(),
             capability: lineage.source.capability,
-            network_capability: lineage.source.network_capability,
-        };
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            let response = guest_client(&source).call(&GuestServiceRequest::RebindEpoch {
-                checkpoint_id: lineage.checkpoint_id.clone(),
+            request: GuestServiceRequest::RebindGeneration {
+                snapshot_id: lineage.snapshot_id.clone(),
                 capture_operation_id: lineage.source.capture_operation_id.clone(),
-                sandbox_id: active.sandbox_id.clone(),
-                previous_epoch: lineage.source.epoch,
-                epoch,
+                machine_id: active.machine_id.clone(),
+                previous_generation: lineage.source.generation,
+                generation,
                 boot_identity: active.boot_identity.clone(),
                 capability: active.capability,
                 network_capability: active.network_capability,
                 generation_seed: lineage.generation_seed,
-            });
-            if matches!(response, Ok(GuestServiceResponse::EpochRebound { .. }))
-                || restored_identity_matches(&active)
-            {
-                break;
-            }
-            if !self.machine.has_live_owner() || Instant::now() >= deadline {
-                return Err(bytes_digest(b"apple-guest-restore-rebind-timeout"));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let deadline = Instant::now() + Duration::from_secs(45);
-        loop {
-            if restored_identity_matches(&active) {
-                return Ok(active);
-            }
-            if !self.machine.has_live_owner() || Instant::now() >= deadline {
-                return Err(bytes_digest(b"apple-restored-guest-capability-rejected"));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+            },
+        });
+        Ok(active)
     }
 
-    fn finish_filesystem_capture(
+    fn prepare_capture_boundary(
         &mut self,
         operation_id: sandsurf_protocol::OperationId,
-    ) -> ControlResult<GuestServiceResponse> {
-        let request = GuestServiceRequest::FinishFilesystemCapture { operation_id };
-        let mut last = None;
-        for attempt in 0..3 {
-            match self.workload.query(request.clone()) {
-                Ok(response) => return Ok(response),
-                Err(error) => last = Some(error),
-            }
-            if attempt != 2 {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        Err(last.expect("capture finish is attempted at least once"))
+        journal: &RuntimeJournal,
+    ) -> ControlResult<()> {
+        let observation = journal.last_observation()?.ok_or(ControlError::Protocol(
+            "capture has no native machine observation",
+        ))?;
+        let boundary = crate::capture::CaptureBoundary::begin(
+            &self.machine_root,
+            operation_id,
+            observation.value().generation,
+            observation.value().state,
+        )?;
+        let result = if boundary.preserve_pause {
+            self.machine.adopt_pause_for_capture()
+        } else {
+            self.machine.pause_for_capture()
+        };
+        result.map_err(|_| ControlError::Unsupported("native capture pause failed"))
+    }
+
+    fn finish_native_capture(&mut self) -> ControlResult<()> {
+        let Some(boundary) = crate::capture::CaptureBoundary::read(&self.machine_root)? else {
+            return Ok(());
+        };
+        // Re-adopt the held native pause after an interrupted request before
+        // releasing it; a missing management connection is irrelevant.
+        self.machine
+            .adopt_pause_for_capture()
+            .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
+        let result = if boundary.preserve_pause {
+            self.machine.finish_capture_preserving_pause()
+        } else {
+            self.machine.resume_after_capture()
+        };
+        result.map_err(|_| ControlError::Unsupported("native capture completion failed"))?;
+        crate::capture::CaptureBoundary::clear(&self.machine_root)
     }
 
     fn prepare_full_capture(
         &mut self,
-        checkpoint_id: sandsurf_protocol::CheckpointId,
+        snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeCheckpointResponse> {
-        let state = journal
-            .last_observation()
-            .map_err(ControlError::State)?
-            .ok_or(ControlError::Protocol(
-                "full capture has no machine observation",
-            ))?
-            .value()
-            .state;
-        if !matches!(state, MachineState::Running | MachineState::Paused) {
-            return Err(ControlError::Unsupported(
-                "full capture requires a running or paused machine",
-            ));
-        }
-        let public_paused = state == MachineState::Paused;
-        let directory = apple_full_capture_directory(&self.sandbox_root, &operation_id);
+    ) -> ControlResult<NativeSnapshotResponse> {
+        self.prepare_capture_boundary(operation_id.clone(), journal)?;
+        let directory = apple_full_capture_directory(&self.machine_root, &operation_id);
         if directory.join("capture.json").exists() {
-            self.capture_origin_was_paused = public_paused;
             let capture = read_json(&directory.join("capture.json"), 1024 * 1024)
                 .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeCheckpointResponse::Prepared {
+            return Ok(NativeSnapshotResponse::Prepared {
                 capture,
                 processes: process_watermarks(journal)?,
             });
         }
-        if public_paused {
-            self.machine
-                .resume_public_pause_for_capture()
-                .map_err(|_| {
-                    ControlError::Unsupported(
-                        "Apple VM could not coordinate capture from a published pause",
-                    )
-                })?;
-            self.capture_origin_was_paused = true;
-        }
-        let response = match self
-            .workload
-            .query(GuestServiceRequest::PrepareFilesystemCapture {
-                operation_id: operation_id.clone(),
-            }) {
-            Ok(value) => value,
-            Err(error) => {
-                if public_paused {
-                    let _ = self.machine.restore_public_pause_after_capture();
-                    self.capture_origin_was_paused = false;
-                }
-                return Err(error);
-            }
-        };
-        if !matches!(
-            response,
-            GuestServiceResponse::FilesystemCapturePrepared { .. }
-        ) {
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
-            return Err(ControlError::Protocol(
-                "guest did not establish a full capture barrier",
-            ));
-        }
-        if let Err(error) = self.workload.reconcile(journal) {
-            let _ = self.finish_filesystem_capture(operation_id.clone());
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
-            return Err(ControlError::State(error));
-        }
-        crate::checkpoints::private_directory(
+        crate::snapshots::private_directory(
             directory
                 .parent()
                 .ok_or(ControlError::Protocol("capture root has no parent"))?,
         )
         .map_err(|_| ControlError::Protocol("full capture root is not private"))?;
-        crate::checkpoints::private_directory(&directory)
+        crate::snapshots::private_directory(&directory)
             .map_err(|_| ControlError::Protocol("full capture directory is not private"))?;
         let saved_state = directory.join("snapshot.vmstate");
         for path in [&saved_state, &directory.join("reconnect.json")] {
@@ -631,26 +530,21 @@ impl AppleGuardianEffect {
             .save_full_state(&operation_id, &saved_state)
             .is_err()
         {
-            let _ = self.machine.resume_after_capture();
-            let _ = self.finish_filesystem_capture(operation_id);
-            if public_paused {
-                let _ = self.machine.restore_public_pause_after_capture();
-                self.capture_origin_was_paused = false;
-            }
+            let _ = self.finish_native_capture();
             return Err(ControlError::Unsupported(
                 "Apple Virtualization could not save full machine state",
             ));
         }
         let result = (|| -> Result<sandsurf_protocol::NativeFullCapture, AppleError> {
-            let active = self.workload.endpoint().ok_or_else(|| {
+            let active = self.management_binding().ok_or_else(|| {
                 AppleError::Invalid("guest reconnect state is unavailable".into())
             })?;
             let reconnect = ReconnectState {
                 format_version: 1,
-                checkpoint_id: checkpoint_id.clone(),
+                snapshot_id: snapshot_id.clone(),
                 capture_operation_id: operation_id.clone(),
-                sandbox_id: active.sandbox_id,
-                epoch: active.epoch,
+                machine_id: active.machine_id,
+                generation: active.generation,
                 boot_identity: active.boot_identity,
                 capability: active.capability,
                 network_capability: active.network_capability,
@@ -672,10 +566,10 @@ impl AppleGuardianEffect {
             let configuration_digest = apple_configuration_digest(&self.config)
                 .map_err(|error| AppleError::Invalid(error.to_string()))?;
             let generation = digest(
-                Domain::Checkpoint,
+                Domain::Snapshot,
                 &(
                     "sandsurf-apple-full-capture-generation-v1",
-                    &checkpoint_id,
+                    &snapshot_id,
                     &operation_id,
                     &state_digest,
                     &reconnect_digest,
@@ -687,13 +581,13 @@ impl AppleGuardianEffect {
                 engine_version: "virtualization-framework-save-v1".into(),
                 architecture: native_architecture_name().into(),
                 configuration_digest,
-                snapshot_state: CheckpointArtifact {
+                snapshot_state: SnapshotArtifact {
                     digest: state_digest,
                     bytes: Counter::try_from(state_bytes)
                         .map_err(|error| AppleError::Invalid(error.to_string()))?,
                 },
                 memory: None,
-                reconnect_state: CheckpointArtifact {
+                reconnect_state: SnapshotArtifact {
                     digest: reconnect_digest,
                     bytes: Counter::try_from(reconnect_bytes)
                         .map_err(|error| AppleError::Invalid(error.to_string()))?,
@@ -701,24 +595,19 @@ impl AppleGuardianEffect {
                 generation,
             };
             write_private_json(&directory.join("capture.json"), &capture)?;
-            crate::checkpoints::sync_directory(&directory)
+            crate::snapshots::sync_directory(&directory)
                 .map_err(|error| AppleError::Invalid(error.to_string()))?;
             Ok(capture)
         })();
         match result {
-            Ok(capture) => Ok(NativeCheckpointResponse::Prepared {
+            Ok(capture) => Ok(NativeSnapshotResponse::Prepared {
                 capture,
                 processes: process_watermarks(journal)?,
             }),
             Err(error) => {
-                let _ = self.machine.resume_after_capture();
-                let _ = self.finish_filesystem_capture(operation_id);
-                if public_paused {
-                    let _ = self.machine.restore_public_pause_after_capture();
-                    self.capture_origin_was_paused = false;
-                }
+                let _ = self.finish_native_capture();
                 Err(ControlError::Rejected {
-                    category: "checkpoint".into(),
+                    category: "snapshot".into(),
                     message: error.to_string(),
                 })
             }
@@ -727,11 +616,11 @@ impl AppleGuardianEffect {
 
     fn stage_full_restore(
         &mut self,
-        checkpoint_id: sandsurf_protocol::CheckpointId,
+        snapshot_id: sandsurf_protocol::SnapshotId,
         manifest_digest: Digest,
-        workload_disk: CheckpointArtifact,
-        expected: sandsurf_protocol::FullCheckpointMetadata,
-    ) -> ControlResult<NativeCheckpointResponse> {
+        system_disk: SnapshotArtifact,
+        expected: sandsurf_protocol::FullSnapshotMetadata,
+    ) -> ControlResult<NativeSnapshotResponse> {
         let configuration_digest = apple_configuration_digest(&self.config)
             .map_err(|_| ControlError::Protocol("restore configuration digest failed"))?;
         if expected.engine != VmEngine::AppleVirtualization
@@ -741,62 +630,51 @@ impl AppleGuardianEffect {
             || expected.memory.is_some()
         {
             return Err(ControlError::Unsupported(
-                "full checkpoint is incompatible with this Apple VM configuration",
+                "full snapshot is incompatible with this Apple VM configuration",
             ));
         }
         let host_root = self
-            .sandbox_root
+            .machine_root
             .parent()
             .and_then(Path::parent)
-            .ok_or(ControlError::Protocol("sandbox root has no host root"))?;
-        let directory = host_root.join("checkpoints").join(checkpoint_id.as_str());
+            .ok_or(ControlError::Protocol("machine root has no host root"))?;
+        let directory = host_root.join("snapshots").join(snapshot_id.as_str());
         for (name, artifact) in [
-            ("workload-state.ext4", &workload_disk),
-            ("control-state.ext4", &expected.control_disk),
+            ("system.ext4", &system_disk),
             ("snapshot.vmstate", &expected.snapshot_state),
             ("reconnect.json", &expected.reconnect_state),
         ] {
-            let actual =
-                crate::checkpoints::file_digest(&directory.join(name), artifact.bytes.get())
-                    .map_err(|_| ControlError::Protocol("full checkpoint artifact is corrupt"))?;
+            let actual = crate::snapshots::file_digest(&directory.join(name), artifact.bytes.get())
+                .map_err(|_| ControlError::Protocol("full snapshot artifact is corrupt"))?;
             if actual != artifact.digest {
                 return Err(ControlError::Protocol(
-                    "full checkpoint artifact digest mismatch",
+                    "full snapshot artifact digest mismatch",
                 ));
             }
         }
-        for (path, artifact) in [
-            (
-                self.sandbox_root.join("disks/workload-state.ext4"),
-                &workload_disk,
-            ),
-            (
-                self.sandbox_root.join("disks/control-state.ext4"),
-                &expected.control_disk,
-            ),
-        ] {
-            if crate::checkpoints::file_digest(&path, artifact.bytes.get())
+        for (path, artifact) in [(self.machine_root.join("disks/system.ext4"), &system_disk)] {
+            if crate::snapshots::file_digest(&path, artifact.bytes.get())
                 .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
                 != artifact.digest
             {
                 return Err(ControlError::Unsupported(
-                    "mutable disks no longer match the suspended full checkpoint",
+                    "mutable disks no longer match the suspended full snapshot",
                 ));
             }
         }
         let reconnect: ReconnectState =
             read_json(&directory.join("reconnect.json"), 1024 * 1024)
                 .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
-        if reconnect.format_version != 1 || reconnect.checkpoint_id != checkpoint_id {
+        if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
-                "restore reconnect identity does not match checkpoint",
+                "restore reconnect identity does not match snapshot",
             ));
         }
-        let restore_root = self.sandbox_root.join("guardian/restores");
-        crate::checkpoints::private_directory(&restore_root)
+        let restore_root = self.machine_root.join("guardian/restores");
+        crate::snapshots::private_directory(&restore_root)
             .map_err(|_| ControlError::Protocol("restore staging root is not private"))?;
         let staged_state = restore_root.join(format!("{}.vmstate", manifest_digest.as_str()));
-        crate::checkpoints::copy_and_verify(
+        crate::snapshots::copy_and_verify(
             &directory.join("snapshot.vmstate"),
             &staged_state,
             expected.snapshot_state.bytes.get(),
@@ -810,18 +688,18 @@ impl AppleGuardianEffect {
             })
             .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
         self.restore_lineage = Some(RestoreLineage {
-            checkpoint_id: checkpoint_id.clone(),
+            snapshot_id: snapshot_id.clone(),
             source: reconnect,
             staged_state,
             generation_seed: random_bytes()
                 .map_err(|_| ControlError::Protocol("restore entropy unavailable"))?,
         });
-        Ok(NativeCheckpointResponse::Complete {
+        Ok(NativeSnapshotResponse::Complete {
             evidence: digest(
-                Domain::Checkpoint,
+                Domain::Snapshot,
                 &(
                     "sandsurf-apple-restore-staged-v1",
-                    checkpoint_id,
+                    snapshot_id,
                     manifest_digest,
                     expected.generation,
                 ),
@@ -831,11 +709,11 @@ impl AppleGuardianEffect {
     }
 
     fn install_runtime(&mut self, configuration: &RuntimeConfiguration) -> RuntimeInstallation {
-        let Some(active) = self.workload.endpoint() else {
+        let Some(active) = self.management_binding() else {
             return RuntimeInstallation::Unknown;
         };
         if let Some(installed) = self.installed_runtime.as_ref()
-            && installed.epoch == active.epoch
+            && installed.generation == active.generation
             && installed.configuration == *configuration
         {
             return RuntimeInstallation::Applied(installed.evidence.clone());
@@ -879,18 +757,11 @@ impl AppleGuardianEffect {
             self.stop_data_planes();
             return RuntimeInstallation::Unknown;
         }
-        let resource_evidence =
-            match guest_client(&active).call(&GuestServiceRequest::ApplyResources {
-                resources: configuration.resources.clone(),
-            }) {
-                Ok(GuestServiceResponse::ResourcesApplied { evidence }) => evidence,
-                _ => {
-                    self.stop_data_planes();
-                    return RuntimeInstallation::Unknown;
-                }
-            };
+        let resource_evidence = digest(Domain::Resource, &configuration.resources)
+            .map_err(|_| ())
+            .ok();
         match digest(
-            Domain::Grant,
+            Domain::Authority,
             &(
                 "sandsurf-apple-runtime-configuration-v1",
                 resource_evidence,
@@ -899,7 +770,7 @@ impl AppleGuardianEffect {
         ) {
             Ok(evidence) => {
                 self.installed_runtime = Some(InstalledRuntime {
-                    epoch: active.epoch,
+                    generation: active.generation,
                     configuration: configuration.clone(),
                     evidence: evidence.clone(),
                 });
@@ -927,7 +798,7 @@ impl AppleGuardianEffect {
     fn contain_unpublished(&mut self) {
         self.machine.contain_unobserved();
         self.pending = None;
-        if let Ok(mut active) = self.workload.active.lock() {
+        if let Ok(mut active) = self.guest_binding.lock() {
             *active = None;
         }
         self.stop_data_planes();
@@ -940,12 +811,12 @@ enum RuntimeInstallation {
     Unknown,
 }
 
-impl AppleWorkload {
+impl AppleGuest {
     fn endpoint(&self) -> Option<ActiveGuest> {
         self.active.lock().ok()?.clone()
     }
 
-    fn driver(&mut self) -> Option<&mut RemoteWorkloadDriver<UnixVsockChannel>> {
+    fn driver(&mut self) -> Option<&mut ManagedGuestClient<UnixVsockChannel>> {
         let active = self.endpoint();
         let Some(active) = active else {
             self.remote = None;
@@ -956,28 +827,27 @@ impl AppleWorkload {
             .as_ref()
             .is_none_or(|(cached, _)| cached != &active)
         {
-            self.remote = Some((
-                active.clone(),
-                RemoteWorkloadDriver::new(guest_client(&active)),
-            ));
+            self.remote = Some((active.clone(), managed_guest(&active)));
         }
         self.remote.as_mut().map(|(_, driver)| driver)
     }
 }
 
-impl WorkloadDriver for AppleWorkload {
-    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
+impl GuestDriver for AppleGuest {
+    fn dispatch(&mut self, command: &GuestCommand) -> EffectOutcome {
         let Some(driver) = self.driver() else {
             return EffectOutcome::NotApplied(bytes_digest(b"apple-guest-not-running"));
         };
-        driver.dispatch(mutation, capability)
+        driver.dispatch(command)
     }
 
-    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if let Some(driver) = self.driver() {
-            driver.reconcile(journal)?;
-        }
-        Ok(())
+    fn poll(
+        &mut self,
+        hints: &crate::guest_worker::ExecutionHints,
+    ) -> ControlResult<crate::guest_worker::GuestPoll> {
+        self.driver()
+            .ok_or(ControlError::Unsupported("guest management unavailable"))?
+            .poll(hints)
     }
 
     fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
@@ -989,8 +859,14 @@ impl WorkloadDriver for AppleWorkload {
 }
 
 impl GuardianEffect for AppleGuardianEffect {
-    fn dispatch(&mut self, mutation: &Mutation, capability: Capability) -> EffectOutcome {
-        self.workload.dispatch(mutation, capability)
+    fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
+        Box::new(AppleGuest {
+            active: Arc::clone(&self.guest_binding),
+            remote: None,
+        })
+    }
+    fn guest_poll_allowed(&self) -> bool {
+        !self.machine.capture_is_paused()
     }
 
     fn transition(
@@ -1004,15 +880,18 @@ impl GuardianEffect for AppleGuardianEffect {
             });
         let restoring = command.desired == sandsurf_protocol::DesiredState::Running
             && current.is_some_and(|value| value.state == MachineState::Suspended);
+        if cold_boot {
+            self.config.resources = command.configuration.resources.clone();
+        }
         if cold_boot || restoring {
-            let epoch = match current {
-                Some(value) => match value.epoch.next() {
+            let generation = match current {
+                Some(value) => match value.generation.next() {
                     Ok(value) => value,
                     Err(_) => return MachineOutcome::Unknown,
                 },
                 None => Counter::ONE,
             };
-            if let Err(evidence) = self.prepare_boot(command, epoch) {
+            if let Err(evidence) = self.prepare_boot(command, generation) {
                 return MachineOutcome::NotApplied(evidence);
             }
         }
@@ -1024,21 +903,21 @@ impl GuardianEffect for AppleGuardianEffect {
         );
         if running {
             if cold_boot || restoring {
-                let epoch = match &outcome {
+                let generation = match &outcome {
                     MachineOutcome::Observed(values) => values
                         .last()
-                        .map(|value| value.epoch)
+                        .map(|value| value.generation)
                         .unwrap_or(Counter::ONE),
                     _ => Counter::ONE,
                 };
                 let authenticated = if restoring {
-                    self.authenticate_restored(epoch)
+                    self.bind_restored(generation)
                 } else {
-                    self.authenticate_pending()
+                    self.bind_pending()
                 };
                 match authenticated {
                     Ok(active) => {
-                        if let Ok(mut endpoint) = self.workload.active.lock() {
+                        if let Ok(mut endpoint) = self.guest_binding.lock() {
                             *endpoint = Some(active);
                         } else {
                             self.contain_unpublished();
@@ -1066,7 +945,7 @@ impl GuardianEffect for AppleGuardianEffect {
                 && let Some(last) = values.last_mut()
             {
                 match digest(
-                    Domain::Grant,
+                    Domain::Authority,
                     &(
                         "sandsurf-apple-running-with-configuration-v1",
                         &last.evidence_digest,
@@ -1081,30 +960,13 @@ impl GuardianEffect for AppleGuardianEffect {
                     }
                 }
             }
-            if restoring {
-                let Some(operation_id) = self
-                    .restore_lineage
-                    .as_ref()
-                    .map(|lineage| lineage.source.capture_operation_id.clone())
-                else {
-                    self.contain_unpublished();
-                    return MachineOutcome::Unknown;
-                };
-                match self.finish_filesystem_capture(operation_id) {
-                    Ok(GuestServiceResponse::FilesystemCaptureFinished { .. }) => {}
-                    Ok(_) | Err(_) => {
-                        self.contain_unpublished();
-                        return MachineOutcome::Unknown;
-                    }
-                }
-            }
         }
         if matches!(
             &outcome,
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| matches!(value.state, MachineState::Stopped | MachineState::Suspended | MachineState::Destroyed))
         ) {
-            if let Ok(mut active) = self.workload.active.lock() {
+            if let Ok(mut active) = self.guest_binding.lock() {
                 *active = None;
             }
             self.stop_data_planes();
@@ -1114,7 +976,7 @@ impl GuardianEffect for AppleGuardianEffect {
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| value.state == MachineState::Suspended)
         ) && let Some(operation_id) = self.suspend_capture_operation.take()
-            && let Err(error) = remove_apple_full_capture(&self.sandbox_root, &operation_id)
+            && let Err(error) = remove_apple_full_capture(&self.machine_root, &operation_id)
         {
             eprintln!("sandsurf retained Apple suspend staging after cleanup failure: {error}");
         }
@@ -1122,10 +984,35 @@ impl GuardianEffect for AppleGuardianEffect {
             &outcome,
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| matches!(value.state, MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed))
-        ) {
-            self.capture_origin_was_paused = false;
+        ) && let Err(error) = crate::capture::CaptureBoundary::clear(&self.machine_root)
+        {
+            eprintln!("sandsurf capture cleanup deferred: {error}");
         }
         outcome
+    }
+
+    fn validate_resources(
+        &self,
+        resources: &Resources,
+        current: &MachineObservation,
+    ) -> ControlResult<()> {
+        resources
+            .validate()
+            .map_err(|_| ControlError::Protocol("invalid native resource envelope"))?;
+        if resources.disk_bytes != self.config.resources.disk_bytes {
+            return Err(ControlError::Unsupported(
+                "disk capacity changes require the storage replacement capability",
+            ));
+        }
+        if (resources.vcpus != self.config.resources.vcpus
+            || resources.memory_mib != self.config.resources.memory_mib)
+            && current.state != MachineState::Stopped
+        {
+            return Err(ControlError::Unsupported(
+                "RAM and vCPU changes require a powered-off computer",
+            ));
+        }
+        Ok(())
     }
 
     fn configure(
@@ -1133,11 +1020,28 @@ impl GuardianEffect for AppleGuardianEffect {
         command: &sandsurf_protocol::ConfigurationCommand,
         current: &MachineObservation,
     ) -> EffectOutcome {
+        if self
+            .validate_resources(&command.configuration.resources, current)
+            .is_err()
+        {
+            return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
+        }
+        if current.state == MachineState::Stopped {
+            return match self.machine.configure(command, current) {
+                sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
+                    EffectOutcome::Applied(evidence)
+                }
+                sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
+                    EffectOutcome::NotApplied(evidence)
+                }
+                sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
+            };
+        }
         match self.machine.configure(command, current) {
             sandsurf_machine::ConfigurationOutcome::Applied(machine) => {
                 match self.install_runtime(&command.configuration) {
                     RuntimeInstallation::Applied(runtime) => digest(
-                        Domain::Grant,
+                        Domain::Authority,
                         &(
                             "sandsurf-apple-configuration-applied-v1",
                             machine,
@@ -1157,110 +1061,73 @@ impl GuardianEffect for AppleGuardianEffect {
         }
     }
 
-    fn reconcile(&mut self, journal: &mut RuntimeJournal) -> sandsurf_state::Result<()> {
-        if journal
-            .last_observation()?
-            .is_some_and(|value| value.value().state == MachineState::Running)
-            && !self.machine.capture_is_paused()
-        {
-            self.workload.reconcile(journal)?;
-        }
-        Ok(())
+    fn resource_usage(&mut self) -> ControlResult<sandsurf_protocol::ResourceUsage> {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ControlError::Protocol("host clock unavailable"))?
+            .as_millis();
+        let observed = Counter::try_from(
+            u64::try_from(millis).map_err(|_| ControlError::Protocol("host time overflow"))?,
+        )
+        .map_err(|_| ControlError::Protocol("host time overflow"))?;
+        let mut usage =
+            sandsurf_protocol::ResourceUsage::host_observation("host-native-apple", observed);
+        let accumulated = self
+            .network_usage
+            .lock()
+            .map_err(|_| ControlError::Protocol("network usage lock poisoned"))?;
+        let current = self
+            .network
+            .lock()
+            .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
+            .as_ref()
+            .map_or_else(Default::default, VmNetworkBridge::snapshot);
+        usage.network_rx_bytes =
+            Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
+                .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
+        usage.network_tx_bytes =
+            Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes))
+                .map_err(|_| ControlError::Protocol("network transmit accounting overflow"))?;
+        usage.network_connections =
+            Counter::try_from(accumulated.connections.saturating_add(current.connections))
+                .map_err(|_| ControlError::Protocol("network connection accounting overflow"))?;
+        Ok(usage)
     }
 
-    fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        if let GuestServiceRequest::PrepareFilesystemCapture { operation_id } = &request {
-            let operation_id = operation_id.clone();
-            let response = self.workload.query(request)?;
-            if !matches!(
-                response,
-                GuestServiceResponse::FilesystemCapturePrepared { .. }
-            ) {
-                return Ok(response);
-            }
-            if self.machine.pause_for_capture().is_err() {
-                let _ = self
-                    .workload
-                    .query(GuestServiceRequest::FinishFilesystemCapture { operation_id });
-                return Err(ControlError::Unsupported(
-                    "Apple VM could not establish the filesystem capture pause",
-                ));
-            }
-            return Ok(response);
-        }
-        if let GuestServiceRequest::FinishFilesystemCapture { operation_id } = request {
-            self.machine.resume_after_capture().map_err(|_| {
-                ControlError::Unsupported("Apple VM could not leave the filesystem capture pause")
-            })?;
-            return self.finish_filesystem_capture(operation_id);
-        }
-        let usage_requested = matches!(request, GuestServiceRequest::ResourceUsage);
-        let mut response = self.workload.query(request)?;
-        if usage_requested && let GuestServiceResponse::ResourceUsage { usage } = &mut response {
-            let accumulated = self
-                .network_usage
-                .lock()
-                .map_err(|_| ControlError::Protocol("network usage lock poisoned"))?;
-            let current = self
-                .network
-                .lock()
-                .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
-                .as_ref()
-                .map_or_else(Default::default, VmNetworkBridge::snapshot);
-            usage.network_rx_bytes =
-                Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
-                    .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
-            usage.network_tx_bytes =
-                Counter::try_from(accumulated.tx_bytes.saturating_add(current.tx_bytes))
-                    .map_err(|_| ControlError::Protocol("network transmit accounting overflow"))?;
-            usage.network_connections =
-                Counter::try_from(accumulated.connections.saturating_add(current.connections))
-                    .map_err(|_| {
-                        ControlError::Protocol("network connection accounting overflow")
-                    })?;
-        }
-        Ok(response)
-    }
-
-    fn native_checkpoint(
+    fn native_snapshot(
         &mut self,
-        request: NativeCheckpointRequest,
+        request: NativeSnapshotRequest,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeCheckpointResponse> {
+    ) -> ControlResult<NativeSnapshotResponse> {
         match request {
-            NativeCheckpointRequest::PrepareFull {
-                checkpoint_id,
+            NativeSnapshotRequest::PrepareDisk { operation_id } => {
+                self.prepare_capture_boundary(operation_id, journal)?;
+                Ok(NativeSnapshotResponse::Complete {
+                    evidence: bytes_digest(b"native-computer-paused-for-disk-capture-v1"),
+                })
+            }
+            NativeSnapshotRequest::FinishDisk { operation_id } => {
+                crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
+                self.finish_native_capture()?;
+                Ok(NativeSnapshotResponse::Complete {
+                    evidence: bytes_digest(b"native-disk-capture-released-v1"),
+                })
+            }
+            NativeSnapshotRequest::PrepareFull {
+                snapshot_id,
                 operation_id,
-            } => self.prepare_full_capture(checkpoint_id, operation_id, journal),
-            NativeCheckpointRequest::FinishFull { operation_id } => {
-                self.machine.resume_after_capture().map_err(|_| {
+            } => self.prepare_full_capture(snapshot_id, operation_id, journal),
+            NativeSnapshotRequest::FinishFull { operation_id } => {
+                crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
+                self.finish_native_capture().map_err(|_| {
                     ControlError::Unsupported("Apple VM could not resume after full capture")
                 })?;
-                let response = self.finish_filesystem_capture(operation_id.clone())?;
-                if !matches!(
-                    response,
-                    GuestServiceResponse::FilesystemCaptureFinished { .. }
-                ) {
-                    return Err(ControlError::Protocol(
-                        "guest did not release the full capture barrier",
-                    ));
-                }
-                if self.capture_origin_was_paused {
-                    self.machine
-                        .restore_public_pause_after_capture()
-                        .map_err(|_| {
-                            ControlError::Unsupported(
-                                "Apple VM could not restore the published pause",
-                            )
-                        })?;
-                    self.capture_origin_was_paused = false;
-                }
-                remove_apple_full_capture(&self.sandbox_root, &operation_id)?;
-                Ok(NativeCheckpointResponse::Complete {
+                remove_apple_full_capture(&self.machine_root, &operation_id)?;
+                Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"apple-full-capture-finished-v1"),
                 })
             }
-            NativeCheckpointRequest::CommitSuspend {
+            NativeSnapshotRequest::CommitSuspend {
                 operation_id,
                 manifest_digest,
             } => {
@@ -1272,9 +1139,9 @@ impl GuardianEffect for AppleGuardianEffect {
                         )
                     })?;
                 self.suspend_capture_operation = Some(operation_id.clone());
-                Ok(NativeCheckpointResponse::Complete {
+                Ok(NativeSnapshotResponse::Complete {
                     evidence: digest(
-                        Domain::Checkpoint,
+                        Domain::Snapshot,
                         &(
                             "sandsurf-apple-suspend-commit-v1",
                             operation_id,
@@ -1284,19 +1151,19 @@ impl GuardianEffect for AppleGuardianEffect {
                     .map_err(|_| ControlError::Protocol("suspend evidence digest failed"))?,
                 })
             }
-            NativeCheckpointRequest::StageRestore {
-                checkpoint_id,
+            NativeSnapshotRequest::StageRestore {
+                snapshot_id,
                 manifest_digest,
-                workload_disk,
+                system_disk,
                 expected,
-            } => self.stage_full_restore(checkpoint_id, manifest_digest, workload_disk, *expected),
+            } => self.stage_full_restore(snapshot_id, manifest_digest, system_disk, *expected),
         }
     }
 
     fn rebind_restored_runtime(
         &mut self,
         journal: &mut RuntimeJournal,
-        epoch: Counter,
+        generation: Counter,
     ) -> sandsurf_state::Result<()> {
         let lineage = self
             .restore_lineage
@@ -1305,10 +1172,10 @@ impl GuardianEffect for AppleGuardianEffect {
                 "restored Apple VM has no staged process lineage",
             ))?;
         journal.rebind_processes(
-            &lineage.checkpoint_id,
-            &lineage.source.sandbox_id,
-            lineage.source.epoch,
-            epoch,
+            &lineage.snapshot_id,
+            &lineage.source.machine_id,
+            lineage.source.generation,
+            generation,
         )?;
         match fs::remove_file(&lineage.staged_state) {
             Ok(()) => {}
@@ -1329,38 +1196,25 @@ impl GuardianEffect for AppleGuardianEffect {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReconnectState {
     format_version: u16,
-    checkpoint_id: sandsurf_protocol::CheckpointId,
+    snapshot_id: sandsurf_protocol::SnapshotId,
     capture_operation_id: sandsurf_protocol::OperationId,
-    sandbox_id: SandboxId,
-    epoch: Counter,
+    machine_id: MachineId,
+    generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
     network_capability: [u8; 32],
 }
 
-fn restored_identity_matches(active: &ActiveGuest) -> bool {
-    matches!(
-        guest_client(active).call(&GuestServiceRequest::ProbeIdentity),
-        Ok(GuestServiceResponse::Identity {
-            sandbox_id,
-            epoch,
-            boot_identity,
-        }) if sandbox_id == active.sandbox_id
-            && epoch == active.epoch
-            && boot_identity == active.boot_identity
-    )
-}
-
-fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<CheckpointProcessWatermark>> {
+fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<SnapshotProcessWatermark>> {
     journal
         .process_snapshots()
         .map_err(ControlError::State)?
         .into_iter()
         .map(|snapshot| {
             let output = journal
-                .process_boundary(&snapshot.request.process_id)
+                .process_boundary(&snapshot.request.execution_id)
                 .map_err(ControlError::State)?;
-            Ok(CheckpointProcessWatermark { snapshot, output })
+            Ok(SnapshotProcessWatermark { snapshot, output })
         })
         .collect()
 }
@@ -1376,33 +1230,33 @@ fn apple_configuration_digest(
     config: &AppleGuardianConfig,
 ) -> Result<Digest, sandsurf_protocol::Invalid> {
     digest(
-        Domain::Checkpoint,
+        Domain::Snapshot,
         &(
             "sandsurf-apple-configuration-v1",
             &config.image_digest,
             &config.helper_digest,
             &config.resources,
             native_architecture_name(),
-            sandbox_guest::GUEST_PROTOCOL_MAJOR,
-            sandbox_guest::GUEST_PROTOCOL_MINOR,
+            sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
+            sandsurf_protocol::GUEST_PROTOCOL_MINOR,
         ),
     )
 }
 
 fn apple_full_capture_directory(
-    sandbox_root: &Path,
+    machine_root: &Path,
     operation_id: &sandsurf_protocol::OperationId,
 ) -> PathBuf {
-    sandbox_root
+    machine_root
         .join("guardian/full-captures")
         .join(operation_id.as_str())
 }
 
 fn remove_apple_full_capture(
-    sandbox_root: &Path,
+    machine_root: &Path,
     operation_id: &sandsurf_protocol::OperationId,
 ) -> ControlResult<()> {
-    let directory = apple_full_capture_directory(sandbox_root, operation_id);
+    let directory = apple_full_capture_directory(machine_root, operation_id);
     for name in ["capture.json", "reconnect.json", "snapshot.vmstate"] {
         match fs::remove_file(directory.join(name)) {
             Ok(()) => {}
@@ -1430,6 +1284,21 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), AppleEr
     Ok(())
 }
 
+fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<UnixVsockChannel> {
+    let pending = active.rebind.as_ref().map(|binding| {
+        let source = ActiveGuest {
+            machine_id: binding.machine_id.clone(),
+            generation: binding.generation,
+            boot_identity: binding.boot_identity.clone(),
+            capability: binding.capability,
+            rebind: None,
+            ..active.clone()
+        };
+        PendingRebind::new(guest_client(&source), binding.request.clone())
+    });
+    ManagedGuestClient::new(guest_client(active), pending)
+}
+
 fn guest_client(active: &ActiveGuest) -> GuestClient<UnixVsockChannel> {
     GuestClient::new(
         UnixVsockChannel {
@@ -1437,34 +1306,32 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<UnixVsockChannel> {
             guest_port: GUEST_CONTROL_PORT,
             timeout: Duration::from_secs(10),
         },
-        active.sandbox_id.clone(),
-        active.epoch,
+        active.machine_id.clone(),
+        active.generation,
         active.boot_identity.clone(),
         active.capability,
     )
 }
 
-fn network_rules(
-    policy: &NetworkPolicy,
-) -> Result<sandbox_network_broker::BrokerPolicy, AppleError> {
+fn network_rules(policy: &NetworkPolicy) -> Result<sandsurf_network::BrokerPolicy, AppleError> {
     policy
         .validate()
         .map_err(|error| AppleError::Invalid(error.to_string()))?;
-    let mut rules = sandbox_network_broker::BrokerPolicy::default();
+    let mut rules = sandsurf_network::BrokerPolicy::default();
     for rule in &policy.rules {
         let destination = match &rule.destination {
             NetworkDestination::Dns {
                 name,
                 include_subdomains,
                 allow_private_addresses,
-            } => sandbox_policy::ManagedNetworkDestination::Dns {
-                name: sandbox_policy::normalize_dns_name(name)
+            } => sandsurf_network::policy::ManagedNetworkDestination::Dns {
+                name: sandsurf_network::policy::normalize_dns_name(name)
                     .map_err(|error| AppleError::Invalid(error.to_string()))?,
                 include_subdomains: *include_subdomains,
                 allow_private_addresses: *allow_private_addresses,
             },
             NetworkDestination::Ip { cidr } => {
-                sandbox_policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
+                sandsurf_network::policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
             }
         };
         let ports = rule
@@ -1472,16 +1339,16 @@ fn network_rules(
             .iter()
             .map(|range| {
                 if range.from == range.to {
-                    sandbox_policy::ManagedNetworkPort::Single(range.from)
+                    sandsurf_network::policy::ManagedNetworkPort::Single(range.from)
                 } else {
-                    sandbox_policy::ManagedNetworkPort::Range {
+                    sandsurf_network::policy::ManagedNetworkPort::Range {
                         from: range.from,
                         to: range.to,
                     }
                 }
             })
             .collect();
-        let managed = sandbox_policy::ManagedNetworkRule {
+        let managed = sandsurf_network::policy::ManagedNetworkRule {
             transport: "tcp".into(),
             destination,
             ports,
@@ -1503,7 +1370,7 @@ fn resolve_source_bundle(
     let installed = host_root.join("images").join(expected.as_str());
     if installed.exists() {
         let image = verify_image(&installed.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        let template = state_template_path(&image)?;
+        let template = image.system_path.clone();
         return Ok((image, template));
     }
     let package = executable
@@ -1536,10 +1403,9 @@ fn resolve_source_bundle(
             manifest_digest: pinned,
         },
     )?;
-    let template = state_template_path(&image)?;
-    let installed = install_image(host_root, &image, &template)?;
+    let installed = sandsurf_image::install_image(&host_root.join("images"), &image)?;
     let copied = verify_image(&installed.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-    let copied_template = state_template_path(&copied)?;
+    let copied_template = copied.system_path.clone();
     Ok((copied, copied_template))
 }
 
@@ -1551,84 +1417,6 @@ struct ImageIndex {
     #[serde(rename = "buildId")]
     _build_id: String,
     files: std::collections::BTreeMap<String, String>,
-}
-
-fn state_template_path(image: &VerifiedImage) -> Result<PathBuf, AppleError> {
-    let template = image
-        .manifest
-        .workload
-        .state_template
-        .as_ref()
-        .ok_or_else(|| AppleError::Invalid("image has no writable-state template".into()))?;
-    Ok(image
-        .manifest_path
-        .parent()
-        .ok_or_else(|| AppleError::Invalid("image manifest has no parent".into()))?
-        .join(&template.path))
-}
-
-fn install_image(
-    host_root: &Path,
-    image: &VerifiedImage,
-    template: &Path,
-) -> Result<PathBuf, AppleError> {
-    let root = host_root.join("images").join(&image.manifest_digest);
-    if root.exists() {
-        return Ok(root);
-    }
-    let staging = host_root
-        .join("images")
-        .join(format!("stage-{}", hex(&random_bytes()?)));
-    ensure_private_directory(&staging)?;
-    let result = (|| -> Result<(), AppleError> {
-        for (source, destination) in [
-            (image.manifest_path.as_path(), staging.join("manifest.json")),
-            (
-                image.kernel_path.as_path(),
-                staging.join(&image.manifest.boot_bundle.kernel.path),
-            ),
-            (
-                image.bootstrap_path.as_path(),
-                staging.join(&image.manifest.boot_bundle.bootstrap.path),
-            ),
-            (
-                image.workload_path.as_path(),
-                staging.join(&image.manifest.workload.rootfs.path),
-            ),
-            (template, staging.join("empty-workspace.ext4")),
-        ] {
-            copy_artifact(source, &destination)?;
-        }
-        if let Some(windows) = &image.windows_x64 {
-            let manifest = image
-                .manifest
-                .platform_artifacts
-                .windows_x64
-                .as_ref()
-                .ok_or_else(|| AppleError::Invalid("Windows artifact metadata is absent".into()))?;
-            for (source, relative) in [
-                (&windows.kernel_path, &manifest.kernel.path),
-                (&windows.bootstrap_path, &manifest.bootstrap.path),
-                (&windows.workload_path, &manifest.workload.path),
-                (&windows.state_template_path, &manifest.state_template.path),
-            ] {
-                copy_artifact(source, &staging.join(relative))?;
-            }
-        }
-        let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        if copied.manifest_digest != image.manifest_digest {
-            return Err(AppleError::Invalid("copied image identity changed".into()));
-        }
-        File::open(&staging)?.sync_all()?;
-        fs::rename(&staging, &root)?;
-        File::open(host_root.join("images"))?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    result?;
-    Ok(root)
 }
 
 fn ensure_mutable_disk(source: &Path, destination: &Path, bytes: u64) -> Result<(), AppleError> {
@@ -1659,21 +1447,21 @@ fn ensure_mutable_disk(source: &Path, destination: &Path, bytes: u64) -> Result<
 
 fn write_authentication(
     path: &Path,
-    sandbox_id: &SandboxId,
-    epoch: Counter,
+    machine_id: &MachineId,
+    generation: Counter,
     boot_identity: &Digest,
     capability: &[u8; 32],
     network_capability: &[u8; 32],
 ) -> Result<(), AppleError> {
-    let identity = sandbox_id.as_str().as_bytes();
+    let identity = machine_id.as_str().as_bytes();
     let size = u16::try_from(identity.len())
-        .map_err(|_| AppleError::Invalid("sandbox identity is too long".into()))?;
+        .map_err(|_| AppleError::Invalid("machine identity is too long".into()))?;
     let digest = decode_hex(boot_identity.as_str())?;
     let mut bytes = Vec::with_capacity(512);
     bytes.extend_from_slice(AUTHENTICATION_MAGIC);
     bytes.extend_from_slice(&size.to_be_bytes());
     bytes.extend_from_slice(identity);
-    bytes.extend_from_slice(&epoch.get().to_be_bytes());
+    bytes.extend_from_slice(&generation.get().to_be_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(capability);
     bytes.extend_from_slice(network_capability);
@@ -1795,8 +1583,4 @@ fn decode_hex(value: &str) -> Result<[u8; 32], AppleError> {
             .map_err(|_| AppleError::Invalid("digest is malformed".into()))?;
     }
     Ok(bytes)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

@@ -28,5 +28,5 @@ jobs:
       - run: npm run build:native
       - run: npm run build:ts
       - run: npm run verify:native
-      - run: cargo test --locked -p sandbox-vm -p sandbox-guest -p sandsurf-workload -p sandsurf-state -p sandsurf-control -p sandsurf-host
-      - run: SANDSURF_KVM_TEST=1 node --test packages/sandbox/test/kvm-environment.test.mjs
+      - run: cargo test --locked -p sandsurf-guest -p sandsurf-state -p sandsurf-host
+      - run: SANDSURF_KVM_TEST=1 node --test packages/sandsurf/test/kvm-environment.test.mjs

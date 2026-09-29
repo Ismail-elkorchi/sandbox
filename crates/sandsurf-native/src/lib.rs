@@ -3,6 +3,7 @@
 //! Native ownership mechanisms shared by the host/guardian and guest bootstrap.
 //! They do not admit authority, launch arbitrary programs, or qualify a VM.
 
+pub mod capacity;
 pub mod guest_channel;
 
 #[cfg(unix)]

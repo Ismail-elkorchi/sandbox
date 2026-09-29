@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-sandbox-digest = { path = "../sandbox-digest" }
+sandsurf-format = { path = "../sandsurf-format" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

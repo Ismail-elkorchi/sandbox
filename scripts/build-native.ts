@@ -8,7 +8,9 @@ import { hydrateImageSources } from "./image-sources.ts";
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await hydrateImageSources();
 
-const debugBuild = process.env.SANDSURF_NATIVE_PROFILE === "debug";
+const buildProfile = process.env.SANDSURF_NATIVE_PROFILE ?? "debug";
+if (buildProfile !== "debug" && buildProfile !== "release") throw new Error("SANDSURF_NATIVE_PROFILE must be debug or release");
+const debugBuild = buildProfile === "debug";
 const requestedTarget = process.env.SANDSURF_NATIVE_TARGET || undefined;
 // An explicit Linux target keeps target-only static-link flags away from host
 // build scripts and proc macros.
@@ -36,7 +38,7 @@ const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linu
 if (["linux", "macos", "windows"].includes(nativePlatform)) {
   buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest(architecture);
 }
-if (nativePlatform === "linux" && !debugBuild && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
+if (nativePlatform === "linux" && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
   const linuxTarget = target ?? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
   buildEnvironment[`CARGO_TARGET_${linuxTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`] = "-C target-feature=+crt-static";
 }
@@ -57,11 +59,14 @@ await replaceArtifact(resolve(
   debugBuild ? "debug" : "release",
   `sandsurf-host${executableSuffix}`,
 ), destination);
-if (nativePlatform === "linux") await assertStaticElf(destination);
+if (nativePlatform === "linux") {
+  await run("strip", ["--strip-debug", destination], {});
+  await assertStaticElf(destination);
+}
 if (nativePlatform === "macos") {
   await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
 }
-const packageNativeRoot = resolve(repository, "packages", "sandbox", "native");
+const packageNativeRoot = resolve(repository, "packages", "sandsurf", "native");
 const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform}-${architecture}`);
 await mkdir(packageDestinationDirectory, { recursive: true });
 await replaceArtifact(destination, resolve(packageDestinationDirectory, destinationName));
@@ -106,7 +111,7 @@ async function writeManifest(root: string): Promise<void> {
 }
 
 async function bundledImageManifestDigest(guestArchitecture: "x64" | "arm64"): Promise<string> {
-  const images = resolve(repository, "packages/sandbox/images");
+  const images = resolve(repository, "packages/sandsurf/images");
   const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
   if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
   const relative = `development-${guestArchitecture}/manifest.json`;

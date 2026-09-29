@@ -9,8 +9,8 @@ use crate::{
     MachineTransition,
 };
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineObservation, MachineState,
-    Qualification, SandboxId, VmEngine, bytes_digest,
+    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineId, MachineObservation,
+    MachineState, Qualification, VmEngine, bytes_digest,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,7 +47,7 @@ pub struct HyperVDisk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HyperVConfig {
-    pub sandbox_id: SandboxId,
+    pub machine_id: MachineId,
     /// Host/store-qualified HCS identity. Callers must not use a process ID or
     /// an unfenced display name here.
     pub vm_id: String,
@@ -96,7 +96,7 @@ pub struct HyperVDriver {
     config: HyperVConfig,
     system: Option<SystemHandle>,
     granted_disks: Vec<PathBuf>,
-    epoch: Option<Counter>,
+    generation: Option<Counter>,
     applied_revision: Option<Counter>,
     capture_paused: bool,
     full_capture_operation: Option<sandsurf_protocol::OperationId>,
@@ -172,7 +172,7 @@ impl HyperVDriver {
             config,
             system: None,
             granted_disks: Vec::new(),
-            epoch: None,
+            generation: None,
             applied_revision: None,
             capture_paused: false,
             full_capture_operation: None,
@@ -237,28 +237,26 @@ impl HyperVDriver {
         Ok(())
     }
 
-    pub fn resume_public_pause_for_capture(&mut self) -> Result<(), HyperVOperationError> {
-        if self.capture_paused {
+    /// Adopt an already published native pause without executing guest code.
+    pub fn adopt_pause_for_capture(&mut self) -> Result<(), HyperVOperationError> {
+        if self.system.is_none() {
             return Err(HyperVOperationError::DispatchRejected);
         }
-        self.run_operation("hcs-public-pause-capture-resume", |system, operation| {
-            // SAFETY: live owned handles and a bounded empty options document.
-            unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }
-        })
-        .map(drop)
-        .map_err(HyperVOperationError::from)
+        self.capture_paused = true;
+        Ok(())
     }
 
-    pub fn restore_public_pause_after_capture(&mut self) -> Result<(), HyperVOperationError> {
-        if self.capture_paused {
-            return Err(HyperVOperationError::DispatchRejected);
+    /// Finish a capture without silently resuming a publicly paused machine.
+    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), HyperVOperationError> {
+        self.capture_paused = false;
+        self.full_capture_operation = None;
+        self.committed_suspend = None;
+        if let Some(path) = self.full_capture_state.take() {
+            if !self.revoke_path_access(&path) {
+                return Err(HyperVOperationError::OutcomeUnknown);
+            }
         }
-        self.run_operation("hcs-public-pause-restore", |system, operation| {
-            // SAFETY: live owned handles and a bounded empty options document.
-            unsafe { HcsPauseComputeSystem(system, operation, wide("{}").as_ptr()) }
-        })
-        .map(drop)
-        .map_err(HyperVOperationError::from)
+        Ok(())
     }
 
     pub fn save_full_state(
@@ -352,15 +350,27 @@ impl HyperVDriver {
     fn create_and_start(
         &mut self,
         command: &LifecycleCommand,
-        epoch: Counter,
+        generation: Counter,
         restore_state: Option<&Path>,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         if self.system.is_some() {
             return MachineOutcome::Unknown;
         }
+        let resources = &command.configuration.resources;
+        if restore_state.is_some()
+            && (resources.memory_mib.get() != self.config.memory_mib
+                || resources.vcpus.get() != u64::from(self.config.vcpus))
+        {
+            return self.unavailable(b"hyper-v-restore-geometry-mismatch");
+        }
+        let Ok(vcpus) = u32::try_from(resources.vcpus.get()) else {
+            return self.unavailable(b"hyper-v-vcpu-overflow");
+        };
+        self.config.memory_mib = resources.memory_mib.get();
+        self.config.vcpus = vcpus;
         if let Err(disposition) = self.grant_disk_access() {
             return disposition;
         }
@@ -417,7 +427,7 @@ impl HyperVDriver {
             self.contain_uncertain_machine();
             return MachineOutcome::Unknown;
         }
-        self.epoch = Some(epoch);
+        self.generation = Some(generation);
         self.applied_revision = Some(command.revision);
         self.capture_paused = false;
         self.full_capture_operation = None;
@@ -427,13 +437,13 @@ impl HyperVDriver {
             MachineOutcome::Observed(vec![
                 transition(
                     command,
-                    epoch,
+                    generation,
                     MachineState::Restoring,
                     b"hcs-restore-create-complete",
                 ),
                 transition(
                     command,
-                    epoch,
+                    generation,
                     MachineState::Running,
                     b"hcs-restore-start-complete",
                 ),
@@ -442,11 +452,16 @@ impl HyperVDriver {
             MachineOutcome::Observed(vec![
                 transition(
                     command,
-                    epoch,
+                    generation,
                     MachineState::Creating,
                     b"hcs-create-complete",
                 ),
-                transition(command, epoch, MachineState::Running, b"hcs-start-complete"),
+                transition(
+                    command,
+                    generation,
+                    MachineState::Running,
+                    b"hcs-start-complete",
+                ),
             ])
         }
     }
@@ -689,7 +704,15 @@ impl MachineDriver for HyperVDriver {
         current: &MachineObservation,
     ) -> ConfigurationOutcome {
         let live = matches!(current.state, MachineState::Running | MachineState::Paused);
-        if command.sandbox_id != self.config.sandbox_id
+        if live
+            && (command.configuration.resources.memory_mib.get() != self.config.memory_mib
+                || command.configuration.resources.vcpus.get() != u64::from(self.config.vcpus))
+        {
+            return ConfigurationOutcome::NotApplied(bytes_digest(
+                b"live-machine-geometry-change-unsupported",
+            ));
+        }
+        if command.machine_id != self.config.machine_id
             || self.applied_revision != Some(current.applied_revision)
             || command.revision <= current.applied_revision
             || live != self.system.is_some()
@@ -720,8 +743,8 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         if self.system.is_none()
             || self.applied_revision != Some(current.applied_revision)
@@ -732,7 +755,7 @@ impl MachineDriver for HyperVDriver {
         self.applied_revision = Some(command.revision);
         MachineOutcome::Observed(vec![transition(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Running,
             b"hcs-already-running",
         )])
@@ -743,10 +766,10 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
-        self.create_and_start(command, epoch, None)
+        self.create_and_start(command, generation, None)
     }
 
     fn pause(
@@ -754,8 +777,8 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         match self.run_operation("hcs-pause", |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
@@ -764,7 +787,7 @@ impl MachineDriver for HyperVDriver {
         }) {
             Ok(_) => MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Paused,
                 b"hcs-pause-complete",
             )]),
@@ -780,8 +803,8 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         match self.run_operation("hcs-resume", |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
@@ -790,7 +813,7 @@ impl MachineDriver for HyperVDriver {
         }) {
             Ok(_) => MachineOutcome::Observed(vec![transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Running,
                 b"hcs-resume-complete",
             )]),
@@ -806,7 +829,7 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id
+        if command.machine_id != self.config.machine_id
             || !self.capture_paused
             || self.full_capture_operation.is_none()
             || self.committed_suspend.is_none()
@@ -830,7 +853,7 @@ impl MachineDriver for HyperVDriver {
         self.full_capture_state = None;
         MachineOutcome::Observed(vec![transition_with_digest(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Suspended,
             b"hcs-saved-state-committed-and-system-released",
             &manifest,
@@ -842,23 +865,23 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id || self.system.is_some() {
+        if command.machine_id != self.config.machine_id || self.system.is_some() {
             return self.unavailable(b"hyper-v-restore-state-mismatch");
         }
         let Some(source) = self.staged_restore.take() else {
             return self.unavailable(b"hyper-v-restore-not-staged");
         };
-        let Ok(epoch) = current.epoch.next() else {
+        let Ok(generation) = current.generation.next() else {
             return MachineOutcome::Unknown;
         };
         let manifest = source.manifest_digest.clone();
-        let mut outcome = self.create_and_start(command, epoch, Some(&source.saved_state));
+        let mut outcome = self.create_and_start(command, generation, Some(&source.saved_state));
         if let MachineOutcome::Observed(values) = &mut outcome
             && let Some(last) = values.last_mut()
         {
             last.evidence_digest = transition_with_digest(
                 command,
-                epoch,
+                generation,
                 MachineState::Running,
                 b"hcs-restored-state-running",
                 &manifest,
@@ -869,15 +892,15 @@ impl MachineDriver for HyperVDriver {
     }
 
     fn stop(&mut self, command: &LifecycleCommand, current: &MachineObservation) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         if !self.terminate_and_release() {
             return MachineOutcome::Unknown;
         }
         MachineOutcome::Observed(vec![transition(
             command,
-            current.epoch,
+            current.generation,
             MachineState::Stopped,
             b"hcs-exit-confirmed",
         )])
@@ -888,8 +911,8 @@ impl MachineDriver for HyperVDriver {
         command: &LifecycleCommand,
         current: &MachineObservation,
     ) -> MachineOutcome {
-        if command.sandbox_id != self.config.sandbox_id {
-            return self.unavailable(b"hyper-v-sandbox-identity-mismatch");
+        if command.machine_id != self.config.machine_id {
+            return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
         if !self.terminate_and_release() {
             return MachineOutcome::Unknown;
@@ -897,13 +920,13 @@ impl MachineDriver for HyperVDriver {
         MachineOutcome::Observed(vec![
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroying,
                 b"hcs-destroying",
             ),
             transition(
                 command,
-                current.epoch,
+                current.generation,
                 MachineState::Destroyed,
                 b"hcs-exit-and-access-revocation-confirmed",
             ),
@@ -992,7 +1015,7 @@ fn qualification(evidence: Option<Digest>, reason: &str) -> Qualification {
 
 fn transition(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     native_evidence: &[u8],
 ) -> MachineTransition {
@@ -1000,7 +1023,7 @@ fn transition(
     evidence.extend_from_slice(native_evidence);
     evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
     MachineTransition {
-        epoch,
+        generation,
         state,
         evidence_digest: bytes_digest(&evidence),
     }
@@ -1008,7 +1031,7 @@ fn transition(
 
 fn transition_with_digest(
     command: &LifecycleCommand,
-    epoch: Counter,
+    generation: Counter,
     state: MachineState,
     native_evidence: &[u8],
     bound: &Digest,
@@ -1018,7 +1041,7 @@ fn transition_with_digest(
     evidence.extend_from_slice(command.request_digest.as_str().as_bytes());
     evidence.extend_from_slice(bound.as_str().as_bytes());
     MachineTransition {
-        epoch,
+        generation,
         state,
         evidence_digest: bytes_digest(&evidence),
     }
@@ -1203,13 +1226,13 @@ mod tests {
 
     fn config() -> HyperVConfig {
         HyperVConfig {
-            sandbox_id: SandboxId::try_from("box").unwrap(),
+            machine_id: MachineId::try_from("box").unwrap(),
             vm_id: "da57a1f0-3ca8-4f20-9802-21e8df32a9b1".to_owned(),
             guest_architecture: GuestArchitecture::Amd64,
             memory_mib: 2048,
             vcpus: 2,
             kernel: PathBuf::from(r"C:\Sandsurf\kernel"),
-            command_line: "console=ttyS0 root=/dev/sda ro init=/sbin/sandbox-guest".into(),
+            command_line: "console=ttyS0 root=/dev/sda ro init=/sbin/sandsurf-guest".into(),
             disks: vec![HyperVDisk {
                 path: PathBuf::from(r"C:\Sandsurf\box\boot.vhdx"),
                 read_only: false,
@@ -1286,7 +1309,7 @@ mod tests {
     #[test]
     fn emits_bound_save_and_restore_documents() {
         let driver = HyperVDriver::new(config()).unwrap();
-        let restore = Path::new(r"C:\Sandsurf\checkpoint.vmrs");
+        let restore = Path::new(r"C:\Sandsurf\snapshot.vmrs");
         let value = serde_json::to_value(driver.hcs_configuration(Some(restore))).unwrap();
         assert_eq!(
             value["VirtualMachine"]["RestoreState"]["SaveStateFilePath"],

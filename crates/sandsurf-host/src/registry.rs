@@ -8,7 +8,7 @@
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
-use sandbox_image::oci::{ConversionLimits, GuestPlatform};
+use sandsurf_image::oci::{ConversionLimits, GuestPlatform};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -85,14 +85,22 @@ struct RegistryReference {
     expected_digest: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Credential {
+    registry_origin: String,
+    token_origins: Vec<String>,
+    authentication: Authentication,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-enum Credential {
+enum Authentication {
     Basic { username: String, password: String },
     Bearer { token: String },
 }
 
-impl Drop for Credential {
+impl Drop for Authentication {
     fn drop(&mut self) {
         match self {
             Self::Basic { username, password } => {
@@ -191,11 +199,22 @@ pub fn fetch_layout(
     }
     let reference = parse_reference(reference)?;
     let credential = credential.map(parse_credential).transpose()?;
+    if let Some(credential) = &credential {
+        let expected = reqwest::Url::parse(&format!("https://{}", reference.registry))
+            .map_err(|_| RegistryError::Invalid("registry origin is malformed".into()))?;
+        if parse_origin(&credential.registry_origin)?.origin() != expected.origin() {
+            return Err(RegistryError::Rejected(
+                "credential is not authorized for this registry origin".into(),
+            ));
+        }
+    }
     prepare_directory(cas_root)?;
     prepare_empty_directory(destination)?;
     prepare_directory(&destination.join("blobs"))?;
     prepare_directory(&destination.join("blobs/sha256"))?;
     let client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(300))
         .user_agent(USER_AGENT)
@@ -461,9 +480,17 @@ impl RegistryClient {
         }
         if let Some(token) = &self.bearer {
             request = request.bearer_auth(token.as_str());
-        } else if let Some(Credential::Bearer { token }) = &self.credential {
+        } else if let Some(Authentication::Bearer { token }) = self
+            .credential
+            .as_ref()
+            .map(|credential| &credential.authentication)
+        {
             request = request.bearer_auth(token);
-        } else if let Some(Credential::Basic { username, password }) = &self.credential {
+        } else if let Some(Authentication::Basic { username, password }) = self
+            .credential
+            .as_ref()
+            .map(|credential| &credential.authentication)
+        {
             request = request.basic_auth(username, Some(password));
         }
         Ok(request.send()?)
@@ -472,8 +499,12 @@ impl RegistryClient {
     fn authorize(&mut self, challenge: &str) -> Result<(), RegistryError> {
         let (scheme, fields) = parse_challenge(challenge)?;
         if scheme.eq_ignore_ascii_case("basic") {
-            return match self.credential {
-                Some(Credential::Basic { .. }) => Ok(()),
+            return match self
+                .credential
+                .as_ref()
+                .map(|credential| &credential.authentication)
+            {
+                Some(Authentication::Basic { .. }) => Ok(()),
                 _ => Err(RegistryError::Rejected(
                     "registry requires a basic credential".into(),
                 )),
@@ -494,25 +525,41 @@ impl RegistryClient {
             || realm_url.username() != ""
             || realm_url.password().is_some()
             || realm_url.fragment().is_some()
+            || realm_url.query().is_some()
         {
             return Err(RegistryError::Invalid(
-                "bearer realm must be an HTTPS URL without embedded credentials or fragment".into(),
+                "bearer realm must be HTTPS without embedded credentials, query or fragment".into(),
             ));
+        }
+        if let Some(credential) = &self.credential {
+            require_token_origin(credential, &realm_url)?;
         }
         if let Some(service) = fields.get("service") {
             require_auth_field(service)?;
             realm_url.query_pairs_mut().append_pair("service", service);
         }
-        let scope = fields
+        let scope = format!("repository:{}:pull", self.reference.repository);
+        if fields
             .get("scope")
-            .cloned()
-            .unwrap_or_else(|| format!("repository:{}:pull", self.reference.repository));
-        require_auth_field(&scope)?;
+            .is_some_and(|requested| requested != &scope)
+        {
+            return Err(RegistryError::Rejected(
+                "registry requested broader credential scope than the approved pull".into(),
+            ));
+        }
         realm_url.query_pairs_mut().append_pair("scope", &scope);
         let mut request = self.client.get(realm_url);
-        if let Some(Credential::Basic { username, password }) = &self.credential {
+        if let Some(Authentication::Basic { username, password }) = self
+            .credential
+            .as_ref()
+            .map(|credential| &credential.authentication)
+        {
             request = request.basic_auth(username, Some(password));
-        } else if let Some(Credential::Bearer { token }) = &self.credential {
+        } else if let Some(Authentication::Bearer { token }) = self
+            .credential
+            .as_ref()
+            .map(|credential| &credential.authentication)
+        {
             request = request.bearer_auth(token);
         }
         let response = require_success(request.send()?)?;
@@ -593,8 +640,15 @@ fn parse_credential(bytes: &[u8]) -> Result<Credential, RegistryError> {
     }
     let value: Credential = serde_json::from_slice(bytes)
         .map_err(|_| RegistryError::Invalid("registry credential encoding is invalid".into()))?;
-    match &value {
-        Credential::Basic { username, password }
+    parse_origin(&value.registry_origin)?;
+    if value.token_origins.len() > 16 {
+        return Err(RegistryError::Limit("credential token origins"));
+    }
+    for origin in &value.token_origins {
+        parse_origin(origin)?;
+    }
+    match &value.authentication {
+        Authentication::Basic { username, password }
             if username.is_empty()
                 || username.len() > 4096
                 || password.is_empty()
@@ -606,7 +660,7 @@ fn parse_credential(bytes: &[u8]) -> Result<Credential, RegistryError> {
                 "registry basic credential is malformed".into(),
             ))
         }
-        Credential::Bearer { token }
+        Authentication::Bearer { token }
             if token.is_empty()
                 || token.len() > 64 * 1024
                 || token.contains(['\0', '\r', '\n']) =>
@@ -617,6 +671,38 @@ fn parse_credential(bytes: &[u8]) -> Result<Credential, RegistryError> {
         }
         _ => Ok(value),
     }
+}
+
+fn parse_origin(value: &str) -> Result<reqwest::Url, RegistryError> {
+    if value.len() > 4096 {
+        return Err(RegistryError::Limit("credential origin"));
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| RegistryError::Invalid("credential origin is malformed".into()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(RegistryError::Invalid(
+            "credential audience must be an HTTPS origin, not a URL path".into(),
+        ));
+    }
+    Ok(url)
+}
+
+fn require_token_origin(credential: &Credential, url: &reqwest::Url) -> Result<(), RegistryError> {
+    for origin in &credential.token_origins {
+        if parse_origin(origin)?.origin() == url.origin() {
+            return Ok(());
+        }
+    }
+    Err(RegistryError::Rejected(
+        "credential is not authorized for this token-service origin".into(),
+    ))
 }
 
 fn parse_challenge(value: &str) -> Result<(&str, BTreeMap<String, String>), RegistryError> {
@@ -1196,17 +1282,38 @@ mod tests {
     }
 
     #[test]
-    fn credentials_have_an_explicit_non_ambient_encoding() {
+    fn credentials_have_explicit_registry_and_token_audiences() {
+        let credential = parse_credential(br#"{"registryOrigin":"https://registry.example","tokenOrigins":["https://auth.example"],"authentication":{"kind":"basic","username":"agent","password":"secret"}}"#).unwrap();
         assert!(matches!(
+            credential.authentication,
+            Authentication::Basic { .. }
+        ));
+        assert!(
+            require_token_origin(
+                &credential,
+                &reqwest::Url::parse("https://auth.example/token").unwrap()
+            )
+            .is_ok()
+        );
+        for url in [
+            "https://attacker.example/token",
+            "https://auth.example:444/token",
+            "https://auth.example.attacker/token",
+        ] {
+            assert!(require_token_origin(&credential, &reqwest::Url::parse(url).unwrap()).is_err());
+        }
+        assert!(
             parse_credential(br#"{"kind":"basic","username":"agent","password":"secret"}"#)
-                .unwrap(),
-            Credential::Basic { .. }
-        ));
-        assert!(matches!(
-            parse_credential(br#"{"kind":"bearer","token":"opaque"}"#).unwrap(),
-            Credential::Bearer { .. }
-        ));
-        assert!(parse_credential(br#"{"username":"ambient"}"#).is_err());
+                .is_err()
+        );
+        for url in [
+            "http://registry.example",
+            "https://registry.example/path",
+            "https://user@registry.example",
+            "https://registry.example?scope=all",
+        ] {
+            assert!(parse_origin(url).is_err());
+        }
     }
 
     #[test]
@@ -1232,7 +1339,7 @@ mod tests {
             ConversionLimits::default(),
         )
         .unwrap();
-        sandbox_image::oci::OciLayout::open(&layout, ConversionLimits::default())
+        sandsurf_image::oci::OciLayout::open(&layout, ConversionLimits::default())
             .unwrap()
             .resolve(&GuestPlatform {
                 architecture: std::env::consts::ARCH

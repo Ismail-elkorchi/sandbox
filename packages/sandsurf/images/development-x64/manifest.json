@@ -1,0 +1,63 @@
+{
+  "formatVersion": 3,
+  "id": "sandsurf-development",
+  "version": "3.24.2",
+  "architecture": "x64",
+  "bootBundle": {
+    "kernel": {
+      "path": "vmlinux-6.18.41",
+      "sha256": "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5"
+    },
+    "guestAgent": {
+      "version": "0.1.0",
+      "protocolMajor": 4,
+      "protocolMinor": 0,
+      "sha256": "31894cb4121d1c720bccb3ba885124740c18f31cae920f1b3fbea57221ca9f9d"
+    },
+    "capabilities": {
+      "overlayfs": true,
+      "vsock": true,
+      "seccomp": true,
+      "cgroupV2": true,
+      "devpts": true
+    }
+  },
+  "system": {
+    "rootfs": {
+      "path": "system.ext4",
+      "sha256": "56b88b89593ff68859309a68d31ed86997c6df18033abf30ce7330cad88eb9df",
+      "format": "ext4"
+    },
+    "defaults": {
+      "environment": {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      },
+      "user": "agent",
+      "workingDirectory": "/home/agent"
+    },
+    "provenance": {
+      "kind": "source-built",
+      "sourceDigest": "098436f65ea1673082ada5cee9d4f00322841fd17884af6eb4735e16b0010e64",
+      "materials": {
+        "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
+        "alpine-packages": "ccccec8ae4a7bb3800e23509667a979a37de313afa9a71f87f20157ff1b8d6b3",
+        "sandsurf-ext4-builder": "d3e9b3804eadd70b71d2084236655d7963f579fc10943ff74b163b58e3ce75ac",
+        "sandsurf-system-recipe": "6e4068c95c6b3753beb037e602cbf9abb1183dbbbb34e2b70d75f0986e228ee2",
+        "sandsurf-management": "31894cb4121d1c720bccb3ba885124740c18f31cae920f1b3fbea57221ca9f9d"
+      }
+    }
+  },
+  "platformArtifacts": {
+    "windowsX64": {
+      "kernel": {
+        "path": "hyperv-vmlinuz-6.18.41",
+        "sha256": "bdb750c617bf47fc893c9ee849e82b4b3bc0287d693195b58bd3fa1c4c8936b5"
+      },
+      "system": {
+        "path": "system.vhdx",
+        "sha256": "208e2e9663768b7fa8e19825ff670442acfa1ebdb9ceff30606f0fb61cb52f90"
+      }
+    }
+  },
+  "signature": null
+}

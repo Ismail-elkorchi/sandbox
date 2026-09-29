@@ -1,9 +1,9 @@
 node_modules/
 target/
-packages/sandbox/dist/
-packages/sandbox/images/development-*/*.ext4
-packages/sandbox-hardware-vm/dist/
-native/*/sandbox-runtime-*
+packages/sandsurf/dist/
+packages/sandsurf/images/development-*/*.ext4
+native/*/sandsurf-host-*
+native/*/sandsurf-vz-helper-*
 native/manifest.json
 release/
 fuzz/artifacts/

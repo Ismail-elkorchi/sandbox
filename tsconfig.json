@@ -1,6 +1,6 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/sandbox" }
+    { "path": "./packages/sandsurf" }
   ]
 }

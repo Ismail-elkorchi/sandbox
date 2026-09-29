@@ -1,18 +1,22 @@
 #![deny(unsafe_code)]
 
-mod checkpoint;
+mod binary;
 mod environment;
 mod frame;
 mod guest;
+mod ports;
 mod session;
+mod snapshot;
 mod types;
 
-pub use checkpoint::*;
+pub use binary::*;
 pub use environment::*;
 pub use frame::*;
 pub use guest::*;
-pub use sandbox_digest::SandsurfDomain as Domain;
+pub use ports::*;
+pub use sandsurf_format::SandsurfDomain as Domain;
 pub use session::*;
+pub use snapshot::*;
 pub use types::*;
 
 use serde::Serialize;
@@ -30,7 +34,7 @@ impl fmt::Display for Invalid {
 impl std::error::Error for Invalid {}
 
 pub fn digest<T: Serialize>(domain: Domain, value: &T) -> Result<Digest, Invalid> {
-    sandbox_digest::sandsurf_digest(domain, value)
+    sandsurf_format::sandsurf_digest(domain, value)
         .map_err(|_| Invalid("non-canonical digest input"))?
         .try_into()
 }
@@ -43,9 +47,9 @@ pub fn bytes_digest(bytes: &[u8]) -> Digest {
 /// Establish the content-chain identity for one process before any bytes are
 /// retained. Guest and guardian both use this exact boundary contract.
 pub fn initial_output_boundary(
-    sandbox: &SandboxId,
-    process: &ProcessId,
-    epoch: Counter,
+    machine: &MachineId,
+    process: &ExecutionId,
+    generation: Counter,
 ) -> Result<OutputBoundary, Invalid> {
     Ok(OutputBoundary {
         final_cursor: Counter::ZERO,
@@ -54,7 +58,7 @@ pub fn initial_output_boundary(
         stderr_bytes: Counter::ZERO,
         terminal_bytes: Counter::ZERO,
         omitted_bytes: Counter::ZERO,
-        final_hash: digest(Domain::Output, &(sandbox, process, epoch))?,
+        final_hash: digest(Domain::Output, &(machine, process, generation))?,
     })
 }
 

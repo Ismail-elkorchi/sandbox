@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Do not open a public issue for a suspected sandbox escape, host-data exposure, process-lifecycle failure, integrity bypass, or other security vulnerability.
+Do not open a public issue for a suspected machine escape, host-data exposure, process-lifecycle failure, integrity bypass, or other security vulnerability.
 
 Use GitHub's private vulnerability reporting for this repository:
 
@@ -14,6 +14,10 @@ Avoid including real credentials or unrelated host data. A minimal reproducer an
 
 ## Scope and claims
 
-The stable Linux namespace implementation is intended for serious local isolation when its functional probe and exact request evaluation succeed. The Windows, macOS, and Firecracker implementations are experimental. No version is claimed suitable for hostile multi-tenant workloads until an external security review is completed with its scope, findings, and tested versions published.
+Sandsurf's security boundary is hardware virtualization: Firecracker/KVM on Linux, Apple Virtualization on macOS, and Hyper-V on Windows. Linux namespaces confine the host-side VMM; they are not an alternative guest execution backend. Native availability and real-hardware qualification are different properties. Consult host inspection for the qualification of the actual build and configuration. No version is claimed suitable for hostile multi-tenant workloads without a scoped external security review.
 
-Security reports are evaluated against the guarantee vocabulary and caveats returned in each run's enforcement report. Behavior already reported as an unsatisfied guarantee or explicit caveat may still be a useful hardening report, but it is not a boundary violation.
+The Linux guest administrator may change or remove guest management software, kill execution keepers, modify its files and copy disclosed credentials. Guest reports, process receipts and guest-held authentication keys do not attest to guest integrity. Native machine observations must not infer shutdown from an unavailable management service.
+
+Host-owned authority covers lifecycle intent, limits, externally enforced networking, storage and retained artifacts/output. A receipt acknowledgement is not application acceptance or permission to delete output. Release requires complete durable capture, continuing retention of actual bytes, or explicit loss authorization. Secret revocation prevents future authorized delivery; it does not prove erasure inside a root-controlled guest or its snapshots.
+
+The breaking redesign remains under development. Native NIC enforcement, recoverable storage ownership and lineage-safe full-state restore are not yet qualified. Report suspected boundary failures even when a capability is marked unqualified, including the host/guest versions and the returned observations.

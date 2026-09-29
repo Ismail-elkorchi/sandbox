@@ -21,9 +21,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             frame.write(&mut std::io::stdout())?;
         }
-        "mutation" => {
-            let value: Mutation = serde_json::from_slice(&bytes)?;
+        "command" => {
+            let value: GuestCommand = serde_json::from_slice(&bytes)?;
             value.validate()?;
+            serde_json::to_writer(std::io::stdout(), &value)?;
+        }
+        "admission" => {
+            let mut value: RequestEnvelope<GuestCommand> = serde_json::from_slice(&bytes)?;
+            value.validate_admission()?;
             serde_json::to_writer(std::io::stdout(), &value)?;
         }
         "release" => {
@@ -36,14 +41,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "digest" => {
             let domain = match arguments.get(2).map(String::as_str) {
-                Some("sandbox") => Domain::Sandbox,
-                Some("grant") => Domain::Grant,
+                Some("machine") => Domain::Machine,
+                Some("authority") => Domain::Authority,
                 Some("operation") => Domain::Operation,
                 Some("receipt") => Domain::Receipt,
                 Some("output") => Domain::Output,
                 Some("release") => Domain::Release,
                 Some("image") => Domain::Image,
-                Some("checkpoint") => Domain::Checkpoint,
+                Some("snapshot") => Domain::Snapshot,
                 Some("transfer") => Domain::Transfer,
                 Some("network") => Domain::Network,
                 Some("secret") => Domain::Secret,

@@ -1,0 +1,1845 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+
+mod namespace;
+
+pub use namespace::{NamespaceLauncher, namespace_probe_main, vmm_isolated_main};
+
+use sandsurf_native::linux::{
+    bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::mem::{self, MaybeUninit};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::ptr;
+use std::time::{Duration, Instant};
+
+const MAX_INTERNAL_MESSAGE: usize = 1024 * 1024;
+const INTERNAL_TERMINATE: u8 = 4;
+const INTERNAL_STARTED: u8 = 101;
+const INTERNAL_SETUP_ERROR: u8 = 102;
+const INTERNAL_EXIT: u8 = 103;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VmmMachineSpec {
+    pub launcher_fd_index: usize,
+    pub mounts: Vec<MountSpec>,
+    pub firecracker_fd_index: usize,
+    pub firecracker_identity: FileIdentity,
+    pub firecracker_sha256: String,
+    pub state_directory_fd_index: usize,
+    pub state_directory_identity: FileIdentity,
+    pub args: Vec<String>,
+    pub open_files_limit: u64,
+    pub file_size_limit: u64,
+    pub termination_grace_ms: u64,
+}
+
+/// Fixed launch contract for one Firecracker VMM. Callers cannot select
+/// arbitrary executable arguments, environment, mount targets,
+/// network modes, or host paths. Descriptor identities are revalidated inside
+/// the confined launcher immediately before exec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VmmLaunchSpec {
+    pub namespace_launcher_fd_index: usize,
+    pub firecracker_fd_index: usize,
+    pub firecracker_identity: FileIdentity,
+    pub firecracker_sha256: String,
+    pub kernel_fd_index: usize,
+    pub system_fd_index: usize,
+    pub authentication_fd_index: usize,
+    pub configuration_fd_index: usize,
+    /// Present only when a fresh Firecracker process is started for snapshot
+    /// loading. These files are mounted read-only at fixed paths and remain
+    /// pinned for the VMM lifetime; Firecracker maps the memory file lazily.
+    pub snapshot_state_fd_index: Option<usize>,
+    pub snapshot_memory_fd_index: Option<usize>,
+    pub state_directory_fd_index: usize,
+    pub state_directory_identity: FileIdentity,
+    pub kvm_fd_index: usize,
+    pub open_files_limit: u64,
+    pub file_size_limit: u64,
+    pub termination_grace_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MountSpec {
+    pub fd_index: usize,
+    pub target_path: String,
+    pub kind: String,
+    pub read_only: bool,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LauncherStarted {
+    pub host_pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LauncherSetupError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LauncherFinalStatus {
+    pub raw_wait_status: i32,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub core_dumped: bool,
+    pub cleanup_failures: Vec<String>,
+    pub tree_reaped: bool,
+}
+
+#[derive(Debug)]
+pub enum LauncherEvent {
+    Final(LauncherFinalStatus),
+    RuntimeError(LauncherSetupError),
+}
+
+#[derive(Debug)]
+pub enum LauncherStatus {
+    Started(LauncherStarted),
+    SetupError(LauncherSetupError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelProbeResult {
+    pub mechanisms: BTreeMap<String, ProbeOutcome>,
+    pub landlock_abi: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeOutcome {
+    pub state: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<ProbeOsError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeOsError {
+    pub code: u32,
+    pub name: String,
+}
+
+pub fn probe_main() -> i32 {
+    let result = run_kernel_probe();
+    match serde_json::to_string(&result) {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(error) => {
+            eprintln!("probe serialization failed: {error}");
+            1
+        }
+    }
+}
+
+fn run_kernel_probe() -> KernelProbeResult {
+    let mut mechanisms = BTreeMap::new();
+    let mut landlock_version = 0;
+    let namespace = namespace::probe(false);
+    let network = namespace::probe(true);
+    mechanisms.insert("namespace-launcher".into(), namespace);
+    mechanisms.insert("network-namespace".into(), network);
+    match probe_landlock_enforcement() {
+        Ok(abi) => {
+            landlock_version = abi;
+            mechanisms.insert(
+                "landlock".into(),
+                available(
+                    "landlock_restrict_self",
+                    &format!("ABI {abi}; allowed read succeeded and denied read returned EACCES"),
+                ),
+            );
+        }
+        Err(error) => {
+            mechanisms.insert(
+                "landlock".into(),
+                probe_outcome("landlock_restrict_self", Err(error)),
+            );
+        }
+    }
+    // SAFETY: PR_SET_NO_NEW_PRIVS accepts scalar arguments and monotonically restricts this probe process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        mechanisms.insert(
+            "seccomp".into(),
+            unavailable("prctl(PR_SET_NO_NEW_PRIVS)", &io::Error::last_os_error()),
+        );
+    } else {
+        match apply_seccomp() {
+            Ok(()) => {
+                // SAFETY: PR_GET_SECCOMP has no pointer arguments and returns the active mode.
+                let mode = unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) };
+                mechanisms.insert(
+                    "seccomp".into(),
+                    if mode == 2 {
+                        available(
+                            "prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)",
+                            "filter mode is active",
+                        )
+                    } else {
+                        ProbeOutcome {
+                            state: "error".into(),
+                            operation: "prctl(PR_GET_SECCOMP)".into(),
+                            os_error: None,
+                            detail: Some(format!("unexpected seccomp mode {mode}")),
+                        }
+                    },
+                );
+            }
+            Err(error) => {
+                mechanisms.insert(
+                    "seccomp".into(),
+                    probe_outcome("install seccomp filter", Err(error)),
+                );
+            }
+        }
+    }
+    KernelProbeResult {
+        mechanisms,
+        landlock_abi: landlock_version,
+    }
+}
+
+fn available(operation: &str, detail: &str) -> ProbeOutcome {
+    ProbeOutcome {
+        state: "available".into(),
+        operation: operation.into(),
+        os_error: None,
+        detail: Some(detail.chars().take(1024).collect()),
+    }
+}
+
+fn unavailable(operation: &str, error: &io::Error) -> ProbeOutcome {
+    ProbeOutcome {
+        state: "unavailable".into(),
+        operation: operation.into(),
+        os_error: error.raw_os_error().and_then(|code| {
+            u32::try_from(code).ok().map(|code| ProbeOsError {
+                code,
+                name: format!("{:?}", error.kind()),
+            })
+        }),
+        detail: Some(error.to_string().chars().take(1024).collect()),
+    }
+}
+
+fn probe_outcome(operation: &str, result: io::Result<()>) -> ProbeOutcome {
+    match result {
+        Ok(()) => available(operation, "operation succeeded"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) || matches!(
+                error.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+            ) =>
+        {
+            unavailable(operation, &error)
+        }
+        Err(error) => ProbeOutcome {
+            state: "error".into(),
+            operation: operation.into(),
+            os_error: error.raw_os_error().and_then(|code| {
+                u32::try_from(code).ok().map(|code| ProbeOsError {
+                    code,
+                    name: format!("{:?}", error.kind()),
+                })
+            }),
+            detail: Some(error.to_string().chars().take(1024).collect()),
+        },
+    }
+}
+
+fn probe_landlock_enforcement() -> io::Result<u32> {
+    let abi = landlock_abi()?;
+    if abi < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Landlock ABI {abi} lacks truncate mediation"),
+        ));
+    }
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let handled = LL_READ_FILE;
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: handled,
+        handled_access_net: 0,
+        scoped: 0,
+    };
+    // SAFETY: attr is initialized and the exact C layout size is passed.
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr,
+            mem::size_of::<LandlockRulesetAttr>(),
+            0,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: create_ruleset returned a new owned descriptor.
+    let ruleset = unsafe { File::from_raw_fd(ruleset_fd as RawFd) };
+    add_landlock_rule(&ruleset, &executable, LL_READ_FILE)?;
+    // SAFETY: no_new_privs takes scalar arguments and monotonically restricts this process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: ruleset is a live Landlock ruleset and flags must be zero.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    File::open(executable)?;
+    match File::open("/proc/self/status") {
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => Ok(abi),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::other(
+            "Landlock denied-read check unexpectedly succeeded",
+        )),
+    }
+}
+
+pub fn send_vmm_launch_spec(
+    stream: &mut UnixStream,
+    spec: &VmmLaunchSpec,
+    files: &[File],
+) -> io::Result<()> {
+    let payload = serde_json::to_vec(spec).map_err(invalid_data)?;
+    if payload.len() > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VMM launcher request is too large",
+        ));
+    }
+    send_fds(
+        stream.as_raw_fd(),
+        u32::try_from(payload.len()).map_err(invalid_data)?,
+        files,
+    )?;
+    stream.write_all(&payload)
+}
+
+pub fn send_launcher_terminate(stream: &mut UnixStream) -> io::Result<()> {
+    write_internal(stream, INTERNAL_TERMINATE, &[])
+}
+
+pub fn read_launcher_status(stream: &mut UnixStream) -> io::Result<LauncherStatus> {
+    let (kind, payload) = read_internal(stream)?;
+    match kind {
+        INTERNAL_STARTED => serde_json::from_slice(&payload)
+            .map(LauncherStatus::Started)
+            .map_err(invalid_data),
+        INTERNAL_SETUP_ERROR => serde_json::from_slice(&payload)
+            .map(LauncherStatus::SetupError)
+            .map_err(invalid_data),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unknown launcher status",
+        )),
+    }
+}
+
+/// Incrementally reads the final launcher event. A deadline never discards a
+/// partial frame, so a guardian can retain its VMM owner and retry observation.
+#[derive(Default)]
+pub struct LauncherEventReader {
+    buffer: Vec<u8>,
+}
+
+impl LauncherEventReader {
+    pub fn read(
+        &mut self,
+        stream: &mut UnixStream,
+        timeout: Duration,
+    ) -> io::Result<LauncherEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.buffer.len() >= 5 {
+                let length = u32::from_be_bytes(self.buffer[1..5].try_into().expect("header bound"))
+                    as usize;
+                if length > MAX_INTERNAL_MESSAGE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "launcher event too large",
+                    ));
+                }
+                if self.buffer.len() >= 5 + length {
+                    if self.buffer.len() != 5 + length {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "multiple launcher events",
+                        ));
+                    }
+                    let event = match self.buffer[0] {
+                        INTERNAL_EXIT => serde_json::from_slice(&self.buffer[5..])
+                            .map(LauncherEvent::Final)
+                            .map_err(invalid_data),
+                        INTERNAL_SETUP_ERROR => serde_json::from_slice(&self.buffer[5..])
+                            .map(LauncherEvent::RuntimeError)
+                            .map_err(invalid_data),
+                        _ => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unknown launcher event",
+                        )),
+                    };
+                    self.buffer.clear();
+                    return event;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "launcher exit confirmation timed out",
+                ));
+            }
+            stream.set_read_timeout(Some(remaining.min(Duration::from_millis(250))))?;
+            let mut chunk = [0_u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "launcher closed before final event",
+                    ));
+                }
+                Ok(count) => {
+                    self.buffer.extend_from_slice(&chunk[..count]);
+                    if self.buffer.len() > MAX_INTERNAL_MESSAGE + 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "launcher event buffer exceeded bound",
+                        ));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+pub fn vmm_launcher_main() -> i32 {
+    // Keep an independent failure channel because the launcher takes ownership
+    // of descriptor zero after startup.
+    // SAFETY: fd 0 is the trusted Unix socket in VMM launcher mode.
+    let failure_fd = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+    match run_vmm_launcher() {
+        Ok(code) => code,
+        Err(error) => {
+            let failure = LauncherSetupError {
+                code: "setup.vmm-launcher".into(),
+                message: bounded_error(&error),
+            };
+            let payload = serde_json::to_vec(&failure).unwrap_or_else(|_| b"{}".to_vec());
+            if failure_fd >= 0 {
+                // SAFETY: fcntl returned an independent owned Unix-domain descriptor.
+                let mut control = unsafe { UnixStream::from_raw_fd(failure_fd) };
+                let _ = write_internal(&mut control, INTERNAL_SETUP_ERROR, &payload);
+            }
+            125
+        }
+    }
+}
+
+fn run_vmm_launcher() -> io::Result<i32> {
+    bind_lifetime_to_parent()?;
+    // SAFETY: VMM launcher mode exclusively transfers ownership of stdin.
+    let mut control = unsafe { UnixStream::from_raw_fd(0) };
+    let (length, files) = receive_fds(control.as_raw_fd())?;
+    if length as usize > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM launcher request exceeds limit",
+        ));
+    }
+    let mut payload = vec![0_u8; length as usize];
+    control.read_exact(&mut payload)?;
+    let vmm: VmmLaunchSpec = serde_json::from_slice(&payload).map_err(invalid_data)?;
+    validate_vmm_spec(&vmm, files.len())?;
+    let spec = vmm_launch_spec(&vmm);
+    namespace::launch(&spec, &files)
+}
+
+fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Result<()> {
+    let mut indexes = vec![
+        spec.namespace_launcher_fd_index,
+        spec.firecracker_fd_index,
+        spec.kernel_fd_index,
+        spec.system_fd_index,
+        spec.authentication_fd_index,
+        spec.configuration_fd_index,
+        spec.state_directory_fd_index,
+        spec.kvm_fd_index,
+    ];
+    match (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index) {
+        (Some(state), Some(memory)) => {
+            indexes.push(state);
+            indexes.push(memory);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VMM snapshot descriptors must be supplied as a pair",
+            ));
+        }
+    }
+    if indexes.iter().any(|index| *index >= descriptor_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM descriptor index is outside the received set",
+        ));
+    }
+    let distinct = indexes
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() != indexes.len()
+        || spec.firecracker_sha256.len() != 64
+        || !spec
+            .firecracker_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase())
+        || spec.open_files_limit < 64
+        || spec.file_size_limit == 0
+        || spec.termination_grace_ms > 60_000
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM launcher contract is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
+    let mut mounts = vec![
+        (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
+        (spec.system_fd_index, "/vm/system", "file", false, false),
+        (
+            spec.authentication_fd_index,
+            "/vm/auth",
+            "file",
+            true,
+            false,
+        ),
+        (
+            spec.configuration_fd_index,
+            "/vm/state/firecracker.json",
+            "file",
+            true,
+            false,
+        ),
+        (
+            spec.state_directory_fd_index,
+            "/vm/state",
+            "directory",
+            false,
+            false,
+        ),
+        (spec.kvm_fd_index, "/dev/kvm", "file", false, true),
+    ]
+    .into_iter()
+    .map(
+        |(fd_index, target_path, kind, read_only, executable)| MountSpec {
+            fd_index,
+            target_path: target_path.into(),
+            kind: kind.into(),
+            read_only,
+            executable,
+        },
+    )
+    .collect::<Vec<_>>();
+    if let (Some(state), Some(memory)) =
+        (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index)
+    {
+        mounts.push(MountSpec {
+            fd_index: state,
+            target_path: "/vm/snapshot-state".into(),
+            kind: "file".into(),
+            read_only: true,
+            executable: false,
+        });
+        mounts.push(MountSpec {
+            fd_index: memory,
+            target_path: "/vm/snapshot-memory".into(),
+            kind: "file".into(),
+            read_only: true,
+            executable: false,
+        });
+    }
+    let mut args = vec![
+        "--enable-pci".into(),
+        "--api-sock".into(),
+        "/vm/state/firecracker.socket".into(),
+    ];
+    if spec.snapshot_state_fd_index.is_none() {
+        args.push("--config-file".into());
+        args.push("/vm/state/firecracker.json".into());
+    }
+    VmmMachineSpec {
+        launcher_fd_index: spec.namespace_launcher_fd_index,
+        mounts,
+        firecracker_fd_index: spec.firecracker_fd_index,
+        firecracker_identity: spec.firecracker_identity,
+        firecracker_sha256: spec.firecracker_sha256.clone(),
+        state_directory_fd_index: spec.state_directory_fd_index,
+        state_directory_identity: spec.state_directory_identity,
+        args,
+        open_files_limit: spec.open_files_limit,
+        file_size_limit: spec.file_size_limit,
+        termination_grace_ms: spec.termination_grace_ms,
+    }
+}
+
+fn namespace_init(
+    control: &mut UnixStream,
+    spec: &VmmMachineSpec,
+    files: Vec<File>,
+) -> io::Result<i32> {
+    let (exec_status_read, mut exec_status_write) = pipe_cloexec()?;
+    // SAFETY: namespace init remains single-threaded, and the child immediately performs bounded setup then exec/_exit.
+    let target_pid = unsafe { libc::fork() };
+    if target_pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if target_pid == 0 {
+        drop(exec_status_read);
+        // SAFETY: setpgid(0, 0) affects only the calling child and uses no pointers.
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            let error = context("create VMM process group", io::Error::last_os_error());
+            let _ = exec_status_write.write_all(error.to_string().as_bytes());
+            // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
+            unsafe { libc::_exit(125) };
+        }
+        if let Err(error) = vmm_exec(spec, &files) {
+            let error = context("Firecracker exec setup", error);
+            let _ = exec_status_write.write_all(error.to_string().as_bytes());
+            // SAFETY: setup failed in the post-fork child; _exit prevents duplicated cleanup.
+            unsafe { libc::_exit(125) };
+        }
+        unreachable!();
+    }
+    drop(files);
+    drop(exec_status_write);
+    let mut setup_error = Vec::new();
+    exec_status_read.take(4097).read_to_end(&mut setup_error)?;
+    if !setup_error.is_empty() {
+        let failure = LauncherSetupError {
+            code: "setup.firecracker-exec".into(),
+            message: String::from_utf8_lossy(&setup_error[..setup_error.len().min(4096)])
+                .into_owned(),
+        };
+        write_internal(
+            control,
+            INTERNAL_SETUP_ERROR,
+            &serde_json::to_vec(&failure).map_err(invalid_data)?,
+        )?;
+        let mut status = 0;
+        // SAFETY: status is writable and target_pid is the child created above.
+        let _ = unsafe { libc::waitpid(target_pid, &mut status, 0) };
+        return Ok(125);
+    }
+    let started = LauncherStarted {
+        host_pid: u32::try_from(target_pid).unwrap_or(0),
+    };
+    write_internal(
+        control,
+        INTERNAL_STARTED,
+        &serde_json::to_vec(&started).map_err(invalid_data)?,
+    )?;
+    let final_status = supervise_vmm(control, target_pid, spec.termination_grace_ms)?;
+    write_internal(
+        control,
+        INTERNAL_EXIT,
+        &serde_json::to_vec(&final_status).map_err(invalid_data)?,
+    )?;
+    Ok(status_to_exit(final_status.raw_wait_status))
+}
+
+fn vmm_exec(spec: &VmmMachineSpec, files: &[File]) -> io::Result<()> {
+    let state_directory = files.get(spec.state_directory_fd_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "state directory index is invalid",
+        )
+    })?;
+    let mounted_state = open_path(
+        Path::new("/vm/state"),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )?;
+    if file_identity(state_directory.as_raw_fd())? != spec.state_directory_identity
+        || file_identity(mounted_state.as_raw_fd())? != spec.state_directory_identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "VMM state directory identity changed",
+        ));
+    }
+    let firecracker = files.get(spec.firecracker_fd_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Firecracker descriptor index is invalid",
+        )
+    })?;
+    if file_identity(firecracker.as_raw_fd())? != spec.firecracker_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firecracker identity changed",
+        ));
+    }
+    if sha256_file(firecracker)? != spec.firecracker_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firecracker digest changed",
+        ));
+    }
+    let mounted_firecracker = open_path(
+        Path::new("/.sandsurf/firecracker"),
+        libc::O_RDONLY | libc::O_CLOEXEC,
+    )?;
+    if sha256_file(&mounted_firecracker)? != spec.firecracker_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mounted Firecracker digest changed",
+        ));
+    }
+    let cwd = c"/vm/state";
+    // SAFETY: the fixed path names the identity-checked mounted state directory.
+    if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
+        return Err(context(
+            "select VMM state directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    drop(mounted_state);
+    drop_capabilities(true).map_err(|error| context("drop capabilities", error))?;
+    // SAFETY: PR_SET_NO_NEW_PRIVS takes scalar arguments and only restricts this process.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(context("set no_new_privs", io::Error::last_os_error()));
+    }
+    // Descriptor zero is the launcher's private control socket. The VMM must
+    // never inherit a second reader for that channel: it could consume a
+    // termination request before the namespace supervisor observes it.
+    let null = File::open("/dev/null").map_err(|error| context("open VMM stdin sink", error))?;
+    // SAFETY: null is a live readable descriptor and dup2 atomically replaces
+    // only this child process's fd 0 before it executes Firecracker.
+    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
+        return Err(context("isolate VMM stdin", io::Error::last_os_error()));
+    }
+
+    apply_landlock(spec).map_err(|error| context("install Landlock ruleset", error))?;
+    apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
+
+    prepare_descriptors_for_exec().map_err(|error| context("close ambient descriptors", error))?;
+
+    let executable_name = CString::new("/.sandsurf/firecracker").map_err(invalid_data)?;
+    let mut arguments = Vec::with_capacity(spec.args.len() + 1);
+    arguments.push(executable_name);
+    for argument in &spec.args {
+        arguments.push(CString::new(argument.as_bytes()).map_err(invalid_data)?);
+    }
+    let argument_pointers = c_string_pointers(&arguments);
+    let environment = Vec::<CString>::new();
+    let environment_pointers = c_string_pointers(&environment);
+    apply_vmm_rlimits(spec).map_err(|error| context("apply VMM rlimits", error))?;
+    let launch_path = c"/.sandsurf/firecracker";
+    // SAFETY: launch_path is the verified read-only Firecracker bind mount and
+    // argv/envp are live NUL-terminated arrays.
+    let result = unsafe {
+        libc::execve(
+            launch_path.as_ptr(),
+            argument_pointers.as_ptr(),
+            environment_pointers.as_ptr(),
+        )
+    } as libc::c_long;
+    if result != 0 {
+        return Err(context(
+            "execve verified Firecracker mount",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn supervise_vmm(
+    control: &mut UnixStream,
+    target_pid: libc::pid_t,
+    termination_grace_ms: u64,
+) -> io::Result<LauncherFinalStatus> {
+    let mut target_status = None;
+    let mut terminating_at: Option<Instant> = None;
+    let mut decoder = InternalDecoder::default();
+    control.set_nonblocking(true)?;
+    loop {
+        reap_children(target_pid, &mut target_status)?;
+        if let Some(status) = target_status {
+            let mut cleanup_failures = Vec::new();
+            if let Err(error) = kill_all_children() {
+                cleanup_failures.push(format!("kill descendants: {error}"));
+            }
+            let tree_reaped = match reap_until_empty() {
+                Ok(()) => true,
+                Err(error) => {
+                    cleanup_failures.push(format!("reap descendants: {error}"));
+                    false
+                }
+            };
+            return Ok(final_status(status, cleanup_failures, tree_reaped));
+        }
+        if let Some(started) = terminating_at
+            && started.elapsed() >= Duration::from_millis(termination_grace_ms)
+        {
+            signal_process_group(target_pid, libc::SIGKILL)?;
+        }
+        match decoder.read_available(control) {
+            Ok(messages) => {
+                for (kind, payload) in messages {
+                    match kind {
+                        INTERNAL_TERMINATE if payload.is_empty() => {
+                            if terminating_at.is_none() {
+                                signal_process_group(target_pid, libc::SIGTERM)?;
+                                terminating_at = Some(Instant::now());
+                            }
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unknown launcher control message",
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                signal_process_group(target_pid, libc::SIGKILL)?;
+                terminating_at = Some(Instant::now() - Duration::from_millis(termination_grace_ms));
+            }
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn final_status(
+    status: i32,
+    cleanup_failures: Vec<String>,
+    tree_reaped: bool,
+) -> LauncherFinalStatus {
+    LauncherFinalStatus {
+        raw_wait_status: status,
+        exit_code: libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)),
+        signal: libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)),
+        core_dumped: libc::WIFSIGNALED(status) && libc::WCOREDUMP(status),
+        cleanup_failures,
+        tree_reaped,
+    }
+}
+
+fn validate_vmm_machine_spec(spec: &VmmMachineSpec, descriptor_count: usize) -> io::Result<()> {
+    if spec.launcher_fd_index >= descriptor_count
+        || spec.firecracker_fd_index >= descriptor_count
+        || spec.state_directory_fd_index >= descriptor_count
+        || spec
+            .mounts
+            .iter()
+            .any(|mount| mount.fd_index >= descriptor_count)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "launcher descriptor index is outside the received set",
+        ));
+    }
+    if spec.args.len() > 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VMM argument count exceeds limit",
+        ));
+    }
+    for mount in &spec.mounts {
+        validate_target(&mount.target_path)?;
+        if mount.kind != "file" && mount.kind != "directory" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid mount object kind",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_vmm_rlimits(spec: &VmmMachineSpec) -> io::Result<()> {
+    set_rlimit(libc::RLIMIT_NOFILE, spec.open_files_limit)?;
+    set_rlimit(libc::RLIMIT_FSIZE, spec.file_size_limit)?;
+    Ok(())
+}
+
+#[cfg(not(target_env = "musl"))]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(target_env = "musl")]
+type RlimitResource = libc::c_int;
+
+fn set_rlimit(resource: RlimitResource, value: u64) -> io::Result<()> {
+    set_rlimit_pair(resource, value, value)
+}
+
+fn set_rlimit_pair(resource: RlimitResource, soft: u64, hard: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: resource is one of the fixed RLIMIT constants and limit points to an initialized rlimit.
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn drop_capabilities(drop_bounding_set: bool) -> io::Result<()> {
+    if drop_bounding_set {
+        for capability in 0..64 {
+            // SAFETY: PR_CAPBSET_READ takes a scalar capability number and no pointers.
+            let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+            if present == 0 {
+                continue;
+            }
+            if present < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    break;
+                }
+                return Err(error);
+            }
+            // SAFETY: PR_CAPBSET_DROP monotonically removes this supported capability.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: header and both capability data words are initialized with the kernel's v3 ABI layout.
+    let result = unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
+}
+
+#[repr(C)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+const LL_EXECUTE: u64 = 1 << 0;
+const LL_WRITE_FILE: u64 = 1 << 1;
+const LL_READ_FILE: u64 = 1 << 2;
+const LL_READ_DIR: u64 = 1 << 3;
+const LL_REMOVE_DIR: u64 = 1 << 4;
+const LL_REMOVE_FILE: u64 = 1 << 5;
+const LL_MAKE_CHAR: u64 = 1 << 6;
+const LL_MAKE_DIR: u64 = 1 << 7;
+const LL_MAKE_REG: u64 = 1 << 8;
+const LL_MAKE_SOCK: u64 = 1 << 9;
+const LL_MAKE_FIFO: u64 = 1 << 10;
+const LL_MAKE_BLOCK: u64 = 1 << 11;
+const LL_MAKE_SYM: u64 = 1 << 12;
+const LL_REFER: u64 = 1 << 13;
+const LL_TRUNCATE: u64 = 1 << 14;
+const LL_IOCTL_DEV: u64 = 1 << 15;
+const LL_READ: u64 = LL_READ_FILE | LL_READ_DIR;
+const LL_WRITE: u64 = LL_WRITE_FILE
+    | LL_REMOVE_DIR
+    | LL_REMOVE_FILE
+    | LL_MAKE_CHAR
+    | LL_MAKE_DIR
+    | LL_MAKE_REG
+    | LL_MAKE_SOCK
+    | LL_MAKE_FIFO
+    | LL_MAKE_BLOCK
+    | LL_MAKE_SYM
+    | LL_REFER
+    | LL_TRUNCATE
+    | LL_IOCTL_DEV;
+
+fn landlock_abi() -> io::Result<u32> {
+    // SAFETY: a null attribute with size zero is the documented Landlock ABI version query.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            ptr::null::<LandlockRulesetAttr>(),
+            0,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(result).map_err(invalid_data)
+}
+
+fn apply_landlock(spec: &VmmMachineSpec) -> io::Result<()> {
+    let abi = landlock_abi()?;
+    let mut handled = LL_EXECUTE
+        | LL_WRITE_FILE
+        | LL_READ_FILE
+        | LL_READ_DIR
+        | LL_REMOVE_DIR
+        | LL_REMOVE_FILE
+        | LL_MAKE_CHAR
+        | LL_MAKE_DIR
+        | LL_MAKE_REG
+        | LL_MAKE_SOCK
+        | LL_MAKE_FIFO
+        | LL_MAKE_BLOCK
+        | LL_MAKE_SYM;
+    if abi >= 2 {
+        handled |= LL_REFER;
+    }
+    if abi >= 3 {
+        handled |= LL_TRUNCATE;
+    }
+    if abi >= 5 {
+        handled |= LL_IOCTL_DEV;
+    }
+    let attr = LandlockRulesetAttr {
+        handled_access_fs: handled,
+        handled_access_net: 0,
+        scoped: 0,
+    };
+    // SAFETY: attr is initialized and its exact C layout size is passed to the Landlock syscall.
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attr,
+            mem::size_of::<LandlockRulesetAttr>(),
+            0,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(context(
+            "create Landlock ruleset",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: a successful create_ruleset returns a new descriptor transferred exactly once to File.
+    let ruleset = unsafe { File::from_raw_fd(ruleset_fd as RawFd) };
+
+    for mount in &spec.mounts {
+        let mut access = if mount.kind == "file" {
+            LL_READ_FILE
+        } else {
+            LL_READ
+        };
+        if mount.executable {
+            access |= LL_EXECUTE;
+        }
+        if !mount.read_only {
+            access |= if mount.kind == "file" {
+                LL_WRITE_FILE | LL_TRUNCATE | LL_IOCTL_DEV
+            } else {
+                LL_WRITE
+            };
+        }
+        add_landlock_rule(&ruleset, Path::new(&mount.target_path), access & handled)
+            .map_err(|error| context(&format!("add Landlock rule {}", mount.target_path), error))?;
+    }
+    add_landlock_rule(&ruleset, Path::new("/dev"), (LL_READ | LL_WRITE) & handled)
+        .map_err(|error| context("add Landlock rule /dev", error))?;
+    add_landlock_rule(&ruleset, Path::new("/proc"), (LL_READ | LL_WRITE) & handled)
+        .map_err(|error| context("add Landlock rule /proc", error))?;
+    add_landlock_rule(
+        &ruleset,
+        Path::new("/.sandsurf/firecracker"),
+        (LL_READ_FILE | LL_EXECUTE) & handled,
+    )
+    .map_err(|error| context("add Landlock rule Firecracker", error))?;
+
+    // SAFETY: ruleset is a live Landlock ruleset descriptor and flags zero is required by the negotiated ABI.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset.as_raw_fd(), 0) } != 0 {
+        return Err(context(
+            "restrict self with Landlock",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+fn add_landlock_rule(ruleset: &File, path: &Path, access: u64) -> io::Result<()> {
+    if access == 0 {
+        return Ok(());
+    }
+    let parent = open_path(path, libc::O_PATH | libc::O_CLOEXEC)?;
+    let attr = LandlockPathBeneathAttr {
+        allowed_access: access,
+        parent_fd: parent.as_raw_fd(),
+    };
+    // SAFETY: attr references a live O_PATH descriptor and matches the C path-beneath layout.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset.as_raw_fd(),
+            LANDLOCK_RULE_PATH_BENEATH,
+            &attr,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+
+fn apply_seccomp() -> io::Result<()> {
+    let architecture = if cfg!(target_arch = "x86_64") {
+        AUDIT_ARCH_X86_64
+    } else {
+        AUDIT_ARCH_AARCH64
+    };
+    let blocked = blocked_syscalls();
+    let mut filters = Vec::with_capacity(blocked.len() * 2 + 10);
+    filters.push(stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 4));
+    filters.push(jump(
+        (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        architecture,
+        1,
+        0,
+    ));
+    filters.push(stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        SECCOMP_RET_KILL_PROCESS,
+    ));
+    filters.push(stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0));
+    let namespace_flags = libc::CLONE_NEWNS
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWCGROUP;
+    filters.push(jump(
+        (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        libc::SYS_clone as u32,
+        0,
+        4,
+    ));
+    filters.push(stmt(
+        (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        16,
+    ));
+    filters.push(jump(
+        (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16,
+        namespace_flags as u32,
+        0,
+        1,
+    ));
+    filters.push(stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        SECCOMP_RET_ERRNO | libc::EPERM as u32,
+    ));
+    filters.push(stmt((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0));
+    for syscall in blocked {
+        filters.push(jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            syscall as u32,
+            0,
+            1,
+        ));
+        let errno = if syscall == libc::SYS_clone3 {
+            libc::ENOSYS
+        } else {
+            libc::EPERM
+        };
+        filters.push(stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            SECCOMP_RET_ERRNO | errno as u32,
+        ));
+    }
+    filters.push(stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        SECCOMP_RET_ALLOW,
+    ));
+    let program = libc::sock_fprog {
+        len: u16::try_from(filters.len()).map_err(invalid_data)?,
+        filter: filters.as_mut_ptr(),
+    };
+    // SAFETY: program references a live, validated BPF array for the duration of PR_SET_SECCOMP.
+    let result = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn blocked_syscalls() -> Vec<libc::c_long> {
+    vec![
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fsopen,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
+        libc::SYS_setns,
+        libc::SYS_unshare,
+        libc::SYS_bpf,
+        libc::SYS_kexec_load,
+        libc::SYS_reboot,
+        libc::SYS_ptrace,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        libc::SYS_perf_event_open,
+        libc::SYS_clone3,
+    ]
+}
+
+const fn stmt(code: u16, value: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k: value,
+    }
+}
+
+const fn jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt,
+        jf,
+        k: value,
+    }
+}
+
+fn c_string_pointers(values: &[CString]) -> Vec<*const libc::c_char> {
+    let mut pointers: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+    pointers.push(ptr::null());
+    pointers
+}
+
+fn open_path(path: &Path, flags: libc::c_int) -> io::Result<File> {
+    let path = path_cstring(path)?;
+    // SAFETY: path is NUL-terminated and flags are supplied by the launcher's fixed call sites.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful open returns a new descriptor transferred exactly once to File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub fn file_identity(fd: RawFd) -> io::Result<FileIdentity> {
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: stat points to writable storage and fd is required by callers to be live.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized every field of libc::stat.
+    let stat = unsafe { stat.assume_init() };
+    Ok(FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        mode: stat.st_mode,
+    })
+}
+
+/// Attempts to retain an exclusive advisory lease for the lifetime of `file`.
+/// `Ok(false)` means another process currently owns the lease.
+pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    // SAFETY: `file` owns a live descriptor and flock retains no pointer.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Sends SIGKILL to an exact positive PID. `Ok(false)` means it no longer exists.
+pub fn kill_process(pid: u32) -> io::Result<bool> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process ID"))?;
+    // SAFETY: a validated positive PID cannot select a process group.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn path_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(invalid_data)
+}
+
+fn sha256_file(file: &File) -> io::Result<String> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_target(path: &str) -> io::Result<()> {
+    if !path.starts_with('/')
+        || path.contains('\0')
+        || path.split('/').any(|part| part == ".." || part == ".")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid target path",
+        ));
+    }
+    Ok(())
+}
+
+fn component_count(path: &str) -> usize {
+    Path::new(path).components().count()
+}
+
+fn reap_children(target_pid: libc::pid_t, target_status: &mut Option<i32>) -> io::Result<()> {
+    loop {
+        let mut status = 0;
+        // SAFETY: status is writable; -1 intentionally selects any namespace child without blocking.
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid == 0 {
+            return Ok(());
+        }
+        if pid < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if pid == target_pid {
+            *target_status = Some(status);
+        }
+    }
+}
+
+fn reap_until_empty() -> io::Result<()> {
+    loop {
+        let mut status = 0;
+        // SAFETY: status is writable; -1 intentionally reaps any remaining namespace child.
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return Ok(());
+            }
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+}
+
+fn kill_all_children() -> io::Result<()> {
+    // SAFETY: PID -1 inside the private PID namespace targets all signalable target descendants.
+    let result = unsafe { libc::kill(-1, libc::SIGKILL) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn signal_process_group(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    // SAFETY: pid is the direct target child; this idempotently establishes its private process group.
+    let _ = unsafe { libc::setpgid(pid, pid) };
+    // SAFETY: negative pid intentionally addresses only the target's private process group.
+    let result = unsafe { libc::kill(-pid, signal) };
+    if result != 0 {
+        // SAFETY: pid is the direct target child and signal is a fixed termination signal.
+        let fallback = unsafe { libc::kill(pid, signal) };
+        if fallback != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn status_to_exit(status: i32) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        125
+    }
+}
+
+#[derive(Default)]
+struct InternalDecoder {
+    buffer: Vec<u8>,
+}
+
+impl InternalDecoder {
+    fn read_available(&mut self, stream: &mut UnixStream) -> io::Result<Vec<(u8, Vec<u8>)>> {
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        if self.buffer.is_empty() {
+                            "launcher control channel closed"
+                        } else {
+                            "launcher control channel ended with a partial frame"
+                        },
+                    ));
+                }
+                Ok(count) => {
+                    self.buffer.extend_from_slice(&chunk[..count]);
+                    if self.buffer.len() > MAX_INTERNAL_MESSAGE + 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "internal decoder buffer exceeded its bound",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        let mut messages = Vec::new();
+        loop {
+            if self.buffer.len() < 5 {
+                break;
+            }
+            let length = u32::from_be_bytes([
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+                self.buffer[4],
+            ]) as usize;
+            if length > MAX_INTERNAL_MESSAGE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "internal message too large",
+                ));
+            }
+            if self.buffer.len() < 5 + length {
+                break;
+            }
+            let kind = self.buffer[0];
+            let payload = self.buffer[5..5 + length].to_vec();
+            self.buffer.drain(..5 + length);
+            messages.push((kind, payload));
+        }
+        Ok(messages)
+    }
+}
+
+fn write_internal(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "internal message too large",
+        ));
+    }
+    let length = u32::try_from(payload.len()).map_err(invalid_data)?;
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(kind);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
+}
+
+fn read_internal(stream: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
+    let mut header = [0_u8; 5];
+    stream.read_exact(&mut header)?;
+    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if length > MAX_INTERNAL_MESSAGE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal message too large",
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload)?;
+    Ok((header[0], payload))
+}
+
+fn send_fds(socket: RawFd, length: u32, files: &[File]) -> io::Result<()> {
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "launcher needs authority descriptors",
+        ));
+    }
+    let mut bytes = length.to_be_bytes();
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    let descriptor_bytes = files
+        .len()
+        .checked_mul(mem::size_of::<RawFd>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "descriptor count overflow"))?;
+    let control_length = cmsg_space(descriptor_bytes);
+    let mut control = vec![0_u8; control_length];
+    // SAFETY: all-zero msghdr is a valid starting state before explicitly setting its active fields.
+    let mut message: libc::msghdr = unsafe { mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control_field_length(control.len())?;
+    let cmsg = message.msg_control.cast::<libc::cmsghdr>();
+    // SAFETY: control has CMSG_SPACE bytes, cmsg points into it, and data has room for every descriptor.
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = control_field_length(cmsg_len(descriptor_bytes))
+            .expect("bounded descriptor control length");
+        let data = cmsg
+            .cast::<u8>()
+            .add(cmsg_align(mem::size_of::<libc::cmsghdr>()))
+            .cast::<RawFd>();
+        for (index, file) in files.iter().enumerate() {
+            *data.add(index) = file.as_raw_fd();
+        }
+    }
+    // SAFETY: message references live header/control buffers for the duration of sendmsg.
+    let sent = unsafe { libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL) };
+    if sent != bytes.len() as isize {
+        return Err(if sent < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::new(io::ErrorKind::WriteZero, "partial descriptor message")
+        });
+    }
+    Ok(())
+}
+
+fn receive_fds(socket: RawFd) -> io::Result<(u32, Vec<File>)> {
+    let mut bytes = [0_u8; 4];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    let maximum_fds = 4096_usize;
+    let mut control = vec![0_u8; cmsg_space(maximum_fds * mem::size_of::<RawFd>())];
+    // SAFETY: all-zero msghdr is a valid starting state before explicitly setting its active fields.
+    let mut message: libc::msghdr = unsafe { mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control_field_length(control.len())?;
+    // SAFETY: message points to writable header/control buffers sized above; recvmsg initializes received control data.
+    let received = unsafe { libc::recvmsg(socket, &mut message, libc::MSG_CMSG_CLOEXEC) };
+    if received != bytes.len() as isize {
+        return Err(if received < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "partial descriptor message")
+        });
+    }
+    if message.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor message truncated",
+        ));
+    }
+    let header = message.msg_control.cast::<libc::cmsghdr>();
+    // SAFETY: after the null check, header points into the initialized control buffer returned by recvmsg.
+    if header.is_null()
+        || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
+        // SAFETY: the same validated cmsghdr pointer remains live for this adjacent field read.
+        || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "launcher descriptors missing",
+        ));
+    }
+    // SAFETY: header was checked non-null and lies within the recvmsg control buffer.
+    let header_len = control_field_to_usize(unsafe { (*header).cmsg_len })?;
+    let base_len = cmsg_align(mem::size_of::<libc::cmsghdr>());
+    if header_len < base_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid descriptor control length",
+        ));
+    }
+    let count = (header_len - base_len) / mem::size_of::<RawFd>();
+    // SAFETY: validated cmsg_len is at least base_len, so data begins within the control message.
+    let data = unsafe { header.cast::<u8>().add(base_len).cast::<RawFd>() };
+    let mut files = Vec::with_capacity(count);
+    for index in 0..count {
+        // SAFETY: count derives from cmsg_len and index remains within the SCM_RIGHTS descriptor array.
+        let fd = unsafe { *data.add(index) };
+        // SAFETY: SCM_RIGHTS installs a new owned descriptor in this process, transferred exactly once to File.
+        files.push(unsafe { File::from_raw_fd(fd) });
+    }
+    Ok((u32::from_be_bytes(bytes), files))
+}
+
+const fn cmsg_align(length: usize) -> usize {
+    let alignment = mem::size_of::<usize>();
+    (length + alignment - 1) & !(alignment - 1)
+}
+
+#[cfg(not(target_env = "musl"))]
+type ControlFieldLength = usize;
+#[cfg(target_env = "musl")]
+type ControlFieldLength = libc::socklen_t;
+
+#[cfg(not(target_env = "musl"))]
+fn control_field_length(length: usize) -> io::Result<ControlFieldLength> {
+    Ok(length)
+}
+
+#[cfg(target_env = "musl")]
+fn control_field_length(length: usize) -> io::Result<ControlFieldLength> {
+    length
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "control buffer is too large"))
+}
+
+#[cfg(not(target_env = "musl"))]
+fn control_field_to_usize(length: ControlFieldLength) -> io::Result<usize> {
+    Ok(length)
+}
+
+#[cfg(target_env = "musl")]
+fn control_field_to_usize(length: ControlFieldLength) -> io::Result<usize> {
+    usize::try_from(length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid control length"))
+}
+
+const fn cmsg_space(data_length: usize) -> usize {
+    cmsg_align(mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_length)
+}
+
+const fn cmsg_len(data_length: usize) -> usize {
+    cmsg_align(mem::size_of::<libc::cmsghdr>()) + data_length
+}
+
+fn bounded_error(error: &io::Error) -> String {
+    error.to_string().chars().take(512).collect()
+}
+
+fn context(operation: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
+fn invalid_data(error: impl Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+use std::fmt::Display;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_messages_are_bounded_and_round_trip() {
+        let (mut left, mut right) = UnixStream::pair().expect("pair");
+        write_internal(&mut left, INTERNAL_TERMINATE, b"abc").expect("write");
+        let (kind, value) = read_internal(&mut right).expect("read");
+        assert_eq!(kind, INTERNAL_TERMINATE);
+        assert_eq!(value, b"abc");
+    }
+
+    #[test]
+    fn final_event_reader_retains_partial_frame_across_timeout() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        let final_status = LauncherFinalStatus {
+            raw_wait_status: 0,
+            exit_code: Some(0),
+            signal: None,
+            core_dumped: false,
+            cleanup_failures: Vec::new(),
+            tree_reaped: true,
+        };
+        let payload = serde_json::to_vec(&final_status).expect("status");
+        let mut frame = vec![INTERNAL_EXIT];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        writer.write_all(&frame[..7]).expect("partial event");
+        let mut events = LauncherEventReader::default();
+        assert_eq!(
+            events
+                .read(&mut reader, Duration::from_millis(10))
+                .expect_err("incomplete event")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        writer.write_all(&frame[7..]).expect("finish event");
+        match events
+            .read(&mut reader, Duration::from_secs(1))
+            .expect("event")
+        {
+            LauncherEvent::Final(value) => assert!(value.tree_reaped),
+            LauncherEvent::RuntimeError(_) => panic!("expected final status"),
+        }
+    }
+
+    #[test]
+    fn file_identity_is_stable_for_a_held_descriptor() {
+        let file = File::open("/dev/null").expect("open");
+        assert_eq!(
+            file_identity(file.as_raw_fd()).expect("identity"),
+            file_identity(file.as_raw_fd()).expect("identity")
+        );
+    }
+
+    #[test]
+    fn kernel_abi_structures_have_expected_layout() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<CapHeader>(), 8);
+        assert_eq!(offset_of!(CapHeader, pid), 4);
+        assert_eq!(size_of::<CapData>(), 12);
+        assert_eq!(size_of::<LandlockRulesetAttr>(), 24);
+        assert_eq!(size_of::<LandlockPathBeneathAttr>(), 16);
+        assert_eq!(offset_of!(LandlockPathBeneathAttr, parent_fd), 8);
+    }
+
+    #[test]
+    fn nonblocking_internal_decoder_preserves_partial_frames() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let mut frame = vec![INTERNAL_TERMINATE];
+        frame.extend_from_slice(&3_u32.to_be_bytes());
+        frame.extend_from_slice(b"abc");
+        writer.write_all(&frame[..2]).expect("partial header");
+        let mut decoder = InternalDecoder::default();
+        assert!(
+            decoder
+                .read_available(&mut reader)
+                .expect("partial")
+                .is_empty()
+        );
+        writer.write_all(&frame[2..6]).expect("header and payload");
+        assert!(
+            decoder
+                .read_available(&mut reader)
+                .expect("partial")
+                .is_empty()
+        );
+        writer.write_all(&frame[6..]).expect("final payload");
+        assert_eq!(
+            decoder.read_available(&mut reader).expect("complete"),
+            vec![(INTERNAL_TERMINATE, b"abc".to_vec())]
+        );
+    }
+
+    #[test]
+    fn nonblocking_internal_decoder_rejects_length_lies() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("pair");
+        reader.set_nonblocking(true).expect("nonblocking");
+        let mut frame = vec![INTERNAL_TERMINATE];
+        frame.extend_from_slice(&((MAX_INTERNAL_MESSAGE as u32) + 1).to_be_bytes());
+        writer.write_all(&frame).expect("malformed frame");
+        assert_eq!(
+            InternalDecoder::default()
+                .read_available(&mut reader)
+                .expect_err("length must fail")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}

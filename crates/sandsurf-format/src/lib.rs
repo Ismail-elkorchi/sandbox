@@ -1,0 +1,176 @@
+#![deny(unsafe_code)]
+
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::fmt::{Display, Formatter};
+
+const FORMAT_DOMAIN: &[u8] = b"SBX-DIGEST-1";
+
+#[derive(Debug)]
+pub enum DigestError {
+    Serialization(serde_json::Error),
+    FloatingPointUnsupported,
+    LengthOverflow,
+}
+
+impl Display for DigestError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Serialization(error) => write!(formatter, "digest serialization failed: {error}"),
+            Self::FloatingPointUnsupported => {
+                formatter.write_str("floating point values are not canonical digest inputs")
+            }
+            Self::LengthOverflow => {
+                formatter.write_str("canonical value exceeds the digest format length limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DigestError {}
+
+pub fn identity_digest<T: Serialize>(value: &T) -> Result<String, DigestError> {
+    digest(b"IDENTITY", value)
+}
+
+/// Sandsurf domains are closed and disjoint from the retired prepared-process domains.
+#[derive(Debug, Clone, Copy)]
+pub enum SandsurfDomain {
+    Machine,
+    Authority,
+    Operation,
+    Receipt,
+    Output,
+    Release,
+    Image,
+    Snapshot,
+    Transfer,
+    Network,
+    Secret,
+    Resource,
+    Exposure,
+}
+
+pub fn sandsurf_digest<T: Serialize>(
+    domain: SandsurfDomain,
+    value: &T,
+) -> Result<String, DigestError> {
+    let domain: &[u8] = match domain {
+        SandsurfDomain::Machine => b"SANDSURF/MACHINE/1",
+        SandsurfDomain::Authority => b"SANDSURF/AUTHORITY/1",
+        SandsurfDomain::Operation => b"SANDSURF/OPERATION/1",
+        SandsurfDomain::Receipt => b"SANDSURF/RECEIPT/1",
+        SandsurfDomain::Output => b"SANDSURF/OUTPUT/1",
+        SandsurfDomain::Release => b"SANDSURF/RELEASE/1",
+        SandsurfDomain::Image => b"SANDSURF/IMAGE/1",
+        SandsurfDomain::Snapshot => b"SANDSURF/SNAPSHOT/1",
+        SandsurfDomain::Transfer => b"SANDSURF/TRANSFER/1",
+        SandsurfDomain::Network => b"SANDSURF/NETWORK/1",
+        SandsurfDomain::Secret => b"SANDSURF/SECRET/1",
+        SandsurfDomain::Resource => b"SANDSURF/RESOURCE/1",
+        SandsurfDomain::Exposure => b"SANDSURF/EXPOSURE/1",
+    };
+    digest(domain, value)
+}
+
+fn digest<T: Serialize>(domain: &[u8], value: &T) -> Result<String, DigestError> {
+    let value = serde_json::to_value(value).map_err(DigestError::Serialization)?;
+    let mut bytes = Vec::new();
+    put_bytes(&mut bytes, FORMAT_DOMAIN)?;
+    put_bytes(&mut bytes, domain)?;
+    encode_value(&value, &mut bytes)?;
+    let output = Sha256::digest(bytes);
+    Ok(to_hex(&output))
+}
+
+fn put_len(output: &mut Vec<u8>, length: usize) -> Result<(), DigestError> {
+    let length = u32::try_from(length).map_err(|_| DigestError::LengthOverflow)?;
+    output.extend_from_slice(&length.to_be_bytes());
+    Ok(())
+}
+
+fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DigestError> {
+    put_len(output, bytes.len())?;
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_value(value: &Value, output: &mut Vec<u8>) -> Result<(), DigestError> {
+    match value {
+        Value::Null => output.push(0x00),
+        Value::Bool(value) => {
+            output.push(0x01);
+            output.push(u8::from(*value));
+        }
+        Value::Number(value) => {
+            output.push(0x02);
+            if let Some(number) = value.as_u64() {
+                output.push(0x00);
+                output.extend_from_slice(&number.to_be_bytes());
+            } else if let Some(number) = value.as_i64() {
+                output.push(0x01);
+                output.extend_from_slice(&number.to_be_bytes());
+            } else {
+                return Err(DigestError::FloatingPointUnsupported);
+            }
+        }
+        Value::String(value) => {
+            output.push(0x03);
+            put_bytes(output, value.as_bytes())?;
+        }
+        Value::Array(values) => {
+            output.push(0x04);
+            put_len(output, values.len())?;
+            for value in values {
+                encode_value(value, output)?;
+            }
+        }
+        Value::Object(values) => {
+            output.push(0x05);
+            put_len(output, values.len())?;
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            for (key, value) in entries {
+                put_bytes(output, key.as_bytes())?;
+                encode_value(value, output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(char::from(HEX[usize::from(byte >> 4)]));
+        value.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn map_key_order_does_not_change_digest() {
+        let first = json!({"z": 1, "a": [true, null, "x"]});
+        let second = json!({"a": [true, null, "x"], "z": 1});
+        assert_eq!(
+            identity_digest(&first).expect("digest"),
+            identity_digest(&second).expect("digest")
+        );
+    }
+
+    #[test]
+    fn digest_domains_are_distinct() {
+        let value = json!({"a": 1});
+        assert_ne!(
+            sandsurf_digest(SandsurfDomain::Network, &value).expect("network"),
+            sandsurf_digest(SandsurfDomain::Operation, &value).expect("operation")
+        );
+    }
+}

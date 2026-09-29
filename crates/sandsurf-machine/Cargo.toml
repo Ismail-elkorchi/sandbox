@@ -22,4 +22,6 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-sandbox-vm = { path = "../sandbox-vm" }
+sandsurf-native = { path = "../sandsurf-native" }
+libc.workspace = true
+sha2.workspace = true
