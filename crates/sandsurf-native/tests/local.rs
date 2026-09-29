@@ -67,6 +67,23 @@ fn current_uid() -> u32 {
 }
 
 #[test]
+fn disconnected_client_does_not_disable_listener_or_lose_buffered_request() {
+    let root = Root::new();
+    let listener = LocalListener::bind(&root.0).unwrap();
+    let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();
+    client.write_frame(&frame(), WAIT).unwrap();
+    drop(client);
+    let mut server = listener.accept(WAIT).unwrap();
+    assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
+    assert!(server.write_frame(&frame(), WAIT).is_err());
+    drop(server);
+    let mut next = LocalConnection::connect(&root.0, WAIT).unwrap();
+    let mut server = listener.accept(WAIT).unwrap();
+    next.write_frame(&frame(), WAIT).unwrap();
+    assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
+}
+
+#[test]
 fn private_storage_refuses_aliases_shared_files_and_replaceable_parents() {
     use sandsurf_native::local::{
         create_private_file, ensure_private_directory, open_private_file,

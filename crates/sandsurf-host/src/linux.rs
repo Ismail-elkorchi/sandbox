@@ -15,11 +15,11 @@ use sandsurf_native::UnixVsockChannel;
 use sandsurf_network::{VmNetworkBridge, VmPortGateway};
 use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
-    Counter, Digest, Domain, GuestCommand, GuestServiceRequest, GuestServiceResponse,
-    LifecycleCommand, MachineId, MachineObservation, MachineState, NativeFullCapture,
-    NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources,
-    RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest,
-    digest,
+    Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
+    GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
+    NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination,
+    NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark,
+    VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -280,7 +280,7 @@ pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<LinuxGuardianC
 pub fn execution_defaults(
     host_root: &Path,
     image_digest: &Digest,
-) -> Result<crate::api::ImageDefaultsView, LinuxError> {
+) -> Result<ExecutionDefaults, LinuxError> {
     let image = verify_image(
         &host_root
             .join("images")
@@ -294,7 +294,7 @@ pub fn execution_defaults(
         ));
     }
     let defaults = image.manifest.system.defaults;
-    Ok(crate::api::ImageDefaultsView {
+    Ok(ExecutionDefaults {
         environment: defaults.environment,
         user: defaults.user,
         working_directory: defaults.working_directory,
@@ -356,11 +356,6 @@ impl LinuxGuardianEffect {
         let disks = machine_root.join("disks");
         fs::create_dir_all(&disks)?;
         let system_disk = disks.join("system.ext4");
-        ensure_mutable_disk(
-            &config.system_seed,
-            &system_disk,
-            config.resources.disk_bytes.get(),
-        )?;
 
         let active = Arc::new(Mutex::new(None));
         let network = Arc::new(Mutex::new(None));
@@ -1270,6 +1265,15 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             return Err(bytes_digest(b"linux-generation-factory-identity-conflict"));
         }
         self.config.resources = resources.clone();
+        ensure_mutable_disk(
+            &self.config.system_seed,
+            &self.system_disk,
+            resources.disk_bytes.get(),
+        )
+        .map_err(|error| {
+            eprintln!("sandsurf disk preparation failed: {error}");
+            bytes_digest(b"linux-system-disk-preparation-failed")
+        })?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"linux-network-entropy"))?;

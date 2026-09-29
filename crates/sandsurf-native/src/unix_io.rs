@@ -77,7 +77,23 @@ impl Write for DeadlineIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         loop {
             require_time(self.deadline)?;
-            match self.stream.write(bytes) {
+            // SAFETY: the slice remains live for send, and the descriptor is
+            // owned by this stream. Per-send suppression avoids both SIGPIPE
+            // and Darwin socket-option changes after a peer has disconnected.
+            let sent = unsafe {
+                libc::send(
+                    self.stream.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            let result = if sent < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(sent as usize)
+            };
+            match result {
                 Ok(count) => return Ok(count),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     wait_ready(self.stream.as_raw_fd(), libc::POLLOUT, self.deadline)?;

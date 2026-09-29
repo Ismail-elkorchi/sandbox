@@ -16,10 +16,11 @@ use sandsurf_protocol::{
     NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
 };
 use sandsurf_protocol::{
-    Counter, Digest, Domain, GuestCommand, GuestServiceRequest, GuestServiceResponse,
-    LifecycleCommand, MachineId, MachineObservation, MachineState, NativeSnapshotRequest,
-    NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources, RuntimeConfiguration,
-    SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest, digest,
+    Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
+    GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
+    NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources,
+    RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest,
+    digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -218,7 +219,7 @@ pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<AppleGuardianC
 pub fn execution_defaults(
     host_root: &Path,
     image_digest: &Digest,
-) -> Result<crate::api::ImageDefaultsView, AppleError> {
+) -> Result<ExecutionDefaults, AppleError> {
     let image = verify_image(
         &host_root
             .join("images")
@@ -232,7 +233,7 @@ pub fn execution_defaults(
         ));
     }
     let defaults = image.manifest.system.defaults;
-    Ok(crate::api::ImageDefaultsView {
+    Ok(ExecutionDefaults {
         environment: defaults.environment,
         user: defaults.user,
         working_directory: defaults.working_directory,
@@ -310,11 +311,6 @@ impl AppleGuardianEffect {
         let disks = machine_root.join("disks");
         ensure_private_directory(&disks)?;
         let system_disk = disks.join("system.ext4");
-        ensure_mutable_disk(
-            &config.system_seed,
-            &system_disk,
-            config.resources.disk_bytes.get(),
-        )?;
         let authentication_disk = machine_root.join("guardian/auth.img");
         let apple = AppleConfig {
             machine_id: config.machine_id.clone(),
@@ -381,6 +377,15 @@ impl AppleGuardianEffect {
         command: &LifecycleCommand,
         generation: Counter,
     ) -> Result<(), Digest> {
+        ensure_mutable_disk(
+            &self.config.system_seed,
+            &self.machine_root.join("disks/system.ext4"),
+            command.configuration.resources.disk_bytes.get(),
+        )
+        .map_err(|error| {
+            eprintln!("sandsurf disk preparation failed: {error}");
+            bytes_digest(b"apple-system-disk-preparation-failed")
+        })?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"apple-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"apple-network-entropy"))?;

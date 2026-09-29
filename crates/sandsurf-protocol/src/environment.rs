@@ -4,7 +4,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Persistent per-Machine overrides layered over immutable image defaults.
+/// Linux execution preferences. Creation accepts overrides of immutable image
+/// defaults; the host catalog stores the resulting complete machine preferences.
 /// Guest defaults are OS preferences, not a compartment or host authority.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

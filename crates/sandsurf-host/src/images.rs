@@ -72,8 +72,6 @@ impl From<sandsurf_image::ImageError> for ImageBuildError {
     }
 }
 
-type LinuxError = ImageBuildError;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImportResult {
@@ -100,7 +98,7 @@ pub(crate) fn import_oci(
     operation: &OperationId,
     request_digest: &Digest,
     registry_credential: Option<&[u8]>,
-) -> Result<ImageRecord, LinuxError> {
+) -> Result<ImageRecord, ImageBuildError> {
     let OciBuildInput {
         source,
         recipe,
@@ -112,7 +110,7 @@ pub(crate) fn import_oci(
         sandsurf_machine::GuestArchitecture::Arm64 => "arm64",
     };
     if requested.os != "linux" || requested.architecture != expected_architecture {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "OCI platform must exactly match the native Linux guest architecture".into(),
         ));
     }
@@ -120,10 +118,14 @@ pub(crate) fn import_oci(
     let architecture = match requested.architecture.as_str() {
         "amd64" => Architecture::X64,
         "arm64" => Architecture::Arm64,
-        _ => return Err(LinuxError::Invalid("unsupported OCI architecture".into())),
+        _ => {
+            return Err(ImageBuildError::Invalid(
+                "unsupported OCI architecture".into(),
+            ));
+        }
     };
     if base.manifest.architecture != architecture {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "recipe boot image architecture differs from the OCI filesystem".into(),
         ));
     }
@@ -134,7 +136,7 @@ pub(crate) fn import_oci(
     if result_path.exists() {
         let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
         if old.request_digest != *request_digest {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "image import staging identity conflicts with the request".into(),
             ));
         }
@@ -153,7 +155,7 @@ pub(crate) fn import_oci(
     let layout_path = match source {
         OciSource::Layout { path } => {
             if !path.is_absolute() {
-                return Err(LinuxError::Invalid(
+                return Err(ImageBuildError::Invalid(
                     "OCI layout path must be absolute".into(),
                 ));
             }
@@ -162,7 +164,7 @@ pub(crate) fn import_oci(
         OciSource::Archive { path } => {
             let layout = stage.join("layout");
             unpack_layout_archive(path, &layout, ConversionLimits::default())
-                .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+                .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
             layout
         }
         OciSource::Registry { reference, .. } => {
@@ -175,23 +177,23 @@ pub(crate) fn import_oci(
                 registry_credential,
                 ConversionLimits::default(),
             )
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
             layout
         }
     };
     let layout = OciLayout::open(&layout_path, ConversionLimits::default())
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let resolved = layout
         .resolve(&requested)
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let tree_root = stage.join("tree");
     let tree = layout
         .convert(resolved, &tree_root)
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     require_os_init(&tree)?;
     let filesystem_tar = stage.join("rootfs.tar");
     write_filesystem_tar(&tree_root, &tree, &filesystem_tar)
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let rootfs_bytes = rootfs_size(&tree)?;
     let artifact = stage.join("artifact");
     prepare_private_directory(&artifact)?;
@@ -205,7 +207,7 @@ pub(crate) fn import_oci(
     for assignment in &tree.source.defaults.environment {
         let (name, value) = assignment
             .split_once('=')
-            .ok_or_else(|| LinuxError::Invalid("validated OCI environment changed".into()))?;
+            .ok_or_else(|| ImageBuildError::Invalid("validated OCI environment changed".into()))?;
         environment.insert(name.to_owned(), value.to_owned());
     }
     let conversion_digest = digest(
@@ -218,7 +220,7 @@ pub(crate) fn import_oci(
             rootfs_bytes,
         ),
     )
-    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let mut manifest = ImageManifest {
         format_version: 3,
         id: format!("oci-{}", short_digest(&tree.source.manifest_digest)?),
@@ -259,7 +261,7 @@ pub(crate) fn import_oci(
     if final_root.exists() {
         let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
         if existing.manifest_digest != verified.manifest_digest {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "published image directory conflicts with its digest".into(),
             ));
         }
@@ -269,17 +271,17 @@ pub(crate) fn import_oci(
         File::open(host_root.join("images"))?.sync_all()?;
     }
     let source_digest = Digest::try_from(bare_digest(&tree.source.manifest_digest)?.to_owned())
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let image = ImageRecord {
         digest: Digest::try_from(verified.manifest_digest)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         source_digest,
         platform: requested.os,
         architecture: requested.architecture,
         logical_bytes: Counter::try_from(rootfs_bytes)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         provenance_digest: conversion_digest,
         sensitive: false,
     };
@@ -298,17 +300,17 @@ pub fn publish_snapshot(
     allow_sensitive: bool,
     operation: &OperationId,
     request_digest: &Digest,
-) -> Result<ImageRecord, LinuxError> {
+) -> Result<ImageRecord, ImageBuildError> {
     if snapshot.phase != SnapshotPhase::Ready
         || snapshot.system_disk_digest.is_none()
         || snapshot.manifest_digest.is_none()
     {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "derived image requires a ready filesystem snapshot".into(),
         ));
     }
     if snapshot.sensitive && !allow_sensitive {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "publishing this complete system disk requires explicit sensitive publication authority".into(),
         ));
     }
@@ -320,7 +322,7 @@ pub fn publish_snapshot(
     if result_path.exists() {
         let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
         if old.request_digest != *request_digest {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "derived image staging identity conflicts with the request".into(),
             ));
         }
@@ -345,7 +347,7 @@ pub fn publish_snapshot(
         ImageTrust::ExplicitLocal,
     )?;
     if source.manifest_digest != snapshot.image_digest.as_str() {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "snapshot source image identity changed".into(),
         ));
     }
@@ -355,7 +357,7 @@ pub fn publish_snapshot(
     let template = artifact.join("derived-system.ext4");
     copy_regular(&source.kernel_path, &kernel)?;
     crate::snapshots::materialize_image_template(&host_root.join("snapshots"), snapshot, &template)
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
 
     let snapshot_manifest = snapshot
         .manifest_digest
@@ -374,7 +376,7 @@ pub fn publish_snapshot(
             snapshot.sensitive,
         ),
     )
-    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let platform_artifacts = materialize_derived_platform_artifacts(
         &source,
         &template,
@@ -405,7 +407,7 @@ pub fn publish_snapshot(
     if final_root.exists() {
         let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
         if existing.manifest_digest != verified.manifest_digest {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "derived image directory conflicts with its digest".into(),
             ));
         }
@@ -422,7 +424,7 @@ pub fn publish_snapshot(
     let logical_bytes = snapshot.system_disk_bytes.get();
     let image = ImageRecord {
         digest: Digest::try_from(verified.manifest_digest)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         source_digest: snapshot
             .system_disk_digest
             .as_ref()
@@ -431,9 +433,9 @@ pub fn publish_snapshot(
         platform: "linux".into(),
         architecture: architecture.into(),
         logical_bytes: Counter::try_from(logical_bytes)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
         provenance_digest,
         sensitive: snapshot.sensitive,
     };
@@ -448,7 +450,7 @@ pub fn publish_snapshot(
     Ok(image)
 }
 
-fn remove_derived_artifact(path: &Path) -> Result<(), LinuxError> {
+fn remove_derived_artifact(path: &Path) -> Result<(), ImageBuildError> {
     for name in [
         "manifest.json",
         "derived-system.ext4",
@@ -466,14 +468,14 @@ fn remove_derived_artifact(path: &Path) -> Result<(), LinuxError> {
     Ok(())
 }
 
-fn parse_platform(value: &str) -> Result<GuestPlatform, LinuxError> {
+fn parse_platform(value: &str) -> Result<GuestPlatform, ImageBuildError> {
     let mut components = value.split('/');
     let os = components.next().unwrap_or_default();
     let architecture = components.next().unwrap_or_default();
     let variant = components.next().map(str::to_owned);
     if os.is_empty() || architecture.is_empty() || components.next().is_some() || value.len() > 128
     {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "OCI platform must be os/architecture[/variant]".into(),
         ));
     }
@@ -488,7 +490,7 @@ fn resolve_recipe_boot_image(
     host_root: &Path,
     executable: &Path,
     expected: &Digest,
-) -> Result<VerifiedImage, LinuxError> {
+) -> Result<VerifiedImage, ImageBuildError> {
     let installed = host_root.join("images").join(expected.as_str());
     let image = match fs::symlink_metadata(&installed) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => verify_image(
@@ -498,14 +500,14 @@ fn resolve_recipe_boot_image(
             },
         )?,
         Ok(_) => {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "recipe boot image is not an owned image directory".into(),
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let (image, _) = resolve_source_bundle(executable)?;
             if image.manifest_digest != expected.as_str() {
-                return Err(LinuxError::Invalid(
+                return Err(ImageBuildError::Invalid(
                     "recipe boot image is unavailable".into(),
                 ));
             }
@@ -518,7 +520,7 @@ fn resolve_recipe_boot_image(
 
 /// Container roots without an OS init require an isolated build recipe. They
 /// must not be silently booted as a chroot under a protected supervisor.
-fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
+fn require_os_init(tree: &ConvertedTree) -> Result<(), ImageBuildError> {
     let mut path = "sbin/init".to_owned();
     for _ in 0..32 {
         let entry = tree
@@ -526,7 +528,7 @@ fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
             .iter()
             .find(|entry| entry.path.trim_start_matches('/') == path)
             .ok_or_else(|| {
-                LinuxError::Invalid(
+                ImageBuildError::Invalid(
                     "OCI input has no bootable /sbin/init; an isolated OS build recipe is required"
                         .into(),
                 )
@@ -537,7 +539,7 @@ fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
                 let target = entry
                     .link_target
                     .as_ref()
-                    .ok_or_else(|| LinuxError::Invalid("OS init link has no target".into()))?;
+                    .ok_or_else(|| ImageBuildError::Invalid("OS init link has no target".into()))?;
                 let joined = if target.starts_with('/') || entry.kind == TreeEntryKind::Hardlink {
                     PathBuf::from(target.trim_start_matches('/'))
                 } else {
@@ -555,7 +557,7 @@ fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
                             components.pop();
                         }
                         _ => {
-                            return Err(LinuxError::Invalid(
+                            return Err(ImageBuildError::Invalid(
                                 "OS init link escapes the machine root".into(),
                             ));
                         }
@@ -567,48 +569,52 @@ fn require_os_init(tree: &ConvertedTree) -> Result<(), LinuxError> {
                     .to_string_lossy()
                     .into_owned();
             }
-            _ => return Err(LinuxError::Invalid("OCI OS init is not executable".into())),
+            _ => {
+                return Err(ImageBuildError::Invalid(
+                    "OCI OS init is not executable".into(),
+                ));
+            }
         }
     }
-    Err(LinuxError::Invalid(
+    Err(ImageBuildError::Invalid(
         "OCI OS init link resolution exceeds its bound".into(),
     ))
 }
 
-fn rootfs_size(tree: &ConvertedTree) -> Result<u64, LinuxError> {
+fn rootfs_size(tree: &ConvertedTree) -> Result<u64, ImageBuildError> {
     let payload = tree.entries.iter().try_fold(0u64, |total, entry| {
         if entry.kind == TreeEntryKind::Regular {
             total.checked_add(entry.size)
         } else {
             Some(total)
         }
-        .ok_or_else(|| LinuxError::Invalid("OCI tree size overflow".into()))
+        .ok_or_else(|| ImageBuildError::Invalid("OCI tree size overflow".into()))
     })?;
     let metadata = u64::try_from(tree.entries.len())
         .ok()
         .and_then(|count| count.checked_mul(16 * 1024))
-        .ok_or_else(|| LinuxError::Invalid("OCI tree metadata size overflow".into()))?;
+        .ok_or_else(|| ImageBuildError::Invalid("OCI tree metadata size overflow".into()))?;
     let required = payload
         .checked_add(payload / 2)
         .and_then(|value| value.checked_add(metadata))
         .and_then(|value| value.checked_add(128 * 1024 * 1024))
-        .ok_or_else(|| LinuxError::Invalid("OCI root filesystem size overflow".into()))?;
+        .ok_or_else(|| ImageBuildError::Invalid("OCI root filesystem size overflow".into()))?;
     let bytes = required
         .max(256 * 1024 * 1024)
         .next_multiple_of(1024 * 1024);
     if bytes > MAX_ROOTFS_BYTES {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "OCI root filesystem exceeds the VM image bound".into(),
         ));
     }
     Ok(bytes)
 }
 
-fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, LinuxError> {
+fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, ImageBuildError> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (tar, output, bytes);
-        Err(LinuxError::Invalid(
+        Err(ImageBuildError::Invalid(
             "OCI machine-image conversion requires a qualified journaled ext4 builder on this host"
                 .into(),
         ))
@@ -616,11 +622,11 @@ fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, Lin
     #[cfg(target_os = "linux")]
     {
         let builder = materialize_tar(tar, output, bytes)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
         // The formatter owns the newly created metadata; no guest-modified
         // disk is ever interpreted by e2fsprogs on the host.
         let tune = crate::linux::protected_tool(&["/usr/sbin/tune2fs", "/sbin/tune2fs"])
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
         let status = std::process::Command::new(tune)
             .args(["-O", "has_journal"])
             .arg(output)
@@ -629,13 +635,14 @@ fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, Lin
             .stderr(std::process::Stdio::null())
             .status()?;
         if !status.success() {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "generated OCI filesystem could not acquire a journal".into(),
             ));
         }
-        finalize_journaled_seed(output).map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        finalize_journaled_seed(output)
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
         let check = crate::linux::protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
         let status = std::process::Command::new(check)
             .args(["-fn"])
             .arg(output)
@@ -644,7 +651,7 @@ fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, Lin
             .stderr(std::process::Stdio::null())
             .status()?;
         if !status.success() {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "generated OCI filesystem failed ext4 verification".into(),
             ));
         }
@@ -652,7 +659,7 @@ fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, Lin
     }
 }
 
-fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), LinuxError> {
+fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), ImageBuildError> {
     let verified = verify_image(
         &host_root
             .join("images")
@@ -661,7 +668,7 @@ fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), LinuxEr
         ImageTrust::ExplicitLocal,
     )?;
     if verified.manifest_digest != image.digest.as_str() {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "published image failed identity verification".into(),
         ));
     }
@@ -678,10 +685,10 @@ struct ImageIndex {
     files: BTreeMap<String, String>,
 }
 
-fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), LinuxError> {
+fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), ImageBuildError> {
     if let Some(path) = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from) {
         if !path.is_absolute() {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
             ));
         }
@@ -693,7 +700,7 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
-        .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
+        .ok_or_else(|| ImageBuildError::Invalid("native package layout is invalid".into()))?;
     let architecture = if cfg!(target_arch = "aarch64") {
         "arm64"
     } else {
@@ -704,12 +711,12 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
     let indexed = index
         .files
         .get(&relative)
-        .ok_or_else(|| LinuxError::Invalid("packaged image manifest is absent".into()))?;
+        .ok_or_else(|| ImageBuildError::Invalid("packaged image manifest is absent".into()))?;
     let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
-        LinuxError::Invalid("native host has no bundled image trust identity".into())
+        ImageBuildError::Invalid("native host has no bundled image trust identity".into())
     })?;
     if indexed != pinned {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "packaged image index differs from the native trust identity".into(),
         ));
     }
@@ -729,9 +736,9 @@ fn materialize_platform_artifacts(
     defaults: &Path,
     destination: &Path,
     bytes: u64,
-) -> Result<PlatformArtifacts, LinuxError> {
+) -> Result<PlatformArtifacts, ImageBuildError> {
     let windows = base.windows_x64.as_ref().ok_or_else(|| {
-        LinuxError::Invalid("packaged boot bundle has no Windows artifacts".into())
+        ImageBuildError::Invalid("packaged boot bundle has no Windows artifacts".into())
     })?;
     let kernel = destination.join("windows-kernel");
     let workload_vhdx = destination.join("windows-system.vhdx");
@@ -751,7 +758,7 @@ fn materialize_platform_artifacts(
     _workload: &Path,
     _destination: &Path,
     _bytes: u64,
-) -> Result<PlatformArtifacts, LinuxError> {
+) -> Result<PlatformArtifacts, ImageBuildError> {
     Ok(PlatformArtifacts::default())
 }
 
@@ -760,23 +767,23 @@ fn materialize_derived_platform_artifacts(
     system: &Path,
     destination: &Path,
     bytes: u64,
-) -> Result<PlatformArtifacts, LinuxError> {
+) -> Result<PlatformArtifacts, ImageBuildError> {
     materialize_platform_artifacts(source, system, destination, bytes)
 }
 
 #[cfg(target_os = "windows")]
-fn image_artifact(path: &Path, name: &str) -> Result<ImageArtifact, LinuxError> {
+fn image_artifact(path: &Path, name: &str) -> Result<ImageArtifact, ImageBuildError> {
     Ok(ImageArtifact {
         path: name.into(),
         sha256: sha256_file(path, MAX_ROOTFS_BYTES)?,
     })
 }
 
-fn prepare_private_directory(path: &Path) -> Result<(), LinuxError> {
+fn prepare_private_directory(path: &Path) -> Result<(), ImageBuildError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
         Ok(_) => {
-            return Err(LinuxError::Invalid(
+            return Err(ImageBuildError::Invalid(
                 "image staging path is not a directory".into(),
             ));
         }
@@ -790,7 +797,7 @@ fn prepare_private_directory(path: &Path) -> Result<(), LinuxError> {
     Ok(())
 }
 
-fn create_private_file(path: &Path) -> Result<File, LinuxError> {
+fn create_private_file(path: &Path) -> Result<File, ImageBuildError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -800,10 +807,10 @@ fn create_private_file(path: &Path) -> Result<File, LinuxError> {
     Ok(options.open(path)?)
 }
 
-fn copy_regular(source: &Path, destination: &Path) -> Result<(), LinuxError> {
+fn copy_regular(source: &Path, destination: &Path) -> Result<(), ImageBuildError> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "image input is not a regular file".into(),
         ));
     }
@@ -833,10 +840,10 @@ pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError>
     Ok(())
 }
 
-fn artifact_storage_bytes(root: &Path) -> Result<u64, LinuxError> {
+fn artifact_storage_bytes(root: &Path) -> Result<u64, ImageBuildError> {
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "image artifact root is not a directory".into(),
         ));
     }
@@ -848,25 +855,25 @@ fn artifact_storage_bytes(root: &Path) -> Result<u64, LinuxError> {
             let entry = entry?;
             entries = entries
                 .checked_add(1)
-                .ok_or_else(|| LinuxError::Invalid("image artifact count overflow".into()))?;
+                .ok_or_else(|| ImageBuildError::Invalid("image artifact count overflow".into()))?;
             if entries > 1_000_000 {
-                return Err(LinuxError::Invalid(
+                return Err(ImageBuildError::Invalid(
                     "image artifact count exceeds its bound".into(),
                 ));
             }
             let metadata = fs::symlink_metadata(entry.path())?;
             if metadata.file_type().is_symlink() {
-                return Err(LinuxError::Invalid(
+                return Err(ImageBuildError::Invalid(
                     "image artifact contains a symbolic link".into(),
                 ));
             }
             total = total
                 .checked_add(allocated_bytes(&metadata)?)
-                .ok_or_else(|| LinuxError::Invalid("image storage size overflow".into()))?;
+                .ok_or_else(|| ImageBuildError::Invalid("image storage size overflow".into()))?;
             if metadata.is_dir() {
                 pending.push(entry.path());
             } else if !metadata.is_file() {
-                return Err(LinuxError::Invalid(
+                return Err(ImageBuildError::Invalid(
                     "image artifact contains a special file".into(),
                 ));
             }
@@ -876,15 +883,15 @@ fn artifact_storage_bytes(root: &Path) -> Result<u64, LinuxError> {
 }
 
 #[cfg(unix)]
-fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, LinuxError> {
+fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, ImageBuildError> {
     metadata
         .blocks()
         .checked_mul(512)
-        .ok_or_else(|| LinuxError::Invalid("image allocated size overflow".into()))
+        .ok_or_else(|| ImageBuildError::Invalid("image allocated size overflow".into()))
 }
 
 #[cfg(not(unix))]
-fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, LinuxError> {
+fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, ImageBuildError> {
     // The Windows artifacts are dynamic VHDX files; their file length is the
     // portable lower bound available without opening another authority-bearing
     // filesystem handle. Quota admission remains conservative for ordinary
@@ -892,26 +899,26 @@ fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, LinuxError> {
     Ok(metadata.len())
 }
 
-fn bare_digest(value: &str) -> Result<&str, LinuxError> {
+fn bare_digest(value: &str) -> Result<&str, ImageBuildError> {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     if value.len() != 64
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(LinuxError::Invalid("OCI digest is malformed".into()));
+        return Err(ImageBuildError::Invalid("OCI digest is malformed".into()));
     }
     Ok(value)
 }
 
-fn short_digest(value: &str) -> Result<&str, LinuxError> {
+fn short_digest(value: &str) -> Result<&str, ImageBuildError> {
     Ok(&bare_digest(value)?[..16])
 }
 
-fn sha256_file(path: &Path, maximum: u64) -> Result<String, LinuxError> {
+fn sha256_file(path: &Path, maximum: u64) -> Result<String, ImageBuildError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "image artifact is not a bounded regular file".into(),
         ));
     }
@@ -928,7 +935,7 @@ fn sha256_file(path: &Path, maximum: u64) -> Result<String, LinuxError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LinuxError> {
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ImageBuildError> {
     let bytes = serde_json::to_vec(value)?;
     let mut file = create_private_file(path)?;
     file.write_all(&bytes)?;
@@ -936,10 +943,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), LinuxError> {
     Ok(())
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, maximum: u64) -> Result<T, LinuxError> {
+fn read_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    maximum: u64,
+) -> Result<T, ImageBuildError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
-        return Err(LinuxError::Invalid(
+        return Err(ImageBuildError::Invalid(
             "image import result is malformed".into(),
         ));
     }
@@ -950,10 +960,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, maximum: u64) -> Result<
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn short_nonce() -> Result<String, LinuxError> {
+fn short_nonce() -> Result<String, ImageBuildError> {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes)
-        .map_err(|_| LinuxError::Invalid("host entropy unavailable".into()))?;
+        .map_err(|_| ImageBuildError::Invalid("host entropy unavailable".into()))?;
     use std::fmt::Write as _;
     let mut output = String::with_capacity(16);
     for byte in bytes {

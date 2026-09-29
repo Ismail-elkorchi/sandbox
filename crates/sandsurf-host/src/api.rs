@@ -8,7 +8,6 @@ use sandsurf_state::{
     HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const HOST_API_VERSION: u16 = 4;
@@ -90,17 +89,9 @@ pub struct MachineView {
     pub lifecycle_intent: LifecycleIntent,
     pub machine: Observation<MachineObservation>,
     pub management: Observation<sandsurf_protocol::GuestManagementReport>,
-    pub execution_defaults: ImageDefaultsView,
+    pub execution_defaults: ExecutionDefaults,
     pub lifetime: MachineLifetime,
     pub last_activity_unix_millis: Counter,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ImageDefaultsView {
-    pub environment: BTreeMap<String, String>,
-    pub user: Option<String>,
-    pub working_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -16,10 +16,11 @@ use sandsurf_protocol::{
     NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
 };
 use sandsurf_protocol::{
-    Counter, Digest, Domain, GuestCommand, GuestServiceRequest, GuestServiceResponse,
-    LifecycleCommand, MachineId, MachineObservation, MachineState, NativeSnapshotRequest,
-    NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources, RuntimeConfiguration,
-    SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest, digest,
+    Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
+    GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
+    NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources,
+    RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest,
+    digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -169,7 +170,7 @@ pub fn read_config(
 pub fn execution_defaults(
     host_root: &Path,
     image_digest: &Digest,
-) -> Result<crate::api::ImageDefaultsView, WindowsError> {
+) -> Result<ExecutionDefaults, WindowsError> {
     let image = verify_image(
         &host_root
             .join("images")
@@ -183,7 +184,7 @@ pub fn execution_defaults(
         ));
     }
     let defaults = image.manifest.system.defaults;
-    Ok(crate::api::ImageDefaultsView {
+    Ok(ExecutionDefaults {
         environment: defaults.environment,
         user: defaults.user,
         working_directory: defaults.working_directory,
@@ -268,11 +269,6 @@ impl WindowsGuardianEffect {
         let disks = machine_root.join("disks");
         fs::create_dir_all(&disks)?;
         let system_disk = disks.join("system.vhdx");
-        ensure_mutable_vhdx(
-            &windows.system_path,
-            &system_disk,
-            config.resources.disk_bytes.get(),
-        )?;
         let ports = vec![
             GUEST_BOOTSTRAP_PORT,
             GUEST_CONTROL_PORT,
@@ -325,6 +321,20 @@ impl WindowsGuardianEffect {
         command: &LifecycleCommand,
         generation: Counter,
     ) -> Result<(), Digest> {
+        let image = verify_image(&self.config.image_manifest, ImageTrust::ExplicitLocal)
+            .map_err(|_| bytes_digest(b"hyper-v-system-seed-unavailable"))?;
+        let windows = image
+            .windows_x64
+            .ok_or_else(|| bytes_digest(b"hyper-v-system-seed-unavailable"))?;
+        ensure_mutable_vhdx(
+            &windows.system_path,
+            &self.machine_root.join("disks/system.vhdx"),
+            command.configuration.resources.disk_bytes.get(),
+        )
+        .map_err(|error| {
+            eprintln!("sandsurf disk preparation failed: {error}");
+            bytes_digest(b"hyper-v-system-disk-preparation-failed")
+        })?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"hyper-v-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"hyper-v-network-entropy"))?;

@@ -102,6 +102,19 @@ fn reclaim_staging(staged: &Path) -> io::Result<()> {
     }
 }
 
+/// Called by the host only after the guardian's committed native detach/exit.
+/// Never removes the machine root, output ledger, artifacts, or snapshots.
+pub(crate) fn retire(disk: &Path) -> io::Result<()> {
+    if !disk.is_absolute() || disk.parent().is_none() {
+        return Err(invalid("disk retirement requires an absolute storage path"));
+    }
+    reclaim_staging(&disk.with_extension("building"))?;
+    reclaim_staging(disk)?;
+    #[cfg(unix)]
+    File::open(disk.parent().expect("validated parent"))?.sync_all()?;
+    Ok(())
+}
+
 fn validate_disk(path: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -166,7 +179,13 @@ mod tests {
         assert!(!target.with_extension("building").exists());
         assert_eq!(&fs::read(&target).unwrap()[..12], b"guest-owned!");
         assert!(materialize(&source, &target, 8192, DiskFormat::Raw, |_| Ok(())).is_err());
-        fs::remove_file(target).unwrap();
+        let retained = root.join("retained-output");
+        fs::write(&retained, b"protected bytes").unwrap();
+        retire(&target).unwrap();
+        assert!(!target.exists());
+        retire(&target).unwrap();
+        assert_eq!(fs::read(&retained).unwrap(), b"protected bytes");
+        fs::remove_file(retained).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

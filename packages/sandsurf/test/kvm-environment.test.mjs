@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
@@ -150,12 +150,39 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       assert.ok(pending.machine.value.appliedRevision < pending.configurationRevision,
         "the failure must leave an admitted but unapplied host revision");
       await machine.destroy();
+      const systemDisk = join(directory, "machines", machine.id, "disks/system.ext4");
+      await assert.rejects(stat(systemDisk), { code: "ENOENT" });
     } finally {
       await new Promise((done) => occupied.close(done));
     }
     assertSameBytes(await output(execution), dense);
     const archivedReceipt = await execution.receipt();
     assert.ok(archivedReceipt);
+    context.diagnostic("retained evidence reconnects without boot images or a native VM owner");
+    await host.close();
+    await (await NativeHostClient.open(directory)).stopService();
+    const retiredEndpoint = join(directory, "machines", identity, "guardian/control.sock");
+    const deadline = Date.now() + 10_000;
+    while (await stat(retiredEndpoint).then(() => true, (error) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    })) {
+      assert.ok(Date.now() < deadline, "destroyed guardian did not retire");
+      await new Promise((done) => setTimeout(done, 100));
+    }
+    const installedImage = join(directory, "images", image);
+    const unavailableImage = join(directory, "images", `${image}.test-unavailable`);
+    await rename(installedImage, unavailableImage);
+    try {
+      host = await Sandsurf.open({ directory, authorizer: () => true });
+      machine = await host.machines.connect(identity);
+      execution = await machine.executions.get("retained-dense");
+      assert.equal((await machine.inspect()).machine.value.state, "destroyed");
+      assertSameBytes(await output(execution), dense);
+      await assert.rejects(stat(join(directory, "machines", identity, "disks/system.ext4")), { code: "ENOENT" });
+    } finally {
+      await rename(unavailableImage, installedImage);
+    }
     await execution.acknowledge(archivedReceipt.digest);
     const pinned = await execution.pin("archive-copy", archivedReceipt.digest);
     const released = await execution.release(archivedReceipt, { kind: "continuing-retention", pin: pinned.id });

@@ -381,24 +381,6 @@ impl LocalConnection {
         if peer.uid != expected_uid {
             return Err(denied("local peer belongs to another account"));
         }
-        #[cfg(target_os = "macos")]
-        {
-            let enabled: libc::c_int = 1;
-            // SAFETY: SO_NOSIGPIPE receives one correctly sized initialized int
-            // on this owned socket. A peer close must be an I/O error, not SIGPIPE.
-            if unsafe {
-                libc::setsockopt(
-                    stream.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    (&raw const enabled).cast(),
-                    std::mem::size_of_val(&enabled) as libc::socklen_t,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-        }
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,

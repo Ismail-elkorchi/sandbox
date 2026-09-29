@@ -157,7 +157,9 @@ pub trait GuestDriver: Send {
 
 pub struct Guardian<E> {
     journal: RuntimeJournal,
-    effect: E,
+    // Native ownership ends at confirmed destruction. The durable ledger can
+    // remain available without image files, virtual hardware, or a guest.
+    effect: Option<E>,
     management_seen: Option<std::time::Instant>,
     execution_seen: std::collections::BTreeMap<ExecutionId, std::time::Instant>,
 }
@@ -194,13 +196,35 @@ impl<E: GuardianEffect> Guardian<E> {
     pub fn new(journal: RuntimeJournal, effect: E) -> Self {
         Self {
             journal,
-            effect,
+            effect: Some(effect),
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
         }
     }
 
+    pub fn retained(journal: RuntimeJournal) -> Result<Self> {
+        if journal
+            .last_observation()?
+            .is_none_or(|value| value.value().state != MachineState::Destroyed)
+        {
+            return Err(Error::Protocol(
+                "retained evidence requires confirmed native destruction",
+            ));
+        }
+        Ok(Self {
+            journal,
+            effect: None,
+            management_seen: None,
+            execution_seen: std::collections::BTreeMap::new(),
+        })
+    }
+
     fn begin_guest(&mut self, request: GuardianRequest) -> Result<GuestAdmission> {
+        if self.effect.is_none() {
+            return Err(Error::Unsupported(
+                "destroyed machine has no guest transport",
+            ));
+        }
         match request {
             GuardianRequest::Dispatch { command } => {
                 self.journal.admit(command.clone())?;
@@ -286,7 +310,12 @@ impl<E: GuardianEffect> Guardian<E> {
         let Some(current) = self.journal.last_observation()? else {
             return Ok(None);
         };
-        if current.value().state != MachineState::Running || !self.effect.guest_poll_allowed() {
+        if current.value().state != MachineState::Running
+            || !self
+                .effect
+                .as_ref()
+                .is_some_and(|effect| effect.guest_poll_allowed())
+        {
             return Ok(None);
         }
         let generation = current.value().generation;
@@ -492,7 +521,10 @@ impl<E: GuardianEffect> Guardian<E> {
             .journal
             .last_observation()?
             .is_some_and(|value| value.value().state == MachineState::Destroyed)
-            && !self.effect.live_observation_reachable())
+            && self
+                .effect
+                .as_mut()
+                .is_none_or(|effect| !effect.live_observation_reachable()))
     }
 
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
@@ -509,7 +541,10 @@ impl<E: GuardianEffect> Guardian<E> {
                         if !matches!(
                             value.value().state,
                             MachineState::Running | MachineState::Paused
-                        ) || self.effect.live_observation_reachable() =>
+                        ) || self
+                            .effect
+                            .as_mut()
+                            .is_some_and(|effect| effect.live_observation_reachable()) =>
                     {
                         Observation::Current {
                             value: value.value().clone(),
@@ -563,8 +598,12 @@ impl<E: GuardianEffect> Guardian<E> {
                         self.reconcile_lifecycle(operation)?
                     }
                     sandsurf_state::LifecycleDecision::Perform(permit) => {
-                        let outcome = permit
-                            .perform(|actual| self.effect.transition(actual, current.as_ref()));
+                        let native = self
+                            .effect
+                            .as_mut()
+                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
+                        let outcome =
+                            permit.perform(|actual| native.transition(actual, current.as_ref()));
                         match outcome {
                             LifecycleEffect::Observed(transitions) => {
                                 if transitions.is_empty() || transitions.len() > 8 {
@@ -583,7 +622,7 @@ impl<E: GuardianEffect> Guardian<E> {
                                         .last()
                                         .expect("restored transition checked above")
                                         .generation;
-                                    self.effect
+                                    native
                                         .rebind_restored_runtime(&mut self.journal, generation)?;
                                 }
                                 let mut references = Vec::with_capacity(transitions.len());
@@ -665,8 +704,11 @@ impl<E: GuardianEffect> Guardian<E> {
                         self.reconcile_configuration(operation)?
                     }
                     sandsurf_state::ConfigurationDecision::Perform(permit) => {
-                        let outcome =
-                            permit.perform(|actual| self.effect.configure(actual, &current));
+                        let native = self
+                            .effect
+                            .as_mut()
+                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
+                        let outcome = permit.perform(|actual| native.configure(actual, &current));
                         match outcome {
                             EffectOutcome::Applied(evidence) => {
                                 let sequence = current.sequence.next().map_err(|_| {
@@ -717,7 +759,11 @@ impl<E: GuardianEffect> Guardian<E> {
                 if &machine_id != self.journal.machine_id() {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
-                let response = self.effect.native_snapshot(request, &mut self.journal)?;
+                let response = self
+                    .effect
+                    .as_mut()
+                    .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
+                    .native_snapshot(request, &mut self.journal)?;
                 Ok(GuardianResponse::NativeSnapshot { response })
             }
             GuardianRequest::Runtime {
@@ -735,11 +781,17 @@ impl<E: GuardianEffect> Guardian<E> {
                             .ok_or(Error::Protocol("native resource state is unavailable"))?;
                         self.journal.validate_resource_envelope(&resources)?;
                         self.effect
+                            .as_ref()
+                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
                             .validate_resources(&resources, current.value())?;
                         RuntimeResponse::Complete
                     }
                     RuntimeRequest::Usage => {
-                        let mut usage = self.effect.resource_usage()?;
+                        let mut usage = self
+                            .effect
+                            .as_mut()
+                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
+                            .resource_usage()?;
                         usage.output_retained_bytes = self.journal.retained_output_bytes()?;
                         usage.executions_current = Counter::try_from(
                             self.journal
@@ -1312,29 +1364,35 @@ pub fn serve_guardian<E: GuardianEffect>(
     let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
     let (guest_jobs, guest_queue) = mpsc::sync_channel::<GuestWorkItem>(16);
     let completion_sender = sender.clone();
-    let mut guest = guardian.effect.guest_driver();
-    let guest_worker = std::thread::Builder::new()
-        .name("sandsurf-guest-io".into())
-        .spawn(move || {
-            while let Ok(GuestWorkItem {
-                job,
-                pending,
-                reply,
-            }) = guest_queue.recv()
-            {
-                let result = crate::guest_worker::execute(&mut *guest, job);
-                if completion_sender
-                    .send(GuardianIngress::GuestComplete {
+    let guest_worker = guardian
+        .effect
+        .as_mut()
+        .map(|native| {
+            let mut guest = native.guest_driver();
+            std::thread::Builder::new()
+                .name("sandsurf-guest-io".into())
+                .spawn(move || {
+                    while let Ok(GuestWorkItem {
+                        job,
                         pending,
-                        result,
                         reply,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })?;
+                    }) = guest_queue.recv()
+                    {
+                        let result = crate::guest_worker::execute(&mut *guest, job);
+                        if completion_sender
+                            .send(GuardianIngress::GuestComplete {
+                                pending,
+                                result,
+                                reply,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+        })
+        .transpose()?;
     let mut outstanding_guest_jobs = 0usize;
     let mut poll_in_flight = false;
     let mut last_poll = std::time::Instant::now();

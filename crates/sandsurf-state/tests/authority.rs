@@ -116,6 +116,14 @@ fn machine_execution_defaults_is_host_owned_and_durable() {
             image,
             resources: resources(),
             defaults: defaults.clone(),
+            image_defaults: ExecutionDefaults {
+                environment: std::collections::BTreeMap::from([
+                    ("MODE".into(), "image".into()),
+                    ("IMAGE_ONLY".into(), "retained".into()),
+                ]),
+                user: Some("root".into()),
+                working_directory: Some("/home".into()),
+            },
             lifetime: lifetime.clone(),
             operation,
         },
@@ -125,8 +133,12 @@ fn machine_execution_defaults_is_host_owned_and_durable() {
         },
     )
     .unwrap();
+    let mut expected = defaults.clone();
+    expected
+        .environment
+        .insert("IMAGE_ONLY".into(), "retained".into());
     let created = host.machine(&machine).unwrap().unwrap();
-    assert_eq!(created.execution_defaults, defaults);
+    assert_eq!(created.execution_defaults, expected);
     assert_eq!(created.lifetime, lifetime);
     let later = created.last_activity_unix_millis.next().unwrap();
     host.observe_activity(&machine, later).unwrap();
@@ -138,7 +150,7 @@ fn machine_execution_defaults_is_host_owned_and_durable() {
         .machine(&machine)
         .unwrap()
         .unwrap();
-    assert_eq!(reopened.execution_defaults, defaults);
+    assert_eq!(reopened.execution_defaults, expected);
     assert_eq!(reopened.lifetime, lifetime);
     assert_eq!(reopened.last_activity_unix_millis, later);
 }
@@ -171,6 +183,7 @@ fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() 
             image,
             resources: resources(),
             defaults,
+            image_defaults: ExecutionDefaults::default(),
             lifetime: MachineLifetime::default(),
             operation: create,
         },
@@ -452,6 +465,7 @@ fn new_machine_inherits_sensitive_image_classification() {
                 image: image.digest,
                 resources: resources(),
                 defaults,
+                image_defaults: ExecutionDefaults::default(),
                 lifetime,
                 operation,
             },
@@ -699,6 +713,7 @@ impl Fixture {
                 image,
                 resources: resources(),
                 defaults,
+                image_defaults: ExecutionDefaults::default(),
                 lifetime: MachineLifetime::default(),
                 operation: create.clone(),
             },
@@ -2012,6 +2027,7 @@ fn admission_reservations_are_transactional_and_no_eviction_occurs() {
                     image,
                     resources,
                     defaults,
+                    image_defaults: ExecutionDefaults::default(),
                     lifetime: MachineLifetime::default(),
                     operation: operation.clone(),
                 },
@@ -2518,6 +2534,17 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     observation.evidence_digest = hash("runtime-and-disks-cleaned");
     let destroyed = f.runtime.observe(observation).unwrap();
     f.host.complete_intent(&destroyed).unwrap();
+    assert_eq!(
+        f.host.machine(&f.machine).unwrap().unwrap().reservation,
+        ReservationState::Held
+    );
+    assert!(
+        f.host.revision(&f.machine).is_err(),
+        "retired identity cannot acquire new machine authority during cleanup"
+    );
+    drop(f.host);
+    f.host = HostCatalog::open(&f.root.0.join("host")).unwrap();
+    f.host.release_retired_storage(&f.machine).unwrap();
     let retired = f.host.machine(&f.machine).unwrap().unwrap();
     assert_eq!(retired.reservation, ReservationState::Released);
     assert!(retired.latest_intent.completion.is_some());

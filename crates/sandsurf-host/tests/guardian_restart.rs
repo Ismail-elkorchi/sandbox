@@ -129,6 +129,7 @@ impl Fixture {
         .unwrap();
         host.create_machine(
             MachineAdmission {
+                image_defaults: ExecutionDefaults::default(),
                 id: machine.clone(),
                 image,
                 resources: resources(),
@@ -341,6 +342,38 @@ impl GuardianEffect for FileEffect {
         };
         LifecycleEffect::Observed(states)
     }
+}
+
+#[test]
+fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner() {
+    let fixture = Fixture::new();
+    let path = fixture.root.0.join("runtime");
+    let mut runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    assert!(Guardian::<FileEffect>::retained(runtime).is_err());
+    runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    let mut last = runtime.last_observation().unwrap().unwrap().value().clone();
+    for state in [MachineState::Destroying, MachineState::Destroyed] {
+        last.state = state;
+        last.sequence = last.sequence.next().unwrap();
+        runtime.observe(last.clone()).unwrap();
+    }
+    drop(runtime);
+    let runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    let mut guardian = Guardian::<FileEffect>::retained(runtime).unwrap();
+    assert!(matches!(guardian.handle(GuardianRequest::Inspect {
+        machine_id: fixture.machine.clone(), operation_id: None,
+    }), GuardianResponse::Inspection { value } if matches!(value.observation, Observation::Current { value: MachineObservation { state: MachineState::Destroyed, .. }})));
+    assert!(matches!(
+        guardian.handle(GuardianRequest::NativeSnapshot {
+            machine_id: fixture.machine.clone(),
+            request: NativeSnapshotRequest::PrepareDisk {
+                operation_id: "capture-retired".try_into().unwrap()
+            },
+        }),
+        GuardianResponse::Rejected { .. }
+    ));
+    assert!(guardian.can_retire().unwrap());
+    assert!(!fixture.root.0.join("effects.log").exists());
 }
 
 #[test]

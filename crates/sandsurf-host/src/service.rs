@@ -13,7 +13,7 @@ use sandsurf_state::{
     RuntimeLimits,
 };
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -156,8 +156,6 @@ pub struct HostService {
     executable: PathBuf,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     verified_guardians: BTreeSet<MachineId>,
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    verified_execution_defaults: BTreeMap<String, crate::api::ImageDefaultsView>,
     artifacts: Arc<crate::artifacts::ArtifactStore>,
     secrets: crate::secrets::SecretAuthority,
 }
@@ -189,8 +187,6 @@ impl HostService {
             executable,
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             verified_guardians: BTreeSet::new(),
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            verified_execution_defaults: BTreeMap::new(),
             artifacts,
             secrets,
         };
@@ -819,6 +815,12 @@ impl HostService {
                     &image_digest,
                     &resources,
                 )?;
+                #[cfg(target_os = "linux")]
+                let image_defaults = crate::linux::execution_defaults(&self.root, &image_digest)?;
+                #[cfg(target_os = "macos")]
+                let image_defaults = crate::apple::execution_defaults(&self.root, &image_digest)?;
+                #[cfg(target_os = "windows")]
+                let image_defaults = crate::windows::execution_defaults(&self.root, &image_digest)?;
                 let approval = Approval {
                     id: approval_id,
                     request_digest: digest(
@@ -839,6 +841,7 @@ impl HostService {
                         image: image_digest,
                         resources,
                         defaults: execution_defaults,
+                        image_defaults,
                         lifetime,
                         operation: operation_id.clone(),
                     },
@@ -1085,6 +1088,9 @@ impl HostService {
                 let lifecycle = self.apply_lifecycle_intent(&intent, endpoint)?;
                 if desired == DesiredState::Running && lifecycle.completed_intent.is_some() {
                     self.catalog.observe_activity(&machine_id, unix_millis()?)?;
+                }
+                if desired == DesiredState::Destroyed && lifecycle.completed_intent.is_some() {
+                    self.retire_machine_storage(&machine_id)?;
                 }
                 let record = self
                     .catalog
@@ -2168,6 +2174,12 @@ impl HostService {
     }
 
     fn provision_guardian(&mut self, machine: &MachineId) -> Result<()> {
+        if self.catalog.machine(machine)?.is_some_and(|record| {
+            record.latest_intent.desired == DesiredState::Destroyed
+                && record.latest_intent.completion.is_some()
+        }) {
+            return self.provision_guardian_inner(machine);
+        }
         #[cfg(target_os = "linux")]
         return self.provision_guardian_with_config(machine, None);
         #[cfg(target_os = "macos")]
@@ -2319,59 +2331,9 @@ impl HostService {
                 Observation::Unavailable { last_known: None },
             ),
         };
-        #[cfg(target_os = "linux")]
-        let execution_defaults = if let Some(value) = self
-            .verified_execution_defaults
-            .get(record.image_digest.as_str())
-            .cloned()
-        {
-            value
-        } else {
-            let value = crate::linux::execution_defaults(&self.root, &record.image_digest)?;
-            self.verified_execution_defaults
-                .insert(record.image_digest.as_str().to_owned(), value.clone());
-            value
-        };
-        #[cfg(target_os = "macos")]
-        let execution_defaults = if let Some(value) = self
-            .verified_execution_defaults
-            .get(record.image_digest.as_str())
-            .cloned()
-        {
-            value
-        } else {
-            let value = crate::apple::execution_defaults(&self.root, &record.image_digest)?;
-            self.verified_execution_defaults
-                .insert(record.image_digest.as_str().to_owned(), value.clone());
-            value
-        };
-        #[cfg(target_os = "windows")]
-        let execution_defaults = if let Some(value) = self
-            .verified_execution_defaults
-            .get(record.image_digest.as_str())
-            .cloned()
-        {
-            value
-        } else {
-            let value = crate::windows::execution_defaults(&self.root, &record.image_digest)?;
-            self.verified_execution_defaults
-                .insert(record.image_digest.as_str().to_owned(), value.clone());
-            value
-        };
-        let mut execution_defaults = execution_defaults;
-        execution_defaults
-            .environment
-            .extend(record.execution_defaults.environment.clone());
-        if record.execution_defaults.user.is_some() {
-            execution_defaults.user = record.execution_defaults.user.clone();
-        }
-        if record.execution_defaults.working_directory.is_some() {
-            execution_defaults.working_directory =
-                record.execution_defaults.working_directory.clone();
-        }
         Ok(MachineView {
             known_sensitive: record.known_sensitive,
-            execution_defaults,
+            execution_defaults: record.execution_defaults,
             lifetime: record.lifetime,
             last_activity_unix_millis: record.last_activity_unix_millis,
             id: record.id,
@@ -2467,6 +2429,12 @@ impl HostService {
             }
             after = records.last().map(|record| record.id.clone());
             for mut record in records {
+                if record.latest_intent.desired == DesiredState::Destroyed
+                    && record.latest_intent.completion.is_some()
+                {
+                    self.retire_machine_storage(&record.id)?;
+                    continue;
+                }
                 if record.reservation == ReservationState::Released {
                     continue;
                 }
@@ -2567,6 +2535,28 @@ impl HostService {
 
     fn machine_root(&self, machine: &MachineId) -> PathBuf {
         self.root.join("machines").join(machine.as_str())
+    }
+
+    fn retire_machine_storage(&mut self, machine: &MachineId) -> Result<()> {
+        let record = self
+            .catalog
+            .machine(machine)?
+            .ok_or(HostError::Invalid("machine is missing"))?;
+        if record.latest_intent.desired != DesiredState::Destroyed
+            || record.latest_intent.completion.is_none()
+        {
+            return Err(HostError::Invalid(
+                "disk retirement requires confirmed native destruction",
+            ));
+        }
+        crate::storage::retire(
+            &self
+                .machine_root(machine)
+                .join("disks")
+                .join(system_disk_name()),
+        )?;
+        self.catalog.release_retired_storage(machine)?;
+        Ok(())
     }
 
     fn guardian_endpoint(&self, machine: &MachineId) -> PathBuf {
@@ -3104,6 +3094,19 @@ impl Drop for ActiveHostConnection {
 pub fn serve_machine_guardian(root: &Path, machine: MachineId) -> Result<()> {
     let machine_root = root.join("machines").join(machine.as_str());
     let journal = RuntimeJournal::open(&machine_root.join("runtime"), &machine)?;
+    if journal
+        .last_observation()?
+        .is_some_and(|value| value.value().state == MachineState::Destroyed)
+    {
+        #[cfg(target_os = "linux")]
+        let mut guardian = Guardian::<crate::linux::LinuxGuardianEffect>::retained(journal)?;
+        #[cfg(target_os = "macos")]
+        let mut guardian = Guardian::<crate::apple::AppleGuardianEffect>::retained(journal)?;
+        #[cfg(target_os = "windows")]
+        let mut guardian = Guardian::<crate::windows::WindowsGuardianEffect>::retained(journal)?;
+        serve_guardian(&machine_root.join("guardian"), &mut guardian)?;
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     {
         let config =

@@ -185,6 +185,9 @@ pub struct MachineAdmission {
     pub image: Digest,
     pub resources: Resources,
     pub defaults: ExecutionDefaults,
+    /// Host-verified metadata from the exact admitted immutable image.
+    /// Resolved preferences are persisted once; later reads need no image.
+    pub image_defaults: ExecutionDefaults,
     pub lifetime: MachineLifetime,
     pub operation: OperationId,
 }
@@ -1456,6 +1459,7 @@ impl HostCatalog {
             image,
             resources,
             defaults,
+            mut image_defaults,
             lifetime,
             operation,
         } = admission;
@@ -1471,6 +1475,14 @@ impl HostCatalog {
                 "creation approval does not bind the exact request",
             ));
         }
+        image_defaults.environment.extend(defaults.environment);
+        if defaults.user.is_some() {
+            image_defaults.user = defaults.user;
+        }
+        if defaults.working_directory.is_some() {
+            image_defaults.working_directory = defaults.working_directory;
+        }
+        image_defaults.validate()?;
         let tx = self.db.connection.transaction()?;
         if let Some(old) = intent(&tx, &operation)? {
             if old.request_digest == request {
@@ -1509,7 +1521,7 @@ impl HostCatalog {
                 id.as_str(),
                 image.as_str(),
                 encode(&runtime_configuration)?,
-                encode(&defaults)?,
+                encode(&image_defaults)?,
                 encode(&lifetime)?,
                 activity.get(),
                 sensitive
@@ -1585,7 +1597,7 @@ impl HostCatalog {
         }
         record_approval(&tx, &approval, self.limits.operations)?;
         let configuration = initial_runtime_configuration(&resources)?;
-        let source_workload: String = tx.query_row(
+        let source_defaults: String = tx.query_row(
             "SELECT defaults FROM machines WHERE id=?1",
             [snapshot.request.machine_id.as_str()],
             |row| row.get(0),
@@ -1597,7 +1609,7 @@ impl HostCatalog {
                 id.as_str(),
                 snapshot.image_digest.as_str(),
                 encode(&configuration)?,
-                source_workload,
+                source_defaults,
                 encode(&lifetime)?,
                 activity.get(),
                 snapshot.sensitive
@@ -2063,17 +2075,28 @@ impl HostCatalog {
             "UPDATE intents SET value=?2 WHERE id=?1",
             params![value.operation_id.as_str(), encode(&value)?],
         )?;
-        if value.desired == DesiredState::Destroyed {
-            // A Destroyed guardian observation is the lifecycle postcondition
-            // that releases this machine reservation. Runtime receipts and
-            // other retained evidence remain governed by their own ledgers.
-            tx.execute(
-                "UPDATE machines SET released=1 WHERE id=?1",
-                [value.machine_id.as_str()],
-            )?;
-        }
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Host storage commits this only after native destruction and durable
+    /// disk deletion. Output, artifacts, and snapshots have separate owners.
+    pub fn release_retired_storage(&mut self, machine: &MachineId) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        let record = machine_record(&tx, machine)?.ok_or(Error::Missing("machine is missing"))?;
+        if record.latest_intent.desired != DesiredState::Destroyed
+            || record.latest_intent.completion.is_none()
+        {
+            return Err(Error::Conflict(
+                "storage release requires confirmed native destruction",
+            ));
+        }
+        tx.execute(
+            "UPDATE machines SET released=1 WHERE id=?1",
+            [machine.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn revision(&self, machine: &MachineId) -> Result<Counter> {
@@ -2454,15 +2477,15 @@ fn initial_runtime_configuration(resources: &Resources) -> Result<RuntimeConfigu
 }
 
 fn revision(db: &rusqlite::Connection, machine: &MachineId) -> Result<Counter> {
-    let value = db
-        .query_row(
-            "SELECT revision FROM machines WHERE id=?1 AND released=0",
-            [machine.as_str()],
-            |r| r.get::<_, u64>(0),
-        )
-        .optional()?
-        .ok_or(Error::Missing("machine identity is missing or retired"))?;
-    Ok(value.try_into()?)
+    let record =
+        machine_record(db, machine)?.ok_or(Error::Missing("machine identity is missing"))?;
+    if record.reservation == ReservationState::Released
+        || (record.latest_intent.desired == DesiredState::Destroyed
+            && record.latest_intent.completion.is_some())
+    {
+        return Err(Error::Missing("machine identity is retired"));
+    }
+    Ok(record.configuration_revision)
 }
 fn require_revision(
     db: &rusqlite::Connection,
