@@ -862,7 +862,8 @@ fn publish_file(
             // SAFETY: both names are single components, the directory is held
             // open, and both C string buffers live through the syscall.
             if unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     parent.as_raw_fd(),
                     temporary.as_ptr(),
                     parent.as_raw_fd(),

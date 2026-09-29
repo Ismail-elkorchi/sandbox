@@ -251,10 +251,10 @@ impl HyperVDriver {
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;
-        if let Some(path) = self.full_capture_state.take() {
-            if !self.revoke_path_access(&path) {
-                return Err(HyperVOperationError::OutcomeUnknown);
-            }
+        if let Some(path) = self.full_capture_state.take()
+            && !self.revoke_path_access(&path)
+        {
+            return Err(HyperVOperationError::OutcomeUnknown);
         }
         Ok(())
     }

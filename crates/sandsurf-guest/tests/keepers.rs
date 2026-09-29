@@ -264,6 +264,8 @@ fn keeper_death_is_capture_uncertainty_not_a_claim_that_linux_processes_stopped(
     }
     assert!(Path::new(&format!("/proc/{}", snapshot.guest_pid)).exists());
     // Explicitly clean the intentionally surviving Linux workload fixture.
+    // SAFETY: the PID comes from this fixture's observed live child, which is
+    // still verified in /proc immediately before signaling it.
     assert_eq!(
         unsafe { libc::kill(snapshot.guest_pid as i32, libc::SIGKILL) },
         0

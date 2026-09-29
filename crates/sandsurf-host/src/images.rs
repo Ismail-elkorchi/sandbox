@@ -2,7 +2,8 @@
 //! the source tree or generated filesystem in the host kernel.
 
 use crate::api::OciSource;
-use sandsurf_image::ext4::materialize_tar;
+#[cfg(target_os = "linux")]
+use sandsurf_image::ext4::{finalize_journaled_seed, materialize_tar};
 use sandsurf_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
     unpack_layout_archive, write_filesystem_tar,
@@ -555,7 +556,51 @@ fn rootfs_size(tree: &ConvertedTree) -> Result<u64, LinuxError> {
 }
 
 fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, LinuxError> {
-    materialize_tar(tar, output, bytes).map_err(|error| LinuxError::Invalid(error.to_string()))
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (tar, output, bytes);
+        Err(LinuxError::Invalid(
+            "OCI machine-image conversion requires a qualified journaled ext4 builder on this host"
+                .into(),
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let builder = materialize_tar(tar, output, bytes)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        // The formatter owns the newly created metadata; no guest-modified
+        // disk is ever interpreted by e2fsprogs on the host.
+        let tune = crate::linux::protected_tool(&["/usr/sbin/tune2fs", "/sbin/tune2fs"])
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        let status = std::process::Command::new(tune)
+            .args(["-O", "has_journal"])
+            .arg(output)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(LinuxError::Invalid(
+                "generated OCI filesystem could not acquire a journal".into(),
+            ));
+        }
+        finalize_journaled_seed(output).map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        let check = crate::linux::protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        let status = std::process::Command::new(check)
+            .args(["-fn"])
+            .arg(output)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(LinuxError::Invalid(
+                "generated OCI filesystem failed ext4 verification".into(),
+            ));
+        }
+        Ok(builder)
+    }
 }
 
 fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), LinuxError> {
@@ -866,4 +911,51 @@ fn short_nonce() -> Result<String, LinuxError> {
         write!(&mut output, "{byte:02x}").expect("string formatting cannot fail");
     }
     Ok(output)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn converted_machine_seed_has_a_verified_internal_journal() {
+        let root = Path::new("/var/tmp").join(format!(
+            "sandsurf-oci-journal-{}-{}",
+            std::process::id(),
+            short_nonce().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let archive_path = root.join("root.tar");
+        let mut archive = tar::Builder::new(File::create_new(&archive_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("etc/identity").unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_size(8);
+        header.set_cksum();
+        archive.append(&header, &b"sandsurf"[..]).unwrap();
+        archive.finish().unwrap();
+        drop(archive);
+        let image = root.join("system.ext4");
+        materialize_ext4(&archive_path, &image, 128 * 1024 * 1024).unwrap();
+        let mut file = File::open(&image).unwrap();
+        let mut superblock = [0u8; 1024];
+        file.seek(SeekFrom::Start(1024)).unwrap();
+        file.read_exact(&mut superblock).unwrap();
+        assert_ne!(
+            u32::from_le_bytes(superblock[92..96].try_into().unwrap()) & 0x0004,
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(superblock[224..228].try_into().unwrap()),
+            8
+        );
+        fs::remove_file(image).unwrap();
+        fs::remove_file(archive_path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

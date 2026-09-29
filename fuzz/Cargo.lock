@@ -455,6 +455,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "machine-cargo-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "sandsurf-format",
+ "sandsurf-image",
+ "sandsurf-network",
+ "sandsurf-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -578,21 +590,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "sandbox-cargo-fuzz"
-version = "0.0.0"
-dependencies = [
- "libfuzzer-sys",
- "sandbox-digest",
- "sandbox-image",
- "sandbox-network-broker",
- "sandbox-policy",
- "sandbox-vm",
- "sandsurf-protocol",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-digest"
+name = "sandsurf-format"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -601,62 +599,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-image"
+name = "sandsurf-image"
 version = "0.1.0"
 dependencies = [
  "arcbox-ext4",
  "ed25519-dalek",
  "flate2",
  "ruzstd",
- "sandbox-digest",
+ "sandsurf-format",
  "serde",
  "serde_json",
  "sha2",
  "tar",
  "uuid",
-]
-
-[[package]]
-name = "sandbox-launcher-linux"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandsurf-native",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "sandbox-network-broker"
-version = "0.1.0"
-dependencies = [
- "sandbox-policy",
-]
-
-[[package]]
-name = "sandbox-policy"
-version = "0.1.0"
-dependencies = [
- "idna",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sandbox-vm"
-version = "0.1.0"
-dependencies = [
- "libc",
- "sandbox-image",
- "sandbox-launcher-linux",
- "sandbox-network-broker",
- "sandbox-policy",
- "sandsurf-native",
- "sandsurf-protocol",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -669,12 +624,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandsurf-network"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "libc",
+ "sandsurf-native",
+ "sandsurf-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sandsurf-protocol"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",
- "sandbox-digest",
+ "sandsurf-format",
  "serde",
  "serde_json",
  "sha2",

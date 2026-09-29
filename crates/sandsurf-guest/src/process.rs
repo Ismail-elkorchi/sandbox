@@ -891,16 +891,21 @@ fn spawn_child(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
 
 fn enter_user(credentials: Option<&UserCredentials>) -> io::Result<()> {
     if let Some(credentials) = credentials {
-        // SAFETY: credential values and the complete supplementary-group array
-        // were resolved before fork; these setters are async-signal-safe.
+        // SAFETY: these calls only read the current process credentials.
         if unsafe { libc::geteuid() } != 0
+            // SAFETY: this call only reads the current process credentials.
             && unsafe { libc::geteuid() } == credentials.uid
+            // SAFETY: this call only reads the current process credentials.
             && unsafe { libc::getegid() } == credentials.gid
         {
             return Ok(());
         }
+        // SAFETY: the supplementary-group array was resolved before fork and
+        // remains alive for the call; these credential setters are async-signal-safe.
         if unsafe { libc::setgroups(credentials.groups.len(), credentials.groups.as_ptr()) } != 0
+            // SAFETY: the validated group ID is a scalar, and setgid is async-signal-safe.
             || unsafe { libc::setgid(credentials.gid) } != 0
+            // SAFETY: the validated user ID is a scalar, and setuid is async-signal-safe.
             || unsafe { libc::setuid(credentials.uid) } != 0
         {
             return Err(io::Error::last_os_error());

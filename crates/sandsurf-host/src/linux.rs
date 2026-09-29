@@ -1671,7 +1671,7 @@ fn reserve_disk_capacity(destination: &Path, requested_bytes: u64) -> Result<(),
     Ok(())
 }
 
-fn protected_tool(candidates: &[&str]) -> Result<PathBuf, LinuxError> {
+pub(crate) fn protected_tool(candidates: &[&str]) -> Result<PathBuf, LinuxError> {
     use std::os::unix::fs::MetadataExt;
     for candidate in candidates {
         let path = PathBuf::from(candidate);

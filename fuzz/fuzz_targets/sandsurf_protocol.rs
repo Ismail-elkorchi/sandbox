@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use sandsurf_protocol::{
-    AuthorizedLifecycle, AuthorizedLoss, AuthorizedGuestCommand, Frame, GuardianRequest,
-    GuardianResponse, MAX_CONTROL_BYTES, GuestCommand, Receipt, ReleaseRequest,
+    AuthorizedLifecycle, AuthorizedLoss, Frame, GuardianRequest, GuardianResponse,
+    GuestCommand, Receipt, ReleaseRequest, RequestEnvelope, MAX_CONTROL_BYTES,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -23,7 +23,9 @@ fuzz_target!(|data: &[u8]| {
         let _ = serde_json::from_slice::<GuestCommand>(data);
         let _ = serde_json::from_slice::<Receipt>(data);
         let _ = serde_json::from_slice::<ReleaseRequest>(data);
-        let _ = serde_json::from_slice::<AuthorizedGuestCommand>(data);
+        if let Ok(mut admission) = serde_json::from_slice::<RequestEnvelope<GuestCommand>>(data) {
+            let _ = admission.validate_admission();
+        }
         let _ = serde_json::from_slice::<AuthorizedLifecycle>(data);
         let _ = serde_json::from_slice::<AuthorizedLoss>(data);
         let _ = serde_json::from_slice::<GuardianRequest>(data);

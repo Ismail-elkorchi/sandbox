@@ -29,6 +29,9 @@ sandsurf-network = { path = "../sandsurf-network" }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Services"] }
 
+[dev-dependencies]
+tar = "=0.4.46"
+
 [[bin]]
 name = "sandsurf-host"
 path = "src/main.rs"
