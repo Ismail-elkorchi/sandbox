@@ -1,20 +1,10 @@
-//! Deterministic, cross-platform ext4 materialization for verified image trees.
-//! The formatter is pure userspace: callers never mount or ask the host kernel
-//! to interpret the untrusted filesystem being constructed.
-
-use arcbox_ext4::{FormatOptions, Formatter};
-use sha2::{Digest as _, Sha256};
+//! Complete Linux filesystem construction from bounded canonical archives.
+//! Never used to interpret or repair a root-controlled runtime disk.
 use std::fmt;
-#[cfg(any(unix, test))]
-use std::fs;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io;
 use std::path::Path;
-use uuid::Uuid;
 
-pub const BUILDER_ID: &str = "arcbox-ext4-0.1.2+sandsurf-journaled-v3";
+pub const BUILDER_ID: &str = "e2fsprogs-ext4-linux-v1";
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MIN_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -22,17 +12,17 @@ pub const MIN_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 pub enum Ext4Error {
     Io(io::Error),
     Invalid(String),
+    Unsupported,
 }
-
 impl fmt::Display for Ext4Error {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(output, "ext4 builder I/O: {error}"),
             Self::Invalid(message) => output.write_str(message),
+            Self::Unsupported => output.write_str("ext4 construction requires a Linux builder"),
         }
     }
 }
-
 impl std::error::Error for Ext4Error {}
 impl From<io::Error> for Ext4Error {
     fn from(value: io::Error) -> Self {
@@ -40,9 +30,9 @@ impl From<io::Error> for Ext4Error {
     }
 }
 
-/// Materialize a canonical tar stream as an unpartitioned ext4 filesystem.
-/// The output path must not exist. The returned digest identifies the exact
-/// formatter contract and is intended for conversion provenance.
+/// Returns the digest of the builder contract and protected tool executables.
+/// A newly generated journaled seed is verified before publication. No guest
+/// scripts run on the host and no filesystem is mounted in the host kernel.
 pub fn materialize_tar(tar: &Path, output: &Path, bytes: u64) -> Result<String, Ext4Error> {
     if !tar.is_absolute()
         || !output.is_absolute()
@@ -53,230 +43,346 @@ pub fn materialize_tar(tar: &Path, output: &Path, bytes: u64) -> Result<String, 
             "ext4 image paths or geometry are outside the builder envelope".into(),
         ));
     }
-    let metadata = tar.symlink_metadata()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_IMAGE_BYTES
+    #[cfg(not(target_os = "linux"))]
     {
-        return Err(Ext4Error::Invalid(
-            "ext4 source must be a bounded regular canonical tar".into(),
-        ));
+        Err(Ext4Error::Unsupported)
     }
-    let mut identity = Sha256::new();
-    identity.update(BUILDER_ID.as_bytes());
-    identity.update(bytes.to_be_bytes());
-    io::copy(&mut File::open(tar)?, &mut HashWriter(&mut identity))?;
-    let digest = identity.finalize();
-    let mut uuid = [0_u8; 16];
-    uuid.copy_from_slice(&digest[..16]);
-    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    let mut reservation = OpenOptions::new();
-    reservation.write(true).create_new(true);
-    #[cfg(unix)]
-    reservation.mode(0o600);
-    drop(reservation.open(output)?);
-
-    let options = FormatOptions::new(bytes)
-        .uuid(Uuid::from_bytes(uuid))
-        .label("Sandsurf");
-    let mut formatter = Formatter::with_options(output, options)
-        .map_err(|error| Ext4Error::Invalid(format!("ext4 builder setup: {error}")))?;
-    formatter
-        .unpack_tar(File::open(tar)?)
-        .map_err(|error| Ext4Error::Invalid(format!("ext4 tree materialization: {error}")))?;
-    formatter
-        .close()
-        .map_err(|error| Ext4Error::Invalid(format!("ext4 image publication: {error}")))?;
-    verify_formatted_geometry(output, bytes)?;
-    normalize_formatter_metadata(output)?;
-    #[cfg(unix)]
-    fs::set_permissions(output, fs::Permissions::from_mode(0o600))?;
-    File::open(output)?.sync_all()?;
-    Ok(format!("{:x}", Sha256::digest(BUILDER_ID.as_bytes())))
+    #[cfg(target_os = "linux")]
+    {
+        linux::materialize(tar, output, bytes)
+    }
 }
 
-fn verify_formatted_geometry(path: &Path, expected_bytes: u64) -> Result<(), Ext4Error> {
-    let mut file = File::open(path)?;
-    let actual_bytes = file.metadata()?.len();
-    let mut superblock = [0_u8; 1024];
-    file.seek(SeekFrom::Start(1024))?;
-    file.read_exact(&mut superblock)?;
-    let blocks = u32::from_le_bytes(superblock[4..8].try_into().unwrap()) as u64;
-    let log_block_size = u32::from_le_bytes(superblock[24..28].try_into().unwrap());
-    let block_size = 1024_u64
-        .checked_shl(log_block_size)
-        .ok_or_else(|| Ext4Error::Invalid("ext4 block size overflow".into()))?;
-    if block_size != 4096
-        || actual_bytes != expected_bytes
-        || blocks.checked_mul(block_size) != Some(expected_bytes)
-    {
-        return Err(Ext4Error::Invalid(
-            "ext4 formatter produced a filesystem larger than its backing file".into(),
-        ));
-    }
-    Ok(())
-}
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+    use std::process::{Command, Stdio};
 
-struct HashWriter<'a>(&'a mut Sha256);
-impl Write for HashWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
+    const FEATURES: &str = "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum";
+
+    pub(super) fn materialize(tar: &Path, output: &Path, bytes: u64) -> Result<String, Ext4Error> {
+        validate_archive(tar, bytes)?;
+        sandsurf_native::filesystem::require_protected_ancestors(output)?;
+        let mkfs =
+            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/mke2fs", "/sbin/mke2fs"])?;
+        let check =
+            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])?;
+        let mut builder = Sha256::new();
+        builder.update(BUILDER_ID);
+        hash_file(&mkfs, &mut builder)?;
+        hash_file(&check, &mut builder)?;
+        let builder = format!("{:x}", builder.finalize());
+        let mut identity = Sha256::new();
+        identity.update(&builder);
+        identity.update(bytes.to_be_bytes());
+        hash_file(tar, &mut identity)?;
+        let mut uuid = identity.finalize()[..16].to_vec();
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        let uuid: String = uuid
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                format!(
+                    "{}{:02x}",
+                    if [4, 6, 8, 10].contains(&index) {
+                        "-"
+                    } else {
+                        ""
+                    },
+                    byte
+                )
+            })
+            .collect();
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(output)?;
+        file.set_len(bytes)?;
+        file.sync_all()?;
+        // Feed a fixed profile through an owned descriptor, not the host's
+        // distribution-specific mke2fs.conf. Unlink before executing the tool.
+        let profile_path = output.with_extension("mkfs-config");
+        let mut profile = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&profile_path)?;
+        fs::remove_file(profile_path)?;
+        profile.write_all(b"[fs_types]\n ext4 = {\n features = has_journal,extent\n }\n")?;
+        profile.seek(SeekFrom::Start(0))?;
+        let extended = format!("lazy_itable_init=0,lazy_journal_init=0,hash_seed={uuid}");
+        let inode_count = (bytes / 16384).max(8192).to_string();
+        let status = Command::new(mkfs)
+            .env("E2FSPROGS_FAKE_TIME", "1700000000")
+            .env("MKE2FS_CONFIG", "/dev/stdin")
+            .args([
+                "-q",
+                "-t",
+                "ext4",
+                "-b",
+                "4096",
+                "-m",
+                "0",
+                "-I",
+                "256",
+                "-N",
+                &inode_count,
+                "-U",
+                &uuid,
+                "-L",
+                "Sandsurf",
+                "-o",
+                "linux",
+                "-G",
+                "16",
+                "-O",
+                FEATURES,
+                "-E",
+                &extended,
+                "-d",
+            ])
+            .arg(tar)
+            .arg(output)
+            .arg((bytes / 4096).to_string())
+            .stdin(Stdio::from(profile))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(Ext4Error::Invalid(
+                "Linux filesystem construction failed (e2fsprogs must support canonical tar input)"
+                    .into(),
+            ));
+        }
+        verify_geometry(output, bytes)?;
+        let status = Command::new(check)
+            .args(["-fn"])
+            .arg(output)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(Ext4Error::Invalid(
+                "generated Linux seed failed ext4 verification".into(),
+            ));
+        }
+        File::open(output)?.sync_all()?;
+        Ok(builder)
     }
-    fn flush(&mut self) -> io::Result<()> {
+
+    fn hash_file(path: &Path, hash: &mut Sha256) -> io::Result<()> {
+        struct HashWriter<'a>(&'a mut Sha256);
+        impl Write for HashWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        io::copy(&mut File::open(path)?, &mut HashWriter(hash))?;
+        Ok(())
+    }
+
+    fn relative(path: &Path) -> Result<(), Ext4Error> {
+        if path.as_os_str().is_empty()
+            || path.as_os_str().len() > 4096
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Ext4Error::Invalid(
+                "noncanonical filesystem archive path".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_archive(path: &Path, disk_bytes: u64) -> Result<(), Ext4Error> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_IMAGE_BYTES
+        {
+            return Err(Ext4Error::Invalid(
+                "ext4 source must be a bounded regular canonical tar".into(),
+            ));
+        }
+        let mut archive = tar::Archive::new(File::open(path)?);
+        let mut entries = BTreeMap::new();
+        let mut payload = 0_u64;
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let path = entry.path()?.into_owned();
+            relative(&path)?;
+            let kind = entry.header().entry_type();
+            if entries.len() >= 100_000
+                || entries.contains_key(&path)
+                || !(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link())
+                || entry.header().mode()? > 0o7777
+                || entry.header().uid()? > u32::MAX as u64
+                || entry.header().gid()? > u32::MAX as u64
+            {
+                return Err(Ext4Error::Invalid(
+                    "filesystem archive metadata is outside the supported profile".into(),
+                ));
+            }
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                if entries
+                    .get(parent)
+                    .is_none_or(|kind: &tar::EntryType| !kind.is_dir())
+                {
+                    return Err(Ext4Error::Invalid(
+                        "filesystem archive requires preceding directory parents".into(),
+                    ));
+                }
+            }
+            if kind.is_hard_link() {
+                let target = entry
+                    .link_name()?
+                    .ok_or_else(|| Ext4Error::Invalid("hardlink target missing".into()))?;
+                relative(&target)?;
+                if entries
+                    .get(target.as_ref())
+                    .is_none_or(|kind| !(kind.is_file() || kind.is_hard_link()))
+                {
+                    return Err(Ext4Error::Invalid(
+                        "hardlink must name a preceding archive file".into(),
+                    ));
+                }
+            }
+            if kind.is_file() {
+                payload = payload
+                    .checked_add(entry.size())
+                    .filter(|value| *value <= disk_bytes)
+                    .ok_or_else(|| {
+                        Ext4Error::Invalid("filesystem payload exceeds disk capacity".into())
+                    })?;
+            } else if entry.size() != 0 {
+                return Err(Ext4Error::Invalid(
+                    "non-file archive entry carries payload".into(),
+                ));
+            }
+            entries.insert(path, kind);
+        }
+        Ok(())
+    }
+
+    fn verify_geometry(path: &Path, bytes: u64) -> Result<(), Ext4Error> {
+        let mut file = File::open(path)?;
+        let mut superblock = [0_u8; 1024];
+        file.seek(SeekFrom::Start(1024))?;
+        file.read_exact(&mut superblock)?;
+        let blocks = u32::from_le_bytes(superblock[4..8].try_into().unwrap()) as u64;
+        let compat = u32::from_le_bytes(superblock[92..96].try_into().unwrap());
+        if file.metadata()?.len() != bytes
+            || blocks * 4096 != bytes
+            || u32::from_le_bytes(superblock[24..28].try_into().unwrap()) != 2
+            || compat & 0x0014 != 0x0014
+            || compat & 0x0200 != 0
+            || u32::from_le_bytes(superblock[224..228].try_into().unwrap()) != 8
+        {
+            return Err(Ext4Error::Invalid(
+                "Linux seed lacks the journaled, online-growable ext4 profile".into(),
+            ));
+        }
         Ok(())
     }
 }
 
-/// Arcbox intentionally timestamps formatter-created directories and inode
-/// change times. Sandsurf's canonical tree gives every entry a zero timestamp,
-/// so clear every inode timestamp to make conversion bit-reproducible.
-fn normalize_formatter_metadata(path: &Path) -> Result<(), Ext4Error> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut superblock = [0_u8; 1024];
-    file.seek(SeekFrom::Start(1024))?;
-    file.read_exact(&mut superblock)?;
-    // e2fsprogs stamps the superblock when it creates the journal. The
-    // resulting image must remain bit-reproducible before it becomes a seed.
-    superblock[48..52].fill(0);
-    file.seek(SeekFrom::Start(1024))?;
-    file.write_all(&superblock)?;
-    let log_block_size = u32::from_le_bytes(superblock[24..28].try_into().unwrap());
-    let block_size = 1024_u64
-        .checked_shl(log_block_size)
-        .ok_or_else(|| Ext4Error::Invalid("ext4 block size overflow".into()))?;
-    let inode_size = u16::from_le_bytes(superblock[88..90].try_into().unwrap()) as u64;
-    let inode_count = u32::from_le_bytes(superblock[0..4].try_into().unwrap()) as u64;
-    let inodes_per_group = u32::from_le_bytes(superblock[40..44].try_into().unwrap()) as u64;
-    if block_size != 4096 || inode_size < 160 || inodes_per_group == 0 || inode_count == 0 {
-        return Err(Ext4Error::Invalid(
-            "portable ext4 builder emitted unsupported geometry".into(),
-        ));
-    }
-    let groups = inode_count.div_ceil(inodes_per_group);
-    for group in 0..groups {
-        let mut descriptor = [0_u8; 32];
-        file.seek(SeekFrom::Start(block_size + group * 32))?;
-        file.read_exact(&mut descriptor)?;
-        let inode_table = u32::from_le_bytes(descriptor[8..12].try_into().unwrap()) as u64;
-        let count = (inode_count - group * inodes_per_group).min(inodes_per_group);
-        let table_bytes = count
-            .checked_mul(inode_size)
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| Ext4Error::Invalid("ext4 inode table size overflow".into()))?;
-        let table_offset = inode_table
-            .checked_mul(block_size)
-            .ok_or_else(|| Ext4Error::Invalid("ext4 inode table offset overflow".into()))?;
-        let mut table = vec![0_u8; table_bytes];
-        file.seek(SeekFrom::Start(table_offset))?;
-        file.read_exact(&mut table)?;
-        for inode in table.chunks_exact_mut(inode_size as usize) {
-            inode[8..24].fill(0);
-            inode[132..152].fill(0);
-        }
-        file.seek(SeekFrom::Start(table_offset))?;
-        file.write_all(&table)?;
-    }
-    file.sync_all()?;
-    Ok(())
-}
-
-/// Finalize the trusted Linux image after e2fsprogs has added an internal
-/// journal. Runtime disks are never passed through this builder operation.
-pub fn finalize_journaled_seed(path: &Path) -> Result<(), Ext4Error> {
-    let mut file = File::open(path)?;
-    let mut superblock = [0_u8; 1024];
-    file.seek(SeekFrom::Start(1024))?;
-    file.read_exact(&mut superblock)?;
-    let features = u32::from_le_bytes(superblock[92..96].try_into().unwrap());
-    let journal_inode = u32::from_le_bytes(superblock[224..228].try_into().unwrap());
-    if features & 0x0004 == 0 || journal_inode != 8 {
-        return Err(Ext4Error::Invalid(
-            "trusted seed has no internal ext4 journal".into(),
-        ));
-    }
-    normalize_formatter_metadata(path)
-}
-
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use sha2::{Digest as _, Sha256};
+    use std::fs::{self, File};
+    use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
-
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn materialization_is_reproducible_and_readable() {
-        let directory = std::env::temp_dir().join(format!(
+    fn materialization_is_reproducible_journaled_and_preserves_linux_metadata() {
+        let root = std::env::temp_dir().join(format!(
             "sandsurf-ext4-builder-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&directory).unwrap();
-        let archive_path = directory.join("rootfs.tar");
-        let archive_file = File::create_new(&archive_path).unwrap();
-        let mut archive = tar::Builder::new(archive_file);
-        archive.mode(tar::HeaderMode::Deterministic);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let tar = root.join("root.tar");
+        let mut archive = tar::Builder::new(File::create_new(&tar).unwrap());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_uid(0);
+        directory.set_gid(0);
+        directory.set_mtime(0);
+        directory.set_size(0);
+        directory.set_cksum();
+        archive
+            .append_data(&mut directory, "etc", io::empty())
+            .unwrap();
         let mut header = tar::Header::new_gnu();
-        header.set_path("etc/identity").unwrap();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o644);
-        header.set_uid(0);
-        header.set_gid(0);
+        header.set_mode(0o4755);
+        header.set_uid(1000);
+        header.set_gid(1000);
         header.set_mtime(0);
         header.set_size(8);
         header.set_cksum();
-        archive.append(&header, &b"sandsurf"[..]).unwrap();
+        archive
+            .append_data(&mut header, "etc/identity", &b"sandsurf"[..])
+            .unwrap();
         archive.finish().unwrap();
         drop(archive);
-
-        let first = directory.join("first.ext4");
-        let second = directory.join("second.ext4");
-        materialize_tar(&archive_path, &first, 256 * 1024 * 1024).unwrap();
-        materialize_tar(&archive_path, &second, 256 * 1024 * 1024).unwrap();
-        assert_eq!(file_digest(&first), file_digest(&second));
-        let mut reader = arcbox_ext4::Reader::new(&first).unwrap();
+        let first = root.join("first.ext4");
+        let second = root.join("second.ext4");
         assert_eq!(
-            reader.read_file("/etc/identity", 0, None).unwrap(),
-            b"sandsurf"
+            materialize_tar(&tar, &first, MIN_IMAGE_BYTES).unwrap(),
+            materialize_tar(&tar, &second, MIN_IMAGE_BYTES).unwrap()
         );
-
-        for path in [&archive_path, &first, &second] {
+        assert_eq!(
+            Sha256::digest(fs::read(&first).unwrap()),
+            Sha256::digest(fs::read(&second).unwrap())
+        );
+        let debugfs =
+            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/debugfs", "/sbin/debugfs"])
+                .unwrap();
+        let read = std::process::Command::new(&debugfs)
+            .args(["-R", "cat /etc/identity"])
+            .arg(&first)
+            .output()
+            .unwrap();
+        assert!(read.status.success());
+        assert_eq!(read.stdout, b"sandsurf");
+        let stat = std::process::Command::new(debugfs)
+            .args(["-R", "stat /etc/identity"])
+            .arg(&first)
+            .output()
+            .unwrap();
+        let stat = String::from_utf8(stat.stdout).unwrap();
+        assert!(stat.contains("Mode:  04755"), "{stat}");
+        assert!(
+            stat.contains("User:  1000") && stat.contains("Group:  1000"),
+            "{stat}"
+        );
+        assert!(materialize_tar(&tar, &root.join("undersized"), 32 * 1024 * 1024).is_err());
+        assert!(!root.join("undersized").exists());
+        for path in [tar, first, second] {
             fs::remove_file(path).unwrap();
         }
-        fs::remove_dir(directory).unwrap();
-    }
-
-    #[test]
-    fn formatter_minimum_is_enforced_before_publication() {
-        let directory = std::env::temp_dir().join(format!(
-            "sandsurf-ext4-minimum-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&directory).unwrap();
-        let archive = directory.join("empty.tar");
-        File::create(&archive).unwrap();
-        let output = directory.join("undersized.ext4");
-        assert!(matches!(
-            materialize_tar(&archive, &output, 32 * 1024 * 1024),
-            Err(Ext4Error::Invalid(_))
-        ));
-        assert!(!output.exists());
-        fs::remove_file(archive).unwrap();
-        fs::remove_dir(directory).unwrap();
-    }
-
-    fn file_digest(path: &Path) -> String {
-        let mut file = File::open(path).unwrap();
-        let mut hash = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = file.read(&mut buffer).unwrap();
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-        }
-        format!("{:x}", hash.finalize())
+        fs::remove_dir(root).unwrap();
     }
 }

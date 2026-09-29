@@ -286,7 +286,7 @@ impl WindowsGuardianEffect {
             vcpus: u32::try_from(config.resources.vcpus.get())
                 .map_err(|_| WindowsError::Invalid("vCPU count overflow".into()))?,
             kernel: windows.kernel_path,
-            command_line: "console=ttyS0 reboot=k panic=1 root=/dev/sda rw init=/sbin/init".into(),
+            command_line: sandsurf_machine::linux_boot_arguments("ttyS0", "/dev/sda"),
             disks: vec![HyperVDisk {
                 path: system_disk,
                 read_only: false,

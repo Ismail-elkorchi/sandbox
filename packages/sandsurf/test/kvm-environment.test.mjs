@@ -4,15 +4,18 @@ import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
-import { Sandsurf } from "../dist/index.js";
-import { NativeHostClient } from "../dist/native-host.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const packageDirectory = process.env.SANDSURF_TEST_PACKAGE_ROOT ?? fileURLToPath(new URL("..", import.meta.url));
+const { Sandsurf } = await import(pathToFileURL(join(packageDirectory, "dist/index.js")).href);
+const { NativeHostClient } = await import(pathToFileURL(join(packageDirectory, "dist/native-host.js")).href);
 
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
 
 test("KVM provides a persistent administrator-controlled Linux computer", { skip: !enabled, timeout: 1_200_000 }, async (context) => {
   const directory = process.env.SANDSURF_TEST_STATE ?? await mkdtemp("/var/tmp/sandsurf-computer-");
   const destination = await mkdtemp("/var/tmp/sandsurf-publication-");
-  const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? resolve("packages/sandsurf/images/development-x64/manifest.json");
+  const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? resolve(packageDirectory, "images/development-x64/manifest.json");
   const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
   let host = await Sandsurf.open({ directory, authorizer: () => true });
   let machine;
@@ -180,15 +183,15 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       assert.equal((await machine.inspect()).machine.value.state, "destroyed");
       assertSameBytes(await output(execution), dense);
       await assert.rejects(stat(join(directory, "machines", identity, "disks/system.ext4")), { code: "ENOENT" });
+      await execution.acknowledge(archivedReceipt.digest);
+      const pinned = await execution.pin("archive-copy", archivedReceipt.digest);
+      const released = await execution.release(archivedReceipt, { kind: "continuing-retention", pin: pinned.id });
+      assert.equal((await execution.cleanupReleased(released.requestDigest)).cleanupPending, false);
+      const retainedPage = await pinned.read({ maximum: dense.byteLength });
+      assertSameBytes(Buffer.concat(retainedPage.chunks.map((chunk) => Buffer.from(chunk.bytes))), dense);
     } finally {
       await rename(unavailableImage, installedImage);
     }
-    await execution.acknowledge(archivedReceipt.digest);
-    const pinned = await execution.pin("archive-copy", archivedReceipt.digest);
-    const released = await execution.release(archivedReceipt, { kind: "continuing-retention", pin: pinned.id });
-    assert.equal((await execution.cleanupReleased(released.requestDigest)).cleanupPending, false);
-    const retainedPage = await pinned.read({ maximum: dense.byteLength });
-    assertSameBytes(Buffer.concat(retainedPage.chunks.map((chunk) => Buffer.from(chunk.bytes))), dense);
     const retained = await host.artifacts.get(identity, artifact.id);
     await writeFile(join(destination, "unrelated"), "preserved");
     await retained.applyToHost({ destination });

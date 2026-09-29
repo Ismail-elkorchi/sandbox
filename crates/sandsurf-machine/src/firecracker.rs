@@ -114,7 +114,7 @@ impl FirecrackerProcess {
         let firecracker_json = FirecrackerJson {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
-                boot_args: "console=ttyS0 reboot=k panic=1 root=/dev/vda rw init=/sbin/init".into(),
+                boot_args: crate::linux_boot_arguments("ttyS0", "/dev/vda"),
             },
             drives,
             machine_config: MachineConfig {

@@ -2,8 +2,7 @@
 //! the source tree or generated filesystem in the host kernel.
 
 use crate::api::{MachineImageRecipe, OciSource};
-#[cfg(target_os = "linux")]
-use sandsurf_image::ext4::{finalize_journaled_seed, materialize_tar};
+use sandsurf_image::ext4::materialize_tar;
 use sandsurf_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
     unpack_layout_archive, write_filesystem_tar,
@@ -198,7 +197,8 @@ pub(crate) fn import_oci(
     let artifact = stage.join("artifact");
     prepare_private_directory(&artifact)?;
     let system_path = artifact.join("oci-system.ext4");
-    let builder = materialize_ext4(&filesystem_tar, &system_path, rootfs_bytes)?;
+    let builder = materialize_tar(&filesystem_tar, &system_path, rootfs_bytes)
+        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let kernel_name = "boot-kernel";
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
     let platform_artifacts =
@@ -610,55 +610,6 @@ fn rootfs_size(tree: &ConvertedTree) -> Result<u64, ImageBuildError> {
     Ok(bytes)
 }
 
-fn materialize_ext4(tar: &Path, output: &Path, bytes: u64) -> Result<String, ImageBuildError> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (tar, output, bytes);
-        Err(ImageBuildError::Invalid(
-            "OCI machine-image conversion requires a qualified journaled ext4 builder on this host"
-                .into(),
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let builder = materialize_tar(tar, output, bytes)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-        // The formatter owns the newly created metadata; no guest-modified
-        // disk is ever interpreted by e2fsprogs on the host.
-        let tune = crate::linux::protected_tool(&["/usr/sbin/tune2fs", "/sbin/tune2fs"])
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-        let status = std::process::Command::new(tune)
-            .args(["-O", "has_journal"])
-            .arg(output)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(ImageBuildError::Invalid(
-                "generated OCI filesystem could not acquire a journal".into(),
-            ));
-        }
-        finalize_journaled_seed(output)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-        let check = crate::linux::protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-        let status = std::process::Command::new(check)
-            .args(["-fn"])
-            .arg(output)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(ImageBuildError::Invalid(
-                "generated OCI filesystem failed ext4 verification".into(),
-            ));
-        }
-        Ok(builder)
-    }
-}
-
 fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), ImageBuildError> {
     let verified = verify_image(
         &host_root
@@ -984,9 +935,20 @@ mod tests {
             std::process::id(),
             short_nonce().unwrap()
         ));
-        fs::create_dir(&root).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
         let archive_path = root.join("root.tar");
         let mut archive = tar::Builder::new(File::create_new(&archive_path).unwrap());
+        let mut directory = tar::Header::new_gnu();
+        directory.set_entry_type(tar::EntryType::Directory);
+        directory.set_mode(0o755);
+        directory.set_uid(0);
+        directory.set_gid(0);
+        directory.set_mtime(0);
+        directory.set_size(0);
+        directory.set_cksum();
+        archive
+            .append_data(&mut directory, "etc", io::empty())
+            .unwrap();
         let mut header = tar::Header::new_gnu();
         header.set_path("etc/identity").unwrap();
         header.set_entry_type(tar::EntryType::Regular);
@@ -1000,7 +962,7 @@ mod tests {
         archive.finish().unwrap();
         drop(archive);
         let image = root.join("system.ext4");
-        materialize_ext4(&archive_path, &image, 128 * 1024 * 1024).unwrap();
+        materialize_tar(&archive_path, &image, 128 * 1024 * 1024).unwrap();
         let mut file = File::open(&image).unwrap();
         let mut superblock = [0u8; 1024];
         file.seek(SeekFrom::Start(1024)).unwrap();

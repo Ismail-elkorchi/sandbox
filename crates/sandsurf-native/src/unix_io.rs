@@ -1,8 +1,10 @@
 //! Deadline-aware byte transport shared by local IPC and VM guest channels.
 
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Instant;
 
 pub(crate) fn require_time(deadline: Option<Instant>) -> io::Result<()> {
@@ -13,6 +15,67 @@ pub(crate) fn require_time(deadline: Option<Instant>) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Establish a native Unix stream without allowing backlog admission to block
+/// a host worker indefinitely. Callers resolve the address relative to their
+/// retained directory; authentication remains the protocol owner's job.
+pub(crate) fn connect_socket(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    // SAFETY: sockaddr_un is a plain C struct; zero is valid initial storage.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path exceeds native bound or contains NUL",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let length =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = length as u8;
+    }
+    #[cfg(target_os = "linux")]
+    let flags = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(target_os = "macos")]
+    let flags = libc::SOCK_STREAM;
+    // SAFETY: socket takes scalar constants and returns a new owned descriptor.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, flags, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is the successful socket call's new descriptor, transferred once.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: F_SETFD marks this owned descriptor close-on-exec. Apple does
+        // not provide SOCK_CLOEXEC; launchers also clear ambient descriptors.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        stream.set_nonblocking(true)?;
+    }
+    require_time(Some(deadline))?;
+    // SAFETY: address is initialized with a bounded, NUL-terminated native path;
+    // length is within its allocation, and fd is this live nonblocking socket.
+    if unsafe { libc::connect(fd, (&raw const address).cast(), length) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            // AF_UNIX EAGAIN means backlog admission failed, not an established
+            // connection. No protocol request has been dispatched.
+            return Err(error);
+        }
+        wait_ready(fd, libc::POLLOUT, Some(deadline))?;
+        if let Some(error) = stream.take_error()? {
+            return Err(error);
+        }
+    }
+    Ok(stream)
 }
 
 pub(crate) fn wait_ready(

@@ -58,6 +58,13 @@ try {
     "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer);
   const lock = await readFile(resolve(consumer, "package-lock.json"), "utf8");
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
+  if (process.env.SANDSURF_KVM_TEST === "1") {
+    if (process.platform !== "linux" || process.arch !== "x64") throw new Error("installed KVM qualification requires a Linux x64 host");
+    await run(process.execPath, ["--test", "--test-concurrency=1", resolve("packages/sandsurf/test/kvm-environment.test.mjs")], consumer, {
+      SANDSURF_TEST_PACKAGE_ROOT: resolve(consumer, "node_modules/sandsurf"),
+      SANDSURF_LOCAL_IMAGE_MANIFEST: resolve(consumer, "node_modules/sandsurf/images/development-x64/manifest.json"),
+    });
+  }
 } finally {
   if (originalUmask !== undefined) process.umask(originalUmask);
   await rm(temporary, { recursive: true, force: true });
@@ -110,15 +117,17 @@ function requiredEnvironment(name: string): string {
   return value;
 }
 
-function run(command: string, arguments_: readonly string[], cwd = process.cwd()): Promise<void> {
+function run(command: string, arguments_: readonly string[], cwd = process.cwd(), environment: Readonly<Record<string, string>> = {}): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
-    const errors: Buffer[] = [];
-    const child = spawn(command, arguments_, { cwd, stdio: ["ignore", "ignore", "pipe"] });
-    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    let output = "";
+    let errors = "";
+    const child = spawn(command, arguments_, { cwd, env: { ...process.env, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
+    child.stdout.on("data", (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-4096); });
+    child.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString("utf8")).slice(-4096); });
     child.once("error", rejectRun);
     child.once("exit", (code, signal) => {
       if (code === 0) resolveRun();
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
+      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${output}\n${errors}`));
     });
   });
 }

@@ -1,8 +1,8 @@
+* text=auto eol=lf
 *.ext4 binary
 *.vhdx binary
-packages/sandbox/images/**/*.json text eol=lf
 packages/**/vmlinux-* binary
-packages/sandbox/image-build-inputs/** binary
-packages/**/sandbox-runtime-* binary
-packages/**/sandbox-vm-runtime-* binary
+packages/**/hyperv-vmlinuz-* binary
+packages/sandsurf/image-build-inputs/** binary
+packages/**/sandsurf-host-* binary
 packages/**/firecracker-* binary

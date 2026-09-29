@@ -1,0 +1,13 @@
+{
+  "kind": "create",
+  "machineId": "box",
+  "kernel": "/kernel",
+  "initialRamdisk": null,
+  "commandLine": "root=/dev/vda",
+  "disks": [{ "path": "/disk", "readOnly": true }],
+  "memoryBytes": 536870912,
+  "vcpus": 2,
+  "controlSocket": "/private/tmp/control.sock",
+  "hostConnectPorts": [10789],
+  "guestListenPorts": [12080]
+}

@@ -149,7 +149,6 @@ fn private_endpoint_authenticates_both_peers_and_preserves_binary_frames() {
     assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn retained_directory_socket_address_supports_long_private_state_roots() {
     let root = Root::new();

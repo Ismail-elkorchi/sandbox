@@ -1037,6 +1037,13 @@ mod tests {
         };
         let request = HelperRequest::Create(Box::new(machine.clone()));
         let value = serde_json::to_value(request).unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../native/macos/fixtures/create.json"))
+                .unwrap();
+        assert_eq!(
+            value, fixture,
+            "Swift's contract fixture must be emitted by the production Rust request type"
+        );
         assert_eq!(value["kind"], "create");
         assert_eq!(value["machineId"], "box");
         assert_eq!(value["hostConnectPorts"][0], 10_789);

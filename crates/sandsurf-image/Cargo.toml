@@ -14,5 +14,6 @@ sha2.workspace = true
 flate2 = "=1.1.10"
 ruzstd = "=0.9.0"
 tar = "=0.4.46"
-arcbox-ext4.workspace = true
-uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandsurf-native = { path = "../sandsurf-native" }

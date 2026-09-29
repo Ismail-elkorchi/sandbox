@@ -1,7 +1,30 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Select a root-owned host executable without trusting PATH or writable
+/// ancestors. These are host tools, never executables from a guest filesystem.
+pub fn protected_tool(candidates: &[&str]) -> io::Result<PathBuf> {
+    for candidate in candidates {
+        let Ok(path) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_file()
+            && metadata.uid() == 0
+            && metadata.mode() & 0o022 == 0
+            && metadata.mode() & 0o111 != 0
+        {
+            require_protected_ancestors(&path)?;
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "required protected host tool is unavailable",
+    ))
+}
 
 /// The caller has already canonicalized the path while retaining/checking its
 /// final identity. Every ancestor must prevent a different account from moving

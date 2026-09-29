@@ -74,6 +74,9 @@ if (nativePlatform === "macos") {
   const helperName = `sandsurf-vz-helper-${architecture}`;
   const helper = resolve(destinationDirectory, helperName);
   await run("/usr/bin/swiftc", [
+    "-parse-as-library",
+    resolve(repository, "native/macos/unix-socket.swift"),
+    resolve(repository, "native/macos/owner-protocol.swift"),
     resolve(repository, "native/macos/sandsurf-vz-helper.swift"),
     "-o", helper,
   ], {});

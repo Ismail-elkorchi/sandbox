@@ -1568,45 +1568,14 @@ fn ensure_mutable_disk(
         destination,
         requested_bytes,
         crate::storage::DiskFormat::Raw,
-        |staged| {
-            reserve_disk_capacity(staged, requested_bytes).map_err(io::Error::other)?;
-            if requested_bytes > fs::metadata(source)?.len() {
-                let resize = protected_tool(&["/usr/sbin/resize2fs", "/sbin/resize2fs"])
-                    .map_err(io::Error::other)?;
-                let status = std::process::Command::new(resize)
-                    .arg(staged)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()?;
-                if !status.success() {
-                    return Err(io::Error::other(
-                        "trusted seed could not be expanded to the reserved disk geometry",
-                    ));
-                }
-            }
-            let check =
-                protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"]).map_err(io::Error::other)?;
-            let status = std::process::Command::new(check)
-                .args(["-fn"])
-                .arg(staged)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()?;
-            if !status.success() {
-                return Err(io::Error::other(
-                    "trusted seed failed ext4 verification before publication",
-                ));
-            }
-            Ok(())
-        },
+        |staged| reserve_disk_capacity(staged, requested_bytes).map_err(io::Error::other),
     )?;
     reserve_disk_capacity(destination, requested_bytes)
 }
 
 fn reserve_disk_capacity(destination: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
-    let fallocate = protected_tool(&["/usr/bin/fallocate", "/bin/fallocate"])?;
+    let fallocate =
+        sandsurf_native::filesystem::protected_tool(&["/usr/bin/fallocate", "/bin/fallocate"])?;
     let status = std::process::Command::new(fallocate)
         .args(["--keep-size", "--length", &requested_bytes.to_string()])
         .arg(destination)
@@ -1623,24 +1592,6 @@ fn reserve_disk_capacity(destination: &Path, requested_bytes: u64) -> Result<(),
     require_allocated(destination, requested_bytes)?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
     Ok(())
-}
-
-pub(crate) fn protected_tool(candidates: &[&str]) -> Result<PathBuf, LinuxError> {
-    use std::os::unix::fs::MetadataExt;
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == 0
-            && metadata.permissions().mode() & 0o022 == 0
-        {
-            return Ok(path);
-        }
-    }
-    Err(LinuxError::Invalid(
-        "required protected host storage tool is unavailable".into(),
-    ))
 }
 
 fn require_allocated(path: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
@@ -1795,4 +1746,35 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, maximum: u64) -> Result<
         return Err(LinuxError::Invalid("JSON artifact exceeds bound".into()));
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn guest_filesystem_bytes_are_opaque_during_creation_and_reopen() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-opaque-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("root-controlled-seed");
+        let destination = root.join("system.ext4");
+        let contents = b"deliberately invalid filesystem metadata";
+        fs::write(&source, contents).unwrap();
+        ensure_mutable_disk(&source, &destination, 8192).unwrap();
+        assert_eq!(fs::metadata(&destination).unwrap().len(), 8192);
+        assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
+        fs::remove_file(source).unwrap();
+        ensure_mutable_disk(&root.join("missing-seed"), &destination, 8192).unwrap();
+        assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
+        crate::storage::retire(&destination).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

@@ -25,7 +25,7 @@
   "system": {
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "f8330071f706188260348c8591c9b2e4dce29c994bbeae6ee9586e2ff2d07fc9",
+      "sha256": "35344d3c70a0241a3ea15d55021352da5b6a3ee879879c67a3f9fc114d82e066",
       "format": "ext4"
     },
     "defaults": {
@@ -37,12 +37,12 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "1bce03aaf90911564048541ea4e6c74fdeb64b293478da47624df28952223473",
+      "sourceDigest": "927a6acb0c24016496d00393dec37e735c8c96484259ac87ebd0017fb8b5033a",
       "materials": {
         "alpine-minirootfs": "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
         "alpine-packages": "ccccec8ae4a7bb3800e23509667a979a37de313afa9a71f87f20157ff1b8d6b3",
-        "sandsurf-ext4-builder": "d3e9b3804eadd70b71d2084236655d7963f579fc10943ff74b163b58e3ce75ac",
-        "sandsurf-system-recipe": "6e4068c95c6b3753beb037e602cbf9abb1183dbbbb34e2b70d75f0986e228ee2",
+        "sandsurf-ext4-builder": "c61fcdaca884504956298f21b2a8164567a451872a05d40c7a778af5a530efec",
+        "sandsurf-system-recipe": "f69702bd34e57948fc20f32f20fddfff5c9b872de3635d666f775ef090f41ad9",
         "sandsurf-management": "aa4d06fc3ce37bf9e315e7fa117a25ff106fe649401dee65d06adf1914e5d589"
       }
     }

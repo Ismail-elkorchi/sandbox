@@ -5,30 +5,6 @@ import Darwin
 private let maxMessageBytes = 1024 * 1024
 private let vmQueue = DispatchQueue(label: "org.sandsurf.virtual-machine")
 
-private struct Disk: Decodable {
-    let path: String
-    let readOnly: Bool
-}
-
-private struct Request: Decodable {
-    let kind: String
-    let sandboxId: String?
-    let kernel: String?
-    let initialRamdisk: String?
-    let commandLine: String?
-    let disks: [Disk]?
-    let memoryBytes: UInt64?
-    let vcpus: Int?
-    let controlSocket: String?
-    let hostConnectPorts: [UInt32]?
-    let guestListenPorts: [UInt32]?
-    let savedState: String?
-}
-
-private struct Response: Encodable {
-    let kind: String
-    let state: String
-}
 
 private enum OwnerError: Error {
     case invalidInvocation
@@ -123,8 +99,7 @@ private final class SocketRelay {
         hostConnectPorts: [UInt32],
         guestListenPorts: [UInt32]
     ) throws {
-        guard path.utf8.count > 0,
-              path.utf8.count + 1 <= MemoryLayout.size(ofValue: sockaddr_un().sun_path),
+        guard path.hasPrefix("/"),
               !hostConnectPorts.isEmpty,
               (hostConnectPorts + guestListenPorts).allSatisfy({ $0 >= 1024 && $0 != UInt32.max }),
               Set(hostConnectPorts).count == hostConnectPorts.count,
@@ -141,16 +116,11 @@ private final class SocketRelay {
         _ = Darwin.unlink(path)
         let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else { throw OwnerError.socketRelay }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8) + [0]
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            destination.initializeMemory(as: UInt8.self, repeating: 0)
-            destination.copyBytes(from: bytes)
-        }
-        let bound = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        let bound = relativeUnixSocket(path) { address, length in
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(descriptor, $0, length)
+                }
             }
         }
         guard bound == 0,
@@ -304,31 +274,6 @@ private final class GuestConnectionDelegate: NSObject, VZVirtioSocketListenerDel
     }
 }
 
-private func connectUnix(_ path: String) -> Int32? {
-    guard path.utf8.count > 0,
-          path.utf8.count + 1 <= MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
-        return nil
-    }
-    let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-    guard descriptor >= 0 else { return nil }
-    var address = sockaddr_un()
-    address.sun_family = sa_family_t(AF_UNIX)
-    let bytes = Array(path.utf8) + [0]
-    withUnsafeMutableBytes(of: &address.sun_path) { destination in
-        destination.initializeMemory(as: UInt8.self, repeating: 0)
-        destination.copyBytes(from: bytes)
-    }
-    let result = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    }
-    if result != 0 {
-        Darwin.close(descriptor)
-        return nil
-    }
-    return descriptor
-}
 
 private final class MachineOwner {
     private var machine: VZVirtualMachine?
@@ -404,7 +349,7 @@ private final class MachineOwner {
               let controlSocket = request.controlSocket,
               let hostConnectPorts = request.hostConnectPorts,
               let guestListenPorts = request.guestListenPorts,
-              request.sandboxId != nil,
+              request.machineId != nil,
               savedState == nil || savedState!.hasPrefix("/") else {
             throw OwnerError.invalidRequest
         }
@@ -571,25 +516,30 @@ private func writeResponse(_ response: Response) throws {
     try FileHandle.standardOutput.write(contentsOf: payload)
 }
 
-guard CommandLine.arguments == [CommandLine.arguments[0], "--sandsurf-owner-v1"] else {
-    throw OwnerError.invalidInvocation
-}
+@main
+private enum SandsurfVMHelper {
+    static func main() throws {
+        guard CommandLine.arguments == [CommandLine.arguments[0], "--sandsurf-owner-v1"] else {
+            throw OwnerError.invalidInvocation
+        }
 
-signal(SIGPIPE, SIG_IGN)
+        signal(SIGPIPE, SIG_IGN)
 
-private let owner = MachineOwner()
-do {
-    while let request = try readRequest() {
+        let owner = MachineOwner()
         do {
-            let response = try owner.handle(request)
-            try writeResponse(response)
-            if request.kind == "stop" || request.kind == "release" { break }
-        } catch OwnerError.invalidRequest {
-            try writeResponse(Response(kind: "not-applied", state: "stopped"))
+            while let request = try readRequest() {
+                do {
+                    let response = try owner.handle(request)
+                    try writeResponse(response)
+                    if request.kind == "stop" || request.kind == "release" { break }
+                } catch OwnerError.invalidRequest {
+                    try writeResponse(Response(kind: "not-applied", state: "stopped"))
+                }
+            }
+            owner.contain()
+        } catch {
+            owner.contain()
+            throw error
         }
     }
-    owner.contain()
-} catch {
-    owner.contain()
-    throw error
 }

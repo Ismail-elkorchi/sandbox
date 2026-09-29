@@ -112,12 +112,23 @@ if (process.platform !== "linux") {
 
 const temporary = await mkdtemp(resolve(tmpdir(), "sandsurf-guest-image-"));
 try {
-  await run("cargo", ["build", ...profileArguments, "-p", "sandsurf-guest", "--target", guestTarget], process.cwd(), {
-    ...(guestTarget.endsWith("-musl") ? { [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" } : {}),
-    [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`]: "-C target-feature=+crt-static",
-  });
-  const guestAgent = resolve("target", guestTarget, buildProfile, "sandsurf-guest");
-  const guestBytes = await readFile(guestAgent);
+  // A native CI build can supply a digest-bound management executable without
+  // requiring the image assembler to execute or cross-compile target code.
+  const binaryInput = process.env.SANDSURF_GUEST_BINARY_FILE;
+  const binaryDigest = process.env.SANDSURF_GUEST_BINARY_SHA256;
+  if (binaryInput === undefined && binaryDigest !== undefined) throw new Error("guest binary digest requires an explicit input file");
+  if (binaryInput !== undefined && (!isAbsolute(binaryInput) || !/^[a-f0-9]{64}$/u.test(binaryDigest ?? ""))) {
+    throw new Error("guest binary input requires an absolute file and its SHA-256 digest");
+  }
+  if (binaryInput === undefined) {
+    await run("cargo", ["build", ...profileArguments, "-p", "sandsurf-guest", "--target", guestTarget], process.cwd(), {
+      ...(guestTarget.endsWith("-musl") ? { [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" } : {}),
+      [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`]: "-C target-feature=+crt-static",
+    });
+  }
+  const guestAgent = binaryInput ?? resolve("target", guestTarget, buildProfile, "sandsurf-guest");
+  const guestBytes = await boundedRegularFile(guestAgent, 128 * 1024 * 1024, "guest management executable");
+  if (binaryInput !== undefined && sha256(guestBytes) !== binaryDigest) throw new Error("guest management input digest mismatch");
   assertElfArchitecture(guestBytes, "guest agent");
   const programOffset = Number(guestBytes.readBigUInt64LE(32));
   const programSize = guestBytes.readUInt16LE(54); const programCount = guestBytes.readUInt16LE(56);
@@ -344,25 +355,20 @@ async function buildLinuxSystem(
     "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "archive_system", "--",
     systemRoot, canonicalTar,
   ]);
-  await run("cargo", [
+  const builderDigest = (await run("cargo", [
     "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "materialize_ext4", "--",
     canonicalTar, output, String(128 * 1024 * 1024),
-  ]);
-  await run("tune2fs", ["-O", "has_journal", output]);
-  await run("cargo", [
-    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "finalize_journaled_ext4", "--", output,
-  ]);
-  await run("e2fsck", ["-fn", output]);
+  ], process.cwd(), {}, true)).trim();
+  if (!/^[a-f0-9]{64}$/u.test(builderDigest)) throw new Error("filesystem builder did not return its provenance digest");
 
   const packageLock = Buffer.from(`${packages.join("\n")}\n`, "utf8");
-  const builderIdentity = Buffer.from("arcbox-ext4-0.1.2+sandsurf-journaled-v3", "utf8");
-  const recipeFiles = ["scripts/build-guest-image.ts", "crates/sandsurf-image/examples/archive_system.rs", "crates/sandsurf-image/examples/finalize_journaled_ext4.rs", "crates/sandsurf-image/src/ext4.rs",
-    ...["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/sudoers.d/agent"].map((path) => `scripts/guest-image/${path}`)];
+  const recipeFiles = ["scripts/build-guest-image.ts", "crates/sandsurf-image/examples/archive_system.rs", "crates/sandsurf-image/src/ext4.rs",
+    ...["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/init.d/sandsurf-expand-root", "etc/sudoers.d/agent"].map((path) => `scripts/guest-image/${path}`)];
   const recipe = Object.fromEntries(await Promise.all(recipeFiles.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
   const materials = {
     "alpine-minirootfs": imageBuild.alpineSha256,
     "alpine-packages": sha256(packageLock),
-    "sandsurf-ext4-builder": sha256(builderIdentity),
+    "sandsurf-ext4-builder": builderDigest,
     "sandsurf-system-recipe": identityDigest(recipe),
     "sandsurf-management": sha256(await readFile(guestAgent)),
   };
@@ -378,7 +384,7 @@ async function configureLinuxSystem(root: string, guestAgent: string): Promise<v
   }
   await copyFile(guestAgent, resolve(root, "usr/sbin/sandsurf-guest"));
   await chmod(resolve(root, "usr/sbin/sandsurf-guest"), 0o755);
-  for (const relative of ["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/sudoers.d/agent"]) {
+  for (const relative of ["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/init.d/sandsurf-expand-root", "etc/sudoers.d/agent"]) {
     await copyFile(resolve("scripts/guest-image", relative), resolve(root, relative));
     await chmod(resolve(root, relative), relative.startsWith("etc/init.d/") ? 0o755 : relative.includes("sudoers") ? 0o440 : 0o644);
   }
@@ -387,7 +393,7 @@ async function configureLinuxSystem(root: string, guestAgent: string): Promise<v
   await writeFile(resolve(root, "etc/rc.conf"), 'rc_cgroup_mode="unified"\n', { mode: 0o644 });
   const runlevels = {
     sysinit: ["devfs", "procfs", "sysfs", "mdev", "cgroups"],
-    boot: ["root", "localmount", "bootmisc", "machine-id", "hostname", "loopback"],
+    boot: ["root", "sandsurf-expand-root", "localmount", "bootmisc", "machine-id", "hostname", "loopback"],
     default: ["sandsurf-management"],
     shutdown: ["killprocs", "mount-ro"],
   } as const;
@@ -519,12 +525,18 @@ function run(
   args: readonly string[],
   cwd = process.cwd(),
   environment: Readonly<Record<string, string>> = {},
-): Promise<void> {
+  captureOutput = false,
+): Promise<string> {
   return new Promise((resolveRun, rejectRun) => {
-    const child = spawn(command, args, { cwd, env: { ...process.env, ...environment }, stdio: "inherit" });
+    let output = "";
+    const child = spawn(command, args, { cwd, env: { ...process.env, ...environment }, stdio: captureOutput ? ["ignore", "pipe", "inherit"] : "inherit" });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      output += chunk.toString("utf8");
+      if (output.length > 4096) { child.kill(); rejectRun(new Error(`${command} exceeded its build-output bound`)); }
+    });
     child.on("error", rejectRun);
     child.on("exit", (code, signal) => {
-      if (code === 0) resolveRun();
+      if (code === 0) resolveRun(output);
       else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`));
     });
   });

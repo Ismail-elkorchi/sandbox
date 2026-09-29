@@ -319,7 +319,7 @@ impl AppleGuardianEffect {
             guest_architecture: crate::service::native_guest_architecture(),
             kernel: image.kernel_path,
             initial_ramdisk: None,
-            command_line: "console=hvc0 reboot=k panic=1 root=/dev/vda rw init=/sbin/init".into(),
+            command_line: sandsurf_machine::linux_boot_arguments("hvc0", "/dev/vda"),
             disks: vec![
                 AppleDisk {
                     path: system_disk,

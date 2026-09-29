@@ -29,14 +29,15 @@ impl DiskFormat {
     }
 }
 
-/// `prepare_seed` may interpret only a verified, never-booted creation seed.
-/// It is never called for a published disk, which guest root may have changed.
+/// Prepare only native storage geometry and allocation. A creation seed can
+/// derive from a root-controlled machine; never interpret its guest filesystem
+/// here. Published disks never enter preparation again.
 pub(crate) fn materialize(
     source: &Path,
     destination: &Path,
     bytes: u64,
     format: DiskFormat,
-    prepare_seed: impl FnOnce(&Path) -> io::Result<()>,
+    prepare_storage: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     if !source.is_absolute()
         || !destination.is_absolute()
@@ -86,7 +87,7 @@ pub(crate) fn materialize(
     }
     output.sync_all()?;
     drop(output);
-    prepare_seed(&staged)?;
+    prepare_storage(&staged)?;
     validate_disk(&staged, bytes, format)?;
     sandsurf_native::storage::publish_new_file(&staged, destination)
 }

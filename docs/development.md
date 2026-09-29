@@ -17,12 +17,12 @@ npm run audit:unsafe
 The deterministic parser smoke harness is `npm run fuzz:smoke`. The trust-boundary libFuzzer set is:
 
 ```sh
-for target in sandsurf_protocol canonical_digest policy paths network_rules dns socks5 http_connect image_manifest guest_protocol artifact_manifest changesets; do
+for target in sandsurf_protocol canonical_digest network_rules dns socks5 http_connect image_manifest guest_protocol; do
   cargo +nightly fuzz run "$target" -- -max_total_time=30 -max_len=1048576
 done
 ```
 
-Build a local guest image only from source-built artifacts:
+Build a local guest image on Linux with protected e2fsprogs (including canonical-tar support) and, for x64 VHDX conversion, qemu-img. Filesystem construction uses a fixed journaled, online-growable ext4 profile. The guest grows its own filesystem; the host never repairs or resizes a guest-controlled filesystem.
 
 ```sh
 SANDSURF_LOCAL_IMAGE=1 \
@@ -31,6 +31,8 @@ npm run build:guest-image
 ```
 
 Release images require the private signing seed through `SANDSURF_IMAGE_SIGNING_KEY_FILE`; the seed must never enter the repository or logs. Firecracker downloads are digest-verified by `npm run fetch:firecracker` and never occur during package installation or workload execution.
+
+On a qualified Linux x64 host, `SANDSURF_KVM_TEST=1 npm run test:package` runs the persistent-computer suite using the installed tarball's SDK, native binary and image. Build serially on memory-constrained hosts; do not compile while VM qualification is running.
 
 Real VM qualification is separate:
 

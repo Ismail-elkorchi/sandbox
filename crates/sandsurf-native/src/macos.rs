@@ -1,5 +1,5 @@
-//! Native macOS permission checks. POSIX mode bits alone cannot establish private
-//! ownership when an extended ACL grants access. These checks never rewrite ACLs.
+//! Native macOS filesystem and descriptor-relative socket primitives.
+//! POSIX modes alone do not establish private ownership in the presence of ACLs.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::fs::{self, File};
@@ -30,6 +30,40 @@ unsafe extern "C" {
     fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
     fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> c_int;
     fn acl_free(value: *mut c_void) -> c_int;
+}
+
+// SAFETY: signature and reset semantics match Apple's libpthread declaration:
+// https://github.com/apple-oss-distributions/libpthread/blob/main/private/pthread/private.h
+unsafe extern "C" {
+    fn pthread_fchdir_np(fd: c_int) -> c_int;
+}
+
+/// Darwin has no procfs directory-descriptor socket path. Run the native lookup
+/// relative to a retained descriptor in an isolated thread. Neither the caller's
+/// per-thread directory nor the process-wide working directory is changed.
+pub(crate) fn in_directory<T: Send>(
+    directory: &File,
+    operation: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                // SAFETY: the borrowed directory remains owned until this thread
+                // joins. This fresh thread has no previous per-thread directory.
+                if unsafe { pthread_fchdir_np(directory.as_raw_fd()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let result = operation();
+                // SAFETY: -1 clears only this worker's per-thread directory. On
+                // panic or reset failure, thread exit also releases that directory.
+                if unsafe { pthread_fchdir_np(-1) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                result
+            })
+            .join()
+            .map_err(|_| io::Error::other("native directory worker panicked"))?
+    })
 }
 
 struct Acl(*mut c_void);

@@ -22,6 +22,16 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Native adapters supply only virtual-hardware-specific device names. The
+/// Linux OS policy is shared: root may administer its mounted block devices,
+/// including growing the filesystem with ordinary e2fsprogs. This does not
+/// confer host disk access; the adapter attaches only machine-owned disks.
+pub fn linux_boot_arguments(console: &str, root_device: &str) -> String {
+    format!(
+        "console={console} reboot=k panic=1 root={root_device} rw init=/sbin/init bdev_allow_write_mounted=1"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestArchitecture {
     Amd64,
@@ -448,6 +458,20 @@ mod tests {
             apply_lifecycle(&mut driver, &command(DesiredState::Running), None),
             MachineOutcome::Unknown
         );
+    }
+
+    #[test]
+    fn native_topologies_share_linux_administrator_boot_policy() {
+        for (console, disk) in [
+            ("ttyS0", "/dev/vda"),
+            ("hvc0", "/dev/vda"),
+            ("ttyS0", "/dev/sda"),
+        ] {
+            let arguments = linux_boot_arguments(console, disk);
+            assert!(arguments.contains(&format!("console={console} ")));
+            assert!(arguments.contains(&format!("root={disk} ")));
+            assert!(arguments.contains("rw init=/sbin/init bdev_allow_write_mounted=1"));
+        }
     }
 
     #[test]

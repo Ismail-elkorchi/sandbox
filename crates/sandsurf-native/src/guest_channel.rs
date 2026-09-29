@@ -43,16 +43,13 @@ mod unix {
     use super::{GuestChannel, GuestChannelError, GuestConnection};
     use crate::unix_io::DeadlineIo;
     use std::cell::Cell;
-    #[cfg(target_os = "linux")]
     use std::fs::File;
     use std::io;
     use std::io::{BufRead, BufReader, Read, Write};
     #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
-    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixStream;
-    #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -119,7 +116,7 @@ mod unix {
     impl GuestChannel for DirectUnixChannel {
         fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
             Ok(Box::new(UnixGuestConnection::new(
-                connect_socket(&self.socket_path)?,
+                connect_socket(&self.socket_path, self.timeout)?,
                 Some(self.timeout),
             )?))
         }
@@ -139,12 +136,21 @@ mod unix {
                     "invalid guest vsock port".into(),
                 ));
             }
-            let mut stream =
-                UnixGuestConnection::new(connect_socket(&self.socket_path)?, Some(self.timeout))?;
-            writeln!(stream, "CONNECT {}", self.guest_port)?;
-            stream.flush()?;
+            let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "guest connection timeout is invalid",
+                )
+            })?;
+            let mut stream = connect_socket(&self.socket_path, self.timeout)?;
+            let mut handshake = DeadlineIo {
+                stream: &mut stream,
+                deadline: Some(deadline),
+            };
+            writeln!(handshake, "CONNECT {}", self.guest_port)?;
+            handshake.flush()?;
             let mut response = String::new();
-            BufReader::new((&mut stream).take(128)).read_line(&mut response)?;
+            BufReader::new(handshake.take(128)).read_line(&mut response)?;
             let assigned_port = response
                 .trim()
                 .strip_prefix("OK ")
@@ -157,13 +163,20 @@ mod unix {
                     "Firecracker vsock connection acknowledgement is invalid".into(),
                 ));
             }
-            stream.set_io_timeout(None)?;
-            Ok(Box::new(stream))
+            Ok(Box::new(UnixGuestConnection::new(stream, None)?))
         }
     }
 
-    #[cfg(target_os = "linux")]
-    fn connect_socket(path: &Path) -> io::Result<UnixStream> {
+    fn connect_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .filter(|_| !timeout.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "guest connection timeout is invalid",
+                )
+            })?;
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -186,21 +199,18 @@ mod unix {
             ));
         }
         let directory = File::open(parent)?;
-        let short = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
-        let stream = UnixStream::connect(short)?;
-        drop(directory);
-        Ok(stream)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn connect_socket(path: &std::path::Path) -> io::Result<UnixStream> {
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "guest socket path must be absolute",
-            ));
+        #[cfg(target_os = "linux")]
+        {
+            let short =
+                PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+            crate::unix_io::connect_socket(&short, deadline)
         }
-        UnixStream::connect(path)
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::in_directory(&directory, || {
+                crate::unix_io::connect_socket(Path::new(name), deadline)
+            })
+        }
     }
 
     #[cfg(test)]
@@ -271,7 +281,48 @@ mod unix {
             fs::remove_dir(root).expect("remove root");
         }
 
-        #[cfg(target_os = "linux")]
+        #[test]
+        fn fragmented_vsock_acknowledgement_cannot_extend_connection_deadline() {
+            use std::fs;
+            use std::os::unix::net::UnixListener;
+            let root = std::env::temp_dir().join(format!("ss-trickle-{}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            let directory = File::open(&root).unwrap();
+            #[cfg(target_os = "linux")]
+            let listener = UnixListener::bind(
+                PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                    .join("guest.sock"),
+            )
+            .unwrap();
+            #[cfg(target_os = "macos")]
+            let listener =
+                crate::macos::in_directory(&directory, || UnixListener::bind("guest.sock"))
+                    .unwrap();
+            let server = std::thread::spawn(move || {
+                let mut stream = listener.accept().unwrap().0;
+                for byte in b"OK 1024\n" {
+                    if stream.write_all(&[*byte]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(125));
+                }
+            });
+            let mut channel = UnixVsockChannel {
+                socket_path: root.join("guest.sock"),
+                guest_port: 1024,
+                timeout: Duration::from_millis(500),
+            };
+            let started = Instant::now();
+            assert!(
+                matches!(channel.connect(), Err(GuestChannelError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            server.join().unwrap();
+            fs::remove_file(root.join("guest.sock")).unwrap();
+            drop(directory);
+            fs::remove_dir(root).unwrap();
+        }
+
         #[test]
         fn descriptor_relative_socket_connect_ignores_long_state_roots() {
             use std::fs;
@@ -285,10 +336,16 @@ mod unix {
             fs::create_dir(&root).expect("create long root");
             let socket = root.join("guest.vsock");
             let directory = File::open(&root).expect("open root");
+            #[cfg(target_os = "linux")]
             let listener_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
                 .join("guest.vsock");
+            #[cfg(target_os = "linux")]
             let listener = UnixListener::bind(listener_path).expect("bind short address");
-            let client = connect_socket(&socket).expect("connect");
+            #[cfg(target_os = "macos")]
+            let listener =
+                crate::macos::in_directory(&directory, || UnixListener::bind("guest.vsock"))
+                    .expect("bind relative address");
+            let client = connect_socket(&socket, Duration::from_secs(1)).expect("connect");
             let _server = listener.accept().expect("accept").0;
             drop(client);
             drop(directory);

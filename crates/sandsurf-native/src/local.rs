@@ -12,13 +12,12 @@
 //! or invalid frame poisons its connection. Callers must not retry commands on a
 //! replacement connection without reconciling their operation identities.
 
-use crate::unix_io::{DeadlineIo, wait_ready};
+use crate::unix_io::{DeadlineIo, connect_socket, wait_ready};
 use sandsurf_protocol::Frame;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -186,21 +185,24 @@ impl Directory {
         crate::macos::require_private_path_acl(&self.path.join(SOCKET))?;
         Ok(metadata)
     }
-    fn native_socket_path(&self) -> PathBuf {
+    fn at_socket<T: Send>(
+        &self,
+        operation: impl FnOnce(&Path) -> io::Result<T> + Send,
+    ) -> io::Result<T> {
         #[cfg(target_os = "linux")]
         {
             // AF_UNIX has a small pathname field. Resolve the already verified,
             // retained directory descriptor through procfs so an otherwise
             // valid private state root cannot make guardian IPC unreachable.
-            PathBuf::from(format!(
+            operation(&PathBuf::from(format!(
                 "/proc/self/fd/{}/{}",
                 self.held.as_raw_fd(),
                 SOCKET
-            ))
+            )))
         }
         #[cfg(target_os = "macos")]
         {
-            self.path.join(SOCKET)
+            crate::macos::in_directory(&self.held, || operation(Path::new(SOCKET)))
         }
     }
 }
@@ -310,7 +312,7 @@ impl LocalListener {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let listener = UnixListener::bind(root.native_socket_path())?;
+        let listener = root.at_socket(|path| UnixListener::bind(path))?;
         let metadata = fs::symlink_metadata(&path)?;
         let owner = SocketOwner {
             root,
@@ -367,7 +369,7 @@ impl LocalConnection {
         let deadline = Deadline::new(timeout)?;
         let root = Directory::open(directory)?;
         let expected = identity(&root.socket()?);
-        let stream = connect_socket(&root.native_socket_path(), &deadline)?;
+        let stream = root.at_socket(|path| connect_socket(path, deadline.0))?;
         if identity(&root.socket()?) != expected {
             return Err(denied("endpoint changed while connecting"));
         }
@@ -435,7 +437,7 @@ struct Deadline(Instant);
 impl Deadline {
     fn new(timeout: Duration) -> io::Result<Self> {
         if timeout.is_zero() || timeout > MAX_DEADLINE {
-            return Err(invalid("local transport deadline must be in (0, 60s]"));
+            return Err(invalid("local transport deadline must be in (0, 300s]"));
         }
         Ok(Self(Instant::now() + timeout))
     }
@@ -453,63 +455,6 @@ impl Deadline {
     fn poll(&self, fd: RawFd, events: libc::c_short) -> io::Result<()> {
         wait_ready(fd, events, Some(self.0))
     }
-}
-
-fn connect_socket(path: &Path, deadline: &Deadline) -> io::Result<UnixStream> {
-    // SAFETY: sockaddr_un is a plain C struct; zero is valid initial storage.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(invalid(
-            "local socket path exceeds native bound or contains NUL",
-        ));
-    }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *slot = *byte as libc::c_char;
-    }
-    let length =
-        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
-    #[cfg(target_os = "macos")]
-    {
-        address.sun_len = length as u8;
-    }
-    #[cfg(target_os = "linux")]
-    let flags = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-    #[cfg(target_os = "macos")]
-    let flags = libc::SOCK_STREAM;
-    // SAFETY: socket takes scalar constants and returns a new owned descriptor.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, flags, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is the successful socket call's new descriptor, transferred once.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: F_SETFD marks this owned descriptor close-on-exec. Apple does not
-        // provide SOCK_CLOEXEC; launchers must also clear ambient descriptors.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        stream.set_nonblocking(true)?;
-    }
-    deadline.remaining()?;
-    // SAFETY: address is initialized with a bounded, NUL-terminated native path;
-    // length is within its allocation, and fd is this live nonblocking socket.
-    if unsafe { libc::connect(fd, (&raw const address).cast(), length) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS) {
-            // In particular, AF_UNIX EAGAIN means backlog admission failed, NOT
-            // an established connection. No request has been dispatched.
-            return Err(error);
-        }
-        deadline.poll(fd, libc::POLLOUT)?;
-        if let Some(error) = stream.take_error()? {
-            return Err(error);
-        }
-    }
-    Ok(stream)
 }
 
 #[cfg(target_os = "linux")]

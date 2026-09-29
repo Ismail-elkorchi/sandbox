@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+description="Grow the Linux root filesystem to its virtual disk capacity"
+
+depend() {
+    need root
+    before localmount
+}
+
+start() {
+    # Filesystem interpretation belongs to Linux, not the host. Like every
+    # service in this image, this is removable by the guest administrator.
+    local root_device=""
+    local argument
+    for argument in $(cat /proc/cmdline); do
+        case "$argument" in
+            root=/dev/*) root_device="${argument#root=}" ;;
+        esac
+    done
+    if [ ! -b "$root_device" ]; then
+        eerror "No root block device in the native boot arguments"
+        return 1
+    fi
+    ebegin "Growing root filesystem to virtual disk capacity"
+    resize2fs "$root_device"
+    eend $?
+}

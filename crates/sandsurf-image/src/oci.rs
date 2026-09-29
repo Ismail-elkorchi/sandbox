@@ -246,13 +246,14 @@ pub fn write_filesystem_tar(
             "converted tree and tar paths must be absolute".into(),
         ));
     }
+    let ordered = filesystem_archive_order(&tree.entries)?;
     let output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)?;
     let mut archive = tar::Builder::new(output);
     archive.mode(tar::HeaderMode::Deterministic);
-    for entry in &tree.entries {
+    for entry in ordered {
         let relative = normalize_layer_path(Path::new(&entry.path), 4096)?;
         if relative.as_os_str().is_empty() {
             continue;
@@ -306,6 +307,62 @@ pub fn write_filesystem_tar(
     let output = archive.into_inner()?;
     output.sync_all()?;
     Ok(())
+}
+
+/// Directory/file order is canonical; hardlinks follow their inode source,
+/// even when their names sort before it. Reject cycles before creating a tar.
+fn filesystem_archive_order(entries: &[TreeEntry]) -> Result<Vec<&TreeEntry>, OciError> {
+    let by_path: BTreeMap<_, _> = entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    if by_path.len() != entries.len() {
+        return Err(OciError::Invalid(
+            "duplicate filesystem archive entry".into(),
+        ));
+    }
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut waiting: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut ready = BTreeSet::new();
+    for entry in by_path.values() {
+        if entry.kind != TreeEntryKind::Hardlink {
+            ordered.push(*entry);
+            continue;
+        }
+        let target = entry
+            .link_target
+            .as_deref()
+            .and_then(|path| by_path.get(path))
+            .ok_or_else(|| OciError::Invalid("filesystem hardlink target missing".into()))?;
+        match target.kind {
+            TreeEntryKind::Regular => {
+                ready.insert(entry.path.as_str());
+            }
+            TreeEntryKind::Hardlink => {
+                waiting
+                    .entry(target.path.as_str())
+                    .or_default()
+                    .push(entry.path.as_str());
+            }
+            _ => {
+                return Err(OciError::Invalid(
+                    "filesystem hardlink target is not an inode source".into(),
+                ));
+            }
+        }
+    }
+    while let Some(path) = ready.pop_first() {
+        ordered.push(by_path[path]);
+        if let Some(children) = waiting.remove(path) {
+            ready.extend(children);
+        }
+    }
+    if ordered.len() != entries.len() {
+        return Err(OciError::Invalid(
+            "filesystem hardlink dependency cycle".into(),
+        ));
+    }
+    Ok(ordered)
 }
 
 fn is_layout_archive_path(path: &Path) -> bool {
@@ -1465,6 +1522,40 @@ mod tests {
                 .convert(forged, &other)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn filesystem_archive_preserves_hardlinks_without_forward_references() {
+        let entry = |path: &str, kind, target: Option<&str>| TreeEntry {
+            path: path.into(),
+            kind,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            digest: None,
+            link_target: target.map(str::to_owned),
+        };
+        let entries = vec![
+            entry("a", TreeEntryKind::Hardlink, Some("b")),
+            entry("b", TreeEntryKind::Hardlink, Some("z")),
+            entry("z", TreeEntryKind::Regular, None),
+        ];
+        let ordered = filesystem_archive_order(&entries).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "b", "a"]
+        );
+        let cycle = vec![
+            entry("a", TreeEntryKind::Hardlink, Some("b")),
+            entry("b", TreeEntryKind::Hardlink, Some("a")),
+        ];
+        assert!(filesystem_archive_order(&cycle).is_err());
+        let absent = vec![entry("a", TreeEntryKind::Hardlink, Some("missing"))];
+        assert!(filesystem_archive_order(&absent).is_err());
     }
 
     #[test]
