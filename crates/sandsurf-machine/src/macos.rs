@@ -12,8 +12,10 @@ use sandsurf_protocol::{
     MachineState, Qualification, VmEngine, bytes_digest,
 };
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -79,6 +81,7 @@ pub struct AppleDriver {
     full_capture_operation: Option<sandsurf_protocol::OperationId>,
     committed_suspend: Option<(sandsurf_protocol::OperationId, Digest)>,
     staged_restore: Option<AppleRestoreSource>,
+    pending_storage_custody: Option<Arc<File>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,11 +168,29 @@ impl AppleDriver {
             full_capture_operation: None,
             committed_suspend: None,
             staged_restore: None,
+            pending_storage_custody: None,
         })
     }
 
     pub fn default_timeout() -> Duration {
         DEFAULT_OPERATION_TIMEOUT
+    }
+
+    /// A pending native launch receives the storage owner's already-held
+    /// custody. It is not a path-based second acquisition in the helper.
+    pub fn stage_storage_custody(&mut self, custody: Arc<File>) -> io::Result<()> {
+        if self.owner.is_some() || self.pending_storage_custody.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native storage custody is already installed",
+            ));
+        }
+        self.pending_storage_custody = Some(custody);
+        Ok(())
+    }
+
+    pub fn discard_pending_storage_custody(&mut self) {
+        self.pending_storage_custody.take();
     }
 
     fn unavailable(reason: &'static [u8]) -> MachineOutcome {
@@ -214,11 +235,14 @@ impl AppleDriver {
         if !file_digest_matches(&self.config.helper, &self.config.helper_digest) {
             return Self::unavailable(b"apple-helper-integrity-mismatch");
         }
-        let mut owner = match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout)
-        {
-            Ok(value) => value,
-            Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+        let Some(custody) = self.pending_storage_custody.take() else {
+            return Self::unavailable(b"apple-storage-custody-missing");
         };
+        let mut owner =
+            match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout, custody) {
+                Ok(value) => value,
+                Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+            };
         let response = owner.request(&HelperRequest::Create(Box::new(
             self.helper_create(command.machine_id.clone()),
         )));
@@ -686,11 +710,14 @@ impl MachineDriver for AppleDriver {
         if !file_digest_matches(&self.config.helper, &self.config.helper_digest) {
             return Self::unavailable(b"apple-helper-integrity-mismatch");
         }
-        let mut owner = match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout)
-        {
-            Ok(value) => value,
-            Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+        let Some(custody) = self.pending_storage_custody.take() else {
+            return Self::unavailable(b"apple-storage-custody-missing");
         };
+        let mut owner =
+            match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout, custody) {
+                Ok(value) => value,
+                Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+            };
         let response = owner.request(&HelperRequest::Restore(Box::new(HelperRestore {
             machine: self.helper_create(command.machine_id.clone()),
             saved_state: source.saved_state,
@@ -800,14 +827,23 @@ struct PendingInspection {
 }
 
 impl HelperOwner {
-    fn spawn(path: &Path, timeout: Duration) -> io::Result<Self> {
-        let mut child = Command::new(path)
-            .arg("--sandsurf-owner-v1")
+    fn spawn(path: &Path, timeout: Duration, custody: Arc<File>) -> io::Result<Self> {
+        let mut command = Command::new(path);
+        command
+            .arg("--sandsurf-owner-v2")
+            .arg("--storage-custody-fd")
+            .arg(custody.as_raw_fd().to_string())
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        // SAFETY: the post-fork child only changes a descriptor flag through
+        // an async-signal-safe syscall; custody owns the inherited description.
+        unsafe {
+            command
+                .pre_exec(move || sandsurf_native::storage::retain_descriptor_for_exec(&custody));
+        }
+        let mut child = command.spawn()?;
         let input = child
             .stdin
             .take()
@@ -1128,6 +1164,48 @@ fn transition_with_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_inherits_exclusive_storage_custody_until_confirmed_process_exit() {
+        use sandsurf_native::PrivateFileAccess;
+        use sandsurf_native::local::{
+            create_private_directory, create_private_file, open_private_file,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-apple-custody-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_private_directory(&root).unwrap();
+        let helper = root.join("helper");
+        // A process-only fixture exercises the production descriptor handoff;
+        // it is not a fake VM or native virtualization qualification.
+        create_private_file(&helper)
+            .unwrap()
+            .write_all(b"#!/bin/sh\nexec /bin/cat\n")
+            .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("storage.lock");
+        let custody = create_private_file(&path).unwrap();
+        custody.try_lock().unwrap();
+        let mut owner =
+            HelperOwner::spawn(&helper, Duration::from_secs(1), Arc::new(custody)).unwrap();
+        let next = open_private_file(&path, PrivateFileAccess::ReadWrite).unwrap();
+        assert!(matches!(
+            next.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        owner.contain();
+        next.try_lock().unwrap();
+        drop(owner);
+        drop(next);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rejects_relative_owner_and_disk_paths() {

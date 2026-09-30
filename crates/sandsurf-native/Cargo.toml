@@ -22,6 +22,7 @@ windows-sys = { workspace = true, features = [
   "Win32_Storage_Vhd",
   "Win32_System_IO",
   "Win32_System_Hypervisor",
+  "Win32_System_HostComputeSystem",
   "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }

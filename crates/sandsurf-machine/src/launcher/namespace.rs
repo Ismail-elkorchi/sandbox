@@ -1,4 +1,5 @@
 use super::*;
+pub(super) use sandsurf_native::storage::retain_descriptor_for_exec as inherit;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
@@ -268,14 +269,6 @@ pub fn namespace_probe_main() -> i32 {
 
 fn descriptor_path(file: &File) -> String {
     format!("/proc/self/fd/{}", file.as_raw_fd())
-}
-
-fn inherit(file: &File) -> io::Result<()> {
-    // SAFETY: this single-threaded launcher owns the descriptor and intentionally transfers it across exec.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn data_mount(command: &mut Command, file: &File, target: &str, mode: &str) {

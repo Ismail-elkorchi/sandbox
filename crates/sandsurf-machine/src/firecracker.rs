@@ -43,6 +43,9 @@ pub struct FirecrackerConfig {
     pub kernel_image: PathBuf,
     /// Exclusively attached, host-owned writable Linux system disk.
     pub system_disk: PathBuf,
+    /// The storage owner's exclusive slot lease, transferred into the actual
+    /// VMM. Never unlock a duplicate while a native attachment still exists.
+    pub storage_lease: std::sync::Arc<File>,
     pub authentication_image: PathBuf,
     pub owner_token: String,
     pub guest_cid: u32,
@@ -143,6 +146,9 @@ impl FirecrackerProcess {
         let mut files = Vec::new();
         let kernel_fd_index = add_file(&mut files, &config.kernel_image)?;
         let system_fd_index = add_file(&mut files, &config.system_disk)?;
+        let storage_lease_fd_index = files.len();
+        let storage_lease_identity = file_identity(config.storage_lease.as_raw_fd())?;
+        files.push(config.storage_lease.try_clone()?);
         let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
         let configuration_fd_index = add_file(&mut files, &config_path)?;
         let snapshot_state_fd_index = restore
@@ -179,6 +185,8 @@ impl FirecrackerProcess {
             firecracker_sha256: actual_digest,
             kernel_fd_index,
             system_fd_index,
+            storage_lease_fd_index,
+            storage_lease_identity,
             authentication_fd_index,
             configuration_fd_index,
             snapshot_state_fd_index,

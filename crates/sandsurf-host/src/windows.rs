@@ -371,6 +371,14 @@ impl WindowsGuardianEffect {
             },
             authentication,
         });
+        let custody = crate::storage::attach_hyper_v(
+            &self.machine_root.join("disks/system.vhdx"),
+            self.machine.vm_id(),
+        )
+        .map_err(|_| bytes_digest(b"hyper-v-system-disk-attachment-failed"))?;
+        self.machine
+            .stage_storage_custody(custody)
+            .map_err(|_| bytes_digest(b"hyper-v-system-disk-custody-conflict"))?;
         Ok(())
     }
 
@@ -897,6 +905,7 @@ impl GuardianEffect for WindowsGuardianEffect {
             }
         }
         let mut outcome = apply_lifecycle(&mut self.machine, command, current);
+        self.machine.discard_pending_storage_custody();
         let running = matches!(
             &outcome,
             MachineOutcome::Observed(values)

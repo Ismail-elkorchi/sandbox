@@ -556,7 +556,24 @@ private func writeResponse(_ response: Response) throws {
 @main
 private enum SandsurfVMHelper {
     static func main() throws {
-        guard CommandLine.arguments == [CommandLine.arguments[0], "--sandsurf-owner-v1"] else {
+        let arguments = CommandLine.arguments
+        guard arguments.count == 4,
+              arguments[1] == "--sandsurf-owner-v2",
+              arguments[2] == "--storage-custody-fd",
+              let custody = Int32(arguments[3]), custody >= 3,
+              fcntl(custody, F_GETFD) >= 0 else {
+            throw OwnerError.invalidInvocation
+        }
+
+        // The inherited open description carries the host's exclusive slot
+        // lease. It is deliberately never unlocked or closed while this native
+        // owner can still retain a VZ disk attachment, including forced death.
+        var metadata = stat()
+        guard fstat(custody, &metadata) == 0,
+              metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              metadata.st_nlink == 1,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & 0o077 == 0 else {
             throw OwnerError.invalidInvocation
         }
 

@@ -69,7 +69,7 @@ fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     drop(host);
     let database = path.join("authority.sqlite");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection.execute_batch("PRAGMA user_version=9;").unwrap();
+    connection.execute_batch("PRAGMA user_version=10;").unwrap();
     drop(connection);
     let original = fs::read(&database).unwrap();
     assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));

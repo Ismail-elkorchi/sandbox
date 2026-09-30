@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:net";
@@ -38,6 +39,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       "host observations include the persistent machine disk independently of Linux free space");
     assert.ok(initialUsage.diskAllocatedBytes >= 256 * 1024 ** 2,
       "the reserved persistent disk must be accounted through native filesystem allocation");
+    const storageLease = join(directory, "machines", objectName(machine.id), "disks/system.storage.lock");
+    assertStorageCustody(storageLease, true);
     context.diagnostic("ordinary Linux boot and administrator access");
     assert.equal((await machine.inspect()).machine.value.state, "running");
     assert.equal(await run(machine, "id -un"), "agent\n");
@@ -87,6 +90,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       const unavailable = await machine.inspect();
       assert.equal(unavailable.machine.kind, "unavailable");
       assert.equal(unavailable.machine.lastKnown.state, "running");
+      assertStorageCustody(storageLease, true);
       const independentlyObservedUsage = await machine.resources.usage();
       assert.ok(independentlyObservedUsage.diskAllocatedBytes >= 256 * 1024 ** 2);
       assert.ok(independentlyObservedUsage.outputRetainedBytes >= dense.length);
@@ -231,6 +235,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       interrupted.waitCapture({ signal: AbortSignal.timeout(15_000) }),
     ]);
     await machine.powerOff();
+    assertStorageCustody(storageLease, false);
     assert.equal((await machine.resources.usage()).executionsCurrent, 0, "native interruption frees managed admission capacity, not output retention");
     for (const result of await waits) {
       assert.equal(result.status, "rejected");
@@ -466,6 +471,15 @@ async function managementReady(machine) {
   } while (Date.now() < deadline);
   throw last;
 }
+function assertStorageCustody(path, attached) {
+  const probe = spawnSync("/usr/bin/flock", ["--nonblock", "--exclusive", path, "/bin/true"], {
+    timeout: 2_000, stdio: "ignore",
+  });
+  assert.equal(probe.error, undefined);
+  assert.equal(probe.status, attached ? 1 : 0,
+    attached ? "the actual native owner must retain exclusive disk custody" : "confirmed native exit must free disk custody");
+}
+
 function exitCode(inspection) {
   assert.equal(inspection.state.kind, "exited");
   assert.equal(inspection.state.outcome.kind, "exit");

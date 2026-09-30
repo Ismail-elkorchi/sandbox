@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 9;
+pub const SERVICE_VERSION: u16 = 10;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.

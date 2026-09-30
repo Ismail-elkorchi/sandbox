@@ -1,6 +1,7 @@
 //! One physical storage owner for machine disks. Durable slot phases fence
 //! creation, replacement and retirement; only a Ready published payload may
-//! be attached. Staging files never represent a VM.
+//! be attached. Staging files never represent a VM. An attachment transfers the
+//! same exclusive slot lease to the native owner until actual native exit.
 
 use sandsurf_native::PrivateFileAccess;
 use sandsurf_native::local::{create_private_file, open_private_file};
@@ -38,23 +39,32 @@ struct DiskObject {
 enum DiskPhase {
     Preparing,
     Ready,
-    Replacing { operation: OperationId },
-    Retiring { replacement: Option<OperationId> },
+    #[cfg(windows)]
+    Attached {
+        compute_system: String,
+    },
+    Replacing {
+        operation: OperationId,
+    },
+    Retiring {
+        replacement: Option<OperationId>,
+    },
     Retired,
 }
 
 /// Physical storage state, not host lifecycle intent or resource authorization.
-/// All slot mutations use the same OS writer lease. Native attachments still
-/// belong to the guardian and must be released before replacement/retirement.
+/// All slot mutations and native attachments use the same exclusive OS lease.
 struct DiskOwner {
     path: PathBuf,
     record: DiskObject,
-    lease: std::fs::File,
+    lease: Option<std::fs::File>,
 }
 
 impl Drop for DiskOwner {
     fn drop(&mut self) {
-        let _ = self.lease.unlock();
+        if let Some(lease) = &self.lease {
+            let _ = lease.unlock();
+        }
     }
 }
 
@@ -100,7 +110,7 @@ impl DiskOwner {
         };
         let fresh = old.is_none();
         let record = if let Some(record) = old {
-            if record.version != 1
+            if record.version != 2
                 || record.filename != filename
                 || record.bytes == 0
                 || record.bytes > MAX_DISK_BYTES
@@ -124,7 +134,7 @@ impl DiskOwner {
                 return Err(invalid("untracked storage cannot be adopted or replaced"));
             }
             DiskObject {
-                version: 1,
+                version: 2,
                 filename: filename.to_owned(),
                 bytes,
                 format,
@@ -134,12 +144,47 @@ impl DiskOwner {
         let mut owner = Self {
             path,
             record,
-            lease,
+            lease: Some(lease),
         };
         if fresh {
             owner.persist()?;
         }
+        #[cfg(windows)]
+        owner.reconcile_attachment(destination)?;
         Ok(owner)
+    }
+
+    #[cfg(windows)]
+    fn reconcile_attachment(&mut self, disk: &Path) -> io::Result<()> {
+        self.reconcile_attachment_using(
+            disk,
+            sandsurf_native::storage::compute_system_absent,
+            sandsurf_native::storage::revoke_disk_attachment_access,
+        )
+    }
+
+    #[cfg(windows)]
+    fn reconcile_attachment_using(
+        &mut self,
+        disk: &Path,
+        absent: impl FnOnce(&str) -> io::Result<bool>,
+        revoke: impl FnOnce(&str, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let DiskPhase::Attached { compute_system } = &self.record.phase else {
+            return Ok(());
+        };
+        if !absent(compute_system)? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native compute system still owns this disk",
+            ));
+        }
+        match fs::symlink_metadata(disk) {
+            Ok(_) => revoke(compute_system, disk)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.set_phase(DiskPhase::Ready)
     }
 
     fn set_phase(&mut self, phase: DiskPhase) -> io::Result<()> {
@@ -158,6 +203,46 @@ impl DiskOwner {
         // publication. Never replace a disk through this metadata path.
         replace_journal_file(&staged, &self.path)
     }
+}
+
+/// Acquire custody of a published disk. The native adapter must retain this
+/// open description in its actual owner, not just a request worker or a cached
+/// power observation. Closing the last transferred description releases the
+/// lease; explicitly unlocking any duplicate would release it too early.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn attach(disk: &Path) -> io::Result<std::sync::Arc<std::fs::File>> {
+    let mut owner = DiskOwner::open(disk, None)?;
+    if owner.record.phase != DiskPhase::Ready {
+        return Err(invalid("only a published Ready disk may be attached"));
+    }
+    validate_disk(disk, owner.record.bytes, owner.record.format)?;
+    let lease = owner.lease.take().expect("storage owner retains its lease");
+    Ok(std::sync::Arc::new(lease))
+}
+
+/// Journal out-of-process HCS attachment before native creation. After a crash
+/// the native fence remains until HCS proves absence and access is reclaimed.
+#[cfg(windows)]
+pub(crate) fn attach_hyper_v(
+    disk: &Path,
+    compute_system: &str,
+) -> io::Result<std::sync::Arc<std::fs::File>> {
+    let mut owner = DiskOwner::open(disk, None)?;
+    if owner.record.phase != DiskPhase::Ready {
+        return Err(invalid("only a published Ready disk may be attached"));
+    }
+    validate_disk(disk, owner.record.bytes, owner.record.format)?;
+    if !sandsurf_native::storage::compute_system_absent(compute_system)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native attachment identity already exists",
+        ));
+    }
+    owner.set_phase(DiskPhase::Attached {
+        compute_system: compute_system.to_owned(),
+    })?;
+    let lease = owner.lease.take().expect("storage owner retains its lease");
+    Ok(std::sync::Arc::new(lease))
 }
 
 impl DiskFormat {
@@ -518,6 +603,129 @@ mod tests {
 
     fn replacement_path(root: &Path, suffix: &str) -> PathBuf {
         root.join(format!(".system.{}.{suffix}", object_name("replace")))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_attachment_record_survives_uncertainty_and_failed_access_cleanup() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let identity = "00000000-0000-0000-0000-000000000001";
+        let mut owner = DiskOwner::open(&target, None).unwrap();
+        let attached = DiskPhase::Attached {
+            compute_system: identity.into(),
+        };
+        owner.set_phase(attached.clone()).unwrap();
+        assert_eq!(
+            owner
+                .reconcile_attachment_using(
+                    &target,
+                    |id| {
+                        assert_eq!(id, identity);
+                        Ok(false)
+                    },
+                    |_, _| panic!("a present native owner cannot lose disk access")
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            owner
+                .reconcile_attachment_using(
+                    &target,
+                    |_| Err(io::Error::other("HCS unavailable")),
+                    |_, _| panic!("unavailable native evidence cannot free storage")
+                )
+                .is_err()
+        );
+        assert!(
+            owner
+                .reconcile_attachment_using(
+                    &target,
+                    |_| Ok(true),
+                    |_, _| Err(io::Error::other(
+                        "exclusive disk/access cleanup unavailable"
+                    ))
+                )
+                .is_err()
+        );
+        assert_eq!(owner.record.phase, attached);
+        let persisted: DiskObject =
+            serde_json::from_slice(&fs::read(&owner.path).unwrap()).unwrap();
+        assert_eq!(persisted.phase, attached);
+        assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
+        owner
+            .reconcile_attachment_using(
+                &target,
+                |_| Ok(true),
+                |id, path| {
+                    assert_eq!(id, identity);
+                    assert_eq!(path, target);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(owner.record.phase, DiskPhase::Ready);
+        drop(owner);
+        replace(&target, &"replace".try_into().unwrap()).unwrap();
+        assert_eq!(fs::read(target).unwrap(), vec![2; 4096]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn attachment_custody_fences_every_mutation_until_last_native_description_closes() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let guardian = attach(&target).unwrap();
+        let native_owner = guardian.try_clone().unwrap();
+        drop(guardian);
+        let operation = "replace".try_into().unwrap();
+        for error in [
+            attach(&target).unwrap_err(),
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| {
+                panic!("an attached slot must not be materialized")
+            })
+            .unwrap_err(),
+            replace(&target, &operation).unwrap_err(),
+            retire(&target, 4096, DiskFormat::Raw).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
+        drop(native_owner);
+        replace(&target, &operation).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
+        assert!(attach(&target).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn attachment_refuses_partial_missing_shared_and_replacing_payloads() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        let preparing = DiskOwner::open(&target, Some((4096, DiskFormat::Raw))).unwrap();
+        drop(preparing);
+        assert!(attach(&target).is_err());
+        create_disk(&target, 1);
+        let alias = fixture.0.join("alias");
+        fs::hard_link(&target, &alias).unwrap();
+        assert!(attach(&target).is_err());
+        fs::remove_file(alias).unwrap();
+        let mut owner = DiskOwner::open(&target, None).unwrap();
+        owner
+            .set_phase(DiskPhase::Replacing {
+                operation: "replace".try_into().unwrap(),
+            })
+            .unwrap();
+        drop(owner);
+        assert!(attach(&target).is_err());
+        replace(&target, &"replace".try_into().unwrap()).unwrap();
+        fs::remove_file(&target).unwrap();
+        assert!(attach(&target).is_err());
     }
 
     fn replace(target: &Path, operation: &OperationId) -> io::Result<()> {
@@ -886,6 +1094,22 @@ mod tests {
             assert_eq!(fs::read(&record_path).unwrap(), corrupt);
             assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
         }
+    }
+
+    #[test]
+    fn previous_storage_generation_is_rejected_without_rewriting_disk_or_record() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let path = target.with_extension("storage.json");
+        let mut old: DiskObject = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        old.version = 1;
+        let original = serde_json::to_vec(&old).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(DiskOwner::open(&target, None).is_err());
+        assert!(retire(&target, 4096, DiskFormat::Raw).is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
+        assert_eq!(fs::read(target).unwrap(), vec![1; 4096]);
     }
 
     #[test]

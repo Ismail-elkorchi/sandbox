@@ -16,6 +16,135 @@ pub fn object_name(identifier: &str) -> String {
     )
 }
 
+/// Transfer a held authority description across exec in a single-threaded
+/// launcher or post-fork child. Do not call this on ambient descriptors in a
+/// multithreaded parent. No path is opened and no lease is reacquired/unlocked.
+#[cfg(unix)]
+pub fn retain_descriptor_for_exec(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if file.as_raw_fd() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custody must not alias stdio",
+        ));
+    }
+    // SAFETY: file owns the live descriptor, and the scalar fcntl operation
+    // changes only its exec-inheritance flag; it does not release flock custody.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Only explicit absence of the exact HCS identity frees its attachment fence.
+/// Stopped, query errors and unavailable HCS are not absence. The probe never
+/// starts or modifies a compute system.
+#[cfg(windows)]
+pub fn compute_system_absent(id: &str) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::GENERIC_ALL;
+    use windows_sys::Win32::System::HostComputeSystem::{
+        HCS_SYSTEM, HcsCloseComputeSystem, HcsOpenComputeSystem,
+    };
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+            }
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid native compute-system identity",
+        ));
+    }
+    let encoded: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let mut system: HCS_SYSTEM = std::ptr::null_mut();
+    // SAFETY: encoded is NUL-terminated and system is a live output slot. HCS
+    // requires GENERIC_ALL even for this existence-only probe.
+    let result = unsafe { HcsOpenComputeSystem(encoded.as_ptr(), GENERIC_ALL, &mut system) };
+    let absent = compute_system_outcome(result, !system.is_null())?;
+    if !absent {
+        // SAFETY: successful open transferred exactly this live native handle.
+        unsafe { HcsCloseComputeSystem(system) };
+    }
+    Ok(absent)
+}
+
+#[cfg(windows)]
+fn compute_system_outcome(result: i32, has_handle: bool) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::HCS_E_SYSTEM_NOT_FOUND;
+    if result >= 0 && has_handle {
+        return Ok(false);
+    }
+    if result == HCS_E_SYSTEM_NOT_FOUND && !has_handle {
+        return Ok(true);
+    }
+    Err(io::Error::other(format!(
+        "native attachment observation unavailable: {result:#x}"
+    )))
+}
+
+/// Remove only the recorded native attachment's access entry after absence.
+/// Never repairs unrelated file ownership.
+#[cfg(windows)]
+pub fn revoke_disk_attachment_access(id: &str, path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::HostComputeSystem::HcsRevokeVmAccess;
+    let identity: Vec<u16> = id.encode_utf16().chain([0]).collect();
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if id.contains('\0') || encoded.contains(&0) || !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid recorded attachment access",
+        ));
+    }
+    encoded.push(0);
+    // Exclusive data-file access proves old native disk handles have drained,
+    // and prevents pathname replacement while the owned ACL entry is removed.
+    // Do not require the final private ACL before removing the recorded VM ACE.
+    let disk = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = disk.metadata()?;
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: disk retains the live handle and information is a writable output.
+    if unsafe { GetFileInformationByHandle(disk.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful native call initialized information completely.
+    let information = unsafe { information.assume_init() };
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || information.nNumberOfLinks != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recorded attachment disk has an alias",
+        ));
+    }
+    // SAFETY: the exact host-recorded identity and absolute path are terminated
+    // and live for this removal of that VM's access entry only.
+    let result = unsafe { HcsRevokeVmAccess(identity.as_ptr(), encoded.as_ptr()) };
+    if result < 0 {
+        return Err(io::Error::other(format!(
+            "native attachment access cleanup failed: {result:#x}"
+        )));
+    }
+    drop(disk);
+    crate::local::open_private_file(path, crate::PrivateFileAccess::ReadOnly)?;
+    Ok(())
+}
+
 /// Reserve a raw disk's allocation through its held writable descriptor.
 /// This does not interpret Linux filesystem bytes or change logical capacity.
 /// Shared/reflink attribution and global pool admission remain separate facts.
@@ -243,6 +372,36 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(windows)]
+    #[test]
+    fn native_compute_absence_is_not_stopped_unavailable_or_denied() {
+        use windows_sys::Win32::Foundation::{
+            E_ACCESSDENIED, HCS_E_SERVICE_DISCONNECT, HCS_E_SYSTEM_ALREADY_STOPPED,
+            HCS_E_SYSTEM_NOT_FOUND,
+        };
+        assert!(compute_system_outcome(HCS_E_SYSTEM_NOT_FOUND, false).unwrap());
+        assert!(!compute_system_outcome(0, true).unwrap());
+        for (result, handle) in [
+            (HCS_E_SYSTEM_ALREADY_STOPPED, false),
+            (HCS_E_SERVICE_DISCONNECT, false),
+            (E_ACCESSDENIED, false),
+            (0, false),
+            (HCS_E_SYSTEM_NOT_FOUND, true),
+        ] {
+            assert!(compute_system_outcome(result, handle).is_err());
+        }
+        for id in [
+            "",
+            "not-a-compute-system",
+            "00000000-0000-0000-0000-00000000000G",
+        ] {
+            assert_eq!(
+                compute_system_absent(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn logical_case_and_reserved_names_have_independent_portable_objects() {

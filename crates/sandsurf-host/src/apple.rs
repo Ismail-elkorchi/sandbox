@@ -415,6 +415,11 @@ impl AppleGuardianEffect {
             network_capability,
             rebind: None,
         });
+        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
+            .map_err(|_| bytes_digest(b"apple-system-disk-attachment-failed"))?;
+        self.machine
+            .stage_storage_custody(custody)
+            .map_err(|_| bytes_digest(b"apple-system-disk-custody-conflict"))?;
         Ok(())
     }
 
@@ -902,6 +907,7 @@ impl GuardianEffect for AppleGuardianEffect {
             }
         }
         let mut outcome = apply_lifecycle(&mut self.machine, command, current);
+        self.machine.discard_pending_storage_custody();
         let running = matches!(
             &outcome,
             MachineOutcome::Observed(values)

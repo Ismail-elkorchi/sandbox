@@ -21,7 +21,9 @@ windows-sys = { workspace = true, features = [
   "Win32_System_Memory",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 sandsurf-native = { path = "../sandsurf-native" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 sha2.workspace = true

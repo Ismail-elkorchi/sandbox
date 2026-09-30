@@ -1278,6 +1278,10 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             eprintln!("sandsurf disk preparation failed: {error}");
             bytes_digest(b"linux-system-disk-preparation-failed")
         })?;
+        let storage_lease = crate::storage::attach(&self.system_disk).map_err(|error| {
+            eprintln!("sandsurf disk attachment refused: {error}");
+            bytes_digest(b"linux-system-disk-attachment-failed")
+        })?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?;
         let network_capability =
             random_bytes().map_err(|_| bytes_digest(b"linux-network-entropy"))?;
@@ -1319,6 +1323,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             state_directory,
             kernel_image: self.kernel.clone(),
             system_disk: self.system_disk.clone(),
+            storage_lease,
             authentication_image,
             owner_token,
             guest_cid: self.config.guest_cid,

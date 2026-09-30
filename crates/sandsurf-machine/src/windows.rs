@@ -15,8 +15,10 @@ use sandsurf_protocol::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::System::HostComputeSystem::{
@@ -104,6 +106,7 @@ pub struct HyperVDriver {
     full_capture_state: Option<PathBuf>,
     committed_suspend: Option<(sandsurf_protocol::OperationId, Digest)>,
     staged_restore: Option<HyperVRestoreSource>,
+    pending_storage_custody: Option<Arc<File>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,11 +182,27 @@ impl HyperVDriver {
             full_capture_state: None,
             committed_suspend: None,
             staged_restore: None,
+            pending_storage_custody: None,
         })
     }
 
     pub fn default_timeout() -> Duration {
         DEFAULT_OPERATION_TIMEOUT
+    }
+
+    pub fn stage_storage_custody(&mut self, custody: Arc<File>) -> std::io::Result<()> {
+        if self.system.is_some() || self.pending_storage_custody.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "native storage custody is already installed",
+            ));
+        }
+        self.pending_storage_custody = Some(custody);
+        Ok(())
+    }
+
+    pub fn discard_pending_storage_custody(&mut self) {
+        self.pending_storage_custody.take();
     }
 
     #[must_use]
@@ -349,6 +368,9 @@ impl HyperVDriver {
         if self.system.is_some() {
             return MachineOutcome::Unknown;
         }
+        let Some(storage_custody) = self.pending_storage_custody.take() else {
+            return self.unavailable(b"hyper-v-storage-custody-missing");
+        };
         let resources = &command.configuration.resources;
         if restore_state.is_some()
             && (resources.memory_mib.get() != self.config.memory_mib
@@ -398,7 +420,10 @@ impl HyperVDriver {
         if failed(dispatched) {
             return self.rollback_grants_or(not_applied_hresult("hcs-create", dispatched));
         }
-        let Some(system) = NonNull::new(raw_system).map(SystemHandle) else {
+        let Some(system) = NonNull::new(raw_system).map(|raw| SystemHandle {
+            raw,
+            _storage_custody: storage_custody,
+        }) else {
             return self.rollback_grants_or(MachineOutcome::Unknown);
         };
         self.system = Some(system);
@@ -469,7 +494,7 @@ impl HyperVDriver {
             .as_ref()
             .ok_or(OperationFailure::NotDispatched)?;
         let operation = OperationHandle::new().ok_or(OperationFailure::NotDispatched)?;
-        let result = dispatch(system.0.as_ptr(), operation.0.as_ptr());
+        let result = dispatch(system.raw.as_ptr(), operation.0.as_ptr());
         if failed(result) {
             return Err(OperationFailure::Dispatch);
         }
@@ -583,7 +608,7 @@ impl HyperVDriver {
                 // SAFETY: the compute-system handle is still live and result is
                 // a valid out pointer. HCS owns no pointer after LocalFree below.
                 let wait = unsafe {
-                    HcsWaitForComputeSystemExit(system.0.as_ptr(), self.timeout_ms(), &mut result)
+                    HcsWaitForComputeSystemExit(system.raw.as_ptr(), self.timeout_ms(), &mut result)
                 };
                 free_result(result);
                 if failed(wait) {
@@ -690,7 +715,7 @@ impl MachineDriver for HyperVDriver {
         // SAFETY: the retained native handle and out pointer are live. Zero
         // polls exit without requesting termination. After exit, HCS permits
         // exit-status queries but not ordinary property queries.
-        let exited = unsafe { HcsWaitForComputeSystemExit(system.0.as_ptr(), 0, &mut document) };
+        let exited = unsafe { HcsWaitForComputeSystemExit(system.raw.as_ptr(), 0, &mut document) };
         let exit_document = wide_result_bytes(document);
         free_result(document);
         if exited == 0 {
@@ -1018,13 +1043,16 @@ impl Drop for OperationHandle {
     }
 }
 
-struct SystemHandle(NonNull<c_void>);
+struct SystemHandle {
+    raw: NonNull<c_void>,
+    _storage_custody: Arc<File>,
+}
 
 impl Drop for SystemHandle {
     fn drop(&mut self) {
         // SAFETY: this wrapper owns exactly one non-null HCS compute-system
         // handle. The VM configuration requests last-handle termination.
-        unsafe { HcsCloseComputeSystem(self.0.as_ptr()) };
+        unsafe { HcsCloseComputeSystem(self.raw.as_ptr()) };
     }
 }
 
