@@ -9,7 +9,7 @@
 //! Host-signed exact-operation envelopes cross the private host/guardian boundary;
 //! they are not a guardian-owned grant database or application capability.
 //! External capture commitments are trusted consumer
-//! assertions; pins retain bytes in this store. Native state admission validates
+//! assertions; output segments independently retain bytes in this store. Native state admission validates
 //! owner-only POSIX modes/ACLs or protected Windows DACLs and held handles.
 
 mod authority;

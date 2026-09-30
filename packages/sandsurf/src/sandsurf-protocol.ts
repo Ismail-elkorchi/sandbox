@@ -84,7 +84,7 @@ export type SandsurfGuestRequest =
   | { readonly kind: "terminate"; readonly executionId: string; readonly graceMillis: number }
   | { readonly kind: "filesystem"; readonly request: Readonly<Record<string, unknown>> };
 
-export interface SandsurfOutputBoundary {
+export interface OutputBoundary {
   readonly finalCursor: number;
   readonly chunks: number;
   readonly stdoutBytes: number;
@@ -97,13 +97,13 @@ export interface SandsurfOutputBoundary {
 export interface SandsurfReleaseRequest {
   readonly operationId: string;
   readonly receiptDigest: string;
-  readonly output: SandsurfOutputBoundary;
+  readonly output: OutputBoundary;
   readonly disposition:
     | { readonly kind: "complete-capture"; readonly commitment: {
       readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string;
-      readonly receiptDigest: string; readonly output: SandsurfOutputBoundary;
+      readonly receiptDigest: string; readonly output: OutputBoundary;
     } }
-    | { readonly kind: "continuing-retention"; readonly pin: string }
+    | { readonly kind: "continuing-retention"; readonly segment: string }
     | { readonly kind: "authorized-loss"; readonly authorization: string };
 }
 
@@ -255,7 +255,7 @@ function guestPath(value: unknown): asserts value is string {
     || value.includes("\0")) throw new Error("invalid Sandsurf guest path");
 }
 
-export function validateSandsurfOutputBoundary(value: unknown): asserts value is SandsurfOutputBoundary {
+export function validateSandsurfOutputBoundary(value: unknown): asserts value is OutputBoundary {
   record(value, ["finalCursor", "chunks", "stdoutBytes", "stderrBytes", "terminalBytes", "omittedBytes", "finalHash"]);
   for (const name of ["finalCursor", "chunks", "stdoutBytes", "stderrBytes", "terminalBytes", "omittedBytes"]) counter(value[name]);
   sha256(value.finalHash);
@@ -276,11 +276,11 @@ export function validateSandsurfRelease(value: unknown): asserts value is Sandsu
       sha256(commitment.receiptDigest); validateSandsurfOutputBoundary(commitment.output);
       break;
     }
-    case "continuing-retention": record(fields, ["kind", "pin"]); identity(fields.pin); break;
+    case "continuing-retention": record(fields, ["kind", "segment"]); identity(fields.segment); break;
     case "authorized-loss": record(fields, ["kind", "authorization"]); identity(fields.authorization); break;
     default: throw new Error("unknown release disposition");
   }
-  // Coverage, pins and loss decisions are checked by the authority, not this codec.
+  // Coverage, segment ownership and loss decisions are checked by the authority, not this codec.
 }
 
 function validateFrame(kind: SandsurfFrameKind, stream: number, sequence: number, length: number): void {

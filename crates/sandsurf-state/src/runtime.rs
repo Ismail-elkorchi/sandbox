@@ -20,10 +20,15 @@ CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFER
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE INDEX chunks_by_digest ON chunks(bytes_digest);
+CREATE UNIQUE INDEX chunks_identity_offset ON chunks(process,sequence,offset);
 CREATE TABLE capture_writes(process TEXT PRIMARY KEY REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL) STRICT;
-CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE output_segments(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE segment_chunks(segment TEXT NOT NULL REFERENCES output_segments(id), process TEXT NOT NULL, sequence INTEGER NOT NULL, offset INTEGER NOT NULL, PRIMARY KEY(segment,sequence), FOREIGN KEY(process,sequence,offset) REFERENCES chunks(process,sequence,offset)) STRICT;
+CREATE INDEX segment_chunks_by_offset ON segment_chunks(segment,offset);
+CREATE INDEX segment_chunks_by_source ON segment_chunks(process,sequence);
+CREATE VIEW segment_frames AS SELECT s.segment,c.sequence,s.offset,c.length,c.stream,c.bytes_digest,c.chain_digest FROM segment_chunks s JOIN chunks c ON c.process=s.process AND c.sequence=s.sequence;
 CREATE TABLE acknowledgement_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
-CREATE TABLE pin_operations(id TEXT PRIMARY KEY, pin TEXT NOT NULL REFERENCES pins(id), process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
+CREATE TABLE output_seal_operations(id TEXT PRIMARY KEY, segment TEXT NOT NULL REFERENCES output_segments(id), request_digest TEXT NOT NULL) STRICT;
 CREATE TABLE release_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), request_digest TEXT NOT NULL) STRICT;
 CREATE TABLE loss_authorizations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL, approval_digest TEXT NOT NULL) STRICT;
 ";
@@ -38,7 +43,7 @@ pub struct RuntimeLimits {
     pub observations: Counter,
     pub events: Counter,
     pub chunks: Counter,
-    pub pins: Counter,
+    pub output_segments: Counter,
     pub output_bytes: Counter,
 }
 
@@ -73,6 +78,27 @@ pub struct OutputPage {
     pub cursor: Counter,
     pub available: Counter,
     pub chunks: Vec<OutputChunk>,
+}
+
+enum RetentionOwner<'a> {
+    Execution(&'a ExecutionId),
+    Segment(&'a OutputSegmentId),
+}
+
+struct RetentionSource<'a> {
+    owner: RetentionOwner<'a>,
+    machine: &'a MachineId,
+    execution: &'a ExecutionId,
+    generation: Counter,
+}
+
+impl RetentionOwner<'_> {
+    fn index(&self) -> (&'static str, &'static str, &str) {
+        match self {
+            Self::Execution(id) => ("chunks", "process", id.as_str()),
+            Self::Segment(id) => ("segment_frames", "segment", id.as_str()),
+        }
+    }
 }
 
 pub struct RuntimeJournal {
@@ -144,7 +170,7 @@ impl RuntimeJournal {
             limits.observations,
             limits.events,
             limits.chunks,
-            limits.pins,
+            limits.output_segments,
             limits.output_bytes,
         ]
         .contains(&Counter::ZERO)
@@ -342,25 +368,18 @@ impl RuntimeJournal {
                 receipt_digest: receipt_digest.try_into()?,
             });
         }
-        if let Some((pin, process, receipt_digest)) = db
+        if let Some((segment, request_digest)) = db
             .query_row(
-                "SELECT pin,process,receipt_digest FROM pin_operations WHERE id=?1",
+                "SELECT segment,request_digest FROM output_seal_operations WHERE id=?1",
                 [id.as_str()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
         {
-            records.push(RuntimeOperationRecord::EvidencePin {
+            records.push(RuntimeOperationRecord::OutputSeal {
                 operation_id: id.clone(),
-                pin_id: pin.try_into()?,
-                execution_id: process.try_into()?,
-                receipt_digest: receipt_digest.try_into()?,
+                request_digest: request_digest.try_into()?,
+                segment: self.output_segment(&segment.try_into()?)?,
             });
         }
         if let Some((process, request_digest, raw_request, cleanup_pending)) = db
@@ -1420,7 +1439,7 @@ impl RuntimeJournal {
 
     /// Bytes whose complete payload is still durably retained by this guardian.
     /// Receipt references are deliberately not counted unless their bytes remain
-    /// available either through the process or an independent retention pin.
+    /// available either through the execution or an independent output segment.
     pub fn retained_output_bytes(&self) -> Result<Counter> {
         let retained: u64 = self.db.connection.query_row(
             "SELECT coalesce(sum(length),0) FROM chunks",
@@ -1494,7 +1513,7 @@ impl RuntimeJournal {
                 "output reservation full; producer must stop before dropping evidence",
             ));
         }
-        capacity(&tx, "chunks", self.limits.chunks)?;
+        output_index_capacity(&tx, self.limits.chunks, 1)?;
         capacity(&tx, "events", self.limits.events)?;
         let chain = next_boundary.final_hash.clone();
         let shared: bool = tx.query_row(
@@ -1659,12 +1678,27 @@ impl RuntimeJournal {
                 "output boundary disagrees with terminal receipt",
             ));
         }
-        self.read_retained(id, boundary, after, max_bytes)
+        let generation: u64 = self.db.connection.query_row(
+            "SELECT output_origin_generation FROM processes WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        self.read_retained(
+            RetentionSource {
+                owner: RetentionOwner::Execution(id),
+                machine: &self.machine,
+                execution: id,
+                generation: generation.try_into()?,
+            },
+            boundary,
+            after,
+            max_bytes,
+        )
     }
 
     fn read_retained(
         &self,
-        id: &ExecutionId,
+        source: RetentionSource<'_>,
         boundary: OutputBoundary,
         after: Counter,
         max_bytes: usize,
@@ -1682,9 +1716,10 @@ impl RuntimeJournal {
             return Ok(page);
         }
         // Indexed predecessor plus forward range: do not rescan prior output on every poll.
-        let start: u64 = self.db.connection.query_row("SELECT offset FROM chunks WHERE process=?1 AND offset<=?2 ORDER BY offset DESC LIMIT 1", params![id.as_str(),after.get()], |r| r.get(0)).optional()?.ok_or(Error::Corrupt("output cursor has no retained segment"))?;
-        let mut statement = self.db.connection.prepare("SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM chunks WHERE process=?1 AND offset>=?2 ORDER BY offset LIMIT 256")?;
-        let rows = statement.query_map(params![id.as_str(), start], |r| {
+        let (table, column, owner) = source.owner.index();
+        let start: u64 = self.db.connection.query_row(&format!("SELECT offset FROM {table} WHERE {column}=?1 AND offset<=?2 ORDER BY offset DESC LIMIT 1"), params![owner,after.get()], |r| r.get(0)).optional()?.ok_or(Error::Corrupt("output cursor has no retained segment"))?;
+        let mut statement = self.db.connection.prepare(&format!("SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM {table} WHERE {column}=?1 AND offset>=?2 AND sequence<=?3 ORDER BY offset LIMIT 256"))?;
+        let rows = statement.query_map(params![owner, start, boundary.chunks.get()], |r| {
             Ok((
                 r.get::<_, u64>(0)?,
                 r.get::<_, u64>(1)?,
@@ -1722,16 +1757,11 @@ impl RuntimeJournal {
             let take = (length - skip).min(remaining);
             let stream: Stream = decode(&stream)?;
             let previous = if sequence == 1 {
-                let generation: u64 = self.db.connection.query_row(
-                    "SELECT output_origin_generation FROM processes WHERE id=?1",
-                    [id.as_str()],
-                    |r| r.get(0),
-                )?;
-                empty_boundary(&self.machine, id, generation.try_into()?)?.final_hash
+                empty_boundary(source.machine, source.execution, source.generation)?.final_hash
             } else {
                 let previous: String = self.db.connection.query_row(
-                    "SELECT chain_digest FROM chunks WHERE process=?1 AND sequence=?2",
-                    params![id.as_str(), sequence - 1],
+                    &format!("SELECT chain_digest FROM {table} WHERE {column}=?1 AND sequence=?2"),
+                    params![owner, sequence - 1],
                     |r| r.get(0),
                 )?;
                 previous.try_into()?
@@ -1916,106 +1946,169 @@ impl RuntimeJournal {
         Ok(())
     }
 
-    pub fn pin(
+    pub fn seal_output(
         &mut self,
         operation: &OperationId,
         id: &ExecutionId,
-        expected: &Digest,
-        pin: PinId,
-    ) -> Result<()> {
-        if let Some((old_pin, old_process, old_digest)) = self
-            .db
-            .connection
-            .query_row(
-                "SELECT pin,process,receipt_digest FROM pin_operations WHERE id=?1",
-                [operation.as_str()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-        {
-            return if old_pin == pin.as_str()
-                && old_process == id.as_str()
-                && old_digest == expected.as_str()
-            {
-                Ok(())
-            } else {
-                Err(Error::Conflict("pin operation identity conflict"))
+        generation: Counter,
+        expected: Option<&OutputBoundary>,
+        segment_id: OutputSegmentId,
+    ) -> Result<OutputSegment> {
+        let request_digest = digest(
+            Domain::Output,
+            &(&self.machine, id, generation, expected, &segment_id),
+        )?;
+        if let Some(prior) = self.runtime_operation(operation)? {
+            return match prior {
+                RuntimeOperationRecord::OutputSeal {
+                    request_digest: old,
+                    segment,
+                    ..
+                } if old == request_digest => Ok(segment),
+                _ => Err(Error::Conflict("output seal operation identity conflict")),
             };
         }
-        let receipt = require_receipt(&self.db.connection, id, expected)?;
-        let mut cursor = Counter::ZERO;
-        while cursor < receipt.output.final_cursor {
-            cursor = self.read_output(id, cursor, MAX_CONTROL_BYTES)?.cursor;
-        }
-        let tx = self.db.connection.transaction()?;
-        runtime_operation_identity_available(&tx, operation)?;
-        require_receipt(&tx, id, expected)?;
-        let released: Option<String> = tx.query_row(
-            "SELECT release FROM processes WHERE id=?1",
-            [id.as_str()],
-            |r| r.get(0),
-        )?;
+        let (raw, origin_generation, released): (String, u64, Option<String>) =
+            self.db.connection.query_row(
+                "SELECT boundary,output_origin_generation,release FROM processes WHERE id=?1",
+                [id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
         if released.is_some() {
+            return Err(Error::Conflict("cannot seal output after source release"));
+        }
+        if generation == Counter::ZERO || generation.get() != origin_generation {
+            return Err(Error::Conflict("output capture generation mismatch"));
+        }
+        let current: OutputBoundary = decode(&raw)?;
+        let boundary = expected.cloned().unwrap_or(current.clone());
+        if boundary.chunks > current.chunks || boundary.final_cursor > current.final_cursor {
+            return Err(Error::Conflict("segment extends beyond captured output"));
+        }
+        let mut observed = empty_boundary(&self.machine, id, generation)?;
+        if boundary.chunks != Counter::ZERO {
+            let (count, length, stdout, stderr, terminal): (u64, u64, u64, u64, u64) = self.db.connection.query_row(
+                "SELECT count(*),coalesce(sum(length),0),coalesce(sum(CASE WHEN stream='\"stdout\"' THEN length ELSE 0 END),0),coalesce(sum(CASE WHEN stream='\"stderr\"' THEN length ELSE 0 END),0),coalesce(sum(CASE WHEN stream='\"terminal\"' THEN length ELSE 0 END),0) FROM chunks WHERE process=?1 AND sequence<=?2",
+                params![id.as_str(), boundary.chunks.get()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+            )?;
+            let (offset, last_length, hash): (u64, u64, String) = self.db.connection.query_row(
+                "SELECT offset,length,chain_digest FROM chunks WHERE process=?1 AND sequence=?2",
+                params![id.as_str(), boundary.chunks.get()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if offset.checked_add(last_length) != Some(length) {
+                return Err(Error::Corrupt("segment framing has incomplete coverage"));
+            }
+            observed = OutputBoundary {
+                final_cursor: length.try_into()?,
+                chunks: count.try_into()?,
+                stdout_bytes: stdout.try_into()?,
+                stderr_bytes: stderr.try_into()?,
+                terminal_bytes: terminal.try_into()?,
+                omitted_bytes: Counter::ZERO,
+                final_hash: hash.try_into()?,
+            };
+        }
+        if observed != boundary {
             return Err(Error::Conflict(
-                "cannot create a retention obligation after release",
+                "segment boundary does not identify an exact captured prefix",
             ));
         }
-        let pin_exists = if let Some((old_process, old_digest)) = tx
-            .query_row(
-                "SELECT process,receipt_digest FROM pins WHERE id=?1",
-                [pin.as_str()],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-        {
-            if old_process != id.as_str() || old_digest != expected.as_str() {
-                return Err(Error::Conflict("pin identity conflict"));
-            }
-            true
-        } else {
-            false
+        let mut cursor = Counter::ZERO;
+        while cursor < boundary.final_cursor {
+            cursor = self
+                .read_retained(
+                    RetentionSource {
+                        owner: RetentionOwner::Execution(id),
+                        machine: &self.machine,
+                        execution: id,
+                        generation,
+                    },
+                    boundary.clone(),
+                    cursor,
+                    MAX_CONTROL_BYTES,
+                )?
+                .cursor;
+        }
+        let segment = OutputSegment {
+            id: segment_id,
+            machine_id: self.machine.clone(),
+            execution_id: id.clone(),
+            generation,
+            output: boundary,
         };
-        if !pin_exists {
-            capacity(&tx, "pins", self.limits.pins)?;
+        let tx = self.db.connection.transaction()?;
+        runtime_operation_identity_available(&tx, operation)?;
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT value FROM output_segments WHERE id=?1",
+                [segment.id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(prior) = prior {
+            if decode::<OutputSegment>(&prior)? != segment {
+                return Err(Error::Conflict("output segment identity conflict"));
+            }
+        } else {
+            capacity(&tx, "output_segments", self.limits.output_segments)?;
+            output_index_capacity(&tx, self.limits.chunks, segment.output.chunks.get())?;
             tx.execute(
-                "INSERT INTO pins VALUES (?1,?2,?3)",
-                params![pin.as_str(), id.as_str(), expected.as_str()],
+                "INSERT INTO output_segments VALUES (?1,?2)",
+                params![segment.id.as_str(), encode(&segment)?],
+            )?;
+            tx.execute(
+                "INSERT INTO segment_chunks SELECT ?1,process,sequence,offset FROM chunks WHERE process=?2 AND sequence<=?3",
+                params![segment.id.as_str(), id.as_str(), segment.output.chunks.get()],
             )?;
         }
         operation_capacity(&tx, self.limits.operations)?;
         tx.execute(
-            "INSERT INTO pin_operations VALUES (?1,?2,?3,?4)",
+            "INSERT INTO output_seal_operations VALUES (?1,?2,?3)",
             params![
                 operation.as_str(),
-                pin.as_str(),
-                id.as_str(),
-                expected.as_str()
+                segment.id.as_str(),
+                request_digest.as_str()
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(segment)
     }
 
-    pub fn read_pin(&self, pin: &PinId, after: Counter, max_bytes: usize) -> Result<OutputPage> {
+    pub fn output_segment(&self, id: &OutputSegmentId) -> Result<OutputSegment> {
+        let raw: String = self.db.connection.query_row(
+            "SELECT value FROM output_segments WHERE id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        let segment: OutputSegment = decode(&raw)?;
+        if segment.id != *id {
+            return Err(Error::Corrupt("output segment identity mismatch"));
+        }
+        Ok(segment)
+    }
+
+    pub fn read_output_segment(
+        &self,
+        id: &OutputSegmentId,
+        after: Counter,
+        max_bytes: usize,
+    ) -> Result<OutputPage> {
         if max_bytes == 0 || max_bytes > MAX_CONTROL_BYTES {
             return Err(Error::Capacity("invalid output page bound"));
         }
-        let id: String = self.db.connection.query_row(
-            "SELECT process FROM pins WHERE id=?1",
-            [pin.as_str()],
-            |r| r.get(0),
-        )?;
-        let id: ExecutionId = id.try_into()?;
-        let (receipt, _) = self
-            .receipt(&id)?
-            .ok_or(Error::Corrupt("retention receipt is missing"))?;
-        self.read_retained(&id, receipt.output, after, max_bytes)
+        let segment = self.output_segment(id)?;
+        self.read_retained(
+            RetentionSource {
+                owner: RetentionOwner::Segment(id),
+                machine: &segment.machine_id,
+                execution: &segment.execution_id,
+                generation: segment.generation,
+            },
+            segment.output,
+            after,
+            max_bytes,
+        )
     }
 
     /// Records delivery of a host-owned decision; the guardian cannot mint loss authority.
@@ -2068,6 +2161,25 @@ impl RuntimeJournal {
 
     /// Commits retirement only; cleanup is deliberately a second, retryable operation.
     pub fn release(&mut self, id: &ExecutionId, request: ReleaseRequest) -> Result<ReleaseStatus> {
+        if let ReleaseDisposition::ContinuingRetention { segment } = &request.disposition {
+            let retained = self.output_segment(segment)?;
+            let original = require_receipt(&self.db.connection, id, &request.receipt_digest)?;
+            if retained.execution_id != *id
+                || retained.machine_id != original.machine_id
+                || retained.generation != original.generation
+                || retained.output != original.output
+            {
+                return Err(Error::Conflict(
+                    "segment does not retain the entire released output",
+                ));
+            }
+            let mut cursor = Counter::ZERO;
+            while cursor < retained.output.final_cursor {
+                cursor = self
+                    .read_output_segment(segment, cursor, MAX_CONTROL_BYTES)?
+                    .cursor;
+            }
+        }
         let identity = digest(Domain::Release, &request)?;
         let tx = self.db.connection.transaction()?;
         if let Some((old_process, old_digest)) = tx
@@ -2121,14 +2233,7 @@ impl RuntimeJournal {
                     ));
                 }
             }
-            ReleaseDisposition::ContinuingRetention { pin } => {
-                let pinned: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pins WHERE id=?1 AND process=?2 AND receipt_digest=?3)", params![pin.as_str(),id.as_str(),request.receipt_digest.as_str()], |r| r.get(0))?;
-                if !pinned {
-                    return Err(Error::Conflict(
-                        "reference has no committed independent retention obligation",
-                    ));
-                }
-            }
+            ReleaseDisposition::ContinuingRetention { .. } => {}
             ReleaseDisposition::AuthorizedLoss { authorization } => {
                 let authorized: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM loss_authorizations WHERE id=?1 AND process=?2 AND receipt_digest=?3)", params![authorization.as_str(),id.as_str(),request.receipt_digest.as_str()], |r| r.get(0))?;
                 if !authorized {
@@ -2186,19 +2291,14 @@ impl RuntimeJournal {
         // Reserve the replay record before deleting any original bytes. Event
         // exhaustion must never turn a failed cleanup commit into silent loss.
         capacity(&tx, "events", self.limits.events)?;
-        let pinned: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pins WHERE process=?1)",
-            [id.as_str()],
-            |r| r.get(0),
-        )?;
-        if !pinned {
-            let mut statement = tx.prepare("SELECT DISTINCT c.bytes_digest FROM chunks c WHERE c.process=?1 AND NOT EXISTS(SELECT 1 FROM chunks other WHERE other.bytes_digest=c.bytes_digest AND other.process<>?1) AND NOT EXISTS(SELECT 1 FROM capture_writes pending WHERE pending.bytes_digest=c.bytes_digest)")?;
+        {
+            let mut statement = tx.prepare("SELECT DISTINCT c.bytes_digest FROM chunks c WHERE c.process=?1 AND NOT EXISTS(SELECT 1 FROM chunks other WHERE other.bytes_digest=c.bytes_digest AND other.process<>?1) AND NOT EXISTS(SELECT 1 FROM segment_chunks retained JOIN chunks frame ON frame.process=retained.process AND frame.sequence=retained.sequence WHERE frame.bytes_digest=c.bytes_digest) AND NOT EXISTS(SELECT 1 FROM capture_writes pending WHERE pending.bytes_digest=c.bytes_digest)")?;
             let digests = statement.query_map([id.as_str()], |row| row.get::<_, String>(0))?;
             for digest in digests {
                 crate::output_store::remove_blob(&self.db.root, &Digest::try_from(digest?)?)?;
             }
             drop(statement);
-            tx.execute("DELETE FROM chunks WHERE process=?1", [id.as_str()])?;
+            tx.execute("DELETE FROM chunks WHERE process=?1 AND NOT EXISTS(SELECT 1 FROM segment_chunks retained WHERE retained.process=chunks.process AND retained.sequence=chunks.sequence)", [id.as_str()])?;
         }
         tx.execute(
             "UPDATE processes SET cleanup_pending=0 WHERE id=?1",
@@ -2220,6 +2320,23 @@ impl RuntimeJournal {
             cleanup_pending: false,
         })
     }
+}
+
+fn output_index_capacity(db: &rusqlite::Connection, limit: Counter, additional: u64) -> Result<()> {
+    let count: u64 = db.query_row(
+        "SELECT (SELECT count(*) FROM chunks) + (SELECT count(*) FROM segment_chunks)",
+        [],
+        |r| r.get(0),
+    )?;
+    if count
+        .checked_add(additional)
+        .is_none_or(|total| total > limit.get())
+    {
+        return Err(Error::Capacity(
+            "retained output framing capacity exhausted",
+        ));
+    }
+    Ok(())
 }
 
 fn observation(db: &rusqlite::Connection) -> Result<Option<MachineObservation>> {
@@ -2353,7 +2470,7 @@ fn require_configuration_state(
 }
 fn operation_capacity(db: &rusqlite::Connection, limit: Counter) -> Result<()> {
     let count: u64 = db.query_row(
-        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations) + (SELECT count(*) FROM configuration_operations) + (SELECT count(*) FROM acknowledgement_operations) + (SELECT count(*) FROM pin_operations) + (SELECT count(*) FROM release_operations)",
+        "SELECT (SELECT count(*) FROM operations) + (SELECT count(*) FROM lifecycle_operations) + (SELECT count(*) FROM configuration_operations) + (SELECT count(*) FROM acknowledgement_operations) + (SELECT count(*) FROM output_seal_operations) + (SELECT count(*) FROM release_operations)",
         [],
         |row| row.get(0),
     )?;
@@ -2391,7 +2508,7 @@ fn require_authority_fence(db: &rusqlite::Connection, revision: Counter) -> Resu
 }
 fn runtime_operation_identity_available(db: &rusqlite::Connection, id: &OperationId) -> Result<()> {
     let conflicting: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM acknowledgement_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM pin_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM release_operations WHERE id=?1)",
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE id=?1) OR EXISTS(SELECT 1 FROM lifecycle_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM acknowledgement_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM output_seal_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM release_operations WHERE id=?1)",
         [id.as_str()],
         |row| row.get(0),
     )?;

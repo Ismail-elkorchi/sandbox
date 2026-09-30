@@ -32,7 +32,7 @@ identifier!(
     OperationId,
     CommitmentId,
     StoreId,
-    PinId,
+    OutputSegmentId,
     DiskId,
     TerminalId,
     SnapshotId,
@@ -599,14 +599,18 @@ pub enum RuntimeRequest {
         execution_id: ExecutionId,
         receipt_digest: Digest,
     },
-    Pin {
+    SealOutput {
         operation_id: OperationId,
         execution_id: ExecutionId,
-        receipt_digest: Digest,
-        pin_id: PinId,
+        generation: Counter,
+        expected: Option<OutputBoundary>,
+        segment_id: OutputSegmentId,
     },
-    ReadPin {
-        pin_id: PinId,
+    OutputSegment {
+        segment_id: OutputSegmentId,
+    },
+    ReadOutputSegment {
+        segment_id: OutputSegmentId,
         after: Counter,
         maximum: u32,
     },
@@ -830,6 +834,9 @@ pub struct ExecutionStatus {
     deny_unknown_fields
 )]
 pub enum RuntimeResponse {
+    OutputSegment {
+        segment: OutputSegment,
+    },
     OwnerIdentity {
         machine_id: MachineId,
     },
@@ -929,11 +936,10 @@ pub enum RuntimeOperationRecord {
         execution_id: ExecutionId,
         receipt_digest: Digest,
     },
-    EvidencePin {
+    OutputSeal {
         operation_id: OperationId,
-        pin_id: PinId,
-        execution_id: ExecutionId,
-        receipt_digest: Digest,
+        request_digest: Digest,
+        segment: OutputSegment,
     },
     EvidenceRelease {
         execution_id: ExecutionId,
@@ -1339,6 +1345,18 @@ pub struct OutputBoundary {
     pub final_hash: Digest,
 }
 
+/// An immutable host capture. It makes no claim that the guest stream has ended.
+/// Its framing and payload ownership do not depend on the source execution's retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OutputSegment {
+    pub id: OutputSegmentId,
+    pub machine_id: MachineId,
+    pub execution_id: ExecutionId,
+    pub generation: Counter,
+    pub output: OutputBoundary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ExecutionOutcome {
@@ -1378,7 +1396,7 @@ pub struct CaptureCommitment {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ReleaseDisposition {
     CompleteCapture { commitment: CaptureCommitment },
-    ContinuingRetention { pin: PinId },
+    ContinuingRetention { segment: OutputSegmentId },
     AuthorizedLoss { authorization: CommitmentId },
 }
 

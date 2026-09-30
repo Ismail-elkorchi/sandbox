@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 8;
+pub const SERVICE_VERSION: u16 = 9;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -956,23 +956,33 @@ impl<E: GuardianEffect> Guardian<E> {
                         )?;
                         RuntimeResponse::Complete
                     }
-                    RuntimeRequest::Pin {
+                    RuntimeRequest::SealOutput {
                         operation_id,
                         execution_id,
-                        receipt_digest,
-                        pin_id,
-                    } => {
-                        self.journal
-                            .pin(&operation_id, &execution_id, &receipt_digest, pin_id)?;
-                        RuntimeResponse::Complete
+                        generation,
+                        expected,
+                        segment_id,
+                    } => RuntimeResponse::OutputSegment {
+                        segment: self.journal.seal_output(
+                            &operation_id,
+                            &execution_id,
+                            generation,
+                            expected.as_ref(),
+                            segment_id,
+                        )?,
+                    },
+                    RuntimeRequest::OutputSegment { segment_id } => {
+                        RuntimeResponse::OutputSegment {
+                            segment: self.journal.output_segment(&segment_id)?,
+                        }
                     }
-                    RuntimeRequest::ReadPin {
-                        pin_id,
+                    RuntimeRequest::ReadOutputSegment {
+                        segment_id,
                         after,
                         maximum,
                     } => RuntimeResponse::Output {
-                        page: evidence_page(self.journal.read_pin(
-                            &pin_id,
+                        page: evidence_page(self.journal.read_output_segment(
+                            &segment_id,
                             after,
                             maximum as usize,
                         )?),

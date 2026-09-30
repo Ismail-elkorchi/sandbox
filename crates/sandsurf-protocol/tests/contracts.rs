@@ -229,6 +229,41 @@ fn authority_and_guardian_messages_are_strict_and_bounded() {
 }
 
 #[test]
+fn output_seals_are_generation_bound_host_captures_not_receipt_acknowledgements() {
+    let request = json!({"kind":"seal-output","operationId":"seal","executionId":"execution","generation":1,"expected":null,"segmentId":"segment"});
+    let parsed: RuntimeRequest = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    let mut missing_generation = request.clone();
+    missing_generation
+        .as_object_mut()
+        .unwrap()
+        .remove("generation");
+    assert!(serde_json::from_value::<RuntimeRequest>(missing_generation).is_err());
+    let mut receipt_bound = request;
+    receipt_bound["receiptDigest"] = json!("a".repeat(64));
+    assert!(serde_json::from_value::<RuntimeRequest>(receipt_bound).is_err());
+    assert!(serde_json::from_value::<RuntimeRequest>(json!({"kind":"pin","operationId":"op","executionId":"execution","receiptDigest":"a".repeat(64),"pinId":"pin"})).is_err());
+    let segment = OutputSegment {
+        id: "segment".try_into().unwrap(),
+        machine_id: "machine".try_into().unwrap(),
+        execution_id: "execution".try_into().unwrap(),
+        generation: Counter::ONE,
+        output: initial_output_boundary(
+            &"machine".try_into().unwrap(),
+            &"execution".try_into().unwrap(),
+            Counter::ONE,
+        )
+        .unwrap(),
+    };
+    let response = RuntimeResponse::OutputSegment { segment };
+    assert_eq!(
+        serde_json::from_value::<RuntimeResponse>(serde_json::to_value(&response).unwrap())
+            .unwrap(),
+        response
+    );
+}
+
+#[test]
 fn fragmented_binary_frames_roundtrip_and_reject_all_truncations() {
     let frame = Frame {
         kind: FrameKind::Data,

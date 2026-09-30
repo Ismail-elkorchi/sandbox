@@ -669,7 +669,7 @@ fn runtime_limits() -> RuntimeLimits {
         observations: n(1000),
         events: n(4096),
         chunks: n(1000),
-        pins: n(64),
+        output_segments: n(64),
         output_bytes: n(1000),
     }
 }
@@ -2256,42 +2256,63 @@ fn evidence_command_identities_are_exact_retry_safe_and_globally_fenced() {
     );
     assert!(
         f.runtime
-            .pin(
+            .seal_output(
                 &acknowledgement,
                 &f.process,
-                &receipt_digest,
+                n(1),
+                None,
                 "cross-kind-pin".try_into().unwrap(),
             )
             .is_err()
     );
 
     let pin_operation: OperationId = "pin-operation".try_into().unwrap();
-    let pin: PinId = "retained-output".try_into().unwrap();
-    f.runtime
-        .pin(&pin_operation, &f.process, &receipt_digest, pin.clone())
+    let pin: OutputSegmentId = "retained-output".try_into().unwrap();
+    let segment = f
+        .runtime
+        .seal_output(
+            &pin_operation,
+            &f.process,
+            n(1),
+            Some(&release.output),
+            pin.clone(),
+        )
         .unwrap();
     assert_eq!(
         f.runtime.runtime_operation(&pin_operation).unwrap(),
-        Some(RuntimeOperationRecord::EvidencePin {
+        Some(RuntimeOperationRecord::OutputSeal {
             operation_id: pin_operation.clone(),
-            pin_id: pin.clone(),
-            execution_id: f.process.clone(),
-            receipt_digest: receipt_digest.clone(),
+            request_digest: digest(
+                Domain::Output,
+                &(&f.machine, &f.process, n(1), Some(&release.output), &pin)
+            )
+            .unwrap(),
+            segment,
         })
     );
     f.runtime
-        .pin(&pin_operation, &f.process, &receipt_digest, pin.clone())
+        .seal_output(
+            &pin_operation,
+            &f.process,
+            n(1),
+            Some(&release.output),
+            pin.clone(),
+        )
         .unwrap();
     assert_eq!(
-        f.runtime.read_pin(&pin, Counter::ZERO, 64).unwrap().cursor,
+        f.runtime
+            .read_output_segment(&pin, Counter::ZERO, 64)
+            .unwrap()
+            .cursor,
         n(13)
     );
     assert!(
         f.runtime
-            .pin(
+            .seal_output(
                 &pin_operation,
                 &f.process,
-                &receipt_digest,
+                n(1),
+                Some(&release.output),
                 "different-pin".try_into().unwrap(),
             )
             .is_err()
@@ -2361,7 +2382,7 @@ fn incomplete_capture_wrong_hash_and_unbacked_reference_cannot_release() {
     assert!(f.runtime.release(&f.process, incomplete).is_err());
     let mut reference = request.clone();
     reference.disposition = ReleaseDisposition::ContinuingRetention {
-        pin: "url-is-not-retention".try_into().unwrap(),
+        segment: "url-is-not-retention".try_into().unwrap(),
     };
     assert!(f.runtime.release(&f.process, reference).is_err());
     let mut wrong = request.clone();
@@ -2455,16 +2476,19 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
 fn continuing_retention_keeps_actual_originals_after_source_release() {
     let mut f = Fixture::new();
     let mut request = f.capture_release();
-    let pin: PinId = "archive-owner".try_into().unwrap();
+    let pin: OutputSegmentId = "archive-owner".try_into().unwrap();
     f.runtime
-        .pin(
+        .seal_output(
             &"pin-archive".try_into().unwrap(),
             &f.process,
-            &request.receipt_digest,
+            n(1),
+            Some(&request.output),
             pin.clone(),
         )
         .unwrap();
-    request.disposition = ReleaseDisposition::ContinuingRetention { pin: pin.clone() };
+    request.disposition = ReleaseDisposition::ContinuingRetention {
+        segment: pin.clone(),
+    };
     let status = f.runtime.release(&f.process, request).unwrap();
     f.runtime
         .cleanup_released(&f.process, &status.request_digest)
@@ -2477,16 +2501,323 @@ fn continuing_retention_keeps_actual_originals_after_source_release() {
             .exists()
     );
     assert!(f.runtime.read_output(&f.process, n(0), 64).is_err());
-    assert_eq!(f.runtime.read_pin(&pin, n(0), 64).unwrap().cursor, n(13));
+    assert_eq!(
+        f.runtime
+            .read_output_segment(&pin, n(0), 64)
+            .unwrap()
+            .cursor,
+        n(13)
+    );
     let path = f.root.0.join("runtime");
     drop(f.runtime);
     assert_eq!(
         RuntimeJournal::open(&path, &f.machine)
             .unwrap()
-            .read_pin(&pin, n(0), 64)
+            .read_output_segment(&pin, n(0), 64)
             .unwrap()
             .cursor,
         n(13)
+    );
+}
+
+#[test]
+fn running_output_seals_an_immutable_prefix_without_a_terminal_receipt() {
+    let mut f = Fixture::new();
+    let first = f
+        .runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"first\0\xff")
+        .unwrap();
+    let operation: OperationId = "seal-running".try_into().unwrap();
+    let segment: OutputSegmentId = "running-prefix".try_into().unwrap();
+    let sealed = f
+        .runtime
+        .seal_output(&operation, &f.process, n(1), None, segment.clone())
+        .unwrap();
+    assert_eq!(sealed.output, first);
+    assert!(f.runtime.receipt(&f.process).unwrap().is_none());
+    f.runtime
+        .append_output(&f.process, n(2), Stream::Stderr, b"second")
+        .unwrap();
+    assert_eq!(
+        f.runtime
+            .seal_output(&operation, &f.process, n(1), None, segment.clone())
+            .unwrap(),
+        sealed
+    );
+    let page = f.runtime.read_output_segment(&segment, n(0), 64).unwrap();
+    assert_eq!(page.available, first.final_cursor);
+    assert_eq!(page.chunks[0].bytes, b"first\0\xff");
+    assert_eq!(page.chunks.len(), 1);
+    assert!(
+        f.runtime
+            .read_output_segment(&segment, first.final_cursor.next().unwrap(), 64)
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .seal_output(&operation, &f.process, n(1), Some(&first), segment.clone())
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .seal_output(
+                &"extend-same-segment".try_into().unwrap(),
+                &f.process,
+                n(1),
+                None,
+                segment.clone()
+            )
+            .is_err()
+    );
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    assert_eq!(runtime.output_segment(&segment).unwrap(), sealed);
+    assert_eq!(
+        runtime
+            .read_output_segment(&segment, n(0), 2)
+            .unwrap()
+            .chunks[0]
+            .bytes,
+        b"fi"
+    );
+    assert_eq!(runtime.retained_output_bytes().unwrap(), n(13));
+}
+
+#[test]
+fn partial_segment_cannot_discharge_remaining_originals_but_retains_its_own_bytes() {
+    let mut f = Fixture::new();
+    let first = f
+        .runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"hello\0\xff")
+        .unwrap();
+    let segment: OutputSegmentId = "protected-prefix".try_into().unwrap();
+    f.runtime
+        .seal_output(
+            &"seal-prefix".try_into().unwrap(),
+            &f.process,
+            n(1),
+            Some(&first),
+            segment.clone(),
+        )
+        .unwrap();
+    let request = f.capture_release();
+    let mut incomplete = request.clone();
+    incomplete.disposition = ReleaseDisposition::ContinuingRetention {
+        segment: segment.clone(),
+    };
+    assert!(f.runtime.release(&f.process, incomplete).is_err());
+    assert_eq!(f.runtime.retained_output_bytes().unwrap(), n(13));
+    let status = f.runtime.release(&f.process, request).unwrap();
+    f.runtime
+        .cleanup_released(&f.process, &status.request_digest)
+        .unwrap();
+    assert_eq!(f.runtime.retained_output_bytes().unwrap(), n(7));
+    assert!(f.runtime.read_output(&f.process, n(0), 64).is_err());
+    let path = f.root.0.join("runtime");
+    assert!(
+        !path
+            .join("output")
+            .join(bytes_digest(b"stderr").as_str())
+            .exists()
+    );
+    drop(f.runtime);
+    let runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    assert_eq!(
+        runtime
+            .read_output_segment(&segment, n(0), 64)
+            .unwrap()
+            .chunks[0]
+            .bytes,
+        b"hello\0\xff"
+    );
+    assert_eq!(runtime.retained_output_bytes().unwrap(), n(7));
+}
+
+#[test]
+fn a_segment_reference_with_missing_bytes_does_not_authorize_source_release() {
+    let mut f = Fixture::new();
+    let mut request = f.capture_release();
+    let segment: OutputSegmentId = "missing-originals".try_into().unwrap();
+    f.runtime
+        .seal_output(
+            &"seal-before-corruption".try_into().unwrap(),
+            &f.process,
+            n(1),
+            None,
+            segment.clone(),
+        )
+        .unwrap();
+    fs::remove_file(
+        f.root
+            .0
+            .join("runtime/output")
+            .join(bytes_digest(b"hello\0\xff").as_str()),
+    )
+    .unwrap();
+    request.disposition = ReleaseDisposition::ContinuingRetention { segment };
+    assert!(f.runtime.release(&f.process, request).is_err());
+    let db = rusqlite::Connection::open(f.root.0.join("runtime/authority.sqlite")).unwrap();
+    let released: bool = db
+        .query_row(
+            "SELECT release IS NOT NULL FROM processes WHERE id=?1",
+            [f.process.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!released);
+    assert!(
+        f.root
+            .0
+            .join("runtime/output")
+            .join(bytes_digest(b"stderr").as_str())
+            .exists()
+    );
+}
+
+#[test]
+fn sealed_prefix_validation_rejects_changed_stream_counts_cursor_hash_and_omissions() {
+    let mut f = Fixture::new();
+    let boundary = f
+        .runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"bytes")
+        .unwrap();
+    let mut variants = Vec::new();
+    let mut changed = boundary.clone();
+    changed.stdout_bytes = n(0);
+    changed.stderr_bytes = n(5);
+    variants.push(changed);
+    let mut changed = boundary.clone();
+    changed.final_cursor = n(4);
+    variants.push(changed);
+    let mut changed = boundary.clone();
+    changed.final_hash = hash("wrong-prefix");
+    variants.push(changed);
+    let mut changed = boundary.clone();
+    changed.omitted_bytes = n(1);
+    variants.push(changed);
+    for (index, invalid) in variants.into_iter().enumerate() {
+        assert!(
+            f.runtime
+                .seal_output(
+                    &format!("invalid-seal-{index}").try_into().unwrap(),
+                    &f.process,
+                    n(1),
+                    Some(&invalid),
+                    format!("invalid-segment-{index}").try_into().unwrap()
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(
+        fs::read_dir(f.root.0.join("runtime/output"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(f.runtime.retained_output_bytes().unwrap(), n(5));
+}
+
+#[test]
+fn output_seals_bind_the_captured_generation_without_sampling_machine_power() {
+    let mut f = Fixture::new();
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"generation-one")
+        .unwrap();
+    let operation: OperationId = "wrong-capture-generation".try_into().unwrap();
+    let segment: OutputSegmentId = "generation-bound".try_into().unwrap();
+    assert!(
+        f.runtime
+            .seal_output(&operation, &f.process, n(2), None, segment.clone())
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .seal_output(&operation, &f.process, n(0), None, segment.clone())
+            .is_err()
+    );
+    assert!(f.runtime.runtime_operation(&operation).unwrap().is_none());
+    assert!(f.runtime.output_segment(&segment).is_err());
+    let mut observed = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    observed.sequence = observed.sequence.next().unwrap();
+    observed.state = MachineState::Stopped;
+    observed.cause = ObservationCause::Native {};
+    observed.evidence_digest = hash("stopped-independently");
+    f.runtime.observe(observed).unwrap();
+    assert_eq!(
+        f.runtime
+            .seal_output(&operation, &f.process, n(1), None, segment.clone())
+            .unwrap()
+            .generation,
+        n(1)
+    );
+    let db = rusqlite::Connection::open(f.root.0.join("runtime/authority.sqlite")).unwrap();
+    for query in [
+        "EXPLAIN QUERY PLAN SELECT offset FROM segment_frames WHERE segment=?1 AND offset<=?2 ORDER BY offset DESC LIMIT 1",
+        "EXPLAIN QUERY PLAN SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM segment_frames WHERE segment=?1 AND offset>=?2 AND sequence<=?3 ORDER BY offset LIMIT 256",
+    ] {
+        let mut statement = db.prepare(query).unwrap();
+        let count = statement.parameter_count();
+        let values: Vec<rusqlite::types::Value> = if count == 2 {
+            vec![segment.as_str().to_owned().into(), 0i64.into()]
+        } else {
+            vec![segment.as_str().to_owned().into(), 0i64.into(), 1i64.into()]
+        };
+        let details = statement
+            .query_map(rusqlite::params_from_iter(values), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            details.contains("segment_chunks_by_offset"),
+            "unbounded retained-segment read: {details}"
+        );
+        assert!(
+            !details.contains("TEMP B-TREE"),
+            "retained-segment pagination must use its ordered index: {details}"
+        );
+    }
+}
+
+#[test]
+fn output_segment_index_capacity_fails_atomically_without_bypassing_the_shared_bound() {
+    let f = Fixture::new();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let db = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    let mut limits = runtime_limits();
+    limits.chunks = n(1);
+    db.execute(
+        "UPDATE configuration SET limits=?1",
+        [serde_json::to_string(&limits).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"bounded")
+        .unwrap();
+    let segment: OutputSegmentId = "too-many-references".try_into().unwrap();
+    let operation: OperationId = "capacity-seal".try_into().unwrap();
+    assert!(
+        runtime
+            .seal_output(&operation, &f.process, n(1), None, segment.clone())
+            .is_err()
+    );
+    assert!(runtime.output_segment(&segment).is_err());
+    assert!(runtime.runtime_operation(&operation).unwrap().is_none());
+    assert_eq!(
+        runtime.read_output(&f.process, n(0), 64).unwrap().chunks[0].bytes,
+        b"bounded"
     );
 }
 
@@ -2537,7 +2868,7 @@ fn explicit_loss_is_exactly_scoped_and_recorded() {
 }
 
 #[test]
-fn corrupt_output_does_not_rewrite_terminal_truth_or_support_new_pin() {
+fn corrupt_output_does_not_rewrite_terminal_truth_or_support_a_new_segment() {
     let mut f = Fixture::new();
     let receipt = f.terminal();
     fs::write(
@@ -2560,10 +2891,11 @@ fn corrupt_output_does_not_rewrite_terminal_truth_or_support_new_pin() {
     );
     assert!(
         f.runtime
-            .pin(
+            .seal_output(
                 &"pin-corrupt".try_into().unwrap(),
                 &f.process,
-                &receipt.1,
+                n(1),
+                Some(&receipt.0.output),
                 "bad-pin".try_into().unwrap(),
             )
             .is_err()
@@ -2732,12 +3064,13 @@ fn shared_immutable_payload_is_not_deleted_when_another_retention_owner_remains(
             .count(),
         2
     );
-    let pin: PinId = "other-retention".try_into().unwrap();
+    let pin: OutputSegmentId = "other-retention".try_into().unwrap();
     f.runtime
-        .pin(
+        .seal_output(
             &"pin-other-output".try_into().unwrap(),
             &other,
-            &digest,
+            n(1),
+            Some(&receipt.output),
             pin.clone(),
         )
         .unwrap();
@@ -2759,7 +3092,9 @@ fn shared_immutable_payload_is_not_deleted_when_another_retention_owner_remains(
         operation_id: "release-other-output".try_into().unwrap(),
         receipt_digest: digest,
         output: receipt.output,
-        disposition: ReleaseDisposition::ContinuingRetention { pin: pin.clone() },
+        disposition: ReleaseDisposition::ContinuingRetention {
+            segment: pin.clone(),
+        },
     };
     let status = f.runtime.release(&other, release).unwrap();
     f.runtime
@@ -2769,7 +3104,7 @@ fn shared_immutable_payload_is_not_deleted_when_another_retention_owner_remains(
     drop(f.runtime);
     let runtime = RuntimeJournal::open(&root, &f.machine).unwrap();
     assert_eq!(
-        runtime.read_pin(&pin, n(0), 64).unwrap().chunks[0].bytes,
+        runtime.read_output_segment(&pin, n(0), 64).unwrap().chunks[0].bytes,
         b"hello\0\xff"
     );
 }

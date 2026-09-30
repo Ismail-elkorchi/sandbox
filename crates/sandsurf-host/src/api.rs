@@ -1,8 +1,9 @@
 use sandsurf_protocol::{
     CommitmentId, Counter, Digest, ExecutionDefaults, ExecutionId, GuestServiceRequest,
     GuestServiceResponse, LifecycleIntent, LifecycleOperation, MachineId, MachineLifetime,
-    MachineObservation, Observation, Operation, OperationId, PinId, Qualification, ReleaseRequest,
-    Resources, RollbackRecord, RuntimeResponse, Snapshot, SnapshotId, SnapshotRequest, VmEngine,
+    MachineObservation, Observation, Operation, OperationId, OutputSegmentId, Qualification,
+    ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, Snapshot, SnapshotId,
+    SnapshotRequest, VmEngine,
 };
 use sandsurf_state::{
     HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord,
@@ -10,7 +11,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 8;
+pub const HOST_API_VERSION: u16 = 9;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -377,9 +378,13 @@ pub enum HostRequest {
         after: Counter,
         maximum: u32,
     },
-    ReadPinnedEvidence {
+    GetOutputSegment {
         machine_id: MachineId,
-        pin_id: PinId,
+        segment_id: OutputSegmentId,
+    },
+    ReadOutputSegment {
+        machine_id: MachineId,
+        segment_id: OutputSegmentId,
         after: Counter,
         maximum: u32,
     },
@@ -389,12 +394,13 @@ pub enum HostRequest {
         execution_id: ExecutionId,
         receipt_digest: Digest,
     },
-    PinEvidence {
+    SealOutput {
         machine_id: MachineId,
         operation_id: OperationId,
         execution_id: ExecutionId,
-        receipt_digest: Digest,
-        pin_id: PinId,
+        generation: Counter,
+        expected: Option<sandsurf_protocol::OutputBoundary>,
+        segment_id: OutputSegmentId,
     },
     ReleaseEvidence {
         machine_id: MachineId,

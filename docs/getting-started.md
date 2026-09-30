@@ -152,4 +152,15 @@ silently rebound.
 
 Receipt acknowledgement does not release output or express application acceptance. Release requires complete capture elsewhere, continuing retention of the actual bytes, or explicitly authorized loss. A receipt reference alone preserves no bytes. Machine destruction must not release retained output.
 
+`execution.output.seal(id, { operationId, boundary? })` creates an independent,
+immutable owner for an exact captured prefix, even while the execution is running
+or management is unavailable. With no boundary, the first journal admission
+selects the current captured prefix; retrying that operation never extends it.
+Reconnect with `machine.outputSegment(id)` and use `inspect()` or `read()`.
+Sealing shares immutable payloads and canonical framing without double-charging
+the original bytes. A partial segment cannot authorize release of a full receipt.
+For a complete segment, use `{ kind: "continuing-retention", segment: id }`:
+source cleanup retains precisely the frames still owned by segments. Sealing
+alone does not rotate a producer's output quota or discard its guest spool.
+
 The breaking redesign remains incomplete. Native network attachments, unified storage recovery, full-state execution lineage and platform hardware qualification still require implementation or qualification; consult the reported capabilities and [security scope](../SECURITY.md).

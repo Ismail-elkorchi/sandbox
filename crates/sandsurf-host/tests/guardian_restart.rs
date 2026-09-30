@@ -90,7 +90,7 @@ fn runtime_limits() -> RuntimeLimits {
         observations: n(64),
         events: n(256),
         chunks: n(64),
-        pins: n(16),
+        output_segments: n(16),
         output_bytes: n(4096),
     }
 }
@@ -241,6 +241,97 @@ impl Fixture {
             command,
         }
     }
+}
+
+#[test]
+fn immutable_output_segment_retains_a_live_prefix_after_source_cleanup_and_reopen() {
+    let fixture = Fixture::new();
+    let path = fixture.root.0.join("runtime");
+    let mut runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    let execution: ExecutionId = "dispatch-process".try_into().unwrap();
+    runtime.admit(fixture.command.clone()).unwrap();
+    runtime
+        .admit_process(
+            execution.clone(),
+            &fixture.command.operation_id,
+            n(1024),
+            false,
+        )
+        .unwrap();
+    let DispatchDecision::Perform(permit) =
+        runtime.begin_dispatch(fixture.command.clone()).unwrap()
+    else {
+        panic!("fresh dispatch required")
+    };
+    permit.perform(|_| ());
+    let prefix = runtime
+        .append_output(&execution, n(1), Stream::Stdout, b"live\0\xff")
+        .unwrap();
+    let operation: OperationId = "seal-live-prefix".try_into().unwrap();
+    let segment_id: OutputSegmentId = "live-prefix".try_into().unwrap();
+    let segment = runtime
+        .seal_output(&operation, &execution, n(1), None, segment_id.clone())
+        .unwrap();
+    assert!(runtime.receipt(&execution).unwrap().is_none());
+    assert_eq!(segment.output, prefix);
+    runtime
+        .append_output(&execution, n(2), Stream::Stderr, b"tail")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .seal_output(&operation, &execution, n(1), None, segment_id.clone())
+            .unwrap(),
+        segment
+    );
+    let (receipt, receipt_digest) = runtime
+        .publish_receipt(
+            &execution,
+            ExecutionOutcome::Exit { code: 0 },
+            hash("cleanup"),
+            hash("accounting"),
+        )
+        .unwrap();
+    let request = ReleaseRequest {
+        operation_id: "release-source".try_into().unwrap(),
+        receipt_digest: receipt_digest.clone(),
+        output: receipt.output.clone(),
+        disposition: ReleaseDisposition::ContinuingRetention {
+            segment: segment_id.clone(),
+        },
+    };
+    assert!(runtime.release(&execution, request.clone()).is_err());
+    let mut complete = request;
+    let captured = fixture.root.0.join("external-output");
+    let mut external = sandsurf_native::local::create_private_file(&captured).unwrap();
+    external.write_all(b"live\0\xfftail").unwrap();
+    external.sync_all().unwrap();
+    drop(external);
+    complete.disposition = ReleaseDisposition::CompleteCapture {
+        commitment: CaptureCommitment {
+            store_id: "trusted-consumer".try_into().unwrap(),
+            commitment_id: "complete-copy".try_into().unwrap(),
+            manifest_digest: hash("external-output-manifest"),
+            receipt_digest,
+            output: receipt.output,
+        },
+    };
+    let status = runtime.release(&execution, complete).unwrap();
+    runtime
+        .cleanup_released(&execution, &status.request_digest)
+        .unwrap();
+    assert_eq!(runtime.retained_output_bytes().unwrap(), n(6));
+    drop(runtime);
+    let runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    assert!(runtime.read_output(&execution, n(0), 64).is_err());
+    assert_eq!(runtime.output_segment(&segment_id).unwrap(), segment);
+    assert_eq!(
+        runtime
+            .read_output_segment(&segment_id, n(0), 64)
+            .unwrap()
+            .chunks[0]
+            .bytes,
+        b"live\0\xff"
+    );
 }
 
 struct FileEffect {

@@ -101,6 +101,15 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     const terminal = await machine.terminals.open({ executionId: "persistent-terminal", argv: ["/bin/sh"] });
     context.diagnostic("persistent PTY and management-service restart");
     await terminal.input.write(Buffer.from("printf terminal-before\n"));
+    const ptyCaptureDeadline = Date.now() + 30_000;
+    for (;;) {
+      if ((await terminal.process.output.read()).available > 0) break;
+      assert.ok(Date.now() < ptyCaptureDeadline, "live PTY prefix was not captured");
+      await new Promise((done) => setTimeout(done, 100));
+    }
+    const liveSegment = await terminal.process.output.seal("live-pty-prefix", { operationId: "seal-live-pty" });
+    assert.equal(await terminal.process.receipt(), undefined, "live segment does not require process completion");
+    const liveBoundary = (await liveSegment.inspect()).output;
     await terminal.detach();
     const identity = machine.id;
     const generation = machine.generation;
@@ -114,10 +123,14 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await attached.input.write(Buffer.from("printf terminal-after\n"));
 
     await run(machine, "sudo -n sh -c '(sleep 4; rc-service sandsurf-management start) > /var/log/sandsurf-restart-test 2>&1 & rc-service sandsurf-management stop'");
+    assert.equal((await (await attached.process.output.seal("pty-management-unavailable")).inspect()).executionId, "persistent-terminal");
     await managementReady(machine);
     await attached.input.write(Buffer.from("printf keeper-survived\nexit\n"));
     assert.equal(exitCode(await attached.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
     assert.match((await output(attached.process)).toString(), /terminal-before[\s\S]*terminal-after[\s\S]*keeper-survived/u);
+    const reconnectedSegment = machine.outputSegment(liveSegment.id);
+    assert.deepEqual((await reconnectedSegment.inspect()).output, liveBoundary);
+    assert.equal((await reconnectedSegment.read()).available, liveBoundary.finalCursor, "later PTY output cannot extend a sealed segment");
     assert.equal(machine.generation, generation, "management restart must not rebind execution generation");
 
     const secretBytes = Buffer.alloc(1024 ** 2, 255);
@@ -324,10 +337,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       assertSameBytes(await output(execution), dense);
       await assert.rejects(stat(join(directory, "machines", identity, "disks/system.ext4")), { code: "ENOENT" });
       await execution.acknowledge(archivedReceipt.digest);
-      const pinned = await execution.pin("archive-copy", archivedReceipt.digest);
-      const released = await execution.release(archivedReceipt, { kind: "continuing-retention", pin: pinned.id });
+      const segment = await execution.output.seal("archive-copy", { boundary: archivedReceipt.receipt.output });
+      const released = await execution.release(archivedReceipt, { kind: "continuing-retention", segment: segment.id });
       assert.equal((await execution.cleanupReleased(released.requestDigest)).cleanupPending, false);
-      const retainedPage = await pinned.read({ maximum: dense.byteLength });
+      assert.equal((await segment.inspect()).output.finalCursor, dense.byteLength);
+      const retainedPage = await segment.read({ maximum: dense.byteLength });
       assertSameBytes(Buffer.concat(retainedPage.chunks.map((chunk) => Buffer.from(chunk.bytes))), dense);
     } finally {
       await rename(unavailableImage, installedImage);

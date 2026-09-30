@@ -4,6 +4,7 @@ import {
   type MachineGenerationPrecondition, type MachineRevisionPrecondition,
   type ExecutionStatus,
   type NativeImageImportOptions,
+  type OutputBoundary, type OutputSegment,
   type NetworkPolicy, type ResourceUsage, type SecretVersion, type SpawnOptions,
 } from "sandsurf";
 
@@ -30,6 +31,15 @@ async function consume(directory: string, image: string): Promise<void> {
     void status.report; void status.interruption;
     await execution.waitLeader();
     await execution.waitCapture();
+    const receipt = await execution.receipt();
+    if (receipt !== undefined) {
+      const segment: OutputSegment = await execution.output.seal("retained-command-output", { operationId: "seal-command-output", boundary: receipt.receipt.output });
+      const boundary: OutputBoundary = (await segment.inspect()).output;
+      const reconnected = computer.outputSegment(segment.id);
+      await reconnected.read({ after: boundary.finalCursor });
+      const release = await execution.release(receipt, { kind: "continuing-retention", segment: segment.id });
+      await execution.cleanupReleased(release.requestDigest);
+    }
     const home = computer.fs.at("/home/agent");
     await home.writeFile("source.txt", new TextEncoder().encode("captured bytes\n"));
     const artifact: Artifact = await computer.artifacts.capture("/home/agent", revision);

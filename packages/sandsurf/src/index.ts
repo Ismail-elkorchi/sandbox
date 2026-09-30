@@ -5,7 +5,7 @@ export {
   Artifact,
   Snapshot,
   Image,
-  PinnedOutput,
+  OutputSegment,
   FilesystemWatcher,
   Execution,
   ExecutionInterruptedError,
@@ -42,6 +42,7 @@ export type {
   OciImageSource,
   OutputChunk,
   OutputPage,
+  OutputSegmentInspection,
   ExecutionInspection,
   ExecutionOperationOptions,
   ExecutionObservation,
@@ -92,6 +93,7 @@ export type {
   TreeEntry,
 } from "./sandsurf.js";
 export { SandsurfHostError } from "./native-host.js";
+export type { OutputBoundary } from "./sandsurf-protocol.js";
 export {
   renderSandsurfServiceDefinition,
   sandsurfServiceDefinition,

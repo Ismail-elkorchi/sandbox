@@ -49,7 +49,7 @@ test("release dispositions require a full boundary and explicit evidence fields"
   const receiptDigest = "b".repeat(64);
   for (const disposition of [
     { kind: "complete-capture", commitment: { storeId: "store", commitmentId: "capture", manifestDigest: "c".repeat(64), receiptDigest, output } },
-    { kind: "continuing-retention", pin: "pin" },
+    { kind: "continuing-retention", segment: "segment" },
     { kind: "authorized-loss", authorization: "approval" },
   ]) {
     const value = { operationId: "release", receiptDigest, output, disposition };
@@ -348,21 +348,28 @@ test("unapplied lifecycle retains host intent revision without inventing complet
   assert.equal(machine.revision, 101);
 });
 
-test("retained-output operations are fenced by receipts, not live machine revisions", async () => {
+test("output sealing does not require a receipt or live machine revision", async () => {
   const requests = [];
   const machine = fixtureMachine(async (request) => {
     requests.push(request);
     assert.equal("expectedRevision" in request, false);
+    if (request.kind === "seal-output") return { kind: "runtime", response: { kind: "output-segment", segment: {
+      id: request.segmentId, machineId: request.machineId, executionId: request.executionId, generation: 1,
+      output: { finalCursor: 0, chunks: 0, stdoutBytes: 0, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "c".repeat(64) },
+    } } };
     return { kind: "runtime", response: request.kind === "release-evidence"
       ? { kind: "release", status: { requestDigest: "a".repeat(64), cleanupPending: false } }
       : { kind: "complete" } };
   });
   const execution = new Execution(machine, "retained", 1);
   await execution.acknowledge("b".repeat(64));
-  await execution.pin("retained-copy", "b".repeat(64));
+  await execution.output.seal("retained-copy");
   await execution.release({ digest: "b".repeat(64), receipt: { output: {} } },
-    { kind: "continuing-retention", pin: "retained-copy" });
-  assert.deepEqual(requests.map((request) => request.kind), ["acknowledge-receipt", "pin-evidence", "release-evidence"]);
+    { kind: "continuing-retention", segment: "retained-copy" });
+  assert.deepEqual(requests.map((request) => request.kind), ["acknowledge-receipt", "seal-output", "release-evidence"]);
+  assert.equal(requests[1].expected, null);
+  assert.equal(requests[1].generation, 1);
+  assert.equal("receiptDigest" in requests[1], false);
 });
 
 test("ordinary command and file queries use cached generations without grants or inspection", async () => {
@@ -385,6 +392,23 @@ test("ordinary command and file queries use cached generations without grants or
   }
   assert.deepEqual(requests[0].request.request.environment, {});
   for (const legacy of ["request", "hostRequest", "guest", "workload"]) assert.equal(legacy in machine, false);
+});
+
+test("output segment handles reconnect directly and validate their immutable capture metadata", async () => {
+  const requests = [];
+  const boundary = { finalCursor: 3, chunks: 1, stdoutBytes: 3, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "c".repeat(64) };
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    return { kind: "runtime", response: { kind: "output-segment", segment: {
+      id: request.segmentId, machineId: request.machineId, executionId: "archived-execution", generation: 1, output: boundary,
+    } } };
+  });
+  const segment = machine.outputSegment("captured-prefix");
+  assert.deepEqual((await segment.inspect()).output, boundary);
+  assert.deepEqual(requests.map((request) => request.kind), ["get-output-segment"]);
+  const execution = new Execution(machine, "archived-execution", 1);
+  await assert.rejects(execution.output.seal("invalid-prefix", { boundary: { ...boundary, finalCursor: -1 } }));
+  assert.equal(requests.length, 1, "invalid capture bounds must not reach the host");
 });
 
 test("stale execution handles retain their generation and cannot be manually rebound", async () => {

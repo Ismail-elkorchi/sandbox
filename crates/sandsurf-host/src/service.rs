@@ -405,17 +405,26 @@ impl HostService {
                     maximum: *maximum,
                 },
             ),
-            HostRequest::ReadPinnedEvidence {
+            HostRequest::ReadOutputSegment {
                 machine_id,
-                pin_id,
+                segment_id,
                 after,
                 maximum,
             } => (
                 machine_id.clone(),
-                RuntimeRequest::ReadPin {
-                    pin_id: pin_id.clone(),
+                RuntimeRequest::ReadOutputSegment {
+                    segment_id: segment_id.clone(),
                     after: *after,
                     maximum: *maximum,
+                },
+            ),
+            HostRequest::GetOutputSegment {
+                machine_id,
+                segment_id,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::OutputSegment {
+                    segment_id: segment_id.clone(),
                 },
             ),
             _ => return Ok(None),
@@ -1435,7 +1444,8 @@ impl HostService {
             | HostRequest::ListProcesses { .. }
             | HostRequest::GetReceipt { .. }
             | HostRequest::ReadEvidence { .. }
-            | HostRequest::ReadPinnedEvidence { .. }) => self
+            | HostRequest::GetOutputSegment { .. }
+            | HostRequest::ReadOutputSegment { .. }) => self
                 .defer_runtime_read(&request)?
                 .ok_or(HostError::Invalid("runtime read route is unavailable"))?
                 .execute(),
@@ -1480,47 +1490,25 @@ impl HostService {
                     )?,
                 })
             }
-            HostRequest::PinEvidence {
+            HostRequest::SealOutput {
                 machine_id,
                 operation_id,
                 execution_id,
-                receipt_digest,
-                pin_id,
+                generation,
+                expected,
+                segment_id,
             } => {
                 self.provision_guardian(&machine_id)?;
                 let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                let prior = runtime_operation(&client, &machine_id, &operation_id)?;
-                match prior {
-                    Some(RuntimeOperationRecord::EvidencePin {
-                        operation_id: old_operation,
-                        pin_id: old_pin,
-                        execution_id: old_process,
-                        receipt_digest: old_receipt,
-                    }) if old_operation == operation_id
-                        && old_pin == pin_id
-                        && old_process == execution_id
-                        && old_receipt == receipt_digest =>
-                    {
-                        return Ok(HostResponse::Runtime {
-                            response: RuntimeResponse::Complete,
-                        });
-                    }
-                    Some(_) => {
-                        return Err(sandsurf_state::Error::Conflict(
-                            "evidence pin operation identity conflict",
-                        )
-                        .into());
-                    }
-                    None => {}
-                }
                 Ok(HostResponse::Runtime {
                     response: client.runtime(
                         machine_id,
-                        RuntimeRequest::Pin {
+                        RuntimeRequest::SealOutput {
                             operation_id,
                             execution_id,
-                            receipt_digest,
-                            pin_id,
+                            generation,
+                            expected,
+                            segment_id,
                         },
                     )?,
                 })
@@ -3362,7 +3350,7 @@ fn runtime_limits(resources: &Resources) -> RuntimeLimits {
         observations: counter(1_000_000),
         events: counter(20_000_000),
         chunks: counter(10_000_000),
-        pins: counter(1_000_000),
+        output_segments: counter(1_000_000),
         output_bytes: resources.output_bytes,
     }
 }

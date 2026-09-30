@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import { isIP } from "node:net";
 import { NativeHostClient, SandsurfHostError, integer, record, text } from "./native-host.js";
-import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js";
+import { createSandsurfGuestPath, sandsurfDigest, validateSandsurfOutputBoundary } from "./sandsurf-protocol.js";
+import type { OutputBoundary } from "./sandsurf-protocol.js";
 
 const transport = Symbol("host transport");
 const subscribe = Symbol("event subscription");
@@ -90,10 +91,11 @@ export interface ImageImportOptions { readonly source?: OciImageSource; readonly
 export interface NativeImageImportOptions { readonly manifestPath: string; readonly manifestDigest: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
-export interface Receipt { readonly machineId: string; readonly generation: number; readonly executionId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
+export interface Receipt { readonly machineId: string; readonly generation: number; readonly executionId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: OutputBoundary; readonly cleanupDigest: string; readonly accountingDigest: string; }
 export interface ReceiptView { readonly receipt: Receipt; readonly digest: string; }
-export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: Readonly<Record<string, unknown>>; }
-export type ReleaseDisposition = { readonly kind: "complete-capture"; readonly commitment: CaptureCommitment } | { readonly kind: "continuing-retention"; readonly pin: string } | { readonly kind: "authorized-loss"; readonly authorization?: string };
+export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: OutputBoundary; }
+export type ReleaseDisposition = { readonly kind: "complete-capture"; readonly commitment: CaptureCommitment } | { readonly kind: "continuing-retention"; readonly segment: string } | { readonly kind: "authorized-loss"; readonly authorization?: string };
+export interface OutputSegmentInspection { readonly id: string; readonly machineId: string; readonly executionId: string; readonly generation: number; readonly output: OutputBoundary; }
 export interface ReleaseStatus { readonly requestDigest: string; readonly cleanupPending: boolean; }
 export interface MachineEvent { readonly cursor: number; readonly value: Readonly<Record<string, unknown>>; readonly digest: string; }
 export interface MachineEventPage { readonly cursor: number; readonly available: number; readonly events: readonly MachineEvent[]; }
@@ -300,7 +302,7 @@ export class Machine {
   constructor(host: Sandsurf, view: MachineInspection) { this.#host = host; this.#view = view; this.id = view.id; this.executions = new ExecutionCollection(this); this.terminals = new TerminalCollection(this); this.fs = new MachineFilesystem(this); this.artifacts = new MachineArtifacts(this, host); this.events = new MachineEvents(this); this.network = new MachineNetwork(this); this.ports = new MachinePorts(this); this.resources = new MachineResources(this); this.secrets = new MachineSecrets(this); this.snapshots = new MachineSnapshots(this, host); }
   get revision(): number { return this.#view.configurationRevision; }
   get generation(): number | undefined { return this.#view.machine.kind === "current" && record(this.#view.machine.value) ? integer(this.#view.machine.value.generation) : undefined; }
-  retainedOutput(pinId: string): PinnedOutput { return new PinnedOutput(this, validateIdentity(pinId)); }
+  outputSegment(segmentId: string): OutputSegment { return new OutputSegment(this, validateIdentity(segmentId)); }
   async inspect(): Promise<MachineInspection> { return this[observe](machineViewFrom(await this.#host[transport]({ kind: "get-machine", machineId: this.id }))); }
   async start(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("running", options); }
   async powerOff(options: MachineLifecycleOptions = {}): Promise<MachineInspection> { return this.#lifecycle("stopped", options); }
@@ -674,12 +676,11 @@ export class Execution {
     return { receipt: response.response.receipt as unknown as Receipt, digest: digest(response.response.digest) };
   }
   async acknowledge(receiptDigest: string, options: { readonly operationId?: string } = {}): Promise<void> { await this.#evidenceCommand("acknowledge-receipt", { receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("acknowledge"))); }
-  async pin(pinId: string, receiptDigest: string, options: { readonly operationId?: string } = {}): Promise<PinnedOutput> { const id = validateIdentity(pinId); await this.#evidenceCommand("pin-evidence", { pinId: id, receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("pin"))); return new PinnedOutput(this.#machine, id); }
   async release(receipt: ReceiptView, disposition: ReleaseDisposition, options: { readonly operationId?: string } = {}): Promise<ReleaseStatus> {
     const operationId = validateIdentity(options.operationId ?? identity("release-evidence"));
     let lossApprovalId: string | null = null; let normalized: Readonly<Record<string, unknown>>;
     if (disposition.kind === "complete-capture") normalized = { kind: disposition.kind, commitment: disposition.commitment };
-    else if (disposition.kind === "continuing-retention") normalized = { kind: disposition.kind, pin: validateIdentity(disposition.pin) };
+    else if (disposition.kind === "continuing-retention") normalized = { kind: disposition.kind, segment: validateIdentity(disposition.segment) };
     else { const lossOperationId = childIdentity(operationId, "loss-authorization"); lossApprovalId = disposition.authorization === undefined ? await this.#machine[authorize]({ kind: "evidence-loss", machineId: this.#machine.id, operationId: lossOperationId, request: { executionId: this.id, receiptDigest: receipt.digest, output: receipt.receipt.output } }) : validateIdentity(disposition.authorization); normalized = { kind: disposition.kind, authorization: lossApprovalId }; }
     const response = await this.#machine[transport]({ kind: "release-evidence", machineId: this.#machine.id, executionId: this.id, request: { operationId, receiptDigest: receipt.digest, output: receipt.receipt.output, disposition: normalized }, lossApprovalId });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "release" || !record(response.response.status)) throw protocol("release response");
@@ -695,7 +696,7 @@ export class Execution {
   async signal(signal: number, options: ExecutionSignalOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "signal", executionId: this.id, signal, group: options.group ?? true }, validateIdentity(options.operationId ?? identity("signal")), this[executionFence](options)); }
   async terminate(options: ExecutionTerminateOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "terminate", executionId: this.id, graceMillis: options.graceMillis ?? 1000 }, validateIdentity(options.operationId ?? identity("terminate")), this[executionFence](options)); }
   async resize(size: TerminalSize, options: ExecutionOperationOptions = {}): Promise<void> { await this.#machine[dispatchGuest]({ kind: "resize-terminal", executionId: this.id, size: { columns: size.columns, rows: size.rows, pixelWidth: size.pixelWidth ?? 0, pixelHeight: size.pixelHeight ?? 0 } }, validateIdentity(options.operationId ?? identity("resize")), this[executionFence](options)); }
-  async #evidenceCommand(kind: "acknowledge-receipt" | "pin-evidence", fields: Readonly<Record<string, unknown>>, operationId: string): Promise<void> {
+  async #evidenceCommand(kind: "acknowledge-receipt", fields: Readonly<Record<string, unknown>>, operationId: string): Promise<void> {
     const response = await this.#machine[transport]({ kind, machineId: this.#machine.id, executionId: this.id, operationId, ...fields });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "complete") throw protocol("evidence command response");
   }
@@ -714,6 +715,20 @@ export class ExecutionOutput {
   readonly #process: Execution;
   readonly #machine: Machine;
   constructor(process: Execution, machine: Machine) { this.#process = process; this.#machine = machine; }
+  /** Seal an exact captured prefix, or the current host boundary on first admission.
+   * Retrying the same operation never expands its original capture. No guest
+   * completion, receipt, live management channel or machine revision is required.
+   */
+  async seal(segmentId: string, options: { readonly operationId?: string; readonly boundary?: OutputBoundary } = {}): Promise<OutputSegment> {
+    const id = validateIdentity(segmentId);
+    if (options.boundary !== undefined) validateSandsurfOutputBoundary(options.boundary);
+    const response = await this.#machine[transport]({ kind: "seal-output", machineId: this.#machine.id,
+      executionId: this.#process.id, generation: this.#process.generation, segmentId: id, expected: options.boundary ?? null,
+      operationId: validateIdentity(options.operationId ?? identity("seal-output")) });
+    const segment = parseOutputSegmentResponse(response);
+    if (segment.id !== id || segment.executionId !== this.#process.id || segment.machineId !== this.#machine.id || segment.generation !== this.#process.generation) throw protocol("sealed output identity");
+    return new OutputSegment(this.#machine, id);
+  }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> { const { after, maximum } = normalizeOutputRead(options); const response = await this.#machine[transport]({ kind: "read-evidence", machineId: this.#machine.id, executionId: this.#process.id, after, maximum }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page) || !Array.isArray(response.response.page.chunks)) throw protocol("output response"); return parseEvidencePage(response.response.page); }
   async *follow(options: { readonly after?: number; readonly maximum?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<OutputChunk, void, void> {
     let cursor = options.after ?? 0;
@@ -740,13 +755,18 @@ export class ExecutionOutput {
   }
 }
 
-export class PinnedOutput {
+export class OutputSegment {
   readonly id: string; readonly #machine: Machine;
   constructor(machine: Machine, id: string) { this.#machine = machine; this.id = id; }
+  async inspect(): Promise<OutputSegmentInspection> {
+    const segment = parseOutputSegmentResponse(await this.#machine[transport]({ kind: "get-output-segment", machineId: this.#machine.id, segmentId: this.id }));
+    if (segment.id !== this.id) throw protocol("output segment identity");
+    return segment;
+  }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> {
     const { after, maximum } = normalizeOutputRead(options);
-    const response = await this.#machine[transport]({ kind: "read-pinned-evidence", machineId: this.#machine.id, pinId: this.id, after, maximum });
-    if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page)) throw protocol("pinned output response");
+    const response = await this.#machine[transport]({ kind: "read-output-segment", machineId: this.#machine.id, segmentId: this.id, after, maximum });
+    if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page)) throw protocol("output segment response");
     return parseEvidencePage(response.response.page);
   }
 }
@@ -1152,6 +1172,13 @@ function runtimeEventBelongsToProcess(event: MachineEvent, executionId: string):
   const value = event.value;
   if ((value.kind === "output" || value.kind === "receipt" || value.kind === "evidence-release") && value.executionId === executionId) return true;
   return value.kind === "machine" || (value.kind === "process" && record(value.process) && record(value.process.request) && value.process.request.executionId === executionId);
+}
+function parseOutputSegmentResponse(response: unknown): OutputSegmentInspection {
+  if (!record(response) || response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output-segment" || !record(response.response.segment)) throw protocol("output segment response");
+  const value = response.response.segment;
+  validateSandsurfOutputBoundary(value.output);
+  return { id: validateIdentity(text(value.id)), machineId: validateIdentity(text(value.machineId)),
+    executionId: validateIdentity(text(value.executionId)), generation: integer(value.generation), output: value.output };
 }
 function parseEvidencePage(value: Record<string, unknown>): OutputPage {
   if (!Array.isArray(value.chunks)) throw protocol("output page");
