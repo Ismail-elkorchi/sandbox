@@ -82,10 +82,15 @@ impl DiskContainer {
         }
     }
 
-    fn extension(self) -> &'static str {
+    fn storage_format(self) -> Result<crate::storage::DiskFormat> {
         match self {
-            Self::RawExt4 => "ext4",
-            Self::Vhdx => "vhdx",
+            Self::RawExt4 => Ok(crate::storage::DiskFormat::Raw),
+            #[cfg(target_os = "windows")]
+            Self::Vhdx => Ok(crate::storage::DiskFormat::Vhdx),
+            #[cfg(not(target_os = "windows"))]
+            Self::Vhdx => Err(SnapshotError::Invalid(
+                "VHDX storage requires the Windows host driver",
+            )),
         }
     }
 }
@@ -302,24 +307,7 @@ pub fn materialize_fork(root: &Path, snapshot: &Snapshot, destination: &Path) ->
         .parent()
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
-    let format = match destination_container {
-        #[cfg(any(unix, test))]
-        DiskContainer::RawExt4 => crate::storage::DiskFormat::Raw,
-        #[cfg(target_os = "windows")]
-        DiskContainer::Vhdx => crate::storage::DiskFormat::Vhdx,
-        #[cfg(not(target_os = "windows"))]
-        DiskContainer::Vhdx => {
-            return Err(SnapshotError::Invalid(
-                "VHDX materialization requires the Windows host driver",
-            ));
-        }
-        #[cfg(all(target_os = "windows", not(test)))]
-        DiskContainer::RawExt4 => {
-            return Err(SnapshotError::Invalid(
-                "Windows machine forks require VHDX storage",
-            ));
-        }
-    };
+    let format = destination_container.storage_format()?;
     crate::storage::publish_disk(
         destination,
         snapshot.system_disk_bytes.get(),
@@ -395,68 +383,32 @@ pub fn rollback(
         .parent()
         .ok_or(SnapshotError::Invalid("rollback target has no parent"))?;
     private_directory(parent)?;
-    let next = parent.join(format!(
-        ".system.{}.next.{}",
-        operation.as_str(),
-        target_container.extension()
-    ));
-    let previous = parent.join(format!(".system.{}.previous", operation.as_str()));
-
-    if !target.exists() && next.exists() {
-        if materialized_digest(&next, snapshot.system_disk_bytes.get(), target_container)?
-            != *expected
-        {
-            return Err(SnapshotError::Invalid(
-                "interrupted rollback candidate disagrees with its snapshot",
-            ));
-        }
-        fs::rename(&next, target)?;
-        sync_directory(parent)?;
-    } else if !target.exists() && previous.exists() {
-        fs::rename(&previous, target)?;
-        sync_directory(parent)?;
-    }
-    if target.exists()
-        && materialized_digest(target, snapshot.system_disk_bytes.get(), target_container)?
-            == *expected
-    {
-        remove_file_if_present(&next)?;
-        remove_file_if_present(&previous)?;
-        sync_directory(parent)?;
-        return rollback_evidence(snapshot, operation);
-    }
-    if previous.exists() {
-        return Err(SnapshotError::Invalid(
-            "interrupted rollback target conflicts with its retained original",
-        ));
-    }
-    materialize_disk(
-        &source,
-        &next,
+    crate::storage::replace_disk(
+        target,
+        operation,
         snapshot.system_disk_bytes.get(),
-        expected,
-        source_container,
-        target_container,
+        target_container.storage_format()?,
+        |staged| {
+            materialize_disk(
+                &source,
+                staged,
+                snapshot.system_disk_bytes.get(),
+                expected,
+                source_container,
+                target_container,
+            )
+            .map_err(io::Error::other)
+        },
+        |candidate| {
+            materialized_digest(
+                candidate,
+                snapshot.system_disk_bytes.get(),
+                target_container,
+            )
+            .map(|actual| actual == *expected)
+            .map_err(io::Error::other)
+        },
     )?;
-    if target.exists() {
-        fs::rename(target, &previous)?;
-        sync_directory(parent)?;
-    }
-    if let Err(error) = fs::rename(&next, target) {
-        if previous.exists() && !target.exists() {
-            let _ = fs::rename(&previous, target);
-            let _ = sync_directory(parent);
-        }
-        return Err(error.into());
-    }
-    sync_directory(parent)?;
-    if file_digest(target, snapshot.system_disk_bytes.get())? != *expected {
-        return Err(SnapshotError::Invalid(
-            "installed rollback disk failed readback verification",
-        ));
-    }
-    remove_file_if_present(&previous)?;
-    sync_directory(parent)?;
     rollback_evidence(snapshot, operation)
 }
 
@@ -898,10 +850,10 @@ mod tests {
         let target_directory = temp.0.join("target");
         private_directory(&target_directory).unwrap();
         let target = target_directory.join("system.ext4");
-        open_write(&target)
-            .unwrap()
-            .write_all(&vec![9_u8; 4096])
-            .unwrap();
+        crate::storage::publish_disk(&target, 4096, crate::storage::DiskFormat::Raw, |staged| {
+            open_write(staged)?.write_all(&vec![9_u8; 4096])
+        })
+        .unwrap();
         rollback(&root, &snapshot, &target, &"rollback".try_into().unwrap()).unwrap();
         assert_eq!(file_digest(&target, 4096).unwrap(), captured.disk_digest);
     }

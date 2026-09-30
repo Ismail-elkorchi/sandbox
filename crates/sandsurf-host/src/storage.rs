@@ -1,32 +1,288 @@
-//! One materialization transaction for machine-owned writable disks. Only the
-//! published name may be attached. The guardian's exclusive ownership is held
-//! throughout preparation and recovery; staging files never represent a VM.
+//! One physical storage owner for machine disks. Durable slot phases fence
+//! creation, replacement and retirement; only a Ready published payload may
+//! be attached. Staging files never represent a VM.
 
 use sandsurf_native::PrivateFileAccess;
 use sandsurf_native::local::{create_private_file, open_private_file};
-use sandsurf_native::storage::{publish_new_file, sync_directory, sync_file};
+use sandsurf_native::storage::{publish_new_file, replace_journal_file, sync_directory, sync_file};
+use sandsurf_protocol::OperationId;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum DiskFormat {
-    #[cfg(any(unix, test))]
     Raw,
     #[cfg(windows)]
     Vhdx,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiskObject {
+    version: u32,
+    filename: String,
+    bytes: u64,
+    format: DiskFormat,
+    phase: DiskPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum DiskPhase {
+    Preparing,
+    Ready,
+    Replacing { operation: OperationId },
+    Retiring { replacement: Option<OperationId> },
+    Retired,
+}
+
+/// Physical storage state, not host lifecycle intent or resource authorization.
+/// All slot mutations use the same OS writer lease. Native attachments still
+/// belong to the guardian and must be released before replacement/retirement.
+struct DiskOwner {
+    path: PathBuf,
+    record: DiskObject,
+    lease: std::fs::File,
+}
+
+impl Drop for DiskOwner {
+    fn drop(&mut self) {
+        let _ = self.lease.unlock();
+    }
+}
+
+impl DiskOwner {
+    fn open(destination: &Path, creation: Option<(u64, DiskFormat)>) -> io::Result<Self> {
+        if !destination.is_absolute() || destination.parent().is_none() {
+            return Err(invalid("storage slot requires an absolute file path"));
+        }
+        let filename = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("storage slot name is invalid"))?;
+        let lease_path = destination.with_extension("storage.lock");
+        let lease = match create_private_file(&lease_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_private_file(&lease_path, PrivateFileAccess::ReadWrite)?
+            }
+            Err(error) => return Err(error),
+        };
+        lease.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage slot already has a writer",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        let path = destination.with_extension("storage.json");
+        let old = match open_private_file(&path, PrivateFileAccess::ReadOnly) {
+            Ok(file) => {
+                if file.metadata()?.len() > 8192 {
+                    return Err(invalid("storage object record exceeds its bound"));
+                }
+                let mut bytes = Vec::new();
+                file.take(8193).read_to_end(&mut bytes)?;
+                if bytes.len() > 8192 {
+                    return Err(invalid("storage object record exceeds its bound"));
+                }
+                Some(serde_json::from_slice::<DiskObject>(&bytes).map_err(io::Error::other)?)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let fresh = old.is_none();
+        let record = if let Some(record) = old {
+            if record.version != 1
+                || record.filename != filename
+                || record.bytes == 0
+                || record.bytes > MAX_DISK_BYTES
+                || !record.bytes.is_multiple_of(4096)
+                || creation
+                    .is_some_and(|(bytes, format)| bytes != record.bytes || format != record.format)
+            {
+                return Err(invalid(
+                    "storage object identity or geometry conflicts with this slot",
+                ));
+            }
+            record
+        } else {
+            let (bytes, format) =
+                creation.ok_or_else(|| invalid("storage slot has no ownership record"))?;
+            if bytes == 0
+                || bytes > MAX_DISK_BYTES
+                || !bytes.is_multiple_of(4096)
+                || object_exists(destination)?
+            {
+                return Err(invalid("untracked storage cannot be adopted or replaced"));
+            }
+            DiskObject {
+                version: 1,
+                filename: filename.to_owned(),
+                bytes,
+                format,
+                phase: DiskPhase::Preparing,
+            }
+        };
+        let mut owner = Self {
+            path,
+            record,
+            lease,
+        };
+        if fresh {
+            owner.persist()?;
+        }
+        Ok(owner)
+    }
+
+    fn set_phase(&mut self, phase: DiskPhase) -> io::Result<()> {
+        self.record.phase = phase;
+        self.persist()
+    }
+
+    fn persist(&mut self) -> io::Result<()> {
+        let staged = self.path.with_extension("record-building");
+        reclaim_staging(&staged)?;
+        let mut file = create_private_file(&staged)?;
+        file.write_all(&serde_json::to_vec(&self.record).map_err(io::Error::other)?)?;
+        sync_file(&file)?;
+        drop(file);
+        // Mutable journal state under the writer lease, not immutable payload
+        // publication. Never replace a disk through this metadata path.
+        replace_journal_file(&staged, &self.path)
+    }
+}
+
 impl DiskFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Raw => "ext4",
+            #[cfg(windows)]
+            Self::Vhdx => "vhdx",
+        }
+    }
     fn is_raw(self) -> bool {
         match self {
-            #[cfg(any(unix, test))]
             Self::Raw => true,
             #[cfg(windows)]
             Self::Vhdx => false,
         }
+    }
+}
+
+/// Replace a detached disk under an already journaled host operation. The
+/// native owner must have released its attachment before entry. Power state
+/// alone is not a storage lease. Original bytes survive until the replacement
+/// is published and verified; interrupted effects reconcile these exact names.
+pub(crate) fn replace_disk(
+    destination: &Path,
+    operation: &OperationId,
+    bytes: u64,
+    format: DiskFormat,
+    build: impl FnOnce(&Path) -> io::Result<()>,
+    matches_content: impl Fn(&Path) -> io::Result<bool>,
+) -> io::Result<()> {
+    if !destination.is_absolute() {
+        return Err(invalid(
+            "disk replacement requires an absolute storage path",
+        ));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid("disk replacement has no parent"))?;
+    let next = parent.join(format!(
+        ".system.{}.next.{}",
+        operation.as_str(),
+        format.extension()
+    ));
+    let previous = parent.join(format!(".system.{}.previous", operation.as_str()));
+    let mut owner = DiskOwner::open(destination, None)?;
+    if owner.record.bytes != bytes || owner.record.format != format {
+        return Err(invalid(
+            "replacement geometry conflicts with storage ownership",
+        ));
+    }
+    match &owner.record.phase {
+        DiskPhase::Ready => owner.set_phase(DiskPhase::Replacing {
+            operation: operation.clone(),
+        })?,
+        DiskPhase::Replacing { operation: active } if active == operation => {}
+        _ => {
+            return Err(invalid(
+                "storage replacement belongs to another operation or retired slot",
+            ));
+        }
+    }
+
+    if !object_exists(destination)? {
+        if object_exists(&next)? {
+            validate_disk(&next, bytes, format)?;
+            if !matches_content(&next)? {
+                return Err(invalid(
+                    "interrupted replacement disagrees with its approved content",
+                ));
+            }
+            publish_new_file(&next, destination)?;
+        } else if object_exists(&previous)? {
+            validate_disk(&previous, bytes, format)?;
+            publish_new_file(&previous, destination)?;
+        }
+    }
+    if object_exists(destination)? {
+        validate_disk(destination, bytes, format)?;
+        if matches_content(destination)? {
+            reclaim_staging(&next.with_extension("building"))?;
+            reclaim_staging(&next)?;
+            reclaim_staging(&previous)?;
+            sync_directory(parent)?;
+            return owner.set_phase(DiskPhase::Ready);
+        }
+    }
+    if object_exists(&previous)? {
+        return Err(invalid("replacement conflicts with its retained original"));
+    }
+    publish_prepared(&next, bytes, format, |staged| {
+        build(staged)?;
+        if !matches_content(staged)? {
+            return Err(invalid(
+                "prepared replacement does not match its approved content",
+            ));
+        }
+        Ok(())
+    })?;
+    if !matches_content(&next)? {
+        return Err(invalid("replacement does not match its approved content"));
+    }
+    if object_exists(destination)? {
+        publish_new_file(destination, &previous)?;
+    }
+    if let Err(error) = publish_new_file(&next, destination) {
+        if object_exists(&previous)? && !object_exists(destination)? {
+            // Recover only this operation's original, without overwriting an
+            // unexpected name or converting a failed publication into success.
+            let _ = publish_new_file(&previous, destination);
+        }
+        return Err(error);
+    }
+    validate_disk(destination, bytes, format)?;
+    if !matches_content(destination)? {
+        return Err(invalid("installed replacement failed content verification"));
+    }
+    reclaim_staging(&previous)?;
+    sync_directory(parent)?;
+    owner.set_phase(DiskPhase::Ready)
+}
+
+fn object_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -80,6 +336,34 @@ pub(crate) fn publish_disk(
     format: DiskFormat,
     build: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    let mut owner = DiskOwner::open(destination, Some((bytes, format)))?;
+    match owner.record.phase {
+        DiskPhase::Preparing => {}
+        DiskPhase::Ready if object_exists(destination)? => {}
+        DiskPhase::Ready => {
+            return Err(invalid(
+                "published machine disk is missing; seed recreation is forbidden",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "storage is replacing or retired; attachment is forbidden",
+            ));
+        }
+    }
+    publish_prepared(destination, bytes, format, build)?;
+    if owner.record.phase != DiskPhase::Ready {
+        owner.set_phase(DiskPhase::Ready)?;
+    }
+    Ok(())
+}
+
+fn publish_prepared(
+    destination: &Path,
+    bytes: u64,
+    format: DiskFormat,
+    build: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     if !destination.is_absolute()
         || bytes == 0
         || bytes > MAX_DISK_BYTES
@@ -119,20 +403,43 @@ fn reclaim_staging(staged: &Path) -> io::Result<()> {
 
 /// Called by the host only after the guardian's committed native detach/exit.
 /// Never removes the machine root, output ledger, artifacts, or snapshots.
-pub(crate) fn retire(disk: &Path) -> io::Result<()> {
+pub(crate) fn retire(disk: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> {
     if !disk.is_absolute() || disk.parent().is_none() {
         return Err(invalid("disk retirement requires an absolute storage path"));
+    }
+    // Destruction can precede the first successful native boot. Establish a
+    // retired slot even when materialization never started; never adopt an
+    // existing payload without its ownership record.
+    let mut owner = DiskOwner::open(disk, Some((bytes, format)))?;
+    let replacement = match &owner.record.phase {
+        DiskPhase::Retired => return Ok(()),
+        DiskPhase::Replacing { operation } => Some(operation.clone()),
+        DiskPhase::Retiring { replacement } => replacement.clone(),
+        _ => None,
+    };
+    owner.set_phase(DiskPhase::Retiring {
+        replacement: replacement.clone(),
+    })?;
+    if let Some(operation) = replacement {
+        let parent = disk.parent().expect("validated parent");
+        let next = parent.join(format!(
+            ".system.{}.next.{}",
+            operation.as_str(),
+            owner.record.format.extension()
+        ));
+        reclaim_staging(&next.with_extension("building"))?;
+        reclaim_staging(&next)?;
+        reclaim_staging(&parent.join(format!(".system.{}.previous", operation.as_str())))?;
     }
     reclaim_staging(&disk.with_extension("building"))?;
     reclaim_staging(disk)?;
     sync_directory(disk.parent().expect("validated parent"))?;
-    Ok(())
+    owner.set_phase(DiskPhase::Retired)
 }
 
 fn validate_disk(path: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> {
     let file = open_private_file(path, PrivateFileAccess::ReadOnly)?;
     let actual = match format {
-        #[cfg(any(unix, test))]
         DiskFormat::Raw => file.metadata()?.len(),
         #[cfg(windows)]
         DiskFormat::Vhdx => sandsurf_native::virtual_disk::virtual_disk_size(path)?,
@@ -181,6 +488,358 @@ mod tests {
         }
     }
 
+    fn create_disk(target: &Path, byte: u8) {
+        publish_disk(target, 4096, DiskFormat::Raw, |staged| {
+            create_private_file(staged)?.write_all(&vec![byte; 4096])
+        })
+        .unwrap();
+    }
+
+    fn replace(target: &Path, operation: &OperationId) -> io::Result<()> {
+        replace_disk(
+            target,
+            operation,
+            4096,
+            DiskFormat::Raw,
+            |staged| create_private_file(staged)?.write_all(&vec![2; 4096]),
+            |candidate| Ok(fs::read(candidate)? == vec![2; 4096]),
+        )
+    }
+
+    #[test]
+    fn missing_published_and_retired_disks_cannot_be_reseeded() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        fs::remove_file(&target).unwrap();
+        assert!(
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                "lost disk must not be recreated"
+            ))
+            .is_err()
+        );
+        assert!(!target.exists());
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
+        assert!(
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                "retired slot must not be recreated"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Retired
+        );
+    }
+
+    #[test]
+    fn destroying_before_first_boot_permanently_retires_the_slot() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Retired
+        );
+        assert!(
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                "destroyed unbooted machine must not be created"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn published_payload_before_ready_commit_is_recovered_without_rebuilding() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        let owner = DiskOwner::open(&target, Some((4096, DiskFormat::Raw))).unwrap();
+        publish_prepared(&target, 4096, DiskFormat::Raw, |staged| {
+            create_private_file(staged)?.write_all(&vec![3; 4096])
+        })
+        .unwrap();
+        drop(owner);
+        publish_disk(&target, 4096, DiskFormat::Raw, |_| {
+            panic!("published payload is complete")
+        })
+        .unwrap();
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Ready
+        );
+        assert_eq!(fs::read(&target).unwrap(), vec![3; 4096]);
+    }
+
+    #[test]
+    fn storage_has_one_writer_and_does_not_adopt_untracked_payloads() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        let owner = DiskOwner::open(&target, Some((4096, DiskFormat::Raw))).unwrap();
+        assert_eq!(
+            DiskOwner::open(&target, None).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(owner);
+        let untracked = fixture.0.join("untracked.ext4");
+        create_private_file(&untracked)
+            .unwrap()
+            .write_all(&vec![9; 4096])
+            .unwrap();
+        assert!(
+            publish_disk(&untracked, 4096, DiskFormat::Raw, |_| panic!(
+                "untracked original must remain intact"
+            ))
+            .is_err()
+        );
+        assert_eq!(fs::read(&untracked).unwrap(), vec![9; 4096]);
+        assert!(!untracked.with_extension("storage.json").exists());
+    }
+
+    #[test]
+    fn interrupted_replacement_recovers_each_namespace_stage() {
+        // 0: admitted; 1: next published; 2: original moved; 3: replacement
+        // installed; 4: original moved while next is still only a build.
+        for stage in 0..5 {
+            let fixture = Fixture::new();
+            let target = fixture.0.join("system.ext4");
+            create_disk(&target, 1);
+            let operation: OperationId = "replace".try_into().unwrap();
+            let next = fixture.0.join(".system.replace.next.ext4");
+            let previous = fixture.0.join(".system.replace.previous");
+            let mut owner = DiskOwner::open(&target, None).unwrap();
+            owner
+                .set_phase(DiskPhase::Replacing {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            if (1..=3).contains(&stage) {
+                publish_prepared(&next, 4096, DiskFormat::Raw, |staged| {
+                    create_private_file(staged)?.write_all(&vec![2; 4096])
+                })
+                .unwrap();
+            }
+            if stage >= 2 {
+                publish_new_file(&target, &previous).unwrap();
+            }
+            if stage == 3 {
+                publish_new_file(&next, &target).unwrap();
+            }
+            if stage == 4 {
+                create_private_file(&next.with_extension("building"))
+                    .unwrap()
+                    .write_all(b"partial")
+                    .unwrap();
+            }
+            drop(owner);
+            assert!(
+                publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                    "unsettled replacement must not attach"
+                ))
+                .is_err()
+            );
+            assert!(replace(&target, &"other-operation".try_into().unwrap()).is_err());
+            replace(&target, &operation).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
+            assert!(!next.exists());
+            assert!(!next.with_extension("building").exists());
+            assert!(!previous.exists());
+            assert_eq!(
+                DiskOwner::open(&target, None).unwrap().record.phase,
+                DiskPhase::Ready
+            );
+            replace(&target, &operation).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "child fixture for killed_storage_owner_recovers_without_reseed"]
+    fn storage_owner_child() {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            std::process::exit(70);
+        });
+        let root = PathBuf::from(std::env::var_os("SANDSURF_STORAGE_OWNER_FIXTURE").unwrap());
+        let target = root.join("system.ext4");
+        create_disk(&target, 1);
+        let mut owner = DiskOwner::open(&target, None).unwrap();
+        owner
+            .set_phase(DiskPhase::Replacing {
+                operation: "replace".try_into().unwrap(),
+            })
+            .unwrap();
+        let next = root.join(".system.replace.next.ext4");
+        publish_prepared(&next, 4096, DiskFormat::Raw, |staged| {
+            create_private_file(staged)?.write_all(&vec![2; 4096])
+        })
+        .unwrap();
+        publish_new_file(&target, &root.join(".system.replace.previous")).unwrap();
+        println!("STORAGE-OWNER-READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn killed_storage_owner_recovers_without_reseed() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        struct ChildOwner(std::process::Child);
+        impl Drop for ChildOwner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fixture = Fixture::new();
+        let mut child = ChildOwner(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage::tests::storage_owner_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SANDSURF_STORAGE_OWNER_FIXTURE", &fixture.0)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdout = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "storage owner fixture exited before readiness"
+            );
+            if line.trim().ends_with("STORAGE-OWNER-READY") {
+                break;
+            }
+        }
+        let target = fixture.0.join("system.ext4");
+        assert!(!target.exists());
+        assert_eq!(
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                "active writer must not be replaced"
+            ))
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(
+            publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                "interrupted replacement must not be reseeded"
+            ))
+            .is_err()
+        );
+        replace(&target, &"replace".try_into().unwrap()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Ready
+        );
+    }
+
+    #[test]
+    fn invalid_replacement_preserves_original_and_remains_unattachable() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let operation: OperationId = "replace".try_into().unwrap();
+        assert!(
+            replace_disk(
+                &target,
+                &operation,
+                4096,
+                DiskFormat::Raw,
+                |staged| create_private_file(staged)?.write_all(&vec![8; 4096]),
+                |candidate| Ok(fs::read(candidate)? == vec![2; 4096])
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
+        assert!(publish_disk(&target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
+        replace(&target, &operation).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
+    }
+
+    #[test]
+    fn retirement_reclaims_only_its_replacement_and_preserves_archives() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let mut owner = DiskOwner::open(&target, None).unwrap();
+        owner
+            .set_phase(DiskPhase::Replacing {
+                operation: "replace".try_into().unwrap(),
+            })
+            .unwrap();
+        drop(owner);
+        let owned = [
+            ".system.replace.next.ext4",
+            ".system.replace.next.building",
+            ".system.replace.previous",
+        ];
+        for name in owned {
+            create_private_file(&fixture.0.join(name))
+                .unwrap()
+                .write_all(b"owned")
+                .unwrap();
+        }
+        let retained = ["retained-output", ".system.unrelated.previous"];
+        for name in retained {
+            create_private_file(&fixture.0.join(name))
+                .unwrap()
+                .write_all(b"retained")
+                .unwrap();
+        }
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
+        for name in owned {
+            assert!(!fixture.0.join(name).exists());
+        }
+        for name in retained {
+            assert_eq!(fs::read(fixture.0.join(name)).unwrap(), b"retained");
+        }
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Retired
+        );
+    }
+
+    #[test]
+    fn corrupt_ownership_records_are_rejected_without_touching_payload() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        create_disk(&target, 1);
+        let record_path = target.with_extension("storage.json");
+        let original = fs::read(&record_path).unwrap();
+        for corrupt in [
+            b"{}".to_vec(),
+            vec![0; 8193],
+            original
+                .iter()
+                .copied()
+                .chain(b" trailing".iter().copied())
+                .collect(),
+        ] {
+            fs::write(&record_path, &corrupt).unwrap();
+            assert!(
+                publish_disk(&target, 4096, DiskFormat::Raw, |_| panic!(
+                    "invalid record must never prepare"
+                ))
+                .is_err()
+            );
+            assert!(retire(&target, 4096, DiskFormat::Raw).is_err());
+            assert_eq!(fs::read(&record_path).unwrap(), corrupt);
+            assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
+        }
+    }
+
     #[test]
     fn shared_disk_identity_is_never_attached_or_deleted() {
         let fixture = Fixture::new();
@@ -205,11 +864,11 @@ mod tests {
             )
             .is_err()
         );
-        assert!(retire(&target).is_err());
+        assert!(retire(&target, 4096, DiskFormat::Raw).is_err());
         assert!(target.exists());
         assert!(alias.exists());
         fs::remove_file(alias).unwrap();
-        retire(&target).unwrap();
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
     }
 
     #[test]
@@ -264,11 +923,11 @@ mod tests {
         assert!(materialize(&alias, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
         std::os::unix::fs::symlink(&source, target.with_extension("building")).unwrap();
         assert!(materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
-        assert!(retire(&target).is_err());
+        assert!(retire(&target, 4096, DiskFormat::Raw).is_err());
         fs::remove_file(target.with_extension("building")).unwrap();
         std::os::unix::fs::symlink(&source, &target).unwrap();
         assert!(materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
-        assert!(retire(&target).is_err());
+        assert!(retire(&target, 4096, DiskFormat::Raw).is_err());
         assert_eq!(fs::read(source).unwrap(), b"seed bytes");
         assert!(
             fs::symlink_metadata(target)
@@ -325,11 +984,11 @@ mod tests {
             .unwrap()
             .write_all(b"protected bytes")
             .unwrap();
-        retire(&target).unwrap();
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
         assert!(!target.exists());
-        retire(&target).unwrap();
+        retire(&target, 4096, DiskFormat::Raw).unwrap();
         assert_eq!(fs::read(&retained).unwrap(), b"protected bytes");
         fs::remove_file(retained).unwrap();
-        fs::remove_dir(root).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

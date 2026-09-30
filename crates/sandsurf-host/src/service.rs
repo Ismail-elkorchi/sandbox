@@ -2600,6 +2600,17 @@ impl HostService {
                 .machine_root(machine)
                 .join("disks")
                 .join(system_disk_name()),
+            record.resources.disk_bytes.get(),
+            {
+                #[cfg(windows)]
+                {
+                    crate::storage::DiskFormat::Vhdx
+                }
+                #[cfg(not(windows))]
+                {
+                    crate::storage::DiskFormat::Raw
+                }
+            },
         )?;
         self.catalog.release_retired_storage(machine)?;
         Ok(())

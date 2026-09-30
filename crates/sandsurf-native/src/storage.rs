@@ -35,6 +35,31 @@ pub fn publish_new_file(staged: &Path, destination: &Path) -> io::Result<()> {
     publish_name(staged, destination)
 }
 
+/// Commit mutable owner-journal metadata. The caller must hold its exclusive
+/// writer lease; immutable disk/image/output payloads use publish_new_file.
+pub fn replace_journal_file(staged: &Path, destination: &Path) -> io::Result<()> {
+    if !staged.is_absolute()
+        || !destination.is_absolute()
+        || staged.parent() != destination.parent()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journal replacement requires absolute paths in one directory",
+        ));
+    }
+    sync_file(&crate::local::open_private_file(
+        staged,
+        crate::PrivateFileAccess::ReadWrite,
+    )?)?;
+    #[cfg(unix)]
+    {
+        std::fs::rename(staged, destination)?;
+        sync_directory(destination.parent().expect("validated journal path"))
+    }
+    #[cfg(windows)]
+    move_name(staged, destination, true)
+}
+
 /// Atomically publish a prepared directory without replacing another object.
 /// Payload and nested directory flushes belong to the materializing owner.
 pub fn publish_new_directory(staged: &Path, destination: &Path) -> io::Result<()> {
@@ -125,8 +150,15 @@ pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> 
 
 #[cfg(windows)]
 pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> {
+    move_name(staged, destination, false)
+}
+
+#[cfg(windows)]
+fn move_name(staged: &Path, destination: &Path, replace: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
     fn wide(path: &Path) -> io::Result<Vec<u16>> {
         let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
         if value.contains(&0) {
@@ -140,10 +172,17 @@ pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> 
     }
     let source = wide(staged)?;
     let target = wide(destination)?;
-    // SAFETY: both paths are terminated and remain live for the synchronous
-    // call. Omitting REPLACE_EXISTING and COPY_ALLOWED prevents overwrite and
-    // cross-volume copy. WRITE_THROUGH waits for native disk publication.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+    // COPY_ALLOWED is never enabled. Only the owner-journal transaction
+    // requests replacement; immutable publication cannot overwrite a name.
+    // WRITE_THROUGH waits for native publication before journal-dependent effects.
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    // SAFETY: both terminated paths remain live for this synchronous call.
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), flags) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -155,6 +194,30 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn owner_journal_replacement_commits_one_complete_record() {
+        use crate::local::{create_private_directory, create_private_file};
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-journal-publication-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&root).unwrap();
+        let stage = root.join("record-building");
+        let target = root.join("record.json");
+        for bytes in [b"original".as_slice(), b"replacement".as_slice()] {
+            create_private_file(&stage)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+            replace_journal_file(&stage, &target).unwrap();
+            assert!(!stage.exists());
+            assert_eq!(fs::read(&target).unwrap(), bytes);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn directory_publication_never_replaces_an_existing_identity() {

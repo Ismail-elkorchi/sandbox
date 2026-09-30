@@ -1773,7 +1773,7 @@ mod storage_tests {
         fs::remove_file(source).unwrap();
         ensure_mutable_disk(&root.join("missing-seed"), &destination, 8192).unwrap();
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
-        crate::storage::retire(&destination).unwrap();
-        fs::remove_dir(root).unwrap();
+        crate::storage::retire(&destination, 8192, crate::storage::DiskFormat::Raw).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

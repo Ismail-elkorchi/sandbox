@@ -9,7 +9,9 @@ test("native bridge correlates concurrent host responses and bounds admission", 
   const root = await mkdtemp(join(tmpdir(), "sandsurf-bridge-"));
   let client;
   try {
-    client = await NativeHostClient.open(root);
+    // The host creates its own private store. A Node-created temporary parent
+    // has inherited Windows ACLs and is not itself an admissible host store.
+    client = await NativeHostClient.open(join(root, "state"));
     const requests = Array.from({ length: 64 }, (_, index) => client.request(index % 2 === 0
       ? { kind: "inspect" }
       : { kind: "list-machines", after: null, maximum: 1 }));
