@@ -2625,8 +2625,12 @@ impl HostService {
 }
 
 pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
-    let mut service = HostService::open(root, executable)?;
+    let service = HostService::open(root, executable)?;
     let listener = LocalListener::bind(&service.endpoint())?;
+    serve_host_owned(service, listener)
+}
+
+fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result<()> {
     let stopped = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::sync_channel::<HostIngress>(MAX_HOST_CONNECTIONS);
@@ -3811,36 +3815,14 @@ mod tests {
             unix_millis().unwrap().get()
         ));
         prepare_directory(&root).unwrap();
-        let service_root = root.clone();
-        let server =
-            thread::spawn(move || serve_host(&service_root, std::env::current_exe().unwrap()));
-        let endpoint = root.join("api");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let idle = loop {
-            match LocalConnection::connect(&endpoint, Duration::from_millis(100)) {
-                Ok(connection) => break connection,
-                Err(error)
-                    if std::time::Instant::now() < deadline
-                        && matches!(
-                            error.kind(),
-                            io::ErrorKind::NotFound
-                                | io::ErrorKind::ConnectionRefused
-                                | io::ErrorKind::TimedOut
-                        ) =>
-                {
-                    thread::sleep(Duration::from_millis(10))
-                }
-                Err(error) => {
-                    let service = if server.is_finished() {
-                        format!("{:?}", server.join().unwrap())
-                    } else {
-                        "still starting".into()
-                    };
-                    panic!("host did not start: {error}; service: {service}");
-                }
-            }
-        };
-        thread::sleep(Duration::from_millis(100));
+        // Fixture admission/publication is not the behavior under test. Complete
+        // it explicitly before measuring whether an idle connection blocks the
+        // production serving loop; do not infer readiness from a timing window.
+        let service = HostService::open(&root, std::env::current_exe().unwrap()).unwrap();
+        let endpoint = service.endpoint();
+        let listener = LocalListener::bind(&endpoint).unwrap();
+        let server = thread::spawn(move || serve_host_owned(service, listener));
+        let idle = LocalConnection::connect(&endpoint, Duration::from_secs(3)).unwrap();
         let (ready, observed) = mpsc::channel();
         let client_root = root.clone();
         thread::spawn(move || {

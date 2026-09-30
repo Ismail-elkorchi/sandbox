@@ -9,6 +9,7 @@ const originalUmask = process.platform === "win32" ? undefined : process.umask()
 try {
   const core = await pack("sandsurf");
   const expectedImages = await packagedImagePaths();
+  const expectedNative = await packagedNativePaths();
   for (const tarball of [core]) {
     const listing = await capture("tar", ["-tzf", tarball]);
     const paths = listing.trim().split(/\r?\n/u).map((path) => path.replaceAll("\\", "/"));
@@ -18,8 +19,8 @@ try {
     if (!paths.includes("package/package.json") || !paths.includes("package/dist/index.js") || !paths.includes("package/README.md") || !paths.includes("package/LICENSE")) {
       throw new Error(`${tarball} is missing package entry points`);
     }
-    for (const imagePath of expectedImages) {
-      if (!paths.includes(imagePath)) throw new Error(`${tarball} is missing ${imagePath}`);
+    for (const payloadPath of [...expectedImages, ...expectedNative]) {
+      if (!paths.includes(payloadPath)) throw new Error(`${tarball} is missing ${payloadPath}`);
     }
     if (paths.some((path) => /(?:minimal-|trusted-bootstrap|development-workload|empty-workspace)/u.test(path))) {
       throw new Error(`${tarball} contains a retired guest image artifact`);
@@ -106,6 +107,23 @@ async function packagedImagePaths(): Promise<readonly string[]> {
     }
   }
   if (required.size !== 0) throw new Error(`required packaged guest images are absent: ${[...required].join(", ")}`);
+  return paths;
+}
+
+async function packagedNativePaths(): Promise<readonly string[]> {
+  const index: unknown = JSON.parse(await readFile(resolve("packages/sandsurf/native/manifest.json"), "utf8"));
+  if (!record(index) || index.formatVersion !== 1 || index.buildId !== "sandsurf-native-0.1.0" || !record(index.files)) {
+    throw new Error("native package index is malformed");
+  }
+  const paths = ["package/native/manifest.json"];
+  const required = new Set((process.env.SANDSURF_REQUIRED_NATIVE_PLATFORMS ?? "").split(",").filter(Boolean));
+  for (const [relative, digest] of Object.entries(index.files)) {
+    const match = /^((?:linux|macos|windows)-(?:x64|arm64))\/[A-Za-z0-9._-]+$/u.exec(relative);
+    if (match === null || typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) throw new Error(`invalid native package entry ${relative}`);
+    required.delete(match[1]!);
+    paths.push(`package/native/${relative}`);
+  }
+  if (required.size !== 0) throw new Error(`required native platforms are absent: ${[...required].join(", ")}`);
   return paths;
 }
 

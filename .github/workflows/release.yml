@@ -64,10 +64,10 @@ jobs:
           - runner: ubuntu-26.04-arm
             artifact: linux-arm64
             image_architecture: arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             artifact: macos-x64
             image_architecture: x64
-          - runner: macos-14
+          - runner: macos-15
             artifact: macos-arm64
             image_architecture: arm64
           - runner: windows-2025
@@ -99,7 +99,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-${{ matrix.artifact }}
-          path: packages/sandsurf/native/${{ matrix.artifact }}
+          path: |
+            packages/sandsurf/native/${{ matrix.artifact }}
+            packages/sandsurf/native/manifest.json
           if-no-files-found: error
 
   assemble:
@@ -126,15 +128,8 @@ jobs:
         with:
           name: guest-image-arm64
           path: packages/sandsurf/images/development-arm64
-      - name: Assemble platform directories
-        shell: bash
-        run: |
-          for directory in staged-runtimes/runtime-*; do
-            platform="${directory##*/runtime-}"
-            mkdir -p "packages/sandsurf/native/$platform"
-            cp -a "$directory/." "packages/sandsurf/native/$platform/"
-          done
-      - run: node scripts/rebuild-native-manifest.ts
+      - name: Assemble the complete verified native package
+        run: node scripts/assemble-release-native.ts
       - run: npm run manifest:images
         env:
           SANDSURF_REQUIRED_IMAGE_ARCHITECTURES: x64,arm64
@@ -146,6 +141,7 @@ jobs:
       - run: npm run test:package
         env:
           SANDSURF_REQUIRED_IMAGE_ARCHITECTURES: x64,arm64
+          SANDSURF_REQUIRED_NATIVE_PLATFORMS: linux-x64,linux-arm64,macos-x64,macos-arm64,windows-x64
       - run: npm run package
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
