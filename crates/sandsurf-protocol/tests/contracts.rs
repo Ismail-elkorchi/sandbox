@@ -302,7 +302,14 @@ fn reject_oversize_headers_without_reading_payload() {
     encoded[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
     let error = Frame::read(&mut &encoded[..]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    for (offset, value) in [(0, b'X'), (5, 4), (6, 255), (7, 1), (11, 1)] {
+    for (offset, value) in [
+        (0, b'X'),
+        (5, 3),
+        (5, (VERSION + 1) as u8),
+        (6, 255),
+        (7, 1),
+        (11, 1),
+    ] {
         let mut invalid = Vec::new();
         frame.write(&mut invalid).unwrap();
         invalid[offset] = value;

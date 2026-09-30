@@ -167,6 +167,13 @@ pub struct WatchEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WatchPage {
+    pub events: Vec<WatchEvent>,
+    pub cursor: Counter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetainedChunk {
     pub cursor: Counter,
     pub stream: Stream,
@@ -479,6 +486,7 @@ pub enum FilesystemRequest {
     PollWatch {
         watcher_id: WatcherId,
         generation: Counter,
+        after: Counter,
         maximum: u16,
     },
     Unwatch {
@@ -766,6 +774,6 @@ pub enum FilesystemResponse {
     ReadMetadata { range: FileRangeMetadata },
     Written { revision: FileRevision },
     Link { target: Vec<u8> },
-    Watch { events: Vec<WatchEvent> },
+    Watch { page: WatchPage },
     Complete,
 }

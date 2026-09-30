@@ -11,7 +11,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 10;
+pub const HOST_API_VERSION: u16 = 11;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -78,6 +78,64 @@ pub enum ReservationView {
     Released,
 }
 
+/// Observation of host-owned storage, not integrity of the root-controlled OS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum StorageInspection {
+    Current {
+        phase: StoragePhase,
+        format: StorageFormat,
+        capacity_bytes: u64,
+        operation_id: Option<OperationId>,
+        payload: StoragePayload,
+    },
+    Unavailable {
+        reason: StorageUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoragePhase {
+    Preparing,
+    Published,
+    Attached,
+    Replacing,
+    Retiring,
+    Retired,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageFormat {
+    Raw,
+    Vhdx,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageUnavailableReason {
+    OwnershipMissing,
+    OwnershipInvalid,
+    AccessUnavailable,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum StoragePayload {
+    Present { file_bytes: u64 },
+    CapacityMismatch { file_bytes: u64 },
+    Missing,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MachineView {
@@ -91,6 +149,7 @@ pub struct MachineView {
     pub lifecycle_intent: LifecycleIntent,
     pub machine: Observation<MachineObservation>,
     pub management: Observation<sandsurf_protocol::GuestManagementReport>,
+    pub storage: StorageInspection,
     pub execution_defaults: ExecutionDefaults,
     pub lifetime: MachineLifetime,
     pub last_activity_unix_millis: Counter,

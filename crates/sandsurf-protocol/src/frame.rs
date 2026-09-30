@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: &[u8; 4] = b"SSF1";
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const HEADER_BYTES: usize = 56;
 pub const AUTHENTICATION_BYTES: usize = 32;
 pub const MAX_CONTROL_BYTES: usize = 256 * 1024;

@@ -4,6 +4,10 @@ import { isIP } from "node:net";
 import { NativeHostClient, SandsurfHostError, integer, record, text } from "./native-host.js";
 import { createSandsurfGuestPath, sandsurfDigest, validateSandsurfOutputBoundary } from "./sandsurf-protocol.js";
 import type { OutputBoundary } from "./sandsurf-protocol.js";
+import { parseDirectoryPage, parseFileMetadata, parseFileRange, parseFileRevision, parseFilesystemWatchPage, parseFilesystemBytes } from "./filesystem.js";
+import type { DirectoryPage, FileMetadata, FileRange, FileRevision, FilesystemWatchEvent, FilesystemWatchPage, FilesystemWatcherIdentity } from "./filesystem.js";
+import { parseExecutionInspection, parseExecutionReceipt, parseExecutionRequest } from "./execution.js";
+import type { ExecutionInspection, Receipt } from "./execution.js";
 
 const transport = Symbol("host transport");
 const subscribe = Symbol("event subscription");
@@ -51,7 +55,12 @@ export type MachineState = "creating" | "starting" | "running" | "paused" | "sto
 export type ObservationCause = { readonly kind: "lifecycle" | "configuration"; readonly operationId: string } | { readonly kind: "native" };
 export interface NativeMachineObservation { readonly machineId: string; readonly generation: number; readonly sequence: number; readonly state: MachineState; readonly appliedRevision: number; readonly cause: ObservationCause; readonly evidenceDigest: string; }
 export type MachineObservation = { readonly kind: "current"; readonly value: NativeMachineObservation } | { readonly kind: "unavailable"; readonly lastKnown: NativeMachineObservation | null };
-export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
+export interface ObservationReference { readonly machineId: string; readonly generation: number; readonly sequence: number; readonly digest: string; }
+export interface MachineLifecycleIntent { readonly machineId: string; readonly operationId: string; readonly desired: DesiredMachineState; readonly revision: number; readonly requestDigest: string; readonly completion: ObservationReference | null; }
+export type StoragePayload = { readonly kind: "present" | "capacity-mismatch"; readonly fileBytes: number } | { readonly kind: "missing" | "unavailable" };
+/** Host storage observations do not attest to the integrity of the Linux filesystem. */
+export type StorageInspection = { readonly kind: "current"; readonly phase: "preparing" | "published" | "attached" | "replacing" | "retiring" | "retired"; readonly format: "raw" | "vhdx"; readonly capacityBytes: number; readonly operationId: string | null; readonly payload: StoragePayload } | { readonly kind: "unavailable"; readonly reason: "ownership-missing" | "ownership-invalid" | "access-unavailable" };
+export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: MachineLifecycleIntent; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly storage: StorageInspection; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
 export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
 export interface NetworkRule { readonly plane: "named-proxy" | "direct-tcp" | "dns"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
 export interface NetworkPolicy { readonly rules: readonly NetworkRule[]; }
@@ -91,7 +100,6 @@ export interface ImageImportOptions { readonly source?: OciImageSource; readonly
 export interface NativeImageImportOptions { readonly manifestPath: string; readonly manifestDigest: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
-export interface Receipt { readonly machineId: string; readonly generation: number; readonly executionId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: OutputBoundary; readonly cleanupDigest: string; readonly accountingDigest: string; }
 export interface ReceiptView { readonly receipt: Receipt; readonly digest: string; }
 export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: OutputBoundary; }
 export type ReleaseDisposition = { readonly kind: "complete-capture"; readonly commitment: CaptureCommitment } | { readonly kind: "continuing-retention"; readonly segment: string } | { readonly kind: "authorized-loss"; readonly authorization?: string };
@@ -509,7 +517,6 @@ export type ExecOptions = SpawnOptions & { readonly signal?: AbortSignal };
 export type ShellOptions = Omit<SpawnOptions, "argv"> & { readonly shell?: string };
 export type ExecShellOptions = Omit<ExecOptions, "argv"> & { readonly shell?: string };
 export interface ExecResult { readonly process: Execution; readonly inspection: ExecutionInspection; }
-export interface ExecutionInspection { readonly request: Readonly<Record<string, unknown>>; readonly guestPid: number; readonly state: Readonly<Record<string, unknown>>; readonly lineage: Readonly<Record<string, unknown>> | null; }
 export type ExecutionObservation = { readonly kind: "current"; readonly value: ExecutionInspection } | { readonly kind: "unavailable"; readonly lastKnown: ExecutionInspection | null };
 export interface ExecutionStatus { readonly executionId: string; readonly generation: number; readonly report: ExecutionObservation; readonly interruption: NativeMachineObservation | null; }
 export class ExecutionInterruptedError extends SandsurfHostError {
@@ -556,7 +563,8 @@ export class ExecutionCollection {
     const executionId = validateIdentity(id);
     const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process" || !record(response.response.request)) throw protocol("execution response");
-    if (response.response.request.executionId !== executionId || response.response.request.machineId !== this.#machine.id) throw protocol("execution reservation identity");
+    const request = parseExecutionRequest(response.response.request);
+    if (request.executionId !== executionId || request.machineId !== this.#machine.id) throw protocol("execution reservation identity");
     const status = parseExecutionStatus(response.response.process, this.#machine.id);
     if (status.executionId !== executionId) throw protocol("execution reservation identity");
     return new Execution(this.#machine, executionId, status.generation);
@@ -585,7 +593,7 @@ export class TerminalCollection {
     const executionId = validateIdentity(id);
     const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process" || !record(response.response.request)) throw protocol("terminal response");
-    const request = response.response.request;
+    const request = parseExecutionRequest(response.response.request);
     if (request.executionId !== executionId || request.machineId !== this.#machine.id) throw protocol("terminal reservation identity");
     if (request.stdio !== "terminal") throw new SandsurfHostError("conflict", `Process ${executionId} is not a terminal`);
     return new Terminal(new Execution(this.#machine, executionId, integer(request.generation)));
@@ -640,13 +648,13 @@ export class Execution {
     const complete = async (value: ExecutionInspection): Promise<boolean> => {
       if (value.state.kind === "running" || (boundaryKind === "capture" && value.state.kind === "draining")) return false;
       if (boundaryKind === "leader" || value.state.kind === "unknown") return true;
+      if (value.state.kind !== "exited") throw protocol("execution capture state");
       terminal = value;
       const receipt = await this.receipt();
       if (receipt === undefined) return false;
       if (receipt.receipt.executionId !== this.id || receipt.receipt.generation !== this.generation ||
-          !record(value.state.output) || !record(receipt.receipt.output) ||
-          receipt.receipt.output.finalCursor !== value.state.output.finalCursor ||
-          receipt.receipt.output.finalHash !== value.state.output.finalHash) throw protocol("capture receipt disagrees with completed process");
+          sandsurfDigest("receipt", [receipt.receipt.outcome, receipt.receipt.output, receipt.receipt.cleanupDigest, receipt.receipt.accountingDigest]) !==
+          sandsurfDigest("receipt", [value.state.outcome, value.state.output, value.state.cleanupDigest, value.state.accountingDigest])) throw protocol("capture receipt disagrees with completed process");
       return true;
     };
     const reported = status.report.kind === "current" ? status.report.value : status.report.lastKnown;
@@ -662,7 +670,7 @@ export class Execution {
         requireExecutionContinuity(this, latest);
       }
       if (event.value.kind !== "process" || !record(event.value.process)) continue;
-      const process = parseProcess(event.value.process);
+      const process = parseExecutionInspection(event.value.process);
       if (process.request.executionId === this.id && process.request.generation === this.generation && await complete(process)) return process;
     }
     if (options.signal !== undefined) throw options.signal.reason;
@@ -673,7 +681,10 @@ export class Execution {
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "receipt") throw protocol("receipt response");
     if (response.response.receipt === null && response.response.digest === null) return undefined;
     if (!record(response.response.receipt) || typeof response.response.digest !== "string") throw protocol("receipt record");
-    return { receipt: response.response.receipt as unknown as Receipt, digest: digest(response.response.digest) };
+    const receiptDigest = digest(response.response.digest);
+    const receipt = parseExecutionReceipt(response.response.receipt, receiptDigest);
+    if (receipt.machineId !== this.#machine.id || receipt.executionId !== this.id || receipt.generation !== this.generation) throw protocol("receipt identity");
+    return { receipt, digest: receiptDigest };
   }
   async acknowledge(receiptDigest: string, options: { readonly operationId?: string } = {}): Promise<void> { await this.#evidenceCommand("acknowledge-receipt", { receiptDigest: digest(receiptDigest) }, validateIdentity(options.operationId ?? identity("acknowledge"))); }
   async release(receipt: ReceiptView, disposition: ReleaseDisposition, options: { readonly operationId?: string } = {}): Promise<ReleaseStatus> {
@@ -786,10 +797,26 @@ export class MachineFilesystem {
     joined.set(this.#directory); joined[this.#directory.byteLength] = 0x2f; joined.set(bytes, this.#directory.byteLength + 1);
     return createSandsurfGuestPath(joined);
   }
-  stat(path: string | Uint8Array, follow = true): Promise<Record<string, unknown>> { return this.#operation({ kind: "stat", path: [...this.#path(path)], follow }); }
-  lstat(path: string | Uint8Array): Promise<Record<string, unknown>> { return this.stat(path, false); }
-  list(path: string | Uint8Array, options: { readonly after?: Uint8Array; readonly maximum?: number } = {}): Promise<Record<string, unknown>> { return this.#operation({ kind: "list", path: [...this.#path(path)], after: options.after === undefined ? null : [...options.after], maximum: options.maximum ?? 256 }); }
-  read(path: string | Uint8Array, offset = 0, maximum = 64 * 1024): Promise<Record<string, unknown>> { return this.#operation({ kind: "read", path: [...this.#path(path)], offset, maximum }); }
+  async stat(path: string | Uint8Array, follow = true): Promise<FileMetadata> {
+    const response = await this.#operation({ kind: "stat", path: [...this.#path(path)], follow });
+    if (response.kind !== "stat") throw protocol("file metadata response");
+    return parseFileMetadata(response.value);
+  }
+  lstat(path: string | Uint8Array): Promise<FileMetadata> { return this.stat(path, false); }
+  async list(path: string | Uint8Array, options: { readonly after?: Uint8Array; readonly maximum?: number } = {}): Promise<DirectoryPage> {
+    const maximum = options.maximum ?? 256;
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 4096) throw new TypeError("directory page bound must be 1..4096");
+    const response = await this.#operation({ kind: "list", path: [...this.#path(path)], after: options.after === undefined ? null : [...options.after], maximum });
+    if (response.kind !== "list") throw protocol("directory page response");
+    return parseDirectoryPage(response.page, maximum, options.after);
+  }
+  async read(path: string | Uint8Array, options: MachineGenerationPrecondition & { readonly offset?: number; readonly maximum?: number } = {}): Promise<FileRange> {
+    const offset = options.offset ?? 0; const maximum = options.maximum ?? 64 * 1024;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > 64 * 1024) throw new TypeError("file range bounds are invalid");
+    const response = await this.#operation({ kind: "read", path: [...this.#path(path)], offset, maximum }, undefined, options);
+    if (response.kind !== "read") throw protocol("file range response");
+    return parseFileRange(response.range, offset, maximum);
+  }
   async *readStream(path: string | Uint8Array, options: MachineGenerationPrecondition & { readonly maximumBytes?: number; readonly chunkBytes?: number; readonly expectedDigest?: string } = {}): AsyncGenerator<Uint8Array> {
     const guestPath = this.#path(path);
     const authority = resolveGenerationPrecondition(this.#machine, options);
@@ -801,18 +828,16 @@ export class MachineFilesystem {
     let offset = 0; let observation: { readonly size: number; readonly token: string } | undefined;
     const hash = createHash("sha256");
     for (;;) {
-      const response = await this.#operation({ kind: "read", path: [...guestPath], offset, maximum }, undefined, authority);
-      if (response.kind !== "read" || !record(response.range) || !record(response.range.observation)
-        || (!Array.isArray(response.range.bytes) && !(response.range.bytes instanceof Uint8Array)) || integer(response.range.offset) !== offset) throw protocol("file range response");
-      const observed = { size: integer(response.range.observation.size), token: digest(text(response.range.observation.token)) };
+      const range = await this.read(Uint8Array.from(guestPath), { ...authority, offset, maximum });
+      const observed = range.observation;
       if (observed.size > maximumBytes) throw new SandsurfHostError("capacity", "file exceeds the requested stream bound");
       if (observation !== undefined && (observed.size !== observation.size || observed.token !== observation.token)) throw new SandsurfHostError("conflict", "file changed during streamed read");
       observation = observed;
-      const bytes = response.range.bytes instanceof Uint8Array ? response.range.bytes : Uint8Array.from(response.range.bytes as number[]);
+      const bytes = range.bytes;
       if (bytes.byteLength > maximum || offset + bytes.byteLength > maximumBytes) throw protocol("file range exceeds its credit");
       hash.update(bytes); offset += bytes.byteLength;
       if (bytes.byteLength !== 0) yield bytes;
-      if (response.range.eof === true) break;
+      if (range.eof) break;
       if (bytes.byteLength === 0) throw protocol("empty non-terminal file range");
     }
     const actualDigest = hash.digest("hex");
@@ -826,11 +851,11 @@ export class MachineFilesystem {
     for (const chunk of chunks) { result.set(chunk, cursor); cursor += chunk.byteLength; }
     return result;
   }
-  async writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: FileOperationOptions & { readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string } = {}): Promise<Record<string, unknown>> {
+  async writeFile(path: string | Uint8Array, bytes: string | Uint8Array, options: FileOperationOptions & { readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string } = {}): Promise<FileRevision> {
     const value = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
     return this.writeStream(path, [value], { length: value.byteLength, digest: createHash("sha256").update(value).digest("hex"), ...options });
   }
-  async writeStream(path: string | Uint8Array, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, options: FileOperationOptions & { readonly length: number; readonly digest: string; readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string }): Promise<Record<string, unknown>> {
+  async writeStream(path: string | Uint8Array, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, options: FileOperationOptions & { readonly length: number; readonly digest: string; readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string }): Promise<FileRevision> {
     if (!Number.isSafeInteger(options.length) || options.length < 0 || options.length > 128 * 1024 ** 3) throw new TypeError("stream length is invalid");
     const operationId = validateIdentity(options.operationId ?? identity("write-file"));
     const transfer = { id: validateIdentity(options.transferId ?? childIdentity(operationId, "transfer")), path: [...this.#path(path)], length: options.length, digest: digest(options.digest), mode: options.mode ?? 0o644, expected: options.expected ?? { kind: "any" } };
@@ -856,7 +881,11 @@ export class MachineFilesystem {
       }
       await flush();
       if (offset !== options.length) throw new SandsurfHostError("transfer", "stream byte count does not match its declaration");
-      return await perform({ kind: "commit-write", transfer }, "commit");
+      const response = await perform({ kind: "commit-write", transfer }, "commit");
+      if (response.kind !== "written") throw protocol("committed file revision");
+      const revision = parseFileRevision(response.revision);
+      if (revision.size !== transfer.length || revision.digest !== transfer.digest) throw protocol("committed file revision identity");
+      return revision;
     } catch (error) {
       // Once a remote operation has begun, delivery may be ambiguous. Keep the
       // staged transfer so the caller can reconcile/retry the stable child IDs.
@@ -864,19 +893,46 @@ export class MachineFilesystem {
       throw error;
     }
   }
-  async mkdir(path: string | Uint8Array, options: FileOperationOptions & { readonly recursive?: boolean } = {}): Promise<void> { await this.#operation({ kind: "mkdir", path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("mkdir")), options); }
-  async rename(from: string | Uint8Array, to: string | Uint8Array, options: FileOperationOptions = {}): Promise<void> { await this.#operation({ kind: "rename", from: [...this.#path(from)], to: [...this.#path(to)] }, validateIdentity(options.operationId ?? identity("rename")), options); }
-  async remove(path: string | Uint8Array, options: FileOperationOptions & { readonly recursive?: boolean } = {}): Promise<void> { await this.#operation({ kind: "remove", path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("remove")), options); }
-  async chmod(path: string | Uint8Array, mode: number, options: FileOperationOptions = {}): Promise<void> { await this.#operation({ kind: "chmod", path: [...this.#path(path)], mode }, validateIdentity(options.operationId ?? identity("chmod")), options); }
-  async readlink(path: string | Uint8Array): Promise<Uint8Array> { const response = await this.#operation({ kind: "readlink", path: [...this.#path(path)] }); if (response.kind !== "link" || !Array.isArray(response.target)) throw protocol("readlink response"); return Uint8Array.from(response.target as number[]); }
-  async symlink(path: string | Uint8Array, target: Uint8Array, options: FileOperationOptions = {}): Promise<void> { await this.#operation({ kind: "symlink", path: [...this.#path(path)], target: [...target] }, validateIdentity(options.operationId ?? identity("symlink")), options); }
+  async mkdir(path: string | Uint8Array, options: FileOperationOptions & { readonly recursive?: boolean } = {}): Promise<void> { await this.#complete({ kind: "mkdir", path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("mkdir")), options); }
+  async rename(from: string | Uint8Array, to: string | Uint8Array, options: FileOperationOptions = {}): Promise<void> { await this.#complete({ kind: "rename", from: [...this.#path(from)], to: [...this.#path(to)] }, validateIdentity(options.operationId ?? identity("rename")), options); }
+  async remove(path: string | Uint8Array, options: FileOperationOptions & { readonly recursive?: boolean } = {}): Promise<void> { await this.#complete({ kind: "remove", path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("remove")), options); }
+  async chmod(path: string | Uint8Array, mode: number, options: FileOperationOptions = {}): Promise<void> { await this.#complete({ kind: "chmod", path: [...this.#path(path)], mode }, validateIdentity(options.operationId ?? identity("chmod")), options); }
+  async readlink(path: string | Uint8Array): Promise<Uint8Array> {
+    const response = await this.#operation({ kind: "readlink", path: [...this.#path(path)] });
+    if (response.kind !== "link") throw protocol("readlink response");
+    const target = parseFilesystemBytes(response.target, 4096);
+    if (target.byteLength === 0 || target.includes(0)) throw protocol("readlink target");
+    return target;
+  }
+  async symlink(path: string | Uint8Array, target: Uint8Array, options: FileOperationOptions = {}): Promise<void> {
+    if (!(target instanceof Uint8Array) || target.byteLength === 0 || target.byteLength > 4096 || target.includes(0)) throw new TypeError("symlink target must be 1..4096 bytes without NUL");
+    await this.#complete({ kind: "symlink", path: [...this.#path(path)], target: [...target] }, validateIdentity(options.operationId ?? identity("symlink")), options);
+  }
   async watch(path: string | Uint8Array, options: FileOperationOptions & { readonly recursive?: boolean; readonly watcherId?: string } = {}): Promise<FilesystemWatcher> {
     const authority = resolveGenerationPrecondition(this.#machine, options); const watcherId = validateIdentity(options.watcherId ?? identity("watcher"));
-    await this.#operation({ kind: "watch", watcherId, generation: authority.expectedGeneration, path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("watch")), authority);
+    await this.#complete({ kind: "watch", watcherId, generation: authority.expectedGeneration, path: [...this.#path(path)], recursive: options.recursive ?? false }, validateIdentity(options.operationId ?? identity("watch")), authority);
     return new FilesystemWatcher(this, watcherId, authority.expectedGeneration);
   }
-  async pollWatcher(watcherId: string, generation: number, maximum = 256): Promise<readonly Readonly<Record<string, unknown>>[]> { const response = await this.#operation({ kind: "poll-watch", watcherId, generation, maximum }); if (response.kind !== "watch" || !Array.isArray(response.events)) throw protocol("watch response"); return response.events.map((event) => { if (!record(event)) throw protocol("watch event"); return event; }); }
-  async closeWatcher(watcherId: string, generation: number, options: FileOperationOptions = {}): Promise<void> { await this.#operation({ kind: "unwatch", watcherId, generation }, validateIdentity(options.operationId ?? identity("unwatch")), options); }
+  attachWatcher(value: FilesystemWatcherIdentity): FilesystemWatcher {
+    const id = validateIdentity(value.id);
+    const generation = integer(value.generation);
+    if (generation === 0) throw new TypeError("watcher generation must be positive");
+    return new FilesystemWatcher(this, id, generation, integer(value.cursor));
+  }
+  async pollWatcher(watcherId: string, generation: number, after: number, maximum = 256): Promise<FilesystemWatchPage> {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 4096) throw new TypeError("watch event bound must be 1..4096");
+    const response = await this.#operation({ kind: "poll-watch", watcherId, generation, after: integer(after), maximum }, undefined, { expectedGeneration: generation });
+    if (response.kind !== "watch") throw protocol("watch response");
+    return parseFilesystemWatchPage(response.page, watcherId, generation, maximum, after);
+  }
+  async closeWatcher(watcherId: string, generation: number, options: FileOperationOptions = {}): Promise<void> {
+    if (options.expectedGeneration !== undefined && options.expectedGeneration !== generation) throw new SandsurfHostError("stale-generation", "Watcher generation cannot be rebound");
+    await this.#complete({ kind: "unwatch", watcherId, generation }, validateIdentity(options.operationId ?? identity("unwatch")), { expectedGeneration: generation });
+  }
+  async #complete(request: Readonly<Record<string, unknown>>, operationId: string, precondition: MachineGenerationPrecondition): Promise<void> {
+    const response = await this.#operation(request, operationId, precondition);
+    if (response.kind !== "complete" || Object.keys(response).length !== 1) throw protocol("filesystem command acknowledgement");
+  }
   async #operation(request: Readonly<Record<string, unknown>>, operationId = identity("file"), precondition: MachineGenerationPrecondition = {}): Promise<Record<string, unknown>> {
     if (typeof request.kind === "string" && ["stat", "list", "read", "readlink", "poll-watch"].includes(request.kind)) {
       const response = await this.#machine[queryGuest]({ kind: "filesystem-query", request }, precondition);
@@ -891,9 +947,18 @@ export class MachineFilesystem {
 }
 
 export class FilesystemWatcher {
-  readonly id: string; readonly generation: number; readonly #filesystem: MachineFilesystem; #closed = false;
-  constructor(filesystem: MachineFilesystem, id: string, generation: number) { this.#filesystem = filesystem; this.id = id; this.generation = generation; }
-  poll(maximum = 256): Promise<readonly Readonly<Record<string, unknown>>[]> { if (this.#closed) throw new SandsurfHostError("client", "Filesystem watcher is closed"); return this.#filesystem.pollWatcher(this.id, this.generation, maximum); }
+  readonly id: string; readonly generation: number; readonly #filesystem: MachineFilesystem; #closed = false; #cursor: number; #polling = false;
+  constructor(filesystem: MachineFilesystem, id: string, generation: number, cursor = 0) { this.#filesystem = filesystem; this.id = id; this.generation = generation; this.#cursor = cursor; }
+  get identity(): FilesystemWatcherIdentity { return { id: this.id, generation: this.generation, cursor: this.#cursor }; }
+  async poll(maximum = 256): Promise<readonly FilesystemWatchEvent[]> {
+    if (this.#closed || this.#polling) throw new SandsurfHostError("client", "Filesystem watcher is closed or already polling");
+    this.#polling = true;
+    try {
+      const page = await this.#filesystem.pollWatcher(this.id, this.generation, this.#cursor, maximum);
+      this.#cursor = page.cursor;
+      return page.events;
+    } finally { this.#polling = false; }
+  }
   async close(options: FileOperationOptions = {}): Promise<void> { if (!this.#closed) { await this.#filesystem.closeWatcher(this.id, this.generation, options); this.#closed = true; } }
 }
 
@@ -1084,7 +1149,30 @@ function normalizeLifetime(value: MachineLifetimePolicy | undefined): Readonly<{
   return { expiresAtUnixMillis, expirationAction };
 }
 function machineViewFrom(response: Record<string, unknown>): MachineInspection { if (response.kind === "lifecycle") { if (!record(response.operation) || typeof response.operation.delivery !== "string") throw protocol("lifecycle operation"); if (response.operation.delivery !== "applied") throw new SandsurfHostError(response.operation.delivery === "not-applied" ? "not-applied" : "ambiguous", `Lifecycle operation was ${response.operation.delivery}`); } const value = response.kind === "machine" ? response.value : response.kind === "lifecycle" ? response.machine : undefined; if (!record(value)) throw protocol("machine response"); return parseView(value); }
-function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, machine: parseMachineObservation(value.machine, text(value.id)), lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
+function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, lifecycleIntent: parseLifecycleIntent(value.lifecycleIntent, text(value.id)), storage: parseStorageInspection(value.storage), machine: parseMachineObservation(value.machine, text(value.id)), lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
+
+function parseLifecycleIntent(value: unknown, machineId: string): MachineLifecycleIntent {
+  if (!record(value) || text(value.machineId) !== machineId || !["running", "paused", "stopped", "suspended", "destroyed"].includes(text(value.desired)) || integer(value.revision) < 1) throw protocol("machine lifecycle intent");
+  let completion: ObservationReference | null = null;
+  if (value.completion !== null) {
+    if (!record(value.completion) || text(value.completion.machineId) !== machineId || integer(value.completion.generation) < 1 || integer(value.completion.sequence) < 1) throw protocol("lifecycle completion reference");
+    completion = { machineId, generation: integer(value.completion.generation), sequence: integer(value.completion.sequence), digest: digest(text(value.completion.digest)) };
+  }
+  return { machineId, operationId: validateIdentity(text(value.operationId)), desired: value.desired as DesiredMachineState, revision: integer(value.revision), requestDigest: digest(text(value.requestDigest)), completion };
+}
+
+function parseStorageInspection(value: unknown): StorageInspection {
+  if (!record(value)) throw protocol("machine storage observation");
+  if (value.kind === "unavailable" && ["ownership-missing", "ownership-invalid", "access-unavailable"].includes(text(value.reason)) && Object.keys(value).every((key) => ["kind", "reason"].includes(key))) return { kind: "unavailable", reason: value.reason as "ownership-missing" | "ownership-invalid" | "access-unavailable" };
+  if (value.kind !== "current" || !["preparing", "published", "attached", "replacing", "retiring", "retired"].includes(text(value.phase)) || !["raw", "vhdx"].includes(text(value.format)) || !record(value.payload)) throw protocol("machine storage observation");
+  const capacityBytes = integer(value.capacityBytes);
+  if (capacityBytes < 4096 || capacityBytes > 128 * 1024 ** 3 || capacityBytes % 4096 !== 0 || Object.keys(value).some((key) => !["kind", "phase", "format", "capacityBytes", "operationId", "payload"].includes(key))) throw protocol("machine storage geometry");
+  let payload: StoragePayload;
+  if ((value.payload.kind === "present" || value.payload.kind === "capacity-mismatch") && Object.keys(value.payload).every((key) => ["kind", "fileBytes"].includes(key))) payload = { kind: value.payload.kind, fileBytes: integer(value.payload.fileBytes) };
+  else if ((value.payload.kind === "missing" || value.payload.kind === "unavailable") && Object.keys(value.payload).length === 1) payload = { kind: value.payload.kind };
+  else throw protocol("machine storage payload");
+  return { kind: "current", phase: value.phase as Extract<StorageInspection, { kind: "current" }>["phase"], format: value.format as "raw" | "vhdx", capacityBytes, operationId: value.operationId === null ? null : validateIdentity(text(value.operationId)), payload };
+}
 function currentMachine(view: MachineInspection): { readonly generation: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Machine machine observation is unavailable"); return { generation: integer(view.machine.value.generation) }; }
 function nativeObservationOrder(observation: MachineObservation): readonly [number, number] {
   const value = observation.kind === "current" ? observation.value : observation.lastKnown;
@@ -1140,8 +1228,7 @@ function resolveGenerationPrecondition(machine: Machine, supplied: MachineGenera
 function resolveMachinePreconditions(machine: Machine, supplied: MachineGenerationPrecondition & MachineRevisionPrecondition): { readonly expectedRevision: number; readonly expectedGeneration: number } {
   return { ...resolveGenerationPrecondition(machine, supplied), expectedRevision: expectedCounter(supplied.expectedRevision, "expected revision") ?? machine[observed].configurationRevision };
 }
-function parseProcess(value: unknown): ExecutionInspection { if (!record(value) || !record(value.request) || !record(value.state) || (value.lineage !== null && !record(value.lineage))) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state, lineage: value.lineage }; }
-function parseExecutionObservation(value: unknown): ExecutionObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseProcess(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseProcess(value.lastKnown) }; }
+function parseExecutionObservation(value: unknown): ExecutionObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseExecutionInspection(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseExecutionInspection(value.lastKnown) }; }
 function parseExecutionStatus(value: unknown, machineId: string): ExecutionStatus {
   if (!record(value)) throw protocol("execution status");
   const generation = integer(value.generation);

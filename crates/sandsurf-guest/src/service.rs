@@ -738,11 +738,15 @@ impl ManagementService {
             FilesystemRequest::PollWatch {
                 watcher_id,
                 generation,
+                after,
                 maximum,
             } => FilesystemResponse::Watch {
-                events: self
-                    .filesystem
-                    .poll_watcher(&watcher_id, generation, maximum.into())?,
+                page: self.filesystem.poll_watcher(
+                    &watcher_id,
+                    generation,
+                    after,
+                    maximum.into(),
+                )?,
             },
             FilesystemRequest::Unwatch {
                 watcher_id,
@@ -796,11 +800,15 @@ impl ManagementService {
             FilesystemRequest::PollWatch {
                 watcher_id,
                 generation,
+                after,
                 maximum,
             } => FilesystemResponse::Watch {
-                events: self
-                    .filesystem
-                    .poll_watcher(&watcher_id, generation, maximum.into())?,
+                page: self.filesystem.poll_watcher(
+                    &watcher_id,
+                    generation,
+                    after,
+                    maximum.into(),
+                )?,
             },
             _ => {
                 return Err((

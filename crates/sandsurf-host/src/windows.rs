@@ -201,7 +201,6 @@ pub struct WindowsGuardianEffect {
     network_usage: NetworkUsage,
     exposures: Arc<Mutex<Option<WindowsPortGateway>>>,
     installed_runtime: Option<InstalledRuntime>,
-    restore_lineage: Option<RestoreLineage>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
 }
 
@@ -233,6 +232,8 @@ struct InstalledRuntime {
     evidence: Digest,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreLineage {
     snapshot_id: sandsurf_protocol::SnapshotId,
     source: ReconnectState,
@@ -312,7 +313,6 @@ impl WindowsGuardianEffect {
             network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),
             exposures: Arc::new(Mutex::new(None)),
             installed_runtime: None,
-            restore_lineage: None,
             suspend_capture_operation: None,
         })
     }
@@ -392,9 +392,8 @@ impl WindowsGuardianEffect {
     }
 
     fn bind_restored(&mut self, generation: Counter) -> Result<ActiveGuest, Digest> {
-        let lineage = self
-            .restore_lineage
-            .as_ref()
+        let lineage = crate::restore::load::<RestoreLineage>(&self.machine_root)
+            .map_err(|_| bytes_digest(b"hyper-v-restore-lineage-unavailable"))?
             .ok_or_else(|| bytes_digest(b"hyper-v-restore-lineage-missing"))?;
         let pending = self
             .pending
@@ -672,13 +671,15 @@ impl WindowsGuardianEffect {
                 manifest_digest: manifest_digest.clone(),
             })
             .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
-        self.restore_lineage = Some(RestoreLineage {
-            snapshot_id: snapshot_id.clone(),
-            source: reconnect,
-            staged_state,
-            generation_seed: random_bytes()
-                .map_err(|_| ControlError::Protocol("restore entropy unavailable"))?,
-        });
+        crate::restore::stage(&self.machine_root, manifest_digest.clone(), || {
+            Ok(RestoreLineage {
+                snapshot_id: snapshot_id.clone(),
+                source: reconnect,
+                staged_state,
+                generation_seed: random_bytes()
+                    .map_err(|_| ControlError::Protocol("restore entropy unavailable"))?,
+            })
+        })?;
         Ok(NativeSnapshotResponse::Complete {
             evidence: digest(
                 Domain::Snapshot,
@@ -1179,27 +1180,32 @@ impl GuardianEffect for WindowsGuardianEffect {
         &mut self,
         journal: &mut RuntimeJournal,
         generation: Counter,
-    ) -> sandsurf_state::Result<()> {
-        let lineage = self
-            .restore_lineage
-            .take()
-            .ok_or(sandsurf_state::Error::Conflict(
-                "restored Hyper-V VM has no staged process lineage",
-            ))?;
+    ) -> ControlResult<()> {
+        let Some(lineage) = crate::restore::load::<RestoreLineage>(&self.machine_root)? else {
+            return Ok(());
+        };
+        if generation == lineage.source.generation {
+            return Ok(());
+        }
+        if generation <= lineage.source.generation {
+            return Err(ControlError::Protocol(
+                "restore integration generation mismatch",
+            ));
+        }
         journal.rebind_processes(
             &lineage.snapshot_id,
             &lineage.source.machine_id,
             lineage.source.generation,
             generation,
         )?;
-        match fs::remove_file(&lineage.staged_state) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                eprintln!("sandsurf retained consumed Hyper-V restore state: {error}");
-            }
+        self.retire_restore_intent()
+    }
+
+    fn retire_restore_intent(&mut self) -> ControlResult<()> {
+        if let Some(lineage) = crate::restore::load::<RestoreLineage>(&self.machine_root)? {
+            crate::restore::retire_stage(&self.machine_root, &lineage.staged_state)?;
         }
-        Ok(())
+        crate::restore::complete(&self.machine_root)
     }
 
     fn observe_power(&mut self) -> ControlResult<Option<sandsurf_machine::NativePowerObservation>> {

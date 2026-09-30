@@ -43,14 +43,12 @@ export type {
   OutputChunk,
   OutputPage,
   OutputSegmentInspection,
-  ExecutionInspection,
   ExecutionOperationOptions,
   ExecutionObservation,
   ExecutionStatus,
   ExecutionSignalOptions,
   ExecutionTerminateOptions,
   Qualification,
-  Receipt,
   ReceiptView,
   ReleaseDisposition,
   ReleaseStatus,
@@ -59,6 +57,10 @@ export type {
   RuntimeConfiguration,
   MachineCreateOptions,
   MachineInspection,
+  MachineLifecycleIntent,
+  ObservationReference,
+  StorageInspection,
+  StoragePayload,
   MachineState,
   MachineObservation,
   NativeMachineObservation,
@@ -93,7 +95,10 @@ export type {
   TreeEntry,
 } from "./sandsurf.js";
 export { SandsurfHostError } from "./native-host.js";
+export type { DirectoryPage, FileMetadata, FileRange, FileReadObservation, FileRevision, FilesystemWatchEvent, FilesystemWatchPage, FilesystemWatcherIdentity } from "./filesystem.js";
 export type { OutputBoundary } from "./sandsurf-protocol.js";
+export type { ExecutionRequest } from "./sandsurf-protocol.js";
+export type { ExecutionInspection, ExecutionLineage, ExecutionOutcome, ExecutionState, Receipt } from "./execution.js";
 export {
   renderSandsurfServiceDefinition,
   sandsurfServiceDefinition,

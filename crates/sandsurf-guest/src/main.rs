@@ -99,7 +99,8 @@ fn supervisor_main() -> io::Result<()> {
         .clone();
     let processes = create_process_supervisor(&identity_snapshot)
         .map_err(|error| stage("open process supervisor", error))?;
-    let filesystem = FilesystemService::new();
+    let filesystem = FilesystemService::open(&Path::new(CONTROL_ROOT).join("watchers"))
+        .map_err(|error| stage("open filesystem watch journal", io::Error::other(error)))?;
     let ledger = Path::new(CONTROL_ROOT).join("operations");
     let service = Arc::new(ManagementService::open(processes, filesystem, &ledger)?);
     let connections = Arc::new(AtomicUsize::new(0));
@@ -271,11 +272,11 @@ fn serve_connection(
                     .read()
                     .map_err(|_| io::Error::other("boot identity lock is unavailable"))?
                     .clone();
-                let valid_generation = if machine_id == current.machine_id {
-                    current.generation.next().ok() == Some(generation)
-                } else {
-                    generation == Counter::ONE
-                };
+                // The host fence advances from its current history, not from
+                // the captured guest's older epoch. Memory cloning into another
+                // machine is not a supported restore operation.
+                let valid_generation =
+                    machine_id == current.machine_id && generation > previous_generation;
                 if current.generation != previous_generation {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -285,7 +286,7 @@ fn serve_connection(
                 if !valid_generation {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
-                        "restore target generation is not the next generation",
+                        "restore target identity or generation is invalid",
                     ));
                 }
                 if capability.iter().all(|byte| *byte == 0)

@@ -119,6 +119,28 @@ fn interrupted_endpoint_publication_reclaims_only_its_unpublished_socket() {
 
 #[test]
 fn disconnected_client_does_not_disable_listener_or_lose_buffered_request() {
+    const FIXTURE: &str = "SANDSURF_LOCAL_DISCONNECT_FIXTURE";
+    if std::env::var_os(FIXTURE).is_none() {
+        // Concurrent test subprocesses briefly inherit this socket across fork.
+        // Test the final-description close in an isolated process, without
+        // weakening the write-failure assertion or changing socket ownership.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disconnected_client_does_not_disable_listener_or_lose_buffered_request",
+                "--test-threads=1",
+            ])
+            .env(FIXTURE, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();
     let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();

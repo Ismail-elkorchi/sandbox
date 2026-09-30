@@ -16,6 +16,57 @@ use std::path::{Path, PathBuf};
 
 const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
+/// Never acquire a mutation/attachment lease, repair a slot, open a filesystem,
+/// or infer native detach just to report storage observations.
+pub(crate) fn inspect(destination: &Path) -> crate::api::StorageInspection {
+    use crate::api::{
+        StorageFormat, StorageInspection, StoragePayload, StoragePhase, StorageUnavailableReason,
+    };
+    let unavailable = |reason| StorageInspection::Unavailable { reason };
+    let record = match read_record(destination) {
+        Ok(Some(record)) => record,
+        Ok(None) => return unavailable(StorageUnavailableReason::OwnershipMissing),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            return unavailable(StorageUnavailableReason::OwnershipInvalid);
+        }
+        Err(_) => return unavailable(StorageUnavailableReason::AccessUnavailable),
+    };
+    let (phase, operation_id) = match record.phase {
+        DiskPhase::Preparing => (StoragePhase::Preparing, None),
+        DiskPhase::Ready => (StoragePhase::Published, None),
+        #[cfg(windows)]
+        DiskPhase::Attached { .. } => (StoragePhase::Attached, None),
+        DiskPhase::Replacing { operation } => (StoragePhase::Replacing, Some(operation)),
+        DiskPhase::Retiring { replacement } => (StoragePhase::Retiring, replacement),
+        DiskPhase::Retired => (StoragePhase::Retired, None),
+    };
+    let payload = match open_private_file(destination, PrivateFileAccess::ReadOnly)
+        .and_then(|file| file.metadata())
+    {
+        Ok(metadata) if record.format == DiskFormat::Raw && metadata.len() != record.bytes => {
+            StoragePayload::CapacityMismatch {
+                file_bytes: metadata.len(),
+            }
+        }
+        Ok(metadata) => StoragePayload::Present {
+            file_bytes: metadata.len(),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => StoragePayload::Missing,
+        Err(_) => StoragePayload::Unavailable,
+    };
+    StorageInspection::Current {
+        phase,
+        capacity_bytes: record.bytes,
+        operation_id,
+        payload,
+        format: match record.format {
+            DiskFormat::Raw => StorageFormat::Raw,
+            #[cfg(windows)]
+            DiskFormat::Vhdx => StorageFormat::Vhdx,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DiskFormat {
@@ -32,6 +83,39 @@ struct DiskObject {
     bytes: u64,
     format: DiskFormat,
     phase: DiskPhase,
+}
+
+/// One bounded reader/validator for both storage mutation and observation.
+fn read_record(destination: &Path) -> io::Result<Option<DiskObject>> {
+    let file = match open_private_file(
+        &destination.with_extension("storage.json"),
+        PrivateFileAccess::ReadOnly,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() > 8192 {
+        return Err(invalid("storage object record exceeds its bound"));
+    }
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes)?;
+    if bytes.len() > 8192 {
+        return Err(invalid("storage object record exceeds its bound"));
+    }
+    let record: DiskObject =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("invalid storage ownership record"))?;
+    if record.version != 2
+        || destination.file_name().and_then(|name| name.to_str()) != Some(record.filename.as_str())
+        || record.bytes == 0
+        || record.bytes > MAX_DISK_BYTES
+        || !record.bytes.is_multiple_of(4096)
+    {
+        return Err(invalid(
+            "storage object identity or geometry conflicts with this slot",
+        ));
+    }
+    Ok(Some(record))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,30 +177,11 @@ impl DiskOwner {
             std::fs::TryLockError::Error(error) => error,
         })?;
         let path = destination.with_extension("storage.json");
-        let old = match open_private_file(&path, PrivateFileAccess::ReadOnly) {
-            Ok(file) => {
-                if file.metadata()?.len() > 8192 {
-                    return Err(invalid("storage object record exceeds its bound"));
-                }
-                let mut bytes = Vec::new();
-                file.take(8193).read_to_end(&mut bytes)?;
-                if bytes.len() > 8192 {
-                    return Err(invalid("storage object record exceeds its bound"));
-                }
-                Some(serde_json::from_slice::<DiskObject>(&bytes).map_err(io::Error::other)?)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
+        let old = read_record(destination)?;
         let fresh = old.is_none();
         let record = if let Some(record) = old {
-            if record.version != 2
-                || record.filename != filename
-                || record.bytes == 0
-                || record.bytes > MAX_DISK_BYTES
-                || !record.bytes.is_multiple_of(4096)
-                || creation
-                    .is_some_and(|(bytes, format)| bytes != record.bytes || format != record.format)
+            if creation
+                .is_some_and(|(bytes, format)| bytes != record.bytes || format != record.format)
             {
                 return Err(invalid(
                     "storage object identity or geometry conflicts with this slot",
@@ -737,6 +802,94 @@ mod tests {
             |staged| create_private_file(staged)?.write_all(&vec![2; 4096]),
             |candidate| Ok(fs::read(candidate)? == vec![2; 4096]),
         )
+    }
+
+    #[test]
+    fn inspection_observes_one_owner_without_mutating_or_releasing_its_lease() {
+        use crate::api::{
+            StorageInspection, StoragePayload, StoragePhase, StorageUnavailableReason,
+        };
+        let fixture = Fixture::new();
+        let disk = fixture.0.join("system.ext4");
+        assert_eq!(
+            inspect(&disk),
+            StorageInspection::Unavailable {
+                reason: StorageUnavailableReason::OwnershipMissing
+            }
+        );
+        let mut owner = DiskOwner::open(&disk, Some((4096, DiskFormat::Raw))).unwrap();
+        assert!(matches!(
+            inspect(&disk),
+            StorageInspection::Current {
+                phase: StoragePhase::Preparing,
+                payload: StoragePayload::Missing,
+                ..
+            }
+        ));
+        create_private_file(&disk)
+            .unwrap()
+            .write_all(&vec![1; 4096])
+            .unwrap();
+        owner.set_phase(DiskPhase::Ready).unwrap();
+        let record = fs::read(disk.with_extension("storage.json")).unwrap();
+        assert!(matches!(
+            inspect(&disk),
+            StorageInspection::Current {
+                phase: StoragePhase::Published,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(disk.with_extension("storage.json")).unwrap(),
+            record
+        );
+        assert_eq!(
+            DiskOwner::open(&disk, None).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(owner);
+        fs::remove_file(&disk).unwrap();
+        assert!(matches!(
+            inspect(&disk),
+            StorageInspection::Current {
+                phase: StoragePhase::Published,
+                payload: StoragePayload::Missing,
+                ..
+            }
+        ));
+        assert!(
+            !disk.exists(),
+            "inspection must never reseed missing storage"
+        );
+    }
+
+    #[test]
+    fn inspection_reports_corrupt_ownership_and_partial_raw_payload_without_repair() {
+        use crate::api::{StorageInspection, StoragePayload, StorageUnavailableReason};
+        let fixture = Fixture::new();
+        let disk = fixture.0.join("system.ext4");
+        let mut owner = DiskOwner::open(&disk, Some((4096, DiskFormat::Raw))).unwrap();
+        create_private_file(&disk)
+            .unwrap()
+            .write_all(b"partial")
+            .unwrap();
+        owner.set_phase(DiskPhase::Ready).unwrap();
+        assert!(matches!(
+            inspect(&disk),
+            StorageInspection::Current {
+                payload: StoragePayload::CapacityMismatch { file_bytes: 7 },
+                ..
+            }
+        ));
+        drop(owner);
+        fs::write(disk.with_extension("storage.json"), b"invalid").unwrap();
+        assert_eq!(
+            inspect(&disk),
+            StorageInspection::Unavailable {
+                reason: StorageUnavailableReason::OwnershipInvalid
+            }
+        );
+        assert_eq!(fs::read(disk).unwrap(), b"partial");
     }
 
     #[test]

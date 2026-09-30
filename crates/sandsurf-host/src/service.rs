@@ -2356,6 +2356,8 @@ impl HostService {
     }
 
     fn view(&mut self, record: MachineRecord) -> Result<MachineView> {
+        let storage =
+            crate::storage::inspect(&self.machine_root(&record.id).join("disks/system.ext4"));
         let (machine, management) = match GuardianClient::new(self.guardian_endpoint(&record.id))
             .inspect(record.id.clone(), None)
         {
@@ -2382,6 +2384,7 @@ impl HostService {
             lifecycle_intent: record.latest_intent,
             machine,
             management,
+            storage,
         })
     }
 

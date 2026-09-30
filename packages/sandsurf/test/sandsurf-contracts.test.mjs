@@ -6,6 +6,61 @@ import { resolve } from "node:path";
 import { before, test } from "node:test";
 import { Artifact, Machine, Execution, ExecutionInterruptedError, Sandsurf, SandsurfHostError } from "../dist/index.js";
 import { createSandsurfGuestPath, createSandsurfGuestCommand, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestRequestMetadata, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfGuestCommand, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
+import { parseExecutionInspection, parseExecutionOutcome, parseExecutionReceipt } from "../dist/execution.js";
+
+function executionRequest(id = "command", stdio = "pipes") {
+  return { machineId: "box", generation: 1, executionId: id, operationId: "spawn-command", argv: ["/bin/sh"], cwd: "/workspace",
+    environment: {}, user: "agent", stdio, terminalSize: stdio === "terminal" ? { columns: 80, rows: 24, pixelWidth: 0, pixelHeight: 0 } : null,
+    activeDeadlineMillis: null, elapsedDeadlineUnixMillis: null, outputBytes: 1024 };
+}
+function completedState() {
+  return { kind: "exited", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64), cleanupDigest: "d".repeat(64),
+    output: { finalCursor: 0, chunks: 0, stdoutBytes: 0, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "a".repeat(64) } };
+}
+function executionReceipt(request = executionRequest()) {
+  const { kind: _kind, ...completion } = completedState();
+  const receipt = { machineId: request.machineId, generation: request.generation, executionId: request.executionId, operationId: request.operationId,
+    requestDigest: "e".repeat(64), ...completion };
+  return { receipt, digest: sandsurfDigest("receipt", receipt) };
+}
+
+test("execution reports expose one validated request, state and lineage model", () => {
+  const request = executionRequest();
+  const value = { request, guestPid: 23, state: completedState(), lineage: null };
+  assert.deepEqual(parseExecutionInspection(value), value);
+  for (const state of [
+    { kind: "running", outcome: { kind: "exit", code: 0 } },
+    { kind: "draining", outcome: { kind: "exit", code: 0 } },
+    { ...completedState(), output: { ...completedState().output, chunks: 1 } },
+    { ...completedState(), outcome: { kind: "exit", code: 0.5 } },
+    { kind: "unknown", evidence: "not-a-digest" },
+    { kind: "healthy" },
+  ]) assert.throws(() => parseExecutionInspection({ ...value, state }), SandsurfHostError);
+  for (const invalid of [
+    { ...value, guestPid: 0x1_0000_0000 }, { ...value, lineage: undefined },
+    { ...value, request: { ...request, generation: 0 } },
+    { ...value, request: { ...request, hostAuthority: "guest-owned" } },
+    { ...value, lineage: { sourceMachineId: "box", sourceGeneration: 1, snapshotId: "snapshot" } },
+  ]) assert.throws(() => parseExecutionInspection(invalid), SandsurfHostError);
+  const restored = { ...value, request: { ...request, generation: 2 }, lineage: { sourceMachineId: "box", sourceGeneration: 1, snapshotId: "snapshot" } };
+  assert.deepEqual(parseExecutionInspection(restored).lineage, restored.lineage);
+  const parsed = parseExecutionInspection(value);
+  request.environment.UNRELATED = "changed-after-parse";
+  assert.equal(parsed.request.environment.UNRELATED, undefined);
+});
+
+test("execution outcomes are closed unions and receipts retain their exact hash-bound bytes", () => {
+  for (const outcome of [{ kind: "exit", code: -1 }, { kind: "signal", signal: 9 }, { kind: "deadline-exceeded" },
+    { kind: "spawn-failed", reason: "a".repeat(64) }, { kind: "interrupted", evidence: "a".repeat(64) }]) {
+    assert.deepEqual(parseExecutionOutcome(outcome), outcome);
+  }
+  for (const outcome of [{ kind: "exit", code: 2147483648 }, { kind: "signal", signal: 0 },
+    { kind: "deadline-exceeded", code: 0 }, { kind: "spawn-failed", reason: "invalid" }]) assert.throws(() => parseExecutionOutcome(outcome), SandsurfHostError);
+  const { receipt, digest } = executionReceipt();
+  assert.deepEqual(parseExecutionReceipt(receipt, digest), receipt);
+  assert.throws(() => parseExecutionReceipt({ ...receipt, outcome: { kind: "exit", code: 1 } }, digest), SandsurfHostError);
+  assert.throws(() => parseExecutionReceipt(receipt, "0".repeat(64)), SandsurfHostError);
+});
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = resolve(root, `target/debug/examples/contract_fixture${process.platform === "win32" ? ".exe" : ""}`);
@@ -205,7 +260,8 @@ function fixtureView(generation = 1) {
     id: "box", imageDigest: "a".repeat(64),
     resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 },
     runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 } },
-    configurationRevision: 99, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
+    configurationRevision: 99, reservation: "held", lifecycleIntent: { machineId: "box", operationId: "create", desired: "running", revision: 99, requestDigest: "a".repeat(64), completion: null }, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
+    storage: { kind: "current", phase: "published", format: "raw", capacityBytes: 1024 ** 3, operationId: null, payload: { kind: "present", fileBytes: 1024 ** 3 } },
     management: { kind: "unavailable", lastKnown: null },
     executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace", entrypoint: [], command: [] },
     lifetime: { expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
@@ -246,7 +302,7 @@ test("authority-changing responses advance cached revisions without inspection",
 
 test("native observations preserve host intent and reject fictitious command attribution", async () => {
   let view = fixtureView();
-  view = { ...view, lifecycleIntent: { desired: "running" }, machine: { kind: "current", value: { ...view.machine.value, state: "stopped", sequence: 2, cause: { kind: "native" } } } };
+  view = { ...view, lifecycleIntent: { ...view.lifecycleIntent, desired: "running" }, machine: { kind: "current", value: { ...view.machine.value, state: "stopped", sequence: 2, cause: { kind: "native" } } } };
   const machine = fixtureMachine(async () => ({ kind: "machine", value: view }));
   const measured = await machine.inspect();
   assert.equal(measured.machine.value.state, "stopped");
@@ -376,7 +432,7 @@ test("ordinary command and file queries use cached generations without grants or
   const requests = [];
   const machine = fixtureMachine(async (request) => {
     requests.push(request);
-    if (request.kind === "guest") return { kind: "guest", response: { kind: "file", response: { kind: "stat" } } };
+    if (request.kind === "guest") return { kind: "guest", response: { kind: "file", response: { kind: "stat", value: { kind: "regular", size: 10, readonly: false, modifiedMillis: null, mode: 0o100644, device: 1, inode: 2 } } } };
     if (request.kind === "dispatch-guest") return { kind: "dispatch", operation: { delivery: "applied" } };
     throw new Error(`unexpected round trip: ${request.kind}`);
   });
@@ -392,6 +448,130 @@ test("ordinary command and file queries use cached generations without grants or
   }
   assert.deepEqual(requests[0].request.request.environment, {});
   for (const legacy of ["request", "hostRequest", "guest", "workload"]) assert.equal(legacy in machine, false);
+});
+
+test("filesystem handles return typed byte-preserving observations and reject malformed metadata", async () => {
+  const metadata = { kind: "regular", size: 2, readonly: false, modifiedMillis: null, mode: 0o100644, device: 1, inode: 2 };
+  let response = { kind: "stat", value: metadata };
+  const machine = fixtureMachine(async () => ({ kind: "guest", response: { kind: "file", response } }));
+  assert.deepEqual(await machine.fs.stat("/file"), metadata);
+  response = { kind: "list", page: { entries: [{ name: [255, 97], stat: metadata }], next: [255, 97] } };
+  const page = await machine.fs.list("/");
+  assert.deepEqual(page.entries[0].name, Uint8Array.of(255, 97));
+  assert.deepEqual(page.next, Uint8Array.of(255, 97));
+  for (const name of [[0], [47], [256], [46], [46, 46]]) {
+    response = { kind: "list", page: { entries: [{ name, stat: metadata }], next: null } };
+    await assert.rejects(machine.fs.list("/"), (error) => error.category === "protocol");
+  }
+  for (const value of [{ ...metadata, readonly: "false" }, { ...metadata, inode: -1 }, { ...metadata, forged: true }]) {
+    response = { kind: "stat", value };
+    await assert.rejects(machine.fs.stat("/file"), (error) => error.category === "protocol");
+  }
+});
+
+test("file range observations validate credit and complete coverage before returning bytes", async () => {
+  let range = { offset: 1, bytes: [255], eof: true, observation: { size: 2, token: "a".repeat(64) } };
+  const machine = fixtureMachine(async () => ({ kind: "guest", response: { kind: "file", response: { kind: "read", range } } }));
+  assert.deepEqual((await machine.fs.read("/file", { offset: 1, maximum: 1 })).bytes, Uint8Array.of(255));
+  for (const invalid of [{ ...range, offset: 0 }, { ...range, bytes: [256] }, { ...range, bytes: [1, 2] }, { ...range, eof: false }]) {
+    range = invalid;
+    await assert.rejects(machine.fs.read("/file", { offset: 1, maximum: 1 }), (error) => error.category === "protocol");
+  }
+});
+
+test("filesystem acknowledgements, pagination and symlink bytes are validated before success", async () => {
+  let response = { kind: "link", target: [46, 46, 47, 255] };
+  const machine = fixtureMachine(async (request) => {
+    if (request.kind === "dispatch-guest") return { kind: "dispatch", operation: { delivery: "applied", admission: { request: { requestDigest: "a".repeat(64) } } } };
+    return { kind: "guest", response: { kind: "file", response } };
+  });
+  assert.deepEqual(await machine.fs.readlink("/link"), Uint8Array.of(46, 46, 47, 255));
+  for (const target of [[], [0], [-1], [256], [1.5]]) {
+    response = { kind: "link", target };
+    await assert.rejects(machine.fs.readlink("/link"), (error) => error.category === "protocol");
+  }
+  response = { kind: "stat", value: {} };
+  await assert.rejects(machine.fs.mkdir("/new"), (error) => error.category === "protocol");
+  response = { kind: "complete", extra: true };
+  await assert.rejects(machine.fs.mkdir("/new"), (error) => error.category === "protocol");
+  response = { kind: "complete" };
+  await machine.fs.mkdir("/new");
+  await assert.rejects(machine.fs.symlink("/link", Uint8Array.of(0)), TypeError);
+  const stat = { kind: "regular", size: 1, readonly: false, modifiedMillis: null, mode: 0o100644, device: 1, inode: 2 };
+  for (const page of [
+    { entries: [{ name: [98], stat }, { name: [97], stat }], next: null },
+    { entries: [{ name: [97], stat }, { name: [97], stat }], next: null },
+    { entries: [{ name: [97], stat }], next: [98] },
+    { entries: [], next: [97] },
+  ]) {
+    response = { kind: "list", page };
+    await assert.rejects(machine.fs.list("/"), (error) => error.category === "protocol");
+  }
+  response = { kind: "list", page: { entries: [{ name: [97], stat }], next: null } };
+  await assert.rejects(machine.fs.list("/", { after: Uint8Array.of(98) }), (error) => error.category === "protocol");
+});
+
+test("watcher polling keeps its admitted generation and validates guest event identity", async () => {
+  const requests = [];
+  const view = fixtureView(2);
+  let event = { watcherId: "watcher", generation: 1, sequence: 1, kind: "overflow", path: null };
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    if (request.kind === "get-machine") return { kind: "machine", value: view };
+    if (request.kind === "dispatch-guest") return { kind: "dispatch", operation: { delivery: "applied", admission: { request: { requestDigest: "a".repeat(64) } } } };
+    if (request.request.kind === "operation") return { kind: "guest", response: { kind: "file", response: { kind: "complete" } } };
+    return { kind: "guest", response: { kind: "file", response: { kind: "watch", page: { events: [event], cursor: event.sequence } } } };
+  });
+  const watcher = await machine.fs.watch("/", { watcherId: "watcher" });
+  await machine.inspect();
+  assert.equal((await watcher.poll())[0].kind, "overflow");
+  assert.equal(requests.at(-1).generation, 1, "a watcher cannot adopt the new cached generation");
+  for (const invalid of [{ ...event, watcherId: "other" }, { ...event, generation: 2 }, { ...event, sequence: 0 }, { ...event, path: [47] }]) {
+    event = invalid;
+    await assert.rejects(watcher.poll(), (error) => error.category === "protocol");
+  }
+});
+
+test("watcher cursors survive lost responses and SDK reconnection without claiming authority", async () => {
+  const requests = [];
+  let loseResponse = true;
+  let invalidCursor = false;
+  let invalidGap = false;
+  const machine = fixtureMachine(async (request) => {
+    requests.push(request);
+    assert.equal(request.generation, 1);
+    const after = request.request.request.after;
+    if (loseResponse) { loseResponse = false; throw new Error("response lost"); }
+    const events = after === 0 ? [{ watcherId: "watcher", generation: 1, sequence: invalidGap ? 2 : 1, kind: "created", path: [47, 120] }] : [];
+    return { kind: "guest", response: { kind: "file", response: { kind: "watch", page: { events, cursor: invalidCursor ? 9 : (events.at(-1)?.sequence ?? after) } } } };
+  });
+  const watcher = machine.fs.attachWatcher({ id: "watcher", generation: 1, cursor: 0 });
+  await assert.rejects(watcher.poll(), /response lost/);
+  assert.equal(watcher.identity.cursor, 0);
+  assert.equal((await watcher.poll()).length, 1);
+  assert.deepEqual(requests.slice(0, 2).map((request) => request.request.request.after), [0, 0]);
+  const reconnected = machine.fs.attachWatcher(watcher.identity);
+  assert.deepEqual(await reconnected.poll(), []);
+  assert.equal(requests.at(-1).request.request.after, 1);
+  invalidCursor = true;
+  await assert.rejects(reconnected.poll(), (error) => error.category === "protocol");
+  assert.equal(reconnected.identity.cursor, 1);
+  invalidCursor = false; invalidGap = true;
+  await assert.rejects(machine.fs.attachWatcher({ id: "watcher", generation: 1, cursor: 0 }).poll(), (error) => error.category === "protocol");
+});
+
+test("storage inspection does not collapse unavailable native power into missing storage", async () => {
+  const view = { ...fixtureView(), machine: { kind: "unavailable", lastKnown: null }, management: { kind: "unavailable", lastKnown: null } };
+  const machine = fixtureMachine(async () => ({ kind: "machine", value: view }));
+  assert.equal((await machine.inspect()).storage.phase, "published");
+  view.storage = { kind: "current", phase: "published", format: "raw", capacityBytes: 4096, operationId: null, payload: { kind: "capacity-mismatch", fileBytes: 7 } };
+  assert.equal((await machine.inspect()).storage.payload.kind, "capacity-mismatch");
+  view.storage = { kind: "unavailable", reason: "ownership-invalid" };
+  assert.equal((await machine.inspect()).storage.reason, "ownership-invalid");
+  for (const invalid of [{ kind: "current", phase: "healthy" }, { kind: "unavailable", reason: "guest-fs-corrupt" }, { kind: "unavailable", reason: "ownership-missing", forged: true }]) {
+    view.storage = invalid;
+    await assert.rejects(machine.inspect(), (error) => error.category === "protocol");
+  }
 });
 
 test("output segment handles reconnect directly and validate their immutable capture metadata", async () => {
@@ -427,7 +607,7 @@ test("filesystem directory views preserve Linux resolution and never expand auth
     assert.equal(request.kind, "guest");
     assert.equal(request.generation, 1);
     paths.push(Buffer.from(request.request.request.path));
-    return { kind: "guest", response: { kind: "file", response: { kind: "stat" } } };
+    return { kind: "guest", response: { kind: "file", response: { kind: "stat", value: { kind: "regular", size: 10, readonly: false, modifiedMillis: null, mode: 0o100644, device: 1, inode: 2 } } } };
   });
   await machine.fs.at("/home/agent").stat("linked/../file");
   await machine.fs.at("/home/agent").at("project").stat("./file");
@@ -483,7 +663,10 @@ test("streamed writes have chunk-boundary-independent identities and preserve am
       }
       if (request.kind === "guest") {
         if (failChunk && operations.at(-1)?.request.request.kind === "write-chunk") throw new SandsurfHostError("transport", "ambiguous delivery");
-        return { kind: "guest", response: { kind: "file", response: { kind: "complete" } } };
+        const response = operations.at(-1)?.request.request.kind === "commit-write"
+          ? { kind: "written", revision: { size: bytes.byteLength, digest: expectedDigest } }
+          : { kind: "complete" };
+        return { kind: "guest", response: { kind: "file", response } };
       }
       throw new Error(`unexpected request: ${request.kind}`);
     });
@@ -500,8 +683,7 @@ test("streamed writes have chunk-boundary-independent identities and preserve am
 });
 
 test("leader exit and output capture are independent boundaries", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "command" };
-  const output = { finalCursor: 0, finalHash: "a".repeat(64) };
+  const request = executionRequest();
   let captured = false;
   let receiptPublished = false;
   const machine = fixtureMachine(async (query) => {
@@ -509,13 +691,13 @@ test("leader exit and output capture are independent boundaries", async () => {
       assert.equal(query.after, 0, "wait performed an RPC poll");
       return eventPage(0, [{ kind: "machine", observation: fixtureView().machine.value }]);
     }
-    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 } } } } } } };
-    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: receiptPublished ? { ...request, output } : null, digest: receiptPublished ? "b".repeat(64) : null } };
+    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64) } } } } } };
+    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(receiptPublished ? executionReceipt() : { receipt: null, digest: null }) } };
     throw new Error(`unexpected request: ${query.kind}`);
   }, 1, undefined, async function* (_id, after) {
     assert.equal(after, 1);
     captured = true;
-    yield eventPage(1, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } }]);
+    yield eventPage(1, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: completedState() } }]);
     receiptPublished = true;
     yield eventPage(2, [{ kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) }]);
   });
@@ -526,8 +708,7 @@ test("leader exit and output capture are independent boundaries", async () => {
 });
 
 test("waiting through unavailable management does not invent termination or replay admission", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "command" };
-  const output = { finalCursor: 0, finalHash: "a".repeat(64) };
+  const request = executionRequest();
   let pages = 0;
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") {
@@ -535,13 +716,13 @@ test("waiting through unavailable management does not invent termination or repl
       assert.equal(pages, 1, "wait performed an RPC poll");
       return eventPage(0, []);
     }
-    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: pages >= 3 ? { ...request, output } : null, digest: pages >= 3 ? "b".repeat(64) : null } };
+    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(pages >= 3 ? executionReceipt() : { receipt: null, digest: null }) } };
     assert.equal(query.kind, "get-process");
     return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
   }, 1, undefined, async function* (_id, after) {
     assert.equal(after, 0);
     pages++;
-    yield eventPage(0, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } }]);
+    yield eventPage(0, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: completedState() } }]);
     pages++;
     yield eventPage(1, [{ kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) }]);
   });
@@ -549,7 +730,7 @@ test("waiting through unavailable management does not invent termination or repl
 });
 
 test("durable spawn reservations reconnect before the first guest observation", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "terminal", stdio: "terminal" };
+  const request = executionRequest("terminal", "terminal");
   const machine = fixtureMachine(async (query) => {
     assert.equal(query.kind, "get-process");
     return { kind: "runtime", response: { kind: "process", request, process: { executionId: "terminal", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
@@ -561,7 +742,7 @@ test("durable spawn reservations reconnect before the first guest observation", 
 });
 
 test("native interruption wakes execution waits without inventing guest exit or capture", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const request = executionRequest();
   const lastKnown = { request, guestPid: 23, lineage: null, state: { kind: "running" } };
   const stopped = { ...fixtureView().machine.value, sequence: 2, state: "stopped", cause: { kind: "native" } };
   let interrupted = false;
@@ -586,14 +767,13 @@ test("native interruption wakes execution waits without inventing guest exit or 
 });
 
 test("native interruption preserves reported leader exit but never substitutes for a capture receipt", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const request = executionRequest();
   const stopped = { ...fixtureView().machine.value, sequence: 2, state: "stopped", cause: { kind: "native" } };
-  const output = { finalCursor: 0, finalHash: "a".repeat(64) };
-  let state = { kind: "draining", outcome: { kind: "exit", code: 0 } };
+  let state = { kind: "draining", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64) };
   let captured = false;
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") return eventPage(0, []);
-    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: captured ? { ...request, output } : null, digest: captured ? "b".repeat(64) : null } };
+    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(captured ? executionReceipt() : { receipt: null, digest: null }) } };
     assert.equal(query.kind, "get-process");
     return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: stopped,
       report: { kind: "unavailable", lastKnown: { request, guestPid: 23, lineage: null, state } } } } };
@@ -601,14 +781,14 @@ test("native interruption preserves reported leader exit but never substitutes f
   const execution = new Execution(machine, "command", 1);
   assert.equal((await execution.waitLeader()).state.kind, "draining");
   await assert.rejects(execution.waitCapture(), ExecutionInterruptedError);
-  state = { kind: "exited", output };
+  state = completedState();
   await assert.rejects(execution.waitCapture(), ExecutionInterruptedError);
   captured = true;
   assert.equal((await execution.waitCapture()).state.kind, "exited");
 });
 
 test("restored execution reservations require reattachment rather than rebinding an old handle", async () => {
-  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const request = executionRequest();
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") return eventPage(0, []);
     assert.equal(query.kind, "get-process");

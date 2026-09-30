@@ -246,8 +246,9 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         Ok(())
     }
 
-    /// Finish a capture without silently resuming a publicly paused machine.
-    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), Digest> {
+    /// Retire capture bookkeeping without changing observed native power. Also
+    /// valid when preparation never paused or a lost resume already applied.
+    pub fn finish_capture_without_resume(&mut self) -> Result<(), Digest> {
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;

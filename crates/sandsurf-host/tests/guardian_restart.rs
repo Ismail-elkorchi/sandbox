@@ -403,6 +403,36 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn retire_restore_intent(&mut self) -> sandsurf_host::guardian::Result<()> {
+        let path = self
+            .path
+            .parent()
+            .unwrap()
+            .join("restore-integration-fails");
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+    fn rebind_restored_runtime(
+        &mut self,
+        _journal: &mut RuntimeJournal,
+        _generation: Counter,
+    ) -> sandsurf_host::guardian::Result<()> {
+        if self
+            .path
+            .parent()
+            .unwrap()
+            .join("restore-integration-fails")
+            .exists()
+        {
+            return Err(sandsurf_host::guardian::Error::Protocol(
+                "injected execution integration failure",
+            ));
+        }
+        Ok(())
+    }
     fn resource_usage(&mut self) -> sandsurf_host::guardian::Result<ResourceUsage> {
         Ok(ResourceUsage::host_observation(
             "fixture-native-usage",
@@ -465,7 +495,15 @@ impl GuardianEffect for FileEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> LifecycleEffect {
-        let generation = current.map_or(Counter::ONE, |value| value.generation);
+        let restored = command.desired == DesiredState::Running
+            && current.is_some_and(|value| value.state == MachineState::Suspended);
+        let generation = current.map_or(Counter::ONE, |value| {
+            if restored {
+                value.generation.next().unwrap()
+            } else {
+                value.generation
+            }
+        });
         let transition = |state| MachineTransition {
             generation,
             state,
@@ -482,6 +520,10 @@ impl GuardianEffect for FileEffect {
                     transition(MachineState::Running),
                 ]
             }
+            DesiredState::Running if restored => vec![
+                transition(MachineState::Restoring),
+                transition(MachineState::Running),
+            ],
             DesiredState::Running => vec![transition(MachineState::Running)],
             DesiredState::Paused => vec![transition(MachineState::Paused)],
             DesiredState::Stopped => vec![transition(MachineState::Stopped)],
@@ -498,6 +540,111 @@ impl GuardianEffect for FileEffect {
         .unwrap();
         LifecycleEffect::Observed(states)
     }
+}
+
+#[test]
+fn failed_execution_integration_cannot_hide_committed_native_resume() {
+    let mut fixture = Fixture::new();
+    let path = fixture.root.0.join("runtime");
+    let runtime = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    fs::write(fixture.root.0.join("restore-integration-fails"), []).unwrap();
+    let mut guardian = Guardian::new(
+        runtime,
+        FileEffect {
+            path: fixture.root.0.join("effects"),
+        },
+    );
+    for (name, desired, revision) in [
+        ("suspend", DesiredState::Suspended, 2),
+        ("restore", DesiredState::Running, 3),
+    ] {
+        let id: OperationId = name.try_into().unwrap();
+        let request_digest = digest(
+            Domain::Operation,
+            &(&fixture.machine, &id, n(revision), desired),
+        )
+        .unwrap();
+        fixture
+            .host
+            .request_lifecycle(
+                &fixture.machine,
+                id.clone(),
+                n(revision),
+                desired,
+                Approval {
+                    id: format!("approve-{name}").try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        let authorization = fixture.host.authorize_lifecycle(&id).unwrap();
+        let response = guardian.handle(GuardianRequest::Transition { authorization });
+        let GuardianResponse::Lifecycle { operation } = response else {
+            panic!("{response:?}");
+        };
+        assert_eq!(operation.delivery, Delivery::Applied);
+    }
+    let response = guardian.handle(GuardianRequest::Inspect {
+        machine_id: fixture.machine.clone(),
+        operation_id: None,
+    });
+    let GuardianResponse::Inspection { value } = response else {
+        panic!("{response:?}");
+    };
+    assert!(
+        matches!(value.observation, Observation::Current { value: MachineObservation {
+        state: MachineState::Running, generation, ..
+    }} if generation == n(2))
+    );
+    assert!(fixture.root.0.join("restore-integration-fails").exists());
+    let id: OperationId = "stop-restored".try_into().unwrap();
+    let desired = DesiredState::Stopped;
+    let request_digest =
+        digest(Domain::Operation, &(&fixture.machine, &id, n(4), desired)).unwrap();
+    fixture
+        .host
+        .request_lifecycle(
+            &fixture.machine,
+            id.clone(),
+            n(4),
+            desired,
+            Approval {
+                id: "approve-stop-restored".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    let authorization = fixture.host.authorize_lifecycle(&id).unwrap();
+    assert!(
+        matches!(guardian.handle(GuardianRequest::Transition { authorization }), GuardianResponse::Lifecycle { operation } if operation.delivery == Delivery::Applied)
+    );
+    assert!(matches!(
+        guardian.handle(GuardianRequest::Inspect {
+            machine_id: fixture.machine.clone(),
+            operation_id: None
+        }),
+        GuardianResponse::Inspection { .. }
+    ));
+    assert!(!fixture.root.0.join("restore-integration-fails").exists());
+    drop(guardian);
+    let reopened = RuntimeJournal::open(&path, &fixture.machine).unwrap();
+    assert_eq!(
+        reopened
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .generation,
+        n(2)
+    );
+    assert_eq!(
+        reopened
+            .lifecycle_operation(&"restore".try_into().unwrap())
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Applied
+    );
 }
 
 #[test]

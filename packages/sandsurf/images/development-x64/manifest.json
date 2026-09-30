@@ -10,9 +10,9 @@
     },
     "guestAgent": {
       "version": "0.1.0",
-      "protocolMajor": 4,
+      "protocolMajor": 5,
       "protocolMinor": 0,
-      "sha256": "c8ce04ad11cbd6a71813057e0b19a02fed6cb45637daa44ab37dc673af0533c7"
+      "sha256": "1b106eddf4e34979b5dd609a9a424a13280eb40ca362bc83b6d53d58da011a45"
     },
     "capabilities": {
       "overlayfs": true,
@@ -25,7 +25,7 @@
   "system": {
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "fab963fd27c1994daa61063efd1c0bc64f3bafeb161748b5815fbc9e8d2aa378",
+      "sha256": "05cc28cfd337810e41fa9fb83b687bfa85c04209b4d079183a63eb5c89058695",
       "format": "ext4"
     },
     "defaults": {
@@ -37,13 +37,13 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "420179eec052f25a2982a59829f4a4b39d92685b9b97ad2704380e9da11de881",
+      "sourceDigest": "593d9daf27731fee98c01b927e2c35fcdbe91d0146874ba255e0a07719fca3c0",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
         "alpine-packages": "ccccec8ae4a7bb3800e23509667a979a37de313afa9a71f87f20157ff1b8d6b3",
         "sandsurf-ext4-builder": "c61fcdaca884504956298f21b2a8164567a451872a05d40c7a778af5a530efec",
-        "sandsurf-system-recipe": "f69702bd34e57948fc20f32f20fddfff5c9b872de3635d666f775ef090f41ad9",
-        "sandsurf-management": "c8ce04ad11cbd6a71813057e0b19a02fed6cb45637daa44ab37dc673af0533c7"
+        "sandsurf-system-recipe": "48fb8d08009fb881919f65104c5d4e9f0827451fc84eef839a353eb174aa9d0a",
+        "sandsurf-management": "1b106eddf4e34979b5dd609a9a424a13280eb40ca362bc83b6d53d58da011a45"
       }
     }
   },
@@ -55,7 +55,7 @@
       },
       "system": {
         "path": "system.vhdx",
-        "sha256": "bfbb4c66f2a36a7f9035906ba403a929bda2796a97e8c35bea7e14360309e7bf"
+        "sha256": "2b95b87ea1d2f27c8c9ee0459778016d18a283326dc0c5f3f5a4d1ecfeff41e4"
       }
     }
   },

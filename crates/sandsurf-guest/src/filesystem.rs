@@ -3,8 +3,9 @@ use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt}
 use sandsurf_protocol::{
     Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind, FileRange,
     FileReadObservation, FileRevision, FileStat, FileTransfer, GuestPath, OperationId, WatchEvent,
-    WatchEventKind, WatcherId,
+    WatchEventKind, WatchPage, WatcherId,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -23,6 +24,8 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_PAGE_ENTRIES: usize = 4096;
 const MAX_WATCHERS: usize = 1024;
 const MAX_WATCH_EVENTS: usize = 4096;
+const MAX_WATCH_RECORD_BYTES: usize = sandsurf_protocol::MAX_CONTROL_BYTES / 2;
+const MAX_RETAINED_WATCH_EVENTS: usize = 512;
 
 #[derive(Debug)]
 pub enum FilesystemError {
@@ -68,26 +71,168 @@ struct WatchFingerprint {
     modified_nanos: i128,
 }
 
-struct Watcher {
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WatchRecord {
+    version: u16,
+    id: WatcherId,
     generation: Counter,
     root: GuestPath,
     recursive: bool,
     sequence: Counter,
-    snapshot: BTreeMap<Vec<u8>, WatchFingerprint>,
+    closed: bool,
+    events: Vec<WatchEvent>,
+}
+
+struct Watcher {
+    record: WatchRecord,
+    // A missing baseline means observation was interrupted, not that the VM
+    // stopped. The first new sample durably records an explicit overflow.
+    snapshot: Option<BTreeMap<Vec<u8>, WatchFingerprint>>,
+}
+
+struct WatchJournalLease(cap_std::fs::File);
+impl Drop for WatchJournalLease {
+    fn drop(&mut self) {
+        // This owns a journal writer, not a VM attachment. Fork children never
+        // write it. End logical ownership on an orderly service close even if
+        // an unrelated child temporarily inherited its descriptor before exec.
+        // Crash release still depends on final OS handle closure.
+        // SAFETY: this is the exclusively held regular-file descriptor.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 pub struct FilesystemService {
     writes: Mutex<()>,
     watchers: Mutex<BTreeMap<WatcherId, Watcher>>,
+    watcher_root: Dir,
+    _watcher_lease: WatchJournalLease,
 }
 
 impl FilesystemService {
     /// The guest administrator's Linux filesystem, not a scoped workload capability.
-    pub fn new() -> Self {
-        Self {
-            writes: Mutex::new(()),
-            watchers: Mutex::new(BTreeMap::new()),
+    pub fn open(watcher_root: &Path) -> Result<Self, FilesystemError> {
+        if !watcher_root.is_absolute() {
+            return Err(FilesystemError::Invalid(
+                "watch journal path must be absolute",
+            ));
         }
+        fs::create_dir_all(watcher_root)?;
+        let directory = Dir::open_ambient_dir(watcher_root, ambient_authority())?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let lease = directory.open_with(".owner", &options)?;
+        if !lease.metadata()?.is_file() {
+            return Err(FilesystemError::Invalid("invalid watch journal lease"));
+        }
+        // SAFETY: the held descriptor is a regular file. Ownership lasts until
+        // this filesystem service drops, independently of polling clients.
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let mut watchers = BTreeMap::new();
+        for entry in directory.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == ".owner" {
+                continue;
+            }
+            if name.as_bytes().starts_with(b".pending-") && name.as_bytes().len() <= 41 {
+                directory.remove_file(&name)?;
+                continue;
+            }
+            if watchers.len() >= MAX_WATCHERS {
+                return Err(FilesystemError::Capacity);
+            }
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            let file = directory.open_with(&name, &options)?;
+            if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_WATCH_RECORD_BYTES as u64
+            {
+                return Err(FilesystemError::Invalid(
+                    "watch journal record is not bounded",
+                ));
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_WATCH_RECORD_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_WATCH_RECORD_BYTES {
+                return Err(FilesystemError::Capacity);
+            }
+            let record: WatchRecord = serde_json::from_slice(&bytes)
+                .map_err(|_| FilesystemError::Invalid("watch journal is corrupt"))?;
+            if record.version != 1
+                || name.as_bytes() != record.id.as_str().as_bytes()
+                || record.generation == Counter::ZERO
+                || record.events.len() > MAX_RETAINED_WATCH_EVENTS
+            {
+                return Err(FilesystemError::Invalid(
+                    "watch journal identity is invalid",
+                ));
+            }
+            let mut sequence = Counter::ZERO;
+            for event in &record.events {
+                if event.watcher_id != record.id
+                    || event.generation != record.generation
+                    || event.sequence <= sequence
+                    || event.sequence > record.sequence
+                    || (event.kind == WatchEventKind::Overflow) != event.path.is_none()
+                {
+                    return Err(FilesystemError::Invalid(
+                        "watch journal event identity is invalid",
+                    ));
+                }
+                sequence = event.sequence;
+            }
+            watchers.insert(
+                record.id.clone(),
+                Watcher {
+                    record,
+                    snapshot: None,
+                },
+            );
+        }
+        Ok(Self {
+            writes: Mutex::new(()),
+            watchers: Mutex::new(watchers),
+            watcher_root: directory,
+            _watcher_lease: WatchJournalLease(lease),
+        })
+    }
+
+    fn publish_watcher(&self, record: &WatchRecord) -> Result<(), FilesystemError> {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|_| FilesystemError::Invalid("watch record encoding failed"))?;
+        if bytes.len() > MAX_WATCH_RECORD_BYTES {
+            return Err(FilesystemError::Capacity);
+        }
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|_| FilesystemError::Unavailable)?;
+        let staged = format!(".pending-{:x}", u128::from_le_bytes(nonce));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let publication = (|| -> Result<(), FilesystemError> {
+            let mut file = self.watcher_root.open_with(&staged, &options)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            self.watcher_root
+                .rename(&staged, &self.watcher_root, record.id.as_str())?;
+            sync_cap_directory(&self.watcher_root)?;
+            Ok(())
+        })();
+        if publication.is_err() {
+            let _ = self.watcher_root.remove_file(&staged);
+        }
+        publication
     }
 
     pub fn stat(&self, guest_path: &str) -> Result<FileStat, FilesystemError> {
@@ -568,26 +713,47 @@ impl FilesystemService {
                 "watcher generation must be positive",
             ));
         }
-        let relative = linux_path(&guest_path);
-        let snapshot = scan_watch(&relative, &guest_path, recursive)?;
         let mut watchers = self
             .watchers
             .lock()
             .map_err(|_| FilesystemError::Unavailable)?;
+        if let Some(watcher) = watchers.get(&watcher_id) {
+            return if !watcher.record.closed
+                && watcher.record.generation == generation
+                && watcher.record.root == guest_path
+                && watcher.record.recursive == recursive
+            {
+                Ok(())
+            } else {
+                Err(FilesystemError::Conflict)
+            };
+        }
         if watchers.len() >= MAX_WATCHERS {
             return Err(FilesystemError::Capacity);
         }
-        if watchers.contains_key(&watcher_id) {
-            return Err(FilesystemError::Conflict);
-        }
+        let available = MAX_DIRECTORY_ENTRIES.saturating_sub(
+            watchers
+                .values()
+                .map(|watcher| watcher.snapshot.as_ref().map_or(0, BTreeMap::len))
+                .sum::<usize>(),
+        );
+        let snapshot = scan_watch(&linux_path(&guest_path), &guest_path, recursive, available)?;
+        let record = WatchRecord {
+            version: 1,
+            id: watcher_id.clone(),
+            generation,
+            root: guest_path,
+            recursive,
+            sequence: Counter::ZERO,
+            closed: false,
+            events: Vec::new(),
+        };
+        self.publish_watcher(&record)?;
         watchers.insert(
             watcher_id,
             Watcher {
-                generation,
-                root: guest_path,
-                recursive,
-                sequence: Counter::ZERO,
-                snapshot,
+                record,
+                snapshot: Some(snapshot),
             },
         );
         Ok(())
@@ -597,8 +763,9 @@ impl FilesystemService {
         &self,
         watcher_id: &WatcherId,
         generation: Counter,
+        after: Counter,
         maximum: usize,
-    ) -> Result<Vec<WatchEvent>, FilesystemError> {
+    ) -> Result<WatchPage, FilesystemError> {
         if maximum == 0 || maximum > MAX_WATCH_EVENTS {
             return Err(FilesystemError::Invalid(
                 "watch event bound must be 1..4096",
@@ -608,64 +775,95 @@ impl FilesystemService {
             .watchers
             .lock()
             .map_err(|_| FilesystemError::Unavailable)?;
+        let other_entries: usize = watchers
+            .iter()
+            .filter(|(id, _)| *id != watcher_id)
+            .map(|(_, watcher)| watcher.snapshot.as_ref().map_or(0, BTreeMap::len))
+            .sum();
         let watcher = watchers
             .get_mut(watcher_id)
             .ok_or(FilesystemError::Invalid("watcher does not exist"))?;
-        if watcher.generation != generation {
+        if watcher.record.generation != generation
+            || watcher.record.closed
+            || after > watcher.record.sequence
+        {
             return Err(FilesystemError::Conflict);
         }
-        let relative = linux_path(&watcher.root);
-        let current = scan_watch(&relative, &watcher.root, watcher.recursive)?;
-        let keys: BTreeSet<_> = watcher
-            .snapshot
-            .keys()
-            .chain(current.keys())
-            .cloned()
-            .collect();
+        let relative = linux_path(&watcher.record.root);
+        let current = scan_watch(
+            &relative,
+            &watcher.record.root,
+            watcher.record.recursive,
+            MAX_DIRECTORY_ENTRIES.saturating_sub(other_entries),
+        )?;
         let mut changes = Vec::new();
-        for path in keys {
-            let kind = match (watcher.snapshot.get(&path), current.get(&path)) {
-                (None, Some(_)) => Some(WatchEventKind::Created),
-                (Some(_), None) => Some(WatchEventKind::Removed),
-                (Some(before), Some(after)) if before != after => Some(WatchEventKind::Modified),
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                changes.push((kind, path));
+        if let Some(before) = &watcher.snapshot {
+            let keys: BTreeSet<_> = before.keys().chain(current.keys()).cloned().collect();
+            for path in keys {
+                let kind = match (before.get(&path), current.get(&path)) {
+                    (None, Some(_)) => Some(WatchEventKind::Created),
+                    (Some(_), None) => Some(WatchEventKind::Removed),
+                    (Some(before), Some(after)) if before != after => {
+                        Some(WatchEventKind::Modified)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    changes.push((kind, path));
+                    if changes.len() > MAX_RETAINED_WATCH_EVENTS {
+                        break;
+                    }
+                }
             }
         }
-        watcher.snapshot = current;
-        if changes.len() > maximum {
-            watcher.sequence = watcher
-                .sequence
-                .next()
-                .map_err(|_| FilesystemError::Capacity)?;
-            return Ok(vec![WatchEvent {
-                watcher_id: watcher_id.clone(),
-                generation,
-                sequence: watcher.sequence,
-                kind: WatchEventKind::Overflow,
-                path: None,
-            }]);
+        let mut record = watcher.record.clone();
+        if watcher.snapshot.is_none() {
+            push_watch_overflow(&mut record, false)?;
+        } else if changes.len() > MAX_RETAINED_WATCH_EVENTS {
+            push_watch_overflow(&mut record, true)?;
+        } else {
+            for (kind, path) in changes {
+                record.sequence = record
+                    .sequence
+                    .next()
+                    .map_err(|_| FilesystemError::Capacity)?;
+                record.events.push(WatchEvent {
+                    watcher_id: watcher_id.clone(),
+                    generation,
+                    sequence: record.sequence,
+                    kind,
+                    path: Some(
+                        GuestPath::try_from(path)
+                            .map_err(|_| FilesystemError::Invalid("watched path is malformed"))?,
+                    ),
+                });
+            }
         }
-        let mut events = Vec::with_capacity(changes.len());
-        for (kind, path) in changes {
-            watcher.sequence = watcher
-                .sequence
-                .next()
-                .map_err(|_| FilesystemError::Capacity)?;
-            events.push(WatchEvent {
-                watcher_id: watcher_id.clone(),
-                generation,
-                sequence: watcher.sequence,
-                kind,
-                path: Some(
-                    GuestPath::try_from(path)
-                        .map_err(|_| FilesystemError::Invalid("watched path is malformed"))?,
-                ),
-            });
+        if record.events.len() > MAX_RETAINED_WATCH_EVENTS
+            || serde_json::to_vec(&record)
+                .map_err(|_| FilesystemError::Capacity)?
+                .len()
+                > MAX_WATCH_RECORD_BYTES
+        {
+            push_watch_overflow(&mut record, true)?;
         }
-        Ok(events)
+        // Publish before advancing the in-memory baseline or replying. Lost
+        // responses can be retried with the same cursor without consuming data.
+        if record.sequence != watcher.record.sequence {
+            self.publish_watcher(&record)?;
+        }
+        watcher.record = record;
+        watcher.snapshot = Some(current);
+        let events: Vec<_> = watcher
+            .record
+            .events
+            .iter()
+            .filter(|event| event.sequence > after)
+            .take(maximum)
+            .cloned()
+            .collect();
+        let cursor = events.last().map_or(after, |event| event.sequence);
+        Ok(WatchPage { events, cursor })
     }
 
     pub fn unwatch(
@@ -678,20 +876,37 @@ impl FilesystemService {
             .lock()
             .map_err(|_| FilesystemError::Unavailable)?;
         let watcher = watchers
-            .get(watcher_id)
+            .get_mut(watcher_id)
             .ok_or(FilesystemError::Invalid("watcher does not exist"))?;
-        if watcher.generation != generation {
+        if watcher.record.generation != generation {
             return Err(FilesystemError::Conflict);
         }
-        watchers.remove(watcher_id);
+        let mut record = watcher.record.clone();
+        record.closed = true;
+        record.events.clear();
+        self.publish_watcher(&record)?;
+        watcher.record = record;
+        watcher.snapshot = None;
         Ok(())
     }
 }
 
-impl Default for FilesystemService {
-    fn default() -> Self {
-        Self::new()
+fn push_watch_overflow(record: &mut WatchRecord, discard: bool) -> Result<(), FilesystemError> {
+    record.sequence = record
+        .sequence
+        .next()
+        .map_err(|_| FilesystemError::Capacity)?;
+    if discard {
+        record.events.clear();
     }
+    record.events.push(WatchEvent {
+        watcher_id: record.id.clone(),
+        generation: record.generation,
+        sequence: record.sequence,
+        kind: WatchEventKind::Overflow,
+        path: None,
+    });
+    Ok(())
 }
 
 fn linux_path(value: &GuestPath) -> PathBuf {
@@ -702,13 +917,14 @@ fn scan_watch(
     relative: &Path,
     guest_path: &GuestPath,
     recursive: bool,
+    maximum: usize,
 ) -> Result<BTreeMap<Vec<u8>, WatchFingerprint>, FilesystemError> {
     let mut result = BTreeMap::new();
     let mut pending = vec![(relative.to_path_buf(), guest_path.as_bytes().to_vec())];
     while let Some((directory, guest_directory)) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
-            if result.len() >= MAX_DIRECTORY_ENTRIES {
+            if result.len() >= maximum {
                 return Err(FilesystemError::Capacity);
             }
             let name = entry.file_name().as_bytes().to_vec();
@@ -916,7 +1132,8 @@ mod tests {
     #[test]
     fn file_publication_is_conditionally_atomic() {
         let root = Temp::new();
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         service.mkdir(root.path("src").as_str(), true).unwrap();
         service
             .write_file(
@@ -961,7 +1178,8 @@ mod tests {
     #[test]
     fn streamed_write_is_contiguous_digest_bound_and_atomically_published() {
         let root = Temp::new();
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         let bytes = b"streamed-binary\0content";
         let transfer = FileTransfer {
             id: "transfer".try_into().unwrap(),
@@ -990,7 +1208,8 @@ mod tests {
 
     #[test]
     fn relative_and_nul_paths_are_rejected() {
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         for path in ["relative", "/contains\0nul"] {
             assert!(service.lstat(path).is_err());
         }
@@ -1001,7 +1220,8 @@ mod tests {
         let root = Temp::new();
         let outside = Temp::new();
         fs::write(outside.0.join("secret"), b"secret").unwrap();
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         service
             .symlink(outside.0.to_str().unwrap(), root.path("link").as_str())
             .unwrap();
@@ -1024,7 +1244,8 @@ mod tests {
     #[test]
     fn range_reads_are_bounded_and_observe_metadata_changes() {
         let root = Temp::new();
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         let path = root.0.join("sparse");
         let mut file = File::create(&path).unwrap();
         file.set_len(64 * 1024 * 1024 * 1024).unwrap();
@@ -1044,9 +1265,127 @@ mod tests {
     }
 
     #[test]
+    fn watch_pages_replay_after_disconnect_and_report_service_restart() {
+        let root = Temp::new();
+        let ledger = Temp::new();
+        let id: WatcherId = "durable-watch".try_into().unwrap();
+        let path = GuestPath::try_from(root.path("").as_str()).unwrap();
+        let service = FilesystemService::open(&ledger.0).unwrap();
+        assert!(FilesystemService::open(&ledger.0).is_err());
+        service
+            .watch(id.clone(), Counter::ONE, path.clone(), false)
+            .unwrap();
+        fs::write(root.0.join("one"), b"1").unwrap();
+        let first = service
+            .poll_watcher(&id, Counter::ONE, Counter::ZERO, 1)
+            .unwrap();
+        assert_eq!(first.events[0].kind, WatchEventKind::Created);
+        assert_eq!(
+            service
+                .poll_watcher(&id, Counter::ONE, Counter::ZERO, 1)
+                .unwrap(),
+            first
+        );
+        drop(service);
+        fs::write(root.0.join("two"), b"2").unwrap();
+        let service = FilesystemService::open(&ledger.0).unwrap();
+        assert_eq!(
+            service
+                .poll_watcher(&id, Counter::ONE, Counter::ZERO, 1)
+                .unwrap(),
+            first
+        );
+        let gap = service
+            .poll_watcher(&id, Counter::ONE, first.cursor, 1)
+            .unwrap();
+        assert_eq!(gap.events[0].kind, WatchEventKind::Overflow);
+        assert_eq!(gap.cursor, first.cursor.next().unwrap());
+        assert_eq!(
+            service
+                .poll_watcher(&id, Counter::ONE, first.cursor, 1)
+                .unwrap(),
+            gap
+        );
+        assert!(
+            service
+                .poll_watcher(&id, Counter::try_from(2).unwrap(), gap.cursor, 1)
+                .is_err()
+        );
+        assert!(
+            service
+                .poll_watcher(&id, Counter::ONE, gap.cursor.next().unwrap(), 1)
+                .is_err()
+        );
+        service.unwatch(&id, Counter::ONE).unwrap();
+        drop(service);
+        let service = FilesystemService::open(&ledger.0).unwrap();
+        assert!(
+            service
+                .poll_watcher(&id, Counter::ONE, gap.cursor, 1)
+                .is_err()
+        );
+        assert!(service.watch(id, Counter::ONE, path, false).is_err());
+    }
+
+    #[test]
+    fn watch_retention_exhaustion_reports_a_gap_instead_of_silently_losing_pages() {
+        let root = Temp::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
+        let id: WatcherId = "bounded-watch".try_into().unwrap();
+        service
+            .watch(
+                id.clone(),
+                Counter::ONE,
+                GuestPath::try_from(root.path("").as_str()).unwrap(),
+                false,
+            )
+            .unwrap();
+        for index in 0..=MAX_RETAINED_WATCH_EVENTS {
+            fs::write(root.0.join(format!("item-{index}")), b"1").unwrap();
+        }
+        let gap = service
+            .poll_watcher(&id, Counter::ONE, Counter::ZERO, 256)
+            .unwrap();
+        assert_eq!(gap.events.len(), 1);
+        assert_eq!(gap.events[0].kind, WatchEventKind::Overflow);
+        assert_eq!(
+            service
+                .poll_watcher(&id, Counter::ONE, Counter::ZERO, 256)
+                .unwrap(),
+            gap
+        );
+        assert!(
+            fs::metadata(ledger.0.join(id.as_str())).unwrap().len()
+                <= MAX_WATCH_RECORD_BYTES as u64
+        );
+        assert!(
+            service
+                .poll_watcher(&id, Counter::ONE, gap.cursor, 256)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn watch_recovery_rejects_corrupt_and_oversized_guest_records() {
+        let ledger = Temp::new();
+        fs::write(ledger.0.join("corrupt"), b"{}").unwrap();
+        assert!(FilesystemService::open(&ledger.0).is_err());
+        fs::remove_file(ledger.0.join("corrupt")).unwrap();
+        File::create(ledger.0.join("oversized"))
+            .unwrap()
+            .set_len(MAX_WATCH_RECORD_BYTES as u64 + 1)
+            .unwrap();
+        assert!(FilesystemService::open(&ledger.0).is_err());
+    }
+
+    #[test]
     fn byte_paths_ranges_pagination_and_watch_overflow_are_explicit() {
         let root = Temp::new();
-        let service = FilesystemService::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
         let non_utf8 = OsString::from_vec(vec![b'n', 0xff]);
         fs::write(root.0.join(&non_utf8), b"0123456789").unwrap();
         fs::write(root.0.join("z"), b"z").unwrap();
@@ -1081,11 +1420,22 @@ mod tests {
             .unwrap();
         fs::write(root.0.join("new-one"), b"1").unwrap();
         fs::write(root.0.join("new-two"), b"2").unwrap();
-        let events = service.poll_watcher(&watcher, Counter::ONE, 1).unwrap();
+        let page = service
+            .poll_watcher(&watcher, Counter::ONE, Counter::ZERO, 1)
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].kind, WatchEventKind::Created);
+        let events = service
+            .poll_watcher(&watcher, Counter::ONE, page.cursor, 1)
+            .unwrap()
+            .events;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, WatchEventKind::Overflow);
-        assert_eq!(events[0].path, None);
+        assert_eq!(events[0].kind, WatchEventKind::Created);
         service.unwatch(&watcher, Counter::ONE).unwrap();
-        assert!(service.poll_watcher(&watcher, Counter::ONE, 1).is_err());
+        assert!(
+            service
+                .poll_watcher(&watcher, Counter::ONE, Counter::ZERO, 1)
+                .is_err()
+        );
     }
 }

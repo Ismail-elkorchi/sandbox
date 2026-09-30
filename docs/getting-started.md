@@ -137,7 +137,36 @@ The default guest account obtains root through ordinary `sudo`. Root can change 
 
 Use `machine.fs` for guest paths. Artifact import, capture, comparison and host application operate on explicitly selected content. Host publication requires approval of immutable retained content and its destination. Snapshots, forks, rollback, networking, secrets and publication are independent capabilities, not a prescribed workflow.
 
+Filesystem methods return typed guest observations, not wire envelopes: `stat()`
+returns metadata, `list()` returns a bounded page with `Uint8Array` names and
+pagination cursor, and `read(path, { offset, maximum })` returns a validated byte
+range. `writeFile()` and `writeStream()` return the committed size and digest.
+These identify the reported/captured bytes, not an immutable live pathname.
+Watchers retain their admitted generation even when the machine handle observes
+a newer boot or restore; polling never silently rebinds an old watcher. Polling
+uses replayable cursors, so a lost response does not consume its page. Persist
+`watcher.identity` and use `machine.fs.attachWatcher(identity)` after reconnect.
+The guest journal retains bounded observation history; retention exhaustion or
+management-service restart reports `overflow`, requiring a rescan. These are
+sampled directory observations, not a guarantee to observe transient changes
+between polls. Guest root can modify or delete this journal.
+
+Machine inspection reports host storage separately from native power and guest
+management. `storage` describes the ownership phase, declared virtual capacity
+and observed payload availability/length. Missing published bytes, invalid
+ownership and inaccessible payloads are distinct observations. Inspection never
+repairs, recreates or detaches a disk and does not inspect the guest filesystem.
+An attached Windows disk may be unreadable to inspection while its native owner
+holds exclusive custody; that is not evidence of missing storage or native stop.
+
 Terminals are PTY executions with replayable `terminal` output. Detaching or cancelling a wait does not terminate an execution. Leader exit and output completion are separate; descendants may continue to hold streams open.
+
+Execution requests, states, outcomes and restore lineage are typed observations.
+`state.kind` distinguishes `running`, leader-exited `draining`, stream-finalized
+`exited`, and `unknown`; an outcome is a closed exit/signal/deadline/failure union.
+Receipt reads validate their identity, complete output boundary and canonical
+digest before returning, and capture waits require agreement with the completed
+guest report. This validation does not attest to guest-root-controlled behavior.
 
 `execution.inspect()` separates the guest `report` from guardian-owned native
 `interruption` evidence. A confirmed native stop or superseded execution

@@ -98,6 +98,10 @@ pub trait GuardianEffect {
     /// native delivery. A volatile native "paused" flag is not this authority.
     fn capture_owner(&self) -> Result<Option<OperationId>>;
     fn guest_driver(&mut self) -> Box<dyn GuestDriver>;
+    /// Volatile I/O coordination only; this does not decide lifecycle or grants.
+    fn guest_io_admissible(&self) -> bool {
+        true
+    }
     fn guest_poll_allowed(&self) -> bool {
         matches!(self.capture_owner(), Ok(None))
     }
@@ -140,7 +144,12 @@ pub trait GuardianEffect {
         &mut self,
         _journal: &mut RuntimeJournal,
         _generation: Counter,
-    ) -> sandsurf_state::Result<()> {
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Retire admitted integration only after native stop/destruction. This
+    /// cannot be inferred from a missing management connection.
+    fn retire_restore_intent(&mut self) -> Result<()> {
         Ok(())
     }
     fn observe_power(&mut self) -> Result<Option<sandsurf_machine::NativePowerObservation>>;
@@ -226,6 +235,11 @@ impl<E: GuardianEffect> Guardian<E> {
         if self.effect.is_none() {
             return Err(Error::Unsupported(
                 "destroyed machine has no guest transport",
+            ));
+        }
+        if !self.effect.as_ref().unwrap().guest_io_admissible() {
+            return Err(Error::Unsupported(
+                "native capture owns the guest I/O boundary",
             ));
         }
         match request {
@@ -617,6 +631,7 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
                 let reachable = self.refresh_native_observation()?;
+                self.reconcile_execution_integration();
                 let observation = match self.journal.last_observation()? {
                     Some(value) if reachable => Observation::Current {
                         value: value.value().clone(),
@@ -705,7 +720,7 @@ impl<E: GuardianEffect> Guardian<E> {
                                         "native lifecycle returned an invalid observation count",
                                     ));
                                 }
-                                if current
+                                let restored_generation = if current
                                     .as_ref()
                                     .is_some_and(|value| value.state == MachineState::Suspended)
                                     && transitions
@@ -716,9 +731,10 @@ impl<E: GuardianEffect> Guardian<E> {
                                         .last()
                                         .expect("restored transition checked above")
                                         .generation;
-                                    native
-                                        .rebind_restored_runtime(&mut self.journal, generation)?;
-                                }
+                                    Some(generation)
+                                } else {
+                                    None
+                                };
                                 let mut references = Vec::with_capacity(transitions.len());
                                 for transition in transitions {
                                     let sequence = match self.journal.last_observation()? {
@@ -757,13 +773,25 @@ impl<E: GuardianEffect> Guardian<E> {
                                     digest(Domain::Operation, &references).map_err(|_| {
                                         Error::Protocol("lifecycle evidence digest failed")
                                     })?;
-                                self.journal.record_lifecycle_delivery(
+                                let operation = self.journal.record_lifecycle_delivery(
                                     &command.operation_id,
                                     &command.request_digest,
                                     Delivery::Applied,
                                     Some(evidence),
                                     Some(final_observation.reference()?),
-                                )?
+                                )?;
+                                // Native facts and lifecycle delivery have their
+                                // own owner. Execution integration cannot rewind
+                                // them or turn an observed running VM into unknown.
+                                if let Some(generation) = restored_generation
+                                    && let Err(error) = native
+                                        .rebind_restored_runtime(&mut self.journal, generation)
+                                {
+                                    eprintln!(
+                                        "sandsurf restored execution integration pending: {error}"
+                                    );
+                                }
+                                operation
                             }
                             LifecycleEffect::NotApplied(evidence) => {
                                 self.journal.record_lifecycle_delivery(
@@ -1011,6 +1039,38 @@ impl<E: GuardianEffect> Guardian<E> {
             GuardianRequest::SubscribeEvents { .. } => Err(Error::Protocol(
                 "event subscriptions require a streaming connection",
             )),
+        }
+    }
+
+    fn reconcile_execution_integration(&mut self) {
+        let generation = match self.journal.last_observation() {
+            Ok(Some(value)) if value.value().state == MachineState::Running => {
+                value.value().generation
+            }
+            Ok(Some(value))
+                if matches!(
+                    value.value().state,
+                    MachineState::Stopped | MachineState::Destroyed
+                ) =>
+            {
+                if let Some(effect) = self.effect.as_mut()
+                    && let Err(error) = effect.retire_restore_intent()
+                {
+                    eprintln!("sandsurf restore intent retirement pending: {error}");
+                }
+                return;
+            }
+            _ => return,
+        };
+        if !matches!(self.journal.generation_was_restored(generation), Ok(true)) {
+            return;
+        }
+        if let Some(effect) = self.effect.as_mut()
+            && let Err(error) = effect.rebind_restored_runtime(&mut self.journal, generation)
+        {
+            // The admitted restore intent remains durable. Neither failed
+            // integration nor its retry is a new native lifecycle decision.
+            eprintln!("sandsurf restored execution integration pending: {error}");
         }
     }
 
@@ -1734,6 +1794,7 @@ pub fn serve_guardian<E: GuardianEffect>(
             if last_poll.elapsed() >= Duration::from_secs(1) {
                 last_poll = std::time::Instant::now();
                 guardian.refresh_native_observation()?;
+                guardian.reconcile_execution_integration();
                 if !poll_in_flight
                     && let Some(job) = guardian.poll_job()?
                     && guest_jobs

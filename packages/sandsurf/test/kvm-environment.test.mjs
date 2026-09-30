@@ -43,6 +43,10 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assertStorageCustody(storageLease, true);
     context.diagnostic("ordinary Linux boot and administrator access");
     assert.equal((await machine.inspect()).machine.value.state, "running");
+    const storage = (await machine.inspect()).storage;
+    assert.equal(storage.kind, "current");
+    assert.equal(storage.capacityBytes, 256 * 1024 ** 2);
+    assert.equal(storage.payload.kind, "present");
     assert.equal(await run(machine, "id -un"), "agent\n");
     assert.equal(await run(machine, "sudo -n id -u"), "0\n");
     assert.ok(Number(await run(machine, "df -k / | tail -1 | awk '{print $2}'")) >= 240_000, "the root filesystem must cover the reserved 256 MiB disk");
@@ -103,6 +107,15 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       assert.equal((await machine.inspect()).machine.value.state, "running");
     }
 
+    await machine.fs.mkdir("/workspace/watch");
+    const watcher = await machine.fs.watch("/workspace/watch", { watcherId: "directory-events" });
+    const written = await machine.fs.writeFile("/workspace/watch/one", "one");
+    assert.equal(written.size, 3);
+    assert.equal(written.digest, createHash("sha256").update("one").digest("hex"));
+    assert.equal((await machine.fs.stat("/workspace/watch/one")).kind, "regular");
+    assert.equal((await watcher.poll())[0].kind, "created");
+    const watcherIdentity = watcher.identity;
+
     const terminal = await machine.terminals.open({ executionId: "persistent-terminal", argv: ["/bin/sh"] });
     context.diagnostic("persistent PTY and management-service restart");
     await terminal.input.write(Buffer.from("printf terminal-before\n"));
@@ -133,6 +146,14 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.ok(fullManifest.full.executions.some((captured) => captured.admission.executionId === "retained-dense" && captured.output.finalCursor === dense.length));
     assert.equal((await machine.inspect()).machine.value.state, "running");
     assert.equal(machine.generation, capturedGeneration, "capture alone does not create a new execution epoch");
+    await machine.pause();
+    const pausedRevision = machine.revision;
+    await machine.snapshots.create({ id: "computer-publicly-paused", kind: "full" });
+    const pausedCapture = await machine.inspect();
+    assert.equal(pausedCapture.machine.value.state, "paused", "capture must not resume an application-owned pause");
+    assert.equal(pausedCapture.lifecycleIntent.desired, "paused");
+    assert.equal(pausedCapture.configurationRevision, pausedRevision);
+    await machine.resume();
     const identity = machine.id;
     const generation = machine.generation;
     await host.close();
@@ -140,6 +161,14 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     machine = await host.machines.connect(identity);
     execution = await machine.executions.get("retained-dense");
     assert.equal(machine.generation, generation, "SDK reconnect is not a new Linux boot");
+    const reconnectedWatcher = machine.fs.attachWatcher(watcherIdentity);
+    try { await machine.fs.writeFile("/workspace/watch/two", "two"); }
+    catch (error) {
+      try { context.diagnostic(Buffer.from(await machine.fs.readFile("/var/log/sandsurf-management.log", { maximumBytes: 128 * 1024 })).toString()); }
+      catch (diagnosticError) { context.diagnostic(`management diagnostic unavailable: ${diagnosticError.message}`); }
+      throw error;
+    }
+    assert.equal((await reconnectedWatcher.poll())[0].sequence, watcherIdentity.cursor + 1);
     const attached = await machine.terminals.get("persistent-terminal");
     await attached.acquireInput();
     await attached.input.write(Buffer.from("printf terminal-after\n"));
@@ -147,6 +176,10 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await run(machine, "sudo -n sh -c '(sleep 4; rc-service sandsurf-management start) > /var/log/sandsurf-restart-test 2>&1 & rc-service sandsurf-management stop'");
     assert.equal((await (await attached.process.output.seal("pty-management-unavailable")).inspect()).executionId, "persistent-terminal");
     await managementReady(machine);
+    const watcherGap = await reconnectedWatcher.poll();
+    assert.equal(watcherGap.at(-1).kind, "overflow", "a restarted directory observer must report its observation gap");
+    assert.equal(reconnectedWatcher.generation, generation);
+    await reconnectedWatcher.close();
     await attached.input.write(Buffer.from("printf keeper-survived\nexit\n"));
     assert.equal(exitCode(await attached.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
     assert.match((await output(attached.process)).toString(), /terminal-before[\s\S]*terminal-after[\s\S]*keeper-survived/u);

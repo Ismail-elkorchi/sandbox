@@ -1319,6 +1319,15 @@ impl RuntimeJournal {
         raw.map(|raw| decode(&raw)).transpose()
     }
 
+    /// Native resume admission, not inferred from management connectivity or
+    /// merely from a numerically newer cold-boot generation.
+    pub fn generation_was_restored(&self, generation: Counter) -> Result<bool> {
+        Ok(self.db.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM observations WHERE json_extract(value,'$.generation')=?1 AND json_extract(value,'$.state')='restoring' AND json_extract(value,'$.cause.kind')='lifecycle')",
+            [generation.get()], |row| row.get(0),
+        )?)
+    }
+
     pub fn process_request(&self, id: &ExecutionId) -> Result<sandsurf_protocol::SpawnRequest> {
         let operation_id: String = self.db.connection.query_row(
             "SELECT operation FROM processes WHERE id=?1",

@@ -60,7 +60,7 @@ fn ordinary_filesystem_queries_do_not_create_a_parallel_capture_session() {
     .unwrap();
     let service = ManagementService::open(
         processes,
-        FilesystemService::new(),
+        FilesystemService::open(&root.0.join("watchers")).unwrap(),
         &root.0.join("operations"),
     )
     .unwrap();
@@ -105,7 +105,7 @@ fn filesystem_operations_reconcile_exact_identity_without_reapplying() {
     .unwrap();
     let service = ManagementService::open(
         processes,
-        FilesystemService::new(),
+        FilesystemService::open(&root.0.join("watchers")).unwrap(),
         &root.0.join("operations"),
     )
     .unwrap();
@@ -144,7 +144,7 @@ fn filesystem_operations_reconcile_exact_identity_without_reapplying() {
             std::path::Path::new(env!("CARGO_BIN_EXE_sandsurf-guest")),
         )
         .unwrap(),
-        FilesystemService::new(),
+        FilesystemService::open(&root.0.join("watchers")).unwrap(),
         &root.0.join("operations"),
     )
     .unwrap();
@@ -179,7 +179,7 @@ fn process_secrets_are_cleaned_and_revocation_terminates_live_recipients() {
             std::path::Path::new(env!("CARGO_BIN_EXE_sandsurf-guest")),
         )
         .unwrap(),
-        FilesystemService::new(),
+        FilesystemService::open(&root.0.join("watchers")).unwrap(),
         &root.0.join("operations"),
     )
     .unwrap();
