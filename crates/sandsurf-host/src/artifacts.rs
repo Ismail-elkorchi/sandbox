@@ -591,15 +591,7 @@ impl ArtifactStore {
                 return Err(ArtifactError::Conflict("guest file length changed"));
             }
             let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
-            sandsurf_native::storage::sync_file(&output)?;
-            let destination = self.blob_path(&digest);
-            if destination.exists() {
-                verify_blob(&destination, &digest, length)?;
-                fs::remove_file(&temporary)?;
-            } else {
-                fs::rename(&temporary, &destination)?;
-                sync_directory(&self.root.join("blobs"))?;
-            }
+            self.publish_completed_blob(&temporary, output, &digest, length)?;
             Ok(digest)
         })();
         if result.is_err() {
@@ -732,39 +724,62 @@ impl ArtifactStore {
             std::process::id(),
             random_suffix()?
         ));
-        let mut output = private_file(&temporary, true)?;
-        let mut hasher = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
+        let result = (|| {
+            let mut output = private_file(&temporary, true)?;
+            let mut hasher = Sha256::new();
+            let mut copied = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                copied = copied
+                    .checked_add(count as u64)
+                    .filter(|value| *value <= length)
+                    .ok_or(ArtifactError::Conflict("capture file grew while copying"))?;
+                output.write_all(&buffer[..count])?;
+                hasher.update(&buffer[..count]);
             }
-            copied = copied
-                .checked_add(count as u64)
-                .filter(|value| *value <= length)
-                .ok_or(ArtifactError::Conflict("capture file grew while copying"))?;
-            output.write_all(&buffer[..count])?;
-            hasher.update(&buffer[..count]);
-        }
-        if copied != length {
+            if copied != length {
+                return Err(ArtifactError::Conflict(
+                    "capture file length changed while copying",
+                ));
+            }
+            let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
+            self.publish_completed_blob(&temporary, output, &digest, length)?;
+            Ok(digest)
+        })();
+        // The producer is closed before reclaiming any incomplete stage,
+        // including read/write failures and oversized or shortened sources.
+        if result.is_err() {
             let _ = fs::remove_file(&temporary);
-            return Err(ArtifactError::Conflict(
-                "capture file length changed while copying",
-            ));
         }
-        sandsurf_native::storage::sync_file(&output)?;
-        let digest: Digest = format!("{:x}", hasher.finalize()).try_into()?;
-        let destination = self.blob_path(&digest);
-        if destination.exists() {
-            verify_blob(&destination, &digest, length)?;
-            fs::remove_file(&temporary)?;
-        } else {
-            fs::rename(&temporary, &destination)?;
-            sync_directory(&self.root.join("blobs"))?;
+        result
+    }
+
+    fn publish_completed_blob(
+        &self,
+        temporary: &Path,
+        output: File,
+        digest: &Digest,
+        length: u64,
+    ) -> Result<()> {
+        // A protected writer fences rename/delete while producing bytes. End
+        // that ownership before the storage publisher flushes and transfers
+        // the completed object to its immutable content-addressed name.
+        drop(output);
+        let destination = self.blob_path(digest);
+        match sandsurf_native::storage::publish_new_file(temporary, &destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                verify_blob(&destination, digest, length)?;
+                fs::remove_file(temporary)?;
+                sync_directory(&self.root.join("blobs"))?;
+            }
+            Err(error) => return Err(error.into()),
         }
-        Ok(digest)
+        Ok(())
     }
 
     pub fn capture_entries(
@@ -1742,6 +1757,61 @@ mod tests {
             std::env::temp_dir().join(format!("sandsurf-tree-{name}-{}", random_suffix().unwrap()));
         create_private_directory(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn failed_capture_closes_and_reclaims_every_unpublished_stage() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("source disconnected"))
+            }
+        }
+        let state = temporary("failed-blobs");
+        let store = ArtifactStore::open(&state).unwrap();
+        assert!(store.publish_blob(&mut FailedRead, 1).is_err());
+        assert!(store.publish_blob(&mut &b"long"[..], 1).is_err());
+        assert!(store.publish_blob(&mut &b"short"[..], 6).is_err());
+        assert_eq!(fs::read_dir(state.join("blobs")).unwrap().count(), 0);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn concurrent_capture_publication_reuses_one_immutable_blob_without_aliases() {
+        let state = temporary("concurrent-blobs");
+        let store = ArtifactStore::open(&state).unwrap();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        store
+                            .publish_blob(&mut &b"shared original bytes"[..], 21)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert_eq!(
+                    worker.join().unwrap(),
+                    bytes_digest(b"shared original bytes")
+                );
+            }
+        });
+        let entries: Vec<_> = fs::read_dir(state.join("blobs"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let blob = entries[0].path();
+        assert_eq!(fs::read(&blob).unwrap(), b"shared original bytes");
+        drop(
+            sandsurf_native::local::open_private_file(
+                &blob,
+                sandsurf_native::PrivateFileAccess::ReadOnly,
+            )
+            .unwrap(),
+        );
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[cfg(windows)]

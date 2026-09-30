@@ -75,14 +75,36 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(unix)]
 fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
-    // A hard link is a no-replace publication on the same filesystem. If the
-    // owner dies after publication, the destination is already complete and
-    // the remaining staging name is safe to reclaim during recovery.
-    std::fs::hard_link(staged, destination)?;
-    let parent = File::open(destination.parent().expect("validated parent"))?;
-    parent.sync_all()?;
-    std::fs::remove_file(staged)?;
-    parent.sync_all()
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(staged.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let target = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // Publish one name atomically. A hard-link publication would transiently
+    // violate private-file identity checks when concurrent captures encounter
+    // the same content digest. Unsupported native rename semantics fail closed.
+    #[cfg(target_os = "linux")]
+    // SAFETY: both terminated paths remain live; same-directory publication
+    // was checked above. The syscall avoids a libc-symbol dependency on musl.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: both terminated paths remain live; RENAME_EXCL forbids replacing
+    // any existing destination rather than adopting a different identity.
+    let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sync_directory(destination.parent().expect("validated parent"))
 }
 
 #[cfg(windows)]
@@ -117,6 +139,36 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn publication_transfers_one_identity_and_never_replaces_existing_bytes() {
+        use crate::local::{create_private_directory, create_private_file, open_private_file};
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-publication-transfer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&root).unwrap();
+        let staged = root.join("staged");
+        let destination = root.join("published");
+        let mut writer = create_private_file(&staged).unwrap();
+        writer.write_all(b"protected original").unwrap();
+        drop(writer);
+        publish_new_file(&staged, &destination).unwrap();
+        assert!(!staged.exists());
+        drop(open_private_file(&destination, crate::PrivateFileAccess::ReadOnly).unwrap());
+        let mut writer = create_private_file(&staged).unwrap();
+        writer.write_all(b"different bytes").unwrap();
+        drop(writer);
+        assert_eq!(
+            publish_new_file(&staged, &destination).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"protected original");
+        assert_eq!(fs::read(&staged).unwrap(), b"different bytes");
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn private_storage_access_is_explicit_and_never_adopts_aliases() {
