@@ -35,6 +35,22 @@ pub fn publish_new_file(staged: &Path, destination: &Path) -> io::Result<()> {
     publish_name(staged, destination)
 }
 
+/// Atomically publish a prepared directory without replacing another object.
+/// Payload and nested directory flushes belong to the materializing owner.
+pub fn publish_new_directory(staged: &Path, destination: &Path) -> io::Result<()> {
+    if !staged.is_absolute()
+        || !destination.is_absolute()
+        || staged.parent() != destination.parent()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory publication requires absolute paths in one directory",
+        ));
+    }
+    sync_directory(staged)?;
+    publish_name(staged, destination)
+}
+
 /// Flush publication metadata where the OS provides a directory fsync. On
 /// Windows, validate the directory handle without claiming a POSIX-style
 /// directory flush: payload files and the authoritative journal are flushed
@@ -139,6 +155,30 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn directory_publication_never_replaces_an_existing_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-directory-publication-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::local::create_private_directory(&root).unwrap();
+        let stage = root.join("stage");
+        let target = root.join("target");
+        crate::local::create_private_directory(&stage).unwrap();
+        fs::write(stage.join("identity"), b"original").unwrap();
+        publish_new_directory(&stage, &target).unwrap();
+        crate::local::create_private_directory(&stage).unwrap();
+        fs::write(stage.join("identity"), b"replacement").unwrap();
+        assert_eq!(
+            publish_new_directory(&stage, &target).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(target.join("identity")).unwrap(), b"original");
+        assert_eq!(fs::read(stage.join("identity")).unwrap(), b"replacement");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn publication_transfers_one_identity_and_never_replaces_existing_bytes() {

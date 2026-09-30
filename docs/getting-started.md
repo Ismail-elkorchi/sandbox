@@ -56,6 +56,26 @@ interrupt an idle read; closing the SDK detaches its observers without stopping
 the Linux machine. Stream credit is transport progress, not receipt
 acknowledgement, application acceptance, or authorization to delete output.
 
+Native complete-machine bundles can be imported without OCI conversion:
+
+```ts
+const nativeImage = await host.images.importNative({
+  manifestPath: "/absolute/machine/manifest.json",
+  manifestDigest: "<sha256-of-exact-manifest-bytes>",
+  operationId: "import-machine",
+});
+```
+
+Approval binds both the source path and manifest digest. The host verifies every
+artifact and durably publishes its own immutable copy. A published operation
+can be retrieved or retried after restart even if the source bundle has been
+deleted. The same image has one catalog representation regardless of whether
+it was imported natively, converted from OCI, or published from a snapshot.
+Provenance carries known sensitivity; a missing sensitivity declaration is not
+proof that a complete disk contains no secrets, and imports do not scrub disks.
+An image must match the native guest architecture; Windows boot additionally
+requires its verified native kernel and VHDX artifacts.
+
 OCI conversion accepts a complete Linux OS filesystem with an executable
 `/sbin/init` and an explicit boot-image recipe:
 

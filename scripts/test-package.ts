@@ -41,11 +41,20 @@ try {
       assert.ok(before.defaultImageDigest);
       assert.equal(before.guestPower.reboot.kind, "unsupported");
       assert.equal(before.guestPower.shutdown.kind, process.platform === "linux" && process.arch === "x64" ? "unsupported" : "supported");
+      const nativeImport = {
+        manifestPath: ${JSON.stringify(resolve(consumer, "node_modules/sandsurf/images"))} + "/development-" + (before.guestArchitecture === "arm64" ? "arm64" : "x64") + "/manifest.json",
+        manifestDigest: before.defaultImageDigest,
+        operationId: "installed-native-image",
+      };
+      const nativeImage = await host.images.importNative(nativeImport);
+      assert.equal(nativeImage.id, before.defaultImageDigest);
       const secret = await host.secrets.put("installed-binary-secret", Buffer.alloc(1024 ** 2, 255), { operationId: "installed-put" });
       assert.equal(secret.bytes, 1024 ** 2);
       await host.close();
-      host = await Sandsurf.open({ directory, service: "connect" });
+      host = await Sandsurf.open({ directory, service: "connect", authorizer: () => true });
       assert.equal((await host.inspect()).hostId, before.hostId);
+      assert.equal((await host.images.importNative(nativeImport)).id, nativeImage.id);
+      assert.equal((await host.images.get(nativeImage.id)).id, nativeImage.id);
       const retained = await host.operations.get("installed-put");
       assert.equal(retained.kind, "secret-put");
       assert.equal(retained.value.secret.version, secret.version);

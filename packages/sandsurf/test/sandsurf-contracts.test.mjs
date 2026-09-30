@@ -306,6 +306,33 @@ test("OCI conversion binds explicit boot artifacts into approval and admission",
   assert.equal(approvals.length, 1);
 });
 
+test("native image import binds immutable input authority and rejects mismatched publication", async () => {
+  const requests = [];
+  const approvals = [];
+  let image = { digest: "a".repeat(64), sourceDigest: "b".repeat(64), platform: "linux", architecture: "amd64",
+    logicalBytes: 1024, storageBytes: 1024, provenanceDigest: "c".repeat(64), sensitive: true };
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request);
+    return { kind: "image-import", operation: { image } };
+  } }, async (change) => { approvals.push(change); return true; });
+  const manifestPath = process.platform === "win32" ? "C:\\images\\manifest.json" : "/images/manifest.json";
+  const options = { manifestPath, manifestDigest: image.digest, operationId: "native-image" };
+  assert.equal((await host.images.importNative(options)).id, image.digest);
+  assert.deepEqual(approvals[0].request, { manifestPath, manifestDigest: image.digest });
+  assert.deepEqual(requests[0], { kind: "import-native-image", manifestPath,
+    manifestDigest: image.digest, operationId: "native-image", approvalId: requests[0].approvalId });
+  for (const invalid of [{ ...options, manifestPath: "relative/manifest.json" },
+    { ...options, manifestPath: `${manifestPath}\0` }, { ...options, manifestDigest: "not-a-digest" }]) {
+    await assert.rejects(host.images.importNative(invalid), TypeError);
+  }
+  assert.equal(approvals.length, 1);
+  assert.equal(requests.length, 1);
+  image = { ...image, digest: "d".repeat(64) };
+  await assert.rejects(host.images.importNative(options), /native image import identity/u);
+  const denied = new Sandsurf({ request: async () => { throw new Error("denied import reached transport"); } }, () => false);
+  await assert.rejects(denied.images.importNative(options), (error) => error.category === "authorization");
+});
+
 test("unapplied lifecycle retains host intent revision without inventing completion", async () => {
   const requests = [];
   const view = fixtureView();

@@ -732,6 +732,49 @@ impl HostService {
                     )?,
                 })
             }
+            HostRequest::ImportNativeImage {
+                manifest_path,
+                manifest_digest,
+                operation_id,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Image,
+                    &(
+                        "sandsurf-import-native-image-v1",
+                        &manifest_path,
+                        &manifest_digest,
+                        &operation_id,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostResponse::ImageImport {
+                        operation: admitted,
+                    });
+                }
+                let image = crate::images::import_native(
+                    &self.root,
+                    &manifest_path,
+                    &manifest_digest,
+                    &operation_id,
+                    &request_digest,
+                )?;
+                Ok(HostResponse::ImageImport {
+                    operation: self.catalog.complete_image_import(
+                        &operation_id,
+                        &request_digest,
+                        image,
+                    )?,
+                })
+            }
             HostRequest::PublishSnapshotImage {
                 snapshot_id,
                 allow_sensitive,

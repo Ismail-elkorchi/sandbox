@@ -10,7 +10,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 7;
+pub const HOST_API_VERSION: u16 = 8;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -208,6 +208,12 @@ pub enum HostRequest {
         source: OciSource,
         recipe: MachineImageRecipe,
         platform: String,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
+    ImportNativeImage {
+        manifest_path: PathBuf,
+        manifest_digest: Digest,
         operation_id: OperationId,
         approval_id: CommitmentId,
     },

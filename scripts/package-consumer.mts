@@ -3,6 +3,7 @@ import {
   type Artifact, type AuthorityChange, type ChangeSet, type MachineInspection,
   type MachineGenerationPrecondition, type MachineRevisionPrecondition,
   type ExecutionStatus,
+  type NativeImageImportOptions,
   type NetworkPolicy, type ResourceUsage, type SecretVersion, type SpawnOptions,
 } from "sandsurf";
 
@@ -12,6 +13,8 @@ async function consume(directory: string, image: string): Promise<void> {
     authorizer(change: AuthorityChange) { return { approvalId: `approval-${change.operationId}` }; },
   });
   try {
+    const native: NativeImageImportOptions = { manifestPath: "/images/machine/manifest.json", manifestDigest: image };
+    void host.images.importNative; void native;
     const computer = await host.machines.create({
       image, resources: { vcpus: 2, memoryMiB: 2048, diskBytes: 20 * 1024 ** 3 },
       user: "agent", environment: { CI: "true" }, workingDirectory: "/home/agent",

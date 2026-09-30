@@ -175,6 +175,23 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await fork.destroy();
     fork = undefined;
 
+    context.diagnostic("snapshot images and native imports share one identity, sensitivity and bootable system seed");
+    const publishedImage = await snapshot.publishImage({ allowSensitive: true, operationId: "publish-computer-image" });
+    assert.equal(publishedImage.inspection.sensitive, true);
+    const reimportedImage = await host.images.importNative({
+      manifestPath: join(directory, "images", publishedImage.id, "manifest.json"),
+      manifestDigest: publishedImage.id, operationId: "reimport-computer-image",
+    });
+    assert.deepEqual(reimportedImage.inspection, publishedImage.inspection);
+    fork = await host.machines.create({ image: reimportedImage.id,
+      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 } });
+    await managementReady(fork);
+    assert.equal((await fork.inspect()).knownSensitive, true);
+    assert.equal(Buffer.from(await fork.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
+    assert.equal(await run(fork, "sudo -n id -u"), "0\n");
+    await fork.destroy();
+    fork = undefined;
+
     context.diagnostic("native power-off interrupts waits without fabricating exit or releasing retained output");
     const interrupted = await machine.executions.start({ argv: ["/bin/sh", "-c", "printf before-stop; sleep 300"], executionId: "interrupted-by-native-stop" });
     const captureDeadline = Date.now() + 15_000;
@@ -365,7 +382,6 @@ async function qualifyImageBuildReports(sourceManifest) {
   const root = await mkdtemp("/var/tmp/sandsurf-image-report-");
   const bundle = join(root, "bundle");
   const directory = join(root, "host");
-  const previousManifest = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
   let host;
   let machine;
   try {
@@ -382,9 +398,18 @@ async function qualifyImageBuildReports(sourceManifest) {
       await copyFile(join(dirname(sourceManifest), artifact.path), join(bundle, artifact.path));
     }
     await writeFile(manifestPath, bytes);
-    process.env.SANDSURF_LOCAL_IMAGE_MANIFEST = manifestPath;
     host = await Sandsurf.open({ directory, authorizer: () => true });
-    machine = await host.machines.create({ image: createHash("sha256").update(bytes).digest("hex"),
+    const manifestDigest = createHash("sha256").update(bytes).digest("hex");
+    const importOptions = { manifestPath, manifestDigest, operationId: "import-native-machine" };
+    const image = await host.images.importNative(importOptions);
+    assert.equal(image.id, manifestDigest);
+    await rm(bundle, { recursive: true });
+    await host.close();
+    await (await NativeHostClient.open(directory)).stopService();
+    host = await Sandsurf.open({ directory, authorizer: () => true });
+    assert.equal((await host.images.importNative(importOptions)).id, image.id, "published operation reconnects without the source bundle");
+    assert.equal((await host.images.get(image.id)).id, image.id);
+    machine = await host.machines.create({ image: image.id,
       resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 } });
     assert.equal((await machine.inspect()).machine.value.state, "running");
     await managementReady(machine);
@@ -399,8 +424,6 @@ async function qualifyImageBuildReports(sourceManifest) {
           await (await NativeHostClient.open(directory)).stopService();
         }
       } finally {
-        if (previousManifest === undefined) delete process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
-        else process.env.SANDSURF_LOCAL_IMAGE_MANIFEST = previousManifest;
         await rm(root, { recursive: true, force: true });
       }
     }

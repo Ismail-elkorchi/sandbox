@@ -82,6 +82,12 @@ export type OciImageSource = { readonly kind: "layout"; readonly path: string } 
  */
 export interface MachineImageRecipe { readonly bootImage: string | Image; }
 export interface ImageImportOptions { readonly source?: OciImageSource; readonly reference?: string; readonly recipe: MachineImageRecipe; readonly platform?: string; readonly operationId?: string; }
+/** Import an immutable complete-machine bundle by the SHA-256 of its exact
+ * manifest bytes. The host retains its own verified copy, not the source path.
+ * Sensitivity preserves declared image provenance; absence of a known
+ * disclosure is not proof that the complete disk contains no secrets.
+ */
+export interface NativeImageImportOptions { readonly manifestPath: string; readonly manifestDigest: string; readonly operationId?: string; }
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
 export interface Receipt { readonly machineId: string; readonly generation: number; readonly executionId: string; readonly operationId: string; readonly requestDigest: string; readonly outcome: Readonly<Record<string, unknown>>; readonly output: Readonly<Record<string, unknown>>; readonly cleanupDigest: string; readonly accountingDigest: string; }
@@ -167,6 +173,18 @@ export class SecretCollection {
 export class ImageCollection {
   readonly #host: Sandsurf;
   constructor(host: Sandsurf) { this.#host = host; }
+  async importNative(options: NativeImageImportOptions): Promise<Image> {
+    if (typeof options.manifestPath !== "string" || !isAbsolute(options.manifestPath) || options.manifestPath.includes("\0")) throw new TypeError("native image manifest path must be absolute");
+    const manifestDigest = digest(options.manifestDigest);
+    const operationId = validateIdentity(options.operationId ?? identity("image"));
+    const request = { manifestPath: options.manifestPath, manifestDigest };
+    const approvalId = await this.#host[authorize]({ kind: "image-import", machineId: "host", operationId, request });
+    const response = await this.#host[transport]({ kind: "import-native-image", ...request, operationId, approvalId });
+    if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("native image import response");
+    const image = parseImage(response.operation.image);
+    if (image.digest !== manifestDigest) throw protocol("native image import identity");
+    return new Image(image);
+  }
   async importOCI(options: ImageImportOptions): Promise<Image> {
     const operationId = validateIdentity(options.operationId ?? identity("image"));
     if (!record(options.recipe)) throw new TypeError("OCI conversion requires an explicit machine-image recipe");

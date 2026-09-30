@@ -204,9 +204,16 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
     if !path.is_absolute() {
         return Err(ImageError::Invalid("manifest path must be absolute".into()));
     }
-    let mut manifest_file = open_regular_bounded(path, 1024 * 1024, "manifest")?;
+    let manifest_file = open_regular_bounded(path, 1024 * 1024, "manifest")?;
     let mut manifest_bytes = Vec::new();
-    manifest_file.read_to_end(&mut manifest_bytes)?;
+    manifest_file
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut manifest_bytes)?;
+    if manifest_bytes.len() > 1024 * 1024 {
+        return Err(ImageError::Invalid(
+            "manifest grew beyond its byte bound".into(),
+        ));
+    }
     let manifest_digest = hex_sha256(&manifest_bytes);
     let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| ImageError::Invalid(error.to_string()))?;
@@ -375,7 +382,7 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
 pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, ImageError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    std::fs::create_dir_all(store)?;
+    sandsurf_native::local::ensure_private_directory(store)?;
     let destination = store.join(&image.manifest_digest);
     if destination.exists() {
         let installed = verify_image(
@@ -392,12 +399,7 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir(&staging)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
-    }
+    sandsurf_native::local::create_private_directory(&staging)?;
     let result = (|| {
         let mut artifacts = BTreeMap::from([
             ("manifest.json".to_owned(), image.manifest_path.clone()),
@@ -417,18 +419,34 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
             artifacts.insert(metadata.kernel.path.clone(), paths.kernel_path.clone());
             artifacts.insert(metadata.system.path.clone(), paths.system_path.clone());
         }
+        let mut directories = std::collections::BTreeSet::new();
         for (relative, source) in artifacts {
+            let maximum = if relative == "manifest.json" {
+                1024 * 1024
+            } else {
+                MAX_IMAGE_ARTIFACT_BYTES
+            };
             let target = staging.join(relative);
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+                let relative = parent
+                    .strip_prefix(&staging)
+                    .map_err(|_| ImageError::Invalid("image directory escaped staging".into()))?;
+                let mut directory = staging.clone();
+                for component in relative.components() {
+                    directory.push(component);
+                    sandsurf_native::local::ensure_private_directory(&directory)?;
+                    directories.insert(directory.clone());
+                }
             }
-            let mut input = File::open(source)?;
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)?;
-            io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
+            let input = open_regular_bounded(&source, maximum, "copy source")?;
+            let mut output = sandsurf_native::local::create_private_file(&target)?;
+            let copied_bytes = io::copy(&mut input.take(maximum + 1), &mut output)?;
+            if copied_bytes > maximum {
+                return Err(ImageError::Invalid(
+                    "copy source grew beyond its byte bound".into(),
+                ));
+            }
+            sandsurf_native::storage::sync_file(&output)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -439,9 +457,27 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
         if copied.manifest_digest != image.manifest_digest {
             return Err(ImageError::DigestMismatch("copied manifest"));
         }
+        for directory in directories.iter().rev() {
+            sync_directory(directory)?;
+        }
         sync_directory(&staging)?;
-        std::fs::rename(&staging, &destination)?;
-        sync_directory(store)?;
+        match sandsurf_native::storage::publish_new_directory(&staging, &destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let installed = verify_image(
+                    &destination.join("manifest.json"),
+                    ImageTrust::Pinned {
+                        manifest_digest: &image.manifest_digest,
+                    },
+                )?;
+                if installed.manifest_digest != image.manifest_digest {
+                    return Err(ImageError::DigestMismatch("concurrent installed manifest"));
+                }
+                std::fs::remove_dir_all(&staging)?;
+                sync_directory(store)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(destination)
     })();
     if result.is_err() {
@@ -451,15 +487,7 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    sandsurf_native::storage::sync_directory(path)
 }
 
 fn validate_digest(value: &str) -> Result<(), ImageError> {
@@ -511,8 +539,15 @@ fn resolve_beneath(parent: &Path, relative: &str) -> Result<PathBuf, ImageError>
 }
 
 fn verify_artifact(path: &Path, expected: &str, name: &'static str) -> Result<(), ImageError> {
-    let mut file = open_regular_bounded(path, MAX_IMAGE_ARTIFACT_BYTES, name)?;
-    if hex_sha256_reader(&mut file)? != expected {
+    let file = open_regular_bounded(path, MAX_IMAGE_ARTIFACT_BYTES, name)?;
+    let mut bounded = file.take(MAX_IMAGE_ARTIFACT_BYTES + 1);
+    let observed = hex_sha256_reader(&mut bounded)?;
+    if bounded.limit() == 0 {
+        return Err(ImageError::Invalid(format!(
+            "{name} grew beyond its byte bound"
+        )));
+    }
+    if observed != expected {
         return Err(ImageError::DigestMismatch(name));
     }
     Ok(())
@@ -604,7 +639,7 @@ mod tests {
                 std::process::id(),
                 TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path).unwrap();
+            sandsurf_native::local::create_private_directory(&path).unwrap();
             Self(path)
         }
     }
@@ -675,6 +710,49 @@ mod tests {
         let path = directory.join("manifest.json");
         fs::write(&path, serde_json::to_vec(manifest).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn publication_owns_verified_bytes_and_nested_artifacts_independently_of_the_source() {
+        let temporary = TempDirectory::new();
+        let source = temporary.0.join("source");
+        fs::create_dir(&source).unwrap();
+        let mut manifest = test_manifest(b"kernel", b"system");
+        manifest.boot_bundle.kernel.path = "boot/kernel".into();
+        manifest.system.rootfs.path = "disks/system.ext4".into();
+        fs::create_dir(source.join("boot")).unwrap();
+        fs::create_dir(source.join("disks")).unwrap();
+        fs::write(source.join("boot/kernel"), b"kernel").unwrap();
+        fs::write(source.join("disks/system.ext4"), b"system").unwrap();
+        let path = source.join("manifest.json");
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let verified = verify_image(&path, ImageTrust::ExplicitLocal).unwrap();
+        let store = temporary.0.join("store");
+        let installed = install_image(&store, &verified).unwrap();
+        fs::remove_dir_all(source).unwrap();
+        assert_eq!(install_image(&store, &verified).unwrap(), installed);
+        let retained = verify_image(
+            &installed.join("manifest.json"),
+            ImageTrust::Pinned {
+                manifest_digest: &verified.manifest_digest,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(retained.kernel_path).unwrap(), b"kernel");
+        assert_eq!(fs::read(retained.system_path).unwrap(), b"system");
+    }
+
+    #[test]
+    fn publication_reverifies_copied_artifacts_and_never_publishes_changed_source() {
+        let temporary = TempDirectory::new();
+        let manifest = test_manifest(b"kernel", b"system");
+        let path = write_image(&temporary.0, &manifest, b"kernel", b"system");
+        let verified = verify_image(&path, ImageTrust::ExplicitLocal).unwrap();
+        fs::write(temporary.0.join("rootfs"), b"modified-system").unwrap();
+        let store = temporary.0.join("store");
+        assert!(install_image(&store, &verified).is_err());
+        assert!(!store.join(&verified.manifest_digest).exists());
+        assert_eq!(fs::read_dir(store).unwrap().count(), 0);
     }
 
     #[test]

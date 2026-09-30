@@ -1,5 +1,5 @@
-//! Cross-platform OCI-to-VM image publication. The conversion never mounts
-//! the source tree or generated filesystem in the host kernel.
+//! Native complete-machine image publication and OCI-to-VM conversion. No
+//! source tree or generated filesystem is mounted in the host kernel.
 
 use crate::api::{MachineImageRecipe, OciSource};
 use sandsurf_image::ext4::materialize_tar;
@@ -9,10 +9,13 @@ use sandsurf_image::oci::{
 };
 use sandsurf_image::{
     Architecture, ImageDefaults, ImageManifest, ImageProvenance, ImageTrust, PlatformArtifacts,
-    RootfsArtifact, RootfsFormat, SystemDiskManifest, VerifiedImage, verify_image,
+    RootfsArtifact, RootfsFormat, SystemDiskManifest, VerifiedImage, install_image, verify_image,
 };
 #[cfg(target_os = "windows")]
 use sandsurf_image::{ImageArtifact, WindowsArtifacts};
+use sandsurf_native::local::{
+    create_private_file, ensure_private_directory as prepare_private_directory,
+};
 use sandsurf_protocol::{
     Counter, Digest, Domain, OperationId, Qualification, Snapshot, SnapshotPhase, digest,
 };
@@ -21,10 +24,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -90,6 +93,178 @@ pub(crate) struct OciBuildInput<'a> {
     pub platform: &'a str,
 }
 
+pub(crate) fn import_native(
+    host_root: &Path,
+    manifest_path: &Path,
+    manifest_digest: &Digest,
+    operation: &OperationId,
+    request_digest: &Digest,
+) -> Result<ImageRecord, ImageBuildError> {
+    if !manifest_path.is_absolute() {
+        return Err(ImageBuildError::Invalid(
+            "native image manifest path must be absolute".into(),
+        ));
+    }
+    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    if let Some(image) = old {
+        return Ok(image);
+    }
+    let store = host_root.join("images");
+    let installed_manifest = store.join(manifest_digest.as_str()).join("manifest.json");
+    // After publication, recovery needs only the immutable host-owned bundle,
+    // never the caller's possibly deleted or changed source directory.
+    let source = if installed_manifest.exists() {
+        &installed_manifest
+    } else {
+        manifest_path
+    };
+    let verified = verify_image(
+        source,
+        ImageTrust::Pinned {
+            manifest_digest: manifest_digest.as_str(),
+        },
+    )?;
+    let expected = match crate::service::native_guest_architecture() {
+        sandsurf_machine::GuestArchitecture::Amd64 => Architecture::X64,
+        sandsurf_machine::GuestArchitecture::Arm64 => Architecture::Arm64,
+    };
+    if verified.manifest.architecture != expected {
+        return Err(ImageBuildError::Invalid(
+            "native image architecture differs from the native Linux machine".into(),
+        ));
+    }
+    let (published, verified) = publish_image(host_root, &verified)?;
+    let image = image_record(&published, &verified)?;
+    finish_import(&stage, request_digest, &image)?;
+    Ok(image)
+}
+
+fn publish_image(
+    host_root: &Path,
+    image: &VerifiedImage,
+) -> Result<(PathBuf, VerifiedImage), ImageBuildError> {
+    let published = install_image(&host_root.join("images"), image)?;
+    // Record only the host-owned immutable copy, never caller/build paths.
+    let verified = verify_image(
+        &published.join("manifest.json"),
+        ImageTrust::Pinned {
+            manifest_digest: &image.manifest_digest,
+        },
+    )?;
+    Ok((published, verified))
+}
+
+fn prepare_import(
+    host_root: &Path,
+    operation: &OperationId,
+    request_digest: &Digest,
+) -> Result<(PathBuf, Option<ImageRecord>), ImageBuildError> {
+    prepare_private_directory(&host_root.join("images"))?;
+    let imports = host_root.join("images/imports");
+    prepare_private_directory(&imports)?;
+    let stage = imports.join(operation.as_str());
+    let result_path = stage.join("result.json");
+    if result_path.exists() {
+        let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
+        if old.request_digest != *request_digest {
+            return Err(ImageBuildError::Invalid(
+                "image import staging identity conflicts with the request".into(),
+            ));
+        }
+        verify_published(host_root, &old.image)?;
+        return Ok((stage, Some(old.image)));
+    }
+    if stage.exists() {
+        let quarantine = imports.join(format!(
+            "quarantine-{}-{}",
+            operation.as_str(),
+            short_nonce()?
+        ));
+        fs::rename(&stage, quarantine)?;
+    }
+    prepare_private_directory(&stage)?;
+    Ok((stage, None))
+}
+
+fn finish_import(
+    stage: &Path,
+    request_digest: &Digest,
+    image: &ImageRecord,
+) -> Result<(), ImageBuildError> {
+    write_json(
+        &stage.join("result.json"),
+        &ImportResult {
+            request_digest: request_digest.clone(),
+            image: image.clone(),
+        },
+    )?;
+    sandsurf_native::storage::sync_directory(stage)?;
+    Ok(())
+}
+
+/// One canonical catalog representation regardless of the publication source.
+/// Provenance and sensitivity are declarations bound to the verified image,
+/// not attestations that the disk is safe or that the running guest is intact.
+fn image_record(root: &Path, image: &VerifiedImage) -> Result<ImageRecord, ImageBuildError> {
+    let manifest = &image.manifest;
+    let as_digest = |value: &str| {
+        Digest::try_from(bare_digest(value)?.to_owned())
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))
+    };
+    let (source_digest, provenance_digest, sensitive) = match &manifest.system.provenance {
+        ImageProvenance::SourceBuilt { source_digest, .. } => (
+            as_digest(source_digest)?,
+            digest(Domain::Image, &manifest.system.provenance)
+                .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
+            false,
+        ),
+        ImageProvenance::Oci {
+            manifest_digest,
+            conversion_digest,
+            ..
+        } => (
+            as_digest(manifest_digest)?,
+            as_digest(conversion_digest)?,
+            false,
+        ),
+        ImageProvenance::Derived {
+            source_image_digest,
+            snapshot_manifest_digest,
+            sensitive,
+        } => {
+            let disk_digest = as_digest(&manifest.system.rootfs.sha256)?;
+            let provenance = digest(
+                Domain::Image,
+                &(
+                    "sandsurf-derived-image-v2",
+                    as_digest(source_image_digest)?,
+                    as_digest(snapshot_manifest_digest)?,
+                    &disk_digest,
+                    sensitive,
+                ),
+            )
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
+            (disk_digest, provenance, *sensitive)
+        }
+    };
+    Ok(ImageRecord {
+        digest: as_digest(&image.manifest_digest)?,
+        source_digest,
+        platform: "linux".into(),
+        architecture: match manifest.architecture {
+            Architecture::X64 => "amd64",
+            Architecture::Arm64 => "arm64",
+        }
+        .into(),
+        logical_bytes: Counter::try_from(fs::metadata(&image.system_path)?.len())
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
+        storage_bytes: Counter::try_from(artifact_storage_bytes(root)?)
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
+        provenance_digest,
+        sensitive,
+    })
+}
+
 pub(crate) fn import_oci(
     host_root: &Path,
     executable: &Path,
@@ -128,29 +303,10 @@ pub(crate) fn import_oci(
             "recipe boot image architecture differs from the OCI filesystem".into(),
         ));
     }
-    let imports = host_root.join("images/imports");
-    prepare_private_directory(&imports)?;
-    let stage = imports.join(operation.as_str());
-    let result_path = stage.join("result.json");
-    if result_path.exists() {
-        let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
-        if old.request_digest != *request_digest {
-            return Err(ImageBuildError::Invalid(
-                "image import staging identity conflicts with the request".into(),
-            ));
-        }
-        verify_published(host_root, &old.image)?;
-        return Ok(old.image);
+    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    if let Some(image) = old {
+        return Ok(image);
     }
-    if stage.exists() {
-        let quarantine = imports.join(format!(
-            "quarantine-{}-{}",
-            operation.as_str(),
-            short_nonce()?
-        ));
-        fs::rename(&stage, quarantine)?;
-    }
-    prepare_private_directory(&stage)?;
     let layout_path = match source {
         OciSource::Layout { path } => {
             if !path.is_absolute() {
@@ -257,40 +413,10 @@ pub(crate) fn import_oci(
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
     let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
-    let final_root = host_root.join("images").join(&verified.manifest_digest);
-    if final_root.exists() {
-        let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        if existing.manifest_digest != verified.manifest_digest {
-            return Err(ImageBuildError::Invalid(
-                "published image directory conflicts with its digest".into(),
-            ));
-        }
-    } else {
-        File::open(&artifact)?.sync_all()?;
-        fs::rename(&artifact, &final_root)?;
-        File::open(host_root.join("images"))?.sync_all()?;
-    }
-    let source_digest = Digest::try_from(bare_digest(&tree.source.manifest_digest)?.to_owned())
-        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-    let image = ImageRecord {
-        digest: Digest::try_from(verified.manifest_digest)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        source_digest,
-        platform: requested.os,
-        architecture: requested.architecture,
-        logical_bytes: Counter::try_from(rootfs_bytes)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        provenance_digest: conversion_digest,
-        sensitive: false,
-    };
-    let result = ImportResult {
-        request_digest: request_digest.clone(),
-        image: image.clone(),
-    };
-    write_json(&result_path, &result)?;
-    File::open(&stage)?.sync_all()?;
+    let (final_root, verified) = publish_image(host_root, &verified)?;
+    fs::remove_dir_all(&artifact)?;
+    let image = image_record(&final_root, &verified)?;
+    finish_import(&stage, request_digest, &image)?;
     Ok(image)
 }
 
@@ -315,29 +441,10 @@ pub fn publish_snapshot(
         ));
     }
 
-    let imports = host_root.join("images/imports");
-    prepare_private_directory(&imports)?;
-    let stage = imports.join(operation.as_str());
-    let result_path = stage.join("result.json");
-    if result_path.exists() {
-        let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
-        if old.request_digest != *request_digest {
-            return Err(ImageBuildError::Invalid(
-                "derived image staging identity conflicts with the request".into(),
-            ));
-        }
-        verify_published(host_root, &old.image)?;
-        return Ok(old.image);
+    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    if let Some(image) = old {
+        return Ok(image);
     }
-    if stage.exists() {
-        let quarantine = imports.join(format!(
-            "quarantine-{}-{}",
-            operation.as_str(),
-            short_nonce()?
-        ));
-        fs::rename(&stage, quarantine)?;
-    }
-    prepare_private_directory(&stage)?;
 
     let source_root = host_root
         .join("images")
@@ -403,69 +510,11 @@ pub fn publish_snapshot(
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
     let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
-    let final_root = host_root.join("images").join(&verified.manifest_digest);
-    if final_root.exists() {
-        let existing = verify_image(&final_root.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        if existing.manifest_digest != verified.manifest_digest {
-            return Err(ImageBuildError::Invalid(
-                "derived image directory conflicts with its digest".into(),
-            ));
-        }
-        remove_derived_artifact(&artifact)?;
-    } else {
-        File::open(&artifact)?.sync_all()?;
-        fs::rename(&artifact, &final_root)?;
-        File::open(host_root.join("images"))?.sync_all()?;
-    }
-    let architecture = match manifest.architecture {
-        Architecture::X64 => "amd64",
-        Architecture::Arm64 => "arm64",
-    };
-    let logical_bytes = snapshot.system_disk_bytes.get();
-    let image = ImageRecord {
-        digest: Digest::try_from(verified.manifest_digest)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        source_digest: snapshot
-            .system_disk_digest
-            .as_ref()
-            .expect("ready snapshot disk was checked")
-            .clone(),
-        platform: "linux".into(),
-        architecture: architecture.into(),
-        logical_bytes: Counter::try_from(logical_bytes)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        storage_bytes: Counter::try_from(artifact_storage_bytes(&final_root)?)
-            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
-        provenance_digest,
-        sensitive: snapshot.sensitive,
-    };
-    write_json(
-        &result_path,
-        &ImportResult {
-            request_digest: request_digest.clone(),
-            image: image.clone(),
-        },
-    )?;
-    File::open(&stage)?.sync_all()?;
+    let (final_root, verified) = publish_image(host_root, &verified)?;
+    fs::remove_dir_all(&artifact)?;
+    let image = image_record(&final_root, &verified)?;
+    finish_import(&stage, request_digest, &image)?;
     Ok(image)
-}
-
-fn remove_derived_artifact(path: &Path) -> Result<(), ImageBuildError> {
-    for name in [
-        "manifest.json",
-        "derived-system.ext4",
-        "boot-kernel",
-        "windows-kernel",
-        "windows-system.vhdx",
-    ] {
-        match fs::remove_file(path.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    fs::remove_dir(path)?;
-    Ok(())
 }
 
 fn parse_platform(value: &str) -> Result<GuestPlatform, ImageBuildError> {
@@ -730,34 +779,6 @@ fn image_artifact(path: &Path, name: &str) -> Result<ImageArtifact, ImageBuildEr
     })
 }
 
-fn prepare_private_directory(path: &Path) -> Result<(), ImageBuildError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
-        Ok(_) => {
-            return Err(ImageBuildError::Invalid(
-                "image staging path is not a directory".into(),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    #[cfg(target_os = "windows")]
-    sandsurf_native::local::create_private_directory(path)?;
-    Ok(())
-}
-
-fn create_private_file(path: &Path) -> Result<File, ImageBuildError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    Ok(options.open(path)?)
-}
-
 fn copy_regular(source: &Path, destination: &Path) -> Result<(), ImageBuildError> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -783,7 +804,7 @@ pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError>
                 ));
             }
             fs::remove_dir_all(&target)?;
-            File::open(images)?.sync_all()?;
+            sandsurf_native::storage::sync_directory(&images)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -890,7 +911,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ImageBuildErro
     let bytes = serde_json::to_vec(value)?;
     let mut file = create_private_file(path)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
+    sandsurf_native::storage::sync_file(&file)?;
     Ok(())
 }
 
@@ -923,10 +944,219 @@ fn short_nonce() -> Result<String, ImageBuildError> {
     Ok(output)
 }
 
+#[cfg(test)]
+mod native_import_tests {
+    use super::*;
+    use sandsurf_image::{BootBundleManifest, ImageArtifact, ImageCapabilities};
+
+    struct Fixture {
+        root: PathBuf,
+        manifest: PathBuf,
+        digest: Digest,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "sandsurf-native-image-{}-{}",
+                std::process::id(),
+                short_nonce().unwrap()
+            ));
+            prepare_private_directory(&root).unwrap();
+            let source = root.join("source");
+            prepare_private_directory(&source).unwrap();
+            fs::write(source.join("kernel"), b"native-kernel").unwrap();
+            fs::write(source.join("system.ext4"), b"opaque-system-seed").unwrap();
+            let manifest = ImageManifest {
+                format_version: 3,
+                id: "native-image-test".into(),
+                version: "1".into(),
+                architecture: match crate::service::native_guest_architecture() {
+                    sandsurf_machine::GuestArchitecture::Amd64 => Architecture::X64,
+                    sandsurf_machine::GuestArchitecture::Arm64 => Architecture::Arm64,
+                },
+                boot_bundle: BootBundleManifest {
+                    kernel: ImageArtifact {
+                        path: "kernel".into(),
+                        sha256: sha256_file(&source.join("kernel"), MAX_ROOTFS_BYTES).unwrap(),
+                    },
+                    guest_agent: None,
+                    capabilities: ImageCapabilities {
+                        overlayfs: false,
+                        vsock: false,
+                        seccomp: false,
+                        cgroup_v2: false,
+                        devpts: false,
+                    },
+                },
+                system: SystemDiskManifest {
+                    rootfs: RootfsArtifact {
+                        path: "system.ext4".into(),
+                        sha256: sha256_file(&source.join("system.ext4"), MAX_ROOTFS_BYTES).unwrap(),
+                        format: RootfsFormat::Ext4,
+                    },
+                    defaults: ImageDefaults::default(),
+                    provenance: ImageProvenance::SourceBuilt {
+                        source_digest: "a".repeat(64),
+                        materials: BTreeMap::from([("source".into(), "b".repeat(64))]),
+                    },
+                },
+                platform_artifacts: PlatformArtifacts::default(),
+                signature: None,
+            };
+            let path = source.join("manifest.json");
+            write_json(&path, &manifest).unwrap();
+            let digest = Digest::try_from(
+                verify_image(&path, ImageTrust::ExplicitLocal)
+                    .unwrap()
+                    .manifest_digest,
+            )
+            .unwrap();
+            Self {
+                root,
+                manifest: path,
+                digest,
+            }
+        }
+        fn import(&self, operation: &str, request: &str) -> Result<ImageRecord, ImageBuildError> {
+            import_native(
+                &self.root,
+                &self.manifest,
+                &self.digest,
+                &OperationId::try_from(operation.to_owned()).unwrap(),
+                &Digest::try_from(request.repeat(64)).unwrap(),
+            )
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn native_import_reconnects_after_source_deletion_and_recovers_before_result_commit() {
+        let fixture = Fixture::new();
+        let image = fixture.import("first-import", "c").unwrap();
+        assert_eq!(image.digest, fixture.digest);
+        assert_eq!(
+            image.logical_bytes.get(),
+            b"opaque-system-seed".len() as u64
+        );
+        assert!(!image.sensitive);
+        fs::remove_dir_all(fixture.manifest.parent().unwrap()).unwrap();
+        assert_eq!(fixture.import("first-import", "c").unwrap(), image);
+        assert!(fixture.import("first-import", "d").is_err());
+        // Interrupt after artifact publication but before the result/journal
+        // commit. Recovery uses only the exact host-owned image digest.
+        fs::remove_file(fixture.root.join("images/imports/first-import/result.json")).unwrap();
+        assert_eq!(fixture.import("first-import", "c").unwrap(), image);
+        assert_eq!(fixture.import("another-import", "e").unwrap(), image);
+        fs::set_permissions(
+            fixture
+                .root
+                .join("images")
+                .join(image.digest.as_str())
+                .join("kernel"),
+            fs::metadata(&fixture.root).unwrap().permissions(),
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .root
+                .join("images")
+                .join(image.digest.as_str())
+                .join("kernel"),
+            b"corrupt-owned-kernel",
+        )
+        .unwrap();
+        assert!(fixture.import("first-import", "c").is_err());
+    }
+
+    #[test]
+    fn native_import_rejects_unpinned_or_modified_input_before_publication() {
+        let fixture = Fixture::new();
+        let wrong = Digest::try_from("d".repeat(64)).unwrap();
+        let operation = OperationId::try_from("wrong-input".to_owned()).unwrap();
+        let request = Digest::try_from("e".repeat(64)).unwrap();
+        assert!(
+            import_native(
+                &fixture.root,
+                &fixture.manifest,
+                &wrong,
+                &operation,
+                &request
+            )
+            .is_err()
+        );
+        assert!(!fixture.root.join("images").join(wrong.as_str()).exists());
+        fs::write(
+            fixture.manifest.parent().unwrap().join("system.ext4"),
+            b"modified-system",
+        )
+        .unwrap();
+        assert!(fixture.import("modified-input", "f").is_err());
+        assert!(
+            !fixture
+                .root
+                .join("images")
+                .join(fixture.digest.as_str())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn every_image_source_uses_one_canonical_record_and_preserves_sensitive_provenance() {
+        let fixture = Fixture::new();
+        let mut manifest: ImageManifest = read_json(&fixture.manifest, 1024 * 1024).unwrap();
+        for provenance in [
+            ImageProvenance::Oci {
+                index_digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                config_digest: "c".repeat(64),
+                conversion_digest: "d".repeat(64),
+            },
+            ImageProvenance::Derived {
+                source_image_digest: "a".repeat(64),
+                snapshot_manifest_digest: "b".repeat(64),
+                sensitive: true,
+            },
+        ] {
+            manifest.system.provenance = provenance;
+            fs::write(&fixture.manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let verified = verify_image(&fixture.manifest, ImageTrust::ExplicitLocal).unwrap();
+            let expected = image_record(fixture.manifest.parent().unwrap(), &verified).unwrap();
+            let digest = Digest::try_from(verified.manifest_digest).unwrap();
+            let imported = import_native(
+                &fixture.root,
+                &fixture.manifest,
+                &digest,
+                &OperationId::try_from(format!("canonical-{}", expected.sensitive)).unwrap(),
+                &Digest::try_from("e".repeat(64)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(imported.digest, expected.digest);
+            assert_eq!(imported.source_digest, expected.source_digest);
+            assert_eq!(imported.provenance_digest, expected.provenance_digest);
+            assert_eq!(imported.sensitive, expected.sensitive);
+            assert_eq!(
+                imported.sensitive,
+                matches!(
+                    manifest.system.provenance,
+                    ImageProvenance::Derived {
+                        sensitive: true,
+                        ..
+                    }
+                )
+            );
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::DirBuilderExt;
 
     #[test]
     fn converted_machine_seed_has_a_verified_internal_journal() {
