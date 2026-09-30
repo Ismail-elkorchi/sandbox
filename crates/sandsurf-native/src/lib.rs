@@ -6,6 +6,7 @@
 pub mod capacity;
 pub mod guest_channel;
 pub mod storage;
+pub mod storage_usage;
 
 /// Access requested for an account-private file. Validation never repairs or
 /// adopts a foreign ACL, mode, owner, link, or reparse identity.

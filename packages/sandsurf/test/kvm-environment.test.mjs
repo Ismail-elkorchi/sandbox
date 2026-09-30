@@ -32,6 +32,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
     });
     await managementReady(machine);
+    const initialUsage = await machine.resources.usage();
+    assert.ok(initialUsage.diskLogicalBytes >= 256 * 1024 ** 2,
+      "host observations include the persistent machine disk independently of Linux free space");
+    assert.ok(initialUsage.diskAllocatedBytes >= 256 * 1024 ** 2,
+      "the reserved persistent disk must be accounted through native filesystem allocation");
     context.diagnostic("ordinary Linux boot and administrator access");
     assert.equal((await machine.inspect()).machine.value.state, "running");
     assert.equal(await run(machine, "id -un"), "agent\n");

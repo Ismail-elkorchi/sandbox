@@ -102,6 +102,12 @@ on that basis; APIs requiring unavailable guest facilities fail independently
 of native machine power. Management compatibility is checked by the actual
 strict guest handshake, not by trusting image provenance.
 
+Disk usage reports host-file lengths and native filesystem allocation for the
+machine's retained tree, including directory allocation. It is not Linux free
+space, dynamic-disk virtual capacity, or an exclusive physical-space reservation:
+shared/reflink extents can be attributed to multiple objects. Windows allocation
+is queried from the held file handle, not substituted with file length.
+
 `(await machine.resources.usage()).executionsCurrent` counts host-owned managed
 admission slots, not Linux PIDs or guest-reported running commands. Admissions
 count before the first guest report and remain reserved through management

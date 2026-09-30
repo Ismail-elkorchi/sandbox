@@ -353,7 +353,12 @@ pub struct ResourceUsage {
     pub cpu_micros: Option<Counter>,
     pub memory_current: Option<Counter>,
     pub memory_peak: Option<Counter>,
+    /// Regular-file lengths in the host-owned machine tree, not guest free
+    /// space or the virtual capacity of a dynamic disk.
     pub disk_logical_bytes: Counter,
+    /// Native filesystem allocation attributed to files and directories.
+    /// Shared/reflink extents may be attributed to more than one object; this
+    /// observation is not an exclusive physical-space reservation.
     pub disk_allocated_bytes: Counter,
     pub io_read_bytes: Option<Counter>,
     pub io_write_bytes: Option<Counter>,

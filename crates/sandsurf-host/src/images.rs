@@ -26,8 +26,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -813,62 +811,7 @@ pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError>
 }
 
 fn artifact_storage_bytes(root: &Path) -> Result<u64, ImageBuildError> {
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(ImageBuildError::Invalid(
-            "image artifact root is not a directory".into(),
-        ));
-    }
-    let mut total = allocated_bytes(&metadata)?;
-    let mut entries = 0_usize;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            entries = entries
-                .checked_add(1)
-                .ok_or_else(|| ImageBuildError::Invalid("image artifact count overflow".into()))?;
-            if entries > 1_000_000 {
-                return Err(ImageBuildError::Invalid(
-                    "image artifact count exceeds its bound".into(),
-                ));
-            }
-            let metadata = fs::symlink_metadata(entry.path())?;
-            if metadata.file_type().is_symlink() {
-                return Err(ImageBuildError::Invalid(
-                    "image artifact contains a symbolic link".into(),
-                ));
-            }
-            total = total
-                .checked_add(allocated_bytes(&metadata)?)
-                .ok_or_else(|| ImageBuildError::Invalid("image storage size overflow".into()))?;
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if !metadata.is_file() {
-                return Err(ImageBuildError::Invalid(
-                    "image artifact contains a special file".into(),
-                ));
-            }
-        }
-    }
-    Ok(total)
-}
-
-#[cfg(unix)]
-fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, ImageBuildError> {
-    metadata
-        .blocks()
-        .checked_mul(512)
-        .ok_or_else(|| ImageBuildError::Invalid("image allocated size overflow".into()))
-}
-
-#[cfg(not(unix))]
-fn allocated_bytes(metadata: &fs::Metadata) -> Result<u64, ImageBuildError> {
-    // The Windows artifacts are dynamic VHDX files; their file length is the
-    // portable lower bound available without opening another authority-bearing
-    // filesystem handle. Quota admission remains conservative for ordinary
-    // files and is reconciled from the artifact tree at publication.
-    Ok(metadata.len())
+    Ok(sandsurf_native::storage_usage::tree_usage(root)?.allocated_bytes)
 }
 
 fn bare_digest(value: &str) -> Result<&str, ImageBuildError> {

@@ -1595,12 +1595,7 @@ fn reserve_disk_capacity(destination: &Path, requested_bytes: u64) -> Result<(),
 }
 
 fn require_allocated(path: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::metadata(path)?;
-    let allocated = metadata
-        .blocks()
-        .checked_mul(512)
-        .ok_or_else(|| LinuxError::Invalid("allocated disk size overflow".into()))?;
+    let allocated = sandsurf_native::storage_usage::object_usage(path)?.allocated_bytes;
     if allocated < requested_bytes {
         return Err(LinuxError::Invalid(
             "persistent disk capacity is not physically reserved".into(),

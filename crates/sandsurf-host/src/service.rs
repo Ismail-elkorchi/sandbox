@@ -1403,9 +1403,10 @@ impl HostService {
                         "native resource accounting is unavailable",
                     ));
                 };
-                let (logical, allocated) = directory_usage(&self.machine_root(&machine_id))?;
-                usage.disk_logical_bytes = logical;
-                usage.disk_allocated_bytes = allocated;
+                let storage =
+                    sandsurf_native::storage_usage::tree_usage(&self.machine_root(&machine_id))?;
+                usage.disk_logical_bytes = Counter::try_from(storage.logical_bytes)?;
+                usage.disk_allocated_bytes = Counter::try_from(storage.allocated_bytes)?;
                 Ok(HostResponse::Usage {
                     usage: self
                         .catalog
@@ -3430,39 +3431,6 @@ fn suspension_identities(intent: &LifecycleIntent) -> Result<(SnapshotId, Operat
 fn reserve_ephemeral_port(address: &str) -> Result<u16> {
     let listener = std::net::TcpListener::bind((address, 0))?;
     Ok(listener.local_addr()?.port())
-}
-
-fn directory_usage(root: &Path) -> Result<(Counter, Counter)> {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    let mut logical = 0_u64;
-    let mut allocated = 0_u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            for entry in fs::read_dir(&path)? {
-                pending.push(entry?.path());
-            }
-        } else if metadata.is_file() {
-            logical = logical
-                .checked_add(metadata.len())
-                .ok_or(HostError::Invalid("disk usage overflow"))?;
-            #[cfg(unix)]
-            {
-                allocated = allocated
-                    .checked_add(metadata.blocks().saturating_mul(512))
-                    .ok_or(HostError::Invalid("allocated disk usage overflow"))?;
-            }
-            #[cfg(not(unix))]
-            {
-                allocated = allocated
-                    .checked_add(metadata.len())
-                    .ok_or(HostError::Invalid("allocated disk usage overflow"))?;
-            }
-        }
-    }
-    Ok((Counter::try_from(logical)?, Counter::try_from(allocated)?))
 }
 
 fn runtime_operation(
