@@ -1378,7 +1378,6 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "libc",
- "reqwest",
  "sandsurf-image",
  "sandsurf-machine",
  "sandsurf-native",
@@ -1400,6 +1399,8 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "flate2",
+ "getrandom 0.2.17",
+ "reqwest",
  "ruzstd",
  "sandsurf-format",
  "sandsurf-native",
@@ -1407,6 +1408,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "zeroize",
 ]
 
 [[package]]

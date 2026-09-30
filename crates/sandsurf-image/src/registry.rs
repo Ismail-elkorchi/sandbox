@@ -5,18 +5,21 @@
 //! request logs. Every published blob is verified against its descriptor before
 //! it becomes visible in the shared CAS.
 
+use crate::oci::{ConversionLimits, GuestPlatform};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
-use sandsurf_image::oci::{ConversionLimits, GuestPlatform};
+use sandsurf_native::PrivateFileAccess;
+use sandsurf_native::local::{
+    create_private_directory, create_private_file, ensure_private_directory, open_private_file,
+};
+use sandsurf_native::storage::{publish_new_file, sync_directory, sync_file};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -208,10 +211,11 @@ pub fn fetch_layout(
             ));
         }
     }
-    prepare_directory(cas_root)?;
+    ensure_private_directory(cas_root)?;
+    sync_directory(cas_root.parent().expect("absolute cache has a parent"))?;
     prepare_empty_directory(destination)?;
-    prepare_directory(&destination.join("blobs"))?;
-    prepare_directory(&destination.join("blobs/sha256"))?;
+    ensure_private_directory(&destination.join("blobs"))?;
+    ensure_private_directory(&destination.join("blobs/sha256"))?;
     let client = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -330,6 +334,7 @@ pub fn fetch_layout(
     sync_directory(&destination.join("blobs/sha256"))?;
     sync_directory(&destination.join("blobs"))?;
     sync_directory(destination)?;
+    sync_directory(destination.parent().expect("absolute layout has a parent"))?;
     Ok(())
 }
 
@@ -381,16 +386,12 @@ impl RegistryClient {
         validate_descriptor(descriptor, self.limits.compressed_bytes)?;
         let hexadecimal = parse_digest(&descriptor.digest)?;
         let cas = cas_root.join("sha256").join(hexadecimal);
-        prepare_directory(&cas_root.join("sha256"))?;
-        if verify_file(&cas, &descriptor.digest, descriptor.size).is_ok() {
-            link_blob(&cas, layout, &descriptor.digest)?;
-            return Ok(());
-        }
-        if cas.exists() {
-            return Err(RegistryError::Invalid(format!(
-                "existing CAS blob {} is corrupt",
-                descriptor.digest
-            )));
+        ensure_private_directory(&cas_root.join("sha256"))?;
+        sync_directory(cas_root)?;
+        match verify_file(&cas, &descriptor.digest, descriptor.size) {
+            Ok(()) => return materialize_blob(&cas, layout, &descriptor.digest),
+            Err(RegistryError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let response = self.authorized_get(
             &format!(
@@ -411,24 +412,16 @@ impl RegistryClient {
             ));
         }
         let temporary = temporary_path(&cas_root.join("sha256"), hexadecimal)?;
-        let result = write_verified_response(response, &temporary, descriptor);
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+        let mut file = create_private_file(&temporary)?;
+        let result = write_verified_blob(response, &mut file, descriptor);
+        drop(file);
+        let result = result
+            .and_then(|()| publish_staged(&temporary, &cas, &descriptor.digest, descriptor.size));
+        if result.is_err() {
+            discard_owned_stage(&temporary);
         }
-        set_read_only(&temporary)?;
-        match fs::hard_link(&temporary, &cas) {
-            Ok(()) => {
-                fs::remove_file(&temporary)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&temporary)?;
-                verify_file(&cas, &descriptor.digest, descriptor.size)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        sync_directory(&cas_root.join("sha256"))?;
-        link_blob(&cas, layout, &descriptor.digest)
+        result?;
+        materialize_blob(&cas, layout, &descriptor.digest)
     }
 
     fn fetch_descriptor(
@@ -946,7 +939,9 @@ fn is_manifest_media(value: &str) -> bool {
 }
 
 fn parse_digest(value: &str) -> Result<&str, RegistryError> {
-    let hexadecimal = value.strip_prefix("sha256:").unwrap_or(value);
+    let hexadecimal = value.strip_prefix("sha256:").ok_or_else(|| {
+        RegistryError::Invalid("descriptor digest must name the sha256 algorithm".into())
+    })?;
     if hexadecimal.len() != 64
         || !hexadecimal
             .bytes()
@@ -1006,17 +1001,16 @@ fn read_response(mut response: Response, maximum: u64) -> Result<Vec<u8>, Regist
     Ok(bytes)
 }
 
-fn write_verified_response(
-    mut response: Response,
-    path: &Path,
+fn write_verified_blob(
+    mut source: impl Read,
+    file: &mut File,
     descriptor: &Descriptor,
 ) -> Result<(), RegistryError> {
-    let mut file = private_new_file(path)?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let count = response.read(&mut buffer)?;
+        let count = source.read(&mut buffer)?;
         if count == 0 {
             break;
         }
@@ -1036,7 +1030,7 @@ fn write_verified_response(
             "blob size or digest differs from its descriptor".into(),
         ));
     }
-    file.sync_all()?;
+    sync_file(file)?;
     Ok(())
 }
 
@@ -1047,53 +1041,97 @@ fn publish_bytes(
     bytes: &[u8],
 ) -> Result<(), RegistryError> {
     let hexadecimal = parse_digest(digest)?;
+    if hex_sha256(bytes) != hexadecimal {
+        return Err(RegistryError::Invalid("blob digest mismatch".into()));
+    }
     let directory = cas_root.join("sha256");
-    prepare_directory(&directory)?;
+    ensure_private_directory(&directory)?;
+    sync_directory(cas_root)?;
     let path = directory.join(hexadecimal);
     if path.exists() {
         verify_file(&path, digest, bytes.len() as u64)?;
     } else {
         let temporary = temporary_path(&directory, hexadecimal)?;
-        write_bytes_file(&temporary, bytes)?;
-        verify_file(&temporary, digest, bytes.len() as u64)?;
-        set_read_only(&temporary)?;
-        match fs::hard_link(&temporary, &path) {
-            Ok(()) => {
-                fs::remove_file(&temporary)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&temporary)?;
-                verify_file(&path, digest, bytes.len() as u64)?;
-            }
-            Err(error) => return Err(error.into()),
+        let mut file = create_private_file(&temporary)?;
+        let result = file.write_all(bytes).and_then(|()| sync_file(&file));
+        drop(file);
+        let result = result
+            .map_err(RegistryError::from)
+            .and_then(|()| publish_staged(&temporary, &path, digest, bytes.len() as u64));
+        if result.is_err() {
+            discard_owned_stage(&temporary);
         }
-        sync_directory(&directory)?;
+        result?;
     }
-    link_blob(&path, layout, digest)
+    materialize_blob(&path, layout, digest)
 }
 
-fn link_blob(source: &Path, layout: &Path, digest: &str) -> Result<(), RegistryError> {
+fn materialize_blob(source: &Path, layout: &Path, digest: &str) -> Result<(), RegistryError> {
     let destination = layout.join("blobs/sha256").join(parse_digest(digest)?);
+    let mut input = open_private_file(source, PrivateFileAccess::ReadOnly)?;
+    let length = input.metadata()?.len();
     if destination.exists() {
-        return verify_file(&destination, digest, fs::metadata(source)?.len());
+        return verify_file(&destination, digest, length);
     }
-    match fs::hard_link(source, &destination) {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| RegistryError::Invalid("layout blob has no parent".into()))?;
+    let staged = temporary_path(parent, parse_digest(digest)?)?;
+    let mut output = create_private_file(&staged)?;
+    let result = (|| {
+        let copied = io::copy(
+            &mut Read::by_ref(&mut input).take(
+                length
+                    .checked_add(1)
+                    .ok_or(RegistryError::Limit("blob length"))?,
+            ),
+            &mut output,
+        )?;
+        if copied != length {
+            return Err(RegistryError::Invalid(
+                "CAS blob changed during materialization".into(),
+            ));
+        }
+        sync_file(&output)?;
+        drop(output);
+        verify_file(&staged, digest, length)?;
+        publish_staged(&staged, &destination, digest, length)
+    })();
+    if result.is_err() {
+        // This path was exclusively created by this call, never another writer's stage.
+        discard_owned_stage(&staged);
+    }
+    result
+}
+
+fn discard_owned_stage(path: &Path) {
+    // Call only after exclusive creation and after closing the staging handle.
+    // Failed publication may already have moved it; never remove the target.
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = sync_directory(parent);
+    }
+}
+
+fn publish_staged(
+    staged: &Path,
+    destination: &Path,
+    digest: &str,
+    length: u64,
+) -> Result<(), RegistryError> {
+    match publish_new_file(staged, destination) {
         Ok(()) => Ok(()),
-        Err(_) if destination.exists() => {
-            verify_file(&destination, digest, fs::metadata(source)?.len())
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_file(destination, digest, length)?;
+            fs::remove_file(staged)?;
+            sync_directory(
+                staged
+                    .parent()
+                    .ok_or_else(|| RegistryError::Invalid("blob stage has no parent".into()))?,
+            )?;
+            Ok(())
         }
-        Err(_) => {
-            let mut input = File::open(source)?;
-            match private_new_file(&destination) {
-                Ok(mut output) => {
-                    io::copy(&mut input, &mut output)?;
-                    output.sync_all()?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            verify_file(&destination, digest, fs::metadata(source)?.len())
-        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1117,16 +1155,22 @@ fn temporary_path(directory: &Path, stem: &str) -> Result<std::path::PathBuf, Re
 }
 
 fn verify_file(path: &Path, digest: &str, length: u64) -> Result<(), RegistryError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != length {
+    let mut file = open_private_file(path, PrivateFileAccess::ReadOnly)?;
+    if file.metadata()?.len() != length {
         return Err(RegistryError::Invalid(
             "CAS blob type or size differs from its descriptor".into(),
         ));
     }
-    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut HashWriter(&mut hasher))?;
-    if format!("sha256:{:x}", hasher.finalize()) != digest {
+    let copied = io::copy(
+        &mut Read::by_ref(&mut file).take(
+            length
+                .checked_add(1)
+                .ok_or(RegistryError::Limit("blob length"))?,
+        ),
+        &mut HashWriter(&mut hasher),
+    )?;
+    if copied != length || format!("sha256:{:x}", hasher.finalize()) != digest {
         return Err(RegistryError::Invalid("CAS blob digest mismatch".into()));
     }
     Ok(())
@@ -1159,72 +1203,15 @@ fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), RegistryEr
 }
 
 fn write_bytes_file(path: &Path, bytes: &[u8]) -> Result<(), RegistryError> {
-    let mut file = private_new_file(path)?;
+    let mut file = create_private_file(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    sync_file(&file)?;
     Ok(())
 }
 
 fn prepare_empty_directory(path: &Path) -> Result<(), RegistryError> {
-    if path.exists() {
-        return Err(RegistryError::Invalid(
-            "OCI layout destination already exists".into(),
-        ));
-    }
-    prepare_directory(path)
-}
-
-fn prepare_directory(path: &Path) -> Result<(), RegistryError> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
-        Ok(_) => {
-            return Err(RegistryError::Invalid(
-                "registry storage object is not a directory".into(),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    fs::DirBuilder::new().mode(0o700).create(path)?;
-    #[cfg(not(unix))]
-    fs::create_dir(path)?;
+    create_private_directory(path)?;
     Ok(())
-}
-
-fn private_new_file(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options.open(path)
-}
-
-fn set_read_only(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o400))
-    }
-    #[cfg(not(unix))]
-    {
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(path, permissions)
-    }
-}
-
-fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
 }
 
 fn require_auth_field(value: &str) -> Result<(), RegistryError> {
@@ -1243,6 +1230,209 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StorageFixture(std::path::PathBuf);
+
+    impl StorageFixture {
+        fn new() -> Self {
+            let root = temporary_path(&std::env::temp_dir(), "sandsurf-registry-test").unwrap();
+            create_private_directory(&root).unwrap();
+            ensure_private_directory(&root.join("cas")).unwrap();
+            Self(root)
+        }
+
+        fn layout(&self, name: &str) -> std::path::PathBuf {
+            let path = self.0.join(name);
+            prepare_empty_directory(&path).unwrap();
+            ensure_private_directory(&path.join("blobs")).unwrap();
+            ensure_private_directory(&path.join("blobs/sha256")).unwrap();
+            path
+        }
+    }
+
+    impl Drop for StorageFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_and_layout_have_independently_owned_verified_bytes() {
+        let fixture = StorageFixture::new();
+        let layout = fixture.layout("layout");
+        let bytes = b"binary\0payload\xff";
+        let digest = format!("sha256:{}", hex_sha256(bytes));
+        let name = parse_digest(&digest).unwrap();
+        let cache = fixture.0.join("cas/sha256").join(name);
+        let copied = layout.join("blobs/sha256").join(name);
+        publish_bytes(&fixture.0.join("cas"), &layout, &digest, bytes).unwrap();
+        verify_file(&cache, &digest, bytes.len() as u64).unwrap();
+        verify_file(&copied, &digest, bytes.len() as u64).unwrap();
+        let modified = fs::metadata(&cache).unwrap().modified().unwrap();
+        publish_bytes(&fixture.0.join("cas"), &layout, &digest, bytes).unwrap();
+        assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), modified);
+        // A layout consumer cannot alter the cache through a shared inode.
+        let mut file = open_private_file(&copied, PrivateFileAccess::ReadWrite).unwrap();
+        file.write_all(b"broken").unwrap();
+        drop(file);
+        verify_file(&cache, &digest, bytes.len() as u64).unwrap();
+        assert!(publish_bytes(&fixture.0.join("cas"), &layout, &digest, bytes).is_err());
+        assert_eq!(fs::read(&copied).unwrap()[..6], *b"broken");
+    }
+
+    #[test]
+    fn corrupt_cache_is_rejected_without_repair_or_layout_publication() {
+        let fixture = StorageFixture::new();
+        let layout = fixture.layout("layout");
+        let bytes = b"expected";
+        let digest = format!("sha256:{}", hex_sha256(bytes));
+        let directory = fixture.0.join("cas/sha256");
+        ensure_private_directory(&directory).unwrap();
+        let cache = directory.join(parse_digest(&digest).unwrap());
+        write_bytes_file(&cache, b"corrupt!").unwrap();
+        assert!(publish_bytes(&fixture.0.join("cas"), &layout, &digest, bytes).is_err());
+        assert_eq!(fs::read(&cache).unwrap(), b"corrupt!");
+        assert_eq!(
+            fs::read_dir(layout.join("blobs/sha256")).unwrap().count(),
+            0
+        );
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn incorrect_digest_never_creates_a_cache_object_or_stage() {
+        let fixture = StorageFixture::new();
+        let layout = fixture.layout("layout");
+        let digest = format!("sha256:{}", hex_sha256(b"other"));
+        assert!(publish_bytes(&fixture.0.join("cas"), &layout, &digest, b"payload").is_err());
+        assert_eq!(fs::read_dir(fixture.0.join("cas")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(layout.join("blobs/sha256")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_publication_reuses_only_verified_objects_and_leaves_no_stages() {
+        let fixture = StorageFixture::new();
+        let layouts: Vec<_> = (0..4)
+            .map(|index| fixture.layout(&format!("layout-{index}")))
+            .collect();
+        let bytes = vec![0x5a; 256 * 1024];
+        let digest = format!("sha256:{}", hex_sha256(&bytes));
+        let cas = fixture.0.join("cas");
+        ensure_private_directory(&cas.join("sha256")).unwrap();
+        let barrier = std::sync::Barrier::new(layouts.len());
+        std::thread::scope(|scope| {
+            for layout in &layouts {
+                scope.spawn(|| {
+                    barrier.wait();
+                    publish_bytes(&cas, layout, &digest, &bytes).unwrap();
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(cas.join("sha256")).unwrap().count(), 1);
+        for layout in layouts {
+            assert_eq!(
+                fs::read_dir(layout.join("blobs/sha256")).unwrap().count(),
+                1
+            );
+            verify_file(
+                &layout
+                    .join("blobs/sha256")
+                    .join(parse_digest(&digest).unwrap()),
+                &digest,
+                bytes.len() as u64,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn existing_layout_identity_is_never_adopted() {
+        let fixture = StorageFixture::new();
+        let layout = fixture.layout("layout");
+        assert!(prepare_empty_directory(&layout).is_err());
+    }
+
+    #[test]
+    fn streamed_blob_must_match_both_declared_size_and_digest() {
+        let fixture = StorageFixture::new();
+        let descriptor = Descriptor {
+            media_type: CONFIG_MEDIA.into(),
+            digest: format!("sha256:{}", hex_sha256(b"expected")),
+            size: 8,
+            platform: None,
+            annotations: BTreeMap::new(),
+        };
+        for (index, payload) in [
+            b"expected".as_slice(),
+            b"truncated".as_slice(),
+            b"broken!!".as_slice(),
+            b"short".as_slice(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = fixture.0.join(format!("stream-{index}"));
+            let mut file = create_private_file(&path).unwrap();
+            let result = write_verified_blob(*payload, &mut file, &descriptor);
+            drop(file);
+            assert_eq!(result.is_ok(), index == 0);
+            if index == 0 {
+                verify_file(&path, &descriptor.digest, descriptor.size).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unbounded_blob_source_is_stopped_before_oversized_bytes_are_written() {
+        struct Endless(usize);
+        impl Read for Endless {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0 += bytes.len();
+                bytes.fill(0);
+                Ok(bytes.len())
+            }
+        }
+        let fixture = StorageFixture::new();
+        let path = fixture.0.join("stream");
+        let mut file = create_private_file(&path).unwrap();
+        let descriptor = Descriptor {
+            media_type: LAYER_MEDIA[0].into(),
+            digest: format!("sha256:{}", hex_sha256(&[0; 4])),
+            size: 4,
+            platform: None,
+            annotations: BTreeMap::new(),
+        };
+        let mut source = Endless(0);
+        assert!(write_verified_blob(&mut source, &mut file, &descriptor).is_err());
+        assert_eq!(source.0, 64 * 1024);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cache_object_is_not_followed_or_replaced() {
+        let fixture = StorageFixture::new();
+        let layout = fixture.layout("layout");
+        let bytes = b"expected";
+        let digest = format!("sha256:{}", hex_sha256(bytes));
+        let directory = fixture.0.join("cas/sha256");
+        ensure_private_directory(&directory).unwrap();
+        let outside = fixture.0.join("outside");
+        write_bytes_file(&outside, bytes).unwrap();
+        let cache = directory.join(parse_digest(&digest).unwrap());
+        std::os::unix::fs::symlink(&outside, &cache).unwrap();
+        assert!(publish_bytes(&fixture.0.join("cas"), &layout, &digest, bytes).is_err());
+        assert!(
+            fs::symlink_metadata(cache)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(outside).unwrap(), bytes);
+    }
 
     #[test]
     fn references_are_canonical_and_digest_bound() {
@@ -1266,6 +1456,8 @@ mod tests {
         ] {
             assert!(parse_reference(invalid).is_err(), "accepted {invalid}");
         }
+        assert!(parse_reference(&format!("registry.example/image@{digest}")).is_err());
+        assert!(parse_digest(&format!("sha512:{digest}")).is_err());
     }
 
     #[test]
@@ -1319,10 +1511,8 @@ mod tests {
     #[test]
     #[ignore = "requires public registry network access"]
     fn public_registry_pull_is_digest_verified_and_layout_readable() {
-        let root =
-            std::env::temp_dir().join(format!("sandsurf-registry-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir(&root).unwrap();
+        let fixture = StorageFixture::new();
+        let root = &fixture.0;
         let layout = root.join("layout");
         fetch_layout(
             &root.join("cas"),
@@ -1339,7 +1529,7 @@ mod tests {
             ConversionLimits::default(),
         )
         .unwrap();
-        sandsurf_image::oci::OciLayout::open(&layout, ConversionLimits::default())
+        crate::oci::OciLayout::open(&layout, ConversionLimits::default())
             .unwrap()
             .resolve(&GuestPlatform {
                 architecture: std::env::consts::ARCH
@@ -1349,6 +1539,5 @@ mod tests {
                 variant: None,
             })
             .unwrap();
-        fs::remove_dir_all(root).unwrap();
     }
 }

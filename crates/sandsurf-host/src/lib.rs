@@ -12,7 +12,6 @@ pub mod images;
 mod ipc_frames;
 #[cfg(target_os = "linux")]
 pub mod linux;
-mod registry;
 pub mod secrets;
 pub mod service;
 mod snapshots;

@@ -351,7 +351,8 @@ impl LinuxGuardianEffect {
         fs::metadata("/dev/kvm").map_err(|_| LinuxError::Invalid("KVM is unavailable".into()))?;
         let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
         let disks = machine_root.join("disks");
-        fs::create_dir_all(&disks)?;
+        sandsurf_native::local::ensure_private_directory(&disks)?;
+        sandsurf_native::storage::sync_directory(machine_root)?;
         let system_disk = disks.join("system.ext4");
 
         let active = Arc::new(Mutex::new(None));
@@ -1762,7 +1763,10 @@ mod storage_tests {
         let source = root.join("root-controlled-seed");
         let destination = root.join("system.ext4");
         let contents = b"deliberately invalid filesystem metadata";
-        fs::write(&source, contents).unwrap();
+        sandsurf_native::local::create_private_file(&source)
+            .unwrap()
+            .write_all(contents)
+            .unwrap();
         ensure_mutable_disk(&source, &destination, 8192).unwrap();
         assert_eq!(fs::metadata(&destination).unwrap().len(), 8192);
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);

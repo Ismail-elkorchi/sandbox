@@ -306,6 +306,7 @@ impl AppleGuardianEffect {
         let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
         let disks = machine_root.join("disks");
         ensure_private_directory(&disks)?;
+        sandsurf_native::storage::sync_directory(machine_root)?;
         let system_disk = disks.join("system.ext4");
         let authentication_disk = machine_root.join("guardian/auth.img");
         let apple = AppleConfig {

@@ -2,10 +2,11 @@
 //! published name may be attached. The guardian's exclusive ownership is held
 //! throughout preparation and recovery; staging files never represent a VM.
 
-use std::fs::{self, File, OpenOptions};
-use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use sandsurf_native::PrivateFileAccess;
+use sandsurf_native::local::{create_private_file, open_private_file};
+use sandsurf_native::storage::{publish_new_file, sync_directory, sync_file};
+use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
 
 const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -39,8 +40,47 @@ pub(crate) fn materialize(
     format: DiskFormat,
     prepare_storage: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    if !source.is_absolute()
-        || !destination.is_absolute()
+    if !source.is_absolute() {
+        return Err(invalid("creation seed path must be absolute"));
+    }
+    publish_disk(destination, bytes, format, |staged| {
+        let mut input = open_private_file(source, PrivateFileAccess::ReadOnly)?;
+        let source_metadata = input.metadata()?;
+        if source_metadata.len() == 0 || source_metadata.len() > MAX_DISK_BYTES {
+            return Err(invalid("creation seed must be a bounded regular file"));
+        }
+        if format.is_raw() && source_metadata.len() > bytes {
+            return Err(invalid(
+                "creation seed exceeds the authorized disk capacity",
+            ));
+        }
+        let mut output = create_private_file(staged)?;
+        if io::copy(
+            &mut Read::by_ref(&mut input).take(source_metadata.len() + 1),
+            &mut output,
+        )? != source_metadata.len()
+            || input.metadata()?.len() != source_metadata.len()
+        {
+            return Err(invalid("creation seed changed during materialization"));
+        }
+        if format.is_raw() {
+            output.set_len(bytes)?;
+        }
+        sync_file(&output)?;
+        drop(output);
+        prepare_storage(staged)
+    })
+}
+
+/// The single publication path for creation seeds and snapshot-derived forks.
+/// Callers may construct raw/VHDX content, but only this owner makes it attachable.
+pub(crate) fn publish_disk(
+    destination: &Path,
+    bytes: u64,
+    format: DiskFormat,
+    build: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if !destination.is_absolute()
         || bytes == 0
         || bytes > MAX_DISK_BYTES
         || !bytes.is_multiple_of(4096)
@@ -56,48 +96,22 @@ pub(crate) fn materialize(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let source_metadata = fs::symlink_metadata(source)?;
-    if !source_metadata.is_file()
-        || source_metadata.file_type().is_symlink()
-        || source_metadata.len() == 0
-        || source_metadata.len() > MAX_DISK_BYTES
-    {
-        return Err(invalid("creation seed must be a bounded regular file"));
-    }
-    if format.is_raw() && source_metadata.len() > bytes {
-        return Err(invalid(
-            "creation seed exceeds the authorized disk capacity",
-        ));
-    }
     let staged = destination.with_extension("building");
     // An interrupted build was never attachable. Recreate it from the
     // verified seed instead of treating partial contents as complete.
     reclaim_staging(&staged)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut output = options.open(&staged)?;
-    let mut input = File::open(source)?;
-    if io::copy(&mut input, &mut output)? != source_metadata.len() {
-        return Err(invalid("creation seed changed during materialization"));
-    }
-    if format.is_raw() {
-        output.set_len(bytes)?;
-    }
-    output.sync_all()?;
-    drop(output);
-    prepare_storage(&staged)?;
+    build(&staged)?;
     validate_disk(&staged, bytes, format)?;
-    sandsurf_native::storage::publish_new_file(&staged, destination)
+    publish_new_file(&staged, destination)
 }
 
 fn reclaim_staging(staged: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(staged) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            fs::remove_file(staged)
+    match open_private_file(staged, PrivateFileAccess::ReadOnly) {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(staged)?;
+            sync_directory(staged.parent().expect("validated storage path"))
         }
-        Ok(_) => Err(invalid("interrupted storage build is not a regular file")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
@@ -111,22 +125,19 @@ pub(crate) fn retire(disk: &Path) -> io::Result<()> {
     }
     reclaim_staging(&disk.with_extension("building"))?;
     reclaim_staging(disk)?;
-    #[cfg(unix)]
-    File::open(disk.parent().expect("validated parent"))?.sync_all()?;
+    sync_directory(disk.parent().expect("validated parent"))?;
     Ok(())
 }
 
 fn validate_disk(path: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(invalid("persistent disk is not a regular file"));
-    }
+    let file = open_private_file(path, PrivateFileAccess::ReadOnly)?;
     let actual = match format {
         #[cfg(any(unix, test))]
-        DiskFormat::Raw => metadata.len(),
+        DiskFormat::Raw => file.metadata()?.len(),
         #[cfg(windows)]
         DiskFormat::Vhdx => sandsurf_native::virtual_disk::virtual_disk_size(path)?,
     };
+    drop(file);
     if actual != bytes {
         return Err(invalid(
             "persistent disk capacity differs from host authority",
@@ -142,6 +153,130 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandsurf_native::local::create_private_directory;
+    use std::io::Write;
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut nonce = [0_u8; 16];
+            getrandom::getrandom(&mut nonce).unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "sandsurf-private-storage-{:032x}",
+                u128::from_le_bytes(nonce)
+            ));
+            create_private_directory(&root).unwrap();
+            create_private_file(&root.join("seed"))
+                .unwrap()
+                .write_all(b"seed bytes")
+                .unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn shared_disk_identity_is_never_attached_or_deleted() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.raw");
+        materialize(
+            &fixture.0.join("seed"),
+            &target,
+            4096,
+            DiskFormat::Raw,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let alias = fixture.0.join("other-owner.raw");
+        fs::hard_link(&target, &alias).unwrap();
+        assert!(
+            materialize(
+                &fixture.0.join("seed"),
+                &target,
+                4096,
+                DiskFormat::Raw,
+                |_| panic!("shared live disk must not be prepared")
+            )
+            .is_err()
+        );
+        assert!(retire(&target).is_err());
+        assert!(target.exists());
+        assert!(alias.exists());
+        fs::remove_file(alias).unwrap();
+        retire(&target).unwrap();
+    }
+
+    #[test]
+    fn linked_interrupted_stage_cannot_reclaim_another_owners_seed() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("seed");
+        let target = fixture.0.join("system.raw");
+        let staged = target.with_extension("building");
+        fs::hard_link(&source, &staged).unwrap();
+        assert!(
+            materialize(&source, &target, 4096, DiskFormat::Raw, |_| panic!(
+                "unowned stage must not be prepared"
+            ))
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"seed bytes");
+        assert!(staged.exists());
+    }
+
+    #[test]
+    fn invalid_prepared_geometry_never_publishes_and_recovery_recreates_owned_stage() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("seed");
+        let target = fixture.0.join("system.raw");
+        assert!(
+            materialize(&source, &target, 4096, DiskFormat::Raw, |staged| {
+                open_private_file(staged, PrivateFileAccess::ReadWrite)?.set_len(8192)
+            })
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            fs::metadata(target.with_extension("building"))
+                .unwrap()
+                .len(),
+            8192
+        );
+        materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().len(), 4096);
+        assert_eq!(&fs::read(target).unwrap()[..10], b"seed bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_seed_stage_and_published_disk_are_rejected_intact() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("seed");
+        let alias = fixture.0.join("seed-link");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let target = fixture.0.join("system.raw");
+        assert!(materialize(&alias, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
+        std::os::unix::fs::symlink(&source, target.with_extension("building")).unwrap();
+        assert!(materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
+        assert!(retire(&target).is_err());
+        fs::remove_file(target.with_extension("building")).unwrap();
+        std::os::unix::fs::symlink(&source, &target).unwrap();
+        assert!(materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).is_err());
+        assert!(retire(&target).is_err());
+        assert_eq!(fs::read(source).unwrap(), b"seed bytes");
+        assert!(
+            fs::symlink_metadata(target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn interrupted_preparation_never_publishes_and_restart_never_interprets_live_disk() {
@@ -153,10 +288,13 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir(&root).unwrap();
+        create_private_directory(&root).unwrap();
         let source = root.join("seed.ext4");
         let target = root.join("system.ext4");
-        fs::write(&source, b"verified-seed").unwrap();
+        create_private_file(&source)
+            .unwrap()
+            .write_all(b"verified-seed")
+            .unwrap();
         assert!(
             materialize(&source, &target, 4096, DiskFormat::Raw, |_| {
                 Err(io::Error::other("interrupted seed preparation"))
@@ -168,11 +306,13 @@ mod tests {
         materialize(&source, &target, 4096, DiskFormat::Raw, |_| Ok(())).unwrap();
         assert!(!target.with_extension("building").exists());
         fs::remove_file(&source).unwrap();
-        let disk = OpenOptions::new().write(true).open(&target).unwrap();
-        use std::io::Write;
+        let disk = open_private_file(&target, PrivateFileAccess::ReadWrite).unwrap();
         (&disk).write_all(b"guest-owned!").unwrap();
         drop(disk);
-        fs::hard_link(&target, target.with_extension("building")).unwrap();
+        create_private_file(&target.with_extension("building"))
+            .unwrap()
+            .write_all(b"unpublished build")
+            .unwrap();
         materialize(&source, &target, 4096, DiskFormat::Raw, |_| {
             panic!("published guest disk must never enter seed preparation")
         })
@@ -181,7 +321,10 @@ mod tests {
         assert_eq!(&fs::read(&target).unwrap()[..12], b"guest-owned!");
         assert!(materialize(&source, &target, 8192, DiskFormat::Raw, |_| Ok(())).is_err());
         let retained = root.join("retained-output");
-        fs::write(&retained, b"protected bytes").unwrap();
+        create_private_file(&retained)
+            .unwrap()
+            .write_all(b"protected bytes")
+            .unwrap();
         retire(&target).unwrap();
         assert!(!target.exists());
         retire(&target).unwrap();

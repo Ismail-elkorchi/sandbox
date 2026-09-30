@@ -23,7 +23,6 @@ sha2.workspace = true
 hmac.workspace = true
 unicode-normalization.workspace = true
 zeroize.workspace = true
-reqwest.workspace = true
 sandsurf-network = { path = "../sandsurf-network" }
 
 [target.'cfg(target_os = "windows")'.dependencies]

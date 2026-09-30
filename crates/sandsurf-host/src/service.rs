@@ -3507,34 +3507,9 @@ fn open_guardian_log(path: &Path) -> Result<fs::File> {
         .open(path)?)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn prepare_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    if !path.exists() {
-        fs::DirBuilder::new().mode(0o700).create(path)?;
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(HostError::Invalid(
-            "host state directory must be private and non-symbolic",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn prepare_directory(path: &Path) -> Result<()> {
-    if !path.exists() {
-        sandsurf_native::local::create_private_directory(path)?;
-    }
-    if !fs::symlink_metadata(path)?.is_dir() {
-        return Err(HostError::Invalid(
-            "host state path is not a private directory",
-        ));
-    }
+    sandsurf_native::local::ensure_private_directory(path)?;
     Ok(())
 }
 

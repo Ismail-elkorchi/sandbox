@@ -5,10 +5,8 @@ use sandsurf_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const COPY_BUFFER: usize = 1024 * 1024;
@@ -150,7 +148,7 @@ pub fn capture_filesystem(
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
     sync_directory(&stage)?;
-    match fs::rename(&stage, &final_directory) {
+    match sandsurf_native::storage::publish_new_directory(&stage, &final_directory) {
         Ok(()) => sync_directory(root)?,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             remove_stage(&stage)?;
@@ -276,7 +274,7 @@ pub fn capture_full(
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
     sync_directory(&stage)?;
-    match fs::rename(&stage, &final_directory) {
+    match sandsurf_native::storage::publish_new_directory(&stage, &final_directory) {
         Ok(()) => sync_directory(root)?,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             remove_stage(&stage)?;
@@ -300,32 +298,54 @@ pub fn materialize_fork(root: &Path, snapshot: &Snapshot, destination: &Path) ->
     let source = snapshot_disk(root, snapshot)?;
     let source_container = published_container(root, snapshot)?;
     let destination_container = disk_container(destination)?;
-    if destination.exists() {
-        let actual = materialized_digest(
-            destination,
-            snapshot.system_disk_bytes.get(),
-            destination_container,
-        )?;
-        return if &actual == expected {
-            Ok(())
-        } else {
-            Err(SnapshotError::Invalid(
-                "fork destination already contains different state",
-            ))
-        };
-    }
     let parent = destination
         .parent()
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
-    materialize_disk(
-        &source,
+    let format = match destination_container {
+        #[cfg(any(unix, test))]
+        DiskContainer::RawExt4 => crate::storage::DiskFormat::Raw,
+        #[cfg(target_os = "windows")]
+        DiskContainer::Vhdx => crate::storage::DiskFormat::Vhdx,
+        #[cfg(not(target_os = "windows"))]
+        DiskContainer::Vhdx => {
+            return Err(SnapshotError::Invalid(
+                "VHDX materialization requires the Windows host driver",
+            ));
+        }
+        #[cfg(all(target_os = "windows", not(test)))]
+        DiskContainer::RawExt4 => {
+            return Err(SnapshotError::Invalid(
+                "Windows machine forks require VHDX storage",
+            ));
+        }
+    };
+    crate::storage::publish_disk(
         destination,
         snapshot.system_disk_bytes.get(),
-        expected,
-        source_container,
-        destination_container,
+        format,
+        |staged| {
+            materialize_disk(
+                &source,
+                staged,
+                snapshot.system_disk_bytes.get(),
+                expected,
+                source_container,
+                destination_container,
+            )
+            .map_err(io::Error::other)
+        },
     )?;
+    if materialized_digest(
+        destination,
+        snapshot.system_disk_bytes.get(),
+        destination_container,
+    )? != *expected
+    {
+        return Err(SnapshotError::Invalid(
+            "fork destination contains different state",
+        ));
+    }
     sync_directory(parent)
 }
 
@@ -650,8 +670,7 @@ pub(crate) fn copy_and_verify(
     }
     let mut destination = open_write(destination_path)?;
     destination.set_len(0)?;
-    let cloned = try_clone(&source, &destination);
-    if !cloned {
+    {
         let mut buffer = vec![0_u8; COPY_BUFFER];
         let mut remaining = length;
         while remaining != 0 {
@@ -714,28 +733,20 @@ fn write_manifest(path: &Path, manifest: &SnapshotManifest) -> Result<()> {
 }
 
 fn open_read(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options.open(path)
+    sandsurf_native::local::open_private_file(path, sandsurf_native::PrivateFileAccess::ReadOnly)
 }
 
 fn open_write(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        options.mode(0o600);
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    match sandsurf_native::local::create_private_file(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            sandsurf_native::local::open_private_file(
+                path,
+                sandsurf_native::PrivateFileAccess::ReadWrite,
+            )
+        }
+        Err(error) => Err(error),
     }
-    options.open(path)
-}
-
-fn try_clone(_: &File, _: &File) -> bool {
-    // Full copy is the portable baseline. Platform clone accelerators may be
-    // added only after their sharing and durability behavior is qualified.
-    false
 }
 
 fn disk_container(path: &Path) -> Result<DiskContainer> {
@@ -753,8 +764,6 @@ fn remove_stage(stage: &Path) -> Result<()> {
         "manifest.json",
         "system.ext4",
         "system.vhdx",
-        "control-state.ext4",
-        "control-state.vhdx",
         "snapshot.vmstate",
         "memory",
         "reconnect.json",
@@ -855,7 +864,10 @@ mod tests {
         let root = temp.0.join("snapshots");
         private_directory(&root).unwrap();
         let source = temp.0.join("source.raw");
-        fs::write(&source, vec![7_u8; 4096]).unwrap();
+        open_write(&source)
+            .unwrap()
+            .write_all(&vec![7_u8; 4096])
+            .unwrap();
         let mut snapshot = snapshot();
         let captured = capture_filesystem(&root, &snapshot, &source).unwrap();
         snapshot.phase = SnapshotPhase::Ready;
@@ -864,9 +876,20 @@ mod tests {
         snapshot.manifest_digest = Some(captured.manifest_digest);
 
         let fork_directory = temp.0.join("fork");
+        private_directory(&fork_directory).unwrap();
         let fork = fork_directory.join("system.ext4");
+        // An interrupted fork leaves only a private, non-attachable stage.
+        let interrupted = fork.with_extension("building");
+        open_write(&interrupted)
+            .unwrap()
+            .write_all(b"partial fork")
+            .unwrap();
         materialize_fork(&root, &snapshot, &fork).unwrap();
+        assert!(!interrupted.exists());
+        assert_eq!(file_digest(&fork, 4096).unwrap(), captured.disk_digest);
         fs::write(&fork, vec![8_u8; 4096]).unwrap();
+        assert!(materialize_fork(&root, &snapshot, &fork).is_err());
+        assert_eq!(fs::read(&fork).unwrap(), vec![8_u8; 4096]);
         assert_eq!(
             file_digest(&root.join("snapshot/system.ext4"), 4096).unwrap(),
             captured.disk_digest
@@ -875,7 +898,10 @@ mod tests {
         let target_directory = temp.0.join("target");
         private_directory(&target_directory).unwrap();
         let target = target_directory.join("system.ext4");
-        fs::write(&target, vec![9_u8; 4096]).unwrap();
+        open_write(&target)
+            .unwrap()
+            .write_all(&vec![9_u8; 4096])
+            .unwrap();
         rollback(&root, &snapshot, &target, &"rollback".try_into().unwrap()).unwrap();
         assert_eq!(file_digest(&target, 4096).unwrap(), captured.disk_digest);
     }

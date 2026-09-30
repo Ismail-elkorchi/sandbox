@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod ext4;
 pub mod oci;
+pub mod registry;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sandsurf_format::identity_digest;
@@ -446,12 +447,14 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
                     "copy source grew beyond its byte bound".into(),
                 ));
             }
-            sandsurf_native::storage::sync_file(&output)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444))?;
+                // Immutability does not grant other host accounts access. The
+                // published bundle belongs to the private host storage owner.
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o400))?;
             }
+            sandsurf_native::storage::sync_file(&output)?;
         }
         let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;
         if copied.manifest_digest != image.manifest_digest {
@@ -738,6 +741,23 @@ mod tests {
             },
         )
         .unwrap();
+        for artifact in [
+            &retained.manifest_path,
+            &retained.kernel_path,
+            &retained.system_path,
+        ] {
+            let held = sandsurf_native::local::open_private_file(
+                artifact,
+                sandsurf_native::PrivateFileAccess::ReadOnly,
+            )
+            .unwrap();
+            assert!(held.metadata().unwrap().is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(held.metadata().unwrap().permissions().mode() & 0o777, 0o400);
+            }
+        }
         assert_eq!(fs::read(retained.kernel_path).unwrap(), b"kernel");
         assert_eq!(fs::read(retained.system_path).unwrap(), b"system");
     }

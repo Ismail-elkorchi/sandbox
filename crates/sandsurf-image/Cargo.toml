@@ -7,11 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 ed25519-dalek.workspace = true
+getrandom.workspace = true
 sandsurf-format = { path = "../sandsurf-format" }
 sandsurf-native = { path = "../sandsurf-native" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+reqwest.workspace = true
+zeroize.workspace = true
 flate2 = "=1.1.10"
 ruzstd = "=0.9.0"
 tar = "=0.4.46"

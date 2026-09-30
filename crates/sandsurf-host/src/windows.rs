@@ -267,7 +267,8 @@ impl WindowsGuardianEffect {
             .windows_x64
             .ok_or_else(|| WindowsError::Invalid("image has no Windows boot artifacts".into()))?;
         let disks = machine_root.join("disks");
-        fs::create_dir_all(&disks)?;
+        sandsurf_native::local::ensure_private_directory(&disks)?;
+        sandsurf_native::storage::sync_directory(machine_root)?;
         let system_disk = disks.join("system.vhdx");
         let ports = vec![
             GUEST_BOOTSTRAP_PORT,

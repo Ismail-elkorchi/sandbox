@@ -322,7 +322,7 @@ pub(crate) fn import_oci(
         }
         OciSource::Registry { reference, .. } => {
             let layout = stage.join("layout");
-            crate::registry::fetch_layout(
+            sandsurf_image::registry::fetch_layout(
                 &host_root.join("images/blobs"),
                 &layout,
                 reference,

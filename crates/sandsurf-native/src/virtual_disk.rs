@@ -310,8 +310,10 @@ pub fn import_raw(source: &Path, destination: &Path, bytes: u64) -> io::Result<(
             "raw import paths or geometry are invalid",
         ));
     }
+    // Creation acquires this path. Failed acquisition must never authorize
+    // deletion of another operation's existing disk.
+    let disk = create_vhdx(destination, bytes)?;
     let result = (|| {
-        let disk = create_vhdx(destination, bytes)?;
         let attached = AttachedDisk::attach(disk, false)?;
         let mut physical = OpenOptions::new()
             .read(true)
@@ -365,4 +367,42 @@ fn copy_exact(source: &mut File, destination: &mut File, bytes: u64) -> io::Resu
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_import_cannot_delete_an_existing_destination() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-vhdx-acquisition-{}-{nonce:x}",
+            std::process::id()
+        ));
+        crate::local::create_private_directory(&root).unwrap();
+        let source = root.join("source.raw");
+        let destination = root.join("owned.vhdx");
+        crate::local::create_private_file(&source)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        crate::local::create_private_file(&destination)
+            .unwrap()
+            .write_all(b"another operation's disk")
+            .unwrap();
+        assert_eq!(
+            import_raw(&source, &destination, 1024 * 1024)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"another operation's disk");
+        fs::remove_file(source).unwrap();
+        fs::remove_file(destination).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }
