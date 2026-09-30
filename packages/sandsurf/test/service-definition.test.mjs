@@ -5,27 +5,40 @@ import { renderSandsurfServiceDefinition } from '../dist/index.js';
 const directory = '/state/agent one';
 const binary = '/opt/sandsurf/bin/sandsurf-host';
 
-test('service definitions bind one explicit state store on every supported host', () => {
+test('host API and guardian supervision have independent native service owners', () => {
   const linux = renderSandsurfServiceDefinition({ directory, binary, platform: 'linux' });
   assert.equal(linux.format, 'systemd-user');
-  assert.match(linux.contents, /NoNewPrivileges=true/u);
-  assert.match(linux.contents, /serve --directory "\/state\/agent one"/u);
+  assert.equal(linux.files.length, 2);
+  const [supervisor, host] = linux.files;
+  assert.match(supervisor.contents, /supervise --directory "\/state\/agent one"/u);
+  assert.match(host.contents, /serve --directory "\/state\/agent one"/u);
+  assert.ok(host.contents.includes(`Wants=${supervisor.name}`));
+  for (const file of linux.files) {
+    assert.match(file.contents, /NoNewPrivileges=true/u);
+    assert.doesNotMatch(file.contents, /KillMode=process|PartOf=|BindsTo=|PrivateTmp=/u);
+  }
 
   const macos = renderSandsurfServiceDefinition({ directory, binary, platform: 'macos' });
-  assert.equal(macos.format, 'launchd-agent');
-  assert.match(macos.contents, /<string>serve<\/string>/u);
-  assert.match(macos.contents, /<string>\/state\/agent one<\/string>/u);
+  assert.equal(macos.files.length, 2);
+  assert.match(macos.files[0].contents, /<string>supervise<\/string>/u);
+  assert.match(macos.files[1].contents, /<string>serve<\/string>/u);
+  assert.notEqual(macos.files[0].name, macos.files[1].name);
 
-  const windows = renderSandsurfServiceDefinition({
-    directory: 'C:\\Sandsurf State',
-    binary: 'C:\\Program Files\\Sandsurf\\sandsurf-host.exe',
-    platform: 'windows'
-  });
+  const windows = renderSandsurfServiceDefinition({ directory: 'C:\\Sandsurf State', binary: 'C:\\Program Files\\Sandsurf\\sandsurf-host.exe', platform: 'windows' });
   assert.equal(windows.format, 'windows-scm-powershell');
-  assert.match(windows.contents, /New-Service/u);
-  assert.match(windows.contents, /service --directory/u);
-  assert.match(windows.contents, /--service-name/u);
-  assert.match(windows.contents, /-Credential/u);
+  assert.equal(windows.files.length, 1);
+  assert.equal((windows.files[0].contents.match(/New-Service/gu) ?? []).length, 2);
+  assert.match(windows.files[0].contents, /--role supervisor/u);
+  assert.match(windows.files[0].contents, /--role host/u);
+  assert.match(windows.files[0].contents, /-DependsOn 'sandsurf-supervisor-/u);
+  assert.match(windows.files[0].contents, /-Credential/u);
+  assert.deepEqual(linux, renderSandsurfServiceDefinition({ directory, binary, platform: 'linux' }));
+});
 
-  assert.equal(linux.name, renderSandsurfServiceDefinition({ directory, binary, platform: 'linux' }).name);
+test('service paths are literal arguments, not unit syntax or environment expressions', () => {
+  const result = renderSandsurfServiceDefinition({ directory: '/state/$name%h', binary, platform: 'linux' });
+  assert.match(result.files[0].contents, /\/state\/\$\$name%%h/u);
+  for (const platform of ['linux', 'macos', 'windows']) {
+    assert.throws(() => renderSandsurfServiceDefinition({ directory: platform === 'windows' ? 'C:\\state\nExecStart=evil' : '/state\nExecStart=evil', binary: platform === 'windows' ? 'C:\\host.exe' : binary, platform }), /control/u);
+  }
 });

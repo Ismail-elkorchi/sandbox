@@ -36,7 +36,7 @@ export async function main(arguments_: readonly string[]): Promise<number> {
     process.stdout.write(
       options.json
         ? `${JSON.stringify(definition, null, 2)}\n`
-        : `# ${definition.name}\n${definition.contents}\n# ${definition.installHint}\n`,
+        : `${definition.files.map((file) => `# ${file.name}\n${file.contents}`).join("\n")}\n# ${definition.installHint}\n`,
     );
     return 0;
   }

@@ -23,7 +23,7 @@ test("native bridge correlates concurrent host responses and bounds admission", 
     }
     assert.equal((await client.request({ kind: "inspect" })).kind, "inspection");
   } finally {
-    if (client !== undefined) await client.stopService();
+    if (client !== undefined) { await client.stopService(); await client.stopSupervisor(); }
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -61,6 +61,7 @@ export class NativeHostClient {
     try {
       try {
         await client.request({ kind: "inspect" });
+        if (service === "auto") await ensureSupervisor(binary, directory);
         opened = true;
         return client;
       } catch (error) {
@@ -76,6 +77,7 @@ export class NativeHostClient {
         if (launchError !== undefined) throw new SandsurfHostError("transport", `Sandsurf host could not start: ${launchError.message}`);
         try {
           await client.request({ kind: "inspect" });
+          await ensureSupervisor(binary, directory);
           opened = true;
           return client;
         } catch (error) {
@@ -221,6 +223,42 @@ export class NativeHostClient {
       await this.close();
     }
   }
+
+  /** Explicit administrative containment of supervisor-owned guardians. */
+  async stopSupervisor(): Promise<void> {
+    if (await supervisorCommand(this.#binary, "stop-supervisor", this.directory) !== 0) {
+      throw new SandsurfHostError("supervision", "guardian supervisor did not confirm shutdown");
+    }
+  }
+}
+
+// The SDK caller bootstraps this owner, never the host API process. Installed
+// service definitions use two independent native services for the same roles.
+async function ensureSupervisor(binary: string, directory: string): Promise<void> {
+  const status = await supervisorCommand(binary, "supervisor-status", directory);
+  if (status === 0) return;
+  if (status !== 2) throw new SandsurfHostError("supervision", "existing guardian supervisor is unhealthy; refusing a second owner");
+  const child = spawn(binary, ["supervise", "--directory", directory], { detached: true, stdio: "ignore", windowsHide: true });
+  let launchError: Error | undefined;
+  child.once("error", (error: Error) => { launchError = error; });
+  child.unref();
+  const deadline = Date.now() + 10_000;
+  do {
+    if (launchError !== undefined) throw new SandsurfHostError("supervision", `guardian supervisor could not start: ${launchError.message}`);
+    const observed = await supervisorCommand(binary, "supervisor-status", directory);
+    if (observed === 0) return;
+    if (observed !== 2) throw new SandsurfHostError("supervision", "guardian supervisor endpoint is incompatible or unhealthy");
+    await new Promise((done) => setTimeout(done, 20));
+  } while (Date.now() < deadline);
+  throw new SandsurfHostError("supervision", "guardian supervisor did not become reachable");
+}
+
+function supervisorCommand(binary: string, mode: "supervisor-status" | "stop-supervisor", directory: string): Promise<number | null> {
+  return new Promise((done, reject) => {
+    const child = spawn(binary, [mode, "--directory", directory], { stdio: "ignore", windowsHide: true });
+    child.once("error", reject);
+    child.once("exit", (code) => done(code));
+  });
 }
 
 async function* bridgeFrames(output: Readable): AsyncGenerator<Buffer, void> {

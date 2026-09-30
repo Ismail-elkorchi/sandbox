@@ -47,10 +47,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let directory = argument(&values, "--directory")?;
     match mode.as_str() {
         "serve" => serve_host(&directory, std::env::current_exe()?)?,
+        "supervise" => sandsurf_host::supervision::serve(&directory, std::env::current_exe()?)?,
+        "supervisor-status" => {
+            match sandsurf_host::supervision::call(
+                &directory,
+                sandsurf_host::supervision::Request::Inspect,
+            ) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    std::process::exit(2)
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        "stop-supervisor" => sandsurf_host::supervision::call(
+            &directory,
+            sandsurf_host::supervision::Request::Shutdown,
+        )?,
         #[cfg(target_os = "windows")]
         "service" => {
             let service_name = text_argument(&values, "--service-name")?;
-            windows_service::run(directory, service_name, std::env::current_exe()?)?;
+            let role = match text_argument(&values, "--role")?.as_str() {
+                "host" => windows_service::Role::Host,
+                "supervisor" => windows_service::Role::Supervisor,
+                _ => return Err("invalid native service role".into()),
+            };
+            windows_service::run(directory, service_name, std::env::current_exe()?, role)?;
         }
         "guardian" => {
             let machine: MachineId = argument(&values, "--machine")?
@@ -353,11 +380,18 @@ mod windows_service {
     static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
     static SERVICE_NAME: OnceLock<Vec<u16>> = OnceLock::new();
     static STATUS: OnceLock<usize> = OnceLock::new();
+    #[derive(Clone, Copy)]
+    pub(super) enum Role {
+        Host,
+        Supervisor,
+    }
+    static ROLE: OnceLock<Role> = OnceLock::new();
 
     pub(super) fn run(
         directory: PathBuf,
         service_name: String,
         executable: PathBuf,
+        role: Role,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if service_name.is_empty() || service_name.encode_utf16().count() > 256 {
             return Err("Windows service name is malformed".into());
@@ -368,6 +402,8 @@ mod windows_service {
         EXECUTABLE
             .set(executable)
             .map_err(|_| "Windows service executable was already initialized")?;
+        ROLE.set(role)
+            .map_err(|_| "Windows service role was already initialized")?;
         let mut name = service_name.encode_utf16().collect::<Vec<_>>();
         name.push(0);
         SERVICE_NAME
@@ -407,10 +443,14 @@ mod windows_service {
         }
         report(SERVICE_START_PENDING, 0, 10_000);
         report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
-        let result = serve_host(
-            DIRECTORY.get().expect("service directory"),
-            EXECUTABLE.get().expect("service executable").clone(),
-        );
+        let directory = DIRECTORY.get().expect("service directory");
+        let executable = EXECUTABLE.get().expect("service executable").clone();
+        let result = match ROLE.get().expect("service role") {
+            Role::Host => serve_host(directory, executable),
+            Role::Supervisor => {
+                sandsurf_host::supervision::serve(directory, executable).map_err(HostError::Io)
+            }
+        };
         report(SERVICE_STOPPED, 0, 0);
         if let Err(error) = result {
             eprintln!("sandsurf-host service: {error}");
@@ -425,8 +465,16 @@ mod windows_service {
         }
         report(SERVICE_STOP_PENDING, 0, 10_000);
         if let Some(directory) = DIRECTORY.get().cloned() {
-            std::thread::spawn(move || {
-                let _ = host_call(&directory, HostRequest::StopService);
+            std::thread::spawn(move || match ROLE.get().expect("service role") {
+                Role::Host => {
+                    let _ = host_call(&directory, HostRequest::StopService);
+                }
+                Role::Supervisor => {
+                    let _ = sandsurf_host::supervision::call(
+                        &directory,
+                        sandsurf_host::supervision::Request::Shutdown,
+                    );
+                }
             });
         }
     }

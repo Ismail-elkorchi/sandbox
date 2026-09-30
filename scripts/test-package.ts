@@ -62,7 +62,9 @@ try {
       assert.equal((await host.machines.list()).length, 0);
     } finally {
       await host.close();
-      await (await NativeHostClient.open(directory)).stopService();
+      const administration = await NativeHostClient.open(directory);
+      await administration.stopService();
+      await administration.stopSupervisor();
     }
   `], consumer);
   await copyFile(resolve("scripts/package-consumer.mts"), resolve(consumer, "package-consumer.mts"));
@@ -72,7 +74,7 @@ try {
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
   if (process.env.SANDSURF_KVM_TEST === "1") {
     if (process.platform !== "linux" || process.arch !== "x64") throw new Error("installed KVM qualification requires a Linux x64 host");
-    await run(process.execPath, ["--test", "--test-concurrency=1", resolve("packages/sandsurf/test/kvm-environment.test.mjs")], consumer, {
+    await run(process.execPath, ["--test", "--test-concurrency=1", resolve("packages/sandsurf/test/kvm-environment.test.mjs"), resolve("packages/sandsurf/test/systemd-machine.test.mjs")], consumer, {
       SANDSURF_TEST_PACKAGE_ROOT: resolve(consumer, "node_modules/sandsurf"),
       SANDSURF_LOCAL_IMAGE_MANIFEST: resolve(consumer, "node_modules/sandsurf/images/development-x64/manifest.json"),
     });

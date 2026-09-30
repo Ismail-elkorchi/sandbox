@@ -68,7 +68,15 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
         Ok(_) => {
             Directory::open(path)?;
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_directory(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match create_private_directory(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    Directory::open(path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Err(error) => return Err(error),
     }
     Ok(())

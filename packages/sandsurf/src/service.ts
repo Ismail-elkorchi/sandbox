@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, posix, resolve, win32 } from "node:path";
+import { posix, resolve, win32 } from "node:path";
 import { resolveSandsurfNativeHost } from "./native-host.js";
 
 export type SandsurfServicePlatform = "linux" | "macos" | "windows";
@@ -7,8 +7,7 @@ export type SandsurfServicePlatform = "linux" | "macos" | "windows";
 export interface SandsurfServiceDefinition {
   readonly platform: SandsurfServicePlatform;
   readonly format: "systemd-user" | "launchd-agent" | "windows-scm-powershell";
-  readonly name: string;
-  readonly contents: string;
+  readonly files: readonly { readonly name: string; readonly contents: string }[];
   readonly installHint: string;
 }
 
@@ -18,63 +17,53 @@ export interface SandsurfServiceDefinitionOptions {
   readonly platform?: SandsurfServicePlatform;
 }
 
-/** Render a service definition without installing it or changing host privileges. */
-export async function sandsurfServiceDefinition(
-  options: SandsurfServiceDefinitionOptions,
-): Promise<SandsurfServiceDefinition> {
-  const directory = resolve(options.directory);
-  if (!isAbsolute(directory)) throw new TypeError("Sandsurf service directory must be absolute");
-  const binary =
-    options.binary === undefined ? await resolveSandsurfNativeHost() : resolve(options.binary);
-  if (!isAbsolute(binary)) throw new TypeError("Sandsurf service binary must be absolute");
+/** Render independent host API and guardian supervision services. No install. */
+export async function sandsurfServiceDefinition(options: SandsurfServiceDefinitionOptions): Promise<SandsurfServiceDefinition> {
   return renderSandsurfServiceDefinition({
-    directory,
-    binary,
+    directory: resolve(options.directory),
+    binary: options.binary === undefined ? await resolveSandsurfNativeHost() : resolve(options.binary),
     platform: options.platform ?? currentPlatform(),
   });
 }
 
 export function renderSandsurfServiceDefinition(options: {
-  readonly directory: string;
-  readonly binary: string;
-  readonly platform: SandsurfServicePlatform;
+  readonly directory: string; readonly binary: string; readonly platform: SandsurfServicePlatform;
 }): SandsurfServiceDefinition {
-  if (
-    !servicePathIsAbsolute(options.directory, options.platform) ||
-    !servicePathIsAbsolute(options.binary, options.platform)
-  )
-    throw new TypeError("Sandsurf service paths must be absolute");
+  const path = options.platform === "windows" ? win32 : posix;
+  for (const value of [options.directory, options.binary]) {
+    if (!path.isAbsolute(value) || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError("Sandsurf service paths must be absolute without control characters");
+  }
   const suffix = createHash("sha256").update(options.directory).digest("hex").slice(0, 12);
-  const serviceName = `sandsurf-${suffix}`;
+  const host = `sandsurf-host-${suffix}`;
+  const supervisor = `sandsurf-supervisor-${suffix}`;
+  const file = (name: string, contents: string): Readonly<{ name: string; contents: string }> => Object.freeze({ name, contents });
   switch (options.platform) {
-    case "linux":
-      return Object.freeze({
-        platform: "linux",
-        format: "systemd-user",
-        name: `${serviceName}.service`,
-        contents: `[Unit]\nDescription=Sandsurf host service (${options.directory})\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=${systemdArgument(options.binary)} serve --directory ${systemdArgument(options.directory)}\nRestart=on-failure\nRestartSec=1\nNoNewPrivileges=true\nPrivateTmp=true\n\n[Install]\nWantedBy=default.target\n`,
-        installHint: `Write this unit to ~/.config/systemd/user/${serviceName}.service, then run systemctl --user daemon-reload and systemctl --user enable --now ${serviceName}.service.`,
+    case "linux": {
+      const unit = (name: string, mode: string, dependency: string): string =>
+        // These authority services share the client's authorized host paths.
+        // Per-unit PrivateTmp would create different stores at the same name.
+        // Guest/VMM isolation belongs to the qualified native launcher instead.
+        `[Unit]\nDescription=Sandsurf ${name}\nAfter=network.target${dependency === "" ? "" : ` ${dependency}.service`}\n${dependency === "" ? "" : `Wants=${dependency}.service\n`}\n[Service]\nType=exec\nExecStart=${systemdArgument(options.binary)} ${mode} --directory ${systemdArgument(options.directory)}\nRestart=on-failure\nRestartSec=1\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n`;
+      return Object.freeze({ platform: "linux", format: "systemd-user",
+        files: Object.freeze([file(`${supervisor}.service`, unit("guardian supervision", "supervise", "")), file(`${host}.service`, unit("host API", "serve", supervisor))]),
+        installHint: `Write both units to ~/.config/systemd/user/, then run systemctl --user daemon-reload and systemctl --user enable --now ${supervisor}.service ${host}.service. Keep the account's user manager running for unattended work. Restarting the host API unit does not stop the supervisor unit or its guardians.`,
       });
+    }
     case "macos": {
-      const label = `dev.sandsurf.host.${suffix}`;
-      return Object.freeze({
-        platform: "macos",
-        format: "launchd-agent",
-        name: `${label}.plist`,
-        contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>${xml(label)}</string>\n  <key>ProgramArguments</key><array>\n    <string>${xml(options.binary)}</string><string>serve</string><string>--directory</string><string>${xml(options.directory)}</string>\n  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>ProcessType</key><string>Interactive</string>\n</dict></plist>\n`,
-        installHint: `Write this plist to ~/Library/LaunchAgents/${label}.plist, then run launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${label}.plist. The packaged VM owner still requires the Apple virtualization entitlement/signature to qualify.`,
+      const agent = (role: string, mode: string): Readonly<{ name: string; contents: string }> => {
+        const label = `dev.sandsurf.${role}.${suffix}`;
+        return file(`${label}.plist`, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array><string>${xml(options.binary)}</string><string>${mode}</string><string>--directory</string><string>${xml(options.directory)}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n</dict></plist>\n`);
+      };
+      return Object.freeze({ platform: "macos", format: "launchd-agent", files: Object.freeze([agent("supervisor", "supervise"), agent("host", "serve")]),
+        installHint: "Write both plists to ~/Library/LaunchAgents/ and bootstrap each with launchctl in the account's GUI domain. The VM owner still needs its Apple virtualization entitlement/signature and real-hardware qualification. A GUI LaunchAgent does not promise survival of account logout.",
       });
     }
     case "windows": {
-      const windowsName = `Sandsurf-${suffix}`;
-      const command = `\"${options.binary}\" service --directory \"${options.directory}\" --service-name \"${windowsName}\"`;
-      return Object.freeze({
-        platform: "windows",
-        format: "windows-scm-powershell",
-        name: windowsName,
-        contents: `$binaryPath = '${powershell(command)}'\n$serviceUser = \"$env:USERDOMAIN\\$env:USERNAME\"\n$credential = Get-Credential -UserName $serviceUser -Message 'Account for the unprivileged Sandsurf host service'\nNew-Item -ItemType Directory -Force -Path '${powershell(options.directory)}' | Out-Null\nicacls '${powershell(options.directory)}' /inheritance:r /grant:r \"$($serviceUser):(OI)(CI)F\" 'SYSTEM:(OI)(CI)F' | Out-Null\nNew-Service -Name '${windowsName}' -DisplayName 'Sandsurf Host (${powershell(options.directory)})' -BinaryPathName $binaryPath -Credential $credential -StartupType Automatic\nStart-Service -Name '${windowsName}'\n`,
-        installHint:
-          "Run this PowerShell definition from an elevated shell after enabling and rebooting into Hyper-V. The selected unprivileged account needs the Log on as a service right and access to the qualified HCS helper.",
+      if (options.binary.includes('"') || options.directory.includes('"')) throw new TypeError("Windows service paths cannot contain quotes");
+      const command = (role: string, name: string): string => powershell(`\"${options.binary}\" service --directory \"${options.directory}\" --service-name \"${name}\" --role ${role}`);
+      return Object.freeze({ platform: "windows", format: "windows-scm-powershell", files: Object.freeze([file(`${host}.ps1`,
+        `$serviceUser = \"$env:USERDOMAIN\\$env:USERNAME\"\n$credential = Get-Credential -UserName $serviceUser -Message 'Account for Sandsurf services'\nNew-Item -ItemType Directory -Force -Path '${powershell(options.directory)}' | Out-Null\nicacls '${powershell(options.directory)}' /inheritance:r /grant:r \"$($serviceUser):(OI)(CI)F\" 'SYSTEM:(OI)(CI)F' | Out-Null\nNew-Service -Name '${supervisor}' -BinaryPathName '${command("supervisor", supervisor)}' -Credential $credential -StartupType Automatic\nNew-Service -Name '${host}' -BinaryPathName '${command("host", host)}' -Credential $credential -DependsOn '${supervisor}' -StartupType Automatic\nStart-Service -Name '${supervisor}'\nStart-Service -Name '${host}'\n`)]),
+        installHint: "Run the PowerShell definition from an elevated shell after enabling and rebooting into Hyper-V. Both independent services use the chosen unprivileged account, which needs Log on as a service and access to the qualified HCS implementation. Stopping the host API service does not stop guardian supervision.",
       });
     }
   }
@@ -86,24 +75,10 @@ function currentPlatform(): SandsurfServicePlatform {
   if (process.platform === "win32") return "windows";
   throw new TypeError(`Sandsurf has no service definition for ${process.platform}`);
 }
-
-function servicePathIsAbsolute(value: string, platform: SandsurfServicePlatform): boolean {
-  return platform === "windows" ? win32.isAbsolute(value) : posix.isAbsolute(value);
-}
-
 function systemdArgument(value: string): string {
-  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%").replaceAll("$", () => "$$")}"`;
 }
-
 function xml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
-
-function powershell(value: string): string {
-  return value.replaceAll("'", "''");
-}
+function powershell(value: string): string { return value.replaceAll("'", "''"); }

@@ -29,4 +29,6 @@ jobs:
       - run: npm run build:ts
       - run: npm run verify:native
       - run: cargo test --locked -p sandsurf-guest -p sandsurf-state -p sandsurf-host
-      - run: SANDSURF_KVM_TEST=1 npm run test:package
+      - name: Installed services require an independent user service manager
+        run: systemctl --user show-environment > /dev/null
+      - run: SANDSURF_KVM_TEST=1 SANDSURF_SERVICE_MANAGER_TEST=1 npm run test:package

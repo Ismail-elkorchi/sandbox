@@ -259,7 +259,15 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
             Directory::open(path)?;
             Ok(())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => create_private_directory(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match create_private_directory(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    Directory::open(path).map(|_| ())
+                }
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     }
 }
@@ -405,6 +413,81 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
     validate_private(&file, false, false)?;
     drop(descriptor);
     Ok(file)
+}
+
+/// Rename the held source inode, relative to its held private parent. In
+/// particular, no-replace publication does not ask for DELETE access to an
+/// existing immutable destination which other readers legitimately retain.
+pub(crate) fn rename_private_object(
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, SetFileInformationByHandle,
+    };
+    if source.parent() != destination.parent() || !source.is_absolute() {
+        return Err(invalid(
+            "rename requires absolute names in one private directory",
+        ));
+    }
+    let parent = Directory::open(
+        source
+            .parent()
+            .ok_or_else(|| invalid("rename parent missing"))?,
+    )?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| invalid("rename destination name missing"))?;
+    let mut name = name.encode_wide().collect::<Vec<_>>();
+    if name.is_empty()
+        || name.len() > 32767
+        || name.iter().any(|unit| matches!(*unit, 0 | 58 | 47 | 92))
+    {
+        return Err(invalid("rename destination is not a bounded ordinary name"));
+    }
+    let length = name.len() * 2;
+    name.push(0);
+    let held = OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(source)?;
+    validate_private(&held, held.metadata()?.is_dir(), false)?;
+    let bytes = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2)
+        .max(size_of::<FILE_RENAME_INFO>());
+    // usize storage supplies native HANDLE alignment; the initialized header
+    // and UTF-16 tail are contained in this allocation through the native call.
+    let mut buffer = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: buffer has the alignment and checked capacity for the complete
+    // FILE_RENAME_INFO header and flexible UTF-16 filename tail.
+    unsafe {
+        info.write(FILE_RENAME_INFO {
+            Anonymous: FILE_RENAME_INFO_0 {
+                ReplaceIfExists: replace,
+            },
+            RootDirectory: parent.held.as_raw_handle().cast(),
+            FileNameLength: length as u32,
+            FileName: [0],
+        });
+        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+    }
+    // SAFETY: source and parent handles and the initialized aligned buffer
+    // remain held for this synchronous same-directory atomic rename. Only the
+    // owner-journal caller may request replacement; no-replace never overwrites.
+    if unsafe {
+        SetFileInformationByHandle(
+            held.as_raw_handle().cast(),
+            FileRenameInfo,
+            info.cast(),
+            bytes as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn open_or_create_private_file(path: &Path) -> io::Result<File> {

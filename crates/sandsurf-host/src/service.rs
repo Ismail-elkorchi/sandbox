@@ -18,10 +18,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2320,17 +2317,17 @@ impl HostService {
                 )));
             }
         }
-        let guardian_log = open_guardian_log(&root.join("guardian/guardian.log"))?;
-        let mut child = Command::new(&self.executable)
-            .arg("guardian")
-            .arg("--directory")
-            .arg(&self.root)
-            .arg("--machine")
-            .arg(machine.as_str())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(guardian_log))
-            .spawn()?;
+        crate::supervision::call(
+            &self.root,
+            crate::supervision::Request::Ensure {
+                machine: machine.clone(),
+            },
+        )
+        .map_err(|error| {
+            HostError::GuardianStartup(format!(
+                "independent guardian supervisor is unavailable: {error}"
+            ))
+        })?;
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if GuardianClient::new(endpoint.clone())
@@ -2339,17 +2336,19 @@ impl HostService {
             {
                 return Ok(());
             }
-            if let Some(status) = child.try_wait()? {
-                return Err(HostError::GuardianStartup(format!(
-                    "guardian exited before becoming reachable ({status}); inspect {}",
+            crate::supervision::call(
+                &self.root,
+                crate::supervision::Request::Check {
+                    machine: machine.clone(),
+                },
+            )
+            .map_err(|error| {
+                HostError::GuardianStartup(format!(
+                    "guardian launch failed: {error}; inspect {}",
                     root.join("guardian/guardian.log").display()
-                )));
-            }
+                ))
+            })?;
             if std::time::Instant::now() >= deadline {
-                // A process which never publishes its authenticated endpoint is
-                // not an independently owned guardian. Do not leave it behind.
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(HostError::GuardianStartup(format!(
                     "guardian did not become reachable; inspect {}",
                     root.join("guardian/guardian.log").display()
@@ -3506,23 +3505,6 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Snapshot(_) => "snapshot",
         HostError::Image(_) => "image",
     }
-}
-
-#[cfg(unix)]
-fn open_guardian_log(path: &Path) -> Result<fs::File> {
-    Ok(fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?)
-}
-
-#[cfg(windows)]
-fn open_guardian_log(path: &Path) -> Result<fs::File> {
-    Ok(fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?)
 }
 
 #[cfg(any(unix, windows))]

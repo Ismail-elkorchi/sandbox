@@ -400,7 +400,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     } finally {
       // Test failure must not strand bridge handles and hide the TAP result.
       await host.close();
-      try { await (await NativeHostClient.open(directory)).stopService(); }
+      try {
+        const administration = await NativeHostClient.open(directory);
+        await administration.stopService();
+        await administration.stopSupervisor();
+      }
       finally {
         if (process.env.SANDSURF_TEST_STATE === undefined) await rm(directory, { recursive: true, force: true });
         await rm(destination, { recursive: true, force: true });
@@ -453,7 +457,9 @@ async function qualifyImageBuildReports(sourceManifest) {
       try {
         if (host !== undefined) {
           await host.close();
-          await (await NativeHostClient.open(directory)).stopService();
+          const administration = await NativeHostClient.open(directory);
+          await administration.stopService();
+          await administration.stopSupervisor();
         }
       } finally {
         await rm(root, { recursive: true, force: true });

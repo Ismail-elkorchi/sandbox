@@ -333,37 +333,7 @@ pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> 
 
 #[cfg(windows)]
 fn move_name(staged: &Path, destination: &Path, replace: bool) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-    fn wide(path: &Path) -> io::Result<Vec<u16>> {
-        let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if value.contains(&0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path contains NUL",
-            ));
-        }
-        value.push(0);
-        Ok(value)
-    }
-    let source = wide(staged)?;
-    let target = wide(destination)?;
-    // COPY_ALLOWED is never enabled. Only the owner-journal transaction
-    // requests replacement; immutable publication cannot overwrite a name.
-    // WRITE_THROUGH waits for native publication before journal-dependent effects.
-    let flags = MOVEFILE_WRITE_THROUGH
-        | if replace {
-            MOVEFILE_REPLACE_EXISTING
-        } else {
-            0
-        };
-    // SAFETY: both terminated paths remain live for this synchronous call.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), flags) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    crate::local::rename_private_object(staged, destination, replace)
 }
 
 #[cfg(test)]
@@ -535,7 +505,11 @@ mod tests {
         drop(writer);
         publish_new_file(&staged, &destination).unwrap();
         assert!(!staged.exists());
-        drop(open_private_file(&destination, crate::PrivateFileAccess::ReadOnly).unwrap());
+        // A retained reader is entitled to keep its protected original open.
+        // On Windows it intentionally denies DELETE sharing. No-replace
+        // publication must still classify the existing object as existing,
+        // without attempting to delete/replace it or asking readers to retry.
+        let original = open_private_file(&destination, crate::PrivateFileAccess::ReadOnly).unwrap();
         let mut writer = create_private_file(&staged).unwrap();
         writer.write_all(b"different bytes").unwrap();
         drop(writer);
@@ -545,6 +519,7 @@ mod tests {
         );
         assert_eq!(fs::read(&destination).unwrap(), b"protected original");
         assert_eq!(fs::read(&staged).unwrap(), b"different bytes");
+        drop(original);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -590,6 +565,35 @@ mod tests {
         assert!(open_private_file(&path, PrivateFileAccess::ReadOnly).is_err());
         assert!(open_private_file(&path, PrivateFileAccess::ReadWrite).is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn independent_services_can_admit_one_shared_private_parent_concurrently() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-concurrent-admission-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        crate::local::ensure_private_directory(&root).unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        crate::local::canonical_private_directory(&root).unwrap();
+        assert!(
+            crate::local::create_private_directory(&root).is_err(),
+            "new-owner creation remains exclusive"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
