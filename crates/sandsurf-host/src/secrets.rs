@@ -1,4 +1,5 @@
 use hmac::{Hmac, Mac};
+use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{Counter, Digest, SecretId, SecretVersion, SecretVersionId};
 use sha2::Sha256;
 use std::fmt;
@@ -109,9 +110,9 @@ impl SecretAuthority {
         bytes: &[u8],
     ) -> Result<SecretVersion, SecretError> {
         validate_bytes(bytes)?;
-        let directory = self.root.join(id.as_str());
+        let directory = self.root.join(object_name(id.as_str()));
         sandsurf_native::local::ensure_private_directory(&directory)?;
-        let path = directory.join(version.as_str());
+        let path = directory.join(object_name(version.as_str()));
         let exists = match fs::symlink_metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -147,7 +148,10 @@ impl SecretAuthority {
 
     pub fn read(&self, id: &SecretId, version: &SecretVersionId) -> Result<Vec<u8>, SecretError> {
         let mut file = sandsurf_native::local::open_private_file(
-            &self.root.join(id.as_str()).join(version.as_str()),
+            &self
+                .root
+                .join(object_name(id.as_str()))
+                .join(object_name(version.as_str())),
             sandsurf_native::PrivateFileAccess::ReadOnly,
         )?;
         let length = file.metadata()?.len();
@@ -196,6 +200,43 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    fn secret_identities_and_versions_do_not_inherit_host_filename_semantics() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-secret-addresses-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let authority = SecretAuthority::open(&root).unwrap();
+        for name in ["CON", "con", "Secret", "secret"] {
+            let id: SecretId = name.try_into().unwrap();
+            for version_name in ["Version", "version"] {
+                let version: SecretVersionId = version_name.try_into().unwrap();
+                let bytes = format!("{name}:{version_name}");
+                authority
+                    .put(id.clone(), version.clone(), bytes.as_bytes())
+                    .unwrap();
+                assert_eq!(
+                    authority.read(&id, &version).unwrap().as_slice(),
+                    bytes.as_bytes()
+                );
+            }
+        }
+        for name in ["CON", "con", "Secret", "secret"] {
+            let id: SecretId = name.try_into().unwrap();
+            for version_name in ["Version", "version"] {
+                assert_eq!(
+                    authority
+                        .read(&id, &version_name.try_into().unwrap())
+                        .unwrap()
+                        .as_slice(),
+                    format!("{name}:{version_name}").as_bytes()
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn opaque_versions_are_immutable_and_privately_integrity_checked() {
         let root = std::env::temp_dir().join(format!(
             "sandsurf-secrets-{}-{}",
@@ -217,7 +258,9 @@ mod tests {
                 .put(id.clone(), first.version.clone(), b"two")
                 .is_err()
         );
-        let object = root.join(id.as_str()).join(first.version.as_str());
+        let object = root
+            .join(object_name(id.as_str()))
+            .join(object_name(first.version.as_str()));
         let mut bytes = fs::read(&object).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
         fs::write(&object, bytes).unwrap();

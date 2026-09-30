@@ -6,6 +6,16 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
+/// Portable address for an opaque logical identifier, not another identity or
+/// authorization decision. Never embed identifiers directly in host filenames:
+/// case folding and reserved device names must not collapse distinct owners.
+pub fn object_name(identifier: &str) -> String {
+    format!(
+        "id-{}",
+        sandsurf_protocol::bytes_digest(identifier.as_bytes()).as_str()
+    )
+}
+
 /// Reserve a raw disk's allocation through its held writable descriptor.
 /// This does not interpret Linux filesystem bytes or change logical capacity.
 /// Shared/reflink attribution and global pool admission remain separate facts.
@@ -233,6 +243,41 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn logical_case_and_reserved_names_have_independent_portable_objects() {
+        use crate::local::{create_private_directory, create_private_file};
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-object-addresses-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&root).unwrap();
+        let identifiers = ["CON", "con", "Foo", "foo", "NUL", "nul", "AUX", "aux"];
+        for id in identifiers {
+            let name = object_name(id);
+            assert_eq!(name.len(), 67);
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            );
+            let directory = root.join(name);
+            create_private_directory(&directory).unwrap();
+            create_private_file(&directory.join("payload"))
+                .unwrap()
+                .write_all(id.as_bytes())
+                .unwrap();
+        }
+        for id in identifiers {
+            assert_eq!(
+                fs::read(root.join(object_name(id)).join("payload")).unwrap(),
+                id.as_bytes()
+            );
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), identifiers.len());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

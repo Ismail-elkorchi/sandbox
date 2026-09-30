@@ -1,3 +1,4 @@
+use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{
     Digest, Domain, FullSnapshotMetadata, NativeFullCapture, OperationId, Snapshot,
     SnapshotConsistency, SnapshotId, SnapshotKind, SnapshotProcessWatermark, digest,
@@ -103,7 +104,7 @@ pub struct CaptureResult {
 }
 
 pub fn published_filesystem(root: &Path, snapshot: &Snapshot) -> Result<Option<CaptureResult>> {
-    let directory = root.join(snapshot.request.id.as_str());
+    let directory = root.join(object_name(snapshot.request.id.as_str()));
     if !directory.exists() {
         return Ok(None);
     }
@@ -116,14 +117,14 @@ pub fn capture_filesystem(
     source_disk: &Path,
 ) -> Result<CaptureResult> {
     private_directory(root)?;
-    let final_directory = root.join(snapshot.request.id.as_str());
+    let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
         return verify_published(&final_directory, snapshot);
     }
     let stage = root.join(format!(
         ".{}.{}.capture",
-        snapshot.request.id.as_str(),
-        snapshot.request.operation_id.as_str()
+        object_name(snapshot.request.id.as_str()),
+        object_name(snapshot.request.operation_id.as_str())
     ));
     private_directory(&stage)?;
     let source_container = disk_container(source_disk)?;
@@ -185,14 +186,14 @@ pub fn capture_full(
     private_directory(root)?;
     let source_container = disk_container(system_disk)?;
     let container = DiskContainer::RawExt4;
-    let final_directory = root.join(snapshot.request.id.as_str());
+    let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
         return verify_published(&final_directory, snapshot);
     }
     let stage = root.join(format!(
         ".{}.{}.capture",
-        snapshot.request.id.as_str(),
-        snapshot.request.operation_id.as_str()
+        object_name(snapshot.request.id.as_str()),
+        object_name(snapshot.request.operation_id.as_str())
     ));
     private_directory(&stage)?;
     let disk_digest = capture_disk(
@@ -413,7 +414,7 @@ pub fn rollback(
 }
 
 fn snapshot_disk(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
-    let directory = root.join(snapshot.request.id.as_str());
+    let directory = root.join(object_name(snapshot.request.id.as_str()));
     let verified = verify_published(&directory, snapshot)?;
     if snapshot.system_disk_digest.as_ref() != Some(&verified.disk_digest)
         || snapshot.manifest_digest.as_ref() != Some(&verified.manifest_digest)
@@ -426,7 +427,11 @@ fn snapshot_disk(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
 }
 
 fn published_container(root: &Path, snapshot: &Snapshot) -> Result<DiskContainer> {
-    Ok(verify_published(&root.join(snapshot.request.id.as_str()), snapshot)?.container)
+    Ok(verify_published(
+        &root.join(object_name(snapshot.request.id.as_str())),
+        snapshot,
+    )?
+    .container)
 }
 
 fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResult> {
@@ -843,7 +848,11 @@ mod tests {
         assert!(materialize_fork(&root, &snapshot, &fork).is_err());
         assert_eq!(fs::read(&fork).unwrap(), vec![8_u8; 4096]);
         assert_eq!(
-            file_digest(&root.join("snapshot/system.ext4"), 4096).unwrap(),
+            file_digest(
+                &root.join(object_name("snapshot")).join("system.ext4"),
+                4096
+            )
+            .unwrap(),
             captured.disk_digest
         );
 

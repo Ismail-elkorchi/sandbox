@@ -16,6 +16,7 @@ use sandsurf_image::{ImageArtifact, WindowsArtifacts};
 use sandsurf_native::local::{
     create_private_file, ensure_private_directory as prepare_private_directory,
 };
+use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{
     Counter, Digest, Domain, OperationId, Qualification, Snapshot, SnapshotPhase, digest,
 };
@@ -160,7 +161,7 @@ fn prepare_import(
     prepare_private_directory(&host_root.join("images"))?;
     let imports = host_root.join("images/imports");
     prepare_private_directory(&imports)?;
-    let stage = imports.join(operation.as_str());
+    let stage = imports.join(object_name(operation.as_str()));
     let result_path = stage.join("result.json");
     if result_path.exists() {
         let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
@@ -175,7 +176,7 @@ fn prepare_import(
     if stage.exists() {
         let quarantine = imports.join(format!(
             "quarantine-{}-{}",
-            operation.as_str(),
+            object_name(operation.as_str()),
             short_nonce()?
         ));
         fs::rename(&stage, quarantine)?;
@@ -991,7 +992,14 @@ mod native_import_tests {
         assert!(fixture.import("first-import", "d").is_err());
         // Interrupt after artifact publication but before the result/journal
         // commit. Recovery uses only the exact host-owned image digest.
-        fs::remove_file(fixture.root.join("images/imports/first-import/result.json")).unwrap();
+        fs::remove_file(
+            fixture
+                .root
+                .join("images/imports")
+                .join(object_name("first-import"))
+                .join("result.json"),
+        )
+        .unwrap();
         assert_eq!(fixture.import("first-import", "c").unwrap(), image);
         assert_eq!(fixture.import("another-import", "e").unwrap(), image);
         fs::set_permissions(

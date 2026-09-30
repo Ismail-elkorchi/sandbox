@@ -7,6 +7,7 @@ use crate::guardian::{
 };
 use sandsurf_machine::GuestArchitecture;
 use sandsurf_native::local::{LocalConnection, LocalListener};
+use sandsurf_native::storage::object_name;
 use sandsurf_protocol::*;
 use sandsurf_state::{
     Approval, CatalogLimits, HostCatalog, MachineRecord, ReservationState, RuntimeJournal,
@@ -644,7 +645,7 @@ impl HostService {
                             &machine_root.join("disks").join(system_disk_name()),
                             &machine_root
                                 .join("guardian/full-captures")
-                                .join(request.operation_id.as_str()),
+                                .join(object_name(request.operation_id.as_str())),
                             capture,
                             processes,
                         );
@@ -1767,7 +1768,7 @@ impl HostService {
                     &machine_root.join("disks").join(system_disk_name()),
                     &machine_root
                         .join("guardian/full-captures")
-                        .join(capture_operation_id.as_str()),
+                        .join(object_name(capture_operation_id.as_str())),
                     capture,
                     processes,
                 )?;
@@ -2580,7 +2581,9 @@ impl HostService {
     }
 
     fn machine_root(&self, machine: &MachineId) -> PathBuf {
-        self.root.join("machines").join(machine.as_str())
+        self.root
+            .join("machines")
+            .join(object_name(machine.as_str()))
     }
 
     fn retire_machine_storage(&mut self, machine: &MachineId) -> Result<()> {
@@ -3154,7 +3157,7 @@ impl Drop for ActiveHostConnection {
 }
 
 pub fn serve_machine_guardian(root: &Path, machine: MachineId) -> Result<()> {
-    let machine_root = root.join("machines").join(machine.as_str());
+    let machine_root = root.join("machines").join(object_name(machine.as_str()));
     let journal = RuntimeJournal::open(&machine_root.join("runtime"), &machine)?;
     if journal
         .last_observation()?

@@ -12,6 +12,7 @@ use sandsurf_machine::linux::{
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::UnixVsockChannel;
+use sandsurf_native::storage::object_name;
 use sandsurf_network::{VmNetworkBridge, VmPortGateway};
 use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
@@ -100,7 +101,7 @@ pub fn prepare_config(
 ) -> Result<LinuxGuardianConfig, LinuxError> {
     let existing_path = host_root
         .join("machines")
-        .join(machine_id.as_str())
+        .join(object_name(machine_id.as_str()))
         .join("guardian/config.json");
     if existing_path.exists() {
         let existing = read_config(&existing_path, machine_id)?;
@@ -854,7 +855,9 @@ impl LinuxGuardianEffect {
             .parent()
             .and_then(Path::parent)
             .ok_or(ControlError::Protocol("machine root has no host root"))?;
-        let directory = host_root.join("snapshots").join(snapshot_id.as_str());
+        let directory = host_root
+            .join("snapshots")
+            .join(object_name(snapshot_id.as_str()));
         let artifacts = [
             ("system.ext4", &system_disk),
             ("snapshot.vmstate", &expected.snapshot_state),
@@ -1128,7 +1131,7 @@ fn full_capture_directory(
 ) -> PathBuf {
     machine_root
         .join("guardian/full-captures")
-        .join(operation_id.as_str())
+        .join(object_name(operation_id.as_str()))
 }
 
 fn remove_full_capture(

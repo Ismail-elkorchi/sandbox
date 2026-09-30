@@ -9,6 +9,7 @@ use sandsurf_machine::windows::{
     HyperVConfig, HyperVDisk, HyperVDriver, HyperVQualification, HyperVRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
+use sandsurf_native::storage::object_name;
 use sandsurf_native::{HyperVChannel, virtual_disk};
 use sandsurf_network::windows::{WindowsNetworkBridge, WindowsPortGateway};
 use sandsurf_protocol::{
@@ -94,7 +95,7 @@ pub fn prepare_config(
 ) -> Result<WindowsGuardianConfig, WindowsError> {
     let path = host_root
         .join("machines")
-        .join(machine_id.as_str())
+        .join(object_name(machine_id.as_str()))
         .join("guardian/config.json");
     if path.exists() {
         let existing = read_config(&path, machine_id)?;
@@ -607,7 +608,9 @@ impl WindowsGuardianEffect {
             .parent()
             .and_then(Path::parent)
             .ok_or(ControlError::Protocol("machine root has no host root"))?;
-        let directory = host_root.join("snapshots").join(snapshot_id.as_str());
+        let directory = host_root
+            .join("snapshots")
+            .join(object_name(snapshot_id.as_str()));
         for (name, artifact) in [
             ("system.ext4", &system_disk),
             ("snapshot.vmstate", &expected.snapshot_state),
@@ -1241,7 +1244,7 @@ fn hyperv_full_capture_directory(
 ) -> PathBuf {
     machine_root
         .join("guardian/full-captures")
-        .join(operation_id.as_str())
+        .join(object_name(operation_id.as_str()))
 }
 
 fn remove_hyperv_full_capture(

@@ -11,6 +11,7 @@ const { Sandsurf, ExecutionInterruptedError } = await import(pathToFileURL(join(
 const { NativeHostClient } = await import(pathToFileURL(join(packageDirectory, "dist/native-host.js")).href);
 
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
+const objectName = (identity) => `id-${createHash("sha256").update(identity).digest("hex")}`;
 
 test("KVM provides a persistent administrator-controlled Linux computer", { skip: !enabled, timeout: 1_200_000 }, async (context) => {
   const directory = process.env.SANDSURF_TEST_STATE ?? await mkdtemp("/var/tmp/sandsurf-computer-");
@@ -29,7 +30,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.match(nativeHost.guestPower.shutdown.reasons.join(" "), /ACPI/u);
     assert.equal(nativeHost.guestPower.reboot.kind, "unsupported");
     machine = await host.machines.create({
-      image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
+      id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
     });
     await managementReady(machine);
     const initialUsage = await machine.resources.usage();
@@ -76,7 +77,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
 
     context.diagnostic("guest commands and retained reads do not inspect native power to identify the guardian");
     const nativeGeneration = machine.generation;
-    const guardianRoot = join(directory, "machines", machine.id, "guardian");
+    const guardianRoot = join(directory, "machines", objectName(machine.id), "guardian");
     const nativeDirectories = (await readdir(guardianRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith(`vm-${nativeGeneration}-`));
     assert.equal(nativeDirectories.length, 1);
     const nativeSocket = join(guardianRoot, nativeDirectories[0].name, "vm-state/firecracker.socket");
@@ -306,7 +307,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       assert.ok(pending.machine.value.appliedRevision < pending.configurationRevision,
         "the failure must leave an admitted but unapplied host revision");
       await machine.destroy();
-      const systemDisk = join(directory, "machines", machine.id, "disks/system.ext4");
+      const systemDisk = join(directory, "machines", objectName(machine.id), "disks/system.ext4");
       await assert.rejects(stat(systemDisk), { code: "ENOENT" });
     } finally {
       await new Promise((done) => occupied.close(done));
@@ -317,7 +318,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     context.diagnostic("retained evidence reconnects without boot images or a native VM owner");
     await host.close();
     await (await NativeHostClient.open(directory)).stopService();
-    const retiredEndpoint = join(directory, "machines", identity, "guardian/control.sock");
+    const retiredEndpoint = join(directory, "machines", objectName(identity), "guardian/control.sock");
     const deadline = Date.now() + 10_000;
     while (await stat(retiredEndpoint).then(() => true, (error) => {
       if (error.code === "ENOENT") return false;
@@ -335,7 +336,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       execution = await machine.executions.get("retained-dense");
       assert.equal((await machine.inspect()).machine.value.state, "destroyed");
       assertSameBytes(await output(execution), dense);
-      await assert.rejects(stat(join(directory, "machines", identity, "disks/system.ext4")), { code: "ENOENT" });
+      await assert.rejects(stat(join(directory, "machines", objectName(identity), "disks/system.ext4")), { code: "ENOENT" });
       await execution.acknowledge(archivedReceipt.digest);
       const segment = await execution.output.seal("archive-copy", { boundary: archivedReceipt.receipt.output });
       const released = await execution.release(archivedReceipt, { kind: "continuing-retention", segment: segment.id });

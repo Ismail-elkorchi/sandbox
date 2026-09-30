@@ -4,7 +4,9 @@
 
 use sandsurf_native::PrivateFileAccess;
 use sandsurf_native::local::{create_private_file, open_private_file};
-use sandsurf_native::storage::{publish_new_file, replace_journal_file, sync_directory, sync_file};
+use sandsurf_native::storage::{
+    object_name, publish_new_file, replace_journal_file, sync_directory, sync_file,
+};
 use sandsurf_protocol::OperationId;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -197,10 +199,13 @@ pub(crate) fn replace_disk(
         .ok_or_else(|| invalid("disk replacement has no parent"))?;
     let next = parent.join(format!(
         ".system.{}.next.{}",
-        operation.as_str(),
+        object_name(operation.as_str()),
         format.extension()
     ));
-    let previous = parent.join(format!(".system.{}.previous", operation.as_str()));
+    let previous = parent.join(format!(
+        ".system.{}.previous",
+        object_name(operation.as_str())
+    ));
     let mut owner = DiskOwner::open(destination, None)?;
     if owner.record.bytes != bytes || owner.record.format != format {
         return Err(invalid(
@@ -437,12 +442,15 @@ pub(crate) fn retire(disk: &Path, bytes: u64, format: DiskFormat) -> io::Result<
         let parent = disk.parent().expect("validated parent");
         let next = parent.join(format!(
             ".system.{}.next.{}",
-            operation.as_str(),
+            object_name(operation.as_str()),
             owner.record.format.extension()
         ));
         reclaim_staging(&next.with_extension("building"))?;
         reclaim_staging(&next)?;
-        reclaim_staging(&parent.join(format!(".system.{}.previous", operation.as_str())))?;
+        reclaim_staging(&parent.join(format!(
+            ".system.{}.previous",
+            object_name(operation.as_str())
+        )))?;
     }
     reclaim_staging(&disk.with_extension("building"))?;
     reclaim_staging(disk)?;
@@ -506,6 +514,10 @@ mod tests {
             create_private_file(staged)?.write_all(&vec![byte; 4096])
         })
         .unwrap();
+    }
+
+    fn replacement_path(root: &Path, suffix: &str) -> PathBuf {
+        root.join(format!(".system.{}.{suffix}", object_name("replace")))
     }
 
     fn replace(target: &Path, operation: &OperationId) -> io::Result<()> {
@@ -642,8 +654,8 @@ mod tests {
             let target = fixture.0.join("system.ext4");
             create_disk(&target, 1);
             let operation: OperationId = "replace".try_into().unwrap();
-            let next = fixture.0.join(".system.replace.next.ext4");
-            let previous = fixture.0.join(".system.replace.previous");
+            let next = replacement_path(&fixture.0, "next.ext4");
+            let previous = replacement_path(&fixture.0, "previous");
             let mut owner = DiskOwner::open(&target, None).unwrap();
             owner
                 .set_phase(DiskPhase::Replacing {
@@ -705,12 +717,12 @@ mod tests {
                 operation: "replace".try_into().unwrap(),
             })
             .unwrap();
-        let next = root.join(".system.replace.next.ext4");
+        let next = replacement_path(&root, "next.ext4");
         publish_prepared(&next, 4096, DiskFormat::Raw, |staged| {
             create_private_file(staged)?.write_all(&vec![2; 4096])
         })
         .unwrap();
-        publish_new_file(&target, &root.join(".system.replace.previous")).unwrap();
+        publish_new_file(&target, &replacement_path(&root, "previous")).unwrap();
         println!("STORAGE-OWNER-READY");
         std::io::stdout().flush().unwrap();
         loop {
@@ -817,12 +829,12 @@ mod tests {
             .unwrap();
         drop(owner);
         let owned = [
-            ".system.replace.next.ext4",
-            ".system.replace.next.building",
-            ".system.replace.previous",
+            replacement_path(&fixture.0, "next.ext4"),
+            replacement_path(&fixture.0, "next.building"),
+            replacement_path(&fixture.0, "previous"),
         ];
-        for name in owned {
-            create_private_file(&fixture.0.join(name))
+        for path in &owned {
+            create_private_file(path)
                 .unwrap()
                 .write_all(b"owned")
                 .unwrap();
@@ -835,8 +847,8 @@ mod tests {
                 .unwrap();
         }
         retire(&target, 4096, DiskFormat::Raw).unwrap();
-        for name in owned {
-            assert!(!fixture.0.join(name).exists());
+        for path in &owned {
+            assert!(!path.exists());
         }
         for name in retained {
             assert_eq!(fs::read(fixture.0.join(name)).unwrap(), b"retained");

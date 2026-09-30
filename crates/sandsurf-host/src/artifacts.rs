@@ -14,6 +14,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions as CapOpenOptions},
 };
+use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{
     CommitmentId, Counter, Digest, Domain, FileKind, FilesystemRequest, FilesystemResponse,
     GuestPath, MachineId, OperationId, bytes_digest, digest,
@@ -1200,13 +1201,16 @@ impl ArtifactStore {
     }
 
     fn capture_directory(&self, operation: &OperationId) -> PathBuf {
-        self.root.join(format!("capture-{}", operation.as_str()))
+        self.root
+            .join(format!("capture-{}", object_name(operation.as_str())))
     }
     fn capture_lease(&self, operation: &OperationId) -> Result<File> {
         self.operation_lease("capture", operation.as_str())
     }
     fn operation_lease(&self, namespace: &str, identity: &str) -> Result<File> {
-        let path = self.root.join(format!("{namespace}-{identity}.lock"));
+        let path = self
+            .root
+            .join(format!("{namespace}-{}.lock", object_name(identity)));
         let file = match sandsurf_native::local::create_private_file(&path) {
             Ok(file) => {
                 sandsurf_native::storage::sync_file(&file)?;
@@ -1231,13 +1235,14 @@ impl ArtifactStore {
     }
     fn capture_stage(&self, operation: &OperationId) -> PathBuf {
         self.root
-            .join(format!("capture-{}.stage", operation.as_str()))
+            .join(format!("capture-{}.stage", object_name(operation.as_str())))
     }
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         self.root.join("blobs").join(digest.as_str())
     }
     fn apply_record_path(&self, operation: &OperationId) -> PathBuf {
-        self.root.join(format!("apply-{}.json", operation.as_str()))
+        self.root
+            .join(format!("apply-{}.json", object_name(operation.as_str())))
     }
 }
 
@@ -1969,6 +1974,35 @@ mod tests {
         drop(lease);
         let lease = second.capture_lease(&operation).unwrap();
         drop(lease);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn case_distinct_artifact_operations_have_independent_paths_and_worker_leases() {
+        let state = temporary("artifact-addresses");
+        let store = ArtifactStore::open(&state).unwrap();
+        let upper: OperationId = "Capture".try_into().unwrap();
+        let lower: OperationId = "capture".try_into().unwrap();
+        let upper_lease = store.capture_lease(&upper).unwrap();
+        let lower_lease = store.capture_lease(&lower).unwrap();
+        let upper_stage = store.capture_stage(&upper);
+        let lower_stage = store.capture_stage(&lower);
+        assert_ne!(
+            upper_stage.to_string_lossy().to_lowercase(),
+            lower_stage.to_string_lossy().to_lowercase()
+        );
+        assert_ne!(
+            store.apply_record_path(&upper),
+            store.apply_record_path(&lower)
+        );
+        create_private_directory(&upper_stage).unwrap();
+        create_private_directory(&lower_stage).unwrap();
+        fs::write(upper_stage.join("owner"), b"upper").unwrap();
+        fs::write(lower_stage.join("owner"), b"lower").unwrap();
+        assert_eq!(fs::read(upper_stage.join("owner")).unwrap(), b"upper");
+        assert_eq!(fs::read(lower_stage.join("owner")).unwrap(), b"lower");
+        drop(upper_lease);
+        drop(lower_lease);
         fs::remove_dir_all(state).unwrap();
     }
 
