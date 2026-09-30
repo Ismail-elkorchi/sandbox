@@ -520,6 +520,11 @@ impl OciLayout {
         source: ResolvedOciImage,
         destination: &Path,
     ) -> Result<ConvertedTree, OciError> {
+        if !cfg!(unix) {
+            return Err(OciError::Unsupported(
+                "OCI conversion requires the Linux builder appliance".into(),
+            ));
+        }
         let current = self.resolve(&GuestPlatform {
             architecture: source.architecture.clone(),
             os: source.os.clone(),
@@ -1399,7 +1404,9 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), OciError> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
-    Ok(())
+    Err(OciError::Unsupported(
+        "Linux inode permissions require the Linux builder appliance".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -1593,10 +1600,16 @@ mod tests {
             .unwrap()
             .convert(source.clone(), &destination);
         #[cfg(not(unix))]
-        assert!(
-            matches!(conversion, Err(OciError::Unsupported(_))),
-            "a host without Linux inode semantics must report the required builder, not silently discard metadata"
-        );
+        {
+            assert!(
+                matches!(conversion, Err(OciError::Unsupported(_))),
+                "a host without Linux inode semantics must report the required builder, not silently discard metadata"
+            );
+            assert!(
+                !destination.exists(),
+                "unsupported conversion must not stage a partial tree"
+            );
+        }
         #[cfg(unix)]
         {
             let converted = conversion.unwrap();
