@@ -311,7 +311,9 @@ impl HostService {
             )
             .into());
         }
-        self.provision_guardian(&machine_id)?;
+        // Guest work routes to an existing machine owner. Owner creation and
+        // native reconciliation belong to lifecycle/recovery, not each command
+        // or PTY keystroke. A missing route is reported without replaying work.
         self.catalog.observe_activity(&machine_id, unix_millis()?)?;
         let command = GuestCommand::new(machine_id.clone(), generation, operation_id, request)?;
         Ok(DeferredGuest {
@@ -345,7 +347,7 @@ impl HostService {
                 "filesystem commands require execution admission",
             ));
         }
-        self.provision_guardian(&machine_id)?;
+        self.catalog.require_guest_access(&machine_id)?;
         Ok(DeferredGuest {
             endpoint: self.guardian_endpoint(&machine_id),
             request: DeferredGuestRequest::Query {
@@ -3532,6 +3534,90 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn ordinary_guest_routes_neither_provision_an_owner_nor_require_native_inspection() {
+        let root = std::env::temp_dir().join(format!(
+            "ssroute-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let machine: MachineId = "box".try_into().unwrap();
+        let create: OperationId = "create".try_into().unwrap();
+        let image = bytes_digest(b"seed");
+        let resources = Resources {
+            vcpus: Counter::ONE,
+            memory_mib: 128_u64.try_into().unwrap(),
+            disk_bytes: 1_000_000_u64.try_into().unwrap(),
+            output_bytes: 1_000_000_u64.try_into().unwrap(),
+            managed_executions: 8_u64.try_into().unwrap(),
+        };
+        let defaults = ExecutionDefaults::default();
+        let lifetime = MachineLifetime::default();
+        let request_digest = digest(
+            Domain::Machine,
+            &(&machine, &image, &resources, &defaults, &lifetime, &create),
+        )
+        .unwrap();
+        service
+            .catalog
+            .create_machine(
+                sandsurf_state::MachineAdmission {
+                    id: machine.clone(),
+                    image,
+                    resources,
+                    defaults,
+                    image_defaults: ExecutionDefaults::default(),
+                    lifetime,
+                    operation: create,
+                },
+                Approval {
+                    id: "create-approval".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+
+        let request = GuestRequest::WriteInput {
+            execution_id: "process".try_into().unwrap(),
+            terminal_lease_id: None,
+            bytes: vec![1],
+        };
+        let dispatch = service
+            .prepare_guest_dispatch(
+                machine.clone(),
+                Counter::ONE,
+                "input".try_into().unwrap(),
+                request,
+            )
+            .unwrap();
+        let query = service
+            .prepare_guest_query(
+                machine.clone(),
+                Counter::ONE,
+                GuestServiceRequest::Process {
+                    execution_id: "process".try_into().unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(dispatch.endpoint, service.guardian_endpoint(&machine));
+        assert_eq!(query.endpoint, dispatch.endpoint);
+        assert!(
+            !service.machine_root(&machine).exists(),
+            "ordinary I/O created machine ownership state"
+        );
+        assert!(
+            matches!(
+                HostDispatch::Guest(Box::new(dispatch)).finish(),
+                HostResponse::Rejected { .. }
+            ),
+            "absence must be explicit, not owner creation"
+        );
+        assert!(!service.machine_root(&machine).exists());
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn oversized_response_is_reported_instead_of_closing_the_connection() {
