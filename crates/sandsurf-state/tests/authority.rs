@@ -2392,7 +2392,13 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
             status: status.clone(),
         })
     );
-    assert!(f.root.0.join("runtime/process.output").exists());
+    assert!(
+        f.root
+            .0
+            .join("runtime/output")
+            .join(bytes_digest(b"hello\0\xff").as_str())
+            .exists()
+    );
     let path = f.root.0.join("runtime");
     drop(f.runtime);
     let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
@@ -2404,7 +2410,18 @@ fn retirement_precedes_cleanup_and_recovery_keeps_identity() {
         .cleanup_released(&f.process, &status.request_digest)
         .unwrap();
     assert!(!cleaned.cleanup_pending);
-    assert!(!path.join("process.output").exists());
+    assert!(
+        !path
+            .join("output")
+            .join(bytes_digest(b"hello\0\xff").as_str())
+            .exists()
+    );
+    assert!(
+        !path
+            .join("output")
+            .join(bytes_digest(b"stderr").as_str())
+            .exists()
+    );
     assert_eq!(
         fs::read(f.root.0.join("captured.output")).unwrap(),
         b"hello\0\xffstderr"
@@ -2452,7 +2469,13 @@ fn continuing_retention_keeps_actual_originals_after_source_release() {
     f.runtime
         .cleanup_released(&f.process, &status.request_digest)
         .unwrap();
-    assert!(f.root.0.join("runtime/process.output").exists());
+    assert!(
+        f.root
+            .0
+            .join("runtime/output")
+            .join(bytes_digest(b"hello\0\xff").as_str())
+            .exists()
+    );
     assert!(f.runtime.read_output(&f.process, n(0), 64).is_err());
     assert_eq!(f.runtime.read_pin(&pin, n(0), 64).unwrap().cursor, n(13));
     let path = f.root.0.join("runtime");
@@ -2517,7 +2540,14 @@ fn explicit_loss_is_exactly_scoped_and_recorded() {
 fn corrupt_output_does_not_rewrite_terminal_truth_or_support_new_pin() {
     let mut f = Fixture::new();
     let receipt = f.terminal();
-    fs::write(f.root.0.join("runtime/process.output"), b"corrupt bytes").unwrap();
+    fs::write(
+        f.root
+            .0
+            .join("runtime/output")
+            .join(bytes_digest(b"hello\0\xff").as_str()),
+        b"corrupt bytes",
+    )
+    .unwrap();
     assert_eq!(
         f.runtime.receipt(&f.process).unwrap(),
         Some(receipt.clone())
@@ -2556,21 +2586,18 @@ fn stream_label_corruption_is_detected() {
 }
 
 #[test]
-fn uncommitted_output_tail_is_not_exposed_and_is_reconciled_before_append() {
-    use std::io::Write;
+fn unpublished_output_stage_never_changes_committed_originals() {
     let mut f = Fixture::new();
     f.runtime
         .append_output(&f.process, n(1), Stream::Stdout, b"committed")
         .unwrap();
     let path = f.root.0.join("runtime");
     drop(f.runtime);
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(path.join("process.output"))
-        .unwrap();
-    file.write_all(b"uncommitted").unwrap();
-    file.sync_all().unwrap();
-    drop(file);
+    let staged = path
+        .join("output")
+        .join(format!("{}.staged", bytes_digest(b"next").as_str()));
+    fs::write(&staged, b"uncommitted").unwrap();
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
     let mut runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
     assert_eq!(
         runtime.read_output(&f.process, n(0), 64).unwrap().cursor,
@@ -2580,8 +2607,227 @@ fn uncommitted_output_tail_is_not_exposed_and_is_reconciled_before_append() {
         .append_output(&f.process, n(2), Stream::Stderr, b"next")
         .unwrap();
     assert_eq!(
-        fs::read(path.join("process.output")).unwrap(),
-        b"committednext"
+        fs::read(
+            path.join("output")
+                .join(bytes_digest(b"committed").as_str())
+        )
+        .unwrap(),
+        b"committed"
+    );
+    assert_eq!(
+        fs::read(path.join("output").join(bytes_digest(b"next").as_str())).unwrap(),
+        b"next"
+    );
+    assert!(!staged.exists());
+}
+
+#[test]
+fn interrupted_capture_recovers_only_the_exact_durable_intent_and_complete_bytes() {
+    use std::io::Write;
+    for stage in [
+        "intent-only",
+        "partial-stage",
+        "complete-stage",
+        "published",
+    ] {
+        let f = Fixture::new();
+        let bytes = b"captured-before-chunk-commit";
+        let boundary = f.runtime.process_boundary(&f.process).unwrap();
+        let next = extend_output_boundary(&boundary, n(1), Stream::Stdout, bytes).unwrap();
+        let root = f.root.0.join("runtime");
+        let content = bytes_digest(bytes);
+        drop(f.runtime);
+        let db = rusqlite::Connection::open(root.join("authority.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO capture_writes VALUES (?1,1,0,?2,?3,?4,?5)",
+            rusqlite::params![
+                f.process.as_str(),
+                bytes.len(),
+                serde_json::to_string(&Stream::Stdout).unwrap(),
+                content.as_str(),
+                next.final_hash.as_str()
+            ],
+        )
+        .unwrap();
+        drop(db);
+        let staged = root
+            .join("output")
+            .join(format!("{}.staged", content.as_str()));
+        if stage != "intent-only" {
+            let path = if stage == "published" {
+                root.join("output").join(content.as_str())
+            } else {
+                staged.clone()
+            };
+            let mut file = sandsurf_native::local::create_private_file(&path).unwrap();
+            file.write_all(if stage == "partial-stage" {
+                &bytes[..3]
+            } else {
+                bytes
+            })
+            .unwrap();
+            file.sync_all().unwrap();
+            fs::File::open(root.join("output"))
+                .unwrap()
+                .sync_all()
+                .unwrap();
+        }
+        let mut runtime = RuntimeJournal::open(&root, &f.machine).unwrap();
+        let complete = matches!(stage, "complete-stage" | "published");
+        assert_eq!(
+            runtime.process_boundary(&f.process).unwrap().final_cursor,
+            if complete {
+                n(bytes.len() as u64)
+            } else {
+                n(0)
+            }
+        );
+        assert!(!staged.exists());
+        runtime
+            .append_output(&f.process, n(1), Stream::Stdout, bytes)
+            .unwrap();
+        assert_eq!(
+            runtime.read_output(&f.process, n(0), 64).unwrap().chunks[0].bytes,
+            bytes
+        );
+        assert!(runtime.receipt(&f.process).unwrap().is_none());
+        assert_eq!(
+            runtime
+                .operation(&f.command.operation_id)
+                .unwrap()
+                .unwrap()
+                .delivery,
+            Delivery::Dispatched
+        );
+        assert_eq!(fs::read_dir(root.join("output")).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn shared_immutable_payload_is_not_deleted_when_another_retention_owner_remains() {
+    let mut f = Fixture::new();
+    let request = f.capture_release();
+    let command = process_command(&f.command, "other-output-owner", n(20), StdioMode::Pipes);
+    f.runtime.admit(command.clone()).unwrap();
+    let other: ExecutionId = "other-output-owner".try_into().unwrap();
+    f.runtime
+        .admit_process(other.clone(), &command.operation_id, n(20), false)
+        .unwrap();
+    dispatch(&mut f.runtime, &command);
+    f.runtime
+        .append_output(&other, n(1), Stream::Stdout, b"hello\0\xff")
+        .unwrap();
+    let (receipt, digest) = f
+        .runtime
+        .publish_receipt(
+            &other,
+            ExecutionOutcome::Exit { code: 0 },
+            hash("cleanup"),
+            hash("accounting"),
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(f.root.0.join("runtime/output"))
+            .unwrap()
+            .count(),
+        2
+    );
+    let pin: PinId = "other-retention".try_into().unwrap();
+    f.runtime
+        .pin(
+            &"pin-other-output".try_into().unwrap(),
+            &other,
+            &digest,
+            pin.clone(),
+        )
+        .unwrap();
+    let status = f.runtime.release(&f.process, request).unwrap();
+    f.runtime
+        .cleanup_released(&f.process, &status.request_digest)
+        .unwrap();
+    assert_eq!(
+        fs::read_dir(f.root.0.join("runtime/output"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.runtime.read_output(&other, n(0), 64).unwrap().chunks[0].bytes,
+        b"hello\0\xff"
+    );
+    let release = ReleaseRequest {
+        operation_id: "release-other-output".try_into().unwrap(),
+        receipt_digest: digest,
+        output: receipt.output,
+        disposition: ReleaseDisposition::ContinuingRetention { pin: pin.clone() },
+    };
+    let status = f.runtime.release(&other, release).unwrap();
+    f.runtime
+        .cleanup_released(&other, &status.request_digest)
+        .unwrap();
+    let root = f.root.0.join("runtime");
+    drop(f.runtime);
+    let runtime = RuntimeJournal::open(&root, &f.machine).unwrap();
+    assert_eq!(
+        runtime.read_pin(&pin, n(0), 64).unwrap().chunks[0].bytes,
+        b"hello\0\xff"
+    );
+}
+
+#[test]
+fn malformed_pending_capture_cannot_repair_or_replace_committed_bytes() {
+    let mut f = Fixture::new();
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"original")
+        .unwrap();
+    let root = f.root.0.join("runtime");
+    drop(f.runtime);
+    let db = rusqlite::Connection::open(root.join("authority.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO capture_writes VALUES (?1,1,0,1,?2,?3,?4)",
+        rusqlite::params![
+            f.process.as_str(),
+            serde_json::to_string(&Stream::Stdout).unwrap(),
+            bytes_digest(b"x").as_str(),
+            hash("fake-chain").as_str()
+        ],
+    )
+    .unwrap();
+    drop(db);
+    assert!(RuntimeJournal::open(&root, &f.machine).is_err());
+    assert_eq!(
+        fs::read(root.join("output").join(bytes_digest(b"original").as_str())).unwrap(),
+        b"original"
+    );
+}
+
+#[test]
+fn another_execution_cannot_silently_recreate_missing_retained_originals() {
+    let mut f = Fixture::new();
+    let receipt = f.terminal();
+    let original = f
+        .root
+        .0
+        .join("runtime/output")
+        .join(bytes_digest(b"hello\0\xff").as_str());
+    fs::remove_file(&original).unwrap();
+    let command = process_command(&f.command, "cannot-repair", n(20), StdioMode::Pipes);
+    let other: ExecutionId = "cannot-repair".try_into().unwrap();
+    f.runtime.admit(command.clone()).unwrap();
+    f.runtime
+        .admit_process(other.clone(), &command.operation_id, n(20), false)
+        .unwrap();
+    dispatch(&mut f.runtime, &command);
+    assert!(
+        f.runtime
+            .append_output(&other, n(1), Stream::Stdout, b"hello\0\xff")
+            .is_err()
+    );
+    assert!(!original.exists());
+    assert_eq!(f.runtime.receipt(&f.process).unwrap(), Some(receipt));
+    assert_eq!(
+        f.runtime.process_boundary(&other).unwrap().final_cursor,
+        n(0)
     );
 }
 
@@ -3093,8 +3339,12 @@ fn abrupt_writer_child() {
                     .unwrap();
             runtime.release(&process, request).unwrap();
             // Crash after physical unlink, before committing cleanup completion.
-            fs::remove_file(root.join("runtime/process.output")).unwrap();
-            fs::File::open(root.join("runtime"))
+            fs::remove_file(
+                root.join("runtime/output")
+                    .join(bytes_digest(b"hello\0\xff").as_str()),
+            )
+            .unwrap();
+            fs::File::open(root.join("runtime/output"))
                 .unwrap()
                 .sync_all()
                 .unwrap();
@@ -3142,7 +3392,18 @@ fn abrupt_process_exit_preserves_committed_output_and_interrupted_release() {
             runtime
                 .cleanup_released(&f.process, &status.request_digest)
                 .unwrap();
-            assert!(!path.join("process.output").exists());
+            assert!(
+                !path
+                    .join("output")
+                    .join(bytes_digest(b"hello\0\xff").as_str())
+                    .exists()
+            );
+            assert!(
+                !path
+                    .join("output")
+                    .join(bytes_digest(b"stderr").as_str())
+                    .exists()
+            );
             assert_eq!(
                 fs::read(f.root.0.join("captured.output")).unwrap(),
                 b"hello\0\xffstderr"

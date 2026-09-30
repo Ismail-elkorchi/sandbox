@@ -15,6 +15,7 @@
 mod authority;
 mod catalog;
 mod database;
+mod output_store;
 mod runtime;
 
 pub use catalog::*;

@@ -117,6 +117,12 @@ count before the first guest report and remain reserved through management
 unavailability, pause and suspend. Native interruption frees their slots, while
 retained bytes and unsettled capture headroom remain protected independently.
 
+Captured output payloads are immutable, digest-verified objects owned by the
+guardian's retention ledger. Write intent is durable before publication, and
+only the ordered chunk commit exposes the bytes as captured. Interrupted writes
+recover without replaying Linux commands. Cleanup unlinks a shared object only
+when no other captured chunk or pending capture still owns its bytes.
+
 Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 
 ```ts

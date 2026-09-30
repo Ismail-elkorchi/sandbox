@@ -1,15 +1,10 @@
 use crate::{
-    Error, Result,
-    authority::AuthorityVerifier,
-    catalog::capacity,
-    database::{Database, private_file, sync_directory, sync_file},
-    decode, encode,
+    Error, Result, authority::AuthorityVerifier, catalog::capacity, database::Database, decode,
+    encode,
 };
 use rusqlite::{OptionalExtension, params};
 use sandsurf_protocol::*;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const SCHEMA: &str = "
@@ -24,6 +19,8 @@ CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL, digest TE
 CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), generation INTEGER NOT NULL, output_origin_generation INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
+CREATE INDEX chunks_by_digest ON chunks(bytes_digest);
+CREATE TABLE capture_writes(process TEXT PRIMARY KEY REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL) STRICT;
 CREATE TABLE pins(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
 CREATE TABLE acknowledgement_operations(id TEXT PRIMARY KEY, process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
 CREATE TABLE pin_operations(id TEXT PRIMARY KEY, pin TEXT NOT NULL REFERENCES pins(id), process TEXT NOT NULL REFERENCES processes(id), receipt_digest TEXT NOT NULL) STRICT;
@@ -156,6 +153,7 @@ impl RuntimeJournal {
         }
         let authority = AuthorityVerifier::new(binding)?;
         let db = Database::create(path, "guardian", SCHEMA)?;
+        crate::output_store::create(&db.root)?;
         db.connection.execute(
             "INSERT INTO configuration(id,machine,limits,authority) VALUES (1,?1,?2,?3)",
             params![
@@ -181,12 +179,15 @@ impl RuntimeJournal {
         if identity != machine.as_str() {
             return Err(Error::Conflict("guardian machine identity mismatch"));
         }
-        Ok(Self {
+        let mut journal = Self {
             db,
             machine: machine.clone(),
             limits: decode(&limits)?,
             authority: AuthorityVerifier::new(decode(&binding)?)?,
-        })
+        };
+        crate::output_store::validate(&journal.db.root)?;
+        journal.recover_output_writes()?;
+        Ok(journal)
     }
     pub fn authority_binding(&self) -> &AuthorityBinding {
         self.authority.binding()
@@ -1439,7 +1440,6 @@ impl RuntimeJournal {
         if bytes.is_empty() || bytes.len() > MAX_STREAM_BYTES {
             return Err(Error::Capacity("invalid output chunk size"));
         }
-        let path = self.db.root.join(format!("{}.output", id.as_str()));
         let tx = self.db.connection.transaction()?;
         let (raw, limit, terminal, receipt, released): (
             String,
@@ -1474,10 +1474,7 @@ impl RuntimeJournal {
                 if length != bytes.len() || offset.checked_add(length as u64).is_none_or(|end| end > boundary.final_cursor.get()) {
                     return Err(Error::Corrupt("replayed output index is inconsistent"));
                 }
-                let mut file = private_file(&path,false)?;
-                let mut original = vec![0;length];
-                file.seek(SeekFrom::Start(offset))?;
-                file.read_exact(&mut original)?;
+                let original = crate::output_store::read(&self.db.root, &content, length)?;
                 if original != bytes { return Err(Error::Corrupt("cannot acknowledge replay with missing or corrupt retained originals")); }
                 return Ok(boundary);
             }
@@ -1498,26 +1495,56 @@ impl RuntimeJournal {
             ));
         }
         capacity(&tx, "chunks", self.limits.chunks)?;
+        capacity(&tx, "events", self.limits.events)?;
         let chain = next_boundary.final_hash.clone();
-        let mut file = match private_file(&path, boundary.final_cursor == Counter::ZERO) {
-            Ok(file) => file,
-            Err(Error::Io(e))
-                if e.kind() == std::io::ErrorKind::AlreadyExists
-                    && boundary.final_cursor == Counter::ZERO =>
-            {
-                private_file(&path, false)?
-            }
-            Err(e) => return Err(e),
-        };
-        if file.metadata()?.len() < boundary.final_cursor.get() {
-            return Err(Error::Corrupt("committed output is truncated"));
+        let shared: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE bytes_digest=?1)",
+            [content.as_str()],
+            |r| r.get(0),
+        )?;
+        if shared && crate::output_store::read(&self.db.root, &content, bytes.len())? != bytes {
+            return Err(Error::Corrupt(
+                "shared output originals are unavailable or changed",
+            ));
         }
-        // Only discard the uncommitted tail. A crash before the SQLite commit never acknowledged it.
-        file.set_len(boundary.final_cursor.get())?;
-        file.seek(SeekFrom::Start(boundary.final_cursor.get()))?;
-        file.write_all(bytes)?;
-        sync_file(&file)?;
-        sync_directory(&self.db.root)?;
+        let prepared = (
+            sequence.get(),
+            boundary.final_cursor.get(),
+            bytes.len() as u64,
+            encode(&stream)?,
+            content.as_str().to_owned(),
+            chain.as_str().to_owned(),
+        );
+        type WriteIdentity = (u64, u64, u64, String, String, String);
+        let pending: Option<WriteIdentity> = tx.query_row(
+            "SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM capture_writes WHERE process=?1",
+            [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).optional()?;
+        if let Some(pending) = pending {
+            if pending != prepared {
+                return Err(Error::Conflict(
+                    "pending output capture has a different identity",
+                ));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO capture_writes VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    id.as_str(),
+                    prepared.0,
+                    prepared.1,
+                    prepared.2,
+                    prepared.3,
+                    prepared.4,
+                    prepared.5
+                ],
+            )?;
+        }
+        // Ownership precedes filesystem effects. A published object without
+        // the final chunk commit is recovered from this exact durable intent.
+        tx.commit()?;
+        crate::output_store::publish(&self.db.root, &content, bytes)?;
+        let tx = self.db.connection.transaction()?;
         tx.execute(
             "INSERT INTO chunks VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
@@ -1535,6 +1562,7 @@ impl RuntimeJournal {
             "UPDATE processes SET boundary=?2 WHERE id=?1",
             params![id.as_str(), encode(&boundary)?],
         )?;
+        tx.execute("DELETE FROM capture_writes WHERE process=?1", [id.as_str()])?;
         append_event(
             &tx,
             &self.machine,
@@ -1546,6 +1574,62 @@ impl RuntimeJournal {
         )?;
         tx.commit()?;
         Ok(boundary)
+    }
+
+    fn recover_output_writes(&mut self) -> Result<()> {
+        loop {
+            type PendingWrite = (String, u64, u64, usize, String, String, String);
+            let pending: Option<PendingWrite> = self.db.connection.query_row(
+                "SELECT process,sequence,offset,length,stream,bytes_digest,chain_digest FROM capture_writes ORDER BY process LIMIT 1",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
+            ).optional()?;
+            let Some((process, sequence, offset, length, stream, digest, chain)) = pending else {
+                break;
+            };
+            let id: ExecutionId = process.try_into()?;
+            let digest: Digest = digest.try_into()?;
+            let stream: Stream = decode(&stream)?;
+            let (raw, limit, terminal, settled): (String, u64, bool, bool) = self.db.connection.query_row(
+                "SELECT boundary,output_limit,terminal_mode,receipt IS NOT NULL OR release IS NOT NULL FROM processes WHERE id=?1",
+                [id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            )?;
+            let boundary: OutputBoundary = decode(&raw)?;
+            if length == 0
+                || length > MAX_STREAM_BYTES
+                || settled
+                || sequence != boundary.chunks.next()?.get()
+                || offset != boundary.final_cursor.get()
+                || offset
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > limit)
+                || terminal != (stream == Stream::Terminal)
+                || sandsurf_protocol::digest(
+                    Domain::Output,
+                    &(
+                        &boundary.final_hash,
+                        Counter::try_from(sequence)?,
+                        Counter::try_from(offset)?,
+                        stream,
+                        &digest,
+                        length,
+                    ),
+                )?
+                .as_str()
+                    != chain
+            {
+                return Err(Error::Corrupt("pending output capture identity is invalid"));
+            }
+            if let Some(bytes) = crate::output_store::recover(&self.db.root, &digest, length)? {
+                self.append_output(&id, sequence.try_into()?, stream, &bytes)?;
+            } else {
+                // No complete payload ever became visible or acknowledged.
+                // The guest may retry the same next sequence after reconnect.
+                self.db
+                    .connection
+                    .execute("DELETE FROM capture_writes WHERE process=?1", [id.as_str()])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn read_output(
@@ -1597,7 +1681,6 @@ impl RuntimeJournal {
         if after == boundary.final_cursor {
             return Ok(page);
         }
-        let mut file = private_file(&self.db.root.join(format!("{}.output", id.as_str())), false)?;
         // Indexed predecessor plus forward range: do not rescan prior output on every poll.
         let start: u64 = self.db.connection.query_row("SELECT offset FROM chunks WHERE process=?1 AND offset<=?2 ORDER BY offset DESC LIMIT 1", params![id.as_str(),after.get()], |r| r.get(0)).optional()?.ok_or(Error::Corrupt("output cursor has no retained segment"))?;
         let mut statement = self.db.connection.prepare("SELECT sequence,offset,length,stream,bytes_digest,chain_digest FROM chunks WHERE process=?1 AND offset>=?2 ORDER BY offset LIMIT 256")?;
@@ -1626,9 +1709,11 @@ impl RuntimeJournal {
             {
                 return Err(Error::Corrupt("invalid output segment index"));
             }
-            let mut bytes = vec![0; length];
-            file.seek(SeekFrom::Start(offset))?;
-            file.read_exact(&mut bytes)?;
+            let bytes = crate::output_store::read(
+                &self.db.root,
+                &Digest::try_from(expected.clone())?,
+                length,
+            )?;
             let content = bytes_digest(&bytes);
             if content.as_str() != expected {
                 return Err(Error::Corrupt("output segment digest mismatch"));
@@ -1699,6 +1784,15 @@ impl RuntimeJournal {
         accounting: Digest,
     ) -> Result<(Receipt, Digest)> {
         let tx = self.db.connection.transaction()?;
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_writes WHERE process=?1)",
+            [id.as_str()],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(Error::Conflict(
+                "output capture must settle before a terminal receipt",
+            ));
+        }
         let (operation_id, generation, boundary, old): (String, u64, String, Option<String>) = tx
             .query_row(
             "SELECT operation,generation,boundary,receipt FROM processes WHERE id=?1",
@@ -2098,13 +2192,12 @@ impl RuntimeJournal {
             |r| r.get(0),
         )?;
         if !pinned {
-            let path = self.db.root.join(format!("{}.output", id.as_str()));
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            let mut statement = tx.prepare("SELECT DISTINCT c.bytes_digest FROM chunks c WHERE c.process=?1 AND NOT EXISTS(SELECT 1 FROM chunks other WHERE other.bytes_digest=c.bytes_digest AND other.process<>?1) AND NOT EXISTS(SELECT 1 FROM capture_writes pending WHERE pending.bytes_digest=c.bytes_digest)")?;
+            let digests = statement.query_map([id.as_str()], |row| row.get::<_, String>(0))?;
+            for digest in digests {
+                crate::output_store::remove_blob(&self.db.root, &Digest::try_from(digest?)?)?;
             }
-            sync_directory(&self.db.root)?;
+            drop(statement);
             tx.execute("DELETE FROM chunks WHERE process=?1", [id.as_str()])?;
         }
         tx.execute(
