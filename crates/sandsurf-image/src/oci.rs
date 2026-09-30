@@ -1486,6 +1486,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn parent_symlinks_are_never_followed() {
         let root = Temp::new();
