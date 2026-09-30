@@ -423,9 +423,13 @@ pub(crate) fn rename_private_object(
     destination: &Path,
     replace: bool,
 ) -> io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfo, SetFileInformationByHandle,
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FILE_RENAME_INFORMATION_0, FileRenameInformation,
+        NtSetInformationFile,
     };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     if source.parent() != destination.parent() || !source.is_absolute() {
         return Err(invalid(
             "rename requires absolute names in one private directory",
@@ -454,17 +458,17 @@ pub(crate) fn rename_private_object(
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(source)?;
     validate_private(&held, held.metadata()?.is_dir(), false)?;
-    let bytes = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2)
-        .max(size_of::<FILE_RENAME_INFO>());
+    let bytes = (std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName) + name.len() * 2)
+        .max(size_of::<FILE_RENAME_INFORMATION>());
     // usize storage supplies native HANDLE alignment; the initialized header
     // and UTF-16 tail are contained in this allocation through the native call.
     let mut buffer = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: buffer has the alignment and checked capacity for the complete
-    // FILE_RENAME_INFO header and flexible UTF-16 filename tail.
+    // FILE_RENAME_INFORMATION header and flexible UTF-16 filename tail.
     unsafe {
-        info.write(FILE_RENAME_INFO {
-            Anonymous: FILE_RENAME_INFO_0 {
+        info.write(FILE_RENAME_INFORMATION {
+            Anonymous: FILE_RENAME_INFORMATION_0 {
                 ReplaceIfExists: replace,
             },
             RootDirectory: parent.held.as_raw_handle().cast(),
@@ -473,19 +477,25 @@ pub(crate) fn rename_private_object(
         });
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
     }
-    // SAFETY: source and parent handles and the initialized aligned buffer
-    // remain held for this synchronous same-directory atomic rename. Only the
-    // owner-journal caller may request replacement; no-replace never overwrites.
-    if unsafe {
-        SetFileInformationByHandle(
+    let mut completion = IO_STATUS_BLOCK::default();
+    // The native API accepts a held RootDirectory with a relative name. Only
+    // the owner journal requests replacement; publication never does.
+    // SAFETY: source, parent, aligned input and completion remain held through
+    // this synchronous call; the non-overlapped source completes before return.
+    let status = unsafe {
+        NtSetInformationFile(
             held.as_raw_handle().cast(),
-            FileRenameInfo,
+            &mut completion,
             info.cast(),
             bytes as u32,
+            FileRenameInformation,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if status != 0 {
+        // SAFETY: the pure native status conversion takes no pointers. NT
+        // APIs return their status directly and do not set Win32 last-error.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(io::Error::from_raw_os_error(code as i32));
     }
     Ok(())
 }

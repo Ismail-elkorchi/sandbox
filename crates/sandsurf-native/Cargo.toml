@@ -14,6 +14,7 @@ sandsurf-protocol = { path = "../sandsurf-protocol" }
 [target.'cfg(target_os = "windows")'.dependencies]
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 windows-sys = { workspace = true, features = [
+  "Wdk_Storage_FileSystem",
   "Win32_Foundation",
   "Win32_Networking_WinSock",
   "Win32_Security",
