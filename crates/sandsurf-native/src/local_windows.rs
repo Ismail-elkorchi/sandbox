@@ -531,6 +531,7 @@ impl LocalConnection {
         let deadline = Deadline::new(timeout)?;
         let root = Directory::open(directory)?;
         let pipe_name = root.pipe_name();
+        let mut saw_instance = false;
         let pipe = loop {
             deadline.remaining()?;
             // SAFETY: pipe name is terminated and all pointer/scalar arguments are valid.
@@ -551,16 +552,29 @@ impl LocalConnection {
             let error = io::Error::last_os_error();
             match error.raw_os_error().map(|value| value as u32) {
                 Some(ERROR_PIPE_BUSY) => {
+                    saw_instance = true;
                     let millis = deadline.millis()?;
                     // SAFETY: the pipe name is terminated and timeout is bounded.
                     if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), millis) } == 0 {
                         let wait_error = io::Error::last_os_error();
-                        if wait_error.kind() != io::ErrorKind::TimedOut {
+                        if wait_error.kind() != io::ErrorKind::TimedOut
+                            && wait_error.raw_os_error().map(|value| value as u32)
+                                != Some(ERROR_FILE_NOT_FOUND)
+                        {
                             return Err(wait_error);
                         }
                     }
                 }
                 Some(ERROR_FILE_NOT_FOUND) => {
+                    if saw_instance {
+                        // Windows can temporarily report no available instance
+                        // during an established listener's handoff. Finish the
+                        // connection under its original deadline; no frame or
+                        // application operation has been dispatched or retried.
+                        root.check()?;
+                        std::thread::sleep(deadline.remaining()?.min(Duration::from_millis(5)));
+                        continue;
+                    }
                     // Absence is an immediate observation. The host/SDK owns
                     // service startup and its retry policy; a pipe connect
                     // must not hide absence behind an operation-length wait.

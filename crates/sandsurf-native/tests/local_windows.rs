@@ -136,6 +136,20 @@ fn disconnected_readiness_clients_do_not_retire_the_pipe_owner() {
 }
 
 #[test]
+fn initial_pipe_absence_is_not_hidden_by_the_connection_deadline() {
+    let root = Root::new();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        LocalConnection::connect(&root.0, WAIT)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(started.elapsed() < WAIT / 2);
+}
+
+#[test]
 fn pipe_owner_fixture() {
     let Some(root) = std::env::var_os("SANDSURF_PIPE_TEST_ROOT") else {
         return;
