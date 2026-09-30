@@ -1167,6 +1167,29 @@ mod tests {
 
     #[test]
     fn helper_inherits_exclusive_storage_custody_until_confirmed_process_exit() {
+        const FIXTURE: &str = "SANDSURF_APPLE_STORAGE_CUSTODY_FIXTURE";
+        if std::env::var_os(FIXTURE).is_none() {
+            // Other tests fork concurrently: until their exec, they correctly
+            // retain every inherited file description, including this lease.
+            // Isolate this close-lifetime assertion rather than unlocking a
+            // potentially live native attachment or accepting a leaked lease.
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::helper_inherits_exclusive_storage_custody_until_confirmed_process_exit",
+                    "--test-threads=1",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "isolated custody assertion failed: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+            return;
+        }
         use sandsurf_native::PrivateFileAccess;
         use sandsurf_native::local::{
             create_private_directory, create_private_file, open_private_file,
