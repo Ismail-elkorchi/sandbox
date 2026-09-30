@@ -335,11 +335,6 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         self.remove_full_snapshot()
     }
 
-    #[must_use]
-    pub fn capture_is_paused(&self) -> bool {
-        self.capture_paused
-    }
-
     /// Fail closed when a higher-level transaction cannot publish a machine
     /// that this driver has already started or restored. No observation is
     /// manufactured here; the guardian retains its previous observation and
@@ -479,9 +474,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
-        if self.capture_paused {
-            return Self::unavailable(b"firecracker-filesystem-capture-active");
-        }
         let Some(process) = self.process.as_ref() else {
             return Self::unavailable(b"firecracker-owner-unavailable");
         };
@@ -503,9 +495,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
     ) -> MachineOutcome {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-machine-identity-mismatch");
-        }
-        if self.capture_paused {
-            return Self::unavailable(b"firecracker-filesystem-capture-active");
         }
         let Some(process) = self.process.as_ref() else {
             return Self::unavailable(b"firecracker-owner-unavailable");

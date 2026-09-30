@@ -336,11 +336,6 @@ impl HyperVDriver {
         Ok(())
     }
 
-    #[must_use]
-    pub fn capture_is_paused(&self) -> bool {
-        self.capture_paused
-    }
-
     fn unavailable(&self, reason: &'static [u8]) -> MachineOutcome {
         MachineOutcome::NotApplied(bytes_digest(reason))
     }

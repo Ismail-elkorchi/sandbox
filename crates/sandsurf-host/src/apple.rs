@@ -864,14 +864,15 @@ impl GuestDriver for AppleGuest {
 }
 
 impl GuardianEffect for AppleGuardianEffect {
+    fn capture_owner(&self) -> ControlResult<Option<sandsurf_protocol::OperationId>> {
+        Ok(crate::capture::CaptureBoundary::read(&self.machine_root)?
+            .map(|capture| capture.operation_id))
+    }
     fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
         Box::new(AppleGuest {
             active: Arc::clone(&self.guest_binding),
             remote: None,
         })
-    }
-    fn guest_poll_allowed(&self) -> bool {
-        !self.machine.capture_is_paused()
     }
 
     fn transition(

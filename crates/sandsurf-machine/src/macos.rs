@@ -452,11 +452,6 @@ impl AppleDriver {
             .as_mut()
             .is_some_and(|owner| matches!(owner.child.try_wait(), Ok(None)))
     }
-
-    #[must_use]
-    pub fn capture_is_paused(&self) -> bool {
-        self.capture_paused
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -89,9 +89,12 @@ use crate::guest_worker::{ExecutionHint, GuestJob, GuestJobResult};
 pub use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 
 pub trait GuardianEffect {
+    /// The durable capture transaction owns the pause, including uncertain
+    /// native delivery. A volatile native "paused" flag is not this authority.
+    fn capture_owner(&self) -> Result<Option<OperationId>>;
     fn guest_driver(&mut self) -> Box<dyn GuestDriver>;
     fn guest_poll_allowed(&self) -> bool {
-        true
+        matches!(self.capture_owner(), Ok(None))
     }
     fn transition(
         &mut self,
@@ -602,8 +605,30 @@ impl<E: GuardianEffect> Guardian<E> {
                             .effect
                             .as_mut()
                             .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
-                        let outcome =
-                            permit.perform(|actual| native.transition(actual, current.as_ref()));
+                        let outcome = permit.perform(|actual| {
+                            if matches!(
+                                actual.desired,
+                                DesiredState::Running | DesiredState::Paused
+                            ) {
+                                match native.capture_owner() {
+                                    Ok(None) => {}
+                                    Ok(Some(_)) => {
+                                        return LifecycleEffect::NotApplied(bytes_digest(
+                                            b"native-capture-owns-pause-boundary",
+                                        ));
+                                    }
+                                    Err(_) => {
+                                        return LifecycleEffect::NotApplied(bytes_digest(
+                                            b"native-capture-ownership-unavailable",
+                                        ));
+                                    }
+                                }
+                            }
+                            // Forced containment must not depend on a readable
+                            // capture journal; suspension verifies its own
+                            // committed full-state witness in the native owner.
+                            native.transition(actual, current.as_ref())
+                        });
                         match outcome {
                             LifecycleEffect::Observed(transitions) => {
                                 if transitions.is_empty() || transitions.len() > 8 {

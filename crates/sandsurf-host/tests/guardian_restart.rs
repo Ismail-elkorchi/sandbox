@@ -305,6 +305,26 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn capture_owner(&self) -> sandsurf_host::guardian::Result<Option<OperationId>> {
+        if self
+            .path
+            .parent()
+            .unwrap()
+            .join("capture-owner-unavailable")
+            .exists()
+        {
+            return Err(sandsurf_host::guardian::Error::Protocol(
+                "capture owner unavailable",
+            ));
+        }
+        Ok(self
+            .path
+            .parent()
+            .unwrap()
+            .join("capture-owned")
+            .exists()
+            .then(|| "capture".try_into().unwrap()))
+    }
     fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
         Box::new(FileGuest {
             path: self.path.clone(),
@@ -618,6 +638,76 @@ fn blocked_guest_io_cannot_block_native_observation_or_power_off() {
     assert!(!fixture.root.0.join("release-guest-query").exists());
     fs::write(fixture.root.0.join("release-guest-query"), []).unwrap();
     assert!(guest_query.join().unwrap().is_ok());
+}
+
+#[test]
+fn durable_capture_ownership_fences_native_delivery_and_never_blocks_forced_containment() {
+    for marker in ["capture-owned", "capture-owner-unavailable"] {
+        let mut fixture = Fixture::new();
+        let endpoint = fixture.root.0.join("endpoint");
+        sandsurf_native::local::ensure_private_directory(&endpoint).unwrap();
+        // The ownership record precedes a confirmed pause; the last native
+        // postcondition is still Running. No volatile pause flag may override it.
+        fs::write(fixture.root.0.join(marker), []).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "guardian_process_fixture", "--test-threads=1"])
+            .env("SANDSURF_GUARDIAN_TEST_ROOT", &fixture.root.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let _child = ChildGuard(child);
+        drop(wait_for_guardian(&endpoint));
+        for (name, desired, expected) in [
+            (
+                "captured-start",
+                DesiredState::Running,
+                Delivery::NotApplied,
+            ),
+            ("captured-pause", DesiredState::Paused, Delivery::NotApplied),
+            (
+                "captured-power-off",
+                DesiredState::Stopped,
+                Delivery::Applied,
+            ),
+        ] {
+            let operation: OperationId = name.try_into().unwrap();
+            let revision = fixture.host.revision(&fixture.machine).unwrap();
+            let request_digest = digest(
+                Domain::Operation,
+                &(&fixture.machine, &operation, revision, desired),
+            )
+            .unwrap();
+            fixture
+                .host
+                .request_lifecycle(
+                    &fixture.machine,
+                    operation.clone(),
+                    revision,
+                    desired,
+                    Approval {
+                        id: format!("approve-{name}").try_into().unwrap(),
+                        request_digest,
+                    },
+                )
+                .unwrap();
+            let outcome = apply_lifecycle(&mut fixture.host, endpoint.clone(), &operation).unwrap();
+            assert_eq!(outcome.guardian_operation.delivery, expected);
+        }
+        let inspection = GuardianClient::new(endpoint)
+            .inspect(fixture.machine.clone(), None)
+            .unwrap();
+        assert!(matches!(
+            inspection.observation,
+            Observation::Current {
+                value: MachineObservation {
+                    state: MachineState::Stopped,
+                    ..
+                }
+            }
+        ));
+    }
 }
 
 #[test]

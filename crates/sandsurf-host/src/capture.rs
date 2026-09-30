@@ -5,10 +5,8 @@
 use crate::guardian::{Error, Result};
 use sandsurf_protocol::{Counter, MachineState, OperationId};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,16 +20,15 @@ pub(crate) struct CaptureBoundary {
 impl CaptureBoundary {
     pub fn read(root: &Path) -> Result<Option<Self>> {
         let path = root.join("guardian/capture-boundary.json");
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_NOFOLLOW);
-        let file = match options.open(path) {
+        let file = match sandsurf_native::local::open_private_file(
+            &path,
+            sandsurf_native::PrivateFileAccess::ReadOnly,
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if !file.metadata()?.is_file() || file.metadata()?.len() > 4096 {
+        if file.metadata()?.len() > 4096 {
             return Err(Error::Protocol("invalid native capture boundary"));
         }
         let mut bytes = Vec::new();
@@ -50,19 +47,19 @@ impl CaptureBoundary {
                 "capture requires a running or paused computer",
             ));
         }
-        let boundary = Self {
-            operation_id,
-            generation,
-            preserve_pause: state == MachineState::Paused,
-        };
         if let Some(active) = Self::read(root)? {
-            if active != boundary {
+            if active.operation_id != operation_id || active.generation != generation {
                 return Err(Error::Protocol(
                     "another native capture owns the pause boundary",
                 ));
             }
             return Ok(active);
         }
+        let boundary = Self {
+            operation_id,
+            generation,
+            preserve_pause: state == MachineState::Paused,
+        };
         let directory = root.join("guardian");
         crate::snapshots::private_directory(&directory)
             .map_err(|_| Error::Protocol("native capture directory is not private"))?;
@@ -70,16 +67,22 @@ impl CaptureBoundary {
         getrandom::getrandom(&mut nonce)
             .map_err(|_| Error::Protocol("capture nonce unavailable"))?;
         let temporary = directory.join(format!(".capture-{}.tmp", u128::from_le_bytes(nonce)));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec(&boundary)?)?;
-        sandsurf_native::storage::sync_file(&file)?;
-        fs::rename(&temporary, directory.join("capture-boundary.json"))?;
-        crate::snapshots::sync_directory(&directory)
-            .map_err(|_| Error::Protocol("native capture boundary durability failed"))?;
+        let mut file = sandsurf_native::local::create_private_file(&temporary)?;
+        let publication = (|| -> Result<()> {
+            file.write_all(&serde_json::to_vec(&boundary)?)?;
+            drop(file);
+            sandsurf_native::storage::publish_new_file(
+                &temporary,
+                &directory.join("capture-boundary.json"),
+            )?;
+            Ok(())
+        })();
+        if publication.is_err() {
+            // Only this newly created stage is reclaimed, after its protected
+            // writer closes. A published ownership record is left for recovery.
+            let _ = fs::remove_file(&temporary);
+        }
+        publication?;
         Ok(boundary)
     }
 
@@ -98,12 +101,18 @@ impl CaptureBoundary {
 
     pub fn clear(root: &Path) -> Result<()> {
         let directory = root.join("guardian");
-        match fs::remove_file(directory.join("capture-boundary.json")) {
-            Ok(()) => crate::snapshots::sync_directory(&directory)
-                .map_err(|_| Error::Protocol("capture release durability failed")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        let path = directory.join("capture-boundary.json");
+        match sandsurf_native::local::open_private_file(
+            &path,
+            sandsurf_native::PrivateFileAccess::ReadOnly,
+        ) {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        fs::remove_file(path)?;
+        sandsurf_native::storage::sync_directory(&directory)?;
+        Ok(())
     }
 }
 
@@ -142,6 +151,17 @@ mod tests {
             CaptureBoundary::begin(&root, operation.clone(), Counter::ONE, MachineState::Paused)
                 .unwrap()
         );
+        assert_eq!(
+            original,
+            CaptureBoundary::begin(
+                &root,
+                operation.clone(),
+                Counter::ONE,
+                MachineState::Running
+            )
+            .unwrap(),
+            "retry must preserve the recorded pause owner, not reinterpret a later observation"
+        );
         assert!(CaptureBoundary::require(&root, &"wrong".try_into().unwrap()).is_err());
         assert!(
             CaptureBoundary::begin(
@@ -155,6 +175,24 @@ mod tests {
         CaptureBoundary::require(&root, &operation).unwrap();
         CaptureBoundary::clear(&root).unwrap();
         assert!(CaptureBoundary::read(&root).unwrap().is_none());
+        let record = root.join("guardian/capture-boundary.json");
+        let mut file = sandsurf_native::local::create_private_file(&record).unwrap();
+        file.write_all(b"damaged ownership record").unwrap();
+        drop(file);
+        assert!(CaptureBoundary::read(&root).is_err());
+        CaptureBoundary::clear(&root).unwrap();
+        CaptureBoundary::clear(&root).unwrap();
+        let mut file = sandsurf_native::local::create_private_file(&record).unwrap();
+        file.write_all(b"aliased record must remain untouched")
+            .unwrap();
+        drop(file);
+        fs::hard_link(&record, root.join("record-alias")).unwrap();
+        assert!(CaptureBoundary::read(&root).is_err());
+        assert!(CaptureBoundary::clear(&root).is_err());
+        assert_eq!(
+            fs::read(&record).unwrap(),
+            b"aliased record must remain untouched"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
