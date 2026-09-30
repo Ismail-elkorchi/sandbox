@@ -374,6 +374,7 @@ fn publish_prepared(
     match fs::symlink_metadata(destination) {
         Ok(_) => {
             validate_disk(destination, bytes, format)?;
+            reserve_allocation(destination, bytes, format)?;
             reclaim_staging(&destination.with_extension("building"))?;
             return Ok(());
         }
@@ -386,7 +387,19 @@ fn publish_prepared(
     reclaim_staging(&staged)?;
     build(&staged)?;
     validate_disk(&staged, bytes, format)?;
+    reserve_allocation(&staged, bytes, format)?;
     publish_new_file(&staged, destination)
+}
+
+fn reserve_allocation(path: &Path, bytes: u64, format: DiskFormat) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if format == DiskFormat::Raw {
+        let file = open_private_file(path, PrivateFileAccess::ReadWrite)?;
+        sandsurf_native::storage::reserve_raw_capacity(&file, bytes)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (path, bytes, format);
+    Ok(())
 }
 
 fn reclaim_staging(staged: &Path) -> io::Result<()> {
@@ -549,6 +562,29 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_disk_publication_reserves_capacity_before_ready_and_reopen_never_rebuilds() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        publish_disk(&target, 65536, DiskFormat::Raw, |staged| {
+            create_private_file(staged)?.set_len(65536)
+        })
+        .unwrap();
+        assert!(fs::metadata(&target).unwrap().blocks() * 512 >= 65536);
+        assert_eq!(
+            DiskOwner::open(&target, None).unwrap().record.phase,
+            DiskPhase::Ready
+        );
+        publish_disk(&target, 65536, DiskFormat::Raw, |_| {
+            panic!("capacity checks must not rebuild a published disk")
+        })
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), vec![0; 65536]);
+        assert!(fs::metadata(&target).unwrap().blocks() * 512 >= 65536);
     }
 
     #[test]

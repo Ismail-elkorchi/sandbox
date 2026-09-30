@@ -6,6 +6,45 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
+/// Reserve a raw disk's allocation through its held writable descriptor.
+/// This does not interpret Linux filesystem bytes or change logical capacity.
+/// Shared/reflink attribution and global pool admission remain separate facts.
+#[cfg(target_os = "linux")]
+pub fn reserve_raw_capacity(file: &File, bytes: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let length = i64::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw allocation exceeds the native offset range",
+        )
+    })?;
+    if bytes == 0 || file.metadata()?.len() != bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw allocation must match the published geometry",
+        ));
+    }
+    // SAFETY: the live writable descriptor is retained; the checked offset
+    // range has no pointers. KEEP_SIZE cannot extend or truncate the disk.
+    if unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, length) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sync_file(file)?;
+    let metadata = file.metadata()?;
+    if metadata.len() != bytes
+        || metadata
+            .blocks()
+            .checked_mul(512)
+            .is_none_or(|allocated| allocated < bytes)
+    {
+        return Err(io::Error::other(
+            "raw disk capacity was not fully allocated",
+        ));
+    }
+    Ok(())
+}
+
 /// Durable payload flush, including Apple's drive-cache flush. Directory
 /// publication and authoritative journal commits remain separate steps.
 pub fn sync_file(file: &File) -> io::Result<()> {
@@ -194,6 +233,38 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_allocation_preserves_content_and_rejects_geometry_changes() {
+        use crate::local::{create_private_directory, create_private_file};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-raw-allocation-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&root).unwrap();
+        let path = root.join("disk.raw");
+        let mut file = create_private_file(&path).unwrap();
+        file.set_len(65536).unwrap();
+        file.seek(SeekFrom::Start(8192)).unwrap();
+        file.write_all(b"root-controlled bytes").unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(reserve_raw_capacity(&file, 131072).is_err());
+        assert!(reserve_raw_capacity(&file, 0).is_err());
+        reserve_raw_capacity(&file, 65536).unwrap();
+        reserve_raw_capacity(&file, 65536).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(file.metadata().unwrap().blocks() * 512 >= 65536);
+        drop(file);
+        let readonly =
+            crate::local::open_private_file(&path, crate::PrivateFileAccess::ReadOnly).unwrap();
+        assert!(reserve_raw_capacity(&readonly, 65536).is_err());
+        drop(readonly);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn owner_journal_replacement_commits_one_complete_record() {

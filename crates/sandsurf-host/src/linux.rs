@@ -27,7 +27,7 @@ use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1569,39 +1569,8 @@ fn ensure_mutable_disk(
         destination,
         requested_bytes,
         crate::storage::DiskFormat::Raw,
-        |staged| reserve_disk_capacity(staged, requested_bytes).map_err(io::Error::other),
+        |_| Ok(()),
     )?;
-    reserve_disk_capacity(destination, requested_bytes)
-}
-
-fn reserve_disk_capacity(destination: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
-    let fallocate =
-        sandsurf_native::filesystem::protected_tool(&["/usr/bin/fallocate", "/bin/fallocate"])?;
-    let status = std::process::Command::new(fallocate)
-        .args(["--keep-size", "--length", &requested_bytes.to_string()])
-        .arg(destination)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if !status.success() {
-        return Err(LinuxError::Invalid(
-            "host storage cannot reserve the persistent disk capacity".into(),
-        ));
-    }
-    File::open(destination)?.sync_all()?;
-    require_allocated(destination, requested_bytes)?;
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-fn require_allocated(path: &Path, requested_bytes: u64) -> Result<(), LinuxError> {
-    let allocated = sandsurf_native::storage_usage::object_usage(path)?.allocated_bytes;
-    if allocated < requested_bytes {
-        return Err(LinuxError::Invalid(
-            "persistent disk capacity is not physically reserved".into(),
-        ));
-    }
     Ok(())
 }
 
