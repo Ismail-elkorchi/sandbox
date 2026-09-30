@@ -895,10 +895,10 @@ fn add_file(files: &mut Vec<File>, path: &Path) -> io::Result<usize> {
 }
 
 fn sync_regular_file(path: &Path) -> Result<u64, FirecrackerError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
+    let file = sandsurf_native::local::open_private_file(
+        path,
+        sandsurf_native::PrivateFileAccess::ReadOnly,
+    )?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(FirecrackerError::Setup(

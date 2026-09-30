@@ -1,7 +1,7 @@
 use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{
     Digest, Domain, FullSnapshotMetadata, NativeFullCapture, OperationId, Snapshot,
-    SnapshotConsistency, SnapshotId, SnapshotKind, SnapshotProcessWatermark, digest,
+    SnapshotConsistency, SnapshotId, SnapshotKind, digest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -137,7 +137,7 @@ pub fn capture_filesystem(
         source_container,
     )?;
     let manifest = SnapshotManifest {
-        format_version: 3,
+        format_version: 4,
         snapshot_id: snapshot.request.id.clone(),
         request_digest: snapshot.request_digest.clone(),
         image_digest: snapshot.image_digest.clone(),
@@ -176,12 +176,34 @@ pub fn capture_full(
     system_disk: &Path,
     native_directory: &Path,
     native: NativeFullCapture,
-    processes: Vec<SnapshotProcessWatermark>,
 ) -> Result<CaptureResult> {
     if snapshot.request.kind != SnapshotKind::Full || !snapshot.sensitive {
         return Err(SnapshotError::Invalid(
             "full capture requires a sensitive full snapshot admission",
         ));
+    }
+    if native.executions.len() > 65_536
+        || serde_json::to_vec(&native.executions)?.len() > sandsurf_protocol::MAX_CONTROL_BYTES / 2
+    {
+        return Err(SnapshotError::Invalid(
+            "full snapshot execution membership exceeds its bound",
+        ));
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    for execution in &native.executions {
+        if execution.admission.validate().is_err()
+            || execution.admission.machine_id != snapshot.request.machine_id
+            || execution.admission.generation != snapshot.request.expected_generation
+            || !identities.insert(&execution.admission.execution_id)
+            || execution
+                .observation
+                .as_ref()
+                .is_some_and(|report| report.request != execution.admission)
+        {
+            return Err(SnapshotError::Invalid(
+                "full capture execution identity mismatch",
+            ));
+        }
     }
     private_directory(root)?;
     let source_container = disk_container(system_disk)?;
@@ -243,11 +265,6 @@ pub fn capture_full(
             Some(&memory.digest),
         )?;
     }
-    if processes.len() > 65_536 {
-        return Err(SnapshotError::Invalid(
-            "full snapshot process inventory exceeds its bound",
-        ));
-    }
     let full = FullSnapshotMetadata {
         engine: native.engine,
         engine_version: native.engine_version,
@@ -256,14 +273,14 @@ pub fn capture_full(
         snapshot_state: native.snapshot_state,
         memory: native.memory,
         reconnect_state: native.reconnect_state,
-        processes,
+        executions: native.executions,
         generation: native.generation,
         // A capture can only become fork-safe through an explicit, separately
         // admitted defaults contract. Ordinary full snapshots default closed.
         fork_safe: false,
     };
     let manifest = SnapshotManifest {
-        format_version: 3,
+        format_version: 4,
         snapshot_id: snapshot.request.id.clone(),
         request_digest: snapshot.request_digest.clone(),
         image_digest: snapshot.image_digest.clone(),
@@ -438,7 +455,7 @@ fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResu
     private_directory(directory)?;
     let manifest: SnapshotManifest =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
-    if manifest.format_version != 3
+    if manifest.format_version != 4
         || manifest.snapshot_id != snapshot.request.id
         || manifest.request_digest != snapshot.request_digest
         || manifest.image_digest != snapshot.image_digest
@@ -813,6 +830,116 @@ mod tests {
             sensitive: false,
             full: None,
         }
+    }
+
+    #[test]
+    fn full_capture_membership_is_immutable_and_does_not_require_a_guest_report() {
+        use sandsurf_protocol::{CapturedExecution, SpawnRequest, StdioMode, VmEngine};
+        let temp = Temp::new();
+        let root = temp.0.join("snapshots");
+        let source = temp.0.join("source.raw");
+        open_write(&source)
+            .unwrap()
+            .write_all(&[7_u8; 4096])
+            .unwrap();
+        let native_root = temp.0.join("native");
+        private_directory(&native_root).unwrap();
+        // Artifact/publication fixture only, not a native-machine witness.
+        let artifact = |name: &str, bytes: &[u8]| {
+            open_write(&native_root.join(name))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+            sandsurf_protocol::SnapshotArtifact {
+                digest: bytes_digest(bytes),
+                bytes: n(bytes.len() as u64),
+            }
+        };
+        let mut snapshot = snapshot();
+        snapshot.request.kind = SnapshotKind::Full;
+        snapshot.sensitive = true;
+        snapshot.request_digest = digest(
+            Domain::Snapshot,
+            &("sandsurf-snapshot-v1", &snapshot.request),
+        )
+        .unwrap();
+        let admission = SpawnRequest {
+            machine_id: snapshot.request.machine_id.clone(),
+            generation: n(1),
+            execution_id: "uncertain-delivery".try_into().unwrap(),
+            operation_id: "spawn".try_into().unwrap(),
+            argv: vec!["/bin/sh".into()],
+            cwd: "/root".into(),
+            environment: Default::default(),
+            user: None,
+            stdio: StdioMode::Pipes,
+            terminal_size: None,
+            active_deadline_millis: None,
+            elapsed_deadline_unix_millis: None,
+            output_bytes: n(4096),
+        };
+        let membership = CapturedExecution {
+            output: sandsurf_protocol::initial_output_boundary(
+                &admission.machine_id,
+                &admission.execution_id,
+                admission.generation,
+            )
+            .unwrap(),
+            admission,
+            observation: None,
+        };
+        let native = NativeFullCapture {
+            engine: VmEngine::Firecracker,
+            engine_version: "artifact-fixture-not-virtualization".into(),
+            architecture: "amd64".into(),
+            configuration_digest: bytes_digest(b"configuration"),
+            executions: vec![membership.clone()],
+            snapshot_state: artifact("snapshot.vmstate", b"state"),
+            memory: Some(artifact("memory", b"memory")),
+            reconnect_state: artifact("reconnect.json", b"reconnect"),
+            generation: bytes_digest(b"capture"),
+        };
+        let mut wrong = native.clone();
+        wrong.executions[0].admission.generation = n(2);
+        assert!(capture_full(&root, &snapshot, &source, &native_root, wrong).is_err());
+        assert!(
+            !root.exists(),
+            "reject invalid identities before allocating capture storage"
+        );
+        let mut duplicate = native.clone();
+        duplicate.executions.push(membership.clone());
+        assert!(capture_full(&root, &snapshot, &source, &native_root, duplicate).is_err());
+        assert!(!root.exists());
+
+        let captured =
+            capture_full(&root, &snapshot, &source, &native_root, native.clone()).unwrap();
+        assert_eq!(
+            captured.full.as_ref().unwrap().executions,
+            vec![membership.clone()]
+        );
+        // Recovery reads the original publication, not replacement observations
+        // or a later runtime inventory supplied by the retried caller.
+        let mut retry = native;
+        retry.executions.clear();
+        let recovered = capture_full(&root, &snapshot, &source, &native_root, retry).unwrap();
+        assert_eq!(recovered.manifest_digest, captured.manifest_digest);
+        assert_eq!(
+            recovered.full.as_ref().unwrap().executions,
+            vec![membership]
+        );
+        let directory = root.join(object_name(snapshot.request.id.as_str()));
+        let mut old: SnapshotManifest =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        old.format_version = 3;
+        fs::write(
+            directory.join("manifest.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verify_published(&directory, &snapshot).is_err(),
+            "superseded format has no reader or migration"
+        );
     }
 
     #[test]

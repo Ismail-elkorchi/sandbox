@@ -1,6 +1,6 @@
 use crate::{
     Counter, Digest, ExecutionSnapshot, MachineId, OperationId, OutputBoundary, Resources,
-    SnapshotId, VmEngine,
+    SnapshotId, SpawnRequest, VmEngine,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,14 +63,18 @@ pub struct SnapshotArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SnapshotProcessWatermark {
-    pub snapshot: ExecutionSnapshot,
+pub struct CapturedExecution {
+    /// Host admission, not evidence that a particular Linux PID exists.
+    pub admission: SpawnRequest,
+    /// Last cooperative guest report; an admitted execution can have none.
+    pub observation: Option<ExecutionSnapshot>,
+    /// Actual bytes retained by the host at the native capture boundary.
     pub output: OutputBoundary,
 }
 
-/// Engine-specific material bound into a full snapshot. The reconnect state
-/// contains protected supervisor credentials and therefore makes every full
-/// capture sensitive even when no workload secret was delivered.
+/// Engine-specific material bound into a full snapshot. Reconnect credentials
+/// are also available to guest root: they authenticate this machine's channel,
+/// not its reports. Their inclusion makes every full capture sensitive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FullSnapshotMetadata {
@@ -83,7 +87,7 @@ pub struct FullSnapshotMetadata {
     /// with an integrated saved-machine artifact leave this absent.
     pub memory: Option<SnapshotArtifact>,
     pub reconnect_state: SnapshotArtifact,
-    pub processes: Vec<SnapshotProcessWatermark>,
+    pub executions: Vec<CapturedExecution>,
     pub generation: Digest,
     pub fork_safe: bool,
 }
@@ -98,6 +102,9 @@ pub struct NativeFullCapture {
     pub engine_version: String,
     pub architecture: String,
     pub configuration_digest: Digest,
+    /// Immutable admission membership at this capture, never reconstructed
+    /// from a later runtime journal when an interrupted capture is retried.
+    pub executions: Vec<CapturedExecution>,
     pub snapshot_state: SnapshotArtifact,
     pub memory: Option<SnapshotArtifact>,
     pub reconnect_state: SnapshotArtifact,
@@ -145,13 +152,8 @@ pub enum NativeSnapshotRequest {
     deny_unknown_fields
 )]
 pub enum NativeSnapshotResponse {
-    Prepared {
-        capture: NativeFullCapture,
-        processes: Vec<SnapshotProcessWatermark>,
-    },
-    Complete {
-        evidence: Digest,
-    },
+    Prepared { capture: NativeFullCapture },
+    Complete { evidence: Digest },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

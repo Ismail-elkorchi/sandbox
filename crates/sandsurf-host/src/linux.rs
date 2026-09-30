@@ -19,8 +19,8 @@ use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
     NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination,
-    NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark,
-    VmEngine, bytes_digest, digest,
+    NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest,
+    digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -976,11 +976,19 @@ impl LinuxGuardianEffect {
             let capture: NativeFullCapture =
                 read_json(&directory.join("capture.json"), 1024 * 1024)
                     .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeSnapshotResponse::Prepared {
-                capture,
-                processes: process_watermarks(journal)?,
-            });
+            return Ok(NativeSnapshotResponse::Prepared { capture });
         }
+        let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
+            .ok_or(ControlError::Protocol(
+                "full capture has no native boundary",
+            ))?;
+        let executions = match journal.capture_executions(boundary.generation) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.finish_native_capture();
+                return Err(ControlError::State(error));
+            }
+        };
         let snapshot = match self.machine.create_full_snapshot(&operation_id) {
             Ok(value) => value,
             Err(_) => {
@@ -1056,6 +1064,7 @@ impl LinuxGuardianEffect {
                 }
                 .into(),
                 configuration_digest,
+                executions,
                 snapshot_state: SnapshotArtifact {
                     digest: state_digest,
                     bytes: Counter::try_from(snapshot.state_bytes)
@@ -1079,10 +1088,7 @@ impl LinuxGuardianEffect {
             Ok(capture)
         })();
         match result {
-            Ok(capture) => Ok(NativeSnapshotResponse::Prepared {
-                capture,
-                processes: process_watermarks(journal)?,
-            }),
+            Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
             Err(error) => {
                 let _ = self.finish_native_capture();
                 Err(ControlError::Rejected {
@@ -1109,20 +1115,6 @@ fn firecracker_configuration_digest(
             sandsurf_protocol::GUEST_PROTOCOL_MINOR,
         ),
     )
-}
-
-fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<SnapshotProcessWatermark>> {
-    journal
-        .process_snapshots()
-        .map_err(ControlError::State)?
-        .into_iter()
-        .map(|snapshot| {
-            let output = journal
-                .process_boundary(&snapshot.request.execution_id)
-                .map_err(ControlError::State)?;
-            Ok(SnapshotProcessWatermark { snapshot, output })
-        })
-        .collect()
 }
 
 fn full_capture_directory(

@@ -20,8 +20,7 @@ use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
     NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources,
-    RuntimeConfiguration, SnapshotArtifact, SnapshotProcessWatermark, VmEngine, bytes_digest,
-    digest,
+    RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -477,11 +476,19 @@ impl WindowsGuardianEffect {
         if directory.join("capture.json").exists() {
             let capture = read_json(&directory.join("capture.json"), 1024 * 1024)
                 .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeSnapshotResponse::Prepared {
-                capture,
-                processes: process_watermarks(journal)?,
-            });
+            return Ok(NativeSnapshotResponse::Prepared { capture });
         }
+        let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
+            .ok_or(ControlError::Protocol(
+                "full capture has no native boundary",
+            ))?;
+        let executions = match journal.capture_executions(boundary.generation) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.finish_native_capture();
+                return Err(ControlError::State(error));
+            }
+        };
         crate::snapshots::private_directory(
             directory
                 .parent()
@@ -561,6 +568,7 @@ impl WindowsGuardianEffect {
                 engine_version: "hcs-schema-2.2-save-v1".into(),
                 architecture: "amd64".into(),
                 configuration_digest,
+                executions,
                 snapshot_state: SnapshotArtifact {
                     digest: state_digest,
                     bytes: Counter::try_from(state_bytes)
@@ -578,10 +586,7 @@ impl WindowsGuardianEffect {
             Ok(capture)
         })();
         match result {
-            Ok(capture) => Ok(NativeSnapshotResponse::Prepared {
-                capture,
-                processes: process_watermarks(journal)?,
-            }),
+            Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
             Err(error) => {
                 let _ = self.finish_native_capture();
                 Err(ControlError::Rejected {
@@ -1215,20 +1220,6 @@ struct ReconnectState {
     boot_identity: Digest,
     capability: [u8; 32],
     network_capability: [u8; 32],
-}
-
-fn process_watermarks(journal: &RuntimeJournal) -> ControlResult<Vec<SnapshotProcessWatermark>> {
-    journal
-        .process_snapshots()
-        .map_err(ControlError::State)?
-        .into_iter()
-        .map(|snapshot| {
-            let output = journal
-                .process_boundary(&snapshot.request.execution_id)
-                .map_err(ControlError::State)?;
-            Ok(SnapshotProcessWatermark { snapshot, output })
-        })
-        .collect()
 }
 
 fn hyperv_configuration_digest(

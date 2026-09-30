@@ -5,7 +5,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 
-const BRIDGE_VERSION = 6;
+const BRIDGE_VERSION = 7;
 const MAX_BRIDGE_BYTES = 1024 * 1024 + 256 * 1024 + 4;
 const MAX_BRIDGE_PENDING = 64;
 const MAX_EVENT_STREAMS = 8;

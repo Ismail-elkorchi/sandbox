@@ -577,6 +577,10 @@ private enum SandsurfVMHelper {
             throw OwnerError.invalidInvocation
         }
 
+        // Saved machine state contains all guest memory, including secrets.
+        // Set the native owner's creation policy before starting its queues;
+        // never repair a broadly accessible artifact after it was created.
+        _ = umask(0o077)
         signal(SIGPIPE, SIG_IGN)
 
         let owner = MachineOwner()

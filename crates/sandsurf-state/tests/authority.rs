@@ -69,7 +69,7 @@ fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     drop(host);
     let database = path.join("authority.sqlite");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection.execute_batch("PRAGMA user_version=10;").unwrap();
+    connection.execute_batch("PRAGMA user_version=11;").unwrap();
     drop(connection);
     let original = fs::read(&database).unwrap();
     assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
@@ -3396,6 +3396,89 @@ fn execution_interruption_is_native_history_not_guest_exit_or_output_completion(
     );
     assert!(reopened.receipt(&f.process).unwrap().is_none());
     assert_eq!(reopened.process_boundary(&f.process).unwrap(), boundary);
+}
+
+#[test]
+fn captured_execution_membership_does_not_resurrect_released_history() {
+    let mut f = Fixture::new();
+    let release = f.capture_release();
+    let boundary = f.runtime.process_boundary(&f.process).unwrap();
+    f.runtime.release(&f.process, release).unwrap();
+    assert!(f.runtime.capture_executions(n(1)).unwrap().is_empty());
+    assert_eq!(f.runtime.process_boundary(&f.process).unwrap(), boundary);
+    assert!(f.runtime.receipt(&f.process).unwrap().is_some());
+}
+
+#[test]
+fn capture_membership_contains_unobserved_admissions_and_only_its_native_epoch() {
+    let mut f = Fixture::new();
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"host-retained")
+        .unwrap();
+    let captured = f.runtime.capture_executions(n(1)).unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].admission,
+        f.runtime.process_request(&f.process).unwrap()
+    );
+    assert!(captured[0].observation.is_none());
+    assert_eq!(captured[0].output.final_cursor, n(13));
+    assert!(f.runtime.capture_executions(n(0)).is_err());
+
+    let report = ExecutionSnapshot {
+        request: captured[0].admission.clone(),
+        guest_pid: 123,
+        state: ExecutionState::Running,
+        lineage: None,
+    };
+    f.runtime.observe_process(&report).unwrap();
+    assert_eq!(
+        f.runtime.capture_executions(n(1)).unwrap()[0].observation,
+        Some(report)
+    );
+    // The earlier capture is a value, not a live query or a PID assertion.
+    assert!(captured[0].observation.is_none());
+
+    let mut native = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    native.sequence = n(4);
+    native.state = MachineState::Stopped;
+    f.runtime.observe(native.clone()).unwrap();
+    native.sequence = n(5);
+    native.generation = n(2);
+    native.state = MachineState::Starting;
+    f.runtime.observe(native.clone()).unwrap();
+    native.sequence = n(6);
+    native.state = MachineState::Running;
+    f.runtime.observe(native).unwrap();
+    let command = process_command_in_generation(&f.command, "new-admission", n(20), n(2));
+    f.runtime.admit(command.clone()).unwrap();
+    f.runtime
+        .admit_process(
+            "new-admission".try_into().unwrap(),
+            &command.operation_id,
+            n(20),
+            false,
+        )
+        .unwrap();
+    let current = f.runtime.capture_executions(n(2)).unwrap();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].admission.execution_id.as_str(), "new-admission");
+    assert!(current[0].observation.is_none());
+    assert_eq!(f.runtime.capture_executions(n(1)).unwrap().len(), 1);
+    assert_eq!(
+        f.runtime.read_output(&f.process, n(0), 128).unwrap().chunks[0].bytes,
+        b"host-retained"
+    );
+    let root = f.root.0.join("runtime");
+    drop(f.runtime);
+    let reopened = RuntimeJournal::open(&root, &f.machine).unwrap();
+    assert_eq!(reopened.capture_executions(n(2)).unwrap(), current);
 }
 
 #[test]

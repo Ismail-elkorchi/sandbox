@@ -170,6 +170,15 @@ pub fn bind_to_retained_parent(parent: &File) -> io::Result<()> {
     Ok(())
 }
 
+/// Native-owner creation policy, installed once before native threads start.
+pub fn private_creation_mask() {
+    // Only use at the single-threaded native-owner exec boundary, never as a
+    // temporary process-global setting in the host's multithreaded API service.
+    // SAFETY: umask accepts a scalar mask and changes only this process's
+    // default creation permissions; it does not repair existing objects.
+    unsafe { libc::umask(0o077) };
+}
+
 /// Mark descriptors above stdio close-on-exec without closing setup handles still
 /// needed to execute a verified held binary.
 pub fn prepare_descriptors_for_exec() -> io::Result<()> {

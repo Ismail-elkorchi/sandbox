@@ -630,8 +630,7 @@ impl HostService {
                                 operation_id: request.operation_id.clone(),
                             },
                         )?;
-                        let NativeSnapshotResponse::Prepared { capture, processes } = prepared
-                        else {
+                        let NativeSnapshotResponse::Prepared { capture } = prepared else {
                             return Err(HostError::Invalid(
                                 "guardian did not establish a full capture boundary",
                             ));
@@ -644,7 +643,6 @@ impl HostService {
                                 .join("guardian/full-captures")
                                 .join(object_name(request.operation_id.as_str())),
                             capture,
-                            processes,
                         );
                         let finished = client
                             .native_snapshot(
@@ -1753,7 +1751,7 @@ impl HostService {
                         operation_id: capture_operation_id.clone(),
                     },
                 )?;
-                let NativeSnapshotResponse::Prepared { capture, processes } = prepared else {
+                let NativeSnapshotResponse::Prepared { capture } = prepared else {
                     return Err(HostError::Invalid(
                         "guardian did not establish the suspension capture boundary",
                     ));
@@ -1767,7 +1765,6 @@ impl HostService {
                         .join("guardian/full-captures")
                         .join(object_name(capture_operation_id.as_str())),
                     capture,
-                    processes,
                 )?;
                 complete_snapshot_capture(
                     &mut self.catalog,

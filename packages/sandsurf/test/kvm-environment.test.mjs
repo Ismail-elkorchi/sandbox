@@ -116,6 +116,23 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(await terminal.process.receipt(), undefined, "live segment does not require process completion");
     const liveBoundary = (await liveSegment.inspect()).output;
     await terminal.detach();
+    context.diagnostic("native full capture binds immutable host admissions while a real PTY remains alive");
+    const capturedGeneration = machine.generation;
+    const fullCapture = await machine.snapshots.create({ id: "computer-full-state", kind: "full" });
+    const fullManifest = JSON.parse(await readFile(join(directory, "snapshots", objectName(fullCapture.id), "manifest.json"), "utf8"));
+    assert.equal(fullManifest.formatVersion, 4);
+    assert.equal(fullManifest.sourceGeneration, capturedGeneration);
+    assert.ok(Array.isArray(fullManifest.full.executions));
+    assert.equal(Object.hasOwn(fullManifest.full, "processes"), false);
+    for (const captured of fullManifest.full.executions) {
+      assert.equal(captured.admission.machineId, machine.id);
+      assert.equal(captured.admission.generation, capturedGeneration);
+      if (captured.observation !== null) assert.deepEqual(captured.observation.request, captured.admission);
+    }
+    assert.ok(fullManifest.full.executions.some((captured) => captured.admission.executionId === "persistent-terminal"));
+    assert.ok(fullManifest.full.executions.some((captured) => captured.admission.executionId === "retained-dense" && captured.output.finalCursor === dense.length));
+    assert.equal((await machine.inspect()).machine.value.state, "running");
+    assert.equal(machine.generation, capturedGeneration, "capture alone does not create a new execution epoch");
     const identity = machine.id;
     const generation = machine.generation;
     await host.close();

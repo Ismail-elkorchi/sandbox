@@ -6,6 +6,7 @@ pub use namespace::{NamespaceLauncher, namespace_probe_main, vmm_isolated_main};
 
 use sandsurf_native::linux::{
     bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
+    private_creation_mask,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -707,6 +708,9 @@ fn namespace_init(
 }
 
 fn vmm_exec(spec: &VmmMachineSpec, files: &[File]) -> io::Result<()> {
+    // VMM-created state and memory contain the whole guest, including secrets.
+    // Admit them privately at creation, independently of the caller's umask.
+    private_creation_mask();
     let storage_lease = files.get(spec.storage_lease_fd_index).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1761,6 +1765,42 @@ use std::fmt::Display;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_owner_creates_sensitive_artifacts_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        const FIXTURE: &str = "SANDSURF_NATIVE_CREATION_MASK_FIXTURE";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launcher::tests::native_owner_creates_sensitive_artifacts_privately",
+                    "--test-threads=1",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        private_creation_mask();
+        let root =
+            std::env::temp_dir().join(format!("sandsurf-native-mask-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let file = File::create(root.join("native.vmstate")).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn transferred_storage_custody_survives_exec_and_sender_disconnect() {

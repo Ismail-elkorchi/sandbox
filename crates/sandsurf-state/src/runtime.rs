@@ -1352,6 +1352,61 @@ impl RuntimeJournal {
         Ok(values)
     }
 
+    /// One native epoch's host admissions, including ambiguous deliveries and
+    /// reservations with no guest report. Older execution history is not part
+    /// of the resumed computer's managed-execution membership.
+    pub fn capture_executions(&self, generation: Counter) -> Result<Vec<CapturedExecution>> {
+        if generation == Counter::ZERO {
+            return Err(Error::Conflict("capture generation must be positive"));
+        }
+        let mut statement = self.db.connection.prepare(
+            "SELECT id,snapshot,boundary FROM processes WHERE generation=?1 AND release IS NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([generation.get()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut captured = Vec::new();
+        let mut encoded_bytes = 0usize;
+        for row in rows {
+            let (id, observation, boundary) = row?;
+            let id = id.try_into()?;
+            let admission = self.process_request(&id)?;
+            // Admission identities are immutable; never invent a different
+            // admission from a cooperative report after an epoch change.
+            if admission.machine_id != self.machine || admission.generation != generation {
+                return Err(Error::Conflict("capture admission identity mismatch"));
+            }
+            let observation: Option<ExecutionSnapshot> =
+                observation.map(|value| decode(&value)).transpose()?;
+            if observation
+                .as_ref()
+                .is_some_and(|value| value.request != admission)
+            {
+                return Err(Error::Conflict("capture observation identity mismatch"));
+            }
+            let value = CapturedExecution {
+                admission,
+                observation,
+                output: decode(&boundary)?,
+            };
+            encoded_bytes = encoded_bytes
+                .checked_add(serde_json::to_vec(&value)?.len() + 1)
+                .ok_or(Error::Capacity("capture membership size overflow"))?;
+            // Leave framing and native metadata space in the bounded response.
+            if encoded_bytes > MAX_CONTROL_BYTES / 2 {
+                return Err(Error::Capacity(
+                    "capture membership exceeds transport bound",
+                ));
+            }
+            captured.push(value);
+        }
+        Ok(captured)
+    }
+
     /// Admission facts are available before a guest has reported its first snapshot.
     pub fn unsettled_execution_boundaries(
         &self,
