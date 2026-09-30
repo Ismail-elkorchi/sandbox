@@ -1491,9 +1491,7 @@ mod tests {
     fn parent_symlinks_are_never_followed() {
         let root = Temp::new();
         let outside = Temp::new();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
-        #[cfg(unix)]
         assert!(resolve_directory(&root.0, Path::new("link/child"), true).is_err());
     }
 
@@ -1591,45 +1589,51 @@ mod tests {
             Some("/workspace")
         );
         let destination = layout.0.join("tree");
-        let converted = OciLayout::open(&layout.0, ConversionLimits::default())
+        let conversion = OciLayout::open(&layout.0, ConversionLimits::default())
             .unwrap()
-            .convert(source.clone(), &destination)
-            .unwrap();
-        assert_eq!(fs::read(destination.join("usr/bin/tool")).unwrap(), b"v2");
-        assert!(!destination.join("usr/bin/old").exists());
+            .convert(source.clone(), &destination);
+        #[cfg(not(unix))]
         assert!(
-            converted
-                .entries
-                .iter()
-                .any(|entry| { entry.path == "usr" && entry.kind == TreeEntryKind::Directory })
+            matches!(conversion, Err(OciError::Unsupported(_))),
+            "a host without Linux inode semantics must report the required builder, not silently discard metadata"
         );
-        assert!(
-            converted.entries.iter().any(|entry| {
+        #[cfg(unix)]
+        {
+            let converted = conversion.unwrap();
+            assert_eq!(fs::read(destination.join("usr/bin/tool")).unwrap(), b"v2");
+            assert!(!destination.join("usr/bin/old").exists());
+            assert!(
+                converted
+                    .entries
+                    .iter()
+                    .any(|entry| { entry.path == "usr" && entry.kind == TreeEntryKind::Directory })
+            );
+            assert!(converted.entries.iter().any(|entry| {
                 entry.path == "usr/bin/tool" && entry.kind == TreeEntryKind::Regular
-            })
-        );
-        let filesystem_tar = layout.0.join("filesystem.tar");
-        write_filesystem_tar(&destination, &converted, &filesystem_tar).unwrap();
-        let mut archive = tar::Archive::new(File::open(&filesystem_tar).unwrap());
-        let tool = archive
-            .entries()
-            .unwrap()
-            .map(Result::unwrap)
-            .find(|entry| entry.path().unwrap() == Path::new("usr/bin/tool"))
-            .unwrap();
-        assert_eq!(tool.header().uid().unwrap(), 0);
-        assert_eq!(tool.header().gid().unwrap(), 0);
-        assert_eq!(tool.header().mode().unwrap(), 0o755);
-
-        let mut forged = source;
-        forged.config_digest = format!("sha256:{}", "0".repeat(64));
-        let other = layout.0.join("forged");
-        assert!(
-            OciLayout::open(&layout.0, ConversionLimits::default())
+            }));
+            let filesystem_tar = layout.0.join("filesystem.tar");
+            write_filesystem_tar(&destination, &converted, &filesystem_tar).unwrap();
+            let mut archive = tar::Archive::new(File::open(&filesystem_tar).unwrap());
+            let tool = archive
+                .entries()
                 .unwrap()
-                .convert(forged, &other)
-                .is_err()
-        );
+                .map(Result::unwrap)
+                .find(|entry| entry.path().unwrap() == Path::new("usr/bin/tool"))
+                .unwrap();
+            assert_eq!(tool.header().uid().unwrap(), 0);
+            assert_eq!(tool.header().gid().unwrap(), 0);
+            assert_eq!(tool.header().mode().unwrap(), 0o755);
+
+            let mut forged = source;
+            forged.config_digest = format!("sha256:{}", "0".repeat(64));
+            let other = layout.0.join("forged");
+            assert!(
+                OciLayout::open(&layout.0, ConversionLimits::default())
+                    .unwrap()
+                    .convert(forged, &other)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

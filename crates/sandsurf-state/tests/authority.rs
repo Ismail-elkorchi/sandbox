@@ -1180,6 +1180,26 @@ fn process_command(
     .unwrap()
 }
 
+fn process_command_in_generation(
+    value: &GuestCommand,
+    identity: &str,
+    output_bytes: Counter,
+    generation: Counter,
+) -> GuestCommand {
+    let mut command = process_command(value, identity, output_bytes, StdioMode::Pipes);
+    let GuestRequest::Spawn { request } = &mut command.request else {
+        unreachable!();
+    };
+    request.generation = generation;
+    GuestCommand::new(
+        command.machine_id,
+        generation,
+        command.operation_id,
+        command.request,
+    )
+    .unwrap()
+}
+
 #[test]
 fn dispatch_permission_is_single_use_and_reopen_does_not_replay() {
     let mut f = Fixture::new();
@@ -2688,6 +2708,7 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
 #[test]
 fn execution_interruption_is_native_history_not_guest_exit_or_output_completion() {
     let mut f = Fixture::new();
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(1));
     assert_eq!(f.runtime.execution_ids().unwrap(), [f.process.clone()]);
     assert_eq!(f.runtime.execution_generation(&f.process).unwrap(), n(1));
     assert!(f.runtime.execution_interruption(n(1)).unwrap().is_none());
@@ -2707,6 +2728,7 @@ fn execution_interruption_is_native_history_not_guest_exit_or_output_completion(
     observed.cause = ObservationCause::Native {};
     f.runtime.observe(observed.clone()).unwrap();
     assert!(f.runtime.execution_interruption(n(1)).unwrap().is_none());
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(1));
     observed.sequence = n(5);
     observed.state = MachineState::Running;
     f.runtime.observe(observed.clone()).unwrap();
@@ -2717,9 +2739,22 @@ fn execution_interruption_is_native_history_not_guest_exit_or_output_completion(
         f.runtime.execution_interruption(n(1)).unwrap(),
         Some(observed.clone())
     );
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(0));
+    // Free native execution capacity, not the interrupted capture promise.
+    let mut envelope = resources();
+    envelope.managed_executions = n(1);
+    envelope.output_bytes = n(100);
+    f.runtime.validate_resource_envelope(&envelope).unwrap();
+    envelope.output_bytes = n(99);
+    assert!(f.runtime.validate_resource_envelope(&envelope).is_err());
+    // A capture admitted before termination may commit afterward. Its original
+    // reservation remains available without resurrecting an execution slot.
+    f.runtime
+        .append_output(&f.process, n(2), Stream::Stdout, b"committed after stop")
+        .unwrap();
     assert!(f.runtime.process_snapshot(&f.process).unwrap().is_none());
     assert!(f.runtime.receipt(&f.process).unwrap().is_none());
-    assert_eq!(f.runtime.process_boundary(&f.process).unwrap(), boundary);
+    assert_ne!(f.runtime.process_boundary(&f.process).unwrap(), boundary);
     assert_eq!(
         f.runtime
             .read_output(&f.process, Counter::ZERO, 128)
@@ -2744,10 +2779,36 @@ fn execution_interruption_is_native_history_not_guest_exit_or_output_completion(
         Some(stopped.clone())
     );
     assert!(f.runtime.execution_interruption(n(2)).unwrap().is_none());
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(0));
+    let command = process_command_in_generation(&f.command, "after-native-stop", n(900), n(2));
+    f.runtime.admit(command.clone()).unwrap();
+    f.runtime
+        .admit_process(
+            "after-native-stop".try_into().unwrap(),
+            &command.operation_id,
+            n(900),
+            false,
+        )
+        .unwrap();
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(1));
+    let overflow = process_command_in_generation(&f.command, "missing-output-headroom", n(1), n(2));
+    f.runtime.admit(overflow.clone()).unwrap();
+    assert!(
+        f.runtime
+            .admit_process(
+                "missing-output-headroom".try_into().unwrap(),
+                &overflow.operation_id,
+                n(1),
+                false
+            )
+            .is_err()
+    );
+    let boundary = f.runtime.process_boundary(&f.process).unwrap();
     let root = f.root.0.join("runtime");
     let machine = f.machine.clone();
     drop(f.runtime);
     let reopened = RuntimeJournal::open(&root, &machine).unwrap();
+    assert_eq!(reopened.managed_execution_slots_held().unwrap(), n(1));
     assert_eq!(
         reopened.execution_interruption(n(1)).unwrap(),
         Some(stopped)
@@ -2773,6 +2834,7 @@ fn suspension_is_not_interruption_but_restore_fences_the_old_handle_generation()
     };
     f.runtime.observe(observed.clone()).unwrap();
     assert!(f.runtime.execution_interruption(n(1)).unwrap().is_none());
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(1));
     observed.sequence = n(5);
     observed.state = MachineState::Restoring;
     observed.generation = n(2);
@@ -2782,6 +2844,7 @@ fn suspension_is_not_interruption_but_restore_fences_the_old_handle_generation()
         Some(observed)
     );
     assert!(f.runtime.execution_interruption(n(2)).unwrap().is_none());
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(0));
 }
 
 #[test]
@@ -2812,6 +2875,78 @@ fn machine_restart_fences_old_generation_without_rewinding_history() {
 }
 
 #[test]
+fn managed_admission_capacity_survives_management_loss_but_not_native_interruption() {
+    let mut f = Fixture::new();
+    for index in 0..7 {
+        let name = format!("reserved-before-stop-{index}");
+        let command = process_command(&f.command, &name, n(10), StdioMode::Pipes);
+        f.runtime.admit(command.clone()).unwrap();
+        f.runtime
+            .admit_process(
+                name.try_into().unwrap(),
+                &command.operation_id,
+                n(10),
+                false,
+            )
+            .unwrap();
+    }
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(8));
+    assert!(f.runtime.process_snapshots().unwrap().is_empty());
+    let command = process_command(&f.command, "one-too-many", n(1), StdioMode::Pipes);
+    f.runtime.admit(command.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.admit_process(
+            "one-too-many".try_into().unwrap(),
+            &command.operation_id,
+            n(1),
+            false
+        ),
+        Err(Error::Capacity("managed execution reservations exhausted"))
+    ));
+    let mut observed = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    observed.sequence = n(4);
+    observed.state = MachineState::Stopped;
+    observed.cause = ObservationCause::Native {};
+    f.runtime.observe(observed.clone()).unwrap();
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(0));
+    observed.sequence = n(5);
+    observed.generation = n(2);
+    observed.state = MachineState::Starting;
+    observed.cause = ObservationCause::Lifecycle {
+        operation_id: "cold-boot".try_into().unwrap(),
+    };
+    f.runtime.observe(observed.clone()).unwrap();
+    observed.sequence = n(6);
+    observed.state = MachineState::Running;
+    f.runtime.observe(observed).unwrap();
+    for index in 0..8 {
+        let name = format!("reserved-after-stop-{index}");
+        let command = process_command_in_generation(&f.command, &name, n(10), n(2));
+        f.runtime.admit(command.clone()).unwrap();
+        f.runtime
+            .admit_process(
+                name.try_into().unwrap(),
+                &command.operation_id,
+                n(10),
+                false,
+            )
+            .unwrap();
+    }
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(8));
+    let mut envelope = resources();
+    envelope.output_bytes = n(249); // Old capture promises: 170; new: 80.
+    assert!(f.runtime.validate_resource_envelope(&envelope).is_err());
+    envelope.output_bytes = n(250);
+    f.runtime.validate_resource_envelope(&envelope).unwrap();
+}
+
+#[test]
 fn independent_jobs_and_pty_streams_have_separate_reservations() {
     let mut f = Fixture::new();
     let command = process_command(&f.command, "terminal", n(200), StdioMode::Terminal);
@@ -2822,6 +2957,7 @@ fn independent_jobs_and_pty_streams_have_separate_reservations() {
         .admit_process(terminal.clone(), &command.operation_id, n(200), true)
         .unwrap();
     dispatch(&mut f.runtime, &command);
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(2));
     assert!(
         f.runtime
             .append_output(&terminal, n(1), Stream::Stdout, b"wrong stream")
@@ -2831,6 +2967,7 @@ fn independent_jobs_and_pty_streams_have_separate_reservations() {
         .append_output(&terminal, n(1), Stream::Terminal, b"shell prompt")
         .unwrap();
     f.terminal();
+    assert_eq!(f.runtime.managed_execution_slots_held().unwrap(), n(1));
     f.runtime
         .append_output(&terminal, n(2), Stream::Terminal, b"still running")
         .unwrap();

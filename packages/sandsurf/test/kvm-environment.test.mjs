@@ -194,6 +194,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
 
     context.diagnostic("native power-off interrupts waits without fabricating exit or releasing retained output");
     const interrupted = await machine.executions.start({ argv: ["/bin/sh", "-c", "printf before-stop; sleep 300"], executionId: "interrupted-by-native-stop" });
+    const slotsBeforeStop = (await machine.resources.usage()).executionsCurrent;
+    assert.ok(slotsBeforeStop > 0);
     const captureDeadline = Date.now() + 15_000;
     let beforeStop;
     do {
@@ -207,6 +209,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       interrupted.waitCapture({ signal: AbortSignal.timeout(15_000) }),
     ]);
     await machine.powerOff();
+    assert.equal((await machine.resources.usage()).executionsCurrent, 0, "native interruption frees managed admission capacity, not output retention");
     for (const result of await waits) {
       assert.equal(result.status, "rejected");
       assert.ok(result.reason instanceof ExecutionInterruptedError);
@@ -220,6 +223,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await assert.rejects((await machine.executions.get(interrupted.id)).waitCapture(), ExecutionInterruptedError);
     await machine.start();
     await managementReady(machine);
+    assert.equal((await machine.resources.usage()).executionsCurrent, 0, "cold boot does not resurrect old managed admission slots");
     assert.notEqual(machine.generation, generation);
     assert.equal(await run(machine, "/usr/local/bin/agent-tool; cat /etc/sandsurf-test /home/agent/cache/value"), "installedcomputerdurable");
     await assert.rejects(execution.input.write(Buffer.from("stale")), /generation/iu);

@@ -361,7 +361,9 @@ pub struct ResourceUsage {
     pub network_rx_bytes: Counter,
     pub network_tx_bytes: Counter,
     pub network_connections: Counter,
-    /// Managed execution bookkeeping, not the root-controlled Linux PID count.
+    /// Host-owned managed admission slots held, including admissions without
+    /// a guest report. Native interruption frees slots, never retained bytes
+    /// or unsettled capture headroom. Not the root-controlled Linux PID count.
     pub executions_current: Counter,
     pub complete: bool,
     pub source: String,

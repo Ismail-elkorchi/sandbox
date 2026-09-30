@@ -865,12 +865,23 @@ impl RuntimeJournal {
         Ok(value)
     }
 
-    /// Unsettled executions keep their reservations even when management is unavailable.
+    /// Managed admission capacity is independent of output retention. Native
+    /// interruption can free a slot without inventing a guest exit, receipt,
+    /// capture boundary, or authorization to discard original bytes.
+    pub fn managed_execution_slots_held(&self) -> Result<Counter> {
+        Ok(Counter::try_from(managed_execution_slots(
+            &self.db.connection,
+        )?)?)
+    }
+
+    /// Management unavailability cannot free either kind of reservation.
     pub fn validate_resource_envelope(&self, resources: &Resources) -> Result<()> {
         resources.validate()?;
-        let (active, reserved): (u64, u64) = self.db.connection.query_row(
-            "SELECT count(*),coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        let active = managed_execution_slots(&self.db.connection)?;
+        let reserved: u64 = self.db.connection.query_row(
+            "SELECT coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
+            [],
+            |row| row.get(0),
         )?;
         let retained: u64 = self.db.connection.query_row(
             "SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0",
@@ -1110,15 +1121,14 @@ impl RuntimeJournal {
             return Err(Error::Conflict("process must be reserved before dispatch"));
         }
         capacity(&tx, "processes", self.limits.identities)?;
-        let active: u64 = tx.query_row(
-            "SELECT count(*) FROM processes WHERE reservation_active=1",
-            [],
-            |row| row.get(0),
-        )?;
+        let active = managed_execution_slots(&tx)?;
         if active >= self.limits.managed_executions.get() {
             return Err(Error::Capacity("managed execution reservations exhausted"));
         }
-        // Live producers reserve their full limit. Settled processes consume
+        // Unsettled capture promises reserve their full limit, including after
+        // native interruption. An in-flight capture may still commit bytes;
+        // reclaiming an execution slot cannot discharge that obligation.
+        // Settled processes consume
         // only their actual retained bytes; unused headroom returns at the
         // same commit that publishes a terminal receipt.
         let reserved: u64 = tx.query_row(
@@ -2148,6 +2158,26 @@ fn append_event(
         params![sequence.get(), encode(&value)?, event_digest.as_str()],
     )?;
     Ok(())
+}
+
+fn managed_execution_slots(db: &rusqlite::Connection) -> Result<u64> {
+    let Some(current) = observation(db)? else {
+        return Ok(0);
+    };
+    // Derive the slot lifetime from the existing authoritative native history,
+    // not guest process reports or another persisted lifecycle/status field.
+    let ended: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM observations WHERE json_extract(value,'$.generation')=?1 AND json_extract(value,'$.state') IN ('stopped','destroyed','failed'))",
+        [current.generation.get()], |row| row.get(0),
+    )?;
+    if ended {
+        return Ok(0);
+    }
+    Ok(db.query_row(
+        "SELECT count(*) FROM processes WHERE reservation_active=1 AND generation=?1",
+        [current.generation.get()],
+        |row| row.get(0),
+    )?)
 }
 
 fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool {

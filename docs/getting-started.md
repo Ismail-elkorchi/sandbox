@@ -102,6 +102,12 @@ on that basis; APIs requiring unavailable guest facilities fail independently
 of native machine power. Management compatibility is checked by the actual
 strict guest handshake, not by trusting image provenance.
 
+`(await machine.resources.usage()).executionsCurrent` counts host-owned managed
+admission slots, not Linux PIDs or guest-reported running commands. Admissions
+count before the first guest report and remain reserved through management
+unavailability, pause and suspend. Native interruption frees their slots, while
+retained bytes and unsettled capture headroom remain protected independently.
+
 Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 
 ```ts

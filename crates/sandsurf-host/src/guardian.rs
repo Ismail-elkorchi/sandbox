@@ -894,19 +894,7 @@ impl<E: GuardianEffect> Guardian<E> {
                             .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
                             .resource_usage()?;
                         usage.output_retained_bytes = self.journal.retained_output_bytes()?;
-                        usage.executions_current = Counter::try_from(
-                            self.journal
-                                .process_snapshots()?
-                                .iter()
-                                .filter(|execution| {
-                                    matches!(
-                                        execution.state,
-                                        ExecutionState::Running | ExecutionState::Draining { .. }
-                                    )
-                                })
-                                .count() as u64,
-                        )
-                        .map_err(|_| Error::Protocol("execution accounting overflow"))?;
+                        usage.executions_current = self.journal.managed_execution_slots_held()?;
                         RuntimeResponse::Usage { usage }
                     }
                     RuntimeRequest::Events { after, maximum } => RuntimeResponse::Events {
