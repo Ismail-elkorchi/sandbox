@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 const API_HEADER_LIMIT: usize = 64 * 1024;
 const API_BODY_LIMIT: usize = 1024 * 1024;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
+const OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerRestore {
@@ -510,7 +511,8 @@ impl FirecrackerProcess {
                 evidence_digest: sandsurf_protocol::bytes_digest(&evidence),
             });
         }
-        let bytes = self.api_request("GET", "/", &[], 200)?;
+        let bytes =
+            self.api_request_until("GET", "/", &[], 200, Instant::now() + OBSERVATION_TIMEOUT)?;
         parse_instance_power(&bytes)
     }
 

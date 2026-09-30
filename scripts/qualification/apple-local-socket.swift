@@ -47,7 +47,7 @@ private enum NativeControlContracts {
         precondition(relativeUnixSocket(root.appendingPathComponent(String(repeating: "x", count: 120)).path) { _, _ in fatalError("oversized basename accepted") } == nil)
         DispatchQueue.concurrentPerform(iterations: 32) { _ in
             precondition(relativeUnixSocket(path) { _, _ in Darwin.access("control.sock", F_OK) } == 0)
-            precondition(files.currentDirectoryPath == originalDirectory)
+            precondition(FileManager.default.currentDirectoryPath == originalDirectory)
         }
         precondition(files.currentDirectoryPath == originalDirectory)
         print("Apple native-owner wire and descriptor-relative socket contracts passed; no VM qualification implied")

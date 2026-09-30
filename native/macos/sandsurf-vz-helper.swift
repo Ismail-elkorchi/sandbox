@@ -216,7 +216,7 @@ private final class SocketRelay {
                         guest.close()
                         return
                     }
-                    add(local: client, guest: guest)
+                    self.add(local: client, guest: guest)
                 }
               }
             }
@@ -511,6 +511,8 @@ private func stateName(_ state: VZVirtualMachine.State) -> String {
     case .pausing: return "running"
     case .resuming: return "paused"
     case .stopping: return "running"
+    case .saving: return "paused"
+    case .restoring: return "restoring"
     case .error: return "failed"
     @unknown default: return "failed"
     }

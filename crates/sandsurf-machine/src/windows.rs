@@ -29,6 +29,7 @@ use windows_sys::Win32::System::HostComputeSystem::{
 use windows_sys::core::{HRESULT, PWSTR};
 
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const OBSERVATION_TIMEOUT_MS: u32 = 250;
 const OWNER: &str = "Sandsurf";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl HyperVDriver {
         if self.capture_paused {
             return Ok(());
         }
-        self.run_operation("hcs-capture-pause", |system, operation| {
+        self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: live owned handles and a bounded empty options document.
             unsafe { HcsPauseComputeSystem(system, operation, wide("{}").as_ptr()) }
         })
@@ -215,7 +216,7 @@ impl HyperVDriver {
         if !self.capture_paused {
             return Ok(());
         }
-        self.run_operation("hcs-capture-resume", |system, operation| {
+        self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: live owned handles and a bounded empty options document.
             unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }
         })
@@ -282,7 +283,7 @@ impl HyperVDriver {
             save_state_file_path: destination.to_string_lossy(),
         })
         .map_err(|_| HyperVOperationError::DispatchRejected)?;
-        let saved = self.run_operation("hcs-save", |system, operation| {
+        let saved = self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: live owned handles and a bounded NUL-terminated options
             // document naming the pre-created private runtime-state file.
             unsafe { HcsSaveComputeSystem(system, operation, wide(&options).as_ptr()) }
@@ -407,7 +408,7 @@ impl HyperVDriver {
             return MachineOutcome::Unknown;
         }
 
-        let start = self.run_operation("hcs-start", |system, operation| {
+        let start = self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: the handles are live and owned by this driver; null is the
             // only supported options value for this HCS operation.
             unsafe { HcsStartComputeSystem(system, operation, ptr::null()) }
@@ -460,7 +461,7 @@ impl HyperVDriver {
 
     fn run_operation(
         &self,
-        _label: &'static str,
+        timeout_ms: u32,
         dispatch: impl FnOnce(HCS_SYSTEM, HCS_OPERATION) -> HRESULT,
     ) -> Result<Vec<u8>, OperationFailure> {
         let system = self
@@ -473,7 +474,7 @@ impl HyperVDriver {
             return Err(OperationFailure::Dispatch);
         }
         operation
-            .wait(self.timeout_ms())
+            .wait(timeout_ms)
             .map_err(|_| OperationFailure::Wait)
     }
 
@@ -569,7 +570,7 @@ impl HyperVDriver {
     fn terminate_and_release(&mut self) -> bool {
         let mut confirmed = true;
         if self.system.is_some() {
-            let terminated = self.run_operation("hcs-terminate", |system, operation| {
+            let terminated = self.run_operation(self.timeout_ms(), |system, operation| {
                 // SAFETY: the handles are live and owned by this driver; null is
                 // the supported options value.
                 unsafe { HcsTerminateComputeSystem(system, operation, ptr::null()) }
@@ -713,7 +714,7 @@ impl MachineDriver for HyperVDriver {
             }));
         }
         let bytes = self
-            .run_operation("hcs-observe", |system, operation| {
+            .run_operation(OBSERVATION_TIMEOUT_MS, |system, operation| {
                 // SAFETY: handles are owned and live; null requests basic properties.
                 unsafe { HcsGetComputeSystemProperties(system, operation, ptr::null()) }
             })
@@ -820,7 +821,7 @@ impl MachineDriver for HyperVDriver {
         if command.machine_id != self.config.machine_id {
             return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
-        match self.run_operation("hcs-pause", |system, operation| {
+        match self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
             // options object is accepted by the HCS pause contract.
             unsafe { HcsPauseComputeSystem(system, operation, wide("{}").as_ptr()) }
@@ -846,7 +847,7 @@ impl MachineDriver for HyperVDriver {
         if command.machine_id != self.config.machine_id {
             return self.unavailable(b"hyper-v-machine-identity-mismatch");
         }
-        match self.run_operation("hcs-resume", |system, operation| {
+        match self.run_operation(self.timeout_ms(), |system, operation| {
             // SAFETY: the handles are live and owned by this driver; an empty
             // options object is accepted by the HCS resume contract.
             unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }

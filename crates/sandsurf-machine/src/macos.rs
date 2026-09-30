@@ -17,10 +17,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_HELPER_MESSAGE: usize = 1024 * 1024;
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const OBSERVATION_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppleQualification {
@@ -464,7 +465,7 @@ impl MachineDriver for AppleDriver {
             return Ok(None);
         };
         let response = owner
-            .request(&HelperRequest::Inspect)
+            .inspect()
             .map_err(|_| bytes_digest(b"apple-native-observation-unavailable"))?;
         if response.kind != ResponseKind::Observed
             || !matches!(
@@ -790,6 +791,12 @@ struct HelperOwner {
     output: Arc<Mutex<ChildStdout>>,
     timeout: Duration,
     poisoned: bool,
+    inspection: Option<PendingInspection>,
+}
+
+struct PendingInspection {
+    reply: mpsc::Receiver<io::Result<HelperResponse>>,
+    started: Instant,
 }
 
 impl HelperOwner {
@@ -815,10 +822,124 @@ impl HelperOwner {
             output: Arc::new(Mutex::new(output)),
             timeout,
             poisoned: false,
+            inspection: None,
         })
     }
 
     fn request(&mut self, request: &HelperRequest) -> io::Result<HelperResponse> {
+        // Drain exactly the outstanding read-only reply before writing a new
+        // command. No duplicate request or second reader can steal its frame.
+        if let Some(pending) = self.inspection.take() {
+            match pending.reply.recv_timeout(self.timeout) {
+                Ok(result) => {
+                    if let Err(error) = result {
+                        self.poisoned = true;
+                        return Err(error);
+                    }
+                }
+                Err(_) => {
+                    self.inspection = Some(pending);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "Apple owner inspection remains pending; command was not dispatched",
+                    ));
+                }
+            }
+        }
+        let receiver = self.send_request(request)?;
+        match receiver.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(_) => {
+                self.poisoned = true;
+                self.contain();
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Apple owner response timed out",
+                ))
+            }
+        }
+    }
+
+    /// Observation is non-mutating even when the native helper is unavailable.
+    /// Retain one unfinished read across probes instead of killing its owner,
+    /// discarding a partial frame, or spawning an unbounded reader per poll.
+    fn inspect(&mut self) -> io::Result<HelperResponse> {
+        if self.poisoned {
+            return Err(io::Error::other("Apple owner channel is poisoned"));
+        }
+        if let Some(pending) = self.inspection.as_ref()
+            && pending.started.elapsed() >= OBSERVATION_TIMEOUT
+        {
+            match pending.reply.try_recv() {
+                Ok(Ok(_)) => {
+                    self.inspection.take();
+                }
+                Ok(Err(error)) => {
+                    self.inspection.take();
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Apple observation reply remains pending",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.inspection.take();
+                    self.poisoned = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Apple inspection reader stopped",
+                    ));
+                }
+            }
+            // A late reply only repairs framing. Measure again rather than
+            // promoting a timed-out sample to a current native observation.
+        }
+        if self.inspection.is_none() {
+            match self.send_request(&HelperRequest::Inspect) {
+                Ok(reply) => {
+                    self.inspection = Some(PendingInspection {
+                        reply,
+                        started: Instant::now(),
+                    })
+                }
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            }
+        }
+        match self.inspection.as_ref().unwrap().reply.recv_timeout(
+            OBSERVATION_TIMEOUT.saturating_sub(self.inspection.as_ref().unwrap().started.elapsed()),
+        ) {
+            Ok(result) => {
+                self.inspection.take();
+                if result.is_err() {
+                    self.poisoned = true;
+                }
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Apple native observation unavailable; response remains pending",
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.inspection.take();
+                self.poisoned = true;
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Apple inspection reader stopped",
+                ))
+            }
+        }
+    }
+
+    fn send_request(
+        &mut self,
+        request: &HelperRequest,
+    ) -> io::Result<mpsc::Receiver<io::Result<HelperResponse>>> {
         if self.poisoned {
             return Err(io::Error::other("Apple owner channel is poisoned"));
         }
@@ -847,17 +968,7 @@ impl HelperOwner {
                 .and_then(|mut stream| read_response(&mut *stream));
             let _ = sender.send(result);
         });
-        match receiver.recv_timeout(self.timeout) {
-            Ok(result) => result,
-            Err(_) => {
-                self.poisoned = true;
-                self.contain();
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Apple owner response timed out",
-                ))
-            }
-        }
+        Ok(receiver)
     }
 
     fn contain(&mut self) {
@@ -1059,6 +1170,93 @@ mod tests {
         let mut oversized = ((MAX_HELPER_MESSAGE + 1) as u32).to_be_bytes().to_vec();
         oversized.extend_from_slice(b"{}");
         assert!(read_response(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
+    fn timed_out_observation_preserves_owner_and_one_fragmented_reply_before_control() {
+        let running = br#"{"kind":"observed","state":"running"}"#;
+        let paused = br#"{"kind":"observed","state":"paused"}"#;
+        let inspect_bytes = serde_json::to_vec(&HelperRequest::Inspect).unwrap().len() + 4;
+        let pause_bytes = serde_json::to_vec(&HelperRequest::Pause).unwrap().len() + 4;
+        // The helper consumes exactly one request before sending its fragmented
+        // reply. A duplicate probe would be consumed as the later pause request.
+        let script = format!(
+            "request=$(dd bs=1 skip=4 count={} 2>/dev/null); test \"$request\" = '{{\"kind\":\"inspect\"}}' || exit 4; printf '\\000\\000\\000\\{:03o}{}'; sleep 0.7; printf '{}'; request=$(dd bs=1 skip=4 count={} 2>/dev/null); test \"$request\" = '{{\"kind\":\"pause\"}}' || exit 4; printf '\\000\\000\\000\\{:03o}{}'; sleep 5",
+            inspect_bytes - 4,
+            running.len(),
+            std::str::from_utf8(&running[..10]).unwrap(),
+            std::str::from_utf8(&running[10..]).unwrap(),
+            pause_bytes - 4,
+            paused.len(),
+            std::str::from_utf8(paused).unwrap(),
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut owner = HelperOwner {
+            input: child.stdin.take(),
+            output: Arc::new(Mutex::new(child.stdout.take().unwrap())),
+            child,
+            timeout: Duration::from_secs(2),
+            poisoned: false,
+            inspection: None,
+        };
+        for _ in 0..2 {
+            assert_eq!(owner.inspect().unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert!(owner.inspection.is_some());
+            assert!(!owner.poisoned);
+            assert!(owner.child.try_wait().unwrap().is_none());
+        }
+        // Lifecycle control drains the outstanding reply and receives its own
+        // result, not the observation that happened to finish first.
+        let response = owner.request(&HelperRequest::Pause).unwrap();
+        assert_eq!(response.state, MachineState::Paused);
+        assert!(owner.inspection.is_none());
+        assert!(owner.child.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_late_power_reply_repairs_framing_but_is_not_current_evidence() {
+        let paused = br#"{"kind":"observed","state":"paused"}"#;
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "printf '\\000\\000\\000\\{:03o}{}'; sleep 5",
+                paused.len(),
+                std::str::from_utf8(paused).unwrap()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (sender, reply) = mpsc::sync_channel(1);
+        sender
+            .send(Ok(HelperResponse {
+                kind: ResponseKind::Observed,
+                state: MachineState::Running,
+            }))
+            .unwrap();
+        let mut owner = HelperOwner {
+            input: child.stdin.take(),
+            output: Arc::new(Mutex::new(child.stdout.take().unwrap())),
+            child,
+            timeout: Duration::from_secs(2),
+            poisoned: false,
+            inspection: Some(PendingInspection {
+                reply,
+                started: Instant::now() - Duration::from_secs(1),
+            }),
+        };
+        assert_eq!(owner.inspect().unwrap().state, MachineState::Paused);
+        assert!(owner.inspection.is_none());
+        assert!(!owner.poisoned);
+        assert!(owner.child.try_wait().unwrap().is_none());
     }
 
     #[test]
