@@ -1,8 +1,11 @@
 //! Archive the reviewed distribution staging tree without confusing temporary
 //! host read permissions with the Linux image's declared inode metadata.
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
