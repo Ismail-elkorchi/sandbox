@@ -158,7 +158,9 @@ impl Fixture {
                 sequence: Counter::ONE,
                 state: MachineState::Creating,
                 applied_revision: Counter::ONE,
-                operation_id: create.clone(),
+                cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                    operation_id: create.clone(),
+                },
                 evidence_digest: hash("owned"),
             })
             .unwrap();
@@ -169,7 +171,9 @@ impl Fixture {
                 sequence: n(2),
                 state: MachineState::Running,
                 applied_revision: Counter::ONE,
-                operation_id: create,
+                cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                    operation_id: create,
+                },
                 evidence_digest: hash("booted"),
             })
             .unwrap();
@@ -199,7 +203,9 @@ impl Fixture {
                 sequence: n(3),
                 state: MachineState::Running,
                 applied_revision: n(2),
-                operation_id: "configure-fixture".try_into().unwrap(),
+                cause: ObservationCause::Configuration {
+                    operation_id: "configure-fixture".try_into().unwrap(),
+                },
                 evidence_digest: hash("revision-2"),
             })
             .unwrap();
@@ -305,6 +311,29 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn observe_power(
+        &mut self,
+    ) -> sandsurf_host::guardian::Result<Option<sandsurf_machine::NativePowerObservation>> {
+        let root = self.path.parent().unwrap();
+        if root.join("native-unavailable").exists() {
+            return Err(sandsurf_host::guardian::Error::Protocol(
+                "native owner unavailable",
+            ));
+        }
+        let state = match fs::read(root.join("native-power")) {
+            Ok(bytes) => serde_json::from_slice::<MachineState>(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => MachineState::Running,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(
+            (!matches!(state, MachineState::Destroyed | MachineState::Suspended)).then(|| {
+                sandsurf_machine::NativePowerObservation {
+                    state,
+                    evidence_digest: hash("measured-native-power"),
+                }
+            }),
+        )
+    }
     fn capture_owner(&self) -> sandsurf_host::guardian::Result<Option<OperationId>> {
         if self
             .path
@@ -361,8 +390,106 @@ impl GuardianEffect for FileEffect {
                 transition(MachineState::Destroyed),
             ],
         };
+        fs::write(
+            self.path.parent().unwrap().join("native-power"),
+            serde_json::to_vec(&states.last().unwrap().state).unwrap(),
+        )
+        .unwrap();
         LifecycleEffect::Observed(states)
     }
+}
+
+#[test]
+fn native_measurements_are_durable_independent_facts_and_unavailability_is_not_shutdown() {
+    let fixture = Fixture::new();
+    let endpoint = fixture.root.0.join("endpoint");
+    sandsurf_native::local::create_private_directory(&endpoint).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "guardian_process_fixture", "--test-threads=1"])
+        .env("SANDSURF_GUARDIAN_TEST_ROOT", &fixture.root.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let _child = ChildGuard(child);
+    drop(wait_for_guardian(&endpoint));
+    let client = GuardianClient::new(endpoint);
+    let initial = client.inspect(fixture.machine.clone(), None).unwrap();
+    let Observation::Current { value: initial } = initial.observation else {
+        panic!("owned machine");
+    };
+    fs::write(fixture.root.0.join("native-unavailable"), []).unwrap();
+    let unavailable = client.inspect(fixture.machine.clone(), None).unwrap();
+    assert!(
+        matches!(unavailable.observation, Observation::Unavailable { last_known: Some(value) } if value == initial)
+    );
+    fs::remove_file(fixture.root.0.join("native-unavailable")).unwrap();
+    fs::write(
+        fixture.root.0.join("native-power"),
+        serde_json::to_vec(&MachineState::Stopped).unwrap(),
+    )
+    .unwrap();
+    // Observe the event ledger, not Inspect: periodic native sampling must run
+    // without a client requesting a machine-state refresh or any guest report.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let measured = loop {
+        let RuntimeResponse::Events { page } = client
+            .runtime(
+                fixture.machine.clone(),
+                RuntimeRequest::Events {
+                    after: Counter::ZERO,
+                    maximum: 256,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("event ledger");
+        };
+        if let Some(value) = page.events.into_iter().find_map(|event| match event.value {
+            RuntimeEventValue::Machine { observation }
+                if observation.cause == ObservationCause::Native {} =>
+            {
+                Some(observation)
+            }
+            _ => None,
+        }) {
+            break value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native state must be sampled independently"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(measured.state, MachineState::Stopped);
+    assert_eq!(measured.generation, initial.generation);
+    assert_eq!(measured.applied_revision, initial.applied_revision);
+    let host = fixture.host.machine(&fixture.machine).unwrap().unwrap();
+    assert_eq!(host.latest_intent.desired, DesiredState::Running);
+    assert_eq!(fixture.host.revision(&fixture.machine).unwrap(), n(2));
+    assert_eq!(
+        client
+            .inspect(fixture.machine.clone(), None)
+            .unwrap()
+            .observation,
+        Observation::Current {
+            value: measured.clone()
+        }
+    );
+    let RuntimeResponse::Events { page } = client
+        .runtime(
+            fixture.machine,
+            RuntimeRequest::Events {
+                after: Counter::ZERO,
+                maximum: 256,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("event ledger");
+    };
+    assert_eq!(page.events.iter().filter(|event| matches!(&event.value, RuntimeEventValue::Machine { observation } if observation.cause == ObservationCause::Native {})).count(), 1, "unchanged measurements do not bloat durable history");
 }
 
 #[test]
@@ -375,6 +502,9 @@ fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner(
     let mut last = runtime.last_observation().unwrap().unwrap().value().clone();
     for state in [MachineState::Destroying, MachineState::Destroyed] {
         last.state = state;
+        last.cause = ObservationCause::Lifecycle {
+            operation_id: "destroy-retained-fixture".try_into().unwrap(),
+        };
         last.sequence = last.sequence.next().unwrap();
         runtime.observe(last.clone()).unwrap();
     }
@@ -435,7 +565,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let _child = ChildGuard(child);
     let authorization = fixture.command.clone();
     let payload = serde_json::to_vec(&(
-        3_u16,
+        4_u16,
         sandsurf_protocol::RequestEnvelope::split(GuardianRequest::Dispatch {
             command: authorization.clone(),
         })

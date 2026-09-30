@@ -39,11 +39,17 @@ export interface SnapshotCreateOptions extends MachineGenerationPrecondition, Ma
 export interface DerivedImagePublishOptions { readonly operationId?: string; readonly allowSensitive?: boolean; }
 export interface MachineForkOptions { readonly id?: string; readonly operationId?: string; readonly resources?: ResourceEnvelope; readonly lifetime?: MachineLifetimePolicy; }
 export type Qualification = { readonly kind: "qualified"; readonly evidence: string } | { readonly kind: "unqualified"; readonly reasons: readonly string[] };
-export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly defaultImageDigest: string | null; }
+export type Capability = { readonly kind: "supported"; readonly qualification: Qualification } | { readonly kind: "unsupported"; readonly reasons: readonly string[] };
+export interface GuestPowerCapabilities { readonly shutdown: Capability; readonly reboot: Capability; }
+export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly guestPower: GuestPowerCapabilities; readonly defaultImageDigest: string | null; }
 export interface ImageDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; }
 export interface ManagementReport { readonly generation: number; readonly identity: { readonly bootId: string; readonly instanceId: string }; readonly observedUnixMillis: number; }
 export type ManagementObservation = { readonly kind: "current"; readonly value: ManagementReport } | { readonly kind: "unavailable"; readonly lastKnown: ManagementReport | null };
-export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: Readonly<Record<string, unknown>>; readonly management: ManagementObservation; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
+export type MachineState = "creating" | "starting" | "running" | "paused" | "stopped" | "suspended" | "restoring" | "destroying" | "destroyed" | "failed";
+export type ObservationCause = { readonly kind: "lifecycle" | "configuration"; readonly operationId: string } | { readonly kind: "native" };
+export interface NativeMachineObservation { readonly machineId: string; readonly generation: number; readonly sequence: number; readonly state: MachineState; readonly appliedRevision: number; readonly cause: ObservationCause; readonly evidenceDigest: string; }
+export type MachineObservation = { readonly kind: "current"; readonly value: NativeMachineObservation } | { readonly kind: "unavailable"; readonly lastKnown: NativeMachineObservation | null };
+export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: Readonly<Record<string, unknown>>; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
 export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
 export interface NetworkRule { readonly plane: "named-proxy" | "direct-tcp" | "dns"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
 export interface NetworkPolicy { readonly rules: readonly NetworkRule[]; }
@@ -100,7 +106,17 @@ export class Sandsurf {
   async inspect(): Promise<HostInspection> {
     this.#open(); const response = await this.#client.request({ kind: "inspect" });
     if (response.kind !== "inspection" || !record(response.value)) throw protocol("host inspection response");
-    return response.value as unknown as HostInspection;
+    const value = response.value;
+    const engine = text(value.engine);
+    if (engine !== "firecracker" && engine !== "apple-virtualization" && engine !== "hyper-v") throw protocol("native engine");
+    if (!record(value.guestPower)) throw protocol("guest power capabilities");
+    return {
+      hostId: validateIdentity(text(value.hostId)), platform: text(value.platform), architecture: text(value.architecture),
+      guestArchitecture: text(value.guestArchitecture), guestPlatform: text(value.guestPlatform), engine,
+      lifecycle: parseQualification(value.lifecycle), fullState: parseQualification(value.fullState), images: parseQualification(value.images),
+      guestPower: { shutdown: parseCapability(value.guestPower.shutdown), reboot: parseCapability(value.guestPower.reboot) },
+      defaultImageDigest: value.defaultImageDigest === null ? null : digest(text(value.defaultImageDigest)),
+    };
   }
   async close(): Promise<void> { this.#closed = true; await this.#client.close(); }
   async [transport](request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { this.#open(); return this.#client.request(request); }
@@ -989,12 +1005,52 @@ function normalizeLifetime(value: MachineLifetimePolicy | undefined): Readonly<{
   return { expiresAtUnixMillis, expirationAction };
 }
 function machineViewFrom(response: Record<string, unknown>): MachineInspection { if (response.kind === "lifecycle") { if (!record(response.operation) || typeof response.operation.delivery !== "string") throw protocol("lifecycle operation"); if (response.operation.delivery !== "applied") throw new SandsurfHostError(response.operation.delivery === "not-applied" ? "not-applied" : "ambiguous", `Lifecycle operation was ${response.operation.delivery}`); } const value = response.kind === "machine" ? response.value : response.kind === "lifecycle" ? response.machine : undefined; if (!record(value)) throw protocol("machine response"); return parseView(value); }
-function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
+function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, machine: parseMachineObservation(value.machine, text(value.id)), lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
 function currentMachine(view: MachineInspection): { readonly generation: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Machine machine observation is unavailable"); return { generation: integer(view.machine.value.generation) }; }
-function nativeObservationOrder(observation: Readonly<Record<string, unknown>>): readonly [number, number] {
+function nativeObservationOrder(observation: MachineObservation): readonly [number, number] {
   const value = observation.kind === "current" ? observation.value : observation.lastKnown;
   if (!record(value)) return [0, 0];
   return [integer(value.generation), integer(value.sequence)];
+}
+
+function parseReasons(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.some((reason) => typeof reason !== "string" || reason.length === 0)) throw protocol("capability reasons");
+  return value as string[];
+}
+function parseQualification(value: unknown): Qualification {
+  if (!record(value)) throw protocol("qualification");
+  if (value.kind === "qualified" && Object.keys(value).every((key) => key === "kind" || key === "evidence")) {
+    if (typeof value.evidence !== "string" || !/^[a-f0-9]{64}$/u.test(value.evidence)) throw protocol("qualification evidence");
+    return { kind: "qualified", evidence: value.evidence };
+  }
+  if (value.kind === "unqualified" && Object.keys(value).every((key) => key === "kind" || key === "reasons")) return { kind: "unqualified", reasons: parseReasons(value.reasons) };
+  throw protocol("qualification");
+}
+function parseCapability(value: unknown): Capability {
+  if (!record(value)) throw protocol("capability support");
+  if (value.kind === "supported" && Object.keys(value).every((key) => key === "kind" || key === "qualification")) return { kind: "supported", qualification: parseQualification(value.qualification) };
+  if (value.kind === "unsupported" && Object.keys(value).every((key) => key === "kind" || key === "reasons")) return { kind: "unsupported", reasons: parseReasons(value.reasons) };
+  throw protocol("capability support");
+}
+
+function parseMachineObservation(observation: Record<string, unknown>, machineId: string): MachineObservation {
+  const parse = (value: unknown): NativeMachineObservation => {
+    if (!record(value) || !record(value.cause) || value.machineId !== machineId) throw protocol("native machine observation identity");
+    const state = text(value.state);
+    if (!["creating", "starting", "running", "paused", "stopped", "suspended", "restoring", "destroying", "destroyed", "failed"].includes(state)) throw protocol("native machine observation state");
+    const causeKind = value.cause.kind;
+    const cause: ObservationCause | undefined = causeKind === "native" ? { kind: "native" }
+      : causeKind === "lifecycle" || causeKind === "configuration"
+        ? { kind: causeKind, operationId: validateIdentity(text(value.cause.operationId)) }
+        : undefined;
+    if (cause === undefined || Object.keys(value.cause).some((key) => key !== "kind" && (cause.kind === "native" || key !== "operationId"))) throw protocol("native observation cause");
+    const generation = integer(value.generation); const sequence = integer(value.sequence);
+    if (generation < 1 || sequence < 1) throw protocol("native machine observation fence");
+    return { machineId, generation, sequence, state: state as MachineState, appliedRevision: integer(value.appliedRevision), cause, evidenceDigest: digest(text(value.evidenceDigest)) };
+  };
+  if (observation.kind === "current") return { kind: "current", value: parse(observation.value) };
+  if (observation.kind === "unavailable") return { kind: "unavailable", lastKnown: observation.lastKnown === null ? null : parse(observation.lastKnown) };
+  throw protocol("native machine observation availability");
 }
 function expectedCounter(value: number | undefined, name: string): number | undefined { if (value === undefined) return undefined; if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive safe integer`); return value; }
 async function resolveRevisionPrecondition(machine: Machine, supplied: number | undefined): Promise<number> { const expected = expectedCounter(supplied, "expected revision"); return expected ?? machine[observed].configurationRevision; }

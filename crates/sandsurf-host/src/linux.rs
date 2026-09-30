@@ -805,8 +805,10 @@ impl GuardianEffect for LinuxGuardianEffect {
         )
     }
 
-    fn live_observation_reachable(&mut self) -> bool {
-        self.machine.has_live_owner()
+    fn observe_power(&mut self) -> ControlResult<Option<sandsurf_machine::NativePowerObservation>> {
+        self.machine
+            .observe_power()
+            .map_err(|_| ControlError::Protocol("native power observation unavailable"))
     }
 }
 

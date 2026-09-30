@@ -155,7 +155,7 @@ function fixtureView(generation = 1) {
     id: "box", imageDigest: "a".repeat(64),
     resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 },
     runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 } },
-    configurationRevision: 99, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { generation, sequence: 1 } },
+    configurationRevision: 99, reservation: "held", lifecycleIntent: {}, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
     management: { kind: "unavailable", lastKnown: null },
     executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace", entrypoint: [], command: [] },
     lifetime: { expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
@@ -184,7 +184,7 @@ test("authority-changing responses advance cached revisions without inspection",
   await machine.powerOff({ operationId: "stop" });
   assert.equal(machine.revision, 103);
   assert.deepEqual(requests.map((request) => request.kind), ["set-network-policy", "update-resources", "set-exposure", "lifecycle"]);
-  view = { ...view, machine: { kind: "current", value: { generation: 2, sequence: 1 } } };
+  view = { ...view, machine: fixtureView(2).machine };
   await machine.inspect();
   assert.equal(machine.generation, 2);
   // A delayed response is an observation, not permission to rewind authority.
@@ -192,6 +192,46 @@ test("authority-changing responses advance cached revisions without inspection",
   await machine.inspect();
   assert.equal(machine.revision, 103);
   assert.equal(machine.generation, 2);
+});
+
+test("native observations preserve host intent and reject fictitious command attribution", async () => {
+  let view = fixtureView();
+  view = { ...view, lifecycleIntent: { desired: "running" }, machine: { kind: "current", value: { ...view.machine.value, state: "stopped", sequence: 2, cause: { kind: "native" } } } };
+  const machine = fixtureMachine(async () => ({ kind: "machine", value: view }));
+  const measured = await machine.inspect();
+  assert.equal(measured.machine.value.state, "stopped");
+  assert.equal(measured.machine.value.cause.kind, "native");
+  assert.equal(measured.lifecycleIntent.desired, "running");
+  assert.equal(machine.revision, 99);
+  const lastKnown = measured.machine.value;
+  view = { ...view, machine: { kind: "unavailable", lastKnown } };
+  assert.deepEqual((await machine.inspect()).machine, view.machine);
+  assert.equal(machine.generation, undefined, "a cached measurement cannot assert current reachability");
+  view = { ...view, machine: { kind: "current", value: { ...lastKnown, cause: { kind: "native", operationId: "pretend-command" } } } };
+  await assert.rejects(machine.inspect(), /observation cause/u);
+});
+
+test("host power support is distinct from qualification and malformed claims are rejected", async () => {
+  const unqualified = { kind: "unqualified", reasons: ["no hardware qualification"] };
+  let value = {
+    hostId: "host", platform: "linux", architecture: "x86_64", guestArchitecture: "amd64", guestPlatform: "linux/amd64", engine: "firecracker",
+    lifecycle: unqualified, fullState: unqualified, images: unqualified, defaultImageDigest: null,
+    guestPower: { shutdown: { kind: "unsupported", reasons: ["no ACPI"] }, reboot: { kind: "unsupported", reasons: ["no reset recovery"] } },
+  };
+  const host = new Sandsurf({ request: async () => ({ kind: "inspection", value }) });
+  assert.deepEqual((await host.inspect()).guestPower, value.guestPower);
+  value = { ...value, guestPower: { ...value.guestPower, shutdown: { kind: "supported", qualification: unqualified } } };
+  assert.deepEqual((await host.inspect()).guestPower.shutdown, { kind: "supported", qualification: unqualified });
+  for (const claim of [
+    { kind: "unqualified", reasons: ["not a support status"] },
+    { kind: "supported" },
+    { kind: "unsupported", reasons: ["missing device"], qualification: unqualified },
+    { kind: "unsupported", reasons: [] },
+    { kind: "supported", qualification: { kind: "qualified", evidence: "not-a-digest" } },
+  ]) {
+    value = { ...value, guestPower: { ...value.guestPower, shutdown: claim } };
+    await assert.rejects(host.inspect(), SandsurfHostError);
+  }
 });
 
 test("OCI conversion binds explicit boot artifacts into approval and admission", async () => {

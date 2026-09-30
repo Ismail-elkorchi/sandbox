@@ -4,7 +4,7 @@ import { lstat, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const BRIDGE_VERSION = 3;
+const BRIDGE_VERSION = 4;
 const MAX_BRIDGE_BYTES = 1024 * 1024 + 256 * 1024 + 4;
 const MAX_BRIDGE_PENDING = 64;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");

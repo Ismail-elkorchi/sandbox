@@ -1604,6 +1604,7 @@ impl HostService {
                 reasons: vec![reason],
             },
             images: { crate::images::qualification() },
+            guest_power: sandsurf_machine::guest_power_capabilities(),
             guest_platform: format!(
                 "linux/{}",
                 match native_guest_architecture() {

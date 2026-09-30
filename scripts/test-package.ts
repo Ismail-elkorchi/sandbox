@@ -39,6 +39,8 @@ try {
     try {
       const before = await host.inspect();
       assert.ok(before.defaultImageDigest);
+      assert.equal(before.guestPower.reboot.kind, "unsupported");
+      assert.equal(before.guestPower.shutdown.kind, process.platform === "linux" && process.arch === "x64" ? "unsupported" : "supported");
       const secret = await host.secrets.put("installed-binary-secret", Buffer.alloc(1024 ** 2, 255), { operationId: "installed-put" });
       assert.equal(secret.bytes, 1024 ** 2);
       await host.close();

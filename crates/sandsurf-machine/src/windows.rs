@@ -12,7 +12,7 @@ use sandsurf_protocol::{
     ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineId, MachineObservation,
     MachineState, Qualification, VmEngine, bytes_digest,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,10 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::System::HostComputeSystem::{
     HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation, HcsCreateComputeSystem,
-    HcsCreateEmptyRuntimeStateFile, HcsCreateOperation, HcsGrantVmAccess, HcsPauseComputeSystem,
-    HcsResumeComputeSystem, HcsRevokeVmAccess, HcsSaveComputeSystem, HcsStartComputeSystem,
-    HcsTerminateComputeSystem, HcsWaitForComputeSystemExit, HcsWaitForOperationResult,
+    HcsCreateEmptyRuntimeStateFile, HcsCreateOperation, HcsGetComputeSystemProperties,
+    HcsGrantVmAccess, HcsPauseComputeSystem, HcsResumeComputeSystem, HcsRevokeVmAccess,
+    HcsSaveComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+    HcsWaitForComputeSystemExit, HcsWaitForOperationResult,
 };
 use windows_sys::core::{HRESULT, PWSTR};
 
@@ -187,11 +188,6 @@ impl HyperVDriver {
     #[must_use]
     pub fn vm_id(&self) -> &str {
         &self.config.vm_id
-    }
-
-    #[must_use]
-    pub fn has_live_owner(&self) -> bool {
-        self.system.is_some()
     }
 
     pub fn contain_unobserved(&mut self) {
@@ -445,7 +441,11 @@ impl HyperVDriver {
                 transition(
                     command,
                     generation,
-                    MachineState::Creating,
+                    if generation == Counter::ONE {
+                        MachineState::Creating
+                    } else {
+                        MachineState::Starting
+                    },
                     b"hcs-create-complete",
                 ),
                 transition(
@@ -531,27 +531,31 @@ impl HyperVDriver {
         }) else {
             return true;
         };
-        let path = self.granted_disks.remove(index);
         let vm_id = wide(&self.config.vm_id);
-        let encoded = wide_path(&path);
+        let encoded = wide_path(&self.granted_disks[index]);
         // SAFETY: the VM ID and formerly granted path are live NUL-terminated
         // UTF-16 buffers for this synchronous revocation call.
-        !failed(unsafe { HcsRevokeVmAccess(vm_id.as_ptr(), encoded.as_ptr()) })
+        if failed(unsafe { HcsRevokeVmAccess(vm_id.as_ptr(), encoded.as_ptr()) }) {
+            return false;
+        }
+        self.granted_disks.remove(index);
+        true
     }
 
     fn revoke_disk_access(&mut self) -> bool {
         let vm_id = wide(&self.config.vm_id);
-        let mut complete = true;
-        while let Some(path) = self.granted_disks.pop() {
-            let path = wide_path(&path);
+        let mut remaining = Vec::new();
+        for path in self.granted_disks.drain(..) {
+            let encoded = wide_path(&path);
             // SAFETY: the VM ID and path buffers are NUL terminated and live for
             // this synchronous HCS access-control call.
-            let result = unsafe { HcsRevokeVmAccess(vm_id.as_ptr(), path.as_ptr()) };
+            let result = unsafe { HcsRevokeVmAccess(vm_id.as_ptr(), encoded.as_ptr()) };
             if failed(result) {
-                complete = false;
+                remaining.push(path);
             }
         }
-        complete
+        self.granted_disks = remaining;
+        self.granted_disks.is_empty()
     }
 
     fn rollback_grants_or(&mut self, outcome: MachineOutcome) -> MachineOutcome {
@@ -675,6 +679,47 @@ impl HyperVDriver {
 }
 
 impl MachineDriver for HyperVDriver {
+    fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
+        if self.system.is_none() {
+            self.revoke_disk_access();
+            return Ok(None);
+        }
+        let system = self.system.as_ref().expect("owned system was checked");
+        let mut document: PWSTR = ptr::null_mut();
+        // SAFETY: the retained native handle and out pointer are live. Zero
+        // polls exit without requesting termination. After exit, HCS permits
+        // exit-status queries but not ordinary property queries.
+        let exited = unsafe { HcsWaitForComputeSystemExit(system.0.as_ptr(), 0, &mut document) };
+        let exit_document = wide_result_bytes(document);
+        free_result(document);
+        if exited == 0 {
+            let evidence_digest = sandsurf_protocol::digest(
+                sandsurf_protocol::Domain::Operation,
+                &(
+                    "hyper-v-native-exit",
+                    &self.config.vm_id,
+                    exited,
+                    exit_document,
+                ),
+            )
+            .map_err(|_| bytes_digest(b"hyper-v-native-exit-evidence-invalid"))?;
+            self.system.take();
+            // Failed revocation remains owned for retry; it does not erase
+            // confirmed native exit evidence.
+            self.revoke_disk_access();
+            return Ok(Some(crate::NativePowerObservation {
+                state: MachineState::Stopped,
+                evidence_digest,
+            }));
+        }
+        let bytes = self
+            .run_operation("hcs-observe", |system, operation| {
+                // SAFETY: handles are owned and live; null requests basic properties.
+                unsafe { HcsGetComputeSystemProperties(system, operation, ptr::null()) }
+            })
+            .map_err(|_| bytes_digest(b"hyper-v-native-observation-unavailable"))?;
+        Ok(Some(parse_hcs_power(&bytes, &self.config.vm_id)?))
+    }
     fn qualification(&self) -> DriverQualification {
         DriverQualification {
             engine: VmEngine::HyperV,
@@ -738,6 +783,15 @@ impl MachineDriver for HyperVDriver {
         }
         if self.system.is_none() || command.revision <= current.applied_revision {
             return self.unavailable(b"hyper-v-live-reconfiguration-not-supported");
+        }
+        if !matches!(
+            self.observe_power(),
+            Ok(Some(crate::NativePowerObservation {
+                state: MachineState::Running,
+                ..
+            }))
+        ) {
+            return MachineOutcome::Unknown;
         }
         MachineOutcome::Observed(vec![transition(
             command,
@@ -994,6 +1048,31 @@ fn failed(result: HRESULT) -> bool {
     result < 0
 }
 
+fn parse_hcs_power(bytes: &[u8], vm_id: &str) -> Result<crate::NativePowerObservation, Digest> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Properties {
+        id: String,
+        state: String,
+    }
+    let properties: Properties = serde_json::from_slice(bytes)
+        .map_err(|_| bytes_digest(b"hyper-v-native-properties-invalid"))?;
+    if !properties.id.eq_ignore_ascii_case(vm_id) {
+        return Err(bytes_digest(b"hyper-v-native-properties-identity-mismatch"));
+    }
+    let state = match properties.state.as_str() {
+        "Running" => MachineState::Running,
+        "Paused" => MachineState::Paused,
+        // Termination is established by the retained handle's exit wait,
+        // never inferred from a stale properties document.
+        _ => return Err(bytes_digest(b"hyper-v-native-power-indeterminate")),
+    };
+    Ok(crate::NativePowerObservation {
+        state,
+        evidence_digest: bytes_digest(bytes),
+    })
+}
+
 fn qualification(evidence: Option<Digest>, reason: &str) -> Qualification {
     match evidence {
         Some(evidence) => Qualification::Qualified { evidence },
@@ -1213,6 +1292,28 @@ struct Attachment<'a> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Foundation::E_HANDLE;
+
+    #[test]
+    fn native_properties_require_the_owned_identity_and_a_definite_power_state() {
+        let id = "da57a1f0-3ca8-4f20-9802-21e8df32a9b1";
+        for (wire, state) in [
+            ("Running", MachineState::Running),
+            ("Paused", MachineState::Paused),
+        ] {
+            let bytes = format!(
+                "{{\"Id\":\"{id}\",\"State\":\"{wire}\",\"SystemType\":\"VirtualMachine\"}}"
+            );
+            let observed = parse_hcs_power(bytes.as_bytes(), id).unwrap();
+            assert_eq!(observed.state, state);
+            assert_eq!(observed.evidence_digest, bytes_digest(bytes.as_bytes()));
+            assert!(parse_hcs_power(bytes.as_bytes(), "different-machine").is_err());
+        }
+        for state in ["Unknown", "Created", "SavedAsTemplate", "Stopped"] {
+            let bytes = format!("{{\"Id\":\"{id}\",\"State\":\"{state}\"}}");
+            assert!(parse_hcs_power(bytes.as_bytes(), id).is_err());
+        }
+        assert!(parse_hcs_power(br#"{"Id":"wrong"}"#, id).is_err());
+    }
 
     fn config() -> HyperVConfig {
         HyperVConfig {

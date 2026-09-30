@@ -3,6 +3,68 @@ use serde_json::json;
 use std::io::{self, Read};
 
 #[test]
+fn capability_support_is_not_qualification() {
+    for capability in [
+        Capability::Unsupported {
+            reasons: vec!["no virtual device".into()],
+        },
+        Capability::Supported {
+            qualification: Qualification::Unqualified {
+                reasons: vec!["no hardware evidence".into()],
+            },
+        },
+        Capability::Supported {
+            qualification: Qualification::Qualified {
+                evidence: bytes_digest(b"hardware"),
+            },
+        },
+    ] {
+        assert_eq!(
+            serde_json::from_value::<Capability>(serde_json::to_value(&capability).unwrap())
+                .unwrap(),
+            capability
+        );
+    }
+    for wire in [
+        json!({"kind":"supported"}),
+        json!({"kind":"unsupported","qualification":{"kind":"unqualified","reasons":[]}}),
+        json!({"kind":"unsupported","reasons":[],"evidence":"pretend"}),
+    ] {
+        assert!(serde_json::from_value::<Capability>(wire).is_err());
+    }
+}
+
+#[test]
+fn machine_observation_causes_do_not_conflate_independent_facts_and_operations() {
+    for cause in [
+        ObservationCause::Native {},
+        ObservationCause::Lifecycle {
+            operation_id: "lifecycle".try_into().unwrap(),
+        },
+        ObservationCause::Configuration {
+            operation_id: "configuration".try_into().unwrap(),
+        },
+    ] {
+        let wire = serde_json::to_value(&cause).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ObservationCause>(wire).unwrap(),
+            cause
+        );
+    }
+    for wire in [
+        json!({"kind":"native","operationId":"pretend"}),
+        json!({"kind":"lifecycle"}),
+        json!({"kind":"configuration","operationId":"valid","unknown":true}),
+        json!({"kind":"unknown"}),
+    ] {
+        assert!(
+            serde_json::from_value::<ObservationCause>(wire.clone()).is_err(),
+            "unexpected cause accepted: {wire}"
+        );
+    }
+}
+
+#[test]
 fn evidence_binary_metadata_binds_full_page_coverage_and_bytes() {
     let bytes = vec![255; MAX_STREAM_BYTES];
     let content = bytes_digest(&bytes);

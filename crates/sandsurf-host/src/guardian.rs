@@ -21,7 +21,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SERVICE_VERSION: u16 = 3;
+const SERVICE_VERSION: u16 = 4;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -138,12 +138,7 @@ pub trait GuardianEffect {
     ) -> sandsurf_state::Result<()> {
         Ok(())
     }
-    /// Reports whether a last committed live-machine observation is currently
-    /// backed by this guardian's exclusive native owner. It is not a lifecycle
-    /// transition and cannot manufacture a stopped/failed observation.
-    fn live_observation_reachable(&mut self) -> bool {
-        true
-    }
+    fn observe_power(&mut self) -> Result<Option<sandsurf_machine::NativePowerObservation>>;
 }
 
 /// Guest/defaults dispatch is deliberately separate from native VM ownership.
@@ -524,10 +519,73 @@ impl<E: GuardianEffect> Guardian<E> {
             .journal
             .last_observation()?
             .is_some_and(|value| value.value().state == MachineState::Destroyed)
-            && self
-                .effect
-                .as_mut()
-                .is_none_or(|effect| !effect.live_observation_reachable()))
+            && match self.effect.as_mut() {
+                None => true,
+                Some(effect) => matches!(effect.observe_power(), Ok(None)),
+            })
+    }
+
+    /// Measure native hardware independently of host intent and guest health.
+    /// Ordinary guest traffic uses the resulting journal fence; it does not
+    /// perform a native control transaction for every command or keystroke.
+    fn refresh_native_observation(&mut self) -> Result<bool> {
+        let Some(current) = self
+            .journal
+            .last_observation()?
+            .map(|value| value.value().clone())
+        else {
+            return Ok(false);
+        };
+        let Some(effect) = self.effect.as_mut() else {
+            return Ok(current.state == MachineState::Destroyed);
+        };
+        let measured = match effect.observe_power() {
+            Ok(measured) => measured,
+            Err(_) => return Ok(false),
+        };
+        let Some(measured) = measured else {
+            return Ok(matches!(
+                current.state,
+                MachineState::Stopped
+                    | MachineState::Suspended
+                    | MachineState::Destroyed
+                    | MachineState::Failed
+            ));
+        };
+        if !matches!(
+            measured.state,
+            MachineState::Running
+                | MachineState::Paused
+                | MachineState::Stopped
+                | MachineState::Failed
+        ) {
+            return Err(Error::Protocol(
+                "native power observation is not a stable state",
+            ));
+        }
+        if measured.state == MachineState::Paused && !matches!(effect.capture_owner(), Ok(None)) {
+            // Capture owns this temporary pause; it is not public pause intent.
+            return Ok(false);
+        }
+        if measured.state != current.state {
+            self.journal.observe(MachineObservation {
+                machine_id: current.machine_id,
+                generation: current.generation,
+                sequence: current
+                    .sequence
+                    .next()
+                    .map_err(|_| Error::Protocol("native observation sequence overflow"))?,
+                state: measured.state,
+                applied_revision: current.applied_revision,
+                cause: ObservationCause::Native {},
+                evidence_digest: measured.evidence_digest,
+            })?;
+            if matches!(measured.state, MachineState::Stopped | MachineState::Failed) {
+                self.management_seen = None;
+                self.execution_seen.clear();
+            }
+        }
+        Ok(true)
     }
 
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
@@ -539,20 +597,11 @@ impl<E: GuardianEffect> Guardian<E> {
                 if &machine_id != self.journal.machine_id() {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
+                let reachable = self.refresh_native_observation()?;
                 let observation = match self.journal.last_observation()? {
-                    Some(value)
-                        if !matches!(
-                            value.value().state,
-                            MachineState::Running | MachineState::Paused
-                        ) || self
-                            .effect
-                            .as_mut()
-                            .is_some_and(|effect| effect.live_observation_reachable()) =>
-                    {
-                        Observation::Current {
-                            value: value.value().clone(),
-                        }
-                    }
+                    Some(value) if reachable => Observation::Current {
+                        value: value.value().clone(),
+                    },
                     Some(value) => Observation::Unavailable {
                         last_known: Some(value.value().clone()),
                     },
@@ -590,6 +639,7 @@ impl<E: GuardianEffect> Guardian<E> {
                 "guest requests require the independent I/O worker",
             )),
             GuardianRequest::Transition { authorization } => {
+                self.refresh_native_observation()?;
                 let command = authorization.statement.command.clone();
                 let current = self
                     .journal
@@ -668,7 +718,9 @@ impl<E: GuardianEffect> Guardian<E> {
                                         sequence,
                                         state: transition.state,
                                         applied_revision: command.revision,
-                                        operation_id: command.operation_id.clone(),
+                                        cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                                            operation_id: command.operation_id.clone(),
+                                        },
                                         evidence_digest: transition.evidence_digest,
                                     })?;
                                     references.push(committed.reference()?);
@@ -745,7 +797,9 @@ impl<E: GuardianEffect> Guardian<E> {
                                     sequence,
                                     state: current.state,
                                     applied_revision: command.revision,
-                                    operation_id: command.operation_id.clone(),
+                                    cause: ObservationCause::Configuration {
+                                        operation_id: command.operation_id.clone(),
+                                    },
                                     evidence_digest: evidence.clone(),
                                 })?;
                                 self.journal.record_configuration_delivery(
@@ -953,7 +1007,10 @@ impl<E: GuardianEffect> Guardian<E> {
     fn reconcile_lifecycle(&mut self, operation: LifecycleOperation) -> Result<LifecycleOperation> {
         if matches!(operation.delivery, Delivery::Dispatched | Delivery::Unknown)
             && let Some(observed) = self.journal.last_observation()?
-            && observed.value().operation_id == operation.command.operation_id
+            && observed.value().cause
+                == (ObservationCause::Lifecycle {
+                    operation_id: operation.command.operation_id.clone(),
+                })
             && observed.value().state.satisfies(operation.command.desired)
         {
             let reference = observed.reference()?;
@@ -976,7 +1033,10 @@ impl<E: GuardianEffect> Guardian<E> {
     ) -> Result<ConfigurationOperation> {
         if matches!(operation.delivery, Delivery::Dispatched | Delivery::Unknown)
             && let Some(observed) = self.journal.last_observation()?
-            && observed.value().operation_id == operation.command.operation_id
+            && observed.value().cause
+                == (ObservationCause::Configuration {
+                    operation_id: operation.command.operation_id.clone(),
+                })
             && observed.value().applied_revision == operation.command.revision
         {
             let reference = observed.reference()?;
@@ -1626,9 +1686,11 @@ pub fn serve_guardian<E: GuardianEffect>(
                     break Err(Error::Protocol("guardian ingress stopped unexpectedly"));
                 }
             }
-            if !poll_in_flight && last_poll.elapsed() >= Duration::from_secs(1) {
+            if last_poll.elapsed() >= Duration::from_secs(1) {
                 last_poll = std::time::Instant::now();
-                if let Some(job) = guardian.poll_job()?
+                guardian.refresh_native_observation()?;
+                if !poll_in_flight
+                    && let Some(job) = guardian.poll_job()?
                     && guest_jobs
                         .try_send(GuestWorkItem {
                             job,

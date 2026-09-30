@@ -10,7 +10,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 4;
+pub const HOST_API_VERSION: u16 = 5;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -34,6 +34,7 @@ pub struct HostInspection {
     pub lifecycle: Qualification,
     pub full_state: Qualification,
     pub images: Qualification,
+    pub guest_power: sandsurf_protocol::GuestPowerCapabilities,
     pub guest_platform: String,
     /// Verified defaults image packaged for this host architecture. Source
     /// builds without packaged artifacts report `None` explicitly.

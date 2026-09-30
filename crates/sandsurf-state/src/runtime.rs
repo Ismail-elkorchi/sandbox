@@ -248,6 +248,24 @@ impl RuntimeJournal {
             if old == value {
                 return Ok(CommittedObservation(old));
             }
+            match &value.cause {
+                ObservationCause::Native {}
+                    if value.generation != old.generation
+                        || value.applied_revision != old.applied_revision =>
+                {
+                    return Err(Error::Conflict(
+                        "native measurement cannot install authority or assign a generation",
+                    ));
+                }
+                ObservationCause::Configuration { .. }
+                    if value.generation != old.generation || value.state != old.state =>
+                {
+                    return Err(Error::Conflict(
+                        "configuration installation cannot change native power state",
+                    ));
+                }
+                _ => {}
+            }
             if value.sequence != old.sequence.next()?
                 || value.generation < old.generation
                 || value.generation > old.generation.next()?
@@ -273,7 +291,8 @@ impl RuntimeJournal {
                     "machine observation requires a valid lifecycle/generation transition",
                 ));
             }
-        } else if value.sequence != Counter::ONE
+        } else if !matches!(value.cause, ObservationCause::Lifecycle { .. })
+            || value.sequence != Counter::ONE
             || value.generation != Counter::ONE
             || value.state != MachineState::Creating
         {
@@ -573,7 +592,10 @@ impl RuntimeJournal {
                     .ok_or(Error::Conflict("applied lifecycle requires an observation"))?
                     .value();
                 if evidence.is_none()
-                    || observation.operation_id != value.command.operation_id
+                    || observation.cause
+                        != (ObservationCause::Lifecycle {
+                            operation_id: value.command.operation_id.clone(),
+                        })
                     || observation.machine_id != value.command.machine_id
                     || observation.applied_revision != value.command.revision
                     || !observation.state.satisfies(value.command.desired)
@@ -760,7 +782,10 @@ impl RuntimeJournal {
                     ))?
                     .value();
                 if evidence.is_none()
-                    || observation.operation_id != value.command.operation_id
+                    || observation.cause
+                        != (ObservationCause::Configuration {
+                            operation_id: value.command.operation_id.clone(),
+                        })
                     || observation.machine_id != value.command.machine_id
                     || observation.applied_revision != value.command.revision
                 {

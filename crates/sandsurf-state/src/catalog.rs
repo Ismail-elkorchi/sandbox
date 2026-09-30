@@ -2031,7 +2031,10 @@ impl HostCatalog {
         if operation.delivery != Delivery::Applied
             || operation.evidence_digest.is_none()
             || operation.command.machine_id != observation.machine_id
-            || operation.command.operation_id != observation.operation_id
+            || observation.cause
+                != (ObservationCause::Lifecycle {
+                    operation_id: operation.command.operation_id.clone(),
+                })
             || operation.command.revision != observation.applied_revision
             || !observation.state.satisfies(operation.command.desired)
             || reference.machine_id != observation.machine_id
@@ -2052,8 +2055,13 @@ impl HostCatalog {
         reference: ObservationRef,
     ) -> Result<LifecycleIntent> {
         let tx = self.db.connection.transaction()?;
-        let mut value = intent(&tx, &observation.operation_id)?
-            .ok_or(Error::Missing("lifecycle intent is missing"))?;
+        let ObservationCause::Lifecycle { operation_id } = &observation.cause else {
+            return Err(Error::Conflict(
+                "only lifecycle evidence can complete host intent",
+            ));
+        };
+        let mut value =
+            intent(&tx, operation_id)?.ok_or(Error::Missing("lifecycle intent is missing"))?;
         if value.machine_id != observation.machine_id
             || !observation.state.satisfies(value.desired)
             || observation.applied_revision != value.revision

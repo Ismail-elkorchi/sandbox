@@ -21,6 +21,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
   let machine;
   let fork;
   try {
+    const nativeHost = await host.inspect();
+    assert.equal(nativeHost.engine, "firecracker");
+    assert.equal(nativeHost.guestPower.shutdown.kind, "unsupported");
+    assert.match(nativeHost.guestPower.shutdown.reasons.join(" "), /ACPI/u);
+    assert.equal(nativeHost.guestPower.reboot.kind, "unsupported");
     machine = await host.machines.create({
       image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
     });
@@ -106,11 +111,16 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
 
     const artifact = await machine.artifacts.capture("/workspace");
     context.diagnostic("disk snapshot, fork and cold-boot persistence");
+    // Crash-consistent disk capture does not include dirty guest RAM. Establish
+    // ordinary Linux durability before asserting these files survive rollback.
+    await run(machine, "sudo -n sync");
     const snapshot = await machine.snapshots.create({ kind: "disk" });
     assert.equal(snapshot.inspection.consistency, "crash");
     fork = await snapshot.fork();
     await managementReady(fork);
     assertSameBytes(await fork.fs.readFile("/workspace/dense"), dense);
+    assert.equal(Buffer.from(await fork.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
+    assert.equal(Buffer.from(await fork.fs.readFile("/home/agent/cache/value")).toString(), "durable");
     assert.equal((await fork.inspect()).knownSensitive, true);
     await fork.fs.writeFile("/workspace/fork-only", "isolated");
     await assert.rejects(machine.fs.readFile("/workspace/fork-only"));
@@ -131,7 +141,35 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await machine.start();
     await managementReady(machine);
     await assert.rejects(machine.fs.readFile("/workspace/later"));
+    assert.equal(Buffer.from(await machine.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
+    assert.equal(Buffer.from(await machine.fs.readFile("/home/agent/cache/value")).toString(), "durable");
     assert.equal((await machine.inspect()).knownSensitive, true, "rollback cannot clear disclosure history");
+
+    // Firecracker x86 lacks ACPI poweroff. Its CPU reset exits the VMM;
+    // exercise that actual native termination, without claiming OS reboot.
+    context.diagnostic("guest CPU reset terminates the native owner without changing host intent; ordinary reboot remains unsupported");
+    const beforeShutdown = await machine.inspect();
+    await machine.executions.start({ argv: ["/bin/sh", "-c", "sudo -n sh -c 'sleep 1; reboot'"], executionId: "native-reset-exit" });
+    const shutdownDeadline = Date.now() + 30_000;
+    let stopped;
+    do {
+      stopped = await machine.inspect();
+      if (stopped.machine.kind === "current" && stopped.machine.value.state === "stopped") break;
+      await new Promise((done) => setTimeout(done, 100));
+    } while (Date.now() < shutdownDeadline);
+    assert.equal(stopped.machine.kind, "current");
+    assert.equal(stopped.machine.value.state, "stopped");
+    assert.equal(stopped.machine.value.cause.kind, "native");
+    assert.equal(stopped.machine.value.generation, beforeShutdown.machine.value.generation);
+    assert.equal(stopped.configurationRevision, beforeShutdown.configurationRevision);
+    assert.equal(stopped.lifecycleIntent.desired, "running");
+    await machine.start();
+    await managementReady(machine);
+    assert.ok(machine.generation > beforeShutdown.machine.value.generation);
+    assert.equal(Buffer.from(await machine.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
+    assert.equal(Buffer.from(await machine.fs.readFile("/home/agent/cache/value")).toString(), "durable");
+    assert.match(Buffer.from(await machine.fs.readFile("/usr/local/bin/agent-tool")).toString(), /printf installed/u);
+    assert.equal(await run(machine, "/usr/local/bin/agent-tool; cat /etc/sandsurf-test /home/agent/cache/value"), "installedcomputerdurable");
 
     await machine.executions.start({ argv: ["/bin/sh", "-c", "sudo -n sh -c 'sleep 1; rc-service sandsurf-management stop'"], executionId: "disable-management" });
     await new Promise((done) => setTimeout(done, 2000));
@@ -248,7 +286,7 @@ async function run(machine, command) {
   const execution = await machine.executions.spawnShell(command);
   const inspection = await execution.waitCapture({ signal: AbortSignal.timeout(30_000) });
   const bytes = await output(execution);
-  if (process.env.SANDSURF_TEST_TRACE === "1") console.error(`guest shell exit: ${inspection.state.kind} ${bytes.byteLength} bytes`);
+  if (process.env.SANDSURF_TEST_TRACE === "1") console.error(`guest shell exit: ${JSON.stringify(inspection.state)} ${bytes.byteLength} bytes; receipt: ${JSON.stringify(await execution.receipt())}`);
   assert.equal(exitCode(inspection), 0, bytes.toString());
   return bytes.toString();
 }

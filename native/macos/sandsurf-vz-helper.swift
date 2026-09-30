@@ -3,7 +3,23 @@ import Virtualization
 import Darwin
 
 private let maxMessageBytes = 1024 * 1024
-private let vmQueue = DispatchQueue(label: "org.sandsurf.virtual-machine")
+private let vmQueueKey = DispatchSpecificKey<Bool>()
+private let vmQueue: DispatchQueue = {
+    let queue = DispatchQueue(label: "sandsurf.virtual-machine")
+    queue.setSpecific(key: vmQueueKey, value: true)
+    return queue
+}()
+
+// All VM/device access belongs to its associated queue. Callbacks already on
+// that queue must not synchronously dispatch back to themselves.
+private func onVMQueue<T>(_ operation: () -> T) -> T {
+    if DispatchQueue.getSpecific(key: vmQueueKey) == true { return operation() }
+    return vmQueue.sync(execute: operation)
+}
+
+private func nativeState(_ machine: VZVirtualMachine) -> VZVirtualMachine.State {
+    onVMQueue { machine.state }
+}
 
 
 private enum OwnerError: Error {
@@ -30,7 +46,7 @@ private final class RelayConnection {
     }
 
     func start() {
-        let guestDescriptor = guest.fileDescriptor
+        let guestDescriptor = onVMQueue { guest.fileDescriptor }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             pump(from: local, to: guestDescriptor)
             Darwin.shutdown(guestDescriptor, SHUT_WR)
@@ -45,13 +61,12 @@ private final class RelayConnection {
 
     func stop() {
         lock.lock()
-        if !closed {
-            closed = true
-            Darwin.shutdown(local, SHUT_RDWR)
-            Darwin.close(local)
-            guest.close()
-        }
+        if closed { lock.unlock(); return }
+        closed = true
+        Darwin.shutdown(local, SHUT_RDWR)
+        Darwin.close(local)
         lock.unlock()
+        onVMQueue { guest.close() }
     }
 
     private func pump(from source: Int32, to destination: Int32) {
@@ -138,14 +153,19 @@ private final class SocketRelay {
             let socketDelegate = GuestConnectionDelegate(
                 basePath: path,
                 ports: guestListenPorts,
-                add: { [weak self] local, guest in self?.add(local: local, guest: guest) }
+                add: { [weak self] local, guest in
+                    guard let self else {
+                        Darwin.close(local)
+                        onVMQueue { guest.close() }
+                        return
+                    }
+                    self.add(local: local, guest: guest)
+                }
             )
             socketListener.delegate = socketDelegate
             guestListener = socketListener
             guestDelegate = socketDelegate
-            for port in guestListenPorts {
-                device.setSocketListener(socketListener, forPort: port)
-            }
+            onVMQueue { for port in guestListenPorts { device.setSocketListener(socketListener, forPort: port) } }
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.acceptLoop(descriptor) }
     }
@@ -162,7 +182,7 @@ private final class SocketRelay {
             Darwin.close(descriptor)
         }
         active.forEach { $0.stop() }
-        for port in guestListenPorts { device.removeSocketListener(forPort: port) }
+        onVMQueue { for port in guestListenPorts { device.removeSocketListener(forPort: port) } }
         guestListener = nil
         guestDelegate = nil
         _ = Darwin.unlink(path)
@@ -176,8 +196,13 @@ private final class SocketRelay {
                 Darwin.close(client)
                 continue
             }
-            device.connect(toPort: port) { [weak self] result in
-                guard let self else { Darwin.close(client); return }
+            vmQueue.async { [device, weak self] in
+              device.connect(toPort: port) { result in
+                guard let self else {
+                    Darwin.close(client)
+                    if case .success(let guest) = result { guest.close() }
+                    return
+                }
                 switch result {
                 case .failure:
                     Darwin.close(client)
@@ -193,6 +218,7 @@ private final class SocketRelay {
                     }
                     add(local: client, guest: guest)
                 }
+              }
             }
         }
     }
@@ -261,11 +287,11 @@ private final class GuestConnectionDelegate: NSObject, VZVirtioSocketListenerDel
         shouldAcceptNewConnection connection: VZVirtioSocketConnection,
         from socketDevice: VZVirtioSocketDevice
     ) -> Bool {
-        let port = connection.destinationPort
+        let port = onVMQueue { connection.destinationPort }
         guard ports.contains(port) else { return false }
         DispatchQueue.global(qos: .userInitiated).async { [basePath, add] in
             guard let local = connectUnix("\(basePath)_\(port)") else {
-                connection.close()
+                onVMQueue { connection.close() }
                 return
             }
             add(local, connection)
@@ -281,6 +307,15 @@ private final class MachineOwner {
 
     func handle(_ request: Request) throws -> Response {
         switch request.kind {
+        case "inspect":
+            guard let machine else { return Response(kind: "unknown", state: "stopped") }
+            let state = nativeState(machine)
+            switch state {
+            case .running, .paused, .stopped, .error:
+                return Response(kind: "observed", state: stateName(state))
+            default:
+                return Response(kind: "unknown", state: stateName(state))
+            }
         case "create":
             return try launch(request, savedState: nil)
         case "restore":
@@ -293,7 +328,7 @@ private final class MachineOwner {
             guard let machine,
                   let savedState = request.savedState,
                   savedState.hasPrefix("/"),
-                  machine.state == .paused else {
+                  nativeState(machine) == .paused else {
                 throw OwnerError.invalidRequest
             }
             if #available(macOS 14.0, *) {
@@ -307,24 +342,24 @@ private final class MachineOwner {
                         else { completion(.success(())) }
                     }
                 }
-                guard machine.state == .paused else { throw OwnerError.unexpectedState }
+                guard nativeState(machine) == .paused else { throw OwnerError.unexpectedState }
                 return Response(kind: "observed", state: "paused")
             }
             return Response(kind: "not-applied", state: "paused")
         case "pause":
             guard let machine else { return Response(kind: "not-applied", state: "stopped") }
-            guard machine.canPause else { return Response(kind: "not-applied", state: stateName(machine.state)) }
+            guard onVMQueue({ machine.canPause }) else { return Response(kind: "not-applied", state: stateName(nativeState(machine))) }
             try awaitResult { completion in machine.pause(completionHandler: completion) }
-            guard machine.state == .paused else { throw OwnerError.unexpectedState }
+            guard nativeState(machine) == .paused else { throw OwnerError.unexpectedState }
             return Response(kind: "observed", state: "paused")
         case "resume":
             guard let machine else { return Response(kind: "not-applied", state: "stopped") }
-            guard machine.canResume else { return Response(kind: "not-applied", state: stateName(machine.state)) }
+            guard onVMQueue({ machine.canResume }) else { return Response(kind: "not-applied", state: stateName(nativeState(machine))) }
             try awaitResult { completion in machine.resume(completionHandler: completion) }
-            guard machine.state == .running else { throw OwnerError.unexpectedState }
+            guard nativeState(machine) == .running else { throw OwnerError.unexpectedState }
             return Response(kind: "observed", state: "running")
         case "release":
-            guard let machine, machine.state == .paused else {
+            guard let machine, nativeState(machine) == .paused else {
                 return Response(kind: "not-applied", state: "stopped")
             }
             relay?.stop()
@@ -394,15 +429,15 @@ private final class MachineOwner {
                         else { completion(.success(())) }
                     }
                 }
-                guard value.state == .paused else { throw OwnerError.unexpectedState }
+                guard nativeState(value) == .paused else { throw OwnerError.unexpectedState }
             } else {
                 throw OwnerError.unsupported
             }
         } else {
             try awaitResult { completion in value.start(completionHandler: completion) }
-            guard value.state == .running else { throw OwnerError.unexpectedState }
+            guard nativeState(value) == .running else { throw OwnerError.unexpectedState }
         }
-        guard let socketDevice = value.socketDevices.first as? VZVirtioSocketDevice else {
+        guard let socketDevice = onVMQueue({ value.socketDevices.first as? VZVirtioSocketDevice }) else {
             throw OwnerError.unsupported
         }
         let socketRelay = try SocketRelay(
@@ -415,7 +450,7 @@ private final class MachineOwner {
         relay = socketRelay
         if savedState != nil {
             try awaitResult { completion in value.resume(completionHandler: completion) }
-            guard value.state == .running else { throw OwnerError.unexpectedState }
+            guard nativeState(value) == .running else { throw OwnerError.unexpectedState }
         }
         return Response(kind: "observed", state: "running")
     }
@@ -424,7 +459,7 @@ private final class MachineOwner {
         relay?.stop()
         relay = nil
         guard let machine else { return }
-        if machine.canStop {
+        if onVMQueue({ machine.canStop }) {
             try awaitResult { completion in
                 machine.stop { error in
                     if let error {
@@ -435,7 +470,7 @@ private final class MachineOwner {
                 }
             }
         }
-        guard machine.state == .stopped else { throw OwnerError.unexpectedState }
+        guard nativeState(machine) == .stopped else { throw OwnerError.unexpectedState }
         self.machine = nil
     }
 

@@ -737,7 +737,9 @@ impl Fixture {
                 sequence: n(1),
                 state: MachineState::Creating,
                 applied_revision: n(1),
-                operation_id: create.clone(),
+                cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                    operation_id: create.clone(),
+                },
                 evidence_digest: hash("owned"),
             })
             .unwrap();
@@ -748,7 +750,9 @@ impl Fixture {
                 sequence: n(2),
                 state: MachineState::Running,
                 applied_revision: n(1),
-                operation_id: create,
+                cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                    operation_id: create,
+                },
                 evidence_digest: hash("booted"),
             })
             .unwrap();
@@ -1322,6 +1326,91 @@ fn exclusive_writers_and_role_separation() {
 }
 
 #[test]
+fn native_facts_never_install_authority_or_complete_pending_host_intent() {
+    let mut f = Fixture::new();
+    let operation: OperationId = "stop-with-independent-observation".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.machine, &operation, n(2), DesiredState::Stopped),
+    )
+    .unwrap();
+    let intent = f
+        .host
+        .request_lifecycle(
+            &f.machine,
+            operation.clone(),
+            n(2),
+            DesiredState::Stopped,
+            Approval {
+                id: "approve-independent-stop".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    let authorization = f.host.authorize_lifecycle(&operation).unwrap();
+    f.runtime.admit_lifecycle(authorization.clone()).unwrap();
+    let LifecycleDecision::Perform(permit) = f.runtime.begin_lifecycle(authorization).unwrap()
+    else {
+        panic!("new operation");
+    };
+    permit.perform(|_| ());
+    let mut native = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    native.sequence = native.sequence.next().unwrap();
+    native.cause = ObservationCause::Native {};
+    native.state = MachineState::Stopped;
+    native.evidence_digest = hash("independent-native-shutdown");
+    let mut invalid = native.clone();
+    invalid.applied_revision = intent.revision;
+    assert!(
+        f.runtime.observe(invalid).is_err(),
+        "measurement cannot apply admitted policy"
+    );
+    let mut invalid = native.clone();
+    invalid.generation = invalid.generation.next().unwrap();
+    invalid.state = MachineState::Starting;
+    assert!(
+        f.runtime.observe(invalid).is_err(),
+        "measurement cannot assign a new execution lineage"
+    );
+    let measured = f.runtime.observe(native).unwrap();
+    assert!(f.host.complete_intent(&measured).is_err());
+    assert!(
+        f.runtime
+            .record_lifecycle_delivery(
+                &operation,
+                &intent.request_digest,
+                Delivery::Applied,
+                Some(hash("not-command-evidence")),
+                Some(measured.reference().unwrap())
+            )
+            .is_err()
+    );
+    assert_eq!(
+        f.runtime
+            .lifecycle_operation(&operation)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Dispatched
+    );
+    assert_eq!(
+        f.host
+            .machine(&f.machine)
+            .unwrap()
+            .unwrap()
+            .latest_intent
+            .completion,
+        None
+    );
+}
+
+#[test]
 fn stop_intent_is_not_stopped_observation() {
     let mut f = Fixture::new();
     let operation: OperationId = "stop".try_into().unwrap();
@@ -1365,7 +1454,9 @@ fn stop_intent_is_not_stopped_observation() {
     let mut observation = old.value().clone();
     observation.sequence = n(4);
     observation.applied_revision = n(3);
-    observation.operation_id = operation.clone();
+    observation.cause = ObservationCause::Lifecycle {
+        operation_id: operation.clone(),
+    };
     let evidence = f.runtime.observe(observation.clone()).unwrap();
     assert!(f.host.complete_intent(&evidence).is_err());
     observation.sequence = n(5);
@@ -1531,7 +1622,9 @@ fn newer_host_intent_supersedes_unapplied_work_without_replaying_it() {
             sequence: prior.value().sequence.next().unwrap(),
             state: MachineState::Stopped,
             applied_revision: n(4),
-            operation_id: stop.clone(),
+            cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                operation_id: stop.clone(),
+            },
             evidence_digest: hash("native-stop"),
         })
         .unwrap();
@@ -2522,7 +2615,9 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     observation.sequence = n(4);
     observation.state = MachineState::Destroying;
     observation.applied_revision = n(3);
-    observation.operation_id = operation.clone();
+    observation.cause = ObservationCause::Lifecycle {
+        operation_id: operation.clone(),
+    };
     observation.evidence_digest = hash("destroying");
     f.runtime.observe(observation.clone()).unwrap();
     assert_eq!(

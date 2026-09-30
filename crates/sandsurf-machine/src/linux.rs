@@ -166,14 +166,6 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         ])
     }
 
-    /// Whether this guardian still owns a live VMM for the current generation. This
-    /// is reachability evidence only; it never changes host lifecycle intent.
-    pub fn has_live_owner(&mut self) -> bool {
-        self.process
-            .as_mut()
-            .is_some_and(|process| matches!(process.has_exited(), Ok(false)))
-    }
-
     fn stop_process(
         &mut self,
         command: &LifecycleCommand,
@@ -186,6 +178,8 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         if self.process.is_none() {
             return if current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Suspended)
+                    || (value.state == MachineState::Failed
+                        && value.cause == sandsurf_protocol::ObservationCause::Native {})
             }) {
                 MachineOutcome::Observed(vec![transition(
                     command,
@@ -366,6 +360,26 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
 }
 
 impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
+    fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
+        let Some(process) = self.process.as_mut() else {
+            return Ok(None);
+        };
+        let observation = process
+            .observe_power()
+            .map_err(|_| bytes_digest(b"firecracker-native-observation-unavailable"))?;
+        if matches!(
+            observation.state,
+            MachineState::Stopped | MachineState::Failed
+        ) {
+            // observe_power confirmed and reaped the confined process tree.
+            self.process.take();
+            self.boot_resources = None;
+            self.capture_paused = false;
+            self.full_capture_operation = None;
+            self.committed_suspend = None;
+        }
+        Ok(Some(observation))
+    }
     fn qualification(&self) -> DriverQualification {
         DriverQualification {
             engine: VmEngine::Firecracker,
@@ -443,6 +457,15 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         }
         if self.process.is_none() || command.revision <= current.applied_revision {
             return Self::unavailable(b"firecracker-live-reconfiguration-not-supported");
+        }
+        if !matches!(
+            self.observe_power(),
+            Ok(Some(crate::NativePowerObservation {
+                state: MachineState::Running,
+                ..
+            }))
+        ) {
+            return MachineOutcome::Unknown;
         }
         // Grant policy is enforced by host/guardian services. The VM shape is
         // unchanged, so applying a newer authority revision is a control-plane

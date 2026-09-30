@@ -232,7 +232,11 @@ impl AppleDriver {
                     transition(
                         command,
                         generation,
-                        MachineState::Creating,
+                        if generation == Counter::ONE {
+                            MachineState::Creating
+                        } else {
+                            MachineState::Starting
+                        },
                         b"vz-create-complete",
                     ),
                     transition(
@@ -445,13 +449,6 @@ impl AppleDriver {
         self.committed_suspend = None;
         self.staged_restore = None;
     }
-
-    #[must_use]
-    pub fn has_live_owner(&mut self) -> bool {
-        self.owner
-            .as_mut()
-            .is_some_and(|owner| matches!(owner.child.try_wait(), Ok(None)))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +459,47 @@ pub enum AppleRuntimeError {
 }
 
 impl MachineDriver for AppleDriver {
+    fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
+        let Some(owner) = self.owner.as_mut() else {
+            return Ok(None);
+        };
+        let response = owner
+            .request(&HelperRequest::Inspect)
+            .map_err(|_| bytes_digest(b"apple-native-observation-unavailable"))?;
+        if response.kind != ResponseKind::Observed
+            || !matches!(
+                response.state,
+                MachineState::Running
+                    | MachineState::Paused
+                    | MachineState::Stopped
+                    | MachineState::Failed
+            )
+        {
+            return Err(bytes_digest(b"apple-native-observation-indeterminate"));
+        }
+        if response.state == MachineState::Stopped {
+            let stopped = owner.request(&HelperRequest::Stop).is_ok_and(|value| {
+                value.kind == ResponseKind::Observed && value.state == MachineState::Stopped
+            });
+            if !stopped || !owner.finish() {
+                return Err(bytes_digest(b"apple-native-exit-unconfirmed"));
+            }
+            self.owner.take();
+        }
+        let evidence_digest = sandsurf_protocol::digest(
+            sandsurf_protocol::Domain::Operation,
+            &(
+                "apple-native-power",
+                &self.config.machine_id,
+                response.state,
+            ),
+        )
+        .map_err(|_| bytes_digest(b"apple-native-evidence-invalid"))?;
+        Ok(Some(crate::NativePowerObservation {
+            state: response.state,
+            evidence_digest,
+        }))
+    }
     fn qualification(&self) -> DriverQualification {
         DriverQualification {
             engine: VmEngine::AppleVirtualization,
@@ -531,6 +569,15 @@ impl MachineDriver for AppleDriver {
         }
         if self.owner.is_none() || command.revision <= current.applied_revision {
             return Self::unavailable(b"apple-live-reconfiguration-not-supported");
+        }
+        if !matches!(
+            self.observe_power(),
+            Ok(Some(crate::NativePowerObservation {
+                state: MachineState::Running,
+                ..
+            }))
+        ) {
+            return MachineOutcome::Unknown;
         }
         MachineOutcome::Observed(vec![transition(
             command,
@@ -869,6 +916,7 @@ fn read_response(stream: &mut impl Read) -> io::Result<HelperResponse> {
     rename_all_fields = "camelCase"
 )]
 enum HelperRequest {
+    Inspect,
     Create(Box<HelperCreate>),
     Restore(Box<HelperRestore>),
     Save { saved_state: PathBuf },

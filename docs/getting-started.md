@@ -73,6 +73,8 @@ const sameExecution = await reconnected.executions.get(execution.id);
 
 The default guest account obtains root through ordinary `sudo`. Root can change the OS and disable management. Management failure is reported independently of native power state; `powerOff()` and `destroy()` do not require a responsive management service. Guest process results are observations, not host attestations.
 
+`host.inspect().guestPower` distinguishes unsupported guest shutdown/reboot mechanisms from implemented but unqualified ones. Firecracker x86 currently lacks ACPI poweroff: Linux can halt while the native VM remains running. Its guest CPU reset terminates the VMM, and ordinary reboot recovery is not implemented. A verified native exit does not change the host's last lifecycle intent or automatically restart the computer. An authorized `start()` preserves disk identity and begins a new execution generation.
+
 Use `machine.fs` for guest paths. Artifact import, capture, comparison and host application operate on explicitly selected content. Host publication requires approval of immutable retained content and its destination. Snapshots, forks, rollback, networking, secrets and publication are independent capabilities, not a prescribed workflow.
 
 Terminals are PTY executions with replayable `terminal` output. Detaching or cancelling a wait does not terminate an execution. Leader exit and output completion are separate; descendants may continue to hold streams open.

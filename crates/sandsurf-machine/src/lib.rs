@@ -7,8 +7,8 @@
 //! the guardian; returning `Observed` is not itself a journal commit.
 
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, DesiredState, Digest, LifecycleCommand, MachineObservation,
-    MachineState, Qualification, VmEngine,
+    Capability, ConfigurationCommand, Counter, DesiredState, Digest, GuestPowerCapabilities,
+    LifecycleCommand, MachineObservation, MachineState, Qualification, VmEngine,
 };
 
 #[cfg(target_os = "linux")]
@@ -38,6 +38,34 @@ pub enum GuestArchitecture {
     Arm64,
 }
 
+/// Native guest power mechanisms, not management-service health. A guest
+/// reset which exits the VMM is not a supported ordinary computer reboot.
+pub fn guest_power_capabilities() -> GuestPowerCapabilities {
+    let shutdown = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Capability::Unsupported {
+            reasons: vec![
+                "Firecracker x86 has no ACPI power-management device; Linux poweroff can halt the guest without terminating the native VM".into(),
+            ],
+        }
+    } else {
+        Capability::Supported {
+            qualification: Qualification::Unqualified {
+                reasons: vec![
+                    "Guest shutdown has no retained real-hardware qualification for this native driver, image and kernel configuration".into(),
+                ],
+            },
+        }
+    };
+    GuestPowerCapabilities {
+        shutdown,
+        reboot: Capability::Unsupported {
+            reasons: vec![
+                "Ordinary guest reboot does not yet have native reset recovery and execution-generation rebinding; a native exit is observed as termination, not silently cold-booted".into(),
+            ],
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverQualification {
     pub engine: VmEngine,
@@ -49,6 +77,14 @@ pub struct DriverQualification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineTransition {
     pub generation: Counter,
+    pub state: MachineState,
+    pub evidence_digest: Digest,
+}
+
+/// A native-owner measurement, not a command outcome or a guest health report.
+/// Generation and authority revision are assigned by the guardian, not drivers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePowerObservation {
     pub state: MachineState,
     pub evidence_digest: Digest,
 }
@@ -72,6 +108,9 @@ pub enum ConfigurationOutcome {
 /// reported native postcondition has been observed.
 pub trait MachineDriver {
     fn qualification(&self) -> DriverQualification;
+    /// None means no live native attachment. Errors mean unavailable evidence,
+    /// never a stopped computer. Observation must not start or replace a VM.
+    fn observe_power(&mut self) -> Result<Option<NativePowerObservation>, Digest>;
     fn configure(
         &mut self,
         command: &ConfigurationCommand,
@@ -231,6 +270,28 @@ fn validate_outcome(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn power_support_does_not_claim_guest_reset_recovery_or_acpi_on_firecracker_x86() {
+        let capabilities = super::guest_power_capabilities();
+        assert!(matches!(
+            capabilities.reboot,
+            super::Capability::Unsupported { .. }
+        ));
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(matches!(
+                capabilities.shutdown,
+                super::Capability::Unsupported { .. }
+            ));
+        } else {
+            assert!(matches!(
+                capabilities.shutdown,
+                super::Capability::Supported {
+                    qualification: super::Qualification::Unqualified { .. }
+                }
+            ));
+        }
+    }
+
     use super::*;
     use sandsurf_protocol::{MachineId, OperationId, bytes_digest};
 
@@ -246,6 +307,9 @@ mod tests {
         }
     }
     impl MachineDriver for Driver {
+        fn observe_power(&mut self) -> Result<Option<NativePowerObservation>, Digest> {
+            Ok(None)
+        }
         fn qualification(&self) -> DriverQualification {
             DriverQualification {
                 engine: VmEngine::Firecracker,
@@ -316,7 +380,9 @@ mod tests {
             sequence: Counter::ONE,
             state,
             applied_revision: Counter::ONE,
-            operation_id: OperationId::try_from("old").unwrap(),
+            cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                operation_id: OperationId::try_from("old").unwrap(),
+            },
             evidence_digest: hash("old"),
         }
     }

@@ -282,6 +282,24 @@ pub struct ObservationRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ObservationCause {
+    Lifecycle {
+        operation_id: OperationId,
+    },
+    Configuration {
+        operation_id: OperationId,
+    },
+    /// An independently measured native fact. It cannot complete host intent.
+    Native {},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MachineObservation {
     pub machine_id: MachineId,
@@ -289,7 +307,7 @@ pub struct MachineObservation {
     pub sequence: Counter,
     pub state: MachineState,
     pub applied_revision: Counter,
-    pub operation_id: OperationId,
+    pub cause: ObservationCause,
     /// Driver evidence identity; observations are written only by the exclusive guardian.
     pub evidence_digest: Digest,
 }
@@ -1364,4 +1382,20 @@ pub enum VmEngine {
 pub enum Qualification {
     Qualified { evidence: Digest },
     Unqualified { reasons: Vec<String> },
+}
+
+/// Implementation support and retained qualification are different facts.
+/// Unsupported never means "supported but not yet tested".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Capability {
+    Supported { qualification: Qualification },
+    Unsupported { reasons: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuestPowerCapabilities {
+    pub shutdown: Capability,
+    pub reboot: Capability,
 }

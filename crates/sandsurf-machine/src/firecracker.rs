@@ -248,7 +248,7 @@ impl FirecrackerProcess {
         .into_iter()
         .filter_map(|(input, path)| input.map(|input| drain_diagnostic(input, path)))
         .collect();
-        let process = Self {
+        let mut process = Self {
             child,
             control,
             diagnostics,
@@ -274,6 +274,11 @@ impl FirecrackerProcess {
             .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
             process.api_request("PUT", "/snapshot/load", &body, 204)?;
         }
+        process.wait_for_power(if restore.is_some() {
+            "Paused"
+        } else {
+            "Running"
+        })?;
         Ok(process)
     }
 
@@ -375,6 +380,39 @@ impl FirecrackerProcess {
         }
     }
 
+    fn wait_for_power(&mut self, expected: &str) -> Result<(), FirecrackerError> {
+        let deadline = Instant::now() + API_TIMEOUT;
+        loop {
+            if self.has_exited()? || Instant::now() >= deadline {
+                return Err(FirecrackerError::Setup(
+                    "native machine did not reach its startup postcondition".into(),
+                ));
+            }
+            match self.api_request_until("GET", "/", &[], 200, deadline) {
+                Ok(bytes) => {
+                    let instance = decode_instance(&bytes)?;
+                    if instance.state == expected {
+                        return Ok(());
+                    }
+                    if instance.state != "Not started" {
+                        return Err(FirecrackerError::Invalid(
+                            "native startup reached an unexpected power state".into(),
+                        ));
+                    }
+                }
+                Err(FirecrackerError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn api_connection(&self, deadline: Instant) -> Result<UnixStream, FirecrackerError> {
         // Persistent Machine roots can exceed AF_UNIX's 108-byte pathname
         // bound. Resolve the already-owned state directory through a short
@@ -403,6 +441,23 @@ impl FirecrackerProcess {
         body: &[u8],
         expected_status: u16,
     ) -> Result<Vec<u8>, FirecrackerError> {
+        self.api_request_until(
+            method,
+            path,
+            body,
+            expected_status,
+            Instant::now() + API_TIMEOUT,
+        )
+    }
+
+    fn api_request_until(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        expected_status: u16,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FirecrackerError> {
         if !matches!(method, "GET" | "PUT" | "PATCH")
             || !path.starts_with('/')
             || path.bytes().any(|value| value.is_ascii_control())
@@ -412,7 +467,6 @@ impl FirecrackerProcess {
                 "Firecracker API request is malformed".into(),
             ));
         }
-        let deadline = Instant::now() + API_TIMEOUT;
         let mut stream = self.api_connection(deadline)?;
         let mut connection = sandsurf_native::unix_io::DeadlineIo {
             stream: &mut stream,
@@ -435,6 +489,29 @@ impl FirecrackerProcess {
 
     pub fn has_exited(&mut self) -> Result<bool, FirecrackerError> {
         Ok(self.child.try_wait()?.is_some())
+    }
+
+    pub fn observe_power(&mut self) -> Result<crate::NativePowerObservation, FirecrackerError> {
+        if self.has_exited()? {
+            let status = self.wait()?;
+            if !status.tree_reaped || !status.cleanup_failures.is_empty() {
+                return Err(FirecrackerError::Setup(
+                    "native exit containment is unconfirmed".into(),
+                ));
+            }
+            let evidence = serde_json::to_vec(status)
+                .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+            return Ok(crate::NativePowerObservation {
+                state: if status.exit_code == Some(0) {
+                    sandsurf_protocol::MachineState::Stopped
+                } else {
+                    sandsurf_protocol::MachineState::Failed
+                },
+                evidence_digest: sandsurf_protocol::bytes_digest(&evidence),
+            });
+        }
+        let bytes = self.api_request("GET", "/", &[], 200)?;
+        parse_instance_power(&bytes)
     }
 
     pub fn wait(&mut self) -> Result<&crate::launcher::LauncherFinalStatus, FirecrackerError> {
@@ -464,6 +541,33 @@ impl FirecrackerProcess {
             let _ = thread.join();
         }
     }
+}
+
+#[derive(Deserialize)]
+struct InstanceInfo {
+    state: String,
+}
+
+fn decode_instance(bytes: &[u8]) -> Result<InstanceInfo, FirecrackerError> {
+    serde_json::from_slice(bytes).map_err(|error| FirecrackerError::Invalid(error.to_string()))
+}
+
+fn parse_instance_power(bytes: &[u8]) -> Result<crate::NativePowerObservation, FirecrackerError> {
+    let instance = decode_instance(bytes)?;
+    let state = match instance.state.as_str() {
+        "Running" => sandsurf_protocol::MachineState::Running,
+        "Paused" => sandsurf_protocol::MachineState::Paused,
+        // Not started is not proof of a terminated, previously running VM.
+        _ => {
+            return Err(FirecrackerError::Invalid(
+                "native power state is indeterminate".into(),
+            ));
+        }
+    };
+    Ok(crate::NativePowerObservation {
+        state,
+        evidence_digest: sandsurf_protocol::bytes_digest(bytes),
+    })
 }
 
 struct ChildLaunchGuard {
@@ -850,6 +954,32 @@ struct Vsock {
 mod control_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn instance_power_is_native_evidence_and_indeterminate_states_are_not_shutdown() {
+        for (wire, state) in [
+            ("Running", sandsurf_protocol::MachineState::Running),
+            ("Paused", sandsurf_protocol::MachineState::Paused),
+        ] {
+            let bytes = format!(
+                "{{\"state\":\"{wire}\",\"id\":\"anonymous-instance\",\"vmm_version\":\"qualified-by-caller\"}}"
+            );
+            let observation = parse_instance_power(bytes.as_bytes()).unwrap();
+            assert_eq!(observation.state, state);
+            assert_eq!(
+                observation.evidence_digest,
+                sandsurf_protocol::bytes_digest(bytes.as_bytes())
+            );
+        }
+        for bytes in [
+            b"{}".as_slice(),
+            br#"{"state":"Not started"}"#,
+            br#"{"state":"Stopped"}"#,
+            br#"{"state":"Running","state":"Paused"}"#,
+        ] {
+            assert!(parse_instance_power(bytes).is_err());
+        }
+    }
 
     #[test]
     fn native_http_response_is_binary_exact_strict_and_bounded() {
