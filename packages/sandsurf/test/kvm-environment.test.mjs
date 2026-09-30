@@ -21,6 +21,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
   let machine;
   let fork;
   let observer;
+  let expiring;
   try {
     const nativeHost = await host.inspect();
     assert.equal(nativeHost.engine, "firecracker");
@@ -262,14 +263,53 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assertSameBytes(await readFile(join(destination, "dense")), dense);
     assert.equal(await readFile(join(destination, "unrelated"), "utf8"), "preserved");
     machine = undefined;
+    context.diagnostic("host expiration remains active under continuous SDK traffic");
+    const expiresAtUnixMs = Date.now() + 30_000;
+    expiring = await host.machines.create({
+      image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 },
+      lifetime: { expiresAtUnixMs, expirationAction: "stop" },
+    });
+    assert.ok(Date.now() < expiresAtUnixMs, "boot consumed the expiration deadline before client traffic began");
+    let sending = true;
+    let trafficError;
+    const traffic = (async () => {
+      while (sending) {
+        await host.inspect();
+        await new Promise((done) => setTimeout(done, 25));
+      }
+    })().catch((error) => { trafficError = error; });
+    try {
+      let stopped = false;
+      for await (const event of expiring.events.follow({ signal: AbortSignal.timeout(Math.max(1, expiresAtUnixMs - Date.now() + 15_000)) })) {
+        if (event.value.kind === "machine" && event.value.observation.state === "stopped") { stopped = true; break; }
+      }
+      assert.equal(stopped, true);
+      const view = await expiring.inspect();
+      assert.equal(view.lifecycleIntent.desired, "stopped");
+      assert.equal(view.machine.value.state, "stopped");
+    } finally { sending = false; await traffic; }
+    assert.ifError(trafficError);
+    await expiring.destroy();
+    expiring = undefined;
   } finally {
-    if (observer !== undefined) await observer.close();
-    if (fork !== undefined) await fork.destroy();
-    if (machine !== undefined) await machine.destroy();
-    await host.close();
-    await (await NativeHostClient.open(directory)).stopService();
-    if (process.env.SANDSURF_TEST_STATE === undefined) await rm(directory, { recursive: true, force: true });
-    await rm(destination, { recursive: true, force: true });
+    let cleanupError;
+    try {
+      if (observer !== undefined) await observer.close();
+      for (const remaining of [expiring, fork, machine]) {
+        if (remaining === undefined) continue;
+        try { await remaining.inspect(); await remaining.destroy(); }
+        catch (error) { cleanupError ??= error; }
+      }
+    } finally {
+      // Test failure must not strand bridge handles and hide the TAP result.
+      await host.close();
+      try { await (await NativeHostClient.open(directory)).stopService(); }
+      finally {
+        if (process.env.SANDSURF_TEST_STATE === undefined) await rm(directory, { recursive: true, force: true });
+        await rm(destination, { recursive: true, force: true });
+      }
+    }
+    if (cleanupError !== undefined) throw cleanupError;
   }
 });
 

@@ -2437,61 +2437,70 @@ impl HostService {
                 break;
             }
             after = records.last().map(|record| record.id.clone());
-            for mut record in records {
-                if record.latest_intent.desired == DesiredState::Destroyed
-                    && record.latest_intent.completion.is_some()
-                {
-                    self.retire_machine_storage(&record.id)?;
-                    continue;
+            for record in records {
+                let id = record.id.clone();
+                if let Err(error) = self.reconcile_machine(record, now) {
+                    // A machine's native failure or interrupted operation is
+                    // not permission to starve other machines' host decisions.
+                    eprintln!(
+                        "sandsurf machine {} reconciliation deferred: {error}",
+                        id.as_str()
+                    );
                 }
-                if record.reservation == ReservationState::Released {
-                    continue;
-                }
-                // Expiration is a current host decision, not contingent on an
-                // earlier command completing or guest management responding.
-                if let Some(expires) = record.lifetime.expires_at_unix_millis
-                    && now >= expires
-                {
-                    let desired = match record.lifetime.expiration_action {
-                        ExpirationAction::Stop => DesiredState::Stopped,
-                        ExpirationAction::Destroy => DesiredState::Destroyed,
-                    };
-                    if record.latest_intent.desired != desired
-                        && record.latest_intent.desired != DesiredState::Destroyed
-                    {
-                        self.apply_policy_lifecycle(record, desired, "expiration")?;
-                    } else if record.latest_intent.completion.is_none()
-                        && record.latest_intent.revision == record.configuration_revision
-                    {
-                        self.provision_guardian(&record.id)?;
-                        self.apply_lifecycle_intent(
-                            &record.latest_intent,
-                            self.guardian_endpoint(&record.id),
-                        )?;
-                    }
-                    continue;
-                }
-                if record.latest_intent.completion.is_none()
-                    && record.latest_intent.revision == record.configuration_revision
-                {
-                    self.provision_guardian(&record.id)?;
-                    let endpoint = self.guardian_endpoint(&record.id);
-                    self.apply_lifecycle_intent(&record.latest_intent, endpoint)?;
-                    record = self.catalog.machine(&record.id)?.ok_or(HostError::Invalid(
-                        "machine disappeared during reconciliation",
-                    ))?;
-                    if record.latest_intent.completion.is_none() {
-                        continue;
-                    }
-                }
-
-                self.reconcile_configuration(&record)?;
             }
             if after.is_none() {
                 break;
             }
         }
         Ok(())
+    }
+
+    fn reconcile_machine(&mut self, mut record: MachineRecord, now: Counter) -> Result<()> {
+        if record.latest_intent.desired == DesiredState::Destroyed
+            && record.latest_intent.completion.is_some()
+        {
+            return self.retire_machine_storage(&record.id);
+        }
+        if record.reservation == ReservationState::Released {
+            return Ok(());
+        }
+        // Host intent changes without claiming that native delivery succeeded.
+        if let Some(expires) = record.lifetime.expires_at_unix_millis
+            && now >= expires
+        {
+            let desired = match record.lifetime.expiration_action {
+                ExpirationAction::Stop => DesiredState::Stopped,
+                ExpirationAction::Destroy => DesiredState::Destroyed,
+            };
+            if record.latest_intent.desired != desired
+                && record.latest_intent.desired != DesiredState::Destroyed
+            {
+                return self.apply_policy_lifecycle(record, desired, "expiration");
+            }
+            if record.latest_intent.completion.is_none()
+                && record.latest_intent.revision == record.configuration_revision
+            {
+                self.provision_guardian(&record.id)?;
+                self.apply_lifecycle_intent(
+                    &record.latest_intent,
+                    self.guardian_endpoint(&record.id),
+                )?;
+            }
+            return Ok(());
+        }
+        if record.latest_intent.completion.is_none()
+            && record.latest_intent.revision == record.configuration_revision
+        {
+            self.provision_guardian(&record.id)?;
+            self.apply_lifecycle_intent(&record.latest_intent, self.guardian_endpoint(&record.id))?;
+            record = self.catalog.machine(&record.id)?.ok_or(HostError::Invalid(
+                "machine disappeared during reconciliation",
+            ))?;
+            if record.latest_intent.completion.is_none() {
+                return Ok(());
+            }
+        }
+        self.reconcile_configuration(&record)
     }
 
     fn apply_policy_lifecycle(
@@ -2672,8 +2681,17 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
                 }
             }
         });
+        let mut next_reconciliation = std::time::Instant::now() + Duration::from_secs(1);
         let result = loop {
-            match receiver.recv_timeout(Duration::from_secs(1)) {
+            if std::time::Instant::now() >= next_reconciliation {
+                if let Err(error) = service.reconcile_lifetime_policies() {
+                    eprintln!("sandsurf host reconciliation deferred: {error}");
+                }
+                next_reconciliation = std::time::Instant::now() + Duration::from_secs(1);
+            }
+            match receiver.recv_timeout(
+                next_reconciliation.saturating_duration_since(std::time::Instant::now()),
+            ) {
                 Ok(HostIngress::Request {
                     parsed,
                     reply,
@@ -2692,11 +2710,7 @@ pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
                     let _ = reply.send(service.complete_task(*completion).unwrap_or_else(rejected));
                 }
                 Ok(HostIngress::Failed(error)) => break Err(error.into()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(error) = service.reconcile_lifetime_policies() {
-                        eprintln!("sandsurf host reconciliation deferred: {error}");
-                    }
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break Err(HostError::Invalid("host ingress stopped unexpectedly"));
                 }
@@ -3535,16 +3549,13 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    #[test]
-    fn ordinary_guest_routes_neither_provision_an_owner_nor_require_native_inspection() {
-        let root = std::env::temp_dir().join(format!(
-            "ssroute-{}-{}",
-            std::process::id(),
-            unix_millis().unwrap().get()
-        ));
-        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
-        let machine: MachineId = "box".try_into().unwrap();
-        let create: OperationId = "create".try_into().unwrap();
+    fn admit_machine(
+        service: &mut HostService,
+        name: &str,
+        lifetime: MachineLifetime,
+    ) -> MachineId {
+        let machine: MachineId = name.try_into().unwrap();
+        let create: OperationId = format!("create-{name}").try_into().unwrap();
         let image = bytes_digest(b"seed");
         let resources = Resources {
             vcpus: Counter::ONE,
@@ -3554,7 +3565,6 @@ mod tests {
             managed_executions: 8_u64.try_into().unwrap(),
         };
         let defaults = ExecutionDefaults::default();
-        let lifetime = MachineLifetime::default();
         let request_digest = digest(
             Domain::Machine,
             &(&machine, &image, &resources, &defaults, &lifetime, &create),
@@ -3573,11 +3583,23 @@ mod tests {
                     operation: create,
                 },
                 Approval {
-                    id: "create-approval".try_into().unwrap(),
+                    id: format!("approve-{name}").try_into().unwrap(),
                     request_digest,
                 },
             )
             .unwrap();
+        machine
+    }
+
+    #[test]
+    fn ordinary_guest_routes_neither_provision_an_owner_nor_require_native_inspection() {
+        let root = std::env::temp_dir().join(format!(
+            "ssroute-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
 
         let request = GuestRequest::WriteInput {
             execution_id: "process".try_into().unwrap(),
@@ -3617,6 +3639,107 @@ mod tests {
         assert!(!service.machine_root(&machine).exists());
         drop(service);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn broken_native_ownership_cannot_starve_another_machines_expiration_intent() {
+        let root = std::env::temp_dir().join(format!(
+            "sspolicy-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let broken = admit_machine(&mut service, "a-broken", MachineLifetime::default());
+        let expired = admit_machine(
+            &mut service,
+            "z-expired",
+            MachineLifetime {
+                expires_at_unix_millis: Some(Counter::ONE),
+                expiration_action: ExpirationAction::Stop,
+            },
+        );
+        service.reconcile_lifetime_policies().unwrap();
+        assert_eq!(
+            service
+                .catalog
+                .machine(&broken)
+                .unwrap()
+                .unwrap()
+                .latest_intent
+                .desired,
+            DesiredState::Running
+        );
+        let expired = service.catalog.machine(&expired).unwrap().unwrap();
+        assert_eq!(expired.latest_intent.desired, DesiredState::Stopped);
+        assert!(
+            expired.latest_intent.completion.is_none(),
+            "a host decision is not native completion"
+        );
+        assert_eq!(expired.reservation, ReservationState::Held);
+        assert!(matches!(
+            service.view(expired).unwrap().machine,
+            Observation::Unavailable { last_known: None }
+        ));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn continuous_api_traffic_does_not_postpone_expiration_reconciliation() {
+        let parent = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = parent.join(format!(
+            "sstimer-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let machine = admit_machine(
+            &mut service,
+            "expiring",
+            MachineLifetime {
+                expires_at_unix_millis: Some(unix_millis().unwrap().checked_add(1000).unwrap()),
+                expiration_action: ExpirationAction::Stop,
+            },
+        );
+        drop(service);
+        let serving = root.clone();
+        let server = thread::spawn(move || serve_host(&serving, serving.join("absent-executable")));
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let observed = loop {
+            match host_call(
+                &root,
+                HostRequest::GetMachine {
+                    machine_id: machine.clone(),
+                },
+            ) {
+                Ok(HostResponse::Machine { value })
+                    if value.lifecycle_intent.desired == DesiredState::Stopped =>
+                {
+                    assert!(value.lifecycle_intent.completion.is_none());
+                    break true;
+                }
+                Ok(HostResponse::Machine { .. }) => {}
+                Err(HostError::EndpointUnavailable(_)) => {}
+                response => panic!("unexpected timer fixture response: {response:?}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            // Keep gaps below the old one-second idle-only timer, without
+            // saturating the machine or relying on a performance threshold.
+            thread::sleep(Duration::from_millis(20));
+        };
+        host_call(&root, HostRequest::StopService).unwrap();
+        server.join().unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            observed,
+            "continuous client traffic starved host expiration intent"
+        );
     }
 
     #[test]

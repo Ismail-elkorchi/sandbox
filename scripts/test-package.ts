@@ -124,8 +124,8 @@ function run(command: string, arguments_: readonly string[], cwd = process.cwd()
     let output = "";
     let errors = "";
     const child = spawn(command, arguments_, { cwd, env: { ...process.env, ...environment }, stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-4096); });
-    child.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString("utf8")).slice(-4096); });
+    child.stdout.on("data", (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-4096); process.stdout.write(chunk); });
+    child.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString("utf8")).slice(-4096); process.stderr.write(chunk); });
     child.once("error", rejectRun);
     child.once("exit", (code, signal) => {
       if (code === 0) resolveRun();

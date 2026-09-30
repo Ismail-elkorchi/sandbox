@@ -291,6 +291,7 @@ impl GuestDriver for FileGuest {
             let deadline = Instant::now() + Duration::from_secs(15);
             while !root.join("release-guest-query").exists() {
                 if Instant::now() >= deadline {
+                    fs::write(root.join("guest-query-timed-out"), []).unwrap();
                     return Err(sandsurf_host::guardian::Error::Protocol(
                         "blocked guest fixture deadline",
                     ));
@@ -839,7 +840,6 @@ fn blocked_guest_io_cannot_block_native_observation_or_power_off() {
     let guest_query =
         std::thread::spawn(move || client.guest(machine, GuestServiceRequest::ProbeIdentity));
     wait_for(&fixture.root.0.join("guest-query-entered"));
-    let started = Instant::now();
     let inspection = GuardianClient::new(endpoint.clone())
         .inspect(fixture.machine.clone(), None)
         .unwrap();
@@ -873,8 +873,11 @@ fn blocked_guest_io_cannot_block_native_observation_or_power_off() {
         .unwrap();
     let result = apply_lifecycle(&mut fixture.host, endpoint, &operation).unwrap();
     assert_eq!(result.guardian_operation.delivery, Delivery::Applied);
+    // Assert the dependency, not filesystem throughput on a shared runner:
+    // native completion must precede either release or timeout of guest I/O.
+    assert!(!fixture.root.0.join("guest-query-timed-out").exists());
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        !guest_query.is_finished(),
         "native control waited on guest I/O"
     );
     assert!(!fixture.root.0.join("release-guest-query").exists());
