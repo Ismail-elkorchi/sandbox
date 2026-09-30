@@ -834,6 +834,9 @@ pub enum RuntimeResponse {
         machine_id: MachineId,
     },
     Usage {
+        /// Guardian journal fence for this sample. This is not a fresh power
+        /// observation and does not claim that native control is reachable.
+        generation: Counter,
         usage: crate::ResourceUsage,
     },
     Events {

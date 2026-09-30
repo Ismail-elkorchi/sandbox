@@ -312,6 +312,12 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn resource_usage(&mut self) -> sandsurf_host::guardian::Result<ResourceUsage> {
+        Ok(ResourceUsage::host_observation(
+            "fixture-native-usage",
+            Counter::ONE,
+        ))
+    }
     fn observe_power(
         &mut self,
     ) -> sandsurf_host::guardian::Result<Option<sandsurf_machine::NativePowerObservation>> {
@@ -612,6 +618,57 @@ fn owner_identity_does_not_sample_native_power_or_accept_another_machine() {
         fixture.root.0.join("native-sampled").exists(),
         "the observation instrument must be active"
     );
+}
+
+#[test]
+fn resource_samples_use_the_journal_fence_without_requiring_native_or_guest_control() {
+    let fixture = Fixture::new();
+    let runtime = RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.machine).unwrap();
+    let generation = runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .generation;
+    fs::write(fixture.root.0.join("record-native-samples"), []).unwrap();
+    fs::write(fixture.root.0.join("native-unavailable"), []).unwrap();
+    fs::write(fixture.root.0.join("management-down"), []).unwrap();
+    let mut guardian = Guardian::new(
+        runtime,
+        FileEffect {
+            path: fixture.root.0.join("effects.log"),
+        },
+    );
+    let response = guardian.handle(GuardianRequest::Runtime {
+        machine_id: fixture.machine.clone(),
+        request: RuntimeRequest::Usage,
+    });
+    let GuardianResponse::Runtime {
+        response:
+            RuntimeResponse::Usage {
+                generation: observed,
+                usage,
+            },
+    } = response
+    else {
+        panic!("host measurements must not require control-plane reachability: {response:?}");
+    };
+    assert_eq!(observed, generation);
+    assert_eq!(usage.source, "fixture-native-usage");
+    assert_eq!(usage.executions_current, Counter::ZERO);
+    assert_eq!(usage.output_retained_bytes, Counter::ZERO);
+    assert!(!fixture.root.0.join("native-sampled").exists());
+    assert!(matches!(guardian.handle(GuardianRequest::Inspect {
+        machine_id: fixture.machine.clone(), operation_id: None,
+    }), GuardianResponse::Inspection { value } if matches!(&value.observation, Observation::Unavailable { last_known: Some(value) } if value.generation == generation)));
+    assert!(fixture.root.0.join("native-sampled").exists());
+    assert!(matches!(
+        guardian.handle(GuardianRequest::Runtime {
+            machine_id: "another-machine".try_into().unwrap(),
+            request: RuntimeRequest::Usage,
+        }),
+        GuardianResponse::Rejected { .. }
+    ));
 }
 
 #[test]

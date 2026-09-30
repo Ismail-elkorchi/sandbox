@@ -107,6 +107,9 @@ machine's retained tree, including directory allocation. It is not Linux free
 space, dynamic-disk virtual capacity, or an exclusive physical-space reservation:
 shared/reflink extents can be attributed to multiple objects. Windows allocation
 is queried from the held file handle, not substituted with file length.
+Resource reads use the guardian journal's generation fence, not a native power
+query. An unavailable native control channel does not by itself make independent
+host storage, retained-output or gateway measurements unavailable.
 
 `(await machine.resources.usage()).executionsCurrent` counts host-owned managed
 admission slots, not Linux PIDs or guest-reported running commands. Admissions

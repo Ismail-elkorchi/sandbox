@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 7;
+pub const SERVICE_VERSION: u16 = 8;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -888,6 +888,14 @@ impl<E: GuardianEffect> Guardian<E> {
                         RuntimeResponse::Complete
                     }
                     RuntimeRequest::Usage => {
+                        let generation = self
+                            .journal
+                            .last_observation()?
+                            .ok_or(Error::Protocol(
+                                "resource sample has no native generation fence",
+                            ))?
+                            .value()
+                            .generation;
                         let mut usage = self
                             .effect
                             .as_mut()
@@ -895,7 +903,7 @@ impl<E: GuardianEffect> Guardian<E> {
                             .resource_usage()?;
                         usage.output_retained_bytes = self.journal.retained_output_bytes()?;
                         usage.executions_current = self.journal.managed_execution_slots_held()?;
-                        RuntimeResponse::Usage { usage }
+                        RuntimeResponse::Usage { generation, usage }
                     }
                     RuntimeRequest::Events { after, maximum } => RuntimeResponse::Events {
                         page: self.journal.events(after, maximum)?,

@@ -1391,14 +1391,12 @@ impl HostService {
             HostRequest::GetUsage { machine_id } => {
                 self.provision_guardian(&machine_id)?;
                 let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                let inspection = client.inspect(machine_id.clone(), None)?;
-                let Observation::Current { value: machine } = inspection.observation else {
-                    return Err(HostError::Invalid(
-                        "resource usage requires a current machine observation",
-                    ));
-                };
                 let response = client.runtime(machine_id.clone(), RuntimeRequest::Usage)?;
-                let RuntimeResponse::Usage { mut usage } = response else {
+                let RuntimeResponse::Usage {
+                    generation,
+                    mut usage,
+                } = response
+                else {
                     return Err(HostError::Invalid(
                         "native resource accounting is unavailable",
                     ));
@@ -1408,9 +1406,7 @@ impl HostService {
                 usage.disk_logical_bytes = Counter::try_from(storage.logical_bytes)?;
                 usage.disk_allocated_bytes = Counter::try_from(storage.allocated_bytes)?;
                 Ok(HostResponse::Usage {
-                    usage: self
-                        .catalog
-                        .observe_usage(&machine_id, machine.generation, usage)?,
+                    usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
                 })
             }
             HostRequest::DispatchGuest { .. } | HostRequest::Guest { .. } => Err(

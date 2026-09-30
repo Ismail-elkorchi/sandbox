@@ -86,6 +86,9 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       const unavailable = await machine.inspect();
       assert.equal(unavailable.machine.kind, "unavailable");
       assert.equal(unavailable.machine.lastKnown.state, "running");
+      const independentlyObservedUsage = await machine.resources.usage();
+      assert.ok(independentlyObservedUsage.diskAllocatedBytes >= 256 * 1024 ** 2);
+      assert.ok(independentlyObservedUsage.outputRetainedBytes >= dense.length);
       assertSameBytes(await output(execution), dense);
       const command = await machine.executions.start({ argv: ["/bin/echo", "native-query-independent"], executionId: "native-query-independent", expectedGeneration: nativeGeneration });
       assert.equal(exitCode(await command.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
