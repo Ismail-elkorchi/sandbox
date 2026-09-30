@@ -316,6 +316,9 @@ impl GuardianEffect for FileEffect {
         &mut self,
     ) -> sandsurf_host::guardian::Result<Option<sandsurf_machine::NativePowerObservation>> {
         let root = self.path.parent().unwrap();
+        if root.join("record-native-samples").exists() {
+            fs::write(root.join("native-sampled"), [])?;
+        }
         if root.join("native-unavailable").exists() {
             return Err(sandsurf_host::guardian::Error::Protocol(
                 "native owner unavailable",
@@ -573,6 +576,42 @@ fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner(
     ));
     assert!(guardian.can_retire().unwrap());
     assert!(!fixture.root.0.join("effects.log").exists());
+}
+
+#[test]
+fn owner_identity_does_not_sample_native_power_or_accept_another_machine() {
+    let fixture = Fixture::new();
+    let runtime = RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.machine).unwrap();
+    fs::write(fixture.root.0.join("record-native-samples"), []).unwrap();
+    let mut guardian = Guardian::new(
+        runtime,
+        FileEffect {
+            path: fixture.root.0.join("effects.log"),
+        },
+    );
+    let request = |machine_id| GuardianRequest::Runtime {
+        machine_id,
+        request: RuntimeRequest::OwnerIdentity {},
+    };
+    assert!(
+        matches!(guardian.handle(request(fixture.machine.clone())), GuardianResponse::Runtime { response: RuntimeResponse::OwnerIdentity { machine_id } } if machine_id == fixture.machine)
+    );
+    assert!(matches!(
+        guardian.handle(request("another-machine".try_into().unwrap())),
+        GuardianResponse::Rejected { .. }
+    ));
+    assert!(!fixture.root.0.join("native-sampled").exists());
+    assert!(matches!(
+        guardian.handle(GuardianRequest::Inspect {
+            machine_id: fixture.machine.clone(),
+            operation_id: None
+        }),
+        GuardianResponse::Inspection { .. }
+    ));
+    assert!(
+        fixture.root.0.join("native-sampled").exists(),
+        "the observation instrument must be active"
+    );
 }
 
 #[test]

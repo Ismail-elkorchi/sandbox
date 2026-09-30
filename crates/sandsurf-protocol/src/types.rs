@@ -569,6 +569,8 @@ pub enum GuardianRequest {
     deny_unknown_fields
 )]
 pub enum RuntimeRequest {
+    /// Private endpoint identity only; says nothing about native VM power.
+    OwnerIdentity {},
     ValidateResources {
         resources: Resources,
     },
@@ -828,6 +830,9 @@ pub struct ExecutionStatus {
     deny_unknown_fields
 )]
 pub enum RuntimeResponse {
+    OwnerIdentity {
+        machine_id: MachineId,
+    },
     Usage {
         usage: crate::ResourceUsage,
     },

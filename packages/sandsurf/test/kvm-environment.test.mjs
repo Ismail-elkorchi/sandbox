@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
@@ -68,6 +68,27 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await execution.acknowledge(receipt.digest);
     if (process.env.SANDSURF_TEST_TRACE === "1") console.error("dense: acknowledged, output re-read begin");
     assertSameBytes(await output(execution), dense);
+
+    context.diagnostic("guest commands and retained reads do not inspect native power to identify the guardian");
+    const nativeGeneration = machine.generation;
+    const guardianRoot = join(directory, "machines", machine.id, "guardian");
+    const nativeDirectories = (await readdir(guardianRoot, { withFileTypes: true })).filter((entry) => entry.isDirectory() && entry.name.startsWith(`vm-${nativeGeneration}-`));
+    assert.equal(nativeDirectories.length, 1);
+    const nativeSocket = join(guardianRoot, nativeDirectories[0].name, "vm-state/firecracker.socket");
+    const unavailableSocket = `${nativeSocket}.test-unavailable`;
+    await rename(nativeSocket, unavailableSocket);
+    try {
+      const unavailable = await machine.inspect();
+      assert.equal(unavailable.machine.kind, "unavailable");
+      assert.equal(unavailable.machine.lastKnown.state, "running");
+      assertSameBytes(await output(execution), dense);
+      const command = await machine.executions.start({ argv: ["/bin/echo", "native-query-independent"], executionId: "native-query-independent", expectedGeneration: nativeGeneration });
+      assert.equal(exitCode(await command.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
+      assert.equal((await output(command)).toString(), "native-query-independent\n");
+    } finally {
+      await rename(unavailableSocket, nativeSocket);
+      assert.equal((await machine.inspect()).machine.value.state, "running");
+    }
 
     const terminal = await machine.terminals.open({ executionId: "persistent-terminal", argv: ["/bin/sh"] });
     context.diagnostic("persistent PTY and management-service restart");

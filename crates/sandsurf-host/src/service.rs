@@ -2278,7 +2278,7 @@ impl HostService {
             )?;
         }
         let endpoint = self.guardian_endpoint(machine);
-        match GuardianClient::new(endpoint.clone()).inspect(machine.clone(), None) {
+        match GuardianClient::new(endpoint.clone()).owner_identity(machine.clone()) {
             Ok(_) => return Ok(()),
             Err(crate::guardian::Error::Io(error))
                 if matches!(
@@ -2305,7 +2305,7 @@ impl HostService {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if GuardianClient::new(endpoint.clone())
-                .inspect(machine.clone(), None)
+                .owner_identity(machine.clone())
                 .is_ok()
             {
                 return Ok(());

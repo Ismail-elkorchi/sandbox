@@ -201,6 +201,18 @@ fn unknown_command_fields_and_reference_only_release_are_rejected() {
 
 #[test]
 fn authority_and_guardian_messages_are_strict_and_bounded() {
+    let owner =
+        json!({ "kind": "runtime", "machineId": "box", "request": { "kind": "owner-identity" } });
+    assert!(serde_json::from_value::<GuardianRequest>(owner.clone()).is_ok());
+    let mut unexpected = owner;
+    unexpected["request"]["powerState"] = json!("running");
+    assert!(serde_json::from_value::<GuardianRequest>(unexpected).is_err());
+    assert!(
+        serde_json::from_value::<RuntimeResponse>(
+            json!({ "kind": "owner-identity", "machineId": "box", "powerState": "running" })
+        )
+        .is_err()
+    );
     assert!(AuthorityPublicKey::try_from("a".repeat(64)).is_ok());
     assert!(AuthorityPublicKey::try_from("A".repeat(64)).is_err());
     assert!(AuthoritySignature::try_from("b".repeat(128)).is_ok());

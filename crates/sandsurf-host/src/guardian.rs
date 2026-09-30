@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 6;
+pub const SERVICE_VERSION: u16 = 7;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -872,6 +872,9 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
                 let response = match request {
+                    RuntimeRequest::OwnerIdentity {} => RuntimeResponse::OwnerIdentity {
+                        machine_id: self.journal.machine_id().clone(),
+                    },
                     RuntimeRequest::ValidateResources { resources } => {
                         let current = self
                             .journal
@@ -1196,6 +1199,16 @@ impl<'host> HostGuardianLink<'host> {
 impl GuardianClient {
     pub fn new(endpoint: PathBuf) -> Self {
         Self { endpoint }
+    }
+
+    /// Reachability of the exclusive journal endpoint is not a power fact.
+    pub fn owner_identity(&self, machine: MachineId) -> Result<()> {
+        match self.runtime(machine.clone(), RuntimeRequest::OwnerIdentity {})? {
+            RuntimeResponse::OwnerIdentity { machine_id } if machine_id == machine => Ok(()),
+            _ => Err(Error::Protocol(
+                "guardian returned the wrong owner identity",
+            )),
+        }
     }
 
     pub fn inspect(
