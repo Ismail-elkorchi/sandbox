@@ -491,6 +491,15 @@ export type ExecShellOptions = Omit<ExecOptions, "argv"> & { readonly shell?: st
 export interface ExecResult { readonly process: Execution; readonly inspection: ExecutionInspection; }
 export interface ExecutionInspection { readonly request: Readonly<Record<string, unknown>>; readonly guestPid: number; readonly state: Readonly<Record<string, unknown>>; readonly lineage: Readonly<Record<string, unknown>> | null; }
 export type ExecutionObservation = { readonly kind: "current"; readonly value: ExecutionInspection } | { readonly kind: "unavailable"; readonly lastKnown: ExecutionInspection | null };
+export interface ExecutionStatus { readonly executionId: string; readonly generation: number; readonly report: ExecutionObservation; readonly interruption: NativeMachineObservation | null; }
+export class ExecutionInterruptedError extends SandsurfHostError {
+  readonly executionId: string; readonly generation: number; readonly observation: NativeMachineObservation;
+  constructor(execution: Execution, observation: NativeMachineObservation) {
+    super("execution-interrupted", `Execution ${execution.id} generation ${execution.generation} was interrupted by native ${observation.state}; this is not a guest exit or a complete output capture`);
+    this.name = "ExecutionInterruptedError";
+    this.executionId = execution.id; this.generation = execution.generation; this.observation = observation;
+  }
+}
 
 export class ExecutionCollection {
   readonly #machine: Machine;
@@ -528,12 +537,14 @@ export class ExecutionCollection {
     const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process" || !record(response.response.request)) throw protocol("execution response");
     if (response.response.request.executionId !== executionId || response.response.request.machineId !== this.#machine.id) throw protocol("execution reservation identity");
-    return new Execution(this.#machine, executionId, integer(response.response.request.generation));
+    const status = parseExecutionStatus(response.response.process, this.#machine.id);
+    if (status.executionId !== executionId) throw protocol("execution reservation identity");
+    return new Execution(this.#machine, executionId, status.generation);
   }
-  async list(): Promise<readonly ExecutionObservation[]> {
+  async list(): Promise<readonly ExecutionStatus[]> {
     const response = await this.#machine[transport]({ kind: "list-processes", machineId: this.#machine.id });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "processes" || !Array.isArray(response.response.processes)) throw protocol("process list response");
-    return response.response.processes.map(parseExecutionObservation);
+    return response.response.processes.map((value: unknown) => parseExecutionStatus(value, this.#machine.id));
   }
 }
 
@@ -572,7 +583,7 @@ export class Terminal {
   async acquireInput(options: ExecutionOperationOptions & { readonly leaseId?: string } = {}): Promise<string> { this.#requireAttached(); const id = validateIdentity(options.leaseId ?? identity("terminal-input")); await this.process.acquireTerminalInput(id, options); this.#inputLeaseId = id; return id; }
   async releaseInput(options: ExecutionOperationOptions = {}): Promise<void> { this.#requireAttached(); if (this.#inputLeaseId !== undefined) { const lease = this.#inputLeaseId; await this.process.releaseTerminalInput(lease, options); this.#inputLeaseId = undefined; } }
   async detach(options: MachineGenerationPrecondition & { readonly releaseInputOperationId?: string } = {}): Promise<void> { if (this.#attached) { await this.releaseInput({ ...(options.releaseInputOperationId === undefined ? {} : { operationId: options.releaseInputOperationId }), ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }) }); this.#attached = false; } }
-  inspect(): Promise<ExecutionObservation> { this.#requireAttached(); return this.process.inspect(); }
+  inspect(): Promise<ExecutionStatus> { this.#requireAttached(); return this.process.inspect(); }
   waitLeader(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitLeader(options); }
   waitCapture(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitCapture(options); }
   resize(size: TerminalSize, options: ExecutionOperationOptions = {}): Promise<void> { this.#requireAttached(); return this.process.resize(size, options); }
@@ -592,13 +603,19 @@ export class Execution {
     if (options.expectedGeneration !== undefined && options.expectedGeneration !== this.generation) throw new SandsurfHostError("stale-generation", "An execution handle cannot be rebound to another generation");
     return { ...options, expectedGeneration: this.generation };
   }
-  async inspect(): Promise<ExecutionObservation> { const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId: this.id }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response"); if (response.response.process === null) throw new SandsurfHostError("missing", `Process ${this.id} does not exist`); return parseExecutionObservation(response.response.process); }
+  async inspect(): Promise<ExecutionStatus> {
+    const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId: this.id });
+    if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response");
+    const status = parseExecutionStatus(response.response.process, this.#machine.id);
+    if (status.executionId !== this.id) throw protocol("execution status identity");
+    return status;
+  }
   waitLeader(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("leader", options); }
   waitCapture(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("capture", options); }
   async #wait(boundaryKind: "leader" | "capture", options: { readonly signal?: AbortSignal }): Promise<ExecutionInspection> {
     if (options.signal?.aborted === true) throw options.signal.reason;
     const boundary = await this.#machine.events.read({ maximum: 1 });
-    const observed = await this.inspect();
+    const status = await this.inspect();
     let terminal: ExecutionInspection | undefined;
     const complete = async (value: ExecutionInspection): Promise<boolean> => {
       if (value.state.kind === "running" || (boundaryKind === "capture" && value.state.kind === "draining")) return false;
@@ -612,9 +629,18 @@ export class Execution {
           receipt.receipt.output.finalHash !== value.state.output.finalHash) throw protocol("capture receipt disagrees with completed process");
       return true;
     };
-    if (observed.kind === "current" && observed.value.request.generation === this.generation && await complete(observed.value)) return observed.value;
+    const reported = status.report.kind === "current" ? status.report.value : status.report.lastKnown;
+    if (reported !== null && reported.request.generation === this.generation &&
+        (status.report.kind === "current" || reported.state.kind !== "running") && await complete(reported)) return reported;
+    requireExecutionContinuity(this, status);
     for await (const event of this.#machine.events.follow({ after: boundary.available, ...(options.signal === undefined ? {} : { signal: options.signal }) })) {
       if (boundaryKind === "capture" && terminal !== undefined && event.value.kind === "receipt" && event.value.executionId === this.id && await complete(terminal)) return terminal;
+      if (event.value.kind === "machine" && nativeBoundaryAffects(event.value.observation, this.generation)) {
+        const latest = await this.inspect();
+        const reported = latest.report.kind === "current" ? latest.report.value : latest.report.lastKnown;
+        if (reported !== null && reported.request.generation === this.generation && reported.state.kind !== "running" && await complete(reported)) return reported;
+        requireExecutionContinuity(this, latest);
+      }
       if (event.value.kind !== "process" || !record(event.value.process)) continue;
       const process = parseProcess(event.value.process);
       if (process.request.executionId === this.id && process.request.generation === this.generation && await complete(process)) return process;
@@ -683,6 +709,7 @@ export class ExecutionOutput {
         const receipt = await this.#process.receipt();
         if (receipt !== undefined && cursor >= integer(receipt.receipt.output.finalCursor)) return;
         if (cursor < page.available || page.chunks.length > 0) continue;
+        requireExecutionContinuity(this.#process, await this.#process.inspect());
         for (;;) {
           const event = await events.next();
           if (event.done) throw new SandsurfHostError("unavailable", `Process ${this.#process.id} event stream ended`);
@@ -1077,10 +1104,36 @@ function resolveMachinePreconditions(machine: Machine, supplied: MachineGenerati
 }
 function parseProcess(value: unknown): ExecutionInspection { if (!record(value) || !record(value.request) || !record(value.state) || (value.lineage !== null && !record(value.lineage))) throw protocol("process inspection"); return { request: value.request, guestPid: integer(value.guestPid), state: value.state, lineage: value.lineage }; }
 function parseExecutionObservation(value: unknown): ExecutionObservation { if (!record(value) || (value.kind !== "current" && value.kind !== "unavailable")) throw protocol("process observation"); if (value.kind === "current") return { kind: "current", value: parseProcess(value.value) }; return { kind: "unavailable", lastKnown: value.lastKnown === null ? null : parseProcess(value.lastKnown) }; }
+function parseExecutionStatus(value: unknown, machineId: string): ExecutionStatus {
+  if (!record(value)) throw protocol("execution status");
+  const generation = integer(value.generation);
+  if (generation < 1) throw protocol("execution status generation");
+  const executionId = validateIdentity(text(value.executionId));
+  const report = parseExecutionObservation(value.report);
+  let interruption: NativeMachineObservation | null = null;
+  if (value.interruption !== null) {
+    if (!record(value.interruption)) throw protocol("native execution interruption");
+    const parsed = parseMachineObservation({ kind: "current", value: value.interruption }, machineId);
+    if (parsed.kind !== "current" || !nativeBoundaryAffects(parsed.value, generation)) throw protocol("native execution interruption");
+    interruption = parsed.value;
+  }
+  const reported = report.kind === "current" ? report.value : report.lastKnown;
+  if (reported !== null && (reported.request.generation !== generation || reported.request.executionId !== executionId || reported.request.machineId !== machineId)) throw protocol("execution status identity");
+  return { executionId, generation, report, interruption };
+}
+function nativeBoundaryAffects(value: unknown, generation: number): boolean {
+  return record(value) && (integer(value.generation) > generation ||
+    (value.generation === generation && (value.state === "stopped" || value.state === "destroyed" || value.state === "failed")));
+}
+function requireExecutionContinuity(execution: Execution, status: ExecutionStatus): void {
+  if (status.executionId !== execution.id) throw protocol("execution status identity");
+  if (status.generation !== execution.generation) throw new SandsurfHostError("stale-generation", `Execution ${execution.id} must be reattached to its restored generation`);
+  if (status.interruption !== null) throw new ExecutionInterruptedError(execution, status.interruption);
+}
 function runtimeEventBelongsToProcess(event: MachineEvent, executionId: string): boolean {
   const value = event.value;
   if ((value.kind === "output" || value.kind === "receipt" || value.kind === "evidence-release") && value.executionId === executionId) return true;
-  return value.kind === "process" && record(value.process) && record(value.process.request) && value.process.request.executionId === executionId;
+  return value.kind === "machine" || (value.kind === "process" && record(value.process) && record(value.process.request) && value.process.request.executionId === executionId);
 }
 function parseEvidencePage(value: Record<string, unknown>): OutputPage {
   if (!Array.isArray(value.chunks)) throw protocol("output page");

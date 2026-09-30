@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const packageDirectory = process.env.SANDSURF_TEST_PACKAGE_ROOT ?? fileURLToPath(new URL("..", import.meta.url));
-const { Sandsurf } = await import(pathToFileURL(join(packageDirectory, "dist/index.js")).href);
+const { Sandsurf, ExecutionInterruptedError } = await import(pathToFileURL(join(packageDirectory, "dist/index.js")).href);
 const { NativeHostClient } = await import(pathToFileURL(join(packageDirectory, "dist/native-host.js")).href);
 
 const enabled = process.env.SANDSURF_KVM_TEST === "1";
@@ -154,7 +154,32 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await fork.destroy();
     fork = undefined;
 
+    context.diagnostic("native power-off interrupts waits without fabricating exit or releasing retained output");
+    const interrupted = await machine.executions.start({ argv: ["/bin/sh", "-c", "printf before-stop; sleep 300"], executionId: "interrupted-by-native-stop" });
+    const captureDeadline = Date.now() + 15_000;
+    let beforeStop;
+    do {
+      beforeStop = await interrupted.output.read();
+      if (beforeStop.available >= Buffer.byteLength("before-stop")) break;
+      assert.ok(Date.now() < captureDeadline, "running execution output was not captured");
+      await new Promise((done) => setTimeout(done, 25));
+    } while (true);
+    const waits = Promise.allSettled([
+      interrupted.waitLeader({ signal: AbortSignal.timeout(15_000) }),
+      interrupted.waitCapture({ signal: AbortSignal.timeout(15_000) }),
+    ]);
     await machine.powerOff();
+    for (const result of await waits) {
+      assert.equal(result.status, "rejected");
+      assert.ok(result.reason instanceof ExecutionInterruptedError);
+      assert.equal(result.reason.observation.state, "stopped");
+    }
+    const interruptedStatus = await interrupted.inspect();
+    assert.equal(interruptedStatus.report.kind, "unavailable");
+    assert.equal(interruptedStatus.interruption.state, "stopped");
+    assert.equal(await interrupted.receipt(), undefined);
+    assert.equal(Buffer.concat((await interrupted.output.read()).chunks.map((chunk) => Buffer.from(chunk.bytes))).toString(), "before-stop");
+    await assert.rejects((await machine.executions.get(interrupted.id)).waitCapture(), ExecutionInterruptedError);
     await machine.start();
     await managementReady(machine);
     assert.notEqual(machine.generation, generation);

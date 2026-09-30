@@ -2,6 +2,7 @@ import {
   Sandsurf, SandsurfHostError,
   type Artifact, type AuthorityChange, type ChangeSet, type MachineInspection,
   type MachineGenerationPrecondition, type MachineRevisionPrecondition,
+  type ExecutionStatus,
   type NetworkPolicy, type ResourceUsage, type SecretVersion, type SpawnOptions,
 } from "sandsurf";
 
@@ -22,6 +23,8 @@ async function consume(directory: string, image: string): Promise<void> {
     const generation: MachineGenerationPrecondition = computer.generation === undefined ? {} : { expectedGeneration: computer.generation };
     const spawn: SpawnOptions = { argv: ["/bin/sh", "-c", "sudo -n id -u"], ...generation };
     const execution = await computer.executions.start(spawn);
+    const status: ExecutionStatus = await execution.inspect();
+    void status.report; void status.interruption;
     await execution.waitLeader();
     await execution.waitCapture();
     const home = computer.fs.at("/home/agent");

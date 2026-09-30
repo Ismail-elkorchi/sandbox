@@ -10,7 +10,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 6;
+pub const HOST_API_VERSION: u16 = 7;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {

@@ -9,7 +9,7 @@ const MAX_BRIDGE_BYTES: usize =
     sandsurf_protocol::MAX_RPC_DATA_BYTES + sandsurf_protocol::MAX_CONTROL_BYTES + 4;
 const MAX_BRIDGE_PENDING: usize = 64;
 const BRIDGE_WORKERS: usize = 8;
-const BRIDGE_VERSION: u16 = 5;
+const BRIDGE_VERSION: u16 = 6;
 
 fn main() {
     if let Err(error) = run() {

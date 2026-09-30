@@ -15,6 +15,7 @@ use std::path::Path;
 const SCHEMA: &str = "
 CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), machine TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL, accepted_revision INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE INDEX observations_by_generation ON observations(json_extract(value,'$.generation'), sequence);
 CREATE TABLE management_reports(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -1240,6 +1241,52 @@ impl RuntimeJournal {
             |row| row.get(0),
         )?;
         raw.map(|value| decode(&value)).transpose()
+    }
+
+    pub fn execution_generation(&self, id: &ExecutionId) -> Result<Counter> {
+        let generation: u64 = self.db.connection.query_row(
+            "SELECT generation FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(Counter::try_from(generation)?)
+    }
+
+    pub fn execution_ids(&self) -> Result<Vec<ExecutionId>> {
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT id FROM processes ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(row?.try_into()?)).collect()
+    }
+
+    /// Derived from the sole native observation history, not another status
+    /// journal. Pause and suspend retain machine execution state; management
+    /// unavailability supplies no native evidence at all. Cold boot and full
+    /// restore invalidate old generation handles, without asserting that every
+    /// captured Linux process was killed.
+    pub fn execution_interruption(
+        &self,
+        generation: Counter,
+    ) -> Result<Option<MachineObservation>> {
+        if generation == Counter::ZERO {
+            return Err(Error::Conflict("execution generation must be positive"));
+        }
+        let raw: Option<String> = self.db.connection.query_row(
+            "SELECT value FROM observations WHERE json_extract(value,'$.generation')=?1 AND json_extract(value,'$.state') IN ('stopped','destroyed','failed') ORDER BY sequence LIMIT 1",
+            [generation.get()],
+            |row| row.get(0),
+        ).optional()?;
+        let raw = match raw {
+            Some(raw) => Some(raw),
+            None => self.db.connection.query_row(
+                "SELECT value FROM observations WHERE json_extract(value,'$.generation')>?1 ORDER BY json_extract(value,'$.generation'),sequence LIMIT 1",
+                [generation.get()],
+                |row| row.get(0),
+            ).optional()?,
+        };
+        raw.map(|raw| decode(&raw)).transpose()
     }
 
     pub fn process_request(&self, id: &ExecutionId) -> Result<sandsurf_protocol::SpawnRequest> {

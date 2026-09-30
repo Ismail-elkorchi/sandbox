@@ -8,6 +8,7 @@ export {
   PinnedOutput,
   FilesystemWatcher,
   Execution,
+  ExecutionInterruptedError,
   Terminal,
 } from "./sandsurf.js";
 export type {
@@ -43,6 +44,7 @@ export type {
   ExecutionInspection,
   ExecutionOperationOptions,
   ExecutionObservation,
+  ExecutionStatus,
   ExecutionSignalOptions,
   ExecutionTerminateOptions,
   Qualification,

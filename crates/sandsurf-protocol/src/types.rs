@@ -809,6 +809,17 @@ pub struct RuntimeEventPage {
 /// alone is not a byte bound: execution observations can carry large argv/env.
 pub const MAX_EVENT_PAGE_BYTES: usize = crate::MAX_CONTROL_BYTES - 1024;
 
+/// Guest reports and host-native interruption evidence have distinct provenance.
+/// Interruption never fabricates a guest exit, stream EOF, or capture receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionStatus {
+    pub execution_id: ExecutionId,
+    pub generation: Counter,
+    pub report: Observation<crate::ExecutionSnapshot>,
+    pub interruption: Option<MachineObservation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -824,11 +835,11 @@ pub enum RuntimeResponse {
         page: RuntimeEventPage,
     },
     Process {
-        process: Box<Option<Observation<crate::ExecutionSnapshot>>>,
+        process: Box<ExecutionStatus>,
         request: crate::SpawnRequest,
     },
     Processes {
-        processes: Vec<Observation<crate::ExecutionSnapshot>>,
+        processes: Vec<ExecutionStatus>,
     },
     Operation {
         operation: Option<RuntimeOperationRecord>,

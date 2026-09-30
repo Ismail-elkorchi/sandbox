@@ -91,6 +91,17 @@ Use `machine.fs` for guest paths. Artifact import, capture, comparison and host 
 
 Terminals are PTY executions with replayable `terminal` output. Detaching or cancelling a wait does not terminate an execution. Leader exit and output completion are separate; descendants may continue to hold streams open.
 
+`execution.inspect()` separates the guest `report` from guardian-owned native
+`interruption` evidence. A confirmed native stop or superseded execution
+generation interrupts pending waits; management-service failure alone does
+not. `ExecutionInterruptedError` carries that native observation, not a
+fabricated Linux exit status or output-completion receipt. Output following
+delivers already retained bytes before reporting interruption; those bytes
+remain readable. A reported leader exit remains available independently of
+capture completeness. After full-state restore, explicitly reattach through
+`executions.get()` to obtain the restored generation; an old handle is not
+silently rebound.
+
 Receipt acknowledgement does not release output or express application acceptance. Release requires complete capture elsewhere, continuing retention of the actual bytes, or explicitly authorized loss. A receipt reference alone preserves no bytes. Machine destruction must not release retained output.
 
 The breaking redesign remains incomplete. Native network attachments, unified storage recovery, full-state execution lineage and platform hardware qualification still require implementation or qualification; consult the reported capabilities and [security scope](../SECURITY.md).

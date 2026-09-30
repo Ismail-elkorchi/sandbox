@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { before, test } from "node:test";
-import { Artifact, Machine, Execution, Sandsurf, SandsurfHostError } from "../dist/index.js";
+import { Artifact, Machine, Execution, ExecutionInterruptedError, Sandsurf, SandsurfHostError } from "../dist/index.js";
 import { createSandsurfGuestPath, createSandsurfGuestCommand, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestRequestMetadata, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfGuestCommand, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
@@ -458,7 +458,7 @@ test("leader exit and output capture are independent boundaries", async () => {
       assert.equal(query.after, 0, "wait performed an RPC poll");
       return eventPage(0, [{ kind: "machine", observation: fixtureView().machine.value }]);
     }
-    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 } } } } } };
+    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 } } } } } } };
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: receiptPublished ? { ...request, output } : null, digest: receiptPublished ? "b".repeat(64) : null } };
     throw new Error(`unexpected request: ${query.kind}`);
   }, 1, undefined, async function* (_id, after) {
@@ -486,7 +486,7 @@ test("waiting through unavailable management does not invent termination or repl
     }
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: pages >= 3 ? { ...request, output } : null, digest: pages >= 3 ? "b".repeat(64) : null } };
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", process: { kind: "unavailable", lastKnown: null } } };
+    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
   }, 1, undefined, async function* (_id, after) {
     assert.equal(after, 0);
     pages++;
@@ -501,10 +501,90 @@ test("durable spawn reservations reconnect before the first guest observation", 
   const request = { machineId: "box", generation: 1, executionId: "terminal", stdio: "terminal" };
   const machine = fixtureMachine(async (query) => {
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", request, process: { kind: "unavailable", lastKnown: null } } };
+    return { kind: "runtime", response: { kind: "process", request, process: { executionId: "terminal", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
   });
   assert.equal((await machine.executions.get("terminal")).generation, 1);
   const terminal = await machine.terminals.get("terminal");
   assert.equal(terminal.process.generation, 1);
-  assert.equal((await terminal.process.inspect()).kind, "unavailable");
+  assert.equal((await terminal.process.inspect()).report.kind, "unavailable");
+});
+
+test("native interruption wakes execution waits without inventing guest exit or capture", async () => {
+  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const lastKnown = { request, guestPid: 23, lineage: null, state: { kind: "running" } };
+  const stopped = { ...fixtureView().machine.value, sequence: 2, state: "stopped", cause: { kind: "native" } };
+  let interrupted = false;
+  let subscriptions = 0;
+  const machine = fixtureMachine(async (query) => {
+    if (query.kind === "list-events") return eventPage(0, []);
+    assert.equal(query.kind, "get-process");
+    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1,
+      report: { kind: "unavailable", lastKnown }, interruption: interrupted ? stopped : null } } };
+  }, 1, undefined, async function* () {
+    subscriptions++;
+    interrupted = true;
+    yield eventPage(0, [{ kind: "machine", observation: stopped }]);
+    assert.fail("interrupted wait requested another event");
+  });
+  const execution = new Execution(machine, "command", 1);
+  const isInterruption = (error) => error instanceof ExecutionInterruptedError && error.generation === 1 && error.observation.state === "stopped";
+  await assert.rejects(execution.waitLeader({ signal: AbortSignal.timeout(1000) }), isInterruption);
+  await assert.rejects(execution.waitCapture({ signal: AbortSignal.timeout(1000) }), isInterruption);
+  assert.equal(subscriptions, 1, "an already committed interruption must not require a subscription");
+  assert.equal((await execution.inspect()).report.lastKnown.state.kind, "running");
+});
+
+test("native interruption preserves reported leader exit but never substitutes for a capture receipt", async () => {
+  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const stopped = { ...fixtureView().machine.value, sequence: 2, state: "stopped", cause: { kind: "native" } };
+  const output = { finalCursor: 0, finalHash: "a".repeat(64) };
+  let state = { kind: "draining", outcome: { kind: "exit", code: 0 } };
+  let captured = false;
+  const machine = fixtureMachine(async (query) => {
+    if (query.kind === "list-events") return eventPage(0, []);
+    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: captured ? { ...request, output } : null, digest: captured ? "b".repeat(64) : null } };
+    assert.equal(query.kind, "get-process");
+    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: stopped,
+      report: { kind: "unavailable", lastKnown: { request, guestPid: 23, lineage: null, state } } } } };
+  });
+  const execution = new Execution(machine, "command", 1);
+  assert.equal((await execution.waitLeader()).state.kind, "draining");
+  await assert.rejects(execution.waitCapture(), ExecutionInterruptedError);
+  state = { kind: "exited", output };
+  await assert.rejects(execution.waitCapture(), ExecutionInterruptedError);
+  captured = true;
+  assert.equal((await execution.waitCapture()).state.kind, "exited");
+});
+
+test("restored execution reservations require reattachment rather than rebinding an old handle", async () => {
+  const request = { machineId: "box", generation: 1, executionId: "command" };
+  const machine = fixtureMachine(async (query) => {
+    if (query.kind === "list-events") return eventPage(0, []);
+    assert.equal(query.kind, "get-process");
+    return { kind: "runtime", response: { kind: "process", request,
+      process: { executionId: "command", generation: 2, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
+  });
+  await assert.rejects(new Execution(machine, "command", 1).waitLeader(), (error) => error instanceof SandsurfHostError && error.category === "stale-generation");
+  assert.equal((await machine.executions.get("command")).generation, 2);
+});
+
+test("output follow yields retained bytes before reporting native interruption", async () => {
+  const bytes = Buffer.from([0, 255, 128, 13, 10]);
+  const stopped = { ...fixtureView().machine.value, sequence: 2, state: "stopped", cause: { kind: "native" } };
+  const machine = fixtureMachine(async (query) => {
+    if (query.kind === "list-events") return eventPage(0, []);
+    if (query.kind === "read-evidence") {
+      const chunks = query.after === 0 ? [{ offset: 0, stream: "stdout", bytes: [...bytes], bytesDigest: createHash("sha256").update(bytes).digest("hex") }] : [];
+      return { kind: "runtime", response: { kind: "output", page: { after: query.after, cursor: bytes.length, available: bytes.length, chunks } } };
+    }
+    if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: null, digest: null } };
+    assert.equal(query.kind, "get-process");
+    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1,
+      report: { kind: "unavailable", lastKnown: null }, interruption: stopped } } };
+  });
+  const execution = new Execution(machine, "command", 1);
+  const stream = execution.output.follow();
+  assert.deepEqual(Buffer.from((await stream.next()).value.bytes), bytes);
+  await assert.rejects(stream.next(), ExecutionInterruptedError);
+  assert.deepEqual(Buffer.from((await execution.output.read()).chunks[0].bytes), bytes);
 });

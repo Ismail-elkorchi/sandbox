@@ -416,6 +416,21 @@ fn native_measurements_are_durable_independent_facts_and_unavailability_is_not_s
     let _child = ChildGuard(child);
     drop(wait_for_guardian(&endpoint));
     let client = GuardianClient::new(endpoint);
+    client.dispatch(fixture.command.clone()).unwrap();
+    let execution: ExecutionId = "dispatch-process".try_into().unwrap();
+    let RuntimeResponse::Processes { processes } = client
+        .runtime(fixture.machine.clone(), RuntimeRequest::Processes)
+        .unwrap()
+    else {
+        panic!("execution list");
+    };
+    assert_eq!(processes.len(), 1);
+    assert_eq!(processes[0].execution_id, execution);
+    assert!(matches!(
+        processes[0].report,
+        Observation::Unavailable { last_known: None }
+    ));
+    assert_eq!(processes[0].interruption, None);
     let initial = client.inspect(fixture.machine.clone(), None).unwrap();
     let Observation::Current { value: initial } = initial.observation else {
         panic!("owned machine");
@@ -466,6 +481,38 @@ fn native_measurements_are_durable_independent_facts_and_unavailability_is_not_s
     assert_eq!(measured.state, MachineState::Stopped);
     assert_eq!(measured.generation, initial.generation);
     assert_eq!(measured.applied_revision, initial.applied_revision);
+    let RuntimeResponse::Process { process, .. } = client
+        .runtime(
+            fixture.machine.clone(),
+            RuntimeRequest::Process {
+                execution_id: execution.clone(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("execution status");
+    };
+    assert_eq!(process.execution_id, execution);
+    assert_eq!(process.generation, Counter::ONE);
+    assert_eq!(process.interruption, Some(measured.clone()));
+    assert!(matches!(
+        process.report,
+        Observation::Unavailable { last_known: None }
+    ));
+    assert!(matches!(
+        client
+            .runtime(
+                fixture.machine.clone(),
+                RuntimeRequest::Receipt {
+                    execution_id: execution
+                }
+            )
+            .unwrap(),
+        RuntimeResponse::Receipt {
+            receipt: None,
+            digest: None
+        }
+    ));
     let host = fixture.host.machine(&fixture.machine).unwrap().unwrap();
     assert_eq!(host.latest_intent.desired, DesiredState::Running);
     assert_eq!(fixture.host.revision(&fixture.machine).unwrap(), n(2));

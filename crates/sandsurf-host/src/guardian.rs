@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 5;
+pub const SERVICE_VERSION: u16 = 6;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -504,6 +504,20 @@ impl<E: GuardianEffect> Guardian<E> {
             }))
     }
 
+    fn execution_status(&self, id: &ExecutionId) -> Result<ExecutionStatus> {
+        let generation = self.journal.execution_generation(id)?;
+        let report = match self.journal.process_snapshot(id)? {
+            Some(value) if self.execution_is_current(&value)? => Observation::Current { value },
+            last_known => Observation::Unavailable { last_known },
+        };
+        Ok(ExecutionStatus {
+            execution_id: id.clone(),
+            generation,
+            report,
+            interruption: self.journal.execution_interruption(generation)?,
+        })
+    }
+
     pub fn handle(&mut self, request: GuardianRequest) -> GuardianResponse {
         match self.handle_inner(request) {
             Ok(response) => response,
@@ -897,40 +911,19 @@ impl<E: GuardianEffect> Guardian<E> {
                     },
                     RuntimeRequest::Process { execution_id } => {
                         let request = self.journal.process_request(&execution_id)?;
-                        let snapshot = self.journal.process_snapshot(&execution_id)?;
-                        let reachable = snapshot
-                            .as_ref()
-                            .map(|snapshot| self.execution_is_current(snapshot))
-                            .transpose()?
-                            .unwrap_or(false);
                         RuntimeResponse::Process {
-                            process: Box::new(Some(match snapshot {
-                                Some(value) if reachable => Observation::Current { value },
-                                Some(value) => Observation::Unavailable {
-                                    last_known: Some(value),
-                                },
-                                None => Observation::Unavailable { last_known: None },
-                            })),
+                            process: Box::new(self.execution_status(&execution_id)?),
                             request,
                         }
                     }
-                    RuntimeRequest::Processes => {
-                        let snapshots = self.journal.process_snapshots()?;
-                        RuntimeResponse::Processes {
-                            processes: snapshots
-                                .into_iter()
-                                .map(|value| {
-                                    Ok(if self.execution_is_current(&value)? {
-                                        Observation::Current { value }
-                                    } else {
-                                        Observation::Unavailable {
-                                            last_known: Some(value),
-                                        }
-                                    })
-                                })
-                                .collect::<Result<Vec<_>>>()?,
-                        }
-                    }
+                    RuntimeRequest::Processes => RuntimeResponse::Processes {
+                        processes: self
+                            .journal
+                            .execution_ids()?
+                            .into_iter()
+                            .map(|id| self.execution_status(&id))
+                            .collect::<Result<Vec<_>>>()?,
+                    },
                     RuntimeRequest::Operation { operation_id } => RuntimeResponse::Operation {
                         operation: self.journal.runtime_operation(&operation_id)?,
                     },
