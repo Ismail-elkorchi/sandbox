@@ -11,7 +11,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 11;
+pub const HOST_API_VERSION: u16 = 12;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -141,7 +141,6 @@ pub enum StoragePayload {
 pub struct MachineView {
     pub id: MachineId,
     pub image_digest: Digest,
-    pub resources: Resources,
     pub runtime_configuration: sandsurf_protocol::RuntimeConfiguration,
     pub configuration_revision: Counter,
     pub reservation: ReservationView,

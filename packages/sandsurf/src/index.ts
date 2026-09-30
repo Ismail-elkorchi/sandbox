@@ -1,4 +1,5 @@
 export {
+  Operation,
   Sandsurf,
   Machine,
   MachineFilesystem,
@@ -12,6 +13,9 @@ export {
   Terminal,
 } from "./sandsurf.js";
 export type {
+  OperationDelivery,
+  OperationInspection,
+  OperationObservation,
   AuthorityChange,
   AuthorityDecision,
   CaptureCommitment,
@@ -72,6 +76,8 @@ export type {
   MachineGenerationPrecondition,
   MachineRevisionPrecondition,
   MachineEvent,
+  MachineEventValue,
+  ConfigurationDeliveryObservation,
   MachineEventPage,
   MachineForkOptions,
   SandsurfAuthorizer,

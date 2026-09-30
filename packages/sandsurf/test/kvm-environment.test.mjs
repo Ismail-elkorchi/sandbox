@@ -218,7 +218,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       for (;;) {
         const event = await stream.next();
         assert.equal(event.done, false);
-        if (event.value.value.kind === "process" && event.value.value.process.request.executionId === streamed.id) break;
+        if (event.value.value.kind === "execution" && event.value.value.execution.request.executionId === streamed.id) break;
       }
     } finally { await stream.return(); }
     assert.equal(exitCode(await streamed.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);

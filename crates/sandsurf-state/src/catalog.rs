@@ -48,7 +48,6 @@ pub struct HostConfigurationOperation {
     pub machine_id: MachineId,
     pub request_digest: Digest,
     pub revision: Counter,
-    pub resources: Resources,
     pub configuration: RuntimeConfiguration,
 }
 
@@ -157,7 +156,6 @@ pub struct SecretRevocationAdmission {
 pub struct MachineRecord {
     pub id: MachineId,
     pub image_digest: Digest,
-    pub resources: Resources,
     pub runtime_configuration: RuntimeConfiguration,
     pub execution_defaults: ExecutionDefaults,
     pub lifetime: MachineLifetime,
@@ -1224,8 +1222,8 @@ impl HostCatalog {
             request_digest,
             phase: SnapshotPhase::Admitted,
             image_digest: machine.image_digest,
-            system_disk_bytes: machine.resources.disk_bytes,
-            resources: machine.resources,
+            system_disk_bytes: machine.runtime_configuration.resources.disk_bytes,
+            resources: machine.runtime_configuration.resources,
             consistency: None,
             system_disk_digest: None,
             manifest_digest: None,
@@ -1292,8 +1290,8 @@ impl HostCatalog {
             request_digest,
             phase: SnapshotPhase::Admitted,
             image_digest: machine.image_digest,
-            system_disk_bytes: machine.resources.disk_bytes,
-            resources: machine.resources,
+            system_disk_bytes: machine.runtime_configuration.resources.disk_bytes,
+            resources: machine.runtime_configuration.resources,
             consistency: None,
             system_disk_digest: None,
             manifest_digest: None,
@@ -1674,7 +1672,7 @@ impl HostCatalog {
         if source.phase != SnapshotPhase::Ready
             || source.request.kind != SnapshotKind::Disk
             || source.image_digest != target.image_digest
-            || source.system_disk_bytes != target.resources.disk_bytes
+            || source.system_disk_bytes != target.runtime_configuration.resources.disk_bytes
         {
             return Err(Error::Conflict(
                 "rollback snapshot is incompatible with the target Machine",
@@ -1900,7 +1898,6 @@ impl HostCatalog {
             machine_id: machine.clone(),
             request_digest: request,
             revision,
-            resources: configuration.resources.clone(),
             configuration,
         };
         capacity(&tx, "configuration_operations", self.limits.operations)?;
@@ -1989,7 +1986,6 @@ impl HostCatalog {
             machine_id: machine.clone(),
             request_digest: request,
             revision,
-            resources,
             configuration,
         };
         capacity(&tx, "configuration_operations", self.limits.operations)?;
@@ -2430,7 +2426,6 @@ fn machine_record(db: &rusqlite::Connection, machine: &MachineId) -> Result<Opti
     Ok(Some(MachineRecord {
         id: machine.clone(),
         image_digest: image.try_into()?,
-        resources: configuration.resources.clone(),
         runtime_configuration: configuration,
         execution_defaults: decode(&defaults)?,
         lifetime: decode(&lifetime)?,

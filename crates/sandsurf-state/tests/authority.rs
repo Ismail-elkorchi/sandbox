@@ -69,7 +69,7 @@ fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     drop(host);
     let database = path.join("authority.sqlite");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection.execute_batch("PRAGMA user_version=12;").unwrap();
+    connection.execute_batch("PRAGMA user_version=13;").unwrap();
     drop(connection);
     let original = fs::read(&database).unwrap();
     assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
@@ -1793,6 +1793,18 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
         )
         .unwrap();
     assert_eq!(first.revision, n(3));
+    let encoded = serde_json::to_value(&first).unwrap();
+    assert!(encoded.get("resources").is_none());
+    assert_eq!(
+        encoded["configuration"]["resources"],
+        serde_json::to_value(&original.runtime_configuration.resources).unwrap()
+    );
+    let encoded_machine = serde_json::to_value(&original).unwrap();
+    assert!(encoded_machine.get("resources").is_none());
+    assert_eq!(
+        encoded_machine["runtimeConfiguration"]["resources"],
+        serde_json::to_value(&original.runtime_configuration.resources).unwrap()
+    );
 
     let second_operation: OperationId = "configure-second".try_into().unwrap();
     let second_digest = hash("configure-second-request");

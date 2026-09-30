@@ -2,7 +2,7 @@ import {
   Sandsurf, SandsurfHostError,
   type Artifact, type AuthorityChange, type ChangeSet, type MachineInspection,
   type MachineGenerationPrecondition, type MachineRevisionPrecondition,
-  type ExecutionStatus,
+  type ExecutionStatus, type MachineEventValue, type OperationInspection,
   type NativeImageImportOptions,
   type OutputBoundary, type OutputSegment,
   type NetworkPolicy, type ResourceUsage, type SecretVersion, type SpawnOptions,
@@ -50,6 +50,15 @@ async function consume(directory: string, image: string): Promise<void> {
     const fork = await snapshot.fork();
     await retained.writeTo(fork, "/tmp/captured");
     const operation = await host.operations.get(snapshot.inspection.operationId);
+    if (operation !== undefined) {
+      const observation: OperationInspection = await operation.inspect();
+      void observation.owner; void observation.observation.kind;
+    }
+    for (const event of (await computer.events.read()).events) {
+      const value: MachineEventValue = event.value;
+      if (value.kind === "execution") void value.execution.state;
+      if (value.kind === "configuration-operation") void value.operation.observation;
+    }
     void policy; void usage; void changes; void operation; void (undefined as SecretVersion | undefined);
   } catch (error) {
     if (!(error instanceof SandsurfHostError)) throw error;

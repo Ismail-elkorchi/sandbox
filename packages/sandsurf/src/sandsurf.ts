@@ -60,7 +60,7 @@ export interface MachineLifecycleIntent { readonly machineId: string; readonly o
 export type StoragePayload = { readonly kind: "present" | "capacity-mismatch"; readonly fileBytes: number } | { readonly kind: "missing" | "unavailable" };
 /** Host storage observations do not attest to the integrity of the Linux filesystem. */
 export type StorageInspection = { readonly kind: "current"; readonly phase: "preparing" | "published" | "attached" | "replacing" | "retiring" | "retired"; readonly format: "raw" | "vhdx"; readonly capacityBytes: number; readonly operationId: string | null; readonly payload: StoragePayload } | { readonly kind: "unavailable"; readonly reason: "ownership-missing" | "ownership-invalid" | "access-unavailable" };
-export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: MachineLifecycleIntent; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly storage: StorageInspection; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
+export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: MachineLifecycleIntent; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly storage: StorageInspection; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
 export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
 export interface NetworkRule { readonly plane: "named-proxy" | "direct-tcp" | "dns"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
 export interface NetworkPolicy { readonly rules: readonly NetworkRule[]; }
@@ -101,11 +101,56 @@ export interface NativeImageImportOptions { readonly manifestPath: string; reado
 export interface ImageInspection { readonly digest: string; readonly sourceDigest: string; readonly platform: string; readonly architecture: string; readonly logicalBytes: number; readonly storageBytes: number; readonly provenanceDigest: string; readonly sensitive: boolean; }
 export interface ImageReleaseInspection { readonly operationId: string; readonly imageDigest: string; readonly requestDigest: string; readonly cleanupPending: boolean; }
 export interface ReceiptView { readonly receipt: Receipt; readonly digest: string; }
+export type OperationDelivery = "admitted" | "dispatched" | "applied" | "not-applied" | "unknown";
+export type OperationObservation =
+  | { readonly kind: "lifecycle"; readonly intent: MachineLifecycleIntent }
+  | { readonly kind: "configuration"; readonly revision: number; readonly configuration: RuntimeConfiguration }
+  | { readonly kind: "transfer"; readonly applied: boolean }
+  | { readonly kind: "image-import"; readonly phase: "admitted" | "published"; readonly image: ImageInspection | null }
+  | { readonly kind: "image-release"; readonly imageDigest: string; readonly cleanupPending: boolean }
+  | { readonly kind: "secret-delivery"; readonly secret: SecretVersion; readonly disclosure: "not-sent" | "possible" | "guest-reported-received"; readonly revoked: boolean; readonly revocationOperation: string | null }
+  | { readonly kind: "secret-put"; readonly secret: SecretVersion; readonly applied: boolean }
+  | { readonly kind: "secret-revocation"; readonly revocation: SecretRevocation }
+  | { readonly kind: "snapshot"; readonly snapshot: SnapshotInspection }
+  | { readonly kind: "rollback"; readonly snapshotId: string; readonly expectedRevision: number; readonly phase: "admitted" | "applied"; readonly evidenceDigest: string | null }
+  | { readonly kind: "guest"; readonly generation: number; readonly requestKind: "spawn" | "close-input" | "write-input" | "acquire-terminal-input" | "release-terminal-input" | "resize-terminal" | "signal" | "terminate" | "filesystem"; readonly delivery: OperationDelivery; readonly evidenceDigest: string | null }
+  | { readonly kind: "receipt-acknowledgement"; readonly executionId: string; readonly receiptDigest: string }
+  | { readonly kind: "output-seal"; readonly segment: OutputSegmentInspection }
+  | { readonly kind: "evidence-release"; readonly executionId: string; readonly status: ReleaseStatus };
+/** An observation of its authoritative store, never client-side authority. */
+export interface OperationInspection {
+  readonly operationId: string;
+  readonly machineId: string | null;
+  readonly owner: "host-authority" | "guardian-journal";
+  readonly requestDigest: string | null;
+  readonly observation: OperationObservation;
+}
 export interface CaptureCommitment { readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string; readonly receiptDigest: string; readonly output: OutputBoundary; }
 export type ReleaseDisposition = { readonly kind: "complete-capture"; readonly commitment: CaptureCommitment } | { readonly kind: "continuing-retention"; readonly segment: string } | { readonly kind: "authorized-loss"; readonly authorization?: string };
 export interface OutputSegmentInspection { readonly id: string; readonly machineId: string; readonly executionId: string; readonly generation: number; readonly output: OutputBoundary; }
 export interface ReleaseStatus { readonly requestDigest: string; readonly cleanupPending: boolean; }
-export interface MachineEvent { readonly cursor: number; readonly value: Readonly<Record<string, unknown>>; readonly digest: string; }
+export interface ConfigurationDeliveryObservation {
+  readonly operationId: string;
+  readonly revision: number;
+  readonly requestDigest: string;
+  readonly configuration: RuntimeConfiguration;
+  readonly delivery: OperationDelivery;
+  readonly evidenceDigest: string | null;
+  readonly observation: ObservationReference | null;
+}
+/** Typed projections of retained facts. Guest execution and delivery reports
+ * remain observations; a receipt event is neither acceptance nor byte retention.
+ */
+export type MachineEventValue =
+  | { readonly kind: "machine"; readonly observation: NativeMachineObservation }
+  | { readonly kind: "guest-operation"; readonly operation: OperationInspection }
+  | { readonly kind: "lifecycle-operation"; readonly operation: ConfigurationDeliveryObservation & { readonly desired: DesiredMachineState } }
+  | { readonly kind: "configuration-operation"; readonly operation: ConfigurationDeliveryObservation }
+  | { readonly kind: "execution"; readonly execution: ExecutionInspection }
+  | { readonly kind: "output"; readonly executionId: string; readonly boundary: OutputBoundary }
+  | { readonly kind: "receipt"; readonly executionId: string; readonly receiptDigest: string }
+  | { readonly kind: "evidence-release"; readonly executionId: string; readonly requestDigest: string; readonly cleanupPending: boolean };
+export interface MachineEvent { readonly cursor: number; readonly value: MachineEventValue; readonly digest: string; }
 export interface MachineEventPage { readonly cursor: number; readonly available: number; readonly events: readonly MachineEvent[]; }
 
 export class Sandsurf {
@@ -152,19 +197,133 @@ export class Sandsurf {
 export class SandsurfOperations {
   readonly #host: Sandsurf;
   constructor(host: Sandsurf) { this.#host = host; }
-  async get(operationId: string, options: { readonly machineId?: string } = {}): Promise<Readonly<Record<string, unknown>> | undefined> {
-    const response = await this.#host[transport](options.machineId === undefined
-      ? { kind: "get-host-operation", operationId: validateIdentity(operationId) }
-      : { kind: "get-operation", operationId: validateIdentity(operationId), machineId: validateIdentity(options.machineId) });
-    if (response.kind === "runtime" && record(response.response) && response.response.kind === "operation") {
-      return response.response.operation === null ? undefined : record(response.response.operation) ? response.response.operation : (() => { throw protocol("operation record"); })();
-    }
-    if (response.kind !== "host-operation") throw protocol("host operation response");
-    if (response.value === null) return undefined;
-    if (!record(response.value)) throw protocol("host operation record");
-    return response.value;
+  async get(operationId: string, options: { readonly machineId?: string } = {}): Promise<Operation | undefined> {
+    const id = validateIdentity(operationId);
+    const machineId = options.machineId === undefined ? undefined : validateIdentity(options.machineId);
+    const observation = await inspectOperation(this.#host, id, machineId);
+    return observation === undefined ? undefined : new Operation(this.#host, observation, machineId);
   }
 }
+
+export class Operation {
+  readonly id: string;
+  readonly #host: Sandsurf;
+  readonly #machineId: string | undefined;
+  #observation: OperationInspection;
+  constructor(host: Sandsurf, observation: OperationInspection, machineId?: string) {
+    this.id = observation.operationId; this.#host = host; this.#machineId = machineId; this.#observation = observation;
+  }
+  get observation(): OperationInspection { return this.#observation; }
+  async inspect(): Promise<OperationInspection> {
+    const observation = await inspectOperation(this.#host, this.id, this.#machineId);
+    if (observation === undefined) throw new SandsurfHostError("missing", `Operation ${this.id} is no longer observable`);
+    this.#observation = observation;
+    return observation;
+  }
+}
+
+async function inspectOperation(host: Sandsurf, operationId: string, machineId?: string): Promise<OperationInspection | undefined> {
+  const response = await host[transport](machineId === undefined ? { kind: "get-host-operation", operationId }
+    : { kind: "get-operation", operationId, machineId });
+  try {
+    if (response.kind === "host-operation") {
+      if (response.value === null) return undefined;
+      return parseOperationRecord(response.value, operationId, machineId, "host-authority");
+    }
+    if (machineId === undefined || response.kind !== "runtime" || !record(response.response) || response.response.kind !== "operation") throw protocol("operation response");
+    if (response.response.operation === null) return undefined;
+    return parseOperationRecord(response.response.operation, operationId, machineId, "guardian-journal");
+  } catch (error) {
+    if (error instanceof SandsurfHostError) throw error;
+    throw protocol("operation observation");
+  }
+}
+
+function parseOperationRecord(raw: unknown, expectedId: string, expectedMachine: string | undefined, owner: OperationInspection["owner"]): OperationInspection {
+  if (!record(raw)) throw protocol("operation record");
+  const kind = text(raw.kind);
+  const value = owner === "host-authority" ? raw.value : raw;
+  if (!record(value)) throw protocol("operation value");
+  let operationId: string; let machineId: string | null; let requestDigest: string | null;
+  let observation: OperationObservation;
+  if (owner === "host-authority") {
+    const identity = kind === "snapshot" ? value.request : value;
+    if (!record(identity)) throw protocol("operation identity");
+    operationId = validateIdentity(text(identity.operationId));
+    machineId = ["image-import", "image-release", "secret-put"].includes(kind) ? null : validateIdentity(text(identity.machineId));
+    requestDigest = digest(text(value.requestDigest));
+    switch (kind) {
+      case "lifecycle": observation = { kind, intent: parseLifecycleIntent(value, machineId!) }; break;
+      case "configuration":
+        if (!record(value.configuration) || integer(value.revision) < 1) throw protocol("configuration operation");
+        observation = { kind, revision: integer(value.revision), configuration: parseRuntimeConfiguration(value.configuration) }; break;
+      case "transfer": observation = { kind, applied: operationBoolean(value.applied) }; break;
+      case "image-import": {
+        const phase = text(value.phase);
+        if (phase !== "admitted" && phase !== "published") throw protocol("image import phase");
+        const image = value.image === null ? null : parseImage(value.image);
+        if ((phase === "published") !== (image !== null)) throw protocol("image import completion");
+        observation = { kind, phase, image }; break;
+      }
+      case "image-release": observation = { kind, imageDigest: digest(text(value.imageDigest)), cleanupPending: operationBoolean(value.cleanupPending) }; break;
+      case "secret-delivery": {
+        const disclosure = value.disclosure;
+        if (!record(value.delivery) || !record(value.delivery.secret) || (disclosure !== "not-sent" && disclosure !== "possible" && disclosure !== "guest-reported-received")) throw protocol("secret delivery observation");
+        observation = { kind, secret: parseSecret(value.delivery.secret), disclosure, revoked: operationBoolean(value.revoked),
+          revocationOperation: value.revocationOperation === null ? null : validateIdentity(text(value.revocationOperation)) }; break;
+      }
+      case "secret-put":
+        if (!record(value.secret)) throw protocol("secret put observation");
+        observation = { kind, secret: parseSecret(value.secret), applied: operationBoolean(value.applied) }; break;
+      case "secret-revocation": observation = { kind, revocation: parseSecretRevocation(value) }; break;
+      case "snapshot": observation = { kind, snapshot: parseSnapshot(value) }; break;
+      case "rollback": {
+        const phase = text(value.phase); const evidenceDigest = operationEvidence(value.evidenceDigest);
+        if ((phase !== "admitted" && phase !== "applied") || integer(value.expectedRevision) < 1 || (phase === "applied" && evidenceDigest === null)) throw protocol("rollback observation");
+        observation = { kind, snapshotId: validateIdentity(text(value.snapshotId)), expectedRevision: integer(value.expectedRevision), phase, evidenceDigest }; break;
+      }
+      default: throw protocol("host operation kind");
+    }
+  } else {
+    if (expectedMachine === undefined) throw protocol("guardian operation scope");
+    machineId = expectedMachine;
+    switch (kind) {
+      case "guest": {
+        const operation = value.operation;
+        if (!record(operation) || !record(operation.admission) || !record(operation.admission.request) || !record(operation.admission.request.request)) throw protocol("guest operation admission");
+        const command = operation.admission.request;
+        if (!record(command.request)) throw protocol("guest operation request");
+        operationId = validateIdentity(text(command.operationId)); machineId = validateIdentity(text(command.machineId)); requestDigest = digest(text(command.requestDigest));
+        const generation = integer(command.generation); const requestKind = text(command.request.kind); const delivery = text(operation.delivery);
+        if (generation < 1 || !["spawn", "close-input", "write-input", "acquire-terminal-input", "release-terminal-input", "resize-terminal", "signal", "terminate", "filesystem"].includes(requestKind) ||
+            !["admitted", "dispatched", "applied", "not-applied", "unknown"].includes(delivery)) throw protocol("guest operation observation");
+        const metadata = { request: command.request, binary: operation.admission.binary };
+        if (requestDigest !== sandsurfDigest("operation", ["sandsurf-guest-command-v2", machineId, generation, operationId, metadata])) throw protocol("guest operation admission digest");
+        observation = { kind, generation, requestKind: requestKind as Extract<OperationObservation, { kind: "guest" }>["requestKind"], delivery: delivery as OperationDelivery, evidenceDigest: operationEvidence(operation.evidenceDigest) }; break;
+      }
+      case "receipt-acknowledgement":
+        operationId = validateIdentity(text(value.operationId)); requestDigest = null;
+        observation = { kind, executionId: validateIdentity(text(value.executionId)), receiptDigest: digest(text(value.receiptDigest)) }; break;
+      case "output-seal": {
+        operationId = validateIdentity(text(value.operationId)); requestDigest = digest(text(value.requestDigest));
+        const segment = parseOutputSegmentMetadata(value.segment);
+        if (segment.machineId !== machineId) throw protocol("output operation machine identity");
+        observation = { kind, segment }; break;
+      }
+      case "evidence-release": {
+        if (!record(value.request) || !record(value.status)) throw protocol("release operation");
+        operationId = validateIdentity(text(value.request.operationId));
+        const status = parseReleaseStatus(value.status); requestDigest = status.requestDigest;
+        observation = { kind, executionId: validateIdentity(text(value.executionId)), status }; break;
+      }
+      default: throw protocol("guardian operation kind");
+    }
+  }
+  if (operationId !== expectedId || (expectedMachine !== undefined && machineId !== expectedMachine)) throw protocol("operation identity differs from requested scope");
+  return { operationId, machineId, owner, requestDigest, observation };
+}
+function operationBoolean(value: unknown): boolean { if (typeof value !== "boolean") throw protocol("operation boolean"); return value; }
+function operationEvidence(value: unknown): string | null { return value === null ? null : digest(text(value)); }
 
 export class SecretCollection {
   readonly #host: Sandsurf;
@@ -257,7 +416,7 @@ export class Snapshot {
     const lifetime = normalizeLifetime(options.lifetime);
     const approvalId = await this.#host[authorize]({ kind: "fork", machineId, operationId, request: { snapshotId: this.id, sourceMachineId: this.inspection.machineId, resources, lifetime } });
     const response = await this.#host[transport]({ kind: "fork-machine", machineId, snapshotId: this.id, resources, lifetime, operationId, approvalId });
-    const machine = new Machine(this.#host, machineViewFrom(response));
+    const machine = new Machine(this.#host, machineViewFrom(response, machineId));
     return machine;
   }
   async publishImage(options: DerivedImagePublishOptions = {}): Promise<Image> {
@@ -282,10 +441,13 @@ export class MachineCollection {
     const executionDefaults = normalizeExecutionDefaults(options);
     const approvalId = await this.#host[authorize]({ kind: "machine-create", machineId, operationId, request: { image: options.image, resources, executionDefaults, network: { rules: [] }, lifetime } });
     const response = await this.#host[transport]({ kind: "create-machine", machineId, imageDigest: options.image, resources, executionDefaults, lifetime, operationId, approvalId });
-    const machine = new Machine(this.#host, machineViewFrom(response));
+    const machine = new Machine(this.#host, machineViewFrom(response, machineId));
     return machine;
   }
-  async connect(id: string): Promise<Machine> { return new Machine(this.#host, machineViewFrom(await this.#host[transport]({ kind: "get-machine", machineId: validateIdentity(id) }))); }
+  async connect(id: string): Promise<Machine> {
+    const machineId = validateIdentity(id);
+    return new Machine(this.#host, machineViewFrom(await this.#host[transport]({ kind: "get-machine", machineId }), machineId));
+  }
   async list(options: { readonly after?: string; readonly maximum?: number } = {}): Promise<readonly Machine[]> {
     const response = await this.#host[transport]({ kind: "list-machines", after: options.after ?? null, maximum: options.maximum ?? 100 });
     if (response.kind !== "machines" || !Array.isArray(response.values)) throw protocol("machine list response");
@@ -376,12 +538,14 @@ export class MachineSnapshots {
     if (response.kind !== "snapshot" || !record(response.value)) throw protocol("snapshot response");
     return new Snapshot(this.#host, parseSnapshot(response.value));
   }
-  async rollback(snapshotId: string, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<Readonly<Record<string, unknown>>> {
+  async rollback(snapshotId: string, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<Operation> {
     const id = validateIdentity(snapshotId); const operationId = validateIdentity(options.operationId ?? identity("rollback")); const expectedRevision = await resolveRevisionPrecondition(this.#machine, options.expectedRevision);
     const approvalId = await this.#machine[authorize]({ kind: "snapshot", machineId: this.#machine.id, operationId, request: { action: "rollback", snapshotId: id, expectedRevision } });
     const response = await this.#machine[transport]({ kind: "rollback-filesystem", machineId: this.#machine.id, snapshotId: id, operationId, expectedRevision, approvalId });
     if (response.kind !== "rollback" || !record(response.value)) throw protocol("rollback response");
-    return response.value;
+    const observation = parseOperationRecord({ kind: "rollback", value: response.value }, operationId, this.#machine.id, "host-authority");
+    if (observation.observation.kind !== "rollback" || observation.observation.snapshotId !== id || observation.observation.expectedRevision !== expectedRevision) throw protocol("rollback admission identity");
+    return new Operation(this.#host, observation, this.#machine.id);
   }
 }
 
@@ -486,7 +650,10 @@ export class MachineEvents {
         try { expectedDigest = sandsurfDigest("operation", ["sandsurf-runtime-event-v1", this.#machine.id, eventCursor, event.value]); }
         catch { throw protocol("runtime event digest input"); }
         if (eventCursor !== ++expected || eventDigest !== expectedDigest) throw protocol("runtime event coverage or digest");
-        return Object.freeze({ cursor: eventCursor, value: Object.freeze({ ...event.value }), digest: eventDigest });
+        let value: MachineEventValue;
+        try { value = parseMachineEventValue(event.value, this.#machine.id); }
+        catch { throw protocol("runtime event observation"); }
+        return Object.freeze({ cursor: eventCursor, value: Object.freeze(value), digest: eventDigest });
     });
     if (events.length > maximum || expected !== cursor || cursor > available) throw protocol("runtime event page boundary");
     return Object.freeze({ cursor, available, events: Object.freeze(parsed) });
@@ -538,7 +705,7 @@ export class ExecutionCollection {
     const user = options.user ?? view.executionDefaults.user ?? "root";
     const activeDeadlineMillis = options.activeDeadlineMs ?? null; if (activeDeadlineMillis !== null && (!Number.isSafeInteger(activeDeadlineMillis) || activeDeadlineMillis <= 0 || activeDeadlineMillis > 30 * 24 * 60 * 60 * 1000)) throw new TypeError("active process deadline must be a positive safe integer no greater than 30 days");
     const elapsedDeadlineUnixMillis = options.elapsedDeadlineUnixMs ?? null; if (elapsedDeadlineUnixMillis !== null && (!Number.isSafeInteger(elapsedDeadlineUnixMillis) || elapsedDeadlineUnixMillis <= 0)) throw new TypeError("elapsed process deadline must be a positive Unix millisecond value");
-    const outputBudget = integer(view.resources.outputBytes);
+    const outputBudget = integer(view.runtimeConfiguration.resources.outputBytes);
     const outputBytes = options.outputBytes ?? Math.max(1, Math.min(16 * 1024 * 1024, Math.floor(outputBudget / 8)));
     if (!Number.isSafeInteger(outputBytes) || outputBytes < 1 || outputBytes > outputBudget) throw new TypeError("process output reservation must fit the Machine output budget");
     await this.#machine[dispatchGuest]({ kind: "spawn", request: { machineId: this.#machine.id, generation: authority.expectedGeneration, executionId, operationId, argv: [...options.argv], cwd: options.cwd ?? view.executionDefaults.workingDirectory ?? "/", environment: { ...view.executionDefaults.environment, ...(options.environment ?? {}) }, user, stdio, terminalSize, activeDeadlineMillis, elapsedDeadlineUnixMillis, outputBytes } }, operationId, authority);
@@ -669,8 +836,8 @@ export class Execution {
         if (reported !== null && reported.request.generation === this.generation && reported.state.kind !== "running" && await complete(reported)) return reported;
         requireExecutionContinuity(this, latest);
       }
-      if (event.value.kind !== "process" || !record(event.value.process)) continue;
-      const process = parseExecutionInspection(event.value.process);
+      if (event.value.kind !== "execution") continue;
+      const process = event.value.execution;
       if (process.request.executionId === this.id && process.request.generation === this.generation && await complete(process)) return process;
     }
     if (options.signal !== undefined) throw options.signal.reason;
@@ -1013,7 +1180,7 @@ export class MachineArtifacts {
     const view = await this.#machine.inspect();
     const expectedRevision = expectedCounter(options.expectedRevision, "expected revision") ?? view.configurationRevision;
     const expectedGeneration = expectedCounter(options.expectedGeneration, "expected generation") ?? currentMachine(view).generation;
-    const maximumBytes = options.maximumBytes ?? Math.min(view.resources.diskBytes, 128 * 1024 ** 3);
+    const maximumBytes = options.maximumBytes ?? Math.min(view.runtimeConfiguration.resources.diskBytes, 128 * 1024 ** 3);
     if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0 || maximumBytes > 128 * 1024 ** 3) throw new TypeError("artifact capture bound is invalid");
     const response = await this.#machine[transport]({ kind: "capture-guest-tree", machineId: this.#machine.id, source: path, operationId, expectedRevision, expectedGeneration, maximumBytes });
     if (response.kind !== "host-tree-capture" || !record(response.capture)) throw protocol("artifact capture");
@@ -1131,7 +1298,7 @@ function normalizeResources(value: ResourceEnvelope): Required<ResourceEnvelope>
   for (const item of [value.vcpus, value.memoryMiB, value.diskBytes, outputBytes, managedExecutions]) if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError("resource values must be positive safe integers");
   return { vcpus: value.vcpus, memoryMiB: value.memoryMiB, diskBytes: value.diskBytes, outputBytes, managedExecutions };
 }
-function normalizeExecutionDefaults(options: MachineCreateOptions): Readonly<Record<string, unknown>> {
+function normalizeExecutionDefaults(options: Pick<MachineCreateOptions, "environment" | "user" | "workingDirectory">): ImageDefaults {
   const environment = { ...(options.environment ?? {}) };
   const entries = Object.entries(environment);
   if (entries.length > 4096 || entries.some(([name, value]) => name.length < 1 || name.length > 512 || name.includes("\0") || name.includes("=") || typeof value !== "string" || value.length > 64 * 1024 || value.includes("\0"))) throw new TypeError("Machine environment is malformed");
@@ -1148,16 +1315,57 @@ function normalizeLifetime(value: MachineLifetimePolicy | undefined): Readonly<{
   if (expirationAction !== "stop" && expirationAction !== "destroy") throw new TypeError("Machine expiration action is invalid");
   return { expiresAtUnixMillis, expirationAction };
 }
-function machineViewFrom(response: Record<string, unknown>): MachineInspection { if (response.kind === "lifecycle") { if (!record(response.operation) || typeof response.operation.delivery !== "string") throw protocol("lifecycle operation"); if (response.operation.delivery !== "applied") throw new SandsurfHostError(response.operation.delivery === "not-applied" ? "not-applied" : "ambiguous", `Lifecycle operation was ${response.operation.delivery}`); } const value = response.kind === "machine" ? response.value : response.kind === "lifecycle" ? response.machine : undefined; if (!record(value)) throw protocol("machine response"); return parseView(value); }
-function parseView(value: unknown): MachineInspection { if (!record(value) || !record(value.resources) || !record(value.runtimeConfiguration) || !record(value.lifecycleIntent) || !record(value.machine) || !record(value.executionDefaults) || !record(value.lifetime)) throw protocol("machine view"); const expirationAction = text(value.lifetime.expirationAction); if (expirationAction !== "stop" && expirationAction !== "destroy") throw protocol("Machine lifetime policy"); const lifetime = { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction }; return { ...value, lifecycleIntent: parseLifecycleIntent(value.lifecycleIntent, text(value.id)), storage: parseStorageInspection(value.storage), machine: parseMachineObservation(value.machine, text(value.id)), lifetime, lastActivityUnixMillis: integer(value.lastActivityUnixMillis), runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration) } as unknown as MachineInspection; }
+function machineViewFrom(response: Record<string, unknown>, expectedId?: string): MachineInspection {
+  if (response.kind === "lifecycle") {
+    if (!record(response.operation)) throw protocol("lifecycle operation");
+    const delivery = parseOperationDelivery(response.operation.delivery);
+    if (delivery !== "applied") throw new SandsurfHostError(delivery === "not-applied" ? "not-applied" : "ambiguous", `Lifecycle operation was ${delivery}`);
+  }
+  const value = response.kind === "machine" ? response.value : response.kind === "lifecycle" ? response.machine : undefined;
+  const view = parseView(value);
+  if (expectedId !== undefined && view.id !== expectedId) throw protocol("machine response identity");
+  return view;
+}
+function parseView(value: unknown): MachineInspection {
+  try {
+    if (!record(value) || !record(value.runtimeConfiguration) || !record(value.machine) || !record(value.executionDefaults) || !record(value.executionDefaults.environment) || !record(value.lifetime)) throw protocol("machine view");
+    const id = validateIdentity(text(value.id)); const configurationRevision = integer(value.configurationRevision);
+    const reservation = text(value.reservation); const expirationAction = text(value.lifetime.expirationAction);
+    if (configurationRevision < 1 || (reservation !== "held" && reservation !== "released") || (expirationAction !== "stop" && expirationAction !== "destroy")) throw protocol("machine authority view");
+    const environment: Record<string, string> = Object.fromEntries(Object.entries(value.executionDefaults.environment).map(([name, entry]) => [name, text(entry)]));
+    const executionDefaults = normalizeExecutionDefaults({ environment,
+      ...(value.executionDefaults.user === null ? {} : { user: text(value.executionDefaults.user) }),
+      ...(value.executionDefaults.workingDirectory === null ? {} : { workingDirectory: text(value.executionDefaults.workingDirectory) }),
+    });
+    const lifecycleIntent = parseLifecycleIntent(value.lifecycleIntent, id);
+    if (lifecycleIntent.revision > configurationRevision) throw protocol("lifecycle intent exceeds host revision");
+    return {
+      id, imageDigest: digest(text(value.imageDigest)), configurationRevision, reservation, knownSensitive: operationBoolean(value.knownSensitive),
+      runtimeConfiguration: parseRuntimeConfiguration(value.runtimeConfiguration),
+      lifecycleIntent, machine: parseMachineObservation(value.machine, id), management: parseManagementObservation(value.management), storage: parseStorageInspection(value.storage),
+      executionDefaults, lifetime: { expiresAtUnixMillis: value.lifetime.expiresAtUnixMillis === null ? null : integer(value.lifetime.expiresAtUnixMillis), expirationAction },
+      lastActivityUnixMillis: integer(value.lastActivityUnixMillis),
+    };
+  } catch (error) {
+    if (error instanceof SandsurfHostError) throw error;
+    throw protocol("machine view");
+  }
+}
+function parseManagementObservation(raw: unknown): ManagementObservation {
+  if (!record(raw)) throw protocol("management observation");
+  const report = (value: unknown): ManagementReport => {
+    if (!record(value) || !record(value.identity) || integer(value.generation) < 1) throw protocol("management report");
+    return { generation: integer(value.generation), observedUnixMillis: integer(value.observedUnixMillis),
+      identity: { bootId: validateIdentity(text(value.identity.bootId)), instanceId: validateIdentity(text(value.identity.instanceId)) } };
+  };
+  if (raw.kind === "current") return { kind: "current", value: report(raw.value) };
+  if (raw.kind === "unavailable") return { kind: "unavailable", lastKnown: raw.lastKnown === null ? null : report(raw.lastKnown) };
+  throw protocol("management availability");
+}
 
 function parseLifecycleIntent(value: unknown, machineId: string): MachineLifecycleIntent {
   if (!record(value) || text(value.machineId) !== machineId || !["running", "paused", "stopped", "suspended", "destroyed"].includes(text(value.desired)) || integer(value.revision) < 1) throw protocol("machine lifecycle intent");
-  let completion: ObservationReference | null = null;
-  if (value.completion !== null) {
-    if (!record(value.completion) || text(value.completion.machineId) !== machineId || integer(value.completion.generation) < 1 || integer(value.completion.sequence) < 1) throw protocol("lifecycle completion reference");
-    completion = { machineId, generation: integer(value.completion.generation), sequence: integer(value.completion.sequence), digest: digest(text(value.completion.digest)) };
-  }
+  const completion = parseObservationReference(value.completion, machineId);
   return { machineId, operationId: validateIdentity(text(value.operationId)), desired: value.desired as DesiredMachineState, revision: integer(value.revision), requestDigest: digest(text(value.requestDigest)), completion };
 }
 
@@ -1258,11 +1466,71 @@ function requireExecutionContinuity(execution: Execution, status: ExecutionStatu
 function runtimeEventBelongsToProcess(event: MachineEvent, executionId: string): boolean {
   const value = event.value;
   if ((value.kind === "output" || value.kind === "receipt" || value.kind === "evidence-release") && value.executionId === executionId) return true;
-  return value.kind === "machine" || (value.kind === "process" && record(value.process) && record(value.process.request) && value.process.request.executionId === executionId);
+  return value.kind === "machine" || (value.kind === "execution" && value.execution.request.executionId === executionId);
+}
+function parseMachineEventValue(value: Record<string, unknown>, machineId: string): MachineEventValue {
+  const fields: Record<string, readonly string[]> = {
+    machine: ["observation"], "guest-operation": ["operation"], "lifecycle-operation": ["operation"], "configuration-operation": ["operation"],
+    process: ["process"], output: ["executionId", "boundary"], receipt: ["executionId", "receiptDigest"],
+    "evidence-release": ["executionId", "requestDigest", "cleanupPending"],
+  };
+  const required = fields[text(value.kind)];
+  if (required === undefined || required.some((key) => !Object.hasOwn(value, key)) || Object.keys(value).some((key) => key !== "kind" && !required.includes(key))) throw protocol("runtime event fields");
+  switch (value.kind) {
+    case "machine": {
+      const parsed = parseMachineObservation({ kind: "current", value: value.observation }, machineId);
+      if (parsed.kind !== "current") throw protocol("native event observation");
+      return { kind: "machine", observation: parsed.value };
+    }
+    case "guest-operation": {
+      const operation = value.operation;
+      if (!record(operation) || !record(operation.admission) || !record(operation.admission.request)) throw protocol("guest event admission");
+      return { kind: "guest-operation", operation: parseOperationRecord({ kind: "guest", operation }, validateIdentity(text(operation.admission.request.operationId)), machineId, "guardian-journal") };
+    }
+    case "lifecycle-operation": case "configuration-operation": {
+      const raw = value.operation;
+      if (!record(raw) || !record(raw.command) || !record(raw.command.configuration) || raw.command.machineId !== machineId) throw protocol("configuration event identity");
+      const revision = integer(raw.command.revision);
+      if (revision < 1) throw protocol("configuration event revision");
+      const operation: ConfigurationDeliveryObservation = {
+        operationId: validateIdentity(text(raw.command.operationId)), revision, requestDigest: digest(text(raw.command.requestDigest)),
+        configuration: parseRuntimeConfiguration(raw.command.configuration), delivery: parseOperationDelivery(raw.delivery),
+        evidenceDigest: operationEvidence(raw.evidenceDigest), observation: parseObservationReference(raw.observation, machineId),
+      };
+      if (value.kind === "configuration-operation") return { kind: value.kind, operation };
+      const desired = text(raw.command.desired);
+      if (!["running", "paused", "stopped", "suspended", "destroyed"].includes(desired)) throw protocol("lifecycle event intent");
+      return { kind: value.kind, operation: { ...operation, desired: desired as DesiredMachineState } };
+    }
+    case "process": {
+      const execution = parseExecutionInspection(value.process);
+      if (execution.request.machineId !== machineId) throw protocol("execution event identity");
+      return { kind: "execution", execution };
+    }
+    case "output":
+      validateSandsurfOutputBoundary(value.boundary);
+      return { kind: "output", executionId: validateIdentity(text(value.executionId)), boundary: { ...value.boundary } };
+    case "receipt": return { kind: "receipt", executionId: validateIdentity(text(value.executionId)), receiptDigest: digest(text(value.receiptDigest)) };
+    case "evidence-release": return { kind: "evidence-release", executionId: validateIdentity(text(value.executionId)), requestDigest: digest(text(value.requestDigest)), cleanupPending: operationBoolean(value.cleanupPending) };
+    default: throw protocol("runtime event kind");
+  }
+}
+function parseOperationDelivery(value: unknown): OperationDelivery {
+  const delivery = text(value);
+  if (!["admitted", "dispatched", "applied", "not-applied", "unknown"].includes(delivery)) throw protocol("operation delivery");
+  return delivery as OperationDelivery;
+}
+function parseObservationReference(value: unknown, machineId: string): ObservationReference | null {
+  if (value === null) return null;
+  if (!record(value) || value.machineId !== machineId || integer(value.generation) < 1 || integer(value.sequence) < 1) throw protocol("observation reference identity");
+  return { machineId, generation: integer(value.generation), sequence: integer(value.sequence), digest: digest(text(value.digest)) };
 }
 function parseOutputSegmentResponse(response: unknown): OutputSegmentInspection {
   if (!record(response) || response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output-segment" || !record(response.response.segment)) throw protocol("output segment response");
-  const value = response.response.segment;
+  return parseOutputSegmentMetadata(response.response.segment);
+}
+function parseOutputSegmentMetadata(value: unknown): OutputSegmentInspection {
+  if (!record(value) || integer(value.generation) < 1) throw protocol("output segment metadata");
   validateSandsurfOutputBoundary(value.output);
   return { id: validateIdentity(text(value.id)), machineId: validateIdentity(text(value.machineId)),
     executionId: validateIdentity(text(value.executionId)), generation: integer(value.generation), output: value.output };
@@ -1310,10 +1578,10 @@ function parseSecretRevocation(value: Record<string, unknown>): SecretRevocation
     environmentBindingsRemoved: integer(evidence.environmentBindingsRemoved),
     recipientsTerminated: identityList(evidence.recipientsTerminated),
     recipientsAlreadyStopped: identityList(evidence.recipientsAlreadyStopped),
-    residualCopiesPossible: evidence.residualCopiesPossible === true,
-    actionsReportedComplete: evidence.actionsReportedComplete === true,
+    residualCopiesPossible: operationBoolean(evidence.residualCopiesPossible),
+    actionsReportedComplete: operationBoolean(evidence.actionsReportedComplete),
   };
-  return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.secret), terminateRecipients: value.terminateRecipients === true, futureDeliveryRevoked: true, guestCleanupReport: parsedEvidence };
+  return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.secret), terminateRecipients: operationBoolean(value.terminateRecipients), futureDeliveryRevoked: true, guestCleanupReport: parsedEvidence };
 }
 function identityList(value: unknown): readonly string[] { if (!Array.isArray(value) || value.length > 1024) throw protocol("identity list"); return value.map((item) => validateIdentity(text(item))); }
 function parseUsage(value: Record<string, unknown>): ResourceUsage { return { cpuMicros: value.cpuMicros === null ? null : integer(value.cpuMicros), memoryCurrent: value.memoryCurrent === null ? null : integer(value.memoryCurrent), memoryPeak: value.memoryPeak === null ? null : integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: value.ioReadBytes === null ? null : integer(value.ioReadBytes), ioWriteBytes: value.ioWriteBytes === null ? null : integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), executionsCurrent: integer(value.executionsCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
@@ -1331,7 +1599,7 @@ function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string
 }
 function parseImage(value: unknown): ImageInspection {
   if (!record(value)) throw protocol("image record");
-  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), storageBytes: integer(value.storageBytes), provenanceDigest: digest(text(value.provenanceDigest)), sensitive: value.sensitive === true };
+  return { digest: digest(text(value.digest)), sourceDigest: digest(text(value.sourceDigest)), platform: text(value.platform), architecture: text(value.architecture), logicalBytes: integer(value.logicalBytes), storageBytes: integer(value.storageBytes), provenanceDigest: digest(text(value.provenanceDigest)), sensitive: operationBoolean(value.sensitive) };
 }
 function parseSnapshot(value: unknown): SnapshotInspection {
   if (!record(value) || !record(value.request) || !record(value.resources)) throw protocol("snapshot record");
@@ -1339,9 +1607,9 @@ function parseSnapshot(value: unknown): SnapshotInspection {
   if (consistency !== null && !["crash", "machine"].includes(consistency)) throw protocol("snapshot consistency");
   const kind = text(value.request.kind) as SnapshotKind; if (kind !== "disk" && kind !== "full") throw protocol("snapshot kind");
   const phase = text(value.phase) as SnapshotInspection["phase"]; if (!["admitted", "capturing", "ready"].includes(phase)) throw protocol("snapshot phase");
-  return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), machineId: validateIdentity(text(value.request.machineId)), expectedGeneration: integer(value.request.expectedGeneration), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: normalizeResources(value.resources as unknown as ResourceEnvelope), consistency, systemDiskDigest: value.systemDiskDigest === null ? null : digest(text(value.systemDiskDigest)), systemDiskBytes: integer(value.systemDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: value.sensitive === true };
+  return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), machineId: validateIdentity(text(value.request.machineId)), expectedGeneration: integer(value.request.expectedGeneration), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: normalizeResources(value.resources as unknown as ResourceEnvelope), consistency, systemDiskDigest: value.systemDiskDigest === null ? null : digest(text(value.systemDiskDigest)), systemDiskBytes: integer(value.systemDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: operationBoolean(value.sensitive) };
 }
-function parseReleaseStatus(value: Record<string, unknown>): ReleaseStatus { return { requestDigest: digest(text(value.requestDigest)), cleanupPending: value.cleanupPending === true }; }
+function parseReleaseStatus(value: Record<string, unknown>): ReleaseStatus { return { requestDigest: digest(text(value.requestDigest)), cleanupPending: operationBoolean(value.cleanupPending) }; }
 function normalizeExclusions(values: readonly string[]): ReadonlySet<string> {
   const result = new Set<string>();
   for (const value of values) {

@@ -57,8 +57,11 @@ try {
       assert.equal((await host.images.importNative(nativeImport)).id, nativeImage.id);
       assert.equal((await host.images.get(nativeImage.id)).id, nativeImage.id);
       const retained = await host.operations.get("installed-put");
-      assert.equal(retained.kind, "secret-put");
-      assert.equal(retained.value.secret.version, secret.version);
+      assert.equal(retained.id, "installed-put");
+      const operation = await retained.inspect();
+      assert.equal(operation.owner, "host-authority");
+      assert.equal(operation.observation.kind, "secret-put");
+      assert.equal(operation.observation.secret.version, secret.version);
       assert.equal((await host.machines.list()).length, 0);
     } finally {
       await host.close();
@@ -72,9 +75,12 @@ try {
     "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer);
   const lock = await readFile(resolve(consumer, "package-lock.json"), "utf8");
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
-  if (process.env.SANDSURF_KVM_TEST === "1") {
-    if (process.platform !== "linux" || process.arch !== "x64") throw new Error("installed KVM qualification requires a Linux x64 host");
-    await run(process.execPath, ["--test", "--test-concurrency=1", resolve("packages/sandsurf/test/kvm-environment.test.mjs"), resolve("packages/sandsurf/test/systemd-machine.test.mjs")], consumer, {
+  const hardwareTests: string[] = [];
+  if (process.env.SANDSURF_KVM_TEST === "1") hardwareTests.push(resolve("packages/sandsurf/test/kvm-environment.test.mjs"));
+  if (process.env.SANDSURF_SERVICE_MANAGER_TEST === "1") hardwareTests.push(resolve("packages/sandsurf/test/systemd-machine.test.mjs"));
+  if (hardwareTests.length !== 0) {
+    if (process.platform !== "linux" || process.arch !== "x64") throw new Error("installed Linux VM qualification requires a Linux x64 host");
+    await run(process.execPath, ["--test", "--test-concurrency=1", ...hardwareTests], consumer, {
       SANDSURF_TEST_PACKAGE_ROOT: resolve(consumer, "node_modules/sandsurf"),
       SANDSURF_LOCAL_IMAGE_MANIFEST: resolve(consumer, "node_modules/sandsurf/images/development-x64/manifest.json"),
     });

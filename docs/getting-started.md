@@ -181,6 +181,25 @@ silently rebound.
 
 Receipt acknowledgement does not release output or express application acceptance. Release requires complete capture elsewhere, continuing retention of the actual bytes, or explicitly authorized loss. A receipt reference alone preserves no bytes. Machine destruction must not release retained output.
 
+`host.operations.get(operationId, { machineId? })` returns an `Operation` handle.
+Its cached `observation` and refreshed `inspect()` result distinguish
+`host-authority` admissions from `guardian-journal` delivery and retention facts.
+Host lifecycle intent is not native power state, configuration admission is not
+proof of installation, and receipt acknowledgement is not application acceptance.
+Retain the operation ID and lookup scope to reconnect; observations confer no
+authority.
+
+`machine.events.read()` and `follow()` return a closed `MachineEventValue` union,
+including typed execution reports, native observations and configuration delivery.
+Each retained event's digest and cursor coverage are checked before its public
+projection is returned. The digest identifies the retained wire event, not the
+SDK's projected value. `machine.snapshots.rollback()` returns the same
+reconnectable `Operation` model; it does not silently replace live handles.
+Authorized resource geometry is available at
+`inspection.runtimeConfiguration.resources`, not a competing top-level copy.
+The current state format is 14 and the native SDK bridge is version 9. Incompatible
+stores and bridges are rejected; existing stores are preserved, not migrated.
+
 `execution.output.seal(id, { operationId, boundary? })` creates an independent,
 immutable owner for an exact captured prefix, even while the execution is running
 or management is unavailable. With no boundary, the first journal admission

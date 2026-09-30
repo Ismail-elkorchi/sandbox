@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { before, test } from "node:test";
-import { Artifact, Machine, Execution, ExecutionInterruptedError, Sandsurf, SandsurfHostError } from "../dist/index.js";
+import { Artifact, Machine, Execution, ExecutionInterruptedError, Operation, Sandsurf, SandsurfHostError } from "../dist/index.js";
 import { createSandsurfGuestPath, createSandsurfGuestCommand, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestRequestMetadata, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfGuestCommand, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 import { parseExecutionInspection, parseExecutionOutcome, parseExecutionReceipt } from "../dist/execution.js";
 
@@ -23,6 +23,104 @@ function executionReceipt(request = executionRequest()) {
     requestDigest: "e".repeat(64), ...completion };
   return { receipt, digest: sandsurfDigest("receipt", receipt) };
 }
+
+test("operation handles retain references and separate host intent from guardian delivery", async () => {
+  let applied = false;
+  const requests = [];
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request);
+    assert.equal(request.kind, "get-host-operation");
+    return { kind: "host-operation", value: { kind: "secret-put", value: { operationId: request.operationId, requestDigest: "a".repeat(64),
+      secret: { id: "secret", version: "opaque-version", bytes: 3 }, applied } } };
+  } }, () => assert.fail("operation observation requested authority"));
+  const operation = await host.operations.get("put-secret");
+  assert.ok(operation instanceof Operation);
+  assert.equal(operation.id, "put-secret");
+  assert.equal(operation.observation.owner, "host-authority");
+  assert.equal(operation.observation.observation.applied, false);
+  applied = true;
+  assert.equal(operation.observation.observation.applied, false, "cached observation cannot invent external progress");
+  assert.equal((await operation.inspect()).observation.applied, true);
+  assert.equal(requests.length, 2);
+
+  const command = createSandsurfGuestCommand({ machineId: "box", generation: 1, operationId: "spawn-command", request: { kind: "spawn", request: executionRequest() } });
+  const guardian = new Sandsurf({ request: async (request) => {
+    assert.equal(request.kind, "get-operation");
+    assert.equal(request.machineId, "box");
+    return { kind: "runtime", response: { kind: "operation", operation: { kind: "guest", operation: {
+      admission: { request: command, binary: null }, delivery: "unknown", evidenceDigest: null,
+    } } } };
+  } }, () => assert.fail("operation observation requested authority"));
+  const delivery = await guardian.operations.get("spawn-command", { machineId: "box" });
+  assert.deepEqual(delivery.observation, { operationId: "spawn-command", machineId: "box", owner: "guardian-journal", requestDigest: command.requestDigest,
+    observation: { kind: "guest", generation: 1, requestKind: "spawn", delivery: "unknown", evidenceDigest: null } });
+});
+
+test("operation lookup rejects mismatched identities, malformed claims and cross-owner records", async () => {
+  const base = { kind: "secret-put", value: { operationId: "op", requestDigest: "a".repeat(64), secret: { id: "secret", version: "opaque", bytes: 3 }, applied: false } };
+  for (const value of [
+    { ...base, value: { ...base.value, operationId: "other" } },
+    { ...base, value: { ...base.value, applied: "true" } },
+    { ...base, value: { ...base.value, requestDigest: "invalid" } },
+    { kind: "guest", value: {} }, { kind: "arbitrary", value: base.value },
+  ]) {
+    const host = new Sandsurf({ request: async () => ({ kind: "host-operation", value }) }, () => true);
+    await assert.rejects(host.operations.get("op"), SandsurfHostError);
+  }
+  const host = new Sandsurf({ request: async () => ({ kind: "host-operation", value: base }) }, () => true);
+  await assert.rejects(host.operations.get("op", { machineId: "box" }), SandsurfHostError);
+  const missing = new Sandsurf({ request: async () => ({ kind: "host-operation", value: null }) }, () => true);
+  assert.equal(await missing.operations.get("missing"), undefined);
+});
+
+test("typed operation observations cover each host record without inventing effect completion", async () => {
+  const common = { operationId: "op", machineId: "box", requestDigest: "a".repeat(64) };
+  const secret = { id: "secret", version: "opaque", bytes: 3 };
+  const resources = fixtureView().runtimeConfiguration.resources;
+  const snapshot = { request: { id: "snapshot", operationId: "op", machineId: "box", expectedGeneration: 1, expectedRevision: 1, kind: "disk", parent: null },
+    requestDigest: common.requestDigest, phase: "ready", imageDigest: "b".repeat(64), resources, consistency: "crash", systemDiskDigest: "c".repeat(64),
+    systemDiskBytes: resources.diskBytes, manifestDigest: "d".repeat(64), sensitive: false, full: null };
+  const records = [
+    ["lifecycle", { ...common, desired: "running", revision: 1, completion: null }],
+    ["configuration", { ...common, revision: 1, configuration: fixtureView().runtimeConfiguration }],
+    ["transfer", { ...common, applied: false, approvalId: "approval" }],
+    ["image-import", { operationId: "op", requestDigest: common.requestDigest, phase: "admitted", image: null }],
+    ["image-release", { operationId: "op", requestDigest: common.requestDigest, imageDigest: "b".repeat(64), cleanupPending: true }],
+    ["secret-delivery", { ...common, delivery: { secret }, disclosure: "possible", revocationOperation: null, revoked: false }],
+    ["secret-put", { operationId: "op", requestDigest: common.requestDigest, secret, applied: false }],
+    ["secret-revocation", { ...common, secret, deliveries: [], terminateRecipients: false, guestCleanupReport: null }],
+    ["snapshot", snapshot],
+    ["rollback", { ...common, snapshotId: "snapshot", expectedRevision: 1, phase: "admitted", evidenceDigest: null }],
+  ];
+  for (const [kind, value] of records) {
+    const host = new Sandsurf({ request: async () => ({ kind: "host-operation", value: { kind, value } }) }, () => assert.fail("read requested authority"));
+    const inspection = (await host.operations.get("op")).observation;
+    assert.equal(inspection.operationId, "op");
+    assert.equal(inspection.observation.kind, kind);
+    assert.equal(inspection.owner, "host-authority");
+    assert.equal(inspection.machineId, ["image-import", "image-release", "secret-put"].includes(kind) ? null : "box");
+    if (kind === "lifecycle") assert.equal(inspection.observation.intent.completion, null, "intent admission is not observed machine state");
+    if (kind === "configuration") assert.equal("delivery" in inspection.observation, false, "configuration admission is not installation evidence");
+    if (kind === "secret-delivery") assert.equal(inspection.observation.disclosure, "possible");
+  }
+});
+
+test("guardian operation views preserve acknowledgement and actual retention as distinct facts", async () => {
+  const segment = { id: "segment", machineId: "box", executionId: "command", generation: 1, output: completedState().output };
+  const records = [
+    { kind: "receipt-acknowledgement", operationId: "op", executionId: "command", receiptDigest: "a".repeat(64) },
+    { kind: "output-seal", operationId: "op", requestDigest: "a".repeat(64), segment },
+    { kind: "evidence-release", executionId: "command", request: { operationId: "op" }, status: { requestDigest: "a".repeat(64), cleanupPending: true } },
+  ];
+  for (const record of records) {
+    const host = new Sandsurf({ request: async () => ({ kind: "runtime", response: { kind: "operation", operation: record } }) }, () => true);
+    const inspection = (await host.operations.get("op", { machineId: "box" })).observation;
+    assert.equal(inspection.owner, "guardian-journal");
+    assert.equal(inspection.observation.kind, record.kind);
+    assert.equal("accepted" in inspection.observation, false);
+    if (record.kind === "evidence-release") assert.equal(inspection.observation.status.cleanupPending, true);
+  }
+});
 
 test("execution reports expose one validated request, state and lineage model", () => {
   const request = executionRequest();
@@ -255,18 +353,108 @@ test("event streams reject gaps, changed digests, and impossible page boundaries
   }
 });
 
+test("retained events expose typed facts and reject digest-valid malformed reports", async () => {
+  const command = createSandsurfGuestCommand({ machineId: "box", generation: 1, operationId: "spawn-command", request: { kind: "spawn", request: executionRequest() } });
+  const configuration = fixtureView().runtimeConfiguration;
+  const delivered = { command: { machineId: "box", operationId: "configure", revision: 2, requestDigest: "c".repeat(64), configuration },
+    delivery: "unknown", evidenceDigest: null, observation: null };
+  const values = [
+    { kind: "machine", observation: fixtureView().machine.value },
+    { kind: "guest-operation", operation: { admission: { request: command, binary: null }, delivery: "unknown", evidenceDigest: null } },
+    { kind: "configuration-operation", operation: delivered },
+    { kind: "lifecycle-operation", operation: { ...delivered, command: { ...delivered.command, desired: "running" } } },
+    { kind: "process", process: { request: executionRequest(), guestPid: 23, state: { kind: "running" }, lineage: null } },
+    { kind: "output", executionId: "command", boundary: completedState().output },
+    { kind: "receipt", executionId: "command", receiptDigest: "a".repeat(64) },
+    { kind: "evidence-release", executionId: "command", requestDigest: "b".repeat(64), cleanupPending: true },
+  ];
+  const machine = fixtureMachine(async () => eventPage(0, values));
+  const page = await machine.events.read();
+  assert.equal(page.events.length, 8);
+  assert.equal(page.events[1].value.operation.owner, "guardian-journal");
+  assert.equal(page.events[1].value.operation.observation.delivery, "unknown");
+  assert.equal(page.events[2].value.operation.observation, null, "unknown installation cannot invent completion");
+  assert.equal(page.events[3].value.operation.desired, "running");
+  assert.equal(page.events[4].value.kind, "execution");
+  assert.equal(page.events[4].value.execution.state.kind, "running");
+  assert.equal("accepted" in page.events[6].value, false);
+  assert.equal(page.events[7].value.cleanupPending, true);
+  const malformed = [
+    { ...values[0], observation: { ...values[0].observation, machineId: "other" } },
+    { ...values[1], operation: { ...values[1].operation, delivery: "successful" } },
+    { ...values[2], operation: { ...delivered, observation: { machineId: "other", generation: 1, sequence: 1, digest: "a".repeat(64) } } },
+    { ...values[3], operation: { ...values[3].operation, command: { ...values[3].operation.command, desired: "healthy" } } },
+    { ...values[4], process: { ...values[4].process, request: { ...executionRequest(), machineId: "other" } } },
+    { ...values[5], boundary: { ...completedState().output, stdoutBytes: 1 } },
+    { ...values[6], accepted: true },
+    { ...values[7], cleanupPending: "false" },
+    { kind: "health", healthy: true },
+  ];
+  for (const value of malformed) {
+    const malformedMachine = fixtureMachine(async () => eventPage(0, [value]));
+    await assert.rejects(malformedMachine.events.read(), (error) => error.category === "protocol");
+  }
+});
+
 function fixtureView(generation = 1) {
   return {
-    id: "box", imageDigest: "a".repeat(64),
-    resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 },
+    id: "box", imageDigest: "a".repeat(64), knownSensitive: false,
     runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 } },
     configurationRevision: 99, reservation: "held", lifecycleIntent: { machineId: "box", operationId: "create", desired: "running", revision: 99, requestDigest: "a".repeat(64), completion: null }, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
     storage: { kind: "current", phase: "published", format: "raw", capacityBytes: 1024 ** 3, operationId: null, payload: { kind: "present", fileBytes: 1024 ** 3 } },
     management: { kind: "unavailable", lastKnown: null },
-    executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace", entrypoint: [], command: [] },
+    executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace" },
     lifetime: { expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
   };
 }
+
+test("machine inspection decodes each ownership dimension without forwarding raw host records", async () => {
+  const view = fixtureView();
+  view.management = { kind: "current", value: { generation: 1, identity: { bootId: "boot", instanceId: "daemon" }, observedUnixMillis: 10 } };
+  view.internalAuthority = { signingKey: "never-public" };
+  const machine = fixtureMachine(async () => ({ kind: "machine", value: view }));
+  const inspection = await machine.inspect();
+  assert.equal(inspection.machine.value.state, "running");
+  assert.equal(inspection.lifecycleIntent.completion, null);
+  assert.equal(inspection.management.value.identity.instanceId, "daemon");
+  assert.equal("internalAuthority" in inspection, false);
+  assert.equal("resources" in inspection, false, "runtime configuration is the sole authorized envelope representation");
+  assert.equal(inspection.runtimeConfiguration.resources.memoryMiB, 512);
+  view.management = { kind: "unavailable", lastKnown: view.management.value };
+  const disconnected = await machine.inspect();
+  assert.equal(disconnected.machine.value.state, "running", "management loss does not establish native stop");
+  assert.equal(disconnected.management.lastKnown.identity.instanceId, "daemon");
+  for (const change of [
+    { knownSensitive: "false" }, { reservation: "active" }, { imageDigest: "invalid" }, { configurationRevision: 0 },
+    { management: { kind: "current", value: { ...inspection.management.value, generation: 0 } } },
+    { management: { kind: "current", value: { ...inspection.management.value, identity: { bootId: "boot", instanceId: "bad/id" } } } },
+    { executionDefaults: { environment: { PATH: 5 }, user: "agent", workingDirectory: "/home/agent" } },
+    { lifecycleIntent: { ...view.lifecycleIntent, revision: 100 } },
+  ]) {
+    const malformed = fixtureMachine(async () => ({ kind: "machine", value: { ...view, ...change } }));
+    await assert.rejects(malformed.inspect(), (error) => error.category === "protocol");
+  }
+  const host = new Sandsurf({ request: async () => ({ kind: "machine", value: fixtureView() }) }, () => true);
+  await assert.rejects(host.machines.connect("different"), (error) => error.category === "protocol");
+});
+
+test("rollback returns a reconnectable host operation without replacing machine or execution handles", async () => {
+  const requests = [];
+  const value = { operationId: "rollback", machineId: "box", snapshotId: "snapshot", expectedRevision: 99, requestDigest: "a".repeat(64), phase: "admitted", evidenceDigest: null };
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request);
+    if (request.kind === "rollback-filesystem") return { kind: "rollback", value };
+    return { kind: "host-operation", value: { kind: "rollback", value: { ...value, phase: "applied", evidenceDigest: "b".repeat(64) } } };
+  } }, () => true);
+  const machine = new Machine(host, fixtureView());
+  const operation = await machine.snapshots.rollback("snapshot", { operationId: "rollback" });
+  assert.ok(operation instanceof Operation);
+  assert.equal(operation.observation.observation.phase, "admitted");
+  assert.equal((await operation.inspect()).observation.phase, "applied");
+  assert.equal(machine.generation, 1, "operation observation cannot fabricate native restore or rebind a machine");
+  assert.equal(requests[1].kind, "get-operation");
+  assert.equal(requests[1].machineId, "box");
+});
 
 test("authority-changing responses advance cached revisions without inspection", async () => {
   let view = fixtureView();
@@ -285,7 +473,7 @@ test("authority-changing responses advance cached revisions without inspection",
   }, 1, async () => true);
   const original = view;
   await machine.network.denyAll({ operationId: "network" });
-  await machine.resources.update(view.resources, { operationId: "resources" });
+  await machine.resources.update(view.runtimeConfiguration.resources, { operationId: "resources" });
   await machine.ports.expose({ guestPort: 8080 }, { id: "web", operationId: "expose" });
   await machine.powerOff({ operationId: "stop" });
   assert.equal(machine.revision, 103);

@@ -2074,7 +2074,7 @@ impl HostService {
                     .catalog
                     .machine(&machine_id)?
                     .ok_or(HostError::Invalid("capture machine is missing"))?;
-                if maximum_bytes > record.resources.disk_bytes {
+                if maximum_bytes > record.runtime_configuration.resources.disk_bytes {
                     return Err(HostError::Invalid(
                         "capture bound exceeds the machine disk budget",
                     ));
@@ -2292,6 +2292,7 @@ impl HostService {
                 .catalog
                 .machine(machine)?
                 .ok_or(HostError::Invalid("machine is missing from host authority"))?
+                .runtime_configuration
                 .resources;
             RuntimeJournal::create(
                 &runtime,
@@ -2374,7 +2375,6 @@ impl HostService {
             last_activity_unix_millis: record.last_activity_unix_millis,
             id: record.id,
             image_digest: record.image_digest,
-            resources: record.resources,
             runtime_configuration: record.runtime_configuration,
             configuration_revision: record.configuration_revision,
             reservation: match record.reservation {
@@ -2602,7 +2602,7 @@ impl HostService {
                 .machine_root(machine)
                 .join("disks")
                 .join(system_disk_name()),
-            record.resources.disk_bytes.get(),
+            record.runtime_configuration.resources.disk_bytes.get(),
             {
                 #[cfg(windows)]
                 {
