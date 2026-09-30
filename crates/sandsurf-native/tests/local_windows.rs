@@ -109,6 +109,33 @@ fn endpoint_lease_excludes_duplicate_owner_and_accept_timeout_is_recoverable() {
 }
 
 #[test]
+fn disconnected_readiness_clients_do_not_retire_the_pipe_owner() {
+    let root = Root::new();
+    let listener = std::sync::Arc::new(LocalListener::bind(&root.0).unwrap());
+    for _ in 0..32 {
+        // Connect before accept, then leave without sending a request. This is
+        // a normal readiness probe, not permission to stop the server.
+        drop(LocalConnection::connect(&root.0, WAIT).unwrap());
+        let accepting = std::sync::Arc::clone(&listener);
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut peer = accepting.accept(WAIT).unwrap();
+                if let Some(received) = peer.read_frame(WAIT).unwrap() {
+                    assert_eq!(received, frame());
+                    peer.write_frame(&frame(), WAIT).unwrap();
+                    return;
+                }
+            }
+            panic!("two connections contained no authenticated request");
+        });
+        let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();
+        client.write_frame(&frame(), WAIT).unwrap();
+        assert_eq!(client.read_frame(WAIT).unwrap(), Some(frame()));
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn pipe_owner_fixture() {
     let Some(root) = std::env::var_os("SANDSURF_PIPE_TEST_ROOT") else {
         return;

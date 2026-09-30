@@ -429,7 +429,6 @@ impl Drop for Lease {
 
 struct ListenerState {
     pending: Option<Handle>,
-    first_instance: bool,
 }
 
 /// One private endpoint owner. A pending pipe instance exists from bind until
@@ -454,7 +453,6 @@ impl LocalListener {
             pipe_name,
             state: Mutex::new(ListenerState {
                 pending: Some(pending),
-                first_instance: false,
             }),
         })
     }
@@ -467,26 +465,53 @@ impl LocalListener {
             .state
             .lock()
             .map_err(|_| io::Error::other("local listener state is poisoned"))?;
-        let pipe = state
-            .pending
-            .take()
-            .ok_or_else(|| io::Error::other("local listener has no pending pipe"))?;
-        if let Err(error) = connect_pipe(&pipe, &deadline) {
-            state.pending = Some(pipe);
-            return Err(error);
+        loop {
+            deadline.remaining()?;
+            self.root.check()?;
+            self.lease.check(&self.root)?;
+            let pipe = state
+                .pending
+                .take()
+                .ok_or_else(|| io::Error::other("local listener has no pending pipe"))?;
+            let disconnected = match connect_pipe(&pipe, &deadline) {
+                Ok(()) => false,
+                Err(error) if is_closed_pipe(&error) => true,
+                Err(error) => {
+                    state.pending = Some(pipe);
+                    return Err(error);
+                }
+            };
+            // A client can disconnect before ConnectNamedPipe observes it.
+            // Never reuse that dead instance or close the final owned instance
+            // before installing its replacement: both destroy availability.
+            let replacement = match create_pipe(&self.pipe_name, false) {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    state.pending = Some(pipe);
+                    return Err(error);
+                }
+            };
+            state.pending = Some(replacement);
+            if disconnected {
+                continue;
+            }
+            self.root.check()?;
+            let process_id = match pipe_client_pid(&pipe) {
+                Ok(process_id) => process_id,
+                Err(error) if is_closed_pipe(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if require_current_user(process_id).is_err() {
+                // Reject the peer, not the endpoint owner. A terminating or
+                // unauthorized client never acquires the listener's lifetime.
+                continue;
+            }
+            return Ok(LocalConnection {
+                pipe,
+                peer: PeerIdentity { process_id },
+                usable: true,
+            });
         }
-        let replacement = create_pipe(&self.pipe_name, state.first_instance)?;
-        state.first_instance = false;
-        state.pending = Some(replacement);
-        drop(state);
-        self.root.check()?;
-        let process_id = pipe_client_pid(&pipe)?;
-        require_current_user(process_id)?;
-        Ok(LocalConnection {
-            pipe,
-            peer: PeerIdentity { process_id },
-            usable: true,
-        })
     }
 
     pub fn close(self) -> io::Result<()> {
@@ -803,21 +828,24 @@ fn pipe_error() -> io::Result<usize> {
 }
 
 fn map_pipe_error(error: io::Error) -> io::Result<usize> {
+    if is_closed_pipe(&error) {
+        return Ok(0);
+    }
     let code = error.raw_os_error().map(|value| value as u32);
     match code {
-        Some(value)
-            if value == ERROR_BROKEN_PIPE
-                || value == ERROR_NO_DATA
-                || value == ERROR_PIPE_NOT_CONNECTED =>
-        {
-            Ok(0)
-        }
         Some(ERROR_OPERATION_ABORTED) => Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "local pipe operation was cancelled",
         )),
         _ => Err(error),
     }
+}
+
+fn is_closed_pipe(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error().map(|value| value as u32),
+        Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED)
+    )
 }
 
 fn pipe_client_pid(pipe: &Handle) -> io::Result<u32> {
