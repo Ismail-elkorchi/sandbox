@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -309,6 +309,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assertSameBytes(await readFile(join(destination, "dense")), dense);
     assert.equal(await readFile(join(destination, "unrelated"), "utf8"), "preserved");
     machine = undefined;
+    context.diagnostic("image feature reports and management provenance do not grant or restrict machine authority");
+    await qualifyImageBuildReports(manifestPath);
     context.diagnostic("host expiration remains active under continuous SDK traffic");
     const expiresAtUnixMs = Date.now() + 30_000;
     expiring = await host.machines.create({
@@ -358,6 +360,52 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     if (cleanupError !== undefined) throw cleanupError;
   }
 });
+
+async function qualifyImageBuildReports(sourceManifest) {
+  const root = await mkdtemp("/var/tmp/sandsurf-image-report-");
+  const bundle = join(root, "bundle");
+  const directory = join(root, "host");
+  const previousManifest = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
+  let host;
+  let machine;
+  try {
+    await mkdir(bundle);
+    const source = JSON.parse(await readFile(sourceManifest, "utf8"));
+    const manifest = { ...source, signature: null, platformArtifacts: { windowsX64: null }, bootBundle: {
+      ...source.bootBundle,
+      capabilities: { overlayfs: false, vsock: false, seccomp: false, cgroupV2: false, devpts: false },
+      guestAgent: { ...source.bootBundle.guestAgent, version: "provenance-only", protocolMajor: 99, protocolMinor: 0 },
+    } };
+    const bytes = Buffer.from(JSON.stringify(manifest));
+    const manifestPath = join(bundle, "manifest.json");
+    for (const artifact of [manifest.bootBundle.kernel, manifest.system.rootfs]) {
+      await copyFile(join(dirname(sourceManifest), artifact.path), join(bundle, artifact.path));
+    }
+    await writeFile(manifestPath, bytes);
+    process.env.SANDSURF_LOCAL_IMAGE_MANIFEST = manifestPath;
+    host = await Sandsurf.open({ directory, authorizer: () => true });
+    machine = await host.machines.create({ image: createHash("sha256").update(bytes).digest("hex"),
+      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 } });
+    assert.equal((await machine.inspect()).machine.value.state, "running");
+    await managementReady(machine);
+    assert.equal(await run(machine, "sudo -n id -u"), "0\n", "the actual guest handshake, not management provenance, controls API compatibility");
+  } finally {
+    try {
+      if (machine !== undefined) { await machine.inspect(); await machine.destroy(); }
+    } finally {
+      try {
+        if (host !== undefined) {
+          await host.close();
+          await (await NativeHostClient.open(directory)).stopService();
+        }
+      } finally {
+        if (previousManifest === undefined) delete process.env.SANDSURF_LOCAL_IMAGE_MANIFEST;
+        else process.env.SANDSURF_LOCAL_IMAGE_MANIFEST = previousManifest;
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+}
 
 async function managementReady(machine) {
   const deadline = Date.now() + 60_000;

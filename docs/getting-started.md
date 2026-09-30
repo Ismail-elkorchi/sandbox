@@ -75,6 +75,13 @@ Archive metadata and decompression are bounded before allocation. The current
 filesystem profile preserves numeric ownership, modes, files and links;
 unsupported xattrs, ACLs and sparse encodings are rejected, not silently lost.
 
+Guest feature and management-version metadata describe the image build. They
+do not require a restricted workload or prove the current guest's integrity.
+A kernel without OverlayFS, guest cgroups, seccomp, PTYs or vsock is not rejected
+on that basis; APIs requiring unavailable guest facilities fail independently
+of native machine power. Management compatibility is checked by the actual
+strict guest handshake, not by trusting image provenance.
+
 Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 
 ```ts

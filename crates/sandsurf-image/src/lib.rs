@@ -131,6 +131,8 @@ pub struct GuestAgentArtifact {
     pub sha256: String,
 }
 
+/// Build-time guest feature report, not host containment requirements or an
+/// attestation of the mutable guest. API availability is observed separately.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImageCapabilities {
@@ -138,7 +140,6 @@ pub struct ImageCapabilities {
     pub vsock: bool,
     pub seccomp: bool,
     pub cgroup_v2: bool,
-    #[serde(default)]
     pub devpts: bool,
 }
 
@@ -270,17 +271,11 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
     {
         return Err(ImageError::Invalid("invalid version or identifier".into()));
     }
-    if manifest
-        .boot_bundle
-        .guest_agent
-        .as_ref()
-        .is_some_and(|agent| agent.protocol_major != 4)
-        || !manifest.boot_bundle.capabilities.vsock
-        || !manifest.boot_bundle.capabilities.seccomp
+    if let Some(agent) = &manifest.boot_bundle.guest_agent
+        && (agent.version.is_empty() || agent.version.len() > 64 || agent.protocol_major == 0)
     {
         return Err(ImageError::Invalid(
-            "management service must support protocol 4; boot profile requires vsock and seccomp"
-                .into(),
+            "invalid management build provenance".into(),
         ));
     }
     for digest in [
@@ -756,6 +751,44 @@ mod tests {
             ),
             Err(ImageError::Signature)
         ));
+    }
+
+    #[test]
+    fn guest_features_and_management_provenance_are_not_machine_admission_authority() {
+        let temporary = TempDirectory::new();
+        let mut manifest = test_manifest(b"kernel", b"rootfs");
+        manifest.boot_bundle.capabilities = ImageCapabilities {
+            overlayfs: false,
+            vsock: false,
+            seccomp: false,
+            cgroup_v2: false,
+            devpts: false,
+        };
+        manifest.boot_bundle.guest_agent = None;
+        let path = write_image(&temporary.0, &manifest, b"kernel", b"rootfs");
+        let verified = verify_image(&path, ImageTrust::ExplicitLocal).unwrap();
+        assert_eq!(verified.manifest, manifest);
+        // Provenance may describe guest software which is not API-compatible.
+        // The real guest handshake still has one strict active wire version.
+        manifest.boot_bundle.guest_agent = Some(GuestAgentArtifact {
+            version: "independent-linux-service".into(),
+            protocol_major: 99,
+            protocol_minor: 0,
+            sha256: hex_sha256(b"service"),
+        });
+        let path = write_image(&temporary.0, &manifest, b"kernel", b"rootfs");
+        verify_image(&path, ImageTrust::ExplicitLocal).unwrap();
+        fs::write(temporary.0.join("kernel"), b"modified kernel").unwrap();
+        assert!(matches!(
+            verify_image(&path, ImageTrust::ExplicitLocal),
+            Err(ImageError::DigestMismatch("kernel"))
+        ));
+        let mut missing = serde_json::to_value(&manifest).unwrap();
+        missing["bootBundle"]["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("devpts");
+        assert!(serde_json::from_value::<ImageManifest>(missing).is_err());
     }
 
     #[test]

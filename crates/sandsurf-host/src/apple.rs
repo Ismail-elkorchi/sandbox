@@ -115,10 +115,6 @@ pub fn prepare_config(
             Architecture::X64
         }
         || verified.manifest.system.rootfs.format != RootfsFormat::Ext4
-        || !verified.manifest.boot_bundle.capabilities.overlayfs
-        || !verified.manifest.boot_bundle.capabilities.cgroup_v2
-        || !verified.manifest.boot_bundle.capabilities.devpts
-        || !verified.manifest.boot_bundle.capabilities.vsock
     {
         return Err(AppleError::Invalid(
             "image does not satisfy the Apple Linux guest contract".into(),

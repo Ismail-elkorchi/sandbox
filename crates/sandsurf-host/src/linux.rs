@@ -130,12 +130,9 @@ pub fn prepare_config(
                 Architecture::X64
             }
         || verified.manifest.system.rootfs.format != RootfsFormat::Ext4
-        || !verified.manifest.boot_bundle.capabilities.overlayfs
-        || !verified.manifest.boot_bundle.capabilities.cgroup_v2
-        || !verified.manifest.boot_bundle.capabilities.devpts
     {
         return Err(LinuxError::Invalid(
-            "image identity or required guest features do not match".into(),
+            "image identity, architecture or system disk format do not match".into(),
         ));
     }
     require_regular(&source_template, 128 * 1024 * 1024 * 1024)?;
