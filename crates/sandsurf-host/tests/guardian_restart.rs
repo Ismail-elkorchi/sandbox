@@ -96,10 +96,11 @@ fn runtime_limits() -> RuntimeLimits {
 }
 
 struct Fixture {
-    root: Root,
     host: HostCatalog,
     machine: MachineId,
     command: GuestCommand,
+    // Release protected database handles before retiring their storage.
+    root: Root,
 }
 
 impl Fixture {

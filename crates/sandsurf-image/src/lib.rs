@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod archive;
 pub mod ext4;
 pub mod oci;
 

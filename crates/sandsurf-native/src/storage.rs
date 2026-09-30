@@ -32,7 +32,7 @@ pub fn publish_new_file(staged: &Path, destination: &Path) -> io::Result<()> {
         ));
     }
     sync_file(&OpenOptions::new().read(true).write(true).open(staged)?)?;
-    publish(staged, destination)
+    publish_name(staged, destination)
 }
 
 /// Flush publication metadata where the OS provides a directory fsync. On
@@ -74,7 +74,7 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let source = CString::new(staged.as_os_str().as_bytes())
@@ -108,7 +108,7 @@ fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn publish(staged: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn publish_name(staged: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
     fn wide(path: &Path) -> io::Result<Vec<u16>> {

@@ -413,6 +413,7 @@ dependencies = [
  "sandsurf-network",
  "sandsurf-protocol",
  "serde_json",
+ "tar",
 ]
 
 [[package]]

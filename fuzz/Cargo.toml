@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.145"
+tar = "=0.4.46"
 sandsurf-format = { path = "../crates/sandsurf-format" }
 sandsurf-image = { path = "../crates/sandsurf-image" }
 sandsurf-network = { path = "../crates/sandsurf-network" }
@@ -64,6 +65,13 @@ bench = false
 [[bin]]
 name = "http_connect"
 path = "fuzz_targets/http_connect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_archive"
+path = "fuzz_targets/image_archive.rs"
 test = false
 doc = false
 bench = false

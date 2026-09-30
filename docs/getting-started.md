@@ -59,6 +59,9 @@ The recipe selects verified native kernel artifacts. OCI `ENTRYPOINT` and
 management integration if guest APIs are needed. Conversion does not run
 package scripts on the host. Journaled OCI conversion currently requires a
 Linux builder; other hosts report that limitation explicitly.
+Archive metadata and decompression are bounded before allocation. The current
+filesystem profile preserves numeric ownership, modes, files and links;
+unsupported xattrs, ACLs and sparse encodings are rejected, not silently lost.
 
 Closing an SDK connection does not stop Linux or its services. Reconnect using the same host directory and durable identities:
 

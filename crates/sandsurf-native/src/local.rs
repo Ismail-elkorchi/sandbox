@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SOCKET: &str = "control.sock";
+const PENDING_SOCKET: &str = "control.pending.sock";
 const LEASE: &str = "control.lock";
 const MAX_DEADLINE: Duration = Duration::from_secs(300);
 
@@ -186,8 +187,11 @@ impl Directory {
         Ok(())
     }
     fn socket(&self) -> io::Result<Metadata> {
+        self.socket_named(SOCKET)
+    }
+    fn socket_named(&self, name: &str) -> io::Result<Metadata> {
         self.check()?;
-        let metadata = fs::symlink_metadata(self.path.join(SOCKET))?;
+        let metadata = fs::symlink_metadata(self.path.join(name))?;
         private(&metadata)?;
         if !metadata.file_type().is_socket() || metadata.nlink() != 1 {
             return Err(denied(
@@ -195,11 +199,12 @@ impl Directory {
             ));
         }
         #[cfg(target_os = "macos")]
-        crate::macos::require_private_path_acl(&self.path.join(SOCKET))?;
+        crate::macos::require_private_path_acl(&self.path.join(name))?;
         Ok(metadata)
     }
     fn at_socket<T: Send>(
         &self,
+        name: &str,
         operation: impl FnOnce(&Path) -> io::Result<T> + Send,
     ) -> io::Result<T> {
         #[cfg(target_os = "linux")]
@@ -210,12 +215,12 @@ impl Directory {
             operation(&PathBuf::from(format!(
                 "/proc/self/fd/{}/{}",
                 self.held.as_raw_fd(),
-                SOCKET
+                name
             )))
         }
         #[cfg(target_os = "macos")]
         {
-            crate::macos::in_directory(&self.held, || operation(Path::new(SOCKET)))
+            crate::macos::in_directory(&self.held, || operation(Path::new(name)))
         }
     }
 }
@@ -275,11 +280,12 @@ struct SocketOwner {
     root: Directory,
     lease: Lease,
     socket_identity: Option<(u64, u64)>,
+    socket_name: &'static str,
 }
 impl SocketOwner {
     fn check(&self) -> io::Result<()> {
         self.lease.check(&self.root)?;
-        if Some(identity(&self.root.socket()?)) != self.socket_identity {
+        if Some(identity(&self.root.socket_named(self.socket_name)?)) != self.socket_identity {
             return Err(denied("endpoint socket identity changed"));
         }
         Ok(())
@@ -289,7 +295,7 @@ impl SocketOwner {
             return Ok(());
         }
         self.check()?;
-        fs::remove_file(self.root.path.join(SOCKET))?;
+        fs::remove_file(self.root.path.join(self.socket_name))?;
         self.socket_identity = None;
         Ok(())
     }
@@ -325,17 +331,40 @@ impl LocalListener {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let listener = root.at_socket(|path| UnixListener::bind(path))?;
-        let metadata = fs::symlink_metadata(&path)?;
-        let owner = SocketOwner {
+        // The published endpoint must never expose bind's umask-derived mode.
+        // A single leased staging name also makes interruption before chmod
+        // recoverable without scanning or adopting unrelated filesystem paths.
+        let pending = root.path.join(PENDING_SOCKET);
+        match fs::symlink_metadata(&pending) {
+            Ok(metadata) => {
+                root.check()?;
+                if metadata.uid() != uid()
+                    || !metadata.file_type().is_socket()
+                    || metadata.nlink() != 1
+                {
+                    return Err(denied("pending endpoint is not this account's socket"));
+                }
+                fs::remove_file(&pending)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let listener = root.at_socket(PENDING_SOCKET, |path| UnixListener::bind(path))?;
+        let metadata = fs::symlink_metadata(&pending)?;
+        let mut owner = SocketOwner {
             root,
             lease,
             socket_identity: Some(identity(&metadata)),
+            socket_name: PENDING_SOCKET,
         };
-        // The parent is already private, including during this chmod.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        // No connection by the public name is possible until privacy and
+        // ownership checks have succeeded. No process-global umask mutation.
+        fs::set_permissions(&pending, fs::Permissions::from_mode(0o600))?;
         owner.check()?;
         listener.set_nonblocking(true)?;
+        crate::storage::publish_name(&pending, &path)?;
+        owner.socket_name = SOCKET;
+        owner.check()?;
         Ok(Self { listener, owner })
     }
 
@@ -382,7 +411,7 @@ impl LocalConnection {
         let deadline = Deadline::new(timeout)?;
         let root = Directory::open(directory)?;
         let expected = identity(&root.socket()?);
-        let stream = root.at_socket(|path| connect_socket(path, deadline.0))?;
+        let stream = root.at_socket(SOCKET, |path| connect_socket(path, deadline.0))?;
         if identity(&root.socket()?) != expected {
             return Err(denied("endpoint changed while connecting"));
         }

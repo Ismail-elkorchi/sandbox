@@ -68,6 +68,56 @@ fn current_uid() -> u32 {
 }
 
 #[test]
+fn endpoint_publication_never_exposes_a_provisional_socket_mode() {
+    use std::sync::atomic::AtomicBool;
+    let root = Root::new();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                match fs::symlink_metadata(root.socket()) {
+                    Ok(metadata) => {
+                        assert_eq!(metadata.mode() & 0o777, 0o600);
+                        assert_eq!(metadata.uid(), current_uid());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("endpoint observation failed: {error}"),
+                }
+            }
+        });
+        for _ in 0..64 {
+            LocalListener::bind(&root.0).unwrap().close().unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn interrupted_endpoint_publication_reclaims_only_its_unpublished_socket() {
+    let root = Root::new();
+    let pending = root.0.join("control.pending.sock");
+    let provisional = std::os::unix::net::UnixListener::bind(&pending).unwrap();
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o777)).unwrap();
+    drop(provisional);
+    assert_eq!(
+        LocalConnection::connect(&root.0, WAIT)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    let listener = LocalListener::bind(&root.0).unwrap();
+    assert!(!pending.exists());
+    let _client = LocalConnection::connect(&root.0, WAIT).unwrap();
+    let _server = listener.accept(WAIT).unwrap();
+    listener.close().unwrap();
+    fs::write(&pending, b"not a staged socket").unwrap();
+    assert!(LocalListener::bind(&root.0).is_err());
+    assert_eq!(fs::read(&pending).unwrap(), b"not a staged socket");
+}
+
+#[test]
 fn disconnected_client_does_not_disable_listener_or_lose_buffered_request() {
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();

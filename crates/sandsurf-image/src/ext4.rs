@@ -219,12 +219,19 @@ mod linux {
                 "ext4 source must be a bounded regular canonical tar".into(),
             ));
         }
-        let mut archive = tar::Archive::new(File::open(path)?);
+        let mut archive = crate::archive::Archive::new(
+            File::open(path)?,
+            crate::archive::Limits {
+                headers: 100_000,
+                bytes: MAX_IMAGE_BYTES,
+                file_bytes: disk_bytes,
+                path_bytes: 4096,
+            },
+        );
         let mut entries = BTreeMap::new();
         let mut payload = 0_u64;
-        for entry in archive.entries()? {
-            let entry = entry?;
-            let path = entry.path()?.into_owned();
+        while let Some(entry) = archive.next_entry()? {
+            let path = entry.path().to_owned();
             relative(&path)?;
             let kind = entry.header().entry_type();
             if entries.len() >= 100_000
@@ -254,11 +261,11 @@ mod linux {
             }
             if kind.is_hard_link() {
                 let target = entry
-                    .link_name()?
+                    .link_name()
                     .ok_or_else(|| Ext4Error::Invalid("hardlink target missing".into()))?;
-                relative(&target)?;
+                relative(target)?;
                 if entries
-                    .get(target.as_ref())
+                    .get(target)
                     .is_none_or(|kind| !(kind.is_file() || kind.is_hard_link()))
                 {
                     return Err(Ext4Error::Invalid(
@@ -345,6 +352,17 @@ mod tests {
         archive
             .append_data(&mut header, "etc/identity", &b"sandsurf"[..])
             .unwrap();
+        let long_target = format!("/{}tool", "directory/".repeat(30));
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_mode(0o777);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_mtime(0);
+        link.set_size(0);
+        archive
+            .append_link(&mut link, "etc/long-link", &long_target)
+            .unwrap();
         archive.finish().unwrap();
         drop(archive);
         let first = root.join("first.ext4");
@@ -367,7 +385,7 @@ mod tests {
             .unwrap();
         assert!(read.status.success());
         assert_eq!(read.stdout, b"sandsurf");
-        let stat = std::process::Command::new(debugfs)
+        let stat = std::process::Command::new(&debugfs)
             .args(["-R", "stat /etc/identity"])
             .arg(&first)
             .output()
@@ -378,6 +396,13 @@ mod tests {
             stat.contains("User:  1000") && stat.contains("Group:  1000"),
             "{stat}"
         );
+        let link = std::process::Command::new(debugfs)
+            .args(["-R", "stat /etc/long-link"])
+            .arg(&first)
+            .output()
+            .unwrap();
+        let link = String::from_utf8(link.stdout).unwrap();
+        assert!(link.contains("Type: symlink"), "{link}");
         assert!(materialize_tar(&tar, &root.join("undersized"), 32 * 1024 * 1024).is_err());
         assert!(!root.join("undersized").exists());
         for path in [tar, first, second] {

@@ -2,14 +2,14 @@
 //! Sandsurf image builder. The output is a VM-image input tree, not a container
 //! runtime root and no OCI entrypoint is executed here.
 
-use flate2::read::GzDecoder;
-use ruzstd::decoding::StreamingDecoder;
+use flate2::read::MultiGzDecoder;
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 const OCI_INDEX_MEDIA: &str = "application/vnd.oci.image.index.v1+json";
@@ -175,18 +175,25 @@ pub fn unpack_layout_archive(
     }
     prepare_empty_destination(destination)?;
     let file = File::open(archive_path)?;
-    let mut archive = tar::Archive::new(file);
+    let mut archive = crate::archive::Archive::new(
+        file,
+        crate::archive::Limits {
+            headers: limits.entries,
+            bytes: limits.compressed_bytes,
+            file_bytes: limits.compressed_bytes,
+            path_bytes: limits.path_bytes,
+        },
+    );
     let mut entries = 0usize;
     let mut bytes = 0u64;
-    for item in archive.entries()? {
+    while let Some(mut item) = archive.next_entry()? {
         entries = entries
             .checked_add(1)
             .ok_or(OciError::Limit("OCI archive entry count"))?;
         if entries > limits.entries {
             return Err(OciError::Limit("OCI archive entry count"));
         }
-        let mut item = item?;
-        let relative = normalize_layer_path(&item.path()?, limits.path_bytes)?;
+        let relative = normalize_layer_path(item.path(), limits.path_bytes)?;
         if relative.as_os_str().is_empty() {
             continue;
         }
@@ -297,9 +304,7 @@ pub fn write_filesystem_tar(
                     tar::EntryType::Link
                 });
                 header.set_size(0);
-                header.set_link_name(target)?;
-                header.set_cksum();
-                archive.append_data(&mut header, &relative, io::empty())?;
+                archive.append_link(&mut header, &relative, target)?;
             }
         }
     }
@@ -582,29 +587,29 @@ impl OciLayout {
     ) -> Result<String, OciError> {
         self.validate_descriptor(descriptor)?;
         let file = File::open(self.blob_path(&descriptor.digest)?)?;
+        let remaining_expanded = self.limits.expanded_bytes.saturating_sub(*total_expanded);
         let decoder: Box<dyn Read> = match descriptor.media_type.as_str() {
             OCI_LAYER_TAR | DOCKER_LAYER_TAR => Box::new(file),
-            OCI_LAYER_GZIP | DOCKER_LAYER_GZIP => Box::new(GzDecoder::new(file)),
-            OCI_LAYER_ZSTD => Box::new(
-                StreamingDecoder::new(file)
-                    .map_err(|error| OciError::Invalid(format!("zstd layer: {error}")))?,
-            ),
+            OCI_LAYER_GZIP | DOCKER_LAYER_GZIP => Box::new(MultiGzDecoder::new(file)),
+            OCI_LAYER_ZSTD => Box::new(ZstdReader::new(file, remaining_expanded)?),
             value => return Err(OciError::Unsupported(format!("layer media type {value}"))),
         };
-        let mut hashing = HashingReader::new(decoder, self.limits.expanded_bytes);
+        let mut hashing = HashingReader::new(decoder, remaining_expanded);
         {
-            let mut archive = tar::Archive::new(&mut hashing);
-            for entry in archive.entries()? {
-                *total_entries = total_entries
-                    .checked_add(1)
-                    .ok_or(OciError::Limit("entry count"))?;
-                if *total_entries > self.limits.entries {
-                    return Err(OciError::Limit("entry count"));
-                }
-                apply_entry(entry?, root, metadata, &self.limits)?;
+            let mut archive = crate::archive::Archive::new(
+                &mut hashing,
+                crate::archive::Limits {
+                    headers: self.limits.entries.saturating_sub(*total_entries),
+                    bytes: remaining_expanded,
+                    file_bytes: self.limits.file_bytes,
+                    path_bytes: self.limits.path_bytes,
+                },
+            );
+            while let Some(entry) = archive.next_entry()? {
+                apply_entry(entry, root, metadata, &self.limits)?;
             }
+            *total_entries += archive.headers_read();
         }
-        io::copy(&mut hashing, &mut io::sink())?;
         *total_expanded = total_expanded
             .checked_add(hashing.bytes)
             .ok_or(OciError::Limit("expanded byte count"))?;
@@ -800,6 +805,58 @@ struct HashingReader<R> {
     maximum: u64,
 }
 
+/// Every compressed frame contributes to the OCI diff ID. Never silently
+/// finish after the first frame and ignore verified, but uninterpreted, input.
+struct ZstdReader<R: Read> {
+    frame: Option<StreamingDecoder<BufReader<R>, FrameDecoder>>,
+}
+
+impl<R: Read> ZstdReader<R> {
+    fn new(source: R, expanded_limit: u64) -> io::Result<Self> {
+        // The output envelope and compression history are different resources.
+        // Bound history before the decoder allocates it, independently of a
+        // potentially multi-gigabyte machine filesystem.
+        let frame = StreamingDecoder::new_with_max_window_size(
+            BufReader::new(source),
+            expanded_limit.min(64 * 1024 * 1024),
+        )
+        .map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("zstd layer: {error}"))
+        })?;
+        Ok(Self { frame: Some(frame) })
+    }
+}
+
+impl<R: Read> Read for ZstdReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let Some(frame) = self.frame.as_mut() else {
+                return Ok(0);
+            };
+            let count = frame.read(output)?;
+            if count != 0 {
+                return Ok(count);
+            }
+            let (mut source, decoder) =
+                self.frame.take().expect("frame checked above").into_parts();
+            if source.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            self.frame = Some(StreamingDecoder::new_with_decoder(source, decoder).map_err(
+                |error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("zstd layer frame: {error}"),
+                    )
+                },
+            )?);
+        }
+    }
+}
+
 impl<R> HashingReader<R> {
     fn new(inner: R, maximum: u64) -> Self {
         Self {
@@ -914,12 +971,12 @@ fn validate_defaults(value: &OciDefaults) -> Result<(), OciError> {
 }
 
 fn apply_entry<R: Read>(
-    mut entry: tar::Entry<'_, R>,
+    mut entry: crate::archive::Entry<'_, R>,
     root: &Path,
     metadata: &mut BTreeMap<String, EntryMetadata>,
     limits: &ConversionLimits,
 ) -> Result<(), OciError> {
-    let path = normalize_layer_path(&entry.path()?, limits.path_bytes)?;
+    let path = normalize_layer_path(entry.path(), limits.path_bytes)?;
     if path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -1029,9 +1086,9 @@ fn apply_entry<R: Read>(
     } else if kind.is_hard_link() {
         remove_metadata_subtree(metadata, &key);
         let target = entry
-            .link_name()?
+            .link_name()
             .ok_or_else(|| OciError::Invalid("hardlink target is absent".into()))?;
-        let target = normalize_layer_path(&target, limits.path_bytes)?;
+        let target = normalize_layer_path(target, limits.path_bytes)?;
         let target_path = resolve_existing_regular(root, &target)?;
         remove_path(&destination)?;
         fs::hard_link(target_path, &destination)?;
@@ -1115,9 +1172,12 @@ fn resolve_existing_regular(root: &Path, relative: &Path) -> Result<PathBuf, Oci
     Ok(path)
 }
 
-fn normalized_link<R: Read>(entry: &tar::Entry<'_, R>, maximum: usize) -> Result<String, OciError> {
+fn normalized_link<R: Read>(
+    entry: &crate::archive::Entry<'_, R>,
+    maximum: usize,
+) -> Result<String, OciError> {
     let target = entry
-        .link_name()?
+        .link_name()
         .ok_or_else(|| OciError::Invalid("symlink target is absent".into()))?;
     let value = target
         .to_str()
@@ -1366,6 +1426,53 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn compressed_layers_account_for_every_member_and_reject_uninterpreted_tails() {
+        fn gzip(data: &[u8]) -> Vec<u8> {
+            let mut writer =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            writer.write_all(data).unwrap();
+            writer.finish().unwrap()
+        }
+        fn zstd(data: &[u8]) -> Vec<u8> {
+            assert!(data.len() < 256);
+            let mut encoded = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, data.len() as u8];
+            let block = ((data.len() as u32) << 3) | 1;
+            encoded.extend_from_slice(&block.to_le_bytes()[..3]);
+            encoded.extend_from_slice(data);
+            encoded
+        }
+        let mut compressed = [gzip(b"first"), gzip(b"second")].concat();
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(&compressed[..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"firstsecond");
+        compressed.extend_from_slice(b"uninterpreted");
+        assert!(
+            MultiGzDecoder::new(&compressed[..])
+                .read_to_end(&mut Vec::new())
+                .is_err()
+        );
+        let mut compressed = [zstd(b"first"), zstd(b"second")].concat();
+        let mut decoded = Vec::new();
+        ZstdReader::new(&compressed[..], 4096)
+            .unwrap()
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, b"firstsecond");
+        compressed.extend_from_slice(b"uninterpreted");
+        assert!(
+            ZstdReader::new(&compressed[..], 4096)
+                .unwrap()
+                .read_to_end(&mut Vec::new())
+                .is_err()
+        );
+        // A 128 MiB history window must fail before allocating its buffer.
+        let oversized_window = [0x28, 0xb5, 0x2f, 0xfd, 0, 0x88];
+        assert!(ZstdReader::new(&oversized_window[..], u64::MAX).is_err());
     }
 
     #[test]
