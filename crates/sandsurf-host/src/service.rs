@@ -432,6 +432,12 @@ impl HostService {
                 value: self.inspect(),
             }),
             HostRequest::StopService => Ok(HostResponse::Complete),
+            HostRequest::OpenEventStream { machine_id } => {
+                self.provision_guardian(&machine_id)?;
+                Ok(HostResponse::EventStream {
+                    endpoint: self.guardian_endpoint(&machine_id),
+                })
+            }
             HostRequest::ListMachines { after, maximum } => {
                 let records = self.catalog.machines(after.as_ref(), maximum)?;
                 let mut values = Vec::with_capacity(records.len());

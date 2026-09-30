@@ -545,6 +545,118 @@ fn guardian_process_fixture() {
 }
 
 #[test]
+fn journal_stream_resumes_after_owner_restart_and_never_blocks_control() {
+    let fixture = Fixture::new();
+    let endpoint = fixture.root.0.join("endpoint");
+    sandsurf_native::local::ensure_private_directory(&endpoint).unwrap();
+    let spawn = || {
+        ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "guardian_process_fixture", "--test-threads=1"])
+                .env("SANDSURF_GUARDIAN_TEST_ROOT", &fixture.root.0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let mut child = spawn();
+    drop(wait_for_guardian(&endpoint));
+    let client = GuardianClient::new(endpoint.clone());
+    let mut stream =
+        EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+    let first = stream.read_page().unwrap();
+    assert_eq!(first.cursor, Counter::ONE);
+    assert_eq!(first.events.len(), 1);
+    // No next credit: a stalled observer cannot hold the journal or VM owner.
+    client.inspect(fixture.machine.clone(), None).unwrap();
+    drop(stream);
+    let mut resumed =
+        EventStream::open(&endpoint, fixture.machine.clone(), first.cursor, 256).unwrap();
+    let history = resumed.read_page().unwrap();
+    assert_eq!(history.events.first().unwrap().cursor, n(2));
+    assert_eq!(history.cursor, history.available);
+    drop(resumed);
+
+    let mut idle =
+        EventStream::open(&endpoint, fixture.machine.clone(), history.available, 256).unwrap();
+    idle.read_page().unwrap();
+    // The management poll can append independent observations concurrently.
+    fs::write(
+        fixture.root.0.join("native-power"),
+        serde_json::to_vec(&MachineState::Paused).unwrap(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let (measured, cursor) = loop {
+        let page = idle.read_page().unwrap();
+        let cursor = page.cursor;
+        if let Some(event) = page.events.into_iter().find(|event| matches!(
+            &event.value, RuntimeEventValue::Machine { observation }
+                if observation.state == MachineState::Paused && observation.cause == ObservationCause::Native {}
+        )) { break (event, cursor); }
+        assert!(
+            Instant::now() < deadline,
+            "committed native fact did not wake observer"
+        );
+    };
+    drop(idle);
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let _restarted = spawn();
+    drop(wait_for_guardian(&endpoint));
+    let mut replay =
+        EventStream::open(&endpoint, fixture.machine.clone(), measured.cursor, 256).unwrap();
+    let after = replay.read_page().unwrap();
+    assert!(after.cursor >= cursor);
+    drop(replay);
+    let mut replay = EventStream::open(
+        &endpoint,
+        fixture.machine.clone(),
+        n(measured.cursor.get() - 1),
+        1,
+    )
+    .unwrap();
+    assert_eq!(replay.read_page().unwrap().events, vec![measured]);
+}
+
+#[test]
+fn journal_stream_capacity_preserves_non_streaming_control_connections() {
+    let fixture = Fixture::new();
+    let endpoint = fixture.root.0.join("endpoint");
+    sandsurf_native::local::ensure_private_directory(&endpoint).unwrap();
+    let _child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "guardian_process_fixture", "--test-threads=1"])
+            .env("SANDSURF_GUARDIAN_TEST_ROOT", &fixture.root.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    drop(wait_for_guardian(&endpoint));
+    let streams = (0..8)
+        .map(|_| {
+            let mut stream =
+                EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+            stream.read_page().unwrap();
+            stream
+        })
+        .collect::<Vec<_>>();
+    let mut denied =
+        EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+    assert!(
+        matches!(denied.read_page(), Err(sandsurf_host::guardian::Error::Rejected { category, .. }) if category == "capacity")
+    );
+    GuardianClient::new(endpoint)
+        .inspect(fixture.machine.clone(), None)
+        .unwrap();
+    drop(streams);
+}
+
+#[test]
 fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let fixture = Fixture::new();
     let endpoint = fixture.root.0.join("endpoint");
@@ -565,7 +677,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let _child = ChildGuard(child);
     let authorization = fixture.command.clone();
     let payload = serde_json::to_vec(&(
-        4_u16,
+        SERVICE_VERSION,
         sandsurf_protocol::RequestEnvelope::split(GuardianRequest::Dispatch {
             command: authorization.clone(),
         })

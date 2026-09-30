@@ -5,6 +5,7 @@ import { NativeHostClient, SandsurfHostError, integer, record, text } from "./na
 import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js";
 
 const transport = Symbol("host transport");
+const subscribe = Symbol("event subscription");
 const authorize = Symbol("host approval");
 const dispatchGuest = Symbol("guest command");
 const queryGuest = Symbol("guest query");
@@ -120,6 +121,7 @@ export class Sandsurf {
   }
   async close(): Promise<void> { this.#closed = true; await this.#client.close(); }
   async [transport](request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { this.#open(); return this.#client.request(request); }
+  [subscribe](machineId: string, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { this.#open(); return this.#client.eventPages(machineId, after, maximum, signal); }
   async [authorize](change: AuthorityChange): Promise<string> {
     if (this.#authorizer === undefined) throw new SandsurfHostError("authorization", `No authorizer is installed for ${change.kind}`);
     const decision = await this.#authorizer(change);
@@ -323,6 +325,7 @@ export class Machine {
     return response.response;
   }
   async [transport](request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { return this.#host[transport](request); }
+  [subscribe](after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { return this.#host[subscribe](this.id, after, maximum, signal); }
   async [authorize](change: AuthorityChange): Promise<string> { return this.#host[authorize](change); }
   async #lifecycle(desired: DesiredMachineState, options: MachineLifecycleOptions): Promise<MachineInspection> {
     const operationId = validateIdentity(options.operationId ?? identity(desired)); const expectedRevision = await resolveRevisionPrecondition(this, options.expectedRevision); const approvalId = await this.#host[authorize]({ kind: "lifecycle", machineId: this.id, operationId, request: { desired, expectedRevision } });
@@ -438,32 +441,43 @@ export class MachineEvents {
   readonly #machine: Machine;
   constructor(machine: Machine) { this.#machine = machine; }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<MachineEventPage> {
-    const after = options.after ?? 0; const maximum = options.maximum ?? 256;
-    if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("event cursor must be a non-negative safe integer");
-    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new TypeError("event page maximum must be 1 through 256");
+    const { after, maximum } = normalizeEventRead(options);
     const response = await this.#machine[transport]({ kind: "list-events", machineId: this.#machine.id, after, maximum });
+    return this.#page(response, after, maximum);
+  }
+  #page(response: Readonly<Record<string, unknown>>, after: number, maximum: number): MachineEventPage {
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "events" || !record(response.response.page) || !Array.isArray(response.response.page.events)) throw protocol("event page response");
     const page = response.response.page; const events = page.events;
     if (!Array.isArray(events)) throw protocol("runtime events");
-    return {
-      cursor: integer(page.cursor),
-      available: integer(page.available),
-      events: Object.freeze(events.map((event: unknown) => {
+    const cursor = integer(page.cursor); const available = integer(page.available);
+    let expected = after;
+    const parsed = events.map((event: unknown) => {
         if (!record(event) || !record(event.value)) throw protocol("runtime event");
-        return Object.freeze({ cursor: integer(event.cursor), value: Object.freeze({ ...event.value }), digest: digest(text(event.digest)) });
-      })),
-    };
+        const eventCursor = integer(event.cursor); const eventDigest = text(event.digest);
+        let expectedDigest: string;
+        try { expectedDigest = sandsurfDigest("operation", ["sandsurf-runtime-event-v1", this.#machine.id, eventCursor, event.value]); }
+        catch { throw protocol("runtime event digest input"); }
+        if (eventCursor !== ++expected || eventDigest !== expectedDigest) throw protocol("runtime event coverage or digest");
+        return Object.freeze({ cursor: eventCursor, value: Object.freeze({ ...event.value }), digest: eventDigest });
+    });
+    if (events.length > maximum || expected !== cursor || cursor > available) throw protocol("runtime event page boundary");
+    return Object.freeze({ cursor, available, events: Object.freeze(parsed) });
   }
-  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly pollMs?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<MachineEvent, void> {
-    let cursor = options.after ?? 0; const poll = options.pollMs ?? 50;
-    if (!Number.isSafeInteger(poll) || poll < 1 || poll > 60_000) throw new TypeError("event poll interval must be 1 through 60000 milliseconds");
-    for (;;) {
-      if (options.signal?.aborted === true) return;
-      const page = await this.read({ after: cursor, maximum: options.maximum ?? 256 });
-      for (const event of page.events) { cursor = event.cursor; yield event; }
-      if (page.events.length === 0) await new Promise((done) => setTimeout(done, poll));
+  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<MachineEvent, void> {
+    let { after, maximum } = normalizeEventRead(options);
+    for await (const response of this.#machine[subscribe](after, maximum, options.signal)) {
+      const page = this.#page(response, after, maximum);
+      for (const event of page.events) { yield event; }
+      after = page.cursor;
     }
   }
+}
+
+function normalizeEventRead(options: { readonly after?: number; readonly maximum?: number }): { after: number; maximum: number } {
+  const after = options.after ?? 0; const maximum = options.maximum ?? 256;
+  if (!Number.isSafeInteger(after) || after < 0) throw new TypeError("event cursor must be a non-negative safe integer");
+  if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 256) throw new TypeError("event page maximum must be 1 through 256");
+  return { after, maximum };
 }
 
 export interface TerminalSize { readonly columns: number; readonly rows: number; readonly pixelWidth?: number; readonly pixelHeight?: number; }
@@ -471,7 +485,7 @@ export interface ExecutionOperationOptions extends MachineGenerationPrecondition
 export interface ExecutionSignalOptions extends ExecutionOperationOptions { readonly group?: boolean; }
 export interface ExecutionTerminateOptions extends ExecutionOperationOptions { readonly graceMillis?: number; }
 export interface SpawnOptions extends MachineGenerationPrecondition { readonly operationId?: string; readonly executionId?: string; readonly argv: readonly string[]; readonly cwd?: string; readonly environment?: Readonly<Record<string, string>>; readonly user?: string; readonly stdio?: "pipes" | "terminal"; readonly terminalSize?: TerminalSize; readonly activeDeadlineMs?: number; readonly elapsedDeadlineUnixMs?: number; readonly outputBytes?: number; }
-export type ExecOptions = SpawnOptions & { readonly signal?: AbortSignal; readonly pollMs?: number };
+export type ExecOptions = SpawnOptions & { readonly signal?: AbortSignal };
 export type ShellOptions = Omit<SpawnOptions, "argv"> & { readonly shell?: string };
 export type ExecShellOptions = Omit<ExecOptions, "argv"> & { readonly shell?: string };
 export interface ExecResult { readonly process: Execution; readonly inspection: ExecutionInspection; }
@@ -495,9 +509,9 @@ export class ExecutionCollection {
     return new Execution(this.#machine, executionId, authority.expectedGeneration);
   }
   async exec(options: ExecOptions): Promise<ExecResult> {
-    const { signal, pollMs, ...spawn } = options;
+    const { signal, ...spawn } = options;
     const process = await this.start(spawn);
-    return { process, inspection: await process.waitLeader({ ...(signal === undefined ? {} : { signal }), ...(pollMs === undefined ? {} : { pollMs }) }) };
+    return { process, inspection: await process.waitLeader({ ...(signal === undefined ? {} : { signal }) }) };
   }
   spawnShell(command: string, options: ShellOptions = {}): Promise<Execution> {
     if (command.length === 0 || command.length > 1024 * 1024) throw new TypeError("shell command is empty or oversized");
@@ -559,8 +573,8 @@ export class Terminal {
   async releaseInput(options: ExecutionOperationOptions = {}): Promise<void> { this.#requireAttached(); if (this.#inputLeaseId !== undefined) { const lease = this.#inputLeaseId; await this.process.releaseTerminalInput(lease, options); this.#inputLeaseId = undefined; } }
   async detach(options: MachineGenerationPrecondition & { readonly releaseInputOperationId?: string } = {}): Promise<void> { if (this.#attached) { await this.releaseInput({ ...(options.releaseInputOperationId === undefined ? {} : { operationId: options.releaseInputOperationId }), ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }) }); this.#attached = false; } }
   inspect(): Promise<ExecutionObservation> { this.#requireAttached(); return this.process.inspect(); }
-  waitLeader(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitLeader(options); }
-  waitCapture(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitCapture(options); }
+  waitLeader(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitLeader(options); }
+  waitCapture(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { this.#requireAttached(); return this.process.waitCapture(options); }
   resize(size: TerminalSize, options: ExecutionOperationOptions = {}): Promise<void> { this.#requireAttached(); return this.process.resize(size, options); }
   signal(signal: number, options: ExecutionSignalOptions = {}): Promise<void> { this.#requireAttached(); return this.process.signal(signal, options); }
   terminate(options: ExecutionTerminateOptions = {}): Promise<void> { this.#requireAttached(); return this.process.terminate(options); }
@@ -579,9 +593,9 @@ export class Execution {
     return { ...options, expectedGeneration: this.generation };
   }
   async inspect(): Promise<ExecutionObservation> { const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId: this.id }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response"); if (response.response.process === null) throw new SandsurfHostError("missing", `Process ${this.id} does not exist`); return parseExecutionObservation(response.response.process); }
-  waitLeader(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("leader", options); }
-  waitCapture(options: { readonly pollMs?: number; readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("capture", options); }
-  async #wait(boundaryKind: "leader" | "capture", options: { readonly pollMs?: number; readonly signal?: AbortSignal }): Promise<ExecutionInspection> {
+  waitLeader(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("leader", options); }
+  waitCapture(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("capture", options); }
+  async #wait(boundaryKind: "leader" | "capture", options: { readonly signal?: AbortSignal }): Promise<ExecutionInspection> {
     if (options.signal?.aborted === true) throw options.signal.reason;
     const boundary = await this.#machine.events.read({ maximum: 1 });
     const observed = await this.inspect();
@@ -599,7 +613,7 @@ export class Execution {
       return true;
     };
     if (observed.kind === "current" && observed.value.request.generation === this.generation && await complete(observed.value)) return observed.value;
-    for await (const event of this.#machine.events.follow({ after: boundary.available, ...(options.pollMs === undefined ? {} : { pollMs: options.pollMs }), ...(options.signal === undefined ? {} : { signal: options.signal }) })) {
+    for await (const event of this.#machine.events.follow({ after: boundary.available, ...(options.signal === undefined ? {} : { signal: options.signal }) })) {
       if (boundaryKind === "capture" && terminal !== undefined && event.value.kind === "receipt" && event.value.executionId === this.id && await complete(terminal)) return terminal;
       if (event.value.kind !== "process" || !record(event.value.process)) continue;
       const process = parseProcess(event.value.process);
@@ -657,26 +671,26 @@ export class ExecutionOutput {
   readonly #machine: Machine;
   constructor(process: Execution, machine: Machine) { this.#process = process; this.#machine = machine; }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<OutputPage> { const { after, maximum } = normalizeOutputRead(options); const response = await this.#machine[transport]({ kind: "read-evidence", machineId: this.#machine.id, executionId: this.#process.id, after, maximum }); if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "output" || !record(response.response.page) || !Array.isArray(response.response.page.chunks)) throw protocol("output response"); return parseEvidencePage(response.response.page); }
-  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly pollMs?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<OutputChunk, void, void> {
+  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<OutputChunk, void, void> {
     let cursor = options.after ?? 0;
-    for (;;) {
-      if (options.signal?.aborted === true) throw options.signal.reason;
-      const boundary = await this.#machine.events.read({ maximum: 1 });
-      const page = await this.read({ after: cursor, ...(options.maximum === undefined ? {} : { maximum: options.maximum }) });
-      for (const chunk of page.chunks) { cursor = chunk.cursor + chunk.bytes.byteLength; yield chunk; }
-      const receipt = await this.#process.receipt();
-      if (receipt !== undefined && cursor >= integer(receipt.receipt.output.finalCursor)) return;
-      if (cursor < page.available || page.chunks.length > 0) continue;
-      let changed = false;
-      for await (const event of this.#machine.events.follow({ after: boundary.available, ...(options.pollMs === undefined ? {} : { pollMs: options.pollMs }), ...(options.signal === undefined ? {} : { signal: options.signal }) })) {
-        if (!runtimeEventBelongsToProcess(event, this.#process.id)) continue;
-        changed = true;
-        break;
+    const boundary = await this.#machine.events.read({ maximum: 1 });
+    const events = this.#machine.events.follow({ after: boundary.available, ...(options.signal === undefined ? {} : { signal: options.signal }) });
+    try {
+      for (;;) {
+        if (options.signal?.aborted === true) throw options.signal.reason;
+        const page = await this.read({ after: cursor, ...(options.maximum === undefined ? {} : { maximum: options.maximum }) });
+        for (const chunk of page.chunks) { cursor = chunk.cursor + chunk.bytes.byteLength; yield chunk; }
+        const receipt = await this.#process.receipt();
+        if (receipt !== undefined && cursor >= integer(receipt.receipt.output.finalCursor)) return;
+        if (cursor < page.available || page.chunks.length > 0) continue;
+        for (;;) {
+          const event = await events.next();
+          if (event.done) throw new SandsurfHostError("unavailable", `Process ${this.#process.id} event stream ended`);
+          if (runtimeEventBelongsToProcess(event.value, this.#process.id)) break;
+        }
       }
-      if (!changed) {
-        if (options.signal !== undefined) throw options.signal.reason;
-        throw new SandsurfHostError("unavailable", `Process ${this.#process.id} event stream ended`);
-      }
+    } finally {
+      await events.return();
     }
   }
 }

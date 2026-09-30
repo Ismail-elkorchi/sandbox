@@ -9,6 +9,11 @@
 
 use sandsurf_protocol::*;
 use sandsurf_state::{DispatchDecision, HostCatalog, RuntimeJournal};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "event_stream.rs"]
+mod event_stream;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub use event_stream::EventStream;
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -21,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-const SERVICE_VERSION: u16 = 4;
+pub const SERVICE_VERSION: u16 = 5;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -1001,6 +1006,9 @@ impl<E: GuardianEffect> Guardian<E> {
                 };
                 Ok(GuardianResponse::Runtime { response })
             }
+            GuardianRequest::SubscribeEvents { .. } => Err(Error::Protocol(
+                "event subscriptions require a streaming connection",
+            )),
         }
     }
 
@@ -1077,12 +1085,12 @@ fn evidence_page(value: sandsurf_state::OutputPage) -> EvidencePage {
     }
 }
 
-fn error_category(error: &Error) -> &'static str {
+fn error_category(error: &Error) -> &str {
     match error {
         Error::Io(_) => "transport",
         Error::Json(_) | Error::Protocol(_) => "protocol",
         Error::State(_) => "state",
-        Error::Rejected { .. } => "remote",
+        Error::Rejected { category, .. } => category,
         Error::Unsupported(_) => "unsupported",
     }
 }
@@ -1446,6 +1454,9 @@ pub fn serve_guardian<E: GuardianEffect>(
     let listener = LocalListener::bind(endpoint)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(event_stream::EventSignal::new(
+        guardian.journal.event_cursor()?,
+    ));
     let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
     let (guest_jobs, guest_queue) = mpsc::sync_channel::<GuestWorkItem>(16);
     let completion_sender = sender.clone();
@@ -1485,6 +1496,7 @@ pub fn serve_guardian<E: GuardianEffect>(
     std::thread::scope(|scope| {
         let stopped_accept = Arc::clone(&stopped);
         let active_accept = Arc::clone(&active);
+        let events_accept = Arc::clone(&events);
         let accept_worker = scope.spawn(move || {
             while !stopped_accept.load(Ordering::Acquire) {
                 let connection = match listener.accept(Duration::from_secs(1)) {
@@ -1501,6 +1513,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                 }
                 let sender = sender.clone();
                 let active = Arc::clone(&active_accept);
+                let events = Arc::clone(&events_accept);
                 let worker = std::thread::Builder::new()
                     .name("sandsurf-guardian-client".into())
                     .spawn(move || {
@@ -1530,6 +1543,22 @@ pub fn serve_guardian<E: GuardianEffect>(
                             wire.assemble(data)
                                 .map_err(|_| Error::Protocol("invalid request bytes"))
                         });
+                        if let Ok(GuardianRequest::SubscribeEvents {
+                            machine_id,
+                            after,
+                            maximum,
+                        }) = &parsed
+                        {
+                            let _ = event_stream::serve(
+                                &mut connection,
+                                &sender,
+                                &events,
+                                machine_id.clone(),
+                                *after,
+                                *maximum,
+                            );
+                            return;
+                        }
                         let (reply, response) = mpsc::channel();
                         if sender
                             .try_send(GuardianIngress::Request {
@@ -1584,7 +1613,11 @@ pub fn serve_guardian<E: GuardianEffect>(
                 }
             }
         });
-        let result = loop {
+        let result = (|| loop {
+            // Notification only: the journal remains the sole history owner.
+            // Publish after every committed owner turn, including admission
+            // paths that continue before periodic native/guest observation.
+            events.publish(guardian.journal.event_cursor()?);
             match receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok(GuardianIngress::Request { parsed, reply }) => {
                     last_request = std::time::Instant::now();
@@ -1710,7 +1743,8 @@ pub fn serve_guardian<E: GuardianEffect>(
                     poll_in_flight = true;
                 }
             }
-        };
+        })();
+        events.close();
         stopped.store(true, Ordering::Release);
         drop(receiver);
         accept_worker

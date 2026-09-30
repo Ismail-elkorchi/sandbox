@@ -921,6 +921,45 @@ fn runtime_events_are_digest_bound_paginated_and_replayable_after_reopen() {
     assert_eq!(tail.available, cursor);
 }
 
+#[test]
+fn journal_pages_are_byte_bounded_before_aggregating_large_execution_metadata() {
+    let mut fixture = Fixture::new();
+    for index in 0..4 {
+        let mut request = fixture.command.request.clone();
+        let GuestRequest::Spawn { request: spawn } = &mut request else {
+            unreachable!()
+        };
+        let operation: OperationId = format!("large-{index}").try_into().unwrap();
+        spawn.execution_id = format!("large-{index}").try_into().unwrap();
+        spawn.operation_id = operation.clone();
+        spawn.argv = vec!["/bin/true".into(), "x".repeat(50_000), "y".repeat(50_000)];
+        let command =
+            GuestCommand::new(fixture.machine.clone(), Counter::ONE, operation, request).unwrap();
+        fixture.runtime.admit(command).unwrap();
+    }
+    let available = fixture.runtime.event_cursor().unwrap();
+    let first = fixture.runtime.events(Counter::ZERO, 256).unwrap();
+    assert!(
+        first.cursor < available,
+        "entry count alone must not determine page size"
+    );
+    let mut cursor = Counter::ZERO;
+    while cursor < available {
+        let page = fixture.runtime.events(cursor, 256).unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_EVENT_PAGE_BYTES);
+        assert!(
+            page.cursor > cursor,
+            "bounded pages must make progress without skipping entries"
+        );
+        for event in &page.events {
+            assert_eq!(event.cursor, cursor.next().unwrap());
+            cursor = event.cursor;
+        }
+        assert_eq!(cursor, page.cursor);
+        assert_eq!(page.available, available);
+    }
+}
+
 fn dispatch(runtime: &mut RuntimeJournal, command: &GuestCommand) {
     let authorization = command.clone();
     match runtime.begin_dispatch(authorization).unwrap() {

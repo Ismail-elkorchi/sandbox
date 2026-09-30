@@ -10,7 +10,7 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 5;
+pub const HOST_API_VERSION: u16 = 6;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
@@ -170,6 +170,9 @@ pub enum HostRequest {
         maximum: Counter,
     },
     GetMachine {
+        machine_id: MachineId,
+    },
+    OpenEventStream {
         machine_id: MachineId,
     },
     GetHostOperation {
@@ -409,6 +412,11 @@ pub enum HostRequest {
 )]
 pub enum HostResponse {
     Complete,
+    /// Private, authenticated observer endpoint. This conveys no lifecycle or
+    /// configuration authority and is never a cached machine observation.
+    EventStream {
+        endpoint: PathBuf,
+    },
     Inspection {
         value: HostInspection,
     },

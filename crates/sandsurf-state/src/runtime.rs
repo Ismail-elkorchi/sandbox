@@ -402,16 +402,20 @@ impl RuntimeJournal {
         }
     }
 
-    pub fn events(&self, after: Counter, maximum: u16) -> Result<RuntimeEventPage> {
-        if maximum == 0 || maximum > 256 {
-            return Err(Error::Capacity("event page must contain 1..256 entries"));
-        }
+    pub fn event_cursor(&self) -> Result<Counter> {
         let available: u64 = self.db.connection.query_row(
             "SELECT coalesce(max(sequence),0) FROM events",
             [],
             |row| row.get(0),
         )?;
-        let available = Counter::try_from(available)?;
+        Ok(Counter::try_from(available)?)
+    }
+
+    pub fn events(&self, after: Counter, maximum: u16) -> Result<RuntimeEventPage> {
+        if maximum == 0 || maximum > 256 {
+            return Err(Error::Capacity("event page must contain 1..256 entries"));
+        }
+        let available = self.event_cursor()?;
         if after > available {
             return Err(Error::Conflict("event cursor is beyond committed history"));
         }
@@ -427,6 +431,12 @@ impl RuntimeJournal {
         })?;
         let mut cursor = after;
         let mut events = Vec::new();
+        let mut encoded_bytes = serde_json::to_vec(&RuntimeEventPage {
+            cursor: available,
+            available,
+            events: Vec::new(),
+        })?
+        .len();
         for row in rows {
             let (sequence, raw, stored_digest) = row?;
             let sequence = Counter::try_from(sequence)?;
@@ -438,11 +448,22 @@ impl RuntimeJournal {
             if event_digest.as_str() != stored_digest {
                 return Err(Error::Corrupt("runtime event digest mismatch"));
             }
-            events.push(RuntimeEvent {
+            let event = RuntimeEvent {
                 cursor: sequence,
                 value,
                 digest: event_digest,
-            });
+            };
+            let bytes = serde_json::to_vec(&event)?.len() + usize::from(!events.is_empty());
+            if encoded_bytes + bytes > MAX_EVENT_PAGE_BYTES {
+                if events.is_empty() {
+                    return Err(Error::Capacity(
+                        "one journal event exceeds its transport page bound",
+                    ));
+                }
+                break;
+            }
+            encoded_bytes += bytes;
+            events.push(event);
             cursor = sequence;
         }
         Ok(RuntimeEventPage {
@@ -2080,17 +2101,6 @@ fn append_event(
         params![sequence.get(), encode(&value)?, event_digest.as_str()],
     )?;
     Ok(())
-}
-
-fn runtime_event_digest(
-    machine: &MachineId,
-    cursor: Counter,
-    value: &RuntimeEventValue,
-) -> Result<Digest> {
-    Ok(digest(
-        Domain::Operation,
-        &("sandsurf-runtime-event-v1", machine, cursor, value),
-    )?)
 }
 
 fn valid_transition(old: &MachineObservation, new: &MachineObservation) -> bool {

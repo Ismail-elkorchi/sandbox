@@ -3,10 +3,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Readable } from "node:stream";
 
-const BRIDGE_VERSION = 4;
+const BRIDGE_VERSION = 5;
 const MAX_BRIDGE_BYTES = 1024 * 1024 + 256 * 1024 + 4;
 const MAX_BRIDGE_PENDING = 64;
+const MAX_EVENT_STREAMS = 8;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export class SandsurfHostError extends Error {
@@ -21,6 +23,8 @@ export class SandsurfHostError extends Error {
 export class NativeHostClient {
   readonly directory: string;
   readonly #bridge: ChildProcessWithoutNullStreams;
+  readonly #binary: string;
+  readonly #streams = new Map<ChildProcessWithoutNullStreams, Promise<void>>();
   readonly #exited: Promise<void>;
   #finishExit!: () => void;
   #buffer = Buffer.alloc(0);
@@ -32,6 +36,7 @@ export class NativeHostClient {
 
   private constructor(directory: string, binary: string) {
     this.directory = directory;
+    this.#binary = binary;
     this.#exited = new Promise((resolveExit) => { this.#finishExit = resolveExit; });
     this.#bridge = spawn(binary, ["bridge", "--directory", directory], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let errorText = "";
@@ -105,9 +110,53 @@ export class NativeHostClient {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    for (const stream of this.#streams.keys()) stream.kill();
     if (this.#pending.size !== 0) await new Promise<void>((resolveDrain) => { this.#drained.push(resolveDrain); });
     this.#bridge.stdin.end();
     await this.#exited;
+    await Promise.all(this.#streams.values());
+  }
+
+  async *eventPages(machineId: string, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> {
+    const aborted = (): boolean => signal?.aborted === true;
+    if (this.#closed) throw new SandsurfHostError("client", "Sandsurf client is closed");
+    if (this.#failed !== undefined) throw this.#failed;
+    if (aborted()) throw signal?.reason;
+    if (this.#streams.size >= MAX_EVENT_STREAMS) throw new SandsurfHostError("capacity", "native event stream capacity is full");
+    const child = spawn(this.#binary, ["event-stream", "--directory", this.directory, "--machine", machineId, "--after", String(after), "--maximum", String(maximum)], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    let errorText = "";
+    let failure: Error | undefined;
+    child.stderr.on("data", (chunk: Buffer) => { errorText = (errorText + chunk.toString("utf8")).slice(-4096); });
+    child.on("error", (error: Error) => { failure = error; });
+    child.stdin.on("error", (error: Error) => { failure = error; child.kill(); });
+    const exited = new Promise<void>((done) => { child.once("close", () => done()); });
+    this.#streams.set(child, exited);
+    const abort = (): void => { child.kill(); };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      for await (const frame of bridgeFrames(child.stdout)) {
+        if (aborted()) throw signal?.reason;
+        const [id, value] = decodeBridgeFrame(frame);
+        if (id !== 1 || value.kind !== "runtime" || !record(value.response) || value.response.kind !== "events" || !record(value.response.page)) throw new SandsurfHostError("protocol", "invalid native event stream page");
+        const cursor = integer(value.response.page.cursor);
+        yield value;
+        if (this.#closed) return;
+        if (aborted()) throw signal?.reason;
+        const credit = Buffer.alloc(8); credit.writeBigUInt64LE(BigInt(cursor));
+        await new Promise<void>((done, reject) => child.stdin.write(credit, (error?: Error | null) => error == null ? done() : reject(error)));
+      }
+      if (aborted()) throw signal?.reason;
+      if (!this.#closed) throw new SandsurfHostError("transport", `native event stream ended: ${failure?.message ?? errorText}`);
+    } catch (error) {
+      if (aborted()) throw signal?.reason;
+      if (!this.#closed) throw error instanceof SandsurfHostError ? error : new SandsurfHostError("transport", `native event stream failed: ${String(error)}`);
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      child.kill();
+      child.stdin.destroy();
+      await exited;
+      this.#streams.delete(child);
+    }
   }
 
   #read(chunk: Buffer): void {
@@ -126,33 +175,17 @@ export class NativeHostClient {
       }
       if (this.#buffer.byteLength < 4 || this.#buffer.byteLength < 4 + this.#buffer.readUInt32LE(0)) continue;
       const frame = this.#buffer.subarray(4);
-      if (frame.byteLength < 4) {
-        this.#fail(new SandsurfHostError("protocol", "native bridge returned a truncated envelope"));
-        return;
-      }
-      const jsonLength = frame.readUInt32LE(0);
-      if (jsonLength === 0 || jsonLength > frame.byteLength - 4) {
-        this.#fail(new SandsurfHostError("protocol", "native bridge returned an invalid envelope length"));
-        return;
-      }
-      let parsed: unknown;
-      try { parsed = JSON.parse(frame.subarray(4, 4 + jsonLength).toString("utf8")); }
-      catch { this.#fail(new SandsurfHostError("protocol", "native bridge returned invalid JSON")); return; }
-      const binary = frame.subarray(4 + jsonLength);
       this.#buffer = Buffer.alloc(0);
-      if (!Array.isArray(parsed) || parsed.length !== 3 || !Number.isSafeInteger(parsed[0]) || parsed[0] <= 0 || parsed[1] !== BRIDGE_VERSION || !record(parsed[2])) {
-        this.#fail(new SandsurfHostError("protocol", "native host returned an invalid response"));
-        return;
-      }
-      const pending = this.#pending.get(parsed[0]);
-      if (pending === undefined) { this.#fail(new SandsurfHostError("protocol", "native bridge returned an unknown request identity")); return; }
+      let id: number;
       let value: Record<string, unknown>;
-      try { value = decodeBridgeResponse(parsed[2], binary); }
+      try { [id, value] = decodeBridgeFrame(frame); }
       catch (error) {
         this.#fail(error instanceof SandsurfHostError ? error : new SandsurfHostError("protocol", "native bridge returned invalid binary output"));
         return;
       }
-      this.#pending.delete(parsed[0]);
+      const pending = this.#pending.get(id);
+      if (pending === undefined) { this.#fail(new SandsurfHostError("protocol", "native bridge returned an unknown request identity")); return; }
+      this.#pending.delete(id);
       try {
         if (value.kind === "rejected") pending.reject(new SandsurfHostError(text(value.category), text(value.message)));
         else pending.resolve(value);
@@ -173,6 +206,7 @@ export class NativeHostClient {
     this.#pending.clear();
     this.#notifyDrained();
     this.#bridge.kill();
+    for (const stream of this.#streams.keys()) stream.kill();
   }
 
   #notifyDrained(): void {
@@ -187,6 +221,37 @@ export class NativeHostClient {
       await this.close();
     }
   }
+}
+
+async function* bridgeFrames(output: Readable): AsyncGenerator<Buffer, void> {
+  let buffered = Buffer.alloc(0);
+  for await (const chunk of output) {
+    const bytes = Buffer.from(chunk as Uint8Array);
+    let position = 0;
+    while (position < bytes.byteLength) {
+      const target = buffered.byteLength < 4 ? 4 : 4 + buffered.readUInt32LE(0);
+      const take = Math.min(target - buffered.byteLength, bytes.byteLength - position);
+      buffered = Buffer.concat([buffered, bytes.subarray(position, position + take)]);
+      position += take;
+      if (buffered.byteLength === 4 && (buffered.readUInt32LE(0) === 0 || buffered.readUInt32LE(0) > MAX_BRIDGE_BYTES)) throw new SandsurfHostError("protocol", "native stream frame exceeds its byte bound");
+      if (buffered.byteLength >= 4 && buffered.byteLength === 4 + buffered.readUInt32LE(0)) {
+        yield buffered.subarray(4);
+        buffered = Buffer.alloc(0);
+      }
+    }
+  }
+  if (buffered.byteLength !== 0) throw new SandsurfHostError("protocol", "native stream ended inside a frame");
+}
+
+function decodeBridgeFrame(frame: Buffer): [number, Record<string, unknown>] {
+  if (frame.byteLength < 4) throw new SandsurfHostError("protocol", "native bridge returned a truncated envelope");
+  const jsonLength = frame.readUInt32LE(0);
+  if (jsonLength === 0 || jsonLength > 256 * 1024 || jsonLength > frame.byteLength - 4) throw new SandsurfHostError("protocol", "native bridge returned an invalid envelope length");
+  let parsed: unknown;
+  try { parsed = JSON.parse(frame.subarray(4, 4 + jsonLength).toString("utf8")); }
+  catch { throw new SandsurfHostError("protocol", "native bridge returned invalid JSON"); }
+  if (!Array.isArray(parsed) || parsed.length !== 3 || !Number.isSafeInteger(parsed[0]) || parsed[0] <= 0 || parsed[1] !== BRIDGE_VERSION || !record(parsed[2])) throw new SandsurfHostError("protocol", "native host returned an invalid response");
+  return [parsed[0], decodeBridgeResponse(parsed[2], frame.subarray(4 + jsonLength))];
 }
 
 function encodeBridgeRequest(id: number, request: Readonly<Record<string, unknown>>): Buffer {

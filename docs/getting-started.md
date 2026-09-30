@@ -44,6 +44,18 @@ for await (const chunk of execution.output.follow()) {
 await host.close();
 ```
 
+`machine.events.follow({ after, signal })` reads committed history through a
+bounded, credit-driven stream, not an SDK polling loop. Save the last consumed
+event cursor to resume after disconnection. Each observer has at most one page
+in flight; a stalled reader does not hold machine control or the journal writer.
+Streams send idle heartbeats and have explicit capacity limits. A reader must
+return page credit within 30 seconds or reconnect from its consumed cursor.
+They report
+transport loss rather than silently reconnecting. Abort the supplied signal to
+interrupt an idle read; closing the SDK detaches its observers without stopping
+the Linux machine. Stream credit is transport progress, not receipt
+acknowledgement, application acceptance, or authorization to delete output.
+
 OCI conversion accepts a complete Linux OS filesystem with an executable
 `/sbin/init` and an explicit boot-image recipe:
 

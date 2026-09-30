@@ -145,10 +145,60 @@ test("retained artifacts publish without a live machine, revision or redundant u
   assert.equal(approvals[0].request.changeSetDigest, requests[0].changeSet.digest);
 });
 
-function fixtureMachine(request, generation = 1, authorizer = async () => { throw new Error("ordinary guest access requested host approval"); }) {
-  const host = new Sandsurf({ request }, authorizer);
+function fixtureMachine(request, generation = 1, authorizer = async () => { throw new Error("ordinary guest access requested host approval"); }, eventPages) {
+  const host = new Sandsurf({ request, eventPages }, authorizer);
   return new Machine(host, fixtureView(generation));
 }
+
+function eventPage(after, values) {
+  const events = values.map((value, index) => {
+    const cursor = after + index + 1;
+    return { cursor, value, digest: sandsurfDigest("operation", ["sandsurf-runtime-event-v1", "box", cursor, value]) };
+  });
+  const cursor = after + values.length;
+  return { kind: "runtime", response: { kind: "events", page: { cursor, available: cursor, events } } };
+}
+
+test("event followers use one resumable stream with page backpressure, not polling", async () => {
+  const calls = [];
+  let resumed = 0;
+  let detached = false;
+  const machine = fixtureMachine(async () => { throw new Error("stream performed an RPC poll"); }, 1, undefined,
+    async function* (id, after, maximum) {
+      calls.push({ id, after, maximum });
+      try {
+        yield eventPage(after, [{ kind: "receipt", executionId: "one", receiptDigest: "a".repeat(64) }, { kind: "receipt", executionId: "two", receiptDigest: "b".repeat(64) }]);
+        resumed++;
+        yield eventPage(after + 2, []);
+      } finally { detached = true; }
+    });
+  const stream = machine.events.follow({ after: 5, maximum: 2 });
+  assert.equal((await stream.next()).value.cursor, 6);
+  assert.equal(resumed, 0);
+  assert.equal((await stream.next()).value.cursor, 7);
+  assert.equal(resumed, 0);
+  await stream.return();
+  assert.equal(detached, true);
+  assert.deepEqual(calls, [{ id: "box", after: 5, maximum: 2 }]);
+});
+
+test("event streams reject gaps, changed digests, and impossible page boundaries", async () => {
+  const valid = eventPage(0, [{ kind: "receipt", executionId: "one", receiptDigest: "a".repeat(64) }]);
+  for (const mutate of [
+    (page) => { page.events[0].digest = "b".repeat(64); },
+    (page) => { page.events[0].digest = "malformed"; },
+    (page) => { page.events[0].value.invalid = 1.5; },
+    (page) => { page.events[0].cursor = 2; },
+    (page) => { page.cursor = 2; },
+    (page) => { page.available = 0; },
+  ]) {
+    const response = structuredClone(valid);
+    mutate(response.response.page);
+    const machine = fixtureMachine(async () => { throw new Error("stream performed an RPC poll"); }, 1, undefined,
+      async function* () { yield response; });
+    await assert.rejects(machine.events.follow().next(), (error) => error.category === "protocol");
+  }
+});
 
 function fixtureView(generation = 1) {
   return {
@@ -405,14 +455,18 @@ test("leader exit and output capture are independent boundaries", async () => {
   let receiptPublished = false;
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") {
-      if (query.after === 1) captured = true;
-      if (query.after === 2) receiptPublished = true;
-      const events = query.after === 1 ? [{ cursor: 2, digest: "a".repeat(64), value: { kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } } }] : query.after === 2 ? [{ cursor: 3, digest: "a".repeat(64), value: { kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) } }] : [];
-      return { kind: "runtime", response: { kind: "events", page: { cursor: events.at(-1)?.cursor ?? 1, available: events.at(-1)?.cursor ?? 1, events } } };
+      assert.equal(query.after, 0, "wait performed an RPC poll");
+      return eventPage(0, [{ kind: "machine", observation: fixtureView().machine.value }]);
     }
     if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 } } } } } };
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: receiptPublished ? { ...request, output } : null, digest: receiptPublished ? "b".repeat(64) : null } };
     throw new Error(`unexpected request: ${query.kind}`);
+  }, 1, undefined, async function* (_id, after) {
+    assert.equal(after, 1);
+    captured = true;
+    yield eventPage(1, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } }]);
+    receiptPublished = true;
+    yield eventPage(2, [{ kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) }]);
   });
   const execution = new Execution(machine, "command", 1);
   assert.equal((await execution.waitLeader()).state.kind, "draining");
@@ -427,12 +481,18 @@ test("waiting through unavailable management does not invent termination or repl
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") {
       pages++;
-      const events = pages === 2 ? [{ cursor: 1, digest: "a".repeat(64), value: { kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } } }] : pages === 3 ? [{ cursor: 2, digest: "a".repeat(64), value: { kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) } }] : [];
-      return { kind: "runtime", response: { kind: "events", page: { cursor: events.at(-1)?.cursor ?? 0, available: 2, events } } };
+      assert.equal(pages, 1, "wait performed an RPC poll");
+      return eventPage(0, []);
     }
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: pages >= 3 ? { ...request, output } : null, digest: pages >= 3 ? "b".repeat(64) : null } };
     assert.equal(query.kind, "get-process");
     return { kind: "runtime", response: { kind: "process", process: { kind: "unavailable", lastKnown: null } } };
+  }, 1, undefined, async function* (_id, after) {
+    assert.equal(after, 0);
+    pages++;
+    yield eventPage(0, [{ kind: "process", process: { request, guestPid: 23, lineage: null, state: { kind: "exited", output } } }]);
+    pages++;
+    yield eventPage(1, [{ kind: "receipt", executionId: "command", receiptDigest: "b".repeat(64) }]);
   });
   assert.equal((await new Execution(machine, "command", 1).waitCapture({ signal: AbortSignal.timeout(1000) })).state.kind, "exited");
 });

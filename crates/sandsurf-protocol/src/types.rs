@@ -552,6 +552,13 @@ pub enum GuardianRequest {
         machine_id: MachineId,
         request: RuntimeRequest,
     },
+    /// Read-only, credit-driven journal subscription. Subsequent credits must
+    /// repeat the identity and page bound with the last delivered cursor.
+    SubscribeEvents {
+        machine_id: MachineId,
+        after: Counter,
+        maximum: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -797,6 +804,10 @@ pub struct RuntimeEventPage {
     pub available: Counter,
     pub events: Vec<RuntimeEvent>,
 }
+
+/// Reserve envelope space on both private IPC and the SDK bridge. Entry count
+/// alone is not a byte bound: execution observations can carry large argv/env.
+pub const MAX_EVENT_PAGE_BYTES: usize = crate::MAX_CONTROL_BYTES - 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(

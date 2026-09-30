@@ -20,6 +20,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
   let host = await Sandsurf.open({ directory, authorizer: () => true });
   let machine;
   let fork;
+  let observer;
   try {
     const nativeHost = await host.inspect();
     assert.equal(nativeHost.engine, "firecracker");
@@ -100,6 +101,12 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assertSameBytes(await machine.fs.readFile("/root/independent-copy"), secretBytes);
     assert.equal((await machine.inspect()).knownSensitive, true);
 
+    observer = await Sandsurf.open({ directory, service: "connect" });
+    const observedMachine = await observer.machines.connect(identity);
+    const stream = observedMachine.events.follow({ maximum: 8, signal: AbortSignal.timeout(30_000) });
+    assert.equal((await stream.next()).value.cursor, 1);
+    // This observer owns only a read channel to the guardian. Host catalog
+    // restart must not require reconnecting it or replaying a guest command.
     await host.close();
     await (await NativeHostClient.open(directory)).stopService();
     host = await Sandsurf.open({ directory, authorizer: () => true });
@@ -108,6 +115,25 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(machine.generation, generation);
     assert.equal((await machine.inspect()).machine.value.state, "running");
     assert.equal(await run(machine, "cat /home/agent/cache/value"), "durable");
+    const streamed = await machine.executions.start({ executionId: "stream-after-host-restart", argv: ["/bin/true"] });
+    try {
+      for (;;) {
+        const event = await stream.next();
+        assert.equal(event.done, false);
+        if (event.value.value.kind === "process" && event.value.value.process.request.executionId === streamed.id) break;
+      }
+    } finally { await stream.return(); }
+    assert.equal(exitCode(await streamed.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
+    const boundary = await machine.events.read({ maximum: 1 });
+    const controller = new AbortController();
+    const cancelled = observedMachine.events.follow({ after: boundary.available, signal: controller.signal });
+    const waiting = cancelled.next();
+    const reason = new Error("detach idle observer");
+    controller.abort(reason);
+    await assert.rejects(waiting, (error) => error === reason);
+    await cancelled.return();
+    await observer.close();
+    observer = undefined;
 
     const artifact = await machine.artifacts.capture("/workspace");
     context.diagnostic("disk snapshot, fork and cold-boot persistence");
@@ -237,6 +263,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(await readFile(join(destination, "unrelated"), "utf8"), "preserved");
     machine = undefined;
   } finally {
+    if (observer !== undefined) await observer.close();
     if (fork !== undefined) await fork.destroy();
     if (machine !== undefined) await machine.destroy();
     await host.close();

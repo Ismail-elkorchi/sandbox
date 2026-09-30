@@ -44,6 +44,17 @@ pub fn bytes_digest(bytes: &[u8]) -> Digest {
     Digest::try_from(format!("{hash:x}")).expect("SHA-256 encoding")
 }
 
+pub fn runtime_event_digest(
+    machine: &MachineId,
+    cursor: Counter,
+    value: &RuntimeEventValue,
+) -> Result<Digest, Invalid> {
+    digest(
+        Domain::Operation,
+        &("sandsurf-runtime-event-v1", machine, cursor, value),
+    )
+}
+
 /// Establish the content-chain identity for one process before any bytes are
 /// retained. Guest and guardian both use this exact boundary contract.
 pub fn initial_output_boundary(

@@ -9,7 +9,7 @@ const MAX_BRIDGE_BYTES: usize =
     sandsurf_protocol::MAX_RPC_DATA_BYTES + sandsurf_protocol::MAX_CONTROL_BYTES + 4;
 const MAX_BRIDGE_PENDING: usize = 64;
 const BRIDGE_WORKERS: usize = 8;
-const BRIDGE_VERSION: u16 = 4;
+const BRIDGE_VERSION: u16 = 5;
 
 fn main() {
     if let Err(error) = run() {
@@ -61,6 +61,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             serve_machine_guardian(&directory, machine)?;
         }
         "bridge" => run_bridge(&directory)?,
+        "event-stream" => {
+            let machine: MachineId = argument(&values, "--machine")?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "machine identity is not UTF-8")?
+                .try_into()?;
+            let after = argument(&values, "--after")?
+                .to_str()
+                .ok_or("invalid event cursor")?
+                .parse::<u64>()?
+                .try_into()?;
+            let maximum = argument(&values, "--maximum")?
+                .to_str()
+                .ok_or("invalid event page size")?
+                .parse::<u16>()?;
+            let endpoint = match host_call(
+                &directory,
+                HostRequest::OpenEventStream {
+                    machine_id: machine.clone(),
+                },
+            )? {
+                HostResponse::EventStream { endpoint } => endpoint,
+                HostResponse::Rejected { category, message } => {
+                    return Err(format!("event stream rejected ({category}): {message}").into());
+                }
+                _ => return Err("host returned an invalid event stream endpoint".into()),
+            };
+            let mut stream =
+                sandsurf_host::guardian::EventStream::open(&endpoint, machine, after, maximum)?;
+            event_bridge_loop(&mut io::stdin(), &mut io::stdout(), &mut || {
+                stream.read_page()
+            })?;
+        }
         _ => return Err("invalid Sandsurf host mode".into()),
     }
     Ok(())
@@ -70,6 +103,40 @@ fn run_bridge(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = io::stdin();
     let mut output = io::stdout();
     bridge_loop(directory, &mut input, &mut output)
+}
+
+fn event_bridge_loop(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    next: &mut impl FnMut() -> sandsurf_host::guardian::Result<sandsurf_protocol::RuntimeEventPage>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let page = next()?;
+        let cursor = page.cursor;
+        let bytes = bridge_payload(
+            1,
+            &HostResponse::Runtime {
+                response: sandsurf_protocol::RuntimeResponse::Events { page },
+            },
+            &[],
+        );
+        if bytes.len() > MAX_BRIDGE_BYTES {
+            return Err("event page exceeds bridge bound".into());
+        }
+        output.write_all(&u32::try_from(bytes.len())?.to_le_bytes())?;
+        output.write_all(&bytes)?;
+        output.flush()?;
+        // Credit acknowledges transport progress only, not receipt acceptance
+        // or permission to release retained output. EOF detaches the observer.
+        let mut credit = [0_u8; 8];
+        if input.read(&mut credit[..1])? == 0 {
+            return Ok(());
+        }
+        input.read_exact(&mut credit[1..])?;
+        if u64::from_le_bytes(credit) != cursor.get() {
+            return Err("event bridge credit differs from delivered cursor".into());
+        }
+    }
 }
 
 fn bridge_loop(
@@ -398,6 +465,56 @@ fn argument(values: &[std::ffi::OsString], name: &str) -> Result<PathBuf, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_bridge_is_credit_driven_and_eof_only_detaches() {
+        let mut credits = 1_u64.to_le_bytes().as_slice().to_vec();
+        let mut output = Vec::new();
+        let mut reads = 0;
+        event_bridge_loop(&mut credits.as_slice(), &mut output, &mut || {
+            reads += 1;
+            Ok(sandsurf_protocol::RuntimeEventPage {
+                cursor: sandsurf_protocol::Counter::ONE,
+                available: sandsurf_protocol::Counter::ONE,
+                events: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        let mut bytes = output.as_slice();
+        for _ in 0..2 {
+            let mut length = [0; 4];
+            bytes.read_exact(&mut length).unwrap();
+            let mut frame = vec![0; u32::from_le_bytes(length) as usize];
+            bytes.read_exact(&mut frame).unwrap();
+            let (id, version, response, binary) = decode_response(&frame);
+            assert_eq!((id, version), (1, BRIDGE_VERSION));
+            assert!(matches!(
+                response,
+                HostResponse::Runtime {
+                    response: sandsurf_protocol::RuntimeResponse::Events { .. }
+                }
+            ));
+            assert!(binary.is_empty());
+        }
+        assert!(bytes.is_empty());
+        for bad in [2_u64.to_le_bytes().to_vec(), vec![1]] {
+            reads = 0;
+            credits = bad;
+            assert!(
+                event_bridge_loop(&mut credits.as_slice(), &mut Vec::new(), &mut || {
+                    reads += 1;
+                    Ok(sandsurf_protocol::RuntimeEventPage {
+                        cursor: sandsurf_protocol::Counter::ONE,
+                        available: sandsurf_protocol::Counter::ONE,
+                        events: Vec::new(),
+                    })
+                })
+                .is_err()
+            );
+            assert_eq!(reads, 1, "invalid credit cannot request another page");
+        }
+    }
 
     fn decode_response(bytes: &[u8]) -> (u64, u16, HostResponse, &[u8]) {
         let json_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
