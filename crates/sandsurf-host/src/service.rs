@@ -772,6 +772,13 @@ impl HostService {
                 let machine_root = self.machine_root(&request.machine_id);
                 let (captured, finished) = match request.kind {
                     SnapshotKind::Disk => {
+                        // The catalog owns images; snapshot bytes belong to a
+                        // separate machine volume. Verify before acquiring the
+                        // pause boundary, never infer an image store from it.
+                        let image = crate::images::resolve_native_image(
+                            &self.root,
+                            &capturing.image_digest,
+                        )?;
                         let prepared = client.native_snapshot(
                             request.machine_id.clone(),
                             NativeSnapshotRequest::PrepareDisk {
@@ -787,6 +794,7 @@ impl HostService {
                             &capture_root,
                             &capturing,
                             &machine_root.join("disks").join(system_disk_name()),
+                            &image,
                         );
                         let finished = client
                             .native_snapshot(

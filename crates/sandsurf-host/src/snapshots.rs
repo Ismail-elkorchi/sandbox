@@ -125,7 +125,15 @@ pub fn capture_filesystem(
     root: &Path,
     snapshot: &Snapshot,
     source_disk: &Path,
+    image: &sandsurf_image::VerifiedImage,
 ) -> Result<CaptureResult> {
+    if snapshot.request.kind != SnapshotKind::Disk
+        || image.manifest_digest != snapshot.image_digest.as_str()
+    {
+        return Err(SnapshotError::Invalid(
+            "disk capture image differs from host admission",
+        ));
+    }
     private_directory(root)?;
     let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
@@ -160,7 +168,7 @@ pub fn capture_filesystem(
         sensitive: snapshot.sensitive,
         kind: SnapshotKind::Disk,
         full: None,
-        boot: capture_boot(root, snapshot, &disk, &stage)?,
+        boot: capture_boot(image, &disk, &stage)?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
@@ -522,31 +530,17 @@ fn published_container(root: &Path, snapshot: &Snapshot) -> Result<DiskContainer
 }
 
 fn capture_boot(
-    root: &Path,
-    snapshot: &Snapshot,
+    image: &sandsurf_image::VerifiedImage,
     disk: &Path,
     stage: &Path,
 ) -> Result<sandsurf_image::boot::FrozenBoot> {
-    let host_root = root
-        .parent()
-        .ok_or(SnapshotError::Invalid("snapshot store has no owner"))?;
-    let image = sandsurf_image::verify_image(
-        &host_root
-            .join("images")
-            .join(snapshot.image_digest.as_str())
-            .join("manifest.json"),
-        sandsurf_image::ImageTrust::Pinned {
-            manifest_digest: snapshot.image_digest.as_str(),
-        },
-    )
-    .map_err(io::Error::other)?;
     // Stages are private and never attachable. Interrupted extraction is
     // discarded, while published boot artifacts are always digest verified.
     let directory = stage.join("boot");
     if directory.exists() {
         fs::remove_dir_all(&directory)?;
     }
-    Ok(crate::storage::freeze_boot(&image, disk, &directory)?)
+    Ok(crate::storage::freeze_boot(image, disk, &directory)?)
 }
 
 pub(crate) fn boot_artifacts(
@@ -896,6 +890,30 @@ mod tests {
 
     struct Temp(PathBuf);
     impl Temp {
+        fn capture_root(&self, snapshot: &Snapshot) -> PathBuf {
+            private_directory(&self.0.join("machines")).unwrap();
+            private_directory(
+                &self
+                    .0
+                    .join("machines")
+                    .join(object_name(snapshot.request.machine_id.as_str())),
+            )
+            .unwrap();
+            super::root(&self.0, snapshot)
+        }
+        fn image(&self, snapshot: &Snapshot) -> sandsurf_image::VerifiedImage {
+            sandsurf_image::verify_image(
+                &self
+                    .0
+                    .join("images")
+                    .join(snapshot.image_digest.as_str())
+                    .join("manifest.json"),
+                sandsurf_image::ImageTrust::Pinned {
+                    manifest_digest: snapshot.image_digest.as_str(),
+                },
+            )
+            .unwrap()
+        }
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
                 "sandsurf-snapshot-test-{}-{}",
@@ -986,11 +1004,20 @@ mod tests {
     #[test]
     fn snapshot_boot_identity_rejects_changed_kernel_and_never_uses_pristine_seed() {
         let temp = Temp::new();
-        let root = temp.0.join("snapshots");
         let disk = temp.0.join("source.raw");
         open_write(&disk).unwrap().write_all(&[3; 4096]).unwrap();
         let snapshot = snapshot();
-        capture_filesystem(&root, &snapshot, &disk).unwrap();
+        let root = temp.capture_root(&snapshot);
+        let image = temp.image(&snapshot);
+        let mut foreign = snapshot.clone();
+        foreign.image_digest = bytes_digest(b"another image");
+        assert!(capture_filesystem(&root, &foreign, &disk, &image).is_err());
+        assert!(
+            !root.exists(),
+            "reject another image before allocating capture storage"
+        );
+        assert!(!root.parent().unwrap().join("images").exists());
+        capture_filesystem(&root, &snapshot, &disk, &image).unwrap();
         let directory = root.join(object_name(snapshot.request.id.as_str()));
         let kernel = directory.join("boot/kernel");
         #[cfg(unix)]
@@ -1157,15 +1184,15 @@ mod tests {
     #[test]
     fn capture_fork_and_rollback_are_verified_independent_copies() {
         let temp = Temp::new();
-        let root = temp.0.join("snapshots");
-        private_directory(&root).unwrap();
         let source = temp.0.join("source.raw");
         open_write(&source)
             .unwrap()
             .write_all(&vec![7_u8; 4096])
             .unwrap();
         let mut snapshot = snapshot();
-        let captured = capture_filesystem(&root, &snapshot, &source).unwrap();
+        let root = temp.capture_root(&snapshot);
+        let image = temp.image(&snapshot);
+        let captured = capture_filesystem(&root, &snapshot, &source, &image).unwrap();
         snapshot.phase = SnapshotPhase::Ready;
         snapshot.consistency = Some(SnapshotConsistency::Crash);
         snapshot.system_disk_digest = Some(captured.disk_digest.clone());
