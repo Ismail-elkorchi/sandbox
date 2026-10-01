@@ -37,6 +37,7 @@ test("installed systemd host restart leaves the independently supervised Linux m
     host = await ready(directory);
     const manifest = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? join(packageRoot, "images/development-x64/manifest.json");
     const image = createHash("sha256").update(await readFile(manifest)).digest("hex");
+    await host.images.importNative({ manifestPath: manifest, manifestDigest: image, operationId: "import-independent-image" });
     machine = await host.machines.create({ id: "independent-machine", image,
       resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 4 * 1024 ** 2, managedExecutions: 8 } });
     await managementReady(machine);

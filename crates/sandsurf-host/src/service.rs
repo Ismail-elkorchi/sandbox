@@ -336,6 +336,9 @@ impl HostService {
                         operation: admitted,
                     })));
                 }
+                self.catalog
+                    .image(&recipe.boot_image_digest)?
+                    .ok_or(HostError::Invalid("OCI boot image has not been admitted"))?;
                 Ok(HostDispatch::Task(Box::new(HostTask::Image {
                     root: self.root.clone(),
                     executable: self.executable.clone(),
@@ -872,6 +875,9 @@ impl HostService {
                 operation_id,
                 approval_id,
             } => {
+                self.catalog
+                    .image(&image_digest)?
+                    .ok_or(HostError::Invalid("machine image has not been admitted"))?;
                 #[cfg(target_os = "linux")]
                 let native_config = crate::linux::prepare_config(
                     &self.root,
@@ -891,7 +897,6 @@ impl HostService {
                 #[cfg(target_os = "windows")]
                 let native_config = crate::windows::prepare_config(
                     &self.root,
-                    &self.executable,
                     &machine_id,
                     &image_digest,
                     &resources,
@@ -977,7 +982,6 @@ impl HostService {
                 #[cfg(target_os = "windows")]
                 let native_config = crate::windows::prepare_config(
                     &self.root,
-                    &self.executable,
                     &machine_id,
                     &snapshot.image_digest,
                     &resources,
@@ -3731,6 +3735,38 @@ mod tests {
         let machine: MachineId = name.try_into().unwrap();
         let create: OperationId = format!("create-{name}").try_into().unwrap();
         let image = bytes_digest(b"seed");
+        if service.catalog.image(&image).unwrap().is_none() {
+            let operation: OperationId = "import-seed".try_into().unwrap();
+            let request = bytes_digest(b"import-seed");
+            service
+                .catalog
+                .admit_image_import(
+                    operation.clone(),
+                    request.clone(),
+                    Approval {
+                        id: "approve-import-seed".try_into().unwrap(),
+                        request_digest: request.clone(),
+                    },
+                )
+                .unwrap();
+            service
+                .catalog
+                .complete_image_import(
+                    &operation,
+                    &request,
+                    sandsurf_state::ImageRecord {
+                        digest: image.clone(),
+                        source_digest: image.clone(),
+                        platform: "linux".into(),
+                        architecture: "amd64".into(),
+                        logical_bytes: Counter::ONE,
+                        storage_bytes: Counter::ONE,
+                        provenance_digest: image.clone(),
+                        sensitive: false,
+                    },
+                )
+                .unwrap();
+        }
         let resources = Resources::from_geometry(
             Counter::ONE,
             128_u64.try_into().unwrap(),

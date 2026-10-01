@@ -21,6 +21,7 @@ test("KVM native NIC survives removal of management and inbound revocation close
   let machine;
   let client;
   try {
+    await host.images.importNative({ manifestPath: manifest, manifestDigest: image, operationId: "import-network-image" });
     machine = await host.machines.create({
       id: "native-network-hardware", image,
       resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 16 * 1024 ** 2, managedExecutions: 32 },

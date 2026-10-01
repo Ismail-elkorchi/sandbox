@@ -11,9 +11,13 @@ const host = await Sandsurf.open({
 });
 
 const support = await host.inspect();
+const image = await host.images.importNative({
+  manifestPath: "/absolute/complete-machine/manifest.json",
+  manifestDigest: "<verified-manifest-sha256>",
+});
 const box = await host.machines.create({
   id: "agent-computer",
-  image: "<verified-image-sha256>",
+  image: image.id,
   resources: { vcpus: 2, memoryMiB: 4096, diskBytes: 20 * 1024 ** 3 },
 });
 

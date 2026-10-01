@@ -1505,11 +1505,12 @@ impl HostCatalog {
         host_operation_identity_available(&tx, &operation)?;
         capacity(&tx, "machines", self.limits.identities)?;
         capacity(&tx, "intents", self.limits.operations)?;
-        let image_state = image_state(&tx, &image)?;
-        if image_state.as_ref().is_some_and(|(_, retired, _)| *retired) {
+        let (image_record, retired, _) = image_state(&tx, &image)?
+            .ok_or(Error::Missing("machine image has not been admitted"))?;
+        if retired {
             return Err(Error::Conflict("machine image is retired"));
         }
-        let sensitive = image_state.is_some_and(|(image, _, _)| image.sensitive);
+        let sensitive = image_record.sensitive;
         let total = resources.checked_add(&catalog_resources_held(&tx, None)?)?;
         if !total.within(&self.limits.resources) {
             return Err(Error::Capacity("host resource reservations exhausted"));

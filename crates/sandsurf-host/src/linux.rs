@@ -176,10 +176,8 @@ fn qualification_for_boot(
     })
 }
 
-/// Resolve and copy an exact source-built boot/defaults bundle into the host's
-/// immutable image store before catalog admission. Local unsigned images are
-/// accepted only through the explicit qualification environment variable;
-/// packaged images require their release signature and index digest.
+/// Resolve the host-owned image previously admitted through the image catalog.
+/// Machine creation never publishes image bytes or bypasses image accounting.
 pub fn prepare_config(
     host_root: &Path,
     executable: &Path,
@@ -206,20 +204,9 @@ pub fn prepare_config(
         }
         return Ok(existing);
     }
-    let installed_root = host_root.join("images").join(image_digest.as_str());
-    let (verified, source_template) = if installed_root.exists() {
-        let verified = verify_image(
-            &installed_root.join("manifest.json"),
-            ImageTrust::ExplicitLocal,
-        )?;
-        let template = verified.system_path.clone();
-        (verified, template)
-    } else {
-        let image = crate::images::resolve_native_image(host_root, executable, image_digest)
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-        let template = image.system_path.clone();
-        (image, template)
-    };
+    let verified = crate::images::resolve_native_image(host_root, image_digest)
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    let source_template = &verified.system_path;
     if verified.manifest_digest != image_digest.as_str()
         || verified.manifest.architecture
             != if cfg!(target_arch = "aarch64") {
@@ -233,8 +220,8 @@ pub fn prepare_config(
             "image identity, architecture or system disk format do not match".into(),
         ));
     }
-    require_regular(&source_template, 128 * 1024 * 1024 * 1024)?;
-    let installed = sandsurf_image::install_image(&host_root.join("images"), &verified)?;
+    require_regular(source_template, 128 * 1024 * 1024 * 1024)?;
+    let installed = host_root.join("images").join(image_digest.as_str());
 
     let firecracker = std::env::var_os("SANDSURF_FIRECRACKER")
         .map(PathBuf::from)

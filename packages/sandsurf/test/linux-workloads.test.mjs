@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { lookup } from "node:dns/promises";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { qualificationDirectory } from "./qualification-storage.mjs";
 import { join } from "node:path";
 import test from "node:test";
@@ -16,8 +18,9 @@ test("installed Linux computer runs package scripts, builds, databases and conta
   const host = await Sandsurf.open({ directory, authorizer: () => true });
   let machine;
   try {
-    const image = (await host.inspect()).defaultImageDigest;
-    assert.ok(image);
+    const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? join(root, "images/development-x64/manifest.json");
+    const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
+    await host.images.importNative({ manifestPath, manifestDigest: image, operationId: "import-workload-image" });
     machine = await host.machines.create({ id: "linux-workloads", image, resources: {
       vcpus: 1, memoryMiB: 768, diskBytes: 2 * 1024 ** 3,
       outputBytes: 16 * 1024 ** 2, managedExecutions: 64,
@@ -37,6 +40,14 @@ test("installed Linux computer runs package scripts, builds, databases and conta
     context.diagnostic("normal guest package installation, including maintainer scripts");
     await run(machine, "sudo -n apk add --no-cache build-base python3 sqlite docker docker-openrc openssh", 240_000);
     assert.match(await run(machine, "getent passwd sshd; test -d /var/lib/docker; apk info --installed python3 sqlite docker"), /sshd[\s\S]*python3/u);
+    context.diagnostic("normal kernel package lifecycle updates direct-boot selection");
+    await run(machine, "sudo -n apk fix linux-virt", 240_000);
+    const bootSelection = JSON.parse(Buffer.from(await machine.fs.readFile("/boot/sandsurf.json")).toString());
+    assert.equal(bootSelection.architecture, "x64");
+    assert.ok(bootSelection.kernel.startsWith("/boot/"));
+    assert.ok(bootSelection.initramfs.startsWith("/boot/"));
+    await machine.fs.stat(bootSelection.kernel);
+    await machine.fs.stat(bootSelection.initramfs);
     await run(machine, "mkdir -p /home/agent/project; printf '#include <stdio.h>\\nint main(void){puts(\"real-build\");}\\n' > /home/agent/project/main.c; cc /home/agent/project/main.c -o /home/agent/project/main; /home/agent/project/main");
     assert.equal(await run(machine, "python3 -c 'import sqlite3; c=sqlite3.connect(\"/home/agent/database\"); c.execute(\"create table durable(value text)\"); c.execute(\"insert into durable values(?)\", (\"retained\",)); c.commit(); print(c.execute(\"pragma integrity_check\").fetchone()[0])'"), "ok\n");
     context.diagnostic("guest namespaces, cgroups, mounts and Docker bridge networking");

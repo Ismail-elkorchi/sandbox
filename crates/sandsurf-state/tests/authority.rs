@@ -50,6 +50,75 @@ fn catalog_limits() -> CatalogLimits {
     }
 }
 
+fn admit_fixture_image(host: &mut HostCatalog, digest: &Digest) {
+    let operation: OperationId = format!("image-{}", digest.as_str()).try_into().unwrap();
+    let request = hash(operation.as_str());
+    host.admit_image_import(
+        operation.clone(),
+        request.clone(),
+        Approval {
+            id: format!("approve-{}", operation.as_str())
+                .try_into()
+                .unwrap(),
+            request_digest: request.clone(),
+        },
+    )
+    .unwrap();
+    let mut record = image("fixture", 1);
+    record.digest = digest.clone();
+    host.complete_image_import(&operation, &request, record)
+        .unwrap();
+}
+
+#[test]
+fn machine_creation_requires_catalog_image_admission_without_partial_authority() {
+    let root = TempRoot::new();
+    let mut host = HostCatalog::create(
+        &root.0.join("host"),
+        "host".try_into().unwrap(),
+        catalog_limits(),
+    )
+    .unwrap();
+    let admission = MachineAdmission {
+        id: "computer".try_into().unwrap(),
+        image: hash("unadmitted-image"),
+        resources: resources(),
+        defaults: ExecutionDefaults::default(),
+        image_defaults: ExecutionDefaults::default(),
+        lifetime: MachineLifetime::default(),
+        operation: "create-computer".try_into().unwrap(),
+    };
+    let request_digest = digest(
+        Domain::Machine,
+        &(
+            &admission.id,
+            &admission.image,
+            &admission.resources,
+            &admission.defaults,
+            &admission.lifetime,
+            &admission.operation,
+        ),
+    )
+    .unwrap();
+    let approval = Approval {
+        id: "approve-create-computer".try_into().unwrap(),
+        request_digest,
+    };
+    assert!(matches!(
+        host.create_machine(admission.clone(), approval.clone()),
+        Err(Error::Missing(_))
+    ));
+    assert!(host.machine(&admission.id).unwrap().is_none());
+    assert!(host.intent(&admission.operation).unwrap().is_none());
+    admit_fixture_image(&mut host, &admission.image);
+    host.create_machine(admission.clone(), approval.clone())
+        .unwrap();
+    assert_eq!(
+        host.create_machine(admission, approval).unwrap().revision,
+        Counter::ONE
+    );
+}
+
 #[test]
 fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     let root = TempRoot::new();
@@ -116,6 +185,7 @@ fn machine_execution_defaults_is_host_owned_and_durable() {
         catalog_limits(),
     )
     .unwrap();
+    admit_fixture_image(&mut host, &image);
     host.create_machine(
         MachineAdmission {
             id: machine.clone(),
@@ -183,6 +253,7 @@ fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() 
         ),
     )
     .unwrap();
+    admit_fixture_image(&mut host, &image);
     host.create_machine(
         MachineAdmission {
             id: machine.clone(),
@@ -700,6 +771,7 @@ impl Fixture {
         let machine: MachineId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
+        admit_fixture_image(&mut host, &image);
         let defaults = ExecutionDefaults::default();
         let request_digest = digest(
             Domain::Machine,

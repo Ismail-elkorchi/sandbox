@@ -106,7 +106,7 @@ pub fn prepare_config(
         }
         return Ok(existing);
     }
-    let verified = crate::images::resolve_native_image(host_root, executable, image_digest)
+    let verified = crate::images::resolve_native_image(host_root, image_digest)
         .map_err(|error| AppleError::Invalid(error.to_string()))?;
     let template = verified.system_path.clone();
     if verified.manifest.architecture

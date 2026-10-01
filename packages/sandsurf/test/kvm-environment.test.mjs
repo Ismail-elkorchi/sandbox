@@ -32,12 +32,13 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.match(nativeHost.guestPower.shutdown.reasons.join(" "), /ACPI/u);
     assert.equal(nativeHost.guestPower.reboot.kind, "supported");
     assert.equal(nativeHost.console.kind, "supported");
+    await host.images.importNative({ manifestPath, manifestDigest: image, operationId: "import-computer-image" });
     machine = await host.machines.create({
       id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
     });
     await managementReady(machine);
     const initialUsage = await machine.resources.usage();
-    assert.ok(initialUsage.diskLogicalBytes >= 256 * 1024 ** 2,
+    assert.ok(initialUsage.diskLogicalBytes >= 2 * 1024 ** 3,
       "host observations include the persistent machine disk independently of Linux free space");
     assert.ok(initialUsage.diskAllocatedBytes >= 256 * 1024 ** 2,
       "the reserved persistent disk must be accounted through native filesystem allocation");
@@ -47,11 +48,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal((await machine.inspect()).machine.value.state, "running");
     const storage = (await machine.inspect()).storage;
     assert.equal(storage.kind, "current");
-    assert.equal(storage.capacityBytes, 256 * 1024 ** 2);
+    assert.equal(storage.capacityBytes, 2 * 1024 ** 3);
     assert.equal(storage.payload.kind, "present");
     assert.equal(await run(machine, "id -un"), "agent\n");
     assert.equal(await run(machine, "sudo -n id -u"), "0\n");
-    assert.ok(Number(await run(machine, "df -k / | tail -1 | awk '{print $2}'")) >= 240_000, "the root filesystem must cover the reserved 256 MiB disk");
+    assert.ok(Number(await run(machine, "df -k / | tail -1 | awk '{print $2}'")) >= 1_900_000, "the root filesystem must cover the reserved 2 GiB disk");
     assert.match(await run(machine, "sudo -n readlink /proc/1/exe; rc-status --runlevel"), /busybox[\s\S]*default/u);
     assert.equal(await run(machine, "sudo -n sh -c 'test -w /etc && test -w /usr && test -w /var && test -w /root' && test -w /home/agent"), "");
     await run(machine, "sudo -n sh -c 'printf computer > /etc/sandsurf-test; printf \"#!/bin/sh\\nprintf installed\\n\" > /usr/local/bin/agent-tool; chmod 755 /usr/local/bin/agent-tool'; mkdir -p /home/agent/cache; printf durable > /home/agent/cache/value");
@@ -244,6 +245,10 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(snapshot.inspection.consistency, "crash");
     fork = await snapshot.fork({ id: "forked-machine" });
     await managementReady(fork);
+    assert.notEqual(Buffer.from(await fork.fs.readFile("/etc/machine-id")).toString(),
+      Buffer.from(await machine.fs.readFile("/etc/machine-id")).toString(), "managed forks regenerate OS identity");
+    assert.notEqual(await run(fork, "cat /sys/class/net/eth0/address"),
+      await run(machine, "cat /sys/class/net/eth0/address"), "forks have independent native NIC identities");
     assertSameBytes(await fork.fs.readFile("/workspace/dense"), dense);
     assert.equal(Buffer.from(await fork.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
     assert.equal(Buffer.from(await fork.fs.readFile("/home/agent/cache/value")).toString(), "durable");

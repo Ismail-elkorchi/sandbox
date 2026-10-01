@@ -301,7 +301,6 @@ pub fn serve(root: &Path, operation: OperationId) -> Result<()> {
                 };
                 crate::images::import_oci(
                     &root,
-                    &std::env::current_exe()?,
                     crate::images::OciBuildInput {
                         source,
                         recipe,

@@ -56,7 +56,10 @@ fn transport_checksum(src: IpAddr, dst: IpAddr, protocol: u8, bytes: &[u8]) -> u
     }
     // Both pseudo-header layouts are even in length.
     let sum = pseudo
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| word.as_slice())
         .chain(bytes.chunks(2))
         .fold(0_u32, |s, b| {
             s + u32::from(u16::from_be_bytes([b[0], *b.get(1).unwrap_or(&0)]))

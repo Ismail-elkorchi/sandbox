@@ -84,7 +84,6 @@ pub struct WindowsGuardianConfig {
 
 pub fn prepare_config(
     host_root: &Path,
-    executable: &Path,
     machine_id: &MachineId,
     image_digest: &Digest,
     resources: &Resources,
@@ -103,7 +102,7 @@ pub fn prepare_config(
         }
         return Ok(existing);
     }
-    let image = crate::images::resolve_native_image(host_root, executable, image_digest)
+    let image = crate::images::resolve_native_image(host_root, image_digest)
         .map_err(|error| WindowsError::Invalid(error.to_string()))?;
     if image.manifest.architecture != Architecture::X64 || image.windows_x64.is_none() {
         return Err(WindowsError::Invalid(

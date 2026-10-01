@@ -105,6 +105,32 @@ impl Fixture {
         let machine: MachineId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
+        let import: OperationId = "import-image".try_into().unwrap();
+        let request = hash("import-image");
+        host.admit_image_import(
+            import.clone(),
+            request.clone(),
+            Approval {
+                id: "approve-import-image".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+        host.complete_image_import(
+            &import,
+            &request,
+            ImageRecord {
+                digest: image.clone(),
+                source_digest: image.clone(),
+                platform: "linux".into(),
+                architecture: "amd64".into(),
+                logical_bytes: n(1),
+                storage_bytes: n(1),
+                provenance_digest: image.clone(),
+                sensitive: false,
+            },
+        )
+        .unwrap();
         let defaults = ExecutionDefaults::default();
         let request_digest = digest(
             Domain::Machine,

@@ -18,9 +18,13 @@ const host = await Sandsurf.open({
 const support = await host.inspect();
 console.dir(support); // Unsupported mechanisms and unqualified ones are distinct.
 
+const image = await host.images.importNative({
+  manifestPath: "/absolute/complete-machine/manifest.json",
+  manifestDigest: "<verified-manifest-sha256>",
+});
 const machine = await host.machines.create({
   id: "agent-computer",
-  image: "<verified-machine-image-sha256>",
+  image: image.id,
   resources: {
     vcpus: 2,
     memoryMiB: 4096,
@@ -76,6 +80,8 @@ expands VM disks or runs image installation hooks. A published operation
 can be retrieved or retried after restart even if the source bundle has been
 deleted. The same image has one catalog representation regardless of whether
 it was imported natively, converted from OCI, or published from a snapshot.
+Machine creation and OCI boot recipes require an admitted image. They do not
+implicitly install package images or create a second image-publication path.
 Provenance carries known sensitivity; a missing sensitivity declaration is not
 proof that a complete disk contains no secrets, and imports do not scrub disks.
 An image must match the native guest architecture; Windows boot additionally

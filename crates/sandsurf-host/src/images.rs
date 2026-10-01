@@ -104,6 +104,7 @@ pub(crate) fn import_native(
             "native image manifest path must be absolute".into(),
         ));
     }
+    let _custody = image_custody(host_root, manifest_digest)?;
     let (stage, old) = prepare_import(host_root, operation, request_digest)?;
     if let Some(image) = old {
         return Ok(image);
@@ -271,7 +272,6 @@ fn image_record(root: &Path, image: &VerifiedImage) -> Result<ImageRecord, Image
 
 pub(crate) fn import_oci(
     host_root: &Path,
-    executable: &Path,
     input: OciBuildInput<'_>,
     operation: &OperationId,
     request_digest: &Digest,
@@ -292,7 +292,8 @@ pub(crate) fn import_oci(
             "OCI platform must exactly match the native Linux guest architecture".into(),
         ));
     }
-    let base = resolve_native_image(host_root, executable, &recipe.boot_image_digest)?;
+    let _custody = image_custody(host_root, &recipe.boot_image_digest)?;
+    let base = resolve_native_image(host_root, &recipe.boot_image_digest)?;
     let architecture = match requested.architecture.as_str() {
         "amd64" => Architecture::X64,
         "arm64" => Architecture::Arm64,
@@ -677,97 +678,29 @@ fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), ImageBu
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ImageIndex {
-    #[serde(rename = "formatVersion")]
-    format_version: u16,
-    #[serde(rename = "buildId")]
-    build_id: String,
-    files: BTreeMap<String, String>,
-}
-
 pub(crate) fn resolve_native_image(
     host_root: &Path,
-    executable: &Path,
     expected: &Digest,
 ) -> Result<VerifiedImage, ImageBuildError> {
     sandsurf_native::volume::inspect(host_root)?;
     let installed = host_root.join("images").join(expected.as_str());
     match fs::symlink_metadata(&installed) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            return Ok(verify_image(
+            Ok(verify_image(
                 &installed.join("manifest.json"),
                 ImageTrust::Pinned {
                     manifest_digest: expected.as_str(),
                 },
-            )?);
+            )?)
         }
-        Ok(_) => {
-            return Err(ImageBuildError::Invalid(
-                "image is not a host-owned directory".into(),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Ok(_) => Err(ImageBuildError::Invalid(
+            "image is not a host-owned directory".into(),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(ImageBuildError::Invalid(
+            "admitted image has no published host-owned bundle".into(),
+        )),
+        Err(error) => Err(error.into()),
     }
-    if let Some(path) = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from) {
-        if !path.is_absolute() {
-            return Err(ImageBuildError::Invalid(
-                "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
-            ));
-        }
-        let image = verify_image(&path, ImageTrust::ExplicitLocal)?;
-        if image.manifest_digest != expected.as_str() {
-            return Err(ImageBuildError::Invalid(
-                "local image differs from authorized image identity".into(),
-            ));
-        }
-        let installed = install_image(&host_root.join("images"), &image)?;
-        return Ok(verify_image(
-            &installed.join("manifest.json"),
-            ImageTrust::Pinned {
-                manifest_digest: expected.as_str(),
-            },
-        )?);
-    }
-    let package = executable
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or_else(|| ImageBuildError::Invalid("native package layout is invalid".into()))?;
-    let architecture = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x64"
-    };
-    let relative = format!("development-{architecture}/manifest.json");
-    let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
-    if index.format_version != 1 || index.build_id != "sandsurf-images-1.0.0" {
-        return Err(ImageBuildError::Invalid(
-            "invalid image distribution index".into(),
-        ));
-    }
-    let indexed = index
-        .files
-        .get(&relative)
-        .ok_or_else(|| ImageBuildError::Invalid("packaged image manifest is absent".into()))?;
-    let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
-        ImageBuildError::Invalid("native host has no bundled image trust identity".into())
-    })?;
-    if indexed != pinned || expected.as_str() != pinned {
-        return Err(ImageBuildError::Invalid(
-            "packaged image index differs from the native trust identity".into(),
-        ));
-    }
-    let image = sandsurf_image::distribution::install(
-        &host_root.join("images"),
-        &package.join("images").join(relative),
-        ImageTrust::Pinned {
-            manifest_digest: pinned,
-        },
-    )?;
-    Ok(image)
 }
 
 #[cfg(target_os = "windows")]
@@ -833,7 +766,32 @@ fn copy_regular(source: &Path, destination: &Path) -> Result<(), ImageBuildError
     Ok(())
 }
 
+/// A publication/read lease, not another image-authority database. The host
+/// catalog may retire an image while a worker reads it, but byte reclamation
+/// and quota release must wait for custody to drain. Kernel locks disappear
+/// on worker failure; lock files retain stable identities for later owners.
+fn image_custody(host_root: &Path, digest: &Digest) -> Result<File, ImageBuildError> {
+    let directory = host_root.join("images/custody");
+    prepare_private_directory(&host_root.join("images"))?;
+    prepare_private_directory(&directory)?;
+    let path = directory.join(digest.as_str());
+    let held = match create_private_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            sandsurf_native::local::open_private_file(
+                &path,
+                sandsurf_native::PrivateFileAccess::ReadWrite,
+            )?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    held.try_lock()
+        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.to_string()))?;
+    Ok(held)
+}
+
 pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError> {
+    let _custody = image_custody(host_root, digest)?;
     let images = host_root.join("images");
     let target = images.join(digest.as_str());
     match fs::symlink_metadata(&target) {
@@ -1029,6 +987,22 @@ mod native_import_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn image_cleanup_waits_for_worker_custody_and_preserves_original_bytes() {
+        let fixture = Fixture::new();
+        fixture.import("pinned-import", "c").unwrap();
+        let held = image_custody(&fixture.root, &fixture.digest).unwrap();
+        let path = fixture.root.join("images").join(fixture.digest.as_str());
+        let before = fs::read(path.join("system.ext4")).unwrap();
+        assert!(
+            matches!(cleanup(&fixture.root, &fixture.digest), Err(ImageBuildError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fs::read(path.join("system.ext4")).unwrap(), before);
+        drop(held);
+        cleanup(&fixture.root, &fixture.digest).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
