@@ -1139,9 +1139,44 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 fn wide_os(path: &Path) -> io::Result<Vec<u16>> {
-    let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+    use std::path::{Component, Prefix};
+    if !path.is_absolute() {
+        return Err(invalid("Windows private storage requires an absolute path"));
+    }
+    // Native calls do not receive Rust std's automatic long-path conversion.
+    // Use the extended namespace consistently, independent of machine-wide
+    // MAX_PATH registry settings. Logical identities and staging names must
+    // not be shortened merely to accommodate the DOS path limit.
+    let absolute = std::path::absolute(path)?;
+    let raw: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let mut value = match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => {
+                let mut value: Vec<u16> = r"\\?\".encode_utf16().collect();
+                value.extend(raw.iter().map(|unit| if *unit == 47 { 92 } else { *unit }));
+                value
+            }
+            Prefix::UNC(_, _) => {
+                let mut value: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+                value.extend(
+                    raw[2..]
+                        .iter()
+                        .map(|unit| if *unit == 47 { 92 } else { *unit }),
+                );
+                value
+            }
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) | Prefix::Verbatim(_) => raw,
+            Prefix::DeviceNS(_) => return Err(invalid("device namespace is not private storage")),
+        },
+        _ => return Err(invalid("Windows private storage has no volume prefix")),
+    };
     if value.contains(&0) {
         return Err(invalid("Windows endpoint path contains NUL"));
+    }
+    if value.len() >= 32767 {
+        return Err(invalid(
+            "Windows private storage path exceeds its native bound",
+        ));
     }
     value.push(0);
     Ok(value)

@@ -72,6 +72,36 @@ fn private_storage_is_owner_only_and_refuses_hard_link_aliases() {
 }
 
 #[test]
+fn private_storage_and_publication_preserve_long_object_paths() {
+    use sandsurf_native::local::{create_private_file, open_private_file};
+    use sandsurf_native::storage::publish_new_file;
+    use std::os::windows::ffi::OsStrExt;
+    let root = Root::new();
+    let mut directory = root.0.clone();
+    for number in 0..4 {
+        directory = directory.join(format!("object-{number}-{}", "a".repeat(70)));
+        create_private_directory(&directory).unwrap();
+    }
+    let source = directory.join(format!("result.{}.pending", "b".repeat(64)));
+    let target = directory.join("result.json");
+    assert!(source.as_os_str().encode_wide().count() > 260);
+    let mut writer = create_private_file(&source).unwrap();
+    writer.write_all(b"long-path retained original").unwrap();
+    writer.sync_all().unwrap();
+    drop(writer);
+    publish_new_file(&source, &target).unwrap();
+    assert!(!source.exists());
+    let retained = open_private_file(&target, PrivateFileAccess::ReadOnly).unwrap();
+    create_private_file(&source).unwrap();
+    assert_eq!(
+        publish_new_file(&source, &target).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"long-path retained original");
+    drop(retained);
+}
+
+#[test]
 fn private_pipe_authenticates_both_peers_and_preserves_binary_frames() {
     let root = Root::new();
     let listener = LocalListener::bind(&root.0).unwrap();
