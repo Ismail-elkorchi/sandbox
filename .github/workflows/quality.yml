@@ -95,6 +95,11 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
+      - name: Compile and entitle the native Apple VM owner (not VM qualification)
+        run: |
+          swiftc -parse-as-library native/macos/unix-socket.swift native/macos/owner-protocol.swift native/macos/sandsurf-vz-helper.swift -o "$RUNNER_TEMP/sandsurf-vz-helper"
+          codesign --force --sign - --options runtime --entitlements scripts/qualification/apple.entitlements "$RUNNER_TEMP/sandsurf-vz-helper"
+          codesign --verify --strict "$RUNNER_TEMP/sandsurf-vz-helper"
       - name: Native Apple owner contracts (not VM qualification)
         run: |
           swiftc -parse-as-library native/macos/owner-protocol.swift native/macos/unix-socket.swift scripts/qualification/apple-local-socket.swift -o "$RUNNER_TEMP/sandsurf-apple-control-test"
