@@ -6,7 +6,9 @@ use sandsurf_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
     unpack_layout_archive, write_filesystem_tar,
 };
-use sandsurf_image::{ImageDefaults, RootfsFormat};
+use sandsurf_image::{
+    ImageDefaults, ImageManifest, RootfsArtifact, RootfsFormat, SystemDiskManifest,
+};
 use std::collections::BTreeMap;
 
 pub(crate) struct BuildInput<'a> {

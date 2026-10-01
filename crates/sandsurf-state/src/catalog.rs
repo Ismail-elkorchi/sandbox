@@ -266,6 +266,15 @@ impl HostCatalog {
     }
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::open(path, "host")?;
+        let orphaned: bool = db.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM machines m LEFT JOIN images i ON m.image=i.digest WHERE m.released=0 AND (i.digest IS NULL OR i.retired<>0))",
+            [], |row| row.get(0),
+        )?;
+        if orphaned {
+            return Err(Error::Corrupt(
+                "active machine has no admitted image; catalog preserved intact",
+            ));
+        }
         let (host, limits, binding): (String, String, String) = db.connection.query_row(
             "SELECT host, limits, authority FROM configuration WHERE id=1",
             [],

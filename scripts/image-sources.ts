@@ -105,7 +105,7 @@ export async function packImageSources(architecture: "x64" | "arm64", roots: Ima
       await pipeline(createReadStream(entry.raw), createGzip({ level: 9 }),
         createWriteStream(staged, { flags: "wx", mode: 0o644 }));
       await rename(staged, entry.compressed);
-      await publishDistributionSource(entry);
+      await publishBuiltTransport(entry);
     } finally {
       await rm(staged, { force: true });
     }
@@ -157,6 +157,41 @@ export async function hydrateImageSources(roots: ImageRoots = defaultRoots): Pro
         await rm(staged, { force: true });
       }
     }
+  }
+}
+
+/** Explicit image production replaces a generated build output. Hydration
+ * instead consumes an existing identity and must never replace its bytes.
+ * Neither operation mutates the host's content-addressed image store.
+ */
+async function publishBuiltTransport(entry: ImageEntry): Promise<void> {
+  await verifyDiskTransport(entry.compressed, entry.sha256);
+  const target = `${entry.raw}.gz`;
+  const staged = temporary(target);
+  const previous = temporary(target);
+  let moved = false;
+  let published = false;
+  try {
+    await copyFile(entry.compressed, staged);
+    await verifyDiskTransport(staged, entry.sha256);
+    await chmod(staged, 0o444);
+    try {
+      await digestFile(target); // Reject links, oversized or changing artifacts.
+      await rename(target, previous);
+      moved = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    try {
+      await rename(staged, target);
+      published = true;
+    } catch (error) {
+      if (moved) { await rename(previous, target); moved = false; }
+      throw error;
+    }
+  } finally {
+    await rm(staged, { force: true });
+    if (published && moved) await rm(previous, { force: true });
   }
 }
 

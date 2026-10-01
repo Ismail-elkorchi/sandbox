@@ -120,6 +120,26 @@ fn machine_creation_requires_catalog_image_admission_without_partial_authority()
 }
 
 #[test]
+fn reopening_rejects_unadmitted_active_image_without_repairing_the_catalog() {
+    let Fixture {
+        host,
+        runtime,
+        root,
+        ..
+    } = Fixture::new();
+    drop(host);
+    drop(runtime);
+    let path = root.0.join("host");
+    let database = path.join("authority.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute("DELETE FROM images", []).unwrap();
+    drop(connection);
+    let before = fs::read(&database).unwrap();
+    assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
+    assert_eq!(fs::read(&database).unwrap(), before);
+}
+
+#[test]
 fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     let root = TempRoot::new();
     let path = root.0.join("incompatible");

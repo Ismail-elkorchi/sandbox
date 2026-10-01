@@ -2,7 +2,7 @@
 
 mod binding;
 
-use sandsurf_guest::{ExecutionRegistry, FilesystemService, ManagementService};
+use sandsurf_guest::{ConnectionBudget, ExecutionRegistry, FilesystemService, ManagementService};
 #[cfg(test)]
 use sandsurf_protocol::bytes_digest;
 use sandsurf_protocol::{
@@ -18,7 +18,6 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 const MAX_AUTHENTICATION_DISK: u64 = 4096;
@@ -92,24 +91,18 @@ fn supervisor_main() -> io::Result<()> {
         .map_err(|error| stage("open filesystem watch journal", io::Error::other(error)))?;
     let ledger = Path::new(CONTROL_ROOT).join("operations");
     let service = Arc::new(ManagementService::open(processes, filesystem, &ledger)?);
-    let connections = Arc::new(AtomicUsize::new(0));
+    let connections = ConnectionBudget::new(MAX_CONTROL_CONNECTIONS);
 
     loop {
         let Ok(connection) = accept_connection(listener.as_raw_fd()) else {
             continue;
         };
-        if connections
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                (value < MAX_CONTROL_CONNECTIONS).then_some(value + 1)
-            })
-            .is_err()
-        {
+        let Some(lease) = connections.try_acquire() else {
             // SAFETY: this accepted descriptor was not transferred elsewhere.
             unsafe { libc::close(connection) };
             continue;
-        }
+        };
         if let Err(error) = set_socket_timeout(connection, std::time::Duration::from_secs(15)) {
-            connections.fetch_sub(1, Ordering::AcqRel);
             // SAFETY: setup failed before ownership transfer.
             unsafe { libc::close(connection) };
             eprintln!(
@@ -121,16 +114,9 @@ fn supervisor_main() -> io::Result<()> {
         let service = Arc::clone(&service);
         let identity = Arc::clone(&identity);
         let session_generation = Arc::clone(&session_generation);
-        let connections = Arc::clone(&connections);
         let management = Arc::clone(&management);
         std::thread::spawn(move || {
-            struct ConnectionGuard(Arc<AtomicUsize>);
-            impl Drop for ConnectionGuard {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            let _guard = ConnectionGuard(connections);
+            let _lease = lease;
             // SAFETY: this worker receives sole ownership of the accepted descriptor.
             let mut connection = unsafe { File::from_raw_fd(connection) };
             if let Err(error) = serve_connection(

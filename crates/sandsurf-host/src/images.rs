@@ -4,13 +4,15 @@
 #[cfg(all(test, target_os = "linux"))]
 use sandsurf_image::ext4::materialize_tar;
 use sandsurf_image::{
-    Architecture, ImageManifest, ImageProvenance, ImageTrust, PlatformArtifacts, RootfsArtifact,
-    SystemDiskManifest, VerifiedImage, install_image, verify_image,
+    Architecture, ImageProvenance, ImageTrust, PlatformArtifacts, VerifiedImage, install_image,
+    verify_image,
 };
 #[cfg(target_os = "windows")]
 use sandsurf_image::{ImageArtifact, WindowsArtifacts};
 #[cfg(test)]
-use sandsurf_image::{ImageDefaults, RootfsFormat};
+use sandsurf_image::{
+    ImageDefaults, ImageManifest, RootfsArtifact, RootfsFormat, SystemDiskManifest,
+};
 use sandsurf_native::local::{
     create_private_file, ensure_private_directory as prepare_private_directory,
 };

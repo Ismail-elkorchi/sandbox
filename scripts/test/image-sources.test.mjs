@@ -62,6 +62,20 @@ test("hydration refuses to replace a corrupt published transport", async (contex
   assert.equal((await stat(path, { bigint: true })).ino, before.ino);
 });
 
+test("explicit image production replaces readonly build transports for a new identity", async (context) => {
+  const f = await fixture(context);
+  await packImageSources("x64", f.roots);
+  const next = Buffer.from("a newly constructed Linux system disk");
+  await writeFile(join(f.directory, "system.ext4"), next);
+  f.manifest.system.rootfs.sha256 = digest(next);
+  await writeFile(join(f.directory, "manifest.json"), JSON.stringify(f.manifest));
+  await writeImageIndex(f.roots.images, ["x64"]);
+  await packImageSources("x64", f.roots);
+  await rm(join(f.directory, "system.ext4"));
+  await hydrateImageSources(f.roots);
+  assert.deepEqual(await readFile(join(f.directory, "system.ext4")), next);
+});
+
 test("hydration rejects a changed manifest before interpreting disk paths", async (context) => {
   const f = await fixture(context);
   await packImageSources("x64", f.roots);

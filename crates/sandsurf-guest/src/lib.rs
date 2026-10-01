@@ -7,6 +7,8 @@
 //! host boundary and host-retained bytes can support host-verifiable claims.
 
 #[cfg(target_os = "linux")]
+mod admission;
+#[cfg(target_os = "linux")]
 mod executions;
 #[cfg(target_os = "linux")]
 mod filesystem;
@@ -16,6 +18,8 @@ mod process;
 mod service;
 mod spool;
 
+#[cfg(target_os = "linux")]
+pub use admission::ConnectionBudget;
 #[cfg(target_os = "linux")]
 pub use executions::{ExecutionRegistry, execution_keeper_main};
 #[cfg(target_os = "linux")]

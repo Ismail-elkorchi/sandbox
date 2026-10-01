@@ -1,10 +1,10 @@
 //! Managed-execution routing. Linux and each independent keeper own processes;
 //! the management daemon owns neither pipe/PTY descriptors nor their lifetime.
 
-use crate::OutputSpool;
 use crate::process::{
     ExecutionKeeper, ProcessError, ProcessRecord, read_process_record, write_process_record,
 };
+use crate::{ConnectionBudget, OutputSpool};
 use sandsurf_protocol::{
     Counter, Digest, ExecutionCompletion, ExecutionId, ExecutionSnapshot, ExecutionState, Frame,
     FrameKind, MachineId, RetainedPage, RetainedPageMetadata, SnapshotId, SpawnRequest, TerminalId,
@@ -896,7 +896,7 @@ pub fn execution_keeper_main(directory: &Path) -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let connections = Arc::new(AtomicUsize::new(0));
+    let connections = ConnectionBudget::new(MAX_KEEPER_CONNECTIONS);
     let pending = Arc::new(AtomicUsize::new(0));
     let startup = Instant::now();
     loop {
@@ -914,27 +914,15 @@ pub fn execution_keeper_main(directory: &Path) -> io::Result<()> {
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                if connections
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                        (value < MAX_KEEPER_CONNECTIONS).then_some(value + 1)
-                    })
-                    .is_err()
-                {
+                let Some(lease) = connections.try_acquire() else {
                     continue;
-                }
+                };
                 set_timeout(&stream)?;
                 let engine = Arc::clone(&engine);
-                let connections = Arc::clone(&connections);
                 let request = request.clone();
                 let pending = Arc::clone(&pending);
                 std::thread::spawn(move || {
-                    struct Guard(Arc<AtomicUsize>);
-                    impl Drop for Guard {
-                        fn drop(&mut self) {
-                            self.0.fetch_sub(1, Ordering::AcqRel);
-                        }
-                    }
-                    let _guard = Guard(connections);
+                    let _lease = lease;
                     let _ = serve_keeper(stream, &engine, &request, &pending);
                 });
             }
