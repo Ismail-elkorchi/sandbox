@@ -2,7 +2,9 @@
 //! runs them in a disposable QEMU appliance, never in the host kernel/chroot.
 //! No inspection, auto format detection, shared directories, host shell, or
 //! network is enabled. Inputs are explicit raw whole-device ext4 disks.
-use std::io::{self, Read};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::path::Path;
 
 fn invalid(message: &str) -> io::Error {

@@ -213,6 +213,7 @@ mod tests {
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
+    #[ignore = "native KVM/libguestfs image qualification; run explicitly with --ignored"]
     fn isolated_materialization_preserves_linux_metadata() {
         let root = std::path::Path::new("/var/tmp").join(format!(
             "sandsurf-ext4-builder-{}-{}",

@@ -35,11 +35,31 @@ test("ext4 and VHDX sources hydrate to complete digest-verified readonly bytes",
     await rm(join(f.directory, name));
   }
   await hydrateImageSources(f.roots);
+  const published = new Map();
   for (const [name, bytes] of Object.entries(f.disks)) {
     assert.deepEqual(await readFile(join(f.directory, name)), bytes);
     if (process.platform !== "win32") assert.equal((await stat(join(f.directory, name))).mode & 0o777, 0o444);
+    published.set(name, await stat(join(f.directory, `${name}.gz`), { bigint: true }));
   }
   await hydrateImageSources(f.roots);
+  for (const [name, before] of published) {
+    const after = await stat(join(f.directory, `${name}.gz`), { bigint: true });
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(after.nlink, 1n);
+  }
+});
+
+test("hydration refuses to replace a corrupt published transport", async (context) => {
+  const f = await fixture(context);
+  await packImageSources("x64", f.roots);
+  const path = join(f.directory, "system.ext4.gz");
+  await chmod(path, 0o600);
+  await writeFile(path, "invalid immutable transport");
+  const before = await stat(path, { bigint: true });
+  await assert.rejects(hydrateImageSources(f.roots));
+  assert.equal(await readFile(path, "utf8"), "invalid immutable transport");
+  assert.equal((await stat(path, { bigint: true })).ino, before.ino);
 });
 
 test("hydration rejects a changed manifest before interpreting disk paths", async (context) => {

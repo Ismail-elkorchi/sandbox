@@ -13,7 +13,7 @@ npm run audit:licenses
 npm run audit:unsafe
 ```
 
-`npm run test:package` installs the packed unscoped `sandsurf` package and verifies its public declarations and platform artifact selection. Release CI builds native artifacts on Linux x64/arm64, macOS x64/arm64, and Windows x64. A successful compile or prerequisite probe does not qualify a VM engine.
+`npm run test:package` installs the packed unscoped `sandsurf` package and verifies its public declarations and platform artifact selection. Source CI compiles the Linux, macOS and Windows adapters independently of hardware-dependent image builds. Package CI validates the committed current-format x64 image; ARM package validation and the five-platform release pipeline require a newly built ARM image on a native KVM host. Hosted image-build runners currently lack KVM, so that pipeline is blocked, not qualified or replaced by software emulation. A successful compile or prerequisite probe does not qualify a VM engine.
 
 Archive creation streams npm's package selection directly to disk; it does not buffer complete machine images or the compressed tarball in Node memory. Distribution bundles contain gzip disk blobs, not multi-gigabyte mostly-empty ext4/VHDX files inside npm's tar stream. Native imports decode those blobs in bounded chunks into a private host-owned staging directory, verify the original manifest and every decoded artifact digest, then atomically publish the VM-native image. The immutable manifest identifies the computer independently of this transport. There is no raw-distribution fallback; raw disks are the internal materialized representation. Package lifecycle hooks are prohibited: build and verify the image/native artifacts explicitly before packing.
 
@@ -31,6 +31,15 @@ Build a local guest image on native Linux with writable KVM, libguestfs (`guestf
 SANDSURF_LOCAL_IMAGE=1 \
 SANDSURF_IMAGE_OUTPUT_DIRECTORY=/absolute/output \
 npm run build:guest-image
+```
+
+The following isolated image tests require native KVM and libguestfs. They are
+explicitly ignored in source-only tests and run in the image-build workflow:
+
+```sh
+cargo test --locked -p sandsurf-image isolated_materialization_preserves_linux_metadata -- --ignored --test-threads=1
+cargo test --locked -p sandsurf-image managed_disk_clones_replace_os_identity_and_preserve_source -- --ignored --test-threads=1
+cargo test --locked -p sandsurf-host converted_machine_seed_has_a_verified_internal_journal -- --ignored --test-threads=1
 ```
 
 Release images require the private signing seed through `SANDSURF_IMAGE_SIGNING_KEY_FILE`; the seed must never enter the repository or logs. Firecracker downloads are digest-verified by `npm run fetch:firecracker` and never occur during package installation or workload execution.

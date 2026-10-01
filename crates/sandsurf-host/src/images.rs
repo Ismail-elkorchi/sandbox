@@ -1164,6 +1164,7 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
+    #[ignore = "native KVM/libguestfs image qualification; run explicitly with --ignored"]
     fn converted_machine_seed_has_a_verified_internal_journal() {
         let root = Path::new("/var/tmp").join(format!(
             "sandsurf-oci-journal-{}-{}",

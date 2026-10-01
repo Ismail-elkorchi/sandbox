@@ -8,19 +8,13 @@ permissions:
   contents: read
 
 jobs:
-  images:
-    uses: ./.github/workflows/development-images.yml
-
   distribution:
-    needs: images
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-26.04
             architecture: x64
-          - runner: macos-15
-            architecture: arm64
           - runner: windows-2025
             architecture: x64
     runs-on: ${{ matrix.runner }}
@@ -36,10 +30,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - if: runner.os == 'Linux'
         uses: ./.github/actions/user-service-manager
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: development-image-${{ matrix.architecture }}
-          path: .
+      # Validate the committed current-format distribution input. Building a
+      # fresh OS image requires KVM and belongs to development-images, not this
+      # source/package gate. ARM distribution is blocked until a current ARM
+      # bundle can be built on a native virtualization-enabled host.
       - run: npm run manifest:images
       - run: npm run build:ts
       - run: npm run build:native
@@ -55,9 +49,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools guestfish qemu-system-x86
-      - name: Read-only appliance kernel access
-        run: sudo setfacl -m "u:$(id -un):r" /boot/vmlinuz-*
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap
       - uses: ./.github/actions/user-service-manager
       - run: npm ci
       - name: Native release assembly contracts
@@ -76,7 +68,7 @@ jobs:
       - run: npm run build:ts
       - run: cargo build --locked -p sandsurf-host
       - run: cargo test --workspace
-      - run: node --test packages/sandsurf/test/*.test.mjs
+      - run: npm run test:ts
       - run: npm run audit:licenses
       - run: npm run audit:unsafe
       - run: cargo install cargo-audit --locked
@@ -109,7 +101,7 @@ jobs:
           "$RUNNER_TEMP/sandsurf-apple-control-test" native/macos/fixtures/create.json
       - run: cargo build --locked -p sandsurf-host
       - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host
-      - run: node --test packages/sandsurf/test/*.test.mjs
+      - run: npm run test:ts
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: node --test packages/sandsurf/test/sandsurf-contracts.test.mjs
 
@@ -135,7 +127,7 @@ jobs:
       - run: npm run build:ts
       - run: cargo build --locked -p sandsurf-host
       - run: cargo test -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host
-      - run: node --test packages/sandsurf/test/*.test.mjs
+      - run: npm run test:ts
       - name: Sandsurf authority and wire contracts (not VM qualification)
         run: node --test packages/sandsurf/test/sandsurf-contracts.test.mjs
 

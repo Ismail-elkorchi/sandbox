@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -17,7 +17,7 @@ const closure = [...REQUIRED_PACKAGES, "musl", "busybox", "apk-tools"]
 
 test("CLI requires explicit architecture, absolute bounded paths, and unique known options", () => {
   assert.deepEqual(parseArguments(["--architecture", "x64", "--output", "/var/tmp/prepared"]), {
-    architecture: "x64", output: "/var/tmp/prepared", temporaryDirectory: "/var/tmp",
+    architecture: "x64", output: resolve("/var/tmp/prepared"), temporaryDirectory: dirname(resolve("/var/tmp/prepared")),
   });
   for (const args of [
     ["--output", "/var/tmp/prepared"],

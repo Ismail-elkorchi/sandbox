@@ -40,6 +40,11 @@ jobs:
       - run: SANDSURF_LOCAL_IMAGE=1 npm run build:guest-image
         env:
           SANDSURF_IMAGE_ARCHITECTURE: ${{ matrix.architecture }}
+      - name: Native isolated image and clone qualification (not computer/NIC qualification)
+        run: |
+          cargo test --locked -p sandsurf-image isolated_materialization_preserves_linux_metadata -- --ignored --test-threads=1
+          cargo test --locked -p sandsurf-image managed_disk_clones_replace_os_identity_and_preserve_source -- --ignored --test-threads=1
+          cargo test --locked -p sandsurf-host converted_machine_seed_has_a_verified_internal_journal -- --ignored --test-threads=1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: development-image-${{ matrix.architecture }}

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -164,12 +164,24 @@ async function publishDistributionSource(entry: ImageEntry): Promise<void> {
   const compressedDigest = await digestFile(entry.compressed);
   await verifyDiskTransport(entry.compressed, entry.sha256);
   const target = `${entry.raw}.gz`;
+  try {
+    await verifyDiskTransport(target, entry.sha256);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   const staged = temporary(target);
   try {
     await copyFile(entry.compressed, staged);
     if (await digestFile(staged) !== compressedDigest) throw new Error("distribution source changed during publication");
     await chmod(staged, 0o444);
-    await rename(staged, target);
+    try {
+      // Publish without replacing a competing or readonly immutable artifact.
+      await link(staged, target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await verifyDiskTransport(target, entry.sha256);
+    }
   } finally { await rm(staged, { force: true }); }
 }
 

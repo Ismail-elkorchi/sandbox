@@ -61,6 +61,7 @@ mod tests {
     use super::*;
     use sandsurf_native::local::{create_private_directory, create_private_file};
     #[test]
+    #[ignore = "native KVM/libguestfs clone qualification; run explicitly with --ignored"]
     fn managed_disk_clones_replace_os_identity_and_preserve_source() {
         let mut nonce = [0; 16];
         getrandom::getrandom(&mut nonce).unwrap();
