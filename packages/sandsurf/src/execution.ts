@@ -1,43 +1,13 @@
-import { SandsurfHostError, integer, record, text } from "./native-host.js";
+import { SandsurfHostError, integer, text } from "./native-host.js";
 import { sandsurfDigest, validateExecutionRequest, validateSandsurfOutputBoundary } from "./sandsurf-protocol.js";
 import type { ExecutionRequest, OutputBoundary } from "./sandsurf-protocol.js";
-
-/** Guest-reported outcome. Even an authenticated report is not host attestation. */
-export type ExecutionOutcome =
-  | { readonly kind: "exit"; readonly code: number }
-  | { readonly kind: "signal"; readonly signal: number }
-  | { readonly kind: "deadline-exceeded" }
-  | { readonly kind: "spawn-failed"; readonly reason: string }
-  | { readonly kind: "interrupted"; readonly evidence: string };
-export type ExecutionState =
-  | { readonly kind: "running" }
-  | { readonly kind: "draining"; readonly outcome: ExecutionOutcome; readonly accountingDigest: string }
-  | { readonly kind: "exited"; readonly outcome: ExecutionOutcome; readonly output: OutputBoundary; readonly cleanupDigest: string; readonly accountingDigest: string }
-  | { readonly kind: "unknown"; readonly evidence: string };
-export interface ExecutionLineage {
-  readonly logicalExecutionId: string;
-  readonly sourceExecutionId: string;
-  readonly sourceMachineId: string;
-  readonly sourceGeneration: number;
-  readonly snapshotId: string;
-  readonly outputAnchor: OutputBoundary;
-}
-export interface ExecutionInspection {
-  readonly request: ExecutionRequest;
-  readonly guestPid: number;
-  readonly state: ExecutionState;
-  readonly lineage: ExecutionLineage | null;
-}
-export interface Receipt {
-  readonly machineId: string; readonly generation: number; readonly executionId: string;
-  readonly operationId: string; readonly requestDigest: string;
-  readonly outcome: ExecutionOutcome; readonly output: OutputBoundary;
-  readonly cleanupDigest: string; readonly accountingDigest: string;
-}
+import type { ExecutionOutcome, ExecutionState, ExecutionLineage, ExecutionSnapshot as ExecutionInspection, Receipt, ProtocolTypes } from "./protocol-generated.js";
+import { validateProtocol } from "./protocol-validation.js";
+export type { ExecutionOutcome, ExecutionState, ExecutionLineage, ExecutionSnapshot as ExecutionInspection, Receipt } from "./protocol-generated.js";
 
 function invalid(): never { throw new SandsurfHostError("protocol", "Invalid execution observation"); }
-function object(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  if (!record(value) || keys.some((key) => !Object.hasOwn(value, key)) || Object.keys(value).some((key) => !keys.includes(key))) invalid();
+function wire<K extends keyof ProtocolTypes>(name: K, value: unknown): ProtocolTypes[K] {
+  try { validateProtocol(name, value); } catch { invalid(); }
   return value;
 }
 function hash(value: unknown): string { const result = text(value); if (!/^[a-f0-9]{64}$/u.test(result)) invalid(); return result; }
@@ -52,52 +22,39 @@ export function parseExecutionRequest(value: unknown): ExecutionRequest {
   return { ...value, argv: [...value.argv], environment: { ...value.environment }, terminalSize: value.terminalSize === null ? null : { ...value.terminalSize } };
 }
 export function parseExecutionOutcome(value: unknown): ExecutionOutcome {
-  if (!record(value)) invalid();
-  switch (value.kind) {
-    case "exit": {
-      const result = object(value, ["kind", "code"]);
-      if (typeof result.code !== "number" || !Number.isInteger(result.code) || result.code < -2147483648 || result.code > 2147483647) invalid();
-      return { kind: "exit", code: result.code };
-    }
-    case "signal": {
-      const result = object(value, ["kind", "signal"]); const signal = integer(result.signal);
-      if (signal < 1 || signal > 0xffffffff) invalid(); return { kind: "signal", signal };
-    }
-    case "deadline-exceeded": object(value, ["kind"]); return { kind: "deadline-exceeded" };
-    case "spawn-failed": object(value, ["kind", "reason"]); return { kind: "spawn-failed", reason: hash(value.reason) };
-    case "interrupted": object(value, ["kind", "evidence"]); return { kind: "interrupted", evidence: hash(value.evidence) };
-    default: invalid();
+  const result = wire("ExecutionOutcome", value);
+  switch (result.kind) {
+    case "exit": return { ...result };
+    case "signal": if (result.signal < 1) invalid(); return { ...result };
+    case "deadline-exceeded": return { ...result };
+    case "spawn-failed": return { kind: result.kind, reason: hash(result.reason) };
+    case "interrupted": return { kind: result.kind, evidence: hash(result.evidence) };
   }
 }
 export function parseExecutionState(value: unknown): ExecutionState {
-  if (!record(value)) invalid();
-  switch (value.kind) {
-    case "running": object(value, ["kind"]); return { kind: "running" };
-    case "draining": object(value, ["kind", "outcome", "accountingDigest"]);
-      return { kind: "draining", outcome: parseExecutionOutcome(value.outcome), accountingDigest: hash(value.accountingDigest) };
-    case "exited": object(value, ["kind", "outcome", "output", "cleanupDigest", "accountingDigest"]);
-      return { kind: "exited", outcome: parseExecutionOutcome(value.outcome), output: boundary(value.output), cleanupDigest: hash(value.cleanupDigest), accountingDigest: hash(value.accountingDigest) };
-    case "unknown": object(value, ["kind", "evidence"]); return { kind: "unknown", evidence: hash(value.evidence) };
-    default: invalid();
+  const result = wire("ExecutionState", value);
+  switch (result.kind) {
+    case "running": return { ...result };
+    case "draining": return { kind: result.kind, outcome: parseExecutionOutcome(result.outcome), accountingDigest: hash(result.accountingDigest) };
+    case "exited": return { kind: result.kind, outcome: parseExecutionOutcome(result.outcome), output: boundary(result.output), cleanupDigest: hash(result.cleanupDigest), accountingDigest: hash(result.accountingDigest) };
+    case "unknown": return { kind: result.kind, evidence: hash(result.evidence) };
   }
 }
 export function parseExecutionInspection(value: unknown): ExecutionInspection {
-  const result = object(value, ["request", "guestPid", "state", "lineage"]);
-  const request = parseExecutionRequest(result.request); const guestPid = integer(result.guestPid);
-  if (guestPid > 0xffffffff) invalid();
-  const lineage = parseExecutionLineage(result.lineage, request);
-  return { request, guestPid, state: parseExecutionState(result.state), lineage };
+  const result = wire("ExecutionSnapshot", value);
+  const request = parseExecutionRequest(result.request);
+  return { request, guestPid: result.guestPid, state: parseExecutionState(result.state), lineage: parseExecutionLineage(result.lineage, request) };
 }
 export function parseExecutionLineage(value: unknown, request: Pick<ExecutionRequest, "machineId" | "generation" | "executionId">): ExecutionLineage | null {
   if (value === null) return null;
-  const origin = object(value, ["logicalExecutionId", "sourceExecutionId", "sourceMachineId", "sourceGeneration", "snapshotId", "outputAnchor"]);
+  const origin = wire("ExecutionLineage", value);
   const lineage: ExecutionLineage = { logicalExecutionId: id(origin.logicalExecutionId), sourceExecutionId: id(origin.sourceExecutionId),
     sourceMachineId: id(origin.sourceMachineId), sourceGeneration: positive(origin.sourceGeneration), snapshotId: id(origin.snapshotId), outputAnchor: boundary(origin.outputAnchor) };
   if (lineage.sourceGeneration >= request.generation || lineage.sourceMachineId !== request.machineId || lineage.sourceExecutionId === request.executionId) invalid();
   return lineage;
 }
 export function parseExecutionReceipt(value: unknown, expectedDigest: string): Receipt {
-  const result = object(value, ["machineId", "generation", "executionId", "operationId", "requestDigest", "outcome", "output", "cleanupDigest", "accountingDigest"]);
+  const result = wire("Receipt", value);
   const receipt: Receipt = { machineId: id(result.machineId), generation: positive(result.generation), executionId: id(result.executionId),
     operationId: id(result.operationId), requestDigest: hash(result.requestDigest), outcome: parseExecutionOutcome(result.outcome), output: boundary(result.output),
     cleanupDigest: hash(result.cleanupDigest), accountingDigest: hash(result.accountingDigest) };

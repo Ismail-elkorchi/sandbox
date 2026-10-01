@@ -5,6 +5,7 @@ import type { Machine } from "./machines.js";
 import { integer, record, SandsurfHostError, text } from "./native-host.js";
 import { resolveGenerationPrecondition } from "./observations.js";
 import { createSandsurfGuestPath } from "./sandsurf-protocol.js";
+import type { FilesystemRequest, FileTransfer } from "./protocol-generated.js";
 import { childIdentity, digest, dispatchGuest, identity, protocol, queryGuest, validateIdentity } from "./sdk-internal.js";
 import { createHash } from "node:crypto";
 
@@ -82,9 +83,9 @@ export class MachineFilesystem {
   async writeStream(path: string | Uint8Array, chunks: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, options: FileOperationOptions & { readonly length: number; readonly digest: string; readonly mode?: number; readonly expected?: FileExpectation; readonly transferId?: string }): Promise<FileRevision> {
     if (!Number.isSafeInteger(options.length) || options.length < 0 || options.length > 128 * 1024 ** 3) throw new TypeError("stream length is invalid");
     const operationId = validateIdentity(options.operationId ?? identity("write-file"));
-    const transfer = { id: validateIdentity(options.transferId ?? childIdentity(operationId, "transfer")), path: [...this.#path(path)], length: options.length, digest: digest(options.digest), mode: options.mode ?? 0o644, expected: options.expected ?? { kind: "any" } };
+    const transfer: FileTransfer = { id: validateIdentity(options.transferId ?? childIdentity(operationId, "transfer")), path: [...this.#path(path)], length: options.length, digest: digest(options.digest), mode: options.mode ?? 0o644, expected: options.expected ?? { kind: "any" } };
     let remoteOperationStarted = false;
-    const perform = async (request: Readonly<Record<string, unknown>>, child: string): Promise<Record<string, unknown>> => {
+    const perform = async (request: FilesystemRequest, child: string): Promise<Record<string, unknown>> => {
       remoteOperationStarted = true;
       return this.#operation(request, childIdentity(operationId, child), options);
     };
@@ -153,11 +154,11 @@ export class MachineFilesystem {
     if (options.expectedGeneration !== undefined && options.expectedGeneration !== generation) throw new SandsurfHostError("stale-generation", "Watcher generation cannot be rebound");
     await this.#complete({ kind: "unwatch", watcherId, generation }, validateIdentity(options.operationId ?? identity("unwatch")), { expectedGeneration: generation });
   }
-  async #complete(request: Readonly<Record<string, unknown>>, operationId: string, precondition: MachineGenerationPrecondition): Promise<void> {
+  async #complete(request: FilesystemRequest, operationId: string, precondition: MachineGenerationPrecondition): Promise<void> {
     const response = await this.#operation(request, operationId, precondition);
     if (response.kind !== "complete" || Object.keys(response).length !== 1) throw protocol("filesystem command acknowledgement");
   }
-  async #operation(request: Readonly<Record<string, unknown>>, operationId = identity("file"), precondition: MachineGenerationPrecondition = {}): Promise<Record<string, unknown>> {
+  async #operation(request: FilesystemRequest, operationId = identity("file"), precondition: MachineGenerationPrecondition = {}): Promise<Record<string, unknown>> {
     if (typeof request.kind === "string" && ["stat", "list", "read", "readlink", "poll-watch"].includes(request.kind)) {
       const response = await this.#machine[queryGuest]({ kind: "filesystem-query", request }, precondition);
       if (response.kind !== "file" || !record(response.response)) throw protocol("filesystem response"); return response.response;

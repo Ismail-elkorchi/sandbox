@@ -1,11 +1,12 @@
-// Internal Sandsurf wire contract. This does not adapt the prepared-process runtime.
+// Wire codecs and semantic checks over the source-generated Rust contracts.
 import { createHash } from "node:crypto";
+import { validateProtocol } from "./protocol-validation.js";
+import { SANDSURF_HEADER_BYTES, SANDSURF_AUTHENTICATION_BYTES, SANDSURF_MAX_CONTROL_BYTES, SANDSURF_MAX_STREAM_BYTES, SANDSURF_PROTOCOL_VERSION, SANDSURF_FRAME_MAGIC } from "./protocol-generated.js";
+export { SANDSURF_HEADER_BYTES, SANDSURF_AUTHENTICATION_BYTES, SANDSURF_MAX_CONTROL_BYTES, SANDSURF_MAX_STREAM_BYTES } from "./protocol-generated.js";
+import type { GuestCommand as SandsurfGuestCommand, GuestRequest as SandsurfGuestRequest, SpawnRequest as ExecutionRequest, TerminalSize as SandsurfTerminalSize, OutputBoundary, ReleaseRequest as SandsurfReleaseRequest } from "./protocol-generated.js";
+export type { GuestCommand as SandsurfGuestCommand, GuestRequest as SandsurfGuestRequest, SpawnRequest as ExecutionRequest, TerminalSize as SandsurfTerminalSize, OutputBoundary, ReleaseRequest as SandsurfReleaseRequest } from "./protocol-generated.js";
 
-export const SANDSURF_HEADER_BYTES = 56;
-export const SANDSURF_AUTHENTICATION_BYTES = 32;
-export const SANDSURF_MAX_CONTROL_BYTES = 256 * 1024;
-export const SANDSURF_MAX_STREAM_BYTES = 64 * 1024;
-const MAGIC = Buffer.from("SCF1");
+const MAGIC = Buffer.from(SANDSURF_FRAME_MAGIC);
 
 export type SandsurfDigestDomain = "machine" | "authority" | "operation" | "receipt" | "output" | "release" | "image" | "snapshot" | "transfer" | "network" | "secret" | "resource" | "exposure";
 export type SandsurfFrameKind = "control" | "data" | "credit" | "end";
@@ -42,70 +43,6 @@ export function sandsurfGuestPathUtf8(value: SandsurfGuestPath): string | undefi
   catch { return undefined; }
 }
 
-export interface SandsurfGuestCommand {
-  readonly machineId: string;
-  readonly generation: number;
-  readonly operationId: string;
-  readonly request: SandsurfGuestRequest;
-  readonly requestDigest: string;
-}
-
-export interface ExecutionRequest {
-  readonly machineId: string;
-  readonly generation: number;
-  readonly executionId: string;
-  readonly operationId: string;
-  readonly argv: readonly string[];
-  readonly cwd: string;
-  readonly environment: Readonly<Record<string, string>>;
-  readonly user: string | null;
-  readonly stdio: "pipes" | "terminal";
-  readonly terminalSize: SandsurfTerminalSize | null;
-  readonly activeDeadlineMillis: number | null;
-  readonly elapsedDeadlineUnixMillis: number | null;
-  readonly outputBytes: number;
-}
-
-export interface SandsurfTerminalSize {
-  readonly columns: number;
-  readonly rows: number;
-  readonly pixelWidth: number;
-  readonly pixelHeight: number;
-}
-
-export type SandsurfGuestRequest =
-  | { readonly kind: "spawn"; readonly request: ExecutionRequest }
-  | { readonly kind: "write-input"; readonly executionId: string; readonly terminalLeaseId: string | null; readonly bytes: readonly number[] }
-  | { readonly kind: "close-input"; readonly executionId: string; readonly terminalLeaseId: string | null }
-  | { readonly kind: "acquire-terminal-input"; readonly executionId: string; readonly terminalLeaseId: string }
-  | { readonly kind: "release-terminal-input"; readonly executionId: string; readonly terminalLeaseId: string }
-  | { readonly kind: "resize-terminal"; readonly executionId: string; readonly size: SandsurfTerminalSize }
-  | { readonly kind: "signal"; readonly executionId: string; readonly signal: number; readonly group: boolean }
-  | { readonly kind: "terminate"; readonly executionId: string; readonly graceMillis: number }
-  | { readonly kind: "filesystem"; readonly request: Readonly<Record<string, unknown>> };
-
-export interface OutputBoundary {
-  readonly finalCursor: number;
-  readonly chunks: number;
-  readonly stdoutBytes: number;
-  readonly stderrBytes: number;
-  readonly terminalBytes: number;
-  readonly omittedBytes: number;
-  readonly finalHash: string;
-}
-
-export interface SandsurfReleaseRequest {
-  readonly operationId: string;
-  readonly receiptDigest: string;
-  readonly output: OutputBoundary;
-  readonly disposition:
-    | { readonly kind: "complete-capture"; readonly commitment: {
-      readonly storeId: string; readonly commitmentId: string; readonly manifestDigest: string;
-      readonly receiptDigest: string; readonly output: OutputBoundary;
-    } }
-    | { readonly kind: "continuing-retention"; readonly segment: string }
-    | { readonly kind: "authorized-loss"; readonly authorization: string };
-}
 
 function counter(value: unknown): asserts value is number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || Object.is(value, -0)) throw new Error("invalid Sandsurf counter");
@@ -116,14 +53,8 @@ function identity(value: unknown): asserts value is string {
 function sha256(value: unknown): asserts value is string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) throw new Error("invalid Sandsurf digest");
 }
-function record(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("expected Sandsurf record");
-  const actual = Object.keys(value);
-  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) throw new Error("unknown or missing Sandsurf record fields");
-}
-
 export function validateSandsurfGuestCommand(value: unknown): asserts value is SandsurfGuestCommand {
-  record(value, ["machineId", "generation", "operationId", "request", "requestDigest"]);
+  validateProtocol("GuestCommand", value);
   identity(value.machineId); identity(value.operationId);
   counter(value.generation); sha256(value.requestDigest);
   if (value.generation === 0) throw new Error("Sandsurf command generation must be positive");
@@ -161,9 +92,9 @@ export function sandsurfGuestRequestMetadata(request: SandsurfGuestRequest): {
   if (request.kind === "write-input") {
     bytes = request.bytes;
     metadata = { ...request, bytes: [] };
-  } else if (request.kind === "filesystem" && ["write", "write-chunk"].includes(String(request.request.kind))) {
+  } else if (request.kind === "filesystem" && (request.request.kind === "write" || request.request.kind === "write-chunk")) {
     if (!Array.isArray(request.request.bytes)) throw new Error("invalid Sandsurf filesystem bytes");
-    bytes = request.request.bytes as readonly number[];
+    bytes = request.request.bytes;
     metadata = { ...request, request: { ...request.request, bytes: [] } };
   }
   if (bytes === undefined) return { request: metadata, binary: null };
@@ -175,13 +106,12 @@ export function sandsurfGuestRequestMetadata(request: SandsurfGuestRequest): {
   }] };
 }
 
-function validateGuestRequest(value: unknown): asserts value is SandsurfGuestRequest {
-  if (value === null || typeof value !== "object" || !("kind" in value)) throw new Error("missing Sandsurf guest command kind");
-  const fields = value as Record<string, unknown>;
+function validateGuestRequest(value: SandsurfGuestRequest): void {
+  const fields = value;
   switch (fields.kind) {
-    case "spawn": record(fields, ["kind", "request"]); validateExecutionRequest(fields.request); break;
+    case "spawn": validateExecutionRequest(fields.request); break;
     case "write-input":
-      record(fields, ["kind", "executionId", "terminalLeaseId", "bytes"]); identity(fields.executionId);
+      identity(fields.executionId);
       if (fields.terminalLeaseId !== null) identity(fields.terminalLeaseId);
       if (!Array.isArray(fields.bytes) || fields.bytes.length < 1 || fields.bytes.length > SANDSURF_MAX_STREAM_BYTES
         || fields.bytes.some((byte) => typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
@@ -189,35 +119,28 @@ function validateGuestRequest(value: unknown): asserts value is SandsurfGuestReq
       }
       break;
     case "close-input":
-      record(fields, ["kind", "executionId", "terminalLeaseId"]); identity(fields.executionId);
+      identity(fields.executionId);
       if (fields.terminalLeaseId !== null) identity(fields.terminalLeaseId);
       break;
     case "acquire-terminal-input":
     case "release-terminal-input":
-      record(fields, ["kind", "executionId", "terminalLeaseId"]); identity(fields.executionId); identity(fields.terminalLeaseId); break;
-    case "resize-terminal": record(fields, ["kind", "executionId", "size"]); identity(fields.executionId); validateTerminalSize(fields.size); break;
+      identity(fields.executionId); identity(fields.terminalLeaseId); break;
+    case "resize-terminal": identity(fields.executionId); validateTerminalSize(fields.size); break;
     case "signal":
-      record(fields, ["kind", "executionId", "signal", "group"]); identity(fields.executionId); counter(fields.signal);
+      identity(fields.executionId); counter(fields.signal);
       if (fields.signal < 1 || fields.signal > 64 || typeof fields.group !== "boolean") throw new Error("invalid Sandsurf signal");
       break;
     case "terminate":
-      record(fields, ["kind", "executionId", "graceMillis"]); identity(fields.executionId); counter(fields.graceMillis);
+      identity(fields.executionId); counter(fields.graceMillis);
       if (fields.graceMillis > 60_000) throw new Error("invalid Sandsurf termination grace");
       break;
-    case "filesystem":
-      record(fields, ["kind", "request"]);
-      if (!recordValue(fields.request) || typeof fields.request.kind !== "string") throw new Error("invalid Sandsurf filesystem request");
-      break;
+    case "filesystem": break;
     default: throw new Error("unknown Sandsurf guest command");
   }
 }
 
-function recordValue(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 export function validateExecutionRequest(value: unknown): asserts value is ExecutionRequest {
-  record(value, ["machineId", "generation", "executionId", "operationId", "argv", "cwd", "environment", "user", "stdio", "terminalSize", "activeDeadlineMillis", "elapsedDeadlineUnixMillis", "outputBytes"]);
+  validateProtocol("SpawnRequest", value);
   identity(value.machineId); identity(value.executionId); identity(value.operationId); counter(value.generation); counter(value.outputBytes);
   if (value.generation === 0 || value.outputBytes === 0 || !Array.isArray(value.argv) || value.argv.length < 1 || value.argv.length > 4096
     || value.argv.some((item) => typeof item !== "string" || item.length < 1 || item.length > 64 * 1024 || item.includes("\0"))) {
@@ -243,7 +166,7 @@ export function validateExecutionRequest(value: unknown): asserts value is Execu
 }
 
 function validateTerminalSize(value: unknown): asserts value is SandsurfTerminalSize {
-  record(value, ["columns", "rows", "pixelWidth", "pixelHeight"]);
+  validateProtocol("TerminalSize", value);
   for (const name of ["columns", "rows", "pixelWidth", "pixelHeight"] as const) {
     counter(value[name]); if (value[name] > 0xffff) throw new Error("invalid Sandsurf terminal dimension");
   }
@@ -256,10 +179,9 @@ function guestPath(value: unknown): asserts value is string {
 }
 
 export function validateSandsurfOutputBoundary(value: unknown): asserts value is OutputBoundary {
-  record(value, ["finalCursor", "chunks", "stdoutBytes", "stderrBytes", "terminalBytes", "omittedBytes", "finalHash"]);
-  for (const name of ["finalCursor", "chunks", "stdoutBytes", "stderrBytes", "terminalBytes", "omittedBytes"]) counter(value[name]);
+  validateProtocol("OutputBoundary", value);
   sha256(value.finalHash);
-  const boundary = value as unknown as OutputBoundary; // All fields checked above.
+  const boundary = value;
   if (BigInt(boundary.stdoutBytes) + BigInt(boundary.stderrBytes) + BigInt(boundary.terminalBytes) !== BigInt(boundary.finalCursor)
     || (boundary.chunks === 0) !== (boundary.finalCursor === 0) || boundary.chunks > boundary.finalCursor
     || BigInt(boundary.finalCursor) > BigInt(boundary.chunks) * BigInt(SANDSURF_MAX_STREAM_BYTES)) {
@@ -268,22 +190,19 @@ export function validateSandsurfOutputBoundary(value: unknown): asserts value is
 }
 
 export function validateSandsurfRelease(value: unknown): asserts value is SandsurfReleaseRequest {
-  record(value, ["operationId", "receiptDigest", "output", "disposition"]);
+  validateProtocol("ReleaseRequest", value);
   identity(value.operationId); sha256(value.receiptDigest); validateSandsurfOutputBoundary(value.output);
   const disposition = value.disposition;
-  if (disposition === null || typeof disposition !== "object" || !("kind" in disposition)) throw new Error("missing release disposition");
-  const fields = disposition as Record<string, unknown>;
+  const fields = disposition;
   switch (fields.kind) {
     case "complete-capture": {
-      record(fields, ["kind", "commitment"]);
       const commitment = fields.commitment;
-      record(commitment, ["storeId", "commitmentId", "manifestDigest", "receiptDigest", "output"]);
       identity(commitment.storeId); identity(commitment.commitmentId); sha256(commitment.manifestDigest);
       sha256(commitment.receiptDigest); validateSandsurfOutputBoundary(commitment.output);
       break;
     }
-    case "continuing-retention": record(fields, ["kind", "segment"]); identity(fields.segment); break;
-    case "authorized-loss": record(fields, ["kind", "authorization"]); identity(fields.authorization); break;
+    case "continuing-retention": identity(fields.segment); break;
+    case "authorized-loss": identity(fields.authorization); break;
     default: throw new Error("unknown release disposition");
   }
   // Coverage, segment ownership and loss decisions are checked by the authority, not this codec.
@@ -303,7 +222,7 @@ export function encodeSandsurfFrame(frame: SandsurfFrame): Buffer {
   validateFrame(frame.kind, frame.stream, frame.sequence, frame.payload.byteLength);
   if (frame.authentication.byteLength !== SANDSURF_AUTHENTICATION_BYTES) throw new Error("invalid Sandsurf frame authentication");
   const header = Buffer.alloc(SANDSURF_HEADER_BYTES);
-  MAGIC.copy(header); header.writeUInt16BE(1, 4); header[6] = kinds.indexOf(frame.kind) + 1;
+  MAGIC.copy(header); header.writeUInt16BE(SANDSURF_PROTOCOL_VERSION, 4); header[6] = kinds.indexOf(frame.kind) + 1;
   header.writeUInt32BE(frame.stream, 8); header.writeBigUInt64BE(BigInt(frame.sequence), 12);
   header.writeUInt32BE(frame.payload.byteLength, 20);
   header.set(frame.authentication, 24);
@@ -332,7 +251,7 @@ export class SandsurfFrameDecoder {
           this.#header.set(bytes.subarray(offset, offset + count), this.#headerUsed);
           this.#headerUsed += count; offset += count;
           if (this.#headerUsed < SANDSURF_HEADER_BYTES) continue;
-          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== 1 || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
+          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== SANDSURF_PROTOCOL_VERSION || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
           const kind = kinds[(this.#header[6] ?? 0) - 1];
           if (kind === undefined) throw new Error("unknown Sandsurf frame kind");
           const stream = this.#header.readUInt32BE(8);

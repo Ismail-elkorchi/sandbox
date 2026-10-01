@@ -1215,14 +1215,12 @@ pub struct SpawnRequest {
     pub user: Option<String>,
     pub stdio: StdioMode,
     pub terminal_size: Option<TerminalSize>,
-    /// Elapsed workload time after which the supervisor terminates this
-    /// process group. This is part of execution semantics, not a client wait
-    /// timeout, and therefore survives client disconnects.
-    /// Relative workload-active deadline. This guest-owned countdown does not
+    /// Relative execution-active deadline. This guest-owned countdown does not
     /// advance while the VM is paused or suspended.
     pub active_deadline_millis: Option<Counter>,
-    /// Absolute host wall-clock boundary. This advances while paused and is
-    /// rechecked against Unix time when the workload resumes.
+    /// Requested Unix wall-clock boundary, rechecked when Linux resumes. This
+    /// is an execution convenience, not an external host guarantee: guest root
+    /// can change its clock or replace the keeper implementing the deadline.
     pub elapsed_deadline_unix_millis: Option<Counter>,
     pub output_bytes: Counter,
 }

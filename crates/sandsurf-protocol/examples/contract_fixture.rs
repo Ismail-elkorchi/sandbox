@@ -39,6 +39,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let value: GuestPath = serde_json::from_slice(&bytes)?;
             serde_json::to_writer(std::io::stdout(), &value)?;
         }
+        "wire" => {
+            fn roundtrip<T: serde::de::DeserializeOwned + serde::Serialize>(
+                bytes: &[u8],
+            ) -> Result<(), Box<dyn std::error::Error>> {
+                let value: T = serde_json::from_slice(bytes)?;
+                serde_json::to_writer(std::io::stdout(), &value)?;
+                Ok(())
+            }
+            match arguments.get(2).map(String::as_str) {
+                Some("ExecutionState") => roundtrip::<ExecutionState>(&bytes)?,
+                Some("GuardianInspection") => roundtrip::<GuardianInspection>(&bytes)?,
+                Some("GuestServiceRequest") => roundtrip::<GuestServiceRequest>(&bytes)?,
+                Some("FilesystemRequest") => roundtrip::<FilesystemRequest>(&bytes)?,
+                Some("RuntimeResponse") => roundtrip::<RuntimeResponse>(&bytes)?,
+                Some("Resources") => roundtrip::<Resources>(&bytes)?,
+                _ => return Err("unknown wire fixture type".into()),
+            }
+        }
         "digest" => {
             let domain = match arguments.get(2).map(String::as_str) {
                 Some("machine") => Domain::Machine,

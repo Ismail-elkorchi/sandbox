@@ -63,6 +63,9 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - run: cargo fmt --all -- --check
+      - run: npm run check:protocol
+      - run: cargo test --locked -p sandsurf-protocol --features typescript --bin sandsurf-protocol-typescript
+      - run: cargo clippy --locked -p sandsurf-protocol --features typescript --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p sandsurf-host --all-targets --features apple-source-check -- -D warnings
       - run: npm run build:ts

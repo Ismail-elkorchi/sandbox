@@ -500,6 +500,10 @@ pub(crate) fn rename_private_object(
         let code = unsafe { RtlNtStatusToDosError(status) };
         return Err(io::Error::from_raw_os_error(code as i32));
     }
+    // The published name must be readable before publication ownership is
+    // released. Readers deny DELETE sharing, so retire this rename handle
+    // before publishing completion to other owners.
+    drop(held);
     parent.check()?;
     Ok(())
 }

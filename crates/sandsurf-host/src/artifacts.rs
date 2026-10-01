@@ -770,7 +770,25 @@ impl ArtifactStore {
         // that ownership before the storage publisher flushes and transfers
         // the completed object to its immutable content-addressed name.
         drop(output);
+        // Content-addressed publication has one owner across threads and
+        // worker processes. In particular, deduplication cannot open a newly
+        // named Windows object until its publisher has closed DELETE custody.
+        // This waits for ownership only; it never retries the storage effect.
+        let _publication = self.operation_lease_with_wait(
+            "blob",
+            digest.as_str(),
+            std::time::Duration::from_secs(5),
+        )?;
         let destination = self.blob_path(digest);
+        match verify_blob(&destination, digest, length) {
+            Ok(()) => {
+                fs::remove_file(temporary)?;
+                sync_directory(&self.root.join("blobs"))?;
+                return Ok(());
+            }
+            Err(ArtifactError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         match sandsurf_native::storage::publish_new_file(temporary, &destination) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1208,6 +1226,14 @@ impl ArtifactStore {
         self.operation_lease("capture", operation.as_str())
     }
     fn operation_lease(&self, namespace: &str, identity: &str) -> Result<File> {
+        self.operation_lease_with_wait(namespace, identity, std::time::Duration::ZERO)
+    }
+    fn operation_lease_with_wait(
+        &self,
+        namespace: &str,
+        identity: &str,
+        wait: std::time::Duration,
+    ) -> Result<File> {
         let path = self
             .root
             .join(format!("{namespace}-{}.lock", object_name(identity)));
@@ -1225,12 +1251,21 @@ impl ArtifactStore {
             }
             Err(error) => return Err(error.into()),
         };
-        file.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => {
-                ArtifactError::Conflict("artifact effect already has an active worker")
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(ArtifactError::Conflict(
+                        "artifact effect already has an active worker",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
-            std::fs::TryLockError::Error(error) => ArtifactError::Io(error),
-        })?;
+        }
         Ok(file)
     }
     fn capture_stage(&self, operation: &OperationId) -> PathBuf {
@@ -1784,11 +1819,16 @@ mod tests {
     #[test]
     fn concurrent_capture_publication_reuses_one_immutable_blob_without_aliases() {
         let state = temporary("concurrent-blobs");
-        let store = ArtifactStore::open(&state).unwrap();
+        // Separate stores exercise OS custody rather than an in-memory mutex
+        // that would not coordinate independent artifact workers.
+        let stores: Vec<_> = (0..16)
+            .map(|_| ArtifactStore::open(&state).unwrap())
+            .collect();
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..16)
-                .map(|_| {
-                    scope.spawn(|| {
+            let workers: Vec<_> = stores
+                .iter()
+                .map(|store| {
+                    scope.spawn(move || {
                         store
                             .publish_blob(&mut &b"shared original bytes"[..], 21)
                             .unwrap()

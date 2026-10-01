@@ -7,6 +7,7 @@ import { before, test } from "node:test";
 import { Artifact, Machine, Execution, ExecutionInterruptedError, Operation, Sandsurf, SandsurfHostError } from "../dist/index.js";
 import { createSandsurfGuestPath, createSandsurfGuestCommand, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestRequestMetadata, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfGuestCommand, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 import { parseExecutionInspection, parseExecutionOutcome, parseExecutionReceipt } from "../dist/execution.js";
+import { validateProtocol } from "../dist/protocol-validation.js";
 
 function executionRequest(id = "command", stdio = "pipes") {
   return { machineId: "box", generation: 1, executionId: id, operationId: "spawn-command", argv: ["/bin/sh"], cwd: "/workspace",
@@ -181,6 +182,36 @@ before(() => {
   assert.equal(built.status, 0, built.stderr);
 });
 function native(mode, input, ...args) { return spawnSync(fixture, [mode, ...args], { input, maxBuffer: 1024 * 1024, timeout: 10_000 }); }
+
+test("source-generated wire shapes match Rust serde, including generics and flattened variants", () => {
+  const emptyObservation = { kind: "unavailable", lastKnown: null };
+  const fixtures = [
+    ["ExecutionState", completedState()],
+    ["ExecutionState", { kind: "draining", outcome: { kind: "exit", code: 0 }, accountingDigest: "a".repeat(64) }],
+    ["GuardianInspection", { machineId: "box", observation: emptyObservation, management: emptyObservation, operation: null, lifecycleOperation: null, configurationOperation: null }],
+    ["GuestServiceRequest", { kind: "rebind-generation", snapshotId: "snapshot", captureOperationId: "capture", machineId: "box", previousGeneration: 1, generation: 2, bootIdentity: "a".repeat(64), capability: Array(32).fill(255), generationSeed: Array(32).fill(0) }],
+    ["FilesystemRequest", { kind: "stat", path: [...Buffer.from("/home/agent")], follow: true }],
+    ["RuntimeResponse", { kind: "console-input", accepted: 65536 }],
+    ["Resources", fixtureView().runtimeConfiguration.resources],
+  ];
+  for (const [name, value] of fixtures) {
+    const result = native("wire", JSON.stringify(value), name);
+    assert.equal(result.status, 0, result.stderr.toString());
+    const serialized = JSON.parse(result.stdout);
+    assert.deepEqual(serialized, value);
+    validateProtocol(name, serialized);
+    const invalid = { ...value, anotherAuthority: true };
+    assert.throws(() => validateProtocol(name, invalid));
+    assert.notEqual(native("wire", JSON.stringify(invalid), name).status, 0);
+  }
+  const request = fixtures.find(([name]) => name === "GuestServiceRequest")[1];
+  for (const capability of [Array(31).fill(0), Array(33).fill(0), Array(32).fill(256), Array(32)]) {
+    assert.throws(() => validateProtocol("GuestServiceRequest", { ...request, capability }));
+  }
+  assert.throws(() => validateProtocol("FilesystemRequest", { kind: "stat", path: [47, -0], follow: true }));
+  assert.throws(() => validateProtocol("RuntimeResponse", { kind: "console-input", accepted: 0x1_0000_0000 }));
+  assert.throws(() => validateProtocol("GuestServiceRequest", { kind: "processes", extra: true }));
+});
 
 test("Rust and TypeScript encode every Sandsurf digest domain identically", () => {
   const value = { z: 1, a: [true, null, "é", -13, Number.MAX_SAFE_INTEGER], "\u{10000}": "astral", "\ue000": "BMP" };

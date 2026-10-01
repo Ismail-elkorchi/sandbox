@@ -13,3 +13,16 @@ sha2.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
+
+[features]
+typescript = ["dep:syn"]
+
+[dependencies.syn]
+version = "=2.0.119"
+features = ["full"]
+optional = true
+
+[[bin]]
+name = "sandsurf-protocol-typescript"
+path = "src/bin/typescript.rs"
+required-features = ["typescript"]
