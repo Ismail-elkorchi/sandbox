@@ -34,7 +34,9 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(nativeHost.console.kind, "supported");
     await host.images.importNative({ manifestPath, manifestDigest: image, operationId: "import-computer-image" });
     machine = await host.machines.create({
-      id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
+      id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3,
+        outputBytes: 64 * 1024 ** 2, managedExecutions: 128,
+        snapshotBytes: 32 * 1024 ** 3, physicalStorageBytes: 40 * 1024 ** 3 },
     });
     await managementReady(machine);
     const initialUsage = await machine.resources.usage();
@@ -243,7 +245,9 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await run(machine, "sudo -n sync");
     const snapshot = await machine.snapshots.create({ kind: "disk" });
     assert.equal(snapshot.inspection.consistency, "crash");
-    fork = await snapshot.fork({ id: "forked-machine" });
+    fork = await snapshot.fork({ id: "forked-machine", resources: {
+      vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 8,
+    } });
     await managementReady(fork);
     assert.notEqual(Buffer.from(await fork.fs.readFile("/etc/machine-id")).toString(),
       Buffer.from(await machine.fs.readFile("/etc/machine-id")).toString(), "managed forks regenerate OS identity");

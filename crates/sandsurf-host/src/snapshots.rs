@@ -1001,6 +1001,10 @@ mod tests {
         #[cfg(windows)]
         {
             let mut permissions = fs::metadata(&kernel).unwrap().permissions();
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows-only fixture clears a readonly file attribute; it preserves the private DACL"
+            )]
             permissions.set_readonly(false);
             fs::set_permissions(&kernel, permissions).unwrap();
         }

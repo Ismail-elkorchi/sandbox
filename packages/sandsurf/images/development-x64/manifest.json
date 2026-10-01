@@ -10,7 +10,7 @@
     },
     "initramfs": {
       "path": "boot-initramfs",
-      "sha256": "3e566cc3fde3e5e6f4eb6332c9c6c40e56fcc69afbb84e1caa78cc2e02c2f5dc"
+      "sha256": "6841a9f92262417005d683ac1535c7b96b54ec0fb24241c24e9f9988a15c1b1f"
     },
     "profile": {
       "kind": "alpine"
@@ -19,7 +19,7 @@
       "version": "1.0.0",
       "protocolMajor": 1,
       "protocolMinor": 0,
-      "sha256": "109dbf83a99e6a4f8c14dec764cf3f2e76b4aaa8825f56a6cac2aa5c2e0cbab9"
+      "sha256": "06fcfbfbb2a87d339ab7e3e4f112e66df076245f8465fcb3e04d467f4bca3b09"
     },
     "capabilities": {
       "overlayfs": true,
@@ -35,7 +35,7 @@
     },
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "469041d9dd1796362fdbaf7489a63bafba1ba4ced23cb1a53978562b43cc5a1f",
+      "sha256": "0eaadb586f8a8e138eb14e5cee4bcde482296bd6ed5f5641888a8c9cb0540a62",
       "format": "ext4"
     },
     "defaults": {
@@ -47,14 +47,14 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "12fe8972f8071f76e777518bc6facd8ba96326b5bd31ebec5826c7a724d0dd4a",
+      "sourceDigest": "65f32f38128d6cca28075e88e4bd6e10bbff77f7a7fa08eadd8cb6ef954794a6",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
         "alpine-offline-packages": "3ed1eca104a718faec7f04ae14a4d199bf542573e3ac88cbc47b2cc0e7b8d7d0",
         "alpine-package-lock": "e058e1e64e00d019f9f5e4155353f3604684fb09d6e12a1c5bd5fe2ed6eb44e2",
         "sandsurf-system-recipe": "0123ff63f23f77a7f0d00cd22858687ab08faa30fe45b8a6906efa772fda35e3",
-        "sandsurf-appliance-recipe": "9b12251203e72d6dbdab790934862f2ccc0dcd630bcce31cf68cd17b47a4496f",
-        "sandsurf-management": "109dbf83a99e6a4f8c14dec764cf3f2e76b4aaa8825f56a6cac2aa5c2e0cbab9"
+        "sandsurf-appliance-recipe": "6ea6e15a0d058fad89741b2ef940f356f81ed888505d0b65dcd0de434c32a4fa",
+        "sandsurf-management": "06fcfbfbb2a87d339ab7e3e4f112e66df076245f8465fcb3e04d467f4bca3b09"
       }
     }
   },
@@ -66,7 +66,7 @@
       },
       "system": {
         "path": "system.vhdx",
-        "sha256": "be3bdfad1f228c7b58e388fd846f9cda412954b0c78963257a413d17572f81af"
+        "sha256": "5e473d790f95e5c4a0ed1c5e236a733b97a360830b518db3d22b84305cd45e7e"
       }
     }
   },

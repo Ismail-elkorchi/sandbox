@@ -492,7 +492,6 @@ fn bridge_payload(id: u64, response: &HostResponse, data: &[u8]) -> Vec<u8> {
     payload
 }
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn text_argument(values: &[std::ffi::OsString], name: &str) -> Result<String, &'static str> {
     argument(values, name)?
         .into_os_string()

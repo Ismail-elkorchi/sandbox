@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     "image-report": ["image-report"],
   };
   if (storage === undefined || !isAbsolute(storage)) {
-    unavailable.push("operator-provisioned bounded volumes are required: set SANDSURF_QUALIFICATION_ROOT; provision a host volume for each fixture and an independent 8GiB machine volume for each identity");
+    unavailable.push("operator-provisioned bounded volumes are required: set SANDSURF_QUALIFICATION_ROOT; computer needs a 128GiB shared host volume and CON needs a 40GiB machine volume for retained captures; other fixtures need 64GiB shared volumes and independent 8GiB machine volumes");
   } else {
     for (const [fixture, identities] of Object.entries(fixtures)) {
       const directory = resolve(storage, fixture);
@@ -50,7 +50,10 @@ async function main(): Promise<void> {
         try {
           const args = ["storage-volume", "--directory", directory, ...(id === undefined ? [] : ["--machine", id])];
           const volume = JSON.parse(await run(candidate, args, 10_000));
-          if (id !== undefined && volume.bytes > 8 * 1024 ** 3) throw new Error("machine fixture volume exceeds 8GiB");
+          const requiredBytes = (id === undefined ? fixture === "computer" ? 128 : 64 : id === "CON" ? 40 : 8) * 1024 ** 3;
+          if (id === undefined ? volume.bytes < requiredBytes : volume.bytes !== requiredBytes) {
+            throw new Error(id === undefined ? `shared fixture volume needs at least ${requiredBytes} bytes` : `machine fixture needs a ${requiredBytes}-byte bounded volume`);
+          }
         } catch (error) { unavailable.push(`${fixture}${id === undefined ? "" : "/" + id}: ${String(error)}`); }
       }
     }
