@@ -123,11 +123,11 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
             Request::Shutdown => {
                 // Explicit host-account/service-manager containment, never SDK
                 // disconnection or host API shutdown. Journals/disks are kept.
-                for (_machine, owner) in &mut children {
-                    #[cfg(target_os = "linux")]
+                #[cfg(target_os = "linux")]
+                for (machine, owner) in &children {
                     if owner.native_unit {
                         let machine_root =
-                            root.join("machines").join(object_name(_machine.as_str()));
+                            root.join("machines").join(object_name(machine.as_str()));
                         let mut stop = Command::new("systemctl");
                         stop.args([
                             "--user",
@@ -136,6 +136,8 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
                         ]);
                         sandsurf_native::resources::run_bounded(stop)?;
                     }
+                }
+                for owner in children.values_mut() {
                     if owner.child.try_wait()?.is_none()
                         && let Err(error) = owner.child.kill()
                         && owner.child.try_wait()?.is_none()

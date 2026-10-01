@@ -435,6 +435,7 @@ pub fn hash_file(path: &Path, bound: u64) -> io::Result<Digest> {
         .map_err(io::Error::other)
 }
 
+#[cfg(target_os = "linux")]
 fn bounded_read(path: &Path, bound: u64) -> io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
     let mut value = Vec::new();

@@ -1063,15 +1063,16 @@ impl LinuxGuardianEffect {
                 ));
             }
         }
-        for (path, artifact) in [(self.machine_root.join("disks/system.ext4"), &system_disk)] {
-            if crate::snapshots::file_digest(&path, artifact.bytes.get())
-                .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
-                != artifact.digest
-            {
-                return Err(ControlError::Unsupported(
-                    "mutable disks no longer match the suspended full snapshot",
-                ));
-            }
+        if crate::snapshots::file_digest(
+            &self.machine_root.join("disks/system.ext4"),
+            system_disk.bytes.get(),
+        )
+        .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
+            != system_disk.digest
+        {
+            return Err(ControlError::Unsupported(
+                "mutable disks no longer match the suspended full snapshot",
+            ));
         }
         let reconnect: ReconnectState =
             read_json(&directory.join("reconnect.json"), 1024 * 1024)

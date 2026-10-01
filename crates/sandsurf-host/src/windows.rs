@@ -18,13 +18,12 @@ use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTRO
 use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
-    NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources, RuntimeConfiguration,
+    NativeSnapshotRequest, NativeSnapshotResponse, Resources, RuntimeConfiguration,
     SnapshotArtifact, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -639,15 +638,16 @@ impl WindowsGuardianEffect {
                 ));
             }
         }
-        for (path, artifact) in [(self.machine_root.join("disks/system.vhdx"), &system_disk)] {
-            if crate::snapshots::current_disk_digest(&path, artifact.bytes.get())
-                .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
-                != artifact.digest
-            {
-                return Err(ControlError::Unsupported(
-                    "mutable disks no longer match the suspended full snapshot",
-                ));
-            }
+        if crate::snapshots::current_disk_digest(
+            &self.machine_root.join("disks/system.vhdx"),
+            system_disk.bytes.get(),
+        )
+        .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
+            != system_disk.digest
+        {
+            return Err(ControlError::Unsupported(
+                "mutable disks no longer match the suspended full snapshot",
+            ));
         }
         let reconnect: ReconnectState =
             read_json(&directory.join("reconnect.json"), 1024 * 1024)
@@ -1046,9 +1046,10 @@ impl GuardianEffect for WindowsGuardianEffect {
             u64::try_from(millis).map_err(|_| ControlError::Protocol("host time overflow"))?,
         )
         .map_err(|_| ControlError::Protocol("host time overflow"))?;
-        let mut usage =
-            sandsurf_protocol::ResourceUsage::host_observation("host-native-windows", observed);
-        Ok(usage)
+        Ok(sandsurf_protocol::ResourceUsage::host_observation(
+            "host-native-windows",
+            observed,
+        ))
     }
 
     fn native_snapshot(

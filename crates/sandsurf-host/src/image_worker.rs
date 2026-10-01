@@ -299,9 +299,9 @@ pub fn serve(root: &Path, operation: OperationId) -> Result<()> {
                     }
                     _ => None,
                 };
-                crate::images::import_oci(
+                crate::images::oci::import(
                     &root,
-                    crate::images::OciBuildInput {
+                    crate::images::oci::BuildInput {
                         source,
                         recipe,
                         platform,
