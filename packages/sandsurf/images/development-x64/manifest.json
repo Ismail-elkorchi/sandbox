@@ -1,18 +1,25 @@
 {
-  "formatVersion": 3,
+  "formatVersion": 1,
   "id": "sandsurf-development",
   "version": "3.24.2",
   "architecture": "x64",
   "bootBundle": {
     "kernel": {
-      "path": "vmlinux-6.18.41",
-      "sha256": "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5"
+      "path": "boot-kernel",
+      "sha256": "c7ce829b618d4a9d2df79c58ea0fb2a392e606f6c47bb94696ea75610a568166"
+    },
+    "initramfs": {
+      "path": "boot-initramfs",
+      "sha256": "3e566cc3fde3e5e6f4eb6332c9c6c40e56fcc69afbb84e1caa78cc2e02c2f5dc"
+    },
+    "profile": {
+      "kind": "alpine"
     },
     "guestAgent": {
-      "version": "0.1.0",
-      "protocolMajor": 5,
+      "version": "1.0.0",
+      "protocolMajor": 1,
       "protocolMinor": 0,
-      "sha256": "1b106eddf4e34979b5dd609a9a424a13280eb40ca362bc83b6d53d58da011a45"
+      "sha256": "109dbf83a99e6a4f8c14dec764cf3f2e76b4aaa8825f56a6cac2aa5c2e0cbab9"
     },
     "capabilities": {
       "overlayfs": true,
@@ -23,9 +30,12 @@
     }
   },
   "system": {
+    "cloneProfile": {
+      "kind": "alpine"
+    },
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "05cc28cfd337810e41fa9fb83b687bfa85c04209b4d079183a63eb5c89058695",
+      "sha256": "469041d9dd1796362fdbaf7489a63bafba1ba4ced23cb1a53978562b43cc5a1f",
       "format": "ext4"
     },
     "defaults": {
@@ -37,13 +47,14 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "593d9daf27731fee98c01b927e2c35fcdbe91d0146874ba255e0a07719fca3c0",
+      "sourceDigest": "12fe8972f8071f76e777518bc6facd8ba96326b5bd31ebec5826c7a724d0dd4a",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
-        "alpine-packages": "ccccec8ae4a7bb3800e23509667a979a37de313afa9a71f87f20157ff1b8d6b3",
-        "sandsurf-ext4-builder": "c61fcdaca884504956298f21b2a8164567a451872a05d40c7a778af5a530efec",
-        "sandsurf-system-recipe": "48fb8d08009fb881919f65104c5d4e9f0827451fc84eef839a353eb174aa9d0a",
-        "sandsurf-management": "1b106eddf4e34979b5dd609a9a424a13280eb40ca362bc83b6d53d58da011a45"
+        "alpine-offline-packages": "3ed1eca104a718faec7f04ae14a4d199bf542573e3ac88cbc47b2cc0e7b8d7d0",
+        "alpine-package-lock": "e058e1e64e00d019f9f5e4155353f3604684fb09d6e12a1c5bd5fe2ed6eb44e2",
+        "sandsurf-system-recipe": "0123ff63f23f77a7f0d00cd22858687ab08faa30fe45b8a6906efa772fda35e3",
+        "sandsurf-appliance-recipe": "9b12251203e72d6dbdab790934862f2ccc0dcd630bcce31cf68cd17b47a4496f",
+        "sandsurf-management": "109dbf83a99e6a4f8c14dec764cf3f2e76b4aaa8825f56a6cac2aa5c2e0cbab9"
       }
     }
   },
@@ -55,7 +66,7 @@
       },
       "system": {
         "path": "system.vhdx",
-        "sha256": "2b95b87ea1d2f27c8c9ee0459778016d18a283326dc0c5f3f5a4d1ecfeff41e4"
+        "sha256": "be3bdfad1f228c7b58e388fd846f9cda412954b0c78963257a413d17572f81af"
       }
     }
   },

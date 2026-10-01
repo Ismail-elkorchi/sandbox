@@ -112,17 +112,22 @@ pub(crate) fn import_native(
     let installed_manifest = store.join(manifest_digest.as_str()).join("manifest.json");
     // After publication, recovery needs only the immutable host-owned bundle,
     // never the caller's possibly deleted or changed source directory.
-    let source = if installed_manifest.exists() {
-        &installed_manifest
+    let verified = if installed_manifest.exists() {
+        verify_image(
+            &installed_manifest,
+            ImageTrust::Pinned {
+                manifest_digest: manifest_digest.as_str(),
+            },
+        )?
     } else {
-        manifest_path
+        sandsurf_image::distribution::install(
+            &store,
+            manifest_path,
+            ImageTrust::Pinned {
+                manifest_digest: manifest_digest.as_str(),
+            },
+        )?
     };
-    let verified = verify_image(
-        source,
-        ImageTrust::Pinned {
-            manifest_digest: manifest_digest.as_str(),
-        },
-    )?;
     let expected = match crate::service::native_guest_architecture() {
         sandsurf_machine::GuestArchitecture::Amd64 => Architecture::X64,
         sandsurf_machine::GuestArchitecture::Arm64 => Architecture::Arm64,
@@ -235,7 +240,7 @@ fn image_record(root: &Path, image: &VerifiedImage) -> Result<ImageRecord, Image
             let provenance = digest(
                 Domain::Image,
                 &(
-                    "sandsurf-derived-image-v2",
+                    "sandsurf-derived-image-v1",
                     as_digest(source_image_digest)?,
                     as_digest(snapshot_manifest_digest)?,
                     &disk_digest,
@@ -287,7 +292,7 @@ pub(crate) fn import_oci(
             "OCI platform must exactly match the native Linux guest architecture".into(),
         ));
     }
-    let base = resolve_recipe_boot_image(host_root, executable, &recipe.boot_image_digest)?;
+    let base = resolve_native_image(host_root, executable, &recipe.boot_image_digest)?;
     let architecture = match requested.architecture.as_str() {
         "amd64" => Architecture::X64,
         "arm64" => Architecture::Arm64,
@@ -356,6 +361,9 @@ pub(crate) fn import_oci(
         .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let kernel_name = "boot-kernel";
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
+    if let Some(initramfs) = &base.initramfs_path {
+        copy_regular(initramfs, &artifact.join("boot-initramfs"))?;
+    }
     let platform_artifacts =
         materialize_platform_artifacts(&base, &system_path, &artifact, rootfs_bytes)?;
     let mut environment = BTreeMap::new();
@@ -368,7 +376,7 @@ pub(crate) fn import_oci(
     let conversion_digest = digest(
         Domain::Image,
         &(
-            "sandsurf-oci-machine-v2",
+            "sandsurf-oci-machine-v1",
             &tree.manifest_digest,
             recipe,
             &builder,
@@ -377,12 +385,13 @@ pub(crate) fn import_oci(
     )
     .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let mut manifest = ImageManifest {
-        format_version: 3,
+        format_version: 1,
         id: format!("oci-{}", short_digest(&tree.source.manifest_digest)?),
         version: short_digest(&tree.source.config_digest)?.to_owned(),
         architecture,
         boot_bundle: base.manifest.boot_bundle.clone(),
         system: SystemDiskManifest {
+            clone_profile: sandsurf_image::identity::CloneProfile::Preserve,
             rootfs: RootfsArtifact {
                 path: "oci-system.ext4".into(),
                 sha256: sha256_file(&system_path, MAX_ROOTFS_BYTES)?,
@@ -404,6 +413,12 @@ pub(crate) fn import_oci(
         signature: None,
     };
     manifest.boot_bundle.kernel.path = kernel_name.into();
+    if let Some(initramfs) = &mut manifest.boot_bundle.initramfs {
+        initramfs.path = "boot-initramfs".into();
+    }
+    // OCI conversion does not install distribution hooks. The selected recipe
+    // explicitly pins boot inputs and preserves custom OS clone identities.
+    manifest.boot_bundle.profile = sandsurf_image::boot::BootProfile::Pinned;
     manifest.boot_bundle.guest_agent = None;
     let manifest_path = artifact.join("manifest.json");
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -461,9 +476,25 @@ pub fn publish_snapshot(
     prepare_private_directory(&artifact)?;
     let kernel = artifact.join("boot-kernel");
     let template = artifact.join("derived-system.ext4");
-    copy_regular(&source.kernel_path, &kernel)?;
-    crate::snapshots::materialize_image_template(&host_root.join("snapshots"), snapshot, &template)
-        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
+    let (snapshot_boot_directory, snapshot_boot) =
+        crate::snapshots::boot_artifacts(&crate::snapshots::root(host_root, snapshot), snapshot)
+            .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
+    copy_regular(
+        &snapshot_boot_directory.join(&snapshot_boot.kernel.path),
+        &kernel,
+    )?;
+    if let Some(initramfs) = &snapshot_boot.initramfs {
+        copy_regular(
+            &snapshot_boot_directory.join(&initramfs.path),
+            &artifact.join("boot-initramfs"),
+        )?;
+    }
+    crate::snapshots::materialize_image_template(
+        &crate::snapshots::root(host_root, snapshot),
+        snapshot,
+        &template,
+    )
+    .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
 
     let snapshot_manifest = snapshot
         .manifest_digest
@@ -472,7 +503,7 @@ pub fn publish_snapshot(
     let provenance_digest = digest(
         Domain::Image,
         &(
-            "sandsurf-derived-image-v2",
+            "sandsurf-derived-image-v1",
             &snapshot.image_digest,
             snapshot_manifest,
             snapshot
@@ -494,6 +525,10 @@ pub fn publish_snapshot(
     manifest.version = snapshot_manifest.as_str()[..16].to_owned();
     manifest.boot_bundle.kernel.path = "boot-kernel".into();
     manifest.boot_bundle.kernel.sha256 = sha256_file(&kernel, MAX_ROOTFS_BYTES)?;
+    manifest.boot_bundle.initramfs = snapshot_boot.initramfs.map(|mut value| {
+        value.path = "boot-initramfs".into();
+        value
+    });
     manifest.system.rootfs.path = "derived-system.ext4".into();
     manifest.system.rootfs.sha256 = sha256_file(&template, MAX_ROOTFS_BYTES)?;
     manifest.platform_artifacts = platform_artifacts;
@@ -532,38 +567,6 @@ fn parse_platform(value: &str) -> Result<GuestPlatform, ImageBuildError> {
         os: os.into(),
         variant,
     })
-}
-
-fn resolve_recipe_boot_image(
-    host_root: &Path,
-    executable: &Path,
-    expected: &Digest,
-) -> Result<VerifiedImage, ImageBuildError> {
-    let installed = host_root.join("images").join(expected.as_str());
-    let image = match fs::symlink_metadata(&installed) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => verify_image(
-            &installed.join("manifest.json"),
-            ImageTrust::Pinned {
-                manifest_digest: expected.as_str(),
-            },
-        )?,
-        Ok(_) => {
-            return Err(ImageBuildError::Invalid(
-                "recipe boot image is not an owned image directory".into(),
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let (image, _) = resolve_source_bundle(executable)?;
-            if image.manifest_digest != expected.as_str() {
-                return Err(ImageBuildError::Invalid(
-                    "recipe boot image is unavailable".into(),
-                ));
-            }
-            image
-        }
-        Err(error) => return Err(error.into()),
-    };
-    Ok(image)
 }
 
 /// Container roots without an OS init require an isolated build recipe. They
@@ -678,13 +681,36 @@ fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), ImageBu
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImageIndex {
     #[serde(rename = "formatVersion")]
-    _format_version: u16,
+    format_version: u16,
     #[serde(rename = "buildId")]
-    _build_id: String,
+    build_id: String,
     files: BTreeMap<String, String>,
 }
 
-fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), ImageBuildError> {
+pub(crate) fn resolve_native_image(
+    host_root: &Path,
+    executable: &Path,
+    expected: &Digest,
+) -> Result<VerifiedImage, ImageBuildError> {
+    sandsurf_native::volume::inspect(host_root)?;
+    let installed = host_root.join("images").join(expected.as_str());
+    match fs::symlink_metadata(&installed) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            return Ok(verify_image(
+                &installed.join("manifest.json"),
+                ImageTrust::Pinned {
+                    manifest_digest: expected.as_str(),
+                },
+            )?);
+        }
+        Ok(_) => {
+            return Err(ImageBuildError::Invalid(
+                "image is not a host-owned directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     if let Some(path) = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from) {
         if !path.is_absolute() {
             return Err(ImageBuildError::Invalid(
@@ -692,8 +718,18 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
             ));
         }
         let image = verify_image(&path, ImageTrust::ExplicitLocal)?;
-        let template = image.system_path.clone();
-        return Ok((image, template));
+        if image.manifest_digest != expected.as_str() {
+            return Err(ImageBuildError::Invalid(
+                "local image differs from authorized image identity".into(),
+            ));
+        }
+        let installed = install_image(&host_root.join("images"), &image)?;
+        return Ok(verify_image(
+            &installed.join("manifest.json"),
+            ImageTrust::Pinned {
+                manifest_digest: expected.as_str(),
+            },
+        )?);
     }
     let package = executable
         .parent()
@@ -707,6 +743,11 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
     };
     let relative = format!("development-{architecture}/manifest.json");
     let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
+    if index.format_version != 1 || index.build_id != "sandsurf-images-1.0.0" {
+        return Err(ImageBuildError::Invalid(
+            "invalid image distribution index".into(),
+        ));
+    }
     let indexed = index
         .files
         .get(&relative)
@@ -714,19 +755,19 @@ fn resolve_source_bundle(executable: &Path) -> Result<(VerifiedImage, PathBuf), 
     let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
         ImageBuildError::Invalid("native host has no bundled image trust identity".into())
     })?;
-    if indexed != pinned {
+    if indexed != pinned || expected.as_str() != pinned {
         return Err(ImageBuildError::Invalid(
             "packaged image index differs from the native trust identity".into(),
         ));
     }
-    let image = verify_image(
+    let image = sandsurf_image::distribution::install(
+        &host_root.join("images"),
         &package.join("images").join(relative),
         ImageTrust::Pinned {
             manifest_digest: pinned,
         },
     )?;
-    let template = image.system_path.clone();
-    Ok((image, template))
+    Ok(image)
 }
 
 #[cfg(target_os = "windows")]
@@ -911,7 +952,7 @@ mod native_import_tests {
             fs::write(source.join("kernel"), b"native-kernel").unwrap();
             fs::write(source.join("system.ext4"), b"opaque-system-seed").unwrap();
             let manifest = ImageManifest {
-                format_version: 3,
+                format_version: 1,
                 id: "native-image-test".into(),
                 version: "1".into(),
                 architecture: match crate::service::native_guest_architecture() {
@@ -919,6 +960,8 @@ mod native_import_tests {
                     sandsurf_machine::GuestArchitecture::Arm64 => Architecture::Arm64,
                 },
                 boot_bundle: BootBundleManifest {
+                    initramfs: None,
+                    profile: sandsurf_image::boot::BootProfile::Pinned,
                     kernel: ImageArtifact {
                         path: "kernel".into(),
                         sha256: sha256_file(&source.join("kernel"), MAX_ROOTFS_BYTES).unwrap(),
@@ -933,6 +976,7 @@ mod native_import_tests {
                     },
                 },
                 system: SystemDiskManifest {
+                    clone_profile: sandsurf_image::identity::CloneProfile::Preserve,
                     rootfs: RootfsArtifact {
                         path: "system.ext4".into(),
                         sha256: sha256_file(&source.join("system.ext4"), MAX_ROOTFS_BYTES).unwrap(),
@@ -949,6 +993,16 @@ mod native_import_tests {
             };
             let path = source.join("manifest.json");
             write_json(&path, &manifest).unwrap();
+            let mut compressed = flate2::write::GzEncoder::new(
+                fs::File::create(source.join("system.ext4.gz")).unwrap(),
+                flate2::Compression::default(),
+            );
+            std::io::copy(
+                &mut fs::File::open(source.join("system.ext4")).unwrap(),
+                &mut compressed,
+            )
+            .unwrap();
+            compressed.finish().unwrap();
             let digest = Digest::try_from(
                 verify_image(&path, ImageTrust::ExplicitLocal)
                     .unwrap()
@@ -1041,7 +1095,7 @@ mod native_import_tests {
         );
         assert!(!fixture.root.join("images").join(wrong.as_str()).exists());
         fs::write(
-            fixture.manifest.parent().unwrap().join("system.ext4"),
+            fixture.manifest.parent().unwrap().join("system.ext4.gz"),
             b"modified-system",
         )
         .unwrap();
@@ -1158,6 +1212,7 @@ mod tests {
         );
         fs::remove_file(image).unwrap();
         fs::remove_file(archive_path).unwrap();
+        fs::remove_dir_all(root.join(".appliance")).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

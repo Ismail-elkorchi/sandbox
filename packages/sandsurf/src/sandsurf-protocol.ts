@@ -5,7 +5,7 @@ export const SANDSURF_HEADER_BYTES = 56;
 export const SANDSURF_AUTHENTICATION_BYTES = 32;
 export const SANDSURF_MAX_CONTROL_BYTES = 256 * 1024;
 export const SANDSURF_MAX_STREAM_BYTES = 64 * 1024;
-const MAGIC = Buffer.from("SSF1");
+const MAGIC = Buffer.from("SCF1");
 
 export type SandsurfDigestDomain = "machine" | "authority" | "operation" | "receipt" | "output" | "release" | "image" | "snapshot" | "transfer" | "network" | "secret" | "resource" | "exposure";
 export type SandsurfFrameKind = "control" | "data" | "credit" | "end";
@@ -148,7 +148,7 @@ export function createSandsurfGuestCommand(
 
 function guestCommandDigest(value: Omit<SandsurfGuestCommand, "requestDigest">): string {
   const metadata = sandsurfGuestRequestMetadata(value.request);
-  return sandsurfDigest("operation", ["sandsurf-guest-command-v2", value.machineId,
+  return sandsurfDigest("operation", ["sandsurf-guest-command-v1", value.machineId,
     value.generation, value.operationId, metadata]);
 }
 
@@ -303,7 +303,7 @@ export function encodeSandsurfFrame(frame: SandsurfFrame): Buffer {
   validateFrame(frame.kind, frame.stream, frame.sequence, frame.payload.byteLength);
   if (frame.authentication.byteLength !== SANDSURF_AUTHENTICATION_BYTES) throw new Error("invalid Sandsurf frame authentication");
   const header = Buffer.alloc(SANDSURF_HEADER_BYTES);
-  MAGIC.copy(header); header.writeUInt16BE(4, 4); header[6] = kinds.indexOf(frame.kind) + 1;
+  MAGIC.copy(header); header.writeUInt16BE(1, 4); header[6] = kinds.indexOf(frame.kind) + 1;
   header.writeUInt32BE(frame.stream, 8); header.writeBigUInt64BE(BigInt(frame.sequence), 12);
   header.writeUInt32BE(frame.payload.byteLength, 20);
   header.set(frame.authentication, 24);
@@ -332,7 +332,7 @@ export class SandsurfFrameDecoder {
           this.#header.set(bytes.subarray(offset, offset + count), this.#headerUsed);
           this.#headerUsed += count; offset += count;
           if (this.#headerUsed < SANDSURF_HEADER_BYTES) continue;
-          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== 4 || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
+          if (!this.#header.subarray(0, 4).equals(MAGIC) || this.#header.readUInt16BE(4) !== 1 || this.#header[7] !== 0) throw new Error("invalid Sandsurf header");
           const kind = kinds[(this.#header[6] ?? 0) - 1];
           if (kind === undefined) throw new Error("unknown Sandsurf frame kind");
           const stream = this.#header.readUInt32BE(8);
@@ -397,6 +397,6 @@ export function sandsurfDigest(domain: SandsurfDigestDomain, value: unknown): st
     }
     throw new Error("unsupported canonical digest value");
   };
-  string("SBX-DIGEST-1"); string(`SANDSURF/${domain.toUpperCase()}/1`); visit(value, 0);
+  string("SANDSURF-COMPUTER-DIGEST-1"); string(`SANDSURF/${domain.toUpperCase()}/1`); visit(value, 0);
   return hash.digest("hex");
 }

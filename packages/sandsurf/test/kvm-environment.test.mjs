@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { qualificationDirectory } from "./qualification-storage.mjs";
 import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
@@ -15,7 +16,7 @@ const enabled = process.env.SANDSURF_KVM_TEST === "1";
 const objectName = (identity) => `id-${createHash("sha256").update(identity).digest("hex")}`;
 
 test("KVM provides a persistent administrator-controlled Linux computer", { skip: !enabled, timeout: 1_200_000 }, async (context) => {
-  const directory = process.env.SANDSURF_TEST_STATE ?? await mkdtemp("/var/tmp/sandsurf-computer-");
+  const directory = await qualificationDirectory("computer");
   const destination = await mkdtemp("/var/tmp/sandsurf-publication-");
   const manifestPath = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? resolve(packageDirectory, "images/development-x64/manifest.json");
   const image = createHash("sha256").update(await readFile(manifestPath)).digest("hex");
@@ -29,9 +30,10 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(nativeHost.engine, "firecracker");
     assert.equal(nativeHost.guestPower.shutdown.kind, "unsupported");
     assert.match(nativeHost.guestPower.shutdown.reasons.join(" "), /ACPI/u);
-    assert.equal(nativeHost.guestPower.reboot.kind, "unsupported");
+    assert.equal(nativeHost.guestPower.reboot.kind, "supported");
+    assert.equal(nativeHost.console.kind, "supported");
     machine = await host.machines.create({
-      id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
+      id: "CON", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 64 * 1024 ** 2, managedExecutions: 128 },
     });
     await managementReady(machine);
     const initialUsage = await machine.resources.usage();
@@ -132,8 +134,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     context.diagnostic("native full capture binds immutable host admissions while a real PTY remains alive");
     const capturedGeneration = machine.generation;
     const fullCapture = await machine.snapshots.create({ id: "computer-full-state", kind: "full" });
-    const fullManifest = JSON.parse(await readFile(join(directory, "snapshots", objectName(fullCapture.id), "manifest.json"), "utf8"));
-    assert.equal(fullManifest.formatVersion, 4);
+    const fullManifest = JSON.parse(await readFile(join(directory, "machines", objectName(machine.id), "snapshots", objectName(fullCapture.id), "manifest.json"), "utf8"));
+    assert.equal(fullManifest.formatVersion, 1);
     assert.equal(fullManifest.sourceGeneration, capturedGeneration);
     assert.ok(Array.isArray(fullManifest.full.executions));
     assert.equal(Object.hasOwn(fullManifest.full, "processes"), false);
@@ -240,7 +242,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await run(machine, "sudo -n sync");
     const snapshot = await machine.snapshots.create({ kind: "disk" });
     assert.equal(snapshot.inspection.consistency, "crash");
-    fork = await snapshot.fork();
+    fork = await snapshot.fork({ id: "forked-machine" });
     await managementReady(fork);
     assertSameBytes(await fork.fs.readFile("/workspace/dense"), dense);
     assert.equal(Buffer.from(await fork.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
@@ -259,8 +261,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
       manifestDigest: publishedImage.id, operationId: "reimport-computer-image",
     });
     assert.deepEqual(reimportedImage.inspection, publishedImage.inspection);
-    fork = await host.machines.create({ image: reimportedImage.id,
-      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 } });
+    fork = await host.machines.create({ id: "derived-machine", image: reimportedImage.id,
+      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 8 } });
     await managementReady(fork);
     assert.equal((await fork.inspect()).knownSensitive, true);
     assert.equal(Buffer.from(await fork.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
@@ -316,25 +318,27 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(Buffer.from(await machine.fs.readFile("/home/agent/cache/value")).toString(), "durable");
     assert.equal((await machine.inspect()).knownSensitive, true, "rollback cannot clear disclosure history");
 
-    // Firecracker x86 lacks ACPI poweroff. Its CPU reset exits the VMM;
-    // exercise that actual native termination, without claiming OS reboot.
-    context.diagnostic("guest CPU reset terminates the native owner without changing host intent; ordinary reboot remains unsupported");
+    context.diagnostic("ordinary guest reset recovers with persistent disks and fences old console input");
     const beforeShutdown = await machine.inspect();
+    const oldConsole = await machine.console.attach();
     await machine.executions.start({ argv: ["/bin/sh", "-c", "sudo -n sh -c 'sleep 1; reboot'"], executionId: "native-reset-exit" });
     const shutdownDeadline = Date.now() + 30_000;
-    let stopped;
+    let rebooted;
     do {
-      stopped = await machine.inspect();
-      if (stopped.machine.kind === "current" && stopped.machine.value.state === "stopped") break;
+      rebooted = await machine.inspect();
+      if (rebooted.machine.kind === "current" && rebooted.machine.value.state === "running"
+        && rebooted.machine.value.generation > beforeShutdown.machine.value.generation) break;
       await new Promise((done) => setTimeout(done, 100));
     } while (Date.now() < shutdownDeadline);
-    assert.equal(stopped.machine.kind, "current");
-    assert.equal(stopped.machine.value.state, "stopped");
-    assert.equal(stopped.machine.value.cause.kind, "native");
-    assert.equal(stopped.machine.value.generation, beforeShutdown.machine.value.generation);
-    assert.equal(stopped.configurationRevision, beforeShutdown.configurationRevision);
-    assert.equal(stopped.lifecycleIntent.desired, "running");
-    await machine.start();
+    assert.equal(rebooted.machine.kind, "current");
+    assert.equal(rebooted.machine.value.state, "running");
+    assert.equal(rebooted.machine.value.cause.kind, "guest-reset");
+    assert.ok(rebooted.machine.value.generation > beforeShutdown.machine.value.generation);
+    assert.equal(rebooted.configurationRevision, beforeShutdown.configurationRevision);
+    assert.equal(rebooted.lifecycleIntent.desired, "running");
+    await assert.rejects(oldConsole.write(Buffer.from("stale")), /generation/iu);
+    const historicalConsole = await oldConsole.read();
+    assert.equal(historicalConsole.generation, beforeShutdown.machine.value.generation);
     await managementReady(machine);
     assert.ok(machine.generation > beforeShutdown.machine.value.generation);
     assert.equal(Buffer.from(await machine.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
@@ -346,6 +350,11 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await new Promise((done) => setTimeout(done, 2000));
     await assert.rejects(machine.fs.stat("/etc/passwd"));
     assert.equal((await machine.inspect()).machine.value.state, "running", "management absence does not prove native shutdown");
+    const nativeConsole = await machine.console.attach();
+    const nativeOutput = await nativeConsole.read();
+    assert.equal(nativeOutput.generation, machine.generation);
+    assert.equal(nativeOutput.captureFailed, false);
+    assert.equal(await nativeConsole.write(Buffer.from("\n")), 1, "serial input survives management loss");
     await machine.pause();
     assert.equal((await machine.inspect()).machine.value.state, "paused");
     context.diagnostic("native destruction supersedes failed host configuration");
@@ -413,7 +422,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     context.diagnostic("host expiration remains active under continuous SDK traffic");
     const expiresAtUnixMs = Date.now() + 30_000;
     expiring = await host.machines.create({
-      image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 },
+      id: "expiring-machine", image, resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 8 },
       lifetime: { expiresAtUnixMs, expirationAction: "stop" },
     });
     assert.ok(Date.now() < expiresAtUnixMs, "boot consumed the expiration deadline before client traffic began");
@@ -456,7 +465,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
         await administration.stopSupervisor();
       }
       finally {
-        if (process.env.SANDSURF_TEST_STATE === undefined) await rm(directory, { recursive: true, force: true });
+        // Operator volumes retain machine evidence; this fixture cannot recycle them.
         await rm(destination, { recursive: true, force: true });
       }
     }
@@ -467,7 +476,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
 async function qualifyImageBuildReports(sourceManifest) {
   const root = await mkdtemp("/var/tmp/sandsurf-image-report-");
   const bundle = join(root, "bundle");
-  const directory = join(root, "host");
+  const directory = await qualificationDirectory("image-report");
   let host;
   let machine;
   try {
@@ -480,9 +489,10 @@ async function qualifyImageBuildReports(sourceManifest) {
     } };
     const bytes = Buffer.from(JSON.stringify(manifest));
     const manifestPath = join(bundle, "manifest.json");
-    for (const artifact of [manifest.bootBundle.kernel, manifest.system.rootfs]) {
+    for (const artifact of [manifest.bootBundle.kernel, manifest.bootBundle.initramfs].filter(Boolean)) {
       await copyFile(join(dirname(sourceManifest), artifact.path), join(bundle, artifact.path));
     }
+    await copyFile(join(dirname(sourceManifest), `${manifest.system.rootfs.path}.gz`), join(bundle, `${manifest.system.rootfs.path}.gz`));
     await writeFile(manifestPath, bytes);
     host = await Sandsurf.open({ directory, authorizer: () => true });
     const manifestDigest = createHash("sha256").update(bytes).digest("hex");
@@ -495,8 +505,8 @@ async function qualifyImageBuildReports(sourceManifest) {
     host = await Sandsurf.open({ directory, authorizer: () => true });
     assert.equal((await host.images.importNative(importOptions)).id, image.id, "published operation reconnects without the source bundle");
     assert.equal((await host.images.get(image.id)).id, image.id);
-    machine = await host.machines.create({ image: image.id,
-      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 1024 ** 2, managedExecutions: 8 } });
+    machine = await host.machines.create({ id: "image-report", image: image.id,
+      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 8 } });
     assert.equal((await machine.inspect()).machine.value.state, "running");
     await managementReady(machine);
     assert.equal(await run(machine, "sudo -n id -u"), "0\n", "the actual guest handshake, not management provenance, controls API compatibility");

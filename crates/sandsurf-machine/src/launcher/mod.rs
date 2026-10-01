@@ -2,7 +2,9 @@
 
 mod namespace;
 
-pub use namespace::{NamespaceLauncher, namespace_probe_main, vmm_isolated_main};
+pub use namespace::{
+    NamespaceLauncher, namespace_probe_main, network_namespace_probe_main, vmm_isolated_main,
+};
 
 use sandsurf_native::linux::{
     bind_lifetime_to_parent, open_pidfd, pipe_cloexec, prepare_descriptors_for_exec,
@@ -31,6 +33,7 @@ const INTERNAL_EXIT: u8 = 103;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct VmmMachineSpec {
+    pub nic_handoff_fd_index: usize,
     pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
     pub firecracker_fd_index: usize,
@@ -40,6 +43,7 @@ pub(crate) struct VmmMachineSpec {
     pub state_directory_identity: FileIdentity,
     pub storage_lease_fd_index: usize,
     pub storage_lease_identity: FileIdentity,
+    pub serial_input_fd_index: usize,
     pub args: Vec<String>,
     pub open_files_limit: u64,
     pub file_size_limit: u64,
@@ -53,15 +57,19 @@ pub(crate) struct VmmMachineSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VmmLaunchSpec {
+    pub nic_handoff_fd_index: usize,
+    pub tun_device_fd_index: usize,
     pub namespace_launcher_fd_index: usize,
     pub firecracker_fd_index: usize,
     pub firecracker_identity: FileIdentity,
     pub firecracker_sha256: String,
     pub kernel_fd_index: usize,
+    pub initramfs_fd_index: Option<usize>,
     pub system_fd_index: usize,
     pub storage_lease_fd_index: usize,
     pub storage_lease_identity: FileIdentity,
     pub authentication_fd_index: usize,
+    pub serial_input_fd_index: usize,
     pub configuration_fd_index: usize,
     /// Present only when a fresh Firecracker process is started for snapshot
     /// loading. These files are mounted read-only at fixed paths and remain
@@ -504,16 +512,22 @@ fn run_vmm_launcher() -> io::Result<i32> {
 
 fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Result<()> {
     let mut indexes = vec![
+        spec.nic_handoff_fd_index,
+        spec.tun_device_fd_index,
         spec.namespace_launcher_fd_index,
         spec.firecracker_fd_index,
         spec.kernel_fd_index,
         spec.system_fd_index,
         spec.storage_lease_fd_index,
         spec.authentication_fd_index,
+        spec.serial_input_fd_index,
         spec.configuration_fd_index,
         spec.state_directory_fd_index,
         spec.kvm_fd_index,
     ];
+    if let Some(index) = spec.initramfs_fd_index {
+        indexes.push(index);
+    }
     match (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index) {
         (Some(state), Some(memory)) => {
             indexes.push(state);
@@ -557,6 +571,13 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
 
 fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
     let mut mounts = vec![
+        (
+            spec.tun_device_fd_index,
+            "/dev/net/tun",
+            "file",
+            false,
+            false,
+        ),
         (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
         (spec.system_fd_index, "/vm/system", "file", false, false),
         (
@@ -593,6 +614,15 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         },
     )
     .collect::<Vec<_>>();
+    if let Some(index) = spec.initramfs_fd_index {
+        mounts.push(MountSpec {
+            fd_index: index,
+            target_path: "/vm/initramfs".into(),
+            kind: "file".into(),
+            read_only: true,
+            executable: false,
+        });
+    }
     if let (Some(state), Some(memory)) =
         (spec.snapshot_state_fd_index, spec.snapshot_memory_fd_index)
     {
@@ -615,12 +645,15 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         "--enable-pci".into(),
         "--api-sock".into(),
         "/vm/state/firecracker.socket".into(),
+        "--metrics-path".into(),
+        "/vm/state/native-metrics.fifo".into(),
     ];
     if spec.snapshot_state_fd_index.is_none() {
         args.push("--config-file".into());
         args.push("/vm/state/firecracker.json".into());
     }
     VmmMachineSpec {
+        nic_handoff_fd_index: spec.nic_handoff_fd_index,
         launcher_fd_index: spec.namespace_launcher_fd_index,
         mounts,
         firecracker_fd_index: spec.firecracker_fd_index,
@@ -630,6 +663,7 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         state_directory_identity: spec.state_directory_identity,
         storage_lease_fd_index: spec.storage_lease_fd_index,
         storage_lease_identity: spec.storage_lease_identity,
+        serial_input_fd_index: spec.serial_input_fd_index,
         args,
         open_files_limit: spec.open_files_limit,
         file_size_limit: spec.file_size_limit,
@@ -642,6 +676,9 @@ fn namespace_init(
     spec: &VmmMachineSpec,
     files: Vec<File>,
 ) -> io::Result<i32> {
+    let packet = sandsurf_network::linux::create_isolated_packet_socket()?;
+    send_fds(files[spec.nic_handoff_fd_index].as_raw_fd(), 0, &[packet])?;
+    drop_capabilities(true)?;
     // Keep custody until the VMM and its descendants have actually been reaped.
     // The VMM inherits a duplicate too, fencing replacement if this supervisor
     // dies while PID-namespace teardown is still in progress.
@@ -786,10 +823,23 @@ fn vmm_exec(spec: &VmmMachineSpec, files: &[File]) -> io::Result<()> {
     // Descriptor zero is the launcher's private control socket. The VMM must
     // never inherit a second reader for that channel: it could consume a
     // termination request before the namespace supervisor observes it.
-    let null = File::open("/dev/null").map_err(|error| context("open VMM stdin sink", error))?;
-    // SAFETY: null is a live readable descriptor and dup2 atomically replaces
-    // only this child process's fd 0 before it executes Firecracker.
-    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
+    let serial = files.get(spec.serial_input_fd_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing serial input descriptor",
+        )
+    })?;
+    // Firecracker sets termios on stdin, so this must be a private PTY slave,
+    // not a pipe and never the launcher's control socket.
+    // SAFETY: both descriptors are live; isatty only queries the serial fd.
+    if unsafe { libc::isatty(serial.as_raw_fd()) } != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serial input is not a terminal",
+        ));
+    }
+    // SAFETY: atomically replaces only the VMM child's stdin before exec.
+    if unsafe { libc::dup2(serial.as_raw_fd(), 0) } < 0 {
         return Err(context("isolate VMM stdin", io::Error::last_os_error()));
     }
 
@@ -906,9 +956,11 @@ fn final_status(
 
 fn validate_vmm_machine_spec(spec: &VmmMachineSpec, descriptor_count: usize) -> io::Result<()> {
     if spec.launcher_fd_index >= descriptor_count
+        || spec.nic_handoff_fd_index >= descriptor_count
         || spec.firecracker_fd_index >= descriptor_count
         || spec.state_directory_fd_index >= descriptor_count
         || spec.storage_lease_fd_index >= descriptor_count
+        || spec.serial_input_fd_index >= descriptor_count
         || spec
             .mounts
             .iter()
@@ -1642,6 +1694,17 @@ fn send_fds(socket: RawFd, length: u32, files: &[File]) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+pub fn receive_native_nic(socket: &UnixStream) -> io::Result<File> {
+    let (length, mut files) = receive_fds(socket.as_raw_fd())?;
+    if length != 0 || files.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native NIC handoff requires exactly one packet descriptor",
+        ));
+    }
+    Ok(files.remove(0))
 }
 
 fn receive_fds(socket: RawFd) -> io::Result<(u32, Vec<File>)> {

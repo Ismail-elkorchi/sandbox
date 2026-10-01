@@ -24,13 +24,8 @@ fn macos_acl_grants_make_authority_unavailable_without_repair_or_deletion() {
         operations: one,
         usage_records: one,
         image_bytes: one,
-        resources: Resources {
-            vcpus: one,
-            memory_mib: one,
-            disk_bytes: one,
-            output_bytes: one,
-            managed_executions: one,
-        },
+        resources: Resources::from_geometry(one, one, one, one, one)
+            .expect("static resource envelope"),
     };
     drop(HostCatalog::create(&catalog, "acl-host".try_into().unwrap(), limits).unwrap());
     for (path, grant) in [

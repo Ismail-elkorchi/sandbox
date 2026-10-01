@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -36,11 +36,13 @@ pub struct FirecrackerSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerConfig {
+    pub network_identity: sandsurf_network::LinkIdentity,
     pub launcher_executable: PathBuf,
     pub firecracker_executable: PathBuf,
     pub firecracker_sha256: String,
     pub state_directory: PathBuf,
     pub kernel_image: PathBuf,
+    pub initial_ramdisk: Option<PathBuf>,
     /// Exclusively attached, host-owned writable Linux system disk.
     pub system_disk: PathBuf,
     /// The storage owner's exclusive slot lease, transferred into the actual
@@ -55,6 +57,7 @@ pub struct FirecrackerConfig {
 }
 
 pub struct FirecrackerProcess {
+    pub network: std::sync::Arc<sandsurf_network::NativeNetworkGateway>,
     child: Child,
     control: UnixStream,
     diagnostics: Vec<JoinHandle<()>>,
@@ -63,6 +66,10 @@ pub struct FirecrackerProcess {
     final_status: Option<crate::launcher::LauncherFinalStatus>,
     event_reader: LauncherEventReader,
     termination_requested: bool,
+    console: Option<crate::NativeConsole>,
+    metrics: Option<JoinHandle<ResetMetrics>>,
+    metrics_stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reset_metrics: Option<ResetMetrics>,
 }
 
 impl FirecrackerProcess {
@@ -101,6 +108,20 @@ impl FirecrackerProcess {
         let vsock_path = vm_state.join("guest.vsock");
         let api_socket_path = vm_state.join("firecracker.socket");
         let config_path = vm_state.join("firecracker.json");
+        let metrics_path = vm_state.join("native-metrics.fifo");
+        let metrics_name = std::ffi::CString::new(metrics_path.as_os_str().as_encoded_bytes())
+            .map_err(|_| FirecrackerError::Invalid("invalid metrics path".into()))?;
+        // SAFETY: live NUL-terminated path; private FIFO is native evidence,
+        // never guest-accessible storage or guest serial output.
+        if unsafe { libc::mkfifo(metrics_name.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let metrics_input = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&metrics_path)?;
+        let (serial_input, serial_slave) = serial_input_pair()?;
         let drives = vec![
             Drive {
                 drive_id: "system".into(),
@@ -118,6 +139,10 @@ impl FirecrackerProcess {
         let firecracker_json = FirecrackerJson {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
+                initrd_path: config
+                    .initial_ramdisk
+                    .as_ref()
+                    .map(|_| "/vm/initramfs".into()),
                 boot_args: crate::linux_boot_arguments("ttyS0", "/dev/vda"),
             },
             drives,
@@ -131,6 +156,11 @@ impl FirecrackerProcess {
                 guest_cid: config.guest_cid,
                 uds_path: "/vm/state/guest.vsock".into(),
             },
+            network_interfaces: vec![NetworkInterface {
+                iface_id: "eth0".into(),
+                host_dev_name: sandsurf_network::linux::TAP_NAME.into(),
+                guest_mac: config.network_identity.mac_address(),
+            }],
         };
         let mut config_file = OpenOptions::new()
             .write(true)
@@ -145,11 +175,18 @@ impl FirecrackerProcess {
 
         let mut files = Vec::new();
         let kernel_fd_index = add_file(&mut files, &config.kernel_image)?;
+        let initramfs_fd_index = config
+            .initial_ramdisk
+            .as_ref()
+            .map(|path| add_file(&mut files, path))
+            .transpose()?;
         let system_fd_index = add_file(&mut files, &config.system_disk)?;
         let storage_lease_fd_index = files.len();
         let storage_lease_identity = file_identity(config.storage_lease.as_raw_fd())?;
         files.push(config.storage_lease.try_clone()?);
         let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
+        let serial_input_fd_index = files.len();
+        files.push(serial_slave);
         let configuration_fd_index = add_file(&mut files, &config_path)?;
         let snapshot_state_fd_index = restore
             .map(|value| add_file(&mut files, &value.snapshot_state))
@@ -178,16 +215,24 @@ impl FirecrackerProcess {
         let namespace_launcher_fd_index = files.len();
         files.push(crate::launcher::NamespaceLauncher::open()?.file);
         let kvm_fd_index = add_file(&mut files, Path::new("/dev/kvm"))?;
+        let tun_device_fd_index = add_file(&mut files, Path::new("/dev/net/tun"))?;
+        let (nic_channel, nic_sender) = UnixStream::pair()?;
+        let nic_handoff_fd_index = files.len();
+        files.push(File::from(OwnedFd::from(nic_sender)));
         let spec = VmmLaunchSpec {
+            nic_handoff_fd_index,
+            tun_device_fd_index,
             namespace_launcher_fd_index,
             firecracker_fd_index,
             firecracker_identity: executable_identity,
             firecracker_sha256: actual_digest,
             kernel_fd_index,
+            initramfs_fd_index,
             system_fd_index,
             storage_lease_fd_index,
             storage_lease_identity,
             authentication_fd_index,
+            serial_input_fd_index,
             configuration_fd_index,
             snapshot_state_fd_index,
             snapshot_memory_fd_index,
@@ -210,7 +255,7 @@ impl FirecrackerProcess {
             .stderr(Stdio::piped())
             .spawn()?;
         let mut guard = ChildLaunchGuard::new(child);
-        let setup = (|| -> Result<(), FirecrackerError> {
+        let setup = (|| -> Result<std::sync::Arc<sandsurf_network::NativeNetworkGateway>, FirecrackerError> {
             send_vmm_launch_spec(&mut control, &spec, &files)?;
             drop(files);
             control.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -224,40 +269,45 @@ impl FirecrackerProcess {
                 }
             }
             control.set_read_timeout(None)?;
-            Ok(())
+            nic_channel.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let packet = crate::launcher::receive_native_nic(&nic_channel)?;
+            let gateway = sandsurf_network::NativeNetworkGateway::start(sandsurf_network::PacketTransport::LinuxPacket(packet), config.network_identity)?;
+            Ok(std::sync::Arc::new(gateway))
         })();
-        if let Err(error) = setup {
-            let failures = guard.cleanup();
-            return if failures.is_empty() {
-                Err(error)
-            } else {
-                Err(FirecrackerError::Setup(format!(
-                    "{error}; launcher cleanup failed: {}",
-                    failures.join("; ")
-                )))
-            };
-        }
+        let network = match setup {
+            Ok(network) => network,
+            Err(error) => {
+                let failures = guard.cleanup();
+                return if failures.is_empty() {
+                    Err(error)
+                } else {
+                    Err(FirecrackerError::Setup(format!(
+                        "{error}; launcher cleanup failed: {}",
+                        failures.join("; ")
+                    )))
+                };
+            }
+        };
         let mut child = guard.handoff();
-        let diagnostics = [
-            (
-                child
-                    .stdout
-                    .take()
-                    .map(|value| Box::new(value) as Box<dyn Read + Send>),
-                vm_state.join("console.log"),
-            ),
-            (
-                child
-                    .stderr
-                    .take()
-                    .map(|value| Box::new(value) as Box<dyn Read + Send>),
-                vm_state.join("vmm.log"),
-            ),
-        ]
+        let console = child.stdout.take().map(|output| crate::NativeConsole {
+            input: Box::new(serial_input),
+            output: Box::new(output),
+        });
+        let diagnostics = [(
+            child
+                .stderr
+                .take()
+                .map(|value| Box::new(value) as Box<dyn Read + Send>),
+            vm_state.join("vmm.log"),
+        )]
         .into_iter()
         .filter_map(|(input, path)| input.map(|input| drain_diagnostic(input, path)))
         .collect();
+        let metrics_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = metrics_stopped.clone();
+        let metrics = std::thread::spawn(move || read_reset_metrics(metrics_input, stopped));
         let mut process = Self {
+            network,
             child,
             control,
             diagnostics,
@@ -266,6 +316,10 @@ impl FirecrackerProcess {
             final_status: None,
             event_reader: LauncherEventReader::default(),
             termination_requested: false,
+            console,
+            metrics: Some(metrics),
+            metrics_stopped,
+            reset_metrics: None,
         };
         if restore.is_some() {
             process.wait_for_api()?;
@@ -500,6 +554,22 @@ impl FirecrackerProcess {
         Ok(self.child.try_wait()?.is_some())
     }
 
+    pub fn take_console(&mut self) -> Option<crate::NativeConsole> {
+        self.console.take()
+    }
+
+    pub fn guest_reset_evidence(&self) -> Option<sandsurf_protocol::Digest> {
+        let status = self.final_status.as_ref()?;
+        let metrics = self.reset_metrics.as_ref()?;
+        if qualifies_guest_reset(status, metrics, self.termination_requested) {
+            let evidence =
+                serde_json::to_vec(&("firecracker-1.17-i8042-reset", status, metrics)).ok()?;
+            Some(sandsurf_protocol::bytes_digest(&evidence))
+        } else {
+            None
+        }
+    }
+
     pub fn observe_power(&mut self) -> Result<crate::NativePowerObservation, FirecrackerError> {
         if self.has_exited()? {
             let status = self.wait()?;
@@ -547,10 +617,124 @@ impl FirecrackerProcess {
     }
 
     fn finish_diagnostics(&mut self) {
+        self.metrics_stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.metrics.take() {
+            self.reset_metrics = thread.join().ok();
+        }
         for thread in self.diagnostics.drain(..) {
             let _ = thread.join();
         }
     }
+}
+
+fn serial_input_pair() -> io::Result<(File, File)> {
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: out pointers are writable; null requests default PTY settings.
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openpty transferred two distinct owned descriptors.
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    for file in [&master, &slave] {
+        // SAFETY: owned descriptor, scalar flags only.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: owned master; nonblocking writes bound guardian input work.
+    if unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master, slave))
+}
+
+#[derive(Default, Serialize)]
+struct ResetMetrics {
+    reset: bool,
+    invalid: bool,
+}
+
+// Firecracker 1.17 FcExitCode::Ok is shared by clean exits. x86 i8042
+// CMD_RESET_CPU increments this native metric; Vmm::drop flushes it on exit.
+// ARM SYSTEM_EVENT_RESET/SHUTDOWN share exit code and have no distinct metric.
+// Sources: upstream v1.17.0 src/vmm/src/{lib.rs,devices/legacy/i8042.rs,
+// vstate/vcpu.rs,logger/metrics.rs}. No log or guest-management heuristics.
+fn qualifies_guest_reset(
+    status: &crate::launcher::LauncherFinalStatus,
+    metrics: &ResetMetrics,
+    terminated: bool,
+) -> bool {
+    cfg!(target_arch = "x86_64")
+        && !terminated
+        && status.exit_code == Some(0)
+        && status.signal.is_none()
+        && status.tree_reaped
+        && status.cleanup_failures.is_empty()
+        && metrics.reset
+        && !metrics.invalid
+}
+
+fn read_reset_metrics(
+    mut input: File,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ResetMetrics {
+    let mut result = ResetMetrics::default();
+    let mut pending = Vec::new();
+    let mut bytes = [0; 4096];
+    loop {
+        match input.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(count) => {
+                for byte in &bytes[..count] {
+                    if *byte == b'\n' {
+                        #[derive(Deserialize)]
+                        struct Sample {
+                            i8042: I8042,
+                        }
+                        #[derive(Deserialize)]
+                        struct I8042 {
+                            reset_count: u64,
+                        }
+                        if cfg!(target_arch = "x86_64") {
+                            match serde_json::from_slice::<Sample>(&pending) {
+                                Ok(sample) => result.reset |= sample.i8042.reset_count > 0,
+                                Err(_) => result.invalid = true,
+                            }
+                        }
+                        pending.clear();
+                    } else if pending.len() < 64 * 1024 {
+                        pending.push(*byte);
+                    } else {
+                        result.invalid = true;
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                result.invalid = true;
+                break;
+            }
+        }
+    }
+    result.invalid |= !pending.is_empty();
+    result
 }
 
 #[derive(Deserialize)]
@@ -924,6 +1108,8 @@ fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
 
 #[derive(Serialize, Deserialize)]
 struct FirecrackerJson {
+    #[serde(rename = "network-interfaces")]
+    network_interfaces: Vec<NetworkInterface>,
     #[serde(rename = "boot-source")]
     boot_source: BootSource,
     drives: Vec<Drive>,
@@ -933,8 +1119,17 @@ struct FirecrackerJson {
 }
 
 #[derive(Serialize, Deserialize)]
+struct NetworkInterface {
+    iface_id: String,
+    host_dev_name: String,
+    guest_mac: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct BootSource {
     kernel_image_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initrd_path: Option<String>,
     boot_args: String,
 }
 
@@ -964,6 +1159,65 @@ struct Vsock {
 mod control_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn reset_requires_native_metric_clean_exit_and_confirmed_containment() {
+        let mut status = crate::launcher::LauncherFinalStatus {
+            raw_wait_status: 0,
+            exit_code: Some(0),
+            signal: None,
+            core_dumped: false,
+            cleanup_failures: vec![],
+            tree_reaped: true,
+        };
+        let metrics = ResetMetrics {
+            reset: true,
+            invalid: false,
+        };
+        assert_eq!(
+            qualifies_guest_reset(&status, &metrics, false),
+            cfg!(target_arch = "x86_64")
+        );
+        assert!(!qualifies_guest_reset(
+            &status,
+            &ResetMetrics::default(),
+            false
+        ));
+        assert!(!qualifies_guest_reset(&status, &metrics, true));
+        assert!(!qualifies_guest_reset(
+            &status,
+            &ResetMetrics {
+                reset: true,
+                invalid: true
+            },
+            false
+        ));
+        status.exit_code = Some(1);
+        assert!(!qualifies_guest_reset(&status, &metrics, false));
+        status.exit_code = Some(0);
+        status.signal = Some(libc::SIGSEGV);
+        assert!(!qualifies_guest_reset(&status, &metrics, false));
+        status.signal = None;
+        status.exit_code = Some(0);
+        status.tree_reaped = false;
+        assert!(!qualifies_guest_reset(&status, &metrics, false));
+        status.tree_reaped = true;
+        status.cleanup_failures.push("uncontained process".into());
+        assert!(!qualifies_guest_reset(&status, &metrics, false));
+    }
+
+    #[test]
+    fn serial_input_is_a_distinct_terminal_descriptor_and_nonblocking() {
+        let (master, slave) = serial_input_pair().unwrap();
+        assert_ne!(master.as_raw_fd(), slave.as_raw_fd());
+        // SAFETY: queries only the two owned descriptors returned above.
+        assert_eq!(unsafe { libc::isatty(slave.as_raw_fd()) }, 1);
+        // SAFETY: F_GETFL takes a live descriptor and no additional argument.
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+    }
 
     #[test]
     fn instance_power_is_native_evidence_and_indeterminate_states_are_not_shutdown() {

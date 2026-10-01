@@ -1,13 +1,15 @@
 import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { packageArchive } from "./package-archive.ts";
 
-const temporary = await mkdtemp(resolve(tmpdir(), "machine-package-test-"));
+const temporary = await mkdtemp(resolve(process.platform === "linux" ? "/var/tmp" : tmpdir(), "machine-package-test-"));
 const npmCli = requiredEnvironment("npm_execpath");
 const originalUmask = process.platform === "win32" ? undefined : process.umask();
 try {
-  const core = await pack("sandsurf");
+  const core = await packageArchive(resolve("packages/sandsurf"), temporary, npmCli);
   const expectedImages = await packagedImagePaths();
   const expectedNative = await packagedNativePaths();
   for (const tarball of [core]) {
@@ -25,37 +27,46 @@ try {
     if (paths.some((path) => /(?:minimal-|trusted-bootstrap|development-workload|empty-workspace)/u.test(path))) {
       throw new Error(`${tarball} contains a retired guest image artifact`);
     }
+    if (paths.some((path) => /\.(?:ext4|vhdx)$/u.test(path))) throw new Error("package contains unpacked machine disks");
   }
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);
   if (originalUmask !== undefined) process.umask(0o002);
   await run(process.execPath, [npmCli, "init", "--yes"], consumer);
   await run(process.execPath, [npmCli, "install", "--ignore-scripts", core], consumer);
+  const installedDirectory = process.env.SANDSURF_PACKAGE_TEST_DIRECTORY ?? resolve(temporary, "installed-native-state");
+  const slot = (await capture(process.execPath, [resolve(consumer, "node_modules/sandsurf/dist/cli.js"), "storage-path", "--directory", installedDirectory, "--machine", "installed-storage-slot"])).trim();
+  if (slot !== resolve(installedDirectory, "machines", "id-" + createHash("sha256").update("installed-storage-slot").digest("hex"))) throw new Error("installed CLI derived an inconsistent machine storage address");
   await run(process.execPath, ["--input-type=module", "--eval", `
     import assert from "node:assert/strict";
     import { Sandsurf } from "sandsurf";
     import { NativeHostClient } from "./node_modules/sandsurf/dist/native-host.js";
-    const directory = ${JSON.stringify(resolve(temporary, "installed-native-state"))};
+    const directory = ${JSON.stringify(installedDirectory)};
     let host = await Sandsurf.open({ directory, authorizer: () => true });
     try {
       const before = await host.inspect();
       assert.ok(before.defaultImageDigest);
-      assert.equal(before.guestPower.reboot.kind, "unsupported");
+      assert.equal(before.guestPower.reboot.kind, process.platform === "linux" && process.arch === "x64" ? "supported" : "unsupported");
+      assert.equal(before.console.kind, "supported");
       assert.equal(before.guestPower.shutdown.kind, process.platform === "linux" && process.arch === "x64" ? "unsupported" : "supported");
       const nativeImport = {
         manifestPath: ${JSON.stringify(resolve(consumer, "node_modules/sandsurf/images"))} + "/development-" + (before.guestArchitecture === "arm64" ? "arm64" : "x64") + "/manifest.json",
         manifestDigest: before.defaultImageDigest,
         operationId: "installed-native-image",
       };
-      const nativeImage = await host.images.importNative(nativeImport);
-      assert.equal(nativeImage.id, before.defaultImageDigest);
+      const nativeImage = before.imageWorkers.kind === "supported"
+        ? await host.images.importNative(nativeImport) : undefined;
+      if (nativeImage !== undefined) assert.equal(nativeImage.id, before.defaultImageDigest);
+      else await assert.rejects(host.images.importNative(nativeImport), (error) => error.category === "unsupported");
       const secret = await host.secrets.put("installed-binary-secret", Buffer.alloc(1024 ** 2, 255), { operationId: "installed-put" });
       assert.equal(secret.bytes, 1024 ** 2);
       await host.close();
       host = await Sandsurf.open({ directory, service: "connect", authorizer: () => true });
       assert.equal((await host.inspect()).hostId, before.hostId);
-      assert.equal((await host.images.importNative(nativeImport)).id, nativeImage.id);
-      assert.equal((await host.images.get(nativeImage.id)).id, nativeImage.id);
+      if (nativeImage !== undefined) {
+        assert.equal((await host.images.importNative(nativeImport)).id, nativeImage.id);
+        assert.equal((await host.images.get(nativeImage.id)).id, nativeImage.id);
+      }
       const retained = await host.operations.get("installed-put");
       assert.equal(retained.id, "installed-put");
       const operation = await retained.inspect();
@@ -71,18 +82,21 @@ try {
     }
   `], consumer);
   await copyFile(resolve("scripts/package-consumer.mts"), resolve(consumer, "package-consumer.mts"));
+  process.stdout.write("Installed native API/CLI checks passed; validating consumer declarations.\n");
   await run(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "--strict", "--noEmit", "--module", "NodeNext", "--target", "ES2024",
-    "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer);
+    "--typeRoots", resolve("node_modules/@types"), "--types", "node", "package-consumer.mts"], consumer, { NODE_OPTIONS: "--max-old-space-size=256" });
   const lock = await readFile(resolve(consumer, "package-lock.json"), "utf8");
   if (lock.includes("node_modules/typescript")) throw new Error("consumer install contains development dependencies");
   const hardwareTests: string[] = [];
   if (process.env.SANDSURF_KVM_TEST === "1") hardwareTests.push(resolve("packages/sandsurf/test/kvm-environment.test.mjs"));
+  if (process.env.SANDSURF_KVM_NETWORK_TEST === "1") hardwareTests.push(resolve("packages/sandsurf/test/native-network-hardware.test.mjs"));
   if (process.env.SANDSURF_SERVICE_MANAGER_TEST === "1") hardwareTests.push(resolve("packages/sandsurf/test/systemd-machine.test.mjs"));
+  if (process.env.SANDSURF_LINUX_QUALIFICATION === "1") hardwareTests.push(resolve("packages/sandsurf/test/linux-workloads.test.mjs"));
   if (hardwareTests.length !== 0) {
     if (process.platform !== "linux" || process.arch !== "x64") throw new Error("installed Linux VM qualification requires a Linux x64 host");
     await run(process.execPath, ["--test", "--test-concurrency=1", ...hardwareTests], consumer, {
       SANDSURF_TEST_PACKAGE_ROOT: resolve(consumer, "node_modules/sandsurf"),
-      SANDSURF_LOCAL_IMAGE_MANIFEST: resolve(consumer, "node_modules/sandsurf/images/development-x64/manifest.json"),
+      SANDSURF_LOCAL_IMAGE_MANIFEST: undefined,
     });
   }
 } finally {
@@ -103,15 +117,31 @@ async function packagedImagePaths(): Promise<readonly string[]> {
     const manifest: unknown = JSON.parse(await readFile(resolve(root, relative), "utf8"));
     if (!record(manifest) || manifest.id !== "sandsurf-development" || manifest.version !== "3.24.2" ||
         !record(manifest.bootBundle) || !record(manifest.bootBundle.kernel) ||
-        manifest.formatVersion !== 3 || !record(manifest.system) ||
+        manifest.formatVersion !== 1 || !record(manifest.system) ||
         !record(manifest.system.rootfs) ||
         !record(manifest.system.provenance) || !record(manifest.system.provenance.materials)) {
       throw new Error(`${relative} is malformed`);
     }
     paths.push(`package/images/${relative}`);
-    for (const artifact of [manifest.bootBundle.kernel, manifest.system.rootfs]) {
+    if (!record(manifest.bootBundle.initramfs)) throw new Error(`${relative} lacks the distribution initramfs`);
+    const artifacts = [manifest.bootBundle.kernel, manifest.bootBundle.initramfs];
+    const disks = [manifest.system.rootfs];
+    if (match[2] === "x64") {
+      if (!record(manifest.platformArtifacts) || !record(manifest.platformArtifacts.windowsX64)) {
+        throw new Error(`${relative} lacks Windows VM artifacts`);
+      }
+      const windows = manifest.platformArtifacts.windowsX64;
+      if (!record(windows.kernel) || !record(windows.system)) throw new Error(`${relative} has malformed Windows artifacts`);
+      artifacts.push(windows.kernel);
+      disks.push(windows.system);
+    }
+    for (const artifact of artifacts) {
       if (typeof artifact.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(artifact.path)) throw new Error(`${relative} has an unsafe artifact path`);
       paths.push(`package/images/${match[1]}/${artifact.path}`);
+    }
+    for (const disk of disks) {
+      if (typeof disk.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(disk.path)) throw new Error(`${relative} has an unsafe disk path`);
+      paths.push(`package/images/${match[1]}/${disk.path}.gz`);
     }
   }
   if (required.size !== 0) throw new Error(`required packaged guest images are absent: ${[...required].join(", ")}`);
@@ -120,7 +150,7 @@ async function packagedImagePaths(): Promise<readonly string[]> {
 
 async function packagedNativePaths(): Promise<readonly string[]> {
   const index: unknown = JSON.parse(await readFile(resolve("packages/sandsurf/native/manifest.json"), "utf8"));
-  if (!record(index) || index.formatVersion !== 1 || index.buildId !== "sandsurf-native-0.1.0" || !record(index.files)) {
+  if (!record(index) || index.formatVersion !== 1 || index.buildId !== "sandsurf-native-1.0.0" || !record(index.files)) {
     throw new Error("native package index is malformed");
   }
   const paths = ["package/native/manifest.json"];
@@ -139,22 +169,13 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function pack(workspace: string): Promise<string> {
-  const output = await capture(process.execPath, [npmCli, "pack", "--json", "--workspace", workspace, "--pack-destination", temporary]);
-  const parsed: unknown = JSON.parse(output);
-  if (!Array.isArray(parsed) || parsed.length !== 1 || typeof parsed[0]?.filename !== "string") {
-    throw new Error(`npm pack returned an invalid result for ${workspace}`);
-  }
-  return resolve(temporary, parsed[0].filename);
-}
-
 function requiredEnvironment(name: string): string {
   const value = process.env[name];
   if (value === undefined) throw new Error(`${name} is required for package verification`);
   return value;
 }
 
-function run(command: string, arguments_: readonly string[], cwd = process.cwd(), environment: Readonly<Record<string, string>> = {}): Promise<void> {
+function run(command: string, arguments_: readonly string[], cwd = process.cwd(), environment: Readonly<Record<string, string | undefined>> = {}): Promise<void> {
   return new Promise((resolveRun, rejectRun) => {
     let output = "";
     let errors = "";

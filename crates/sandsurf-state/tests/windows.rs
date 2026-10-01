@@ -17,13 +17,8 @@ fn windows_private_state_is_owner_only_reopenable_and_writer_exclusive() {
             operations: one,
             usage_records: one,
             image_bytes: one,
-            resources: Resources {
-                vcpus: one,
-                memory_mib: one,
-                disk_bytes: one,
-                output_bytes: one,
-                managed_executions: one,
-            },
+            resources: Resources::from_geometry(one, one, one, one, one)
+                .expect("static resource envelope"),
         },
     )
     .unwrap();

@@ -311,19 +311,24 @@ pub(crate) struct ManagementRebind {
     pub boot_identity: Digest,
     pub capability: [u8; 32],
     pub request: GuestServiceRequest,
+    pub staging: GuestServiceRequest,
 }
 
 pub struct PendingRebind<C> {
     pub source: GuestClient<C>,
     pub request: GuestServiceRequest,
-    attempted: bool,
+    staging: GuestServiceRequest,
 }
 impl<C> PendingRebind<C> {
-    pub fn new(source: GuestClient<C>, request: GuestServiceRequest) -> Self {
+    pub fn new(
+        source: GuestClient<C>,
+        request: GuestServiceRequest,
+        staging: GuestServiceRequest,
+    ) -> Self {
         Self {
             source,
             request,
-            attempted: false,
+            staging,
         }
     }
 }
@@ -356,10 +361,24 @@ impl<C: GuestChannel> ManagedGuestClient<C> {
             self.rebind = None;
             return Ok(());
         }
-        if !pending.attempted {
-            // Delivery is ambiguous after transport failure. Never blindly replay
-            // the generation change; subsequent jobs probe the target identity.
-            pending.attempted = true;
+        // Reconcile a lost response against both channel identities before
+        // replaying the exact durable restore intent. This never repeats a
+        // spawn or input, and a rotated source capability cannot rotate again.
+        if pending
+            .source
+            .call(&GuestServiceRequest::ProbeIdentity)
+            .is_ok_and(|response| current(&response, &pending.source))
+        {
+            match pending.source.call(&pending.staging) {
+                Ok(GuestServiceResponse::Effect {
+                    outcome: sandsurf_protocol::GuestEffectOutcome::Applied { .. },
+                }) => {}
+                _ => {
+                    return Err(ControlError::Unsupported(
+                        "restored execution membership unavailable; native computer remains running",
+                    ));
+                }
+            }
             let _ = pending.source.call(&pending.request);
         }
         if self

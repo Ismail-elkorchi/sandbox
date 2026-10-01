@@ -27,6 +27,34 @@ fn process(mode: &str, directory: &Path) -> Process {
             .unwrap(),
     )
 }
+
+#[cfg(target_os = "linux")]
+fn pool_stopped(root: &Path, pool: sandsurf_native::service_pool::ServicePool) -> bool {
+    let unit = pool.unit(root).unwrap();
+    !Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", &unit])
+        .status()
+        .unwrap()
+        .success()
+}
+#[cfg(target_os = "linux")]
+fn supervisor_owner(root: &Path) -> u32 {
+    let unit = sandsurf_native::service_pool::ServicePool::Supervisor
+        .unit(root)
+        .unwrap();
+    let output = Command::new("systemctl")
+        .args(["--user", "show", "--property=MainPID", "--value", &unit])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pid = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_ne!(pid, 0, "supervisor unit has no running native owner");
+    pid
+}
 fn ready(mut operation: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !operation() {
@@ -66,6 +94,9 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
         )
         .is_ok()
     });
+    #[cfg(target_os = "linux")]
+    let owner = supervisor_owner(&root);
+    #[cfg(not(target_os = "linux"))]
     let owner = supervisor.0.id();
     assert!(
         call(
@@ -88,7 +119,10 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
         HostResponse::Complete
     ));
     assert!(host.0.wait().unwrap().success());
+    #[cfg(target_os = "linux")]
+    ready(|| pool_stopped(&root, sandsurf_native::service_pool::ServicePool::Api));
     call(&root, Request::Inspect).unwrap();
+    #[cfg(not(target_os = "linux"))]
     assert!(supervisor.0.try_wait().unwrap().is_none());
     let mut replacement = process("serve", &root);
     ready(|| {
@@ -101,12 +135,24 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
         )
         .is_ok()
     });
+    #[cfg(target_os = "linux")]
+    assert_eq!(supervisor_owner(&root), owner);
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(supervisor.0.id(), owner);
     call(&root, Request::Inspect).unwrap();
     host_call(&root, HostRequest::StopService).unwrap();
     assert!(replacement.0.wait().unwrap().success());
+    #[cfg(target_os = "linux")]
+    ready(|| pool_stopped(&root, sandsurf_native::service_pool::ServicePool::Api));
     call(&root, Request::Shutdown).unwrap();
     assert!(supervisor.0.wait().unwrap().success());
+    #[cfg(target_os = "linux")]
+    ready(|| {
+        pool_stopped(
+            &root,
+            sandsurf_native::service_pool::ServicePool::Supervisor,
+        )
+    });
     drop((supervisor, host, replacement, duplicate));
     // Exact fixture directory only, after every process released its handles.
     fs::remove_dir_all(root).unwrap();

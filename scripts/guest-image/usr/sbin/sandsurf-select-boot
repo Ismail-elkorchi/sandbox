@@ -1,0 +1,35 @@
+#!/bin/sh
+# The Alpine profile selects the linux-virt kernel and its matching mkinitfs
+# result. Guest root owns this file and the selection; host verification is
+# bounded offline extraction, not attestation of this script.
+set -eu
+test -s /boot/vmlinuz-virt
+test -s /boot/initramfs-virt
+case "$(uname -m)" in
+    x86_64) architecture=x64 ;;
+    aarch64) architecture=arm64 ;;
+    *) echo "unsupported direct-boot architecture" >&2; exit 1 ;;
+esac
+mkdir -p /boot/sandsurf
+kernel=$(mktemp /boot/sandsurf/.kernel.XXXXXX)
+initramfs=$(mktemp /boot/sandsurf/.initramfs.XXXXXX)
+trap 'rm -f "$kernel" "$initramfs"' EXIT HUP INT TERM
+# ARM64 direct boot needs an uncompressed Image. Decompression stays in Linux.
+if [ "$architecture" = arm64 ] && [ "$(od -An -tx1 -N2 /boot/vmlinuz-virt | tr -d ' \n')" = 1f8b ]; then
+    gzip -dc /boot/vmlinuz-virt > "$kernel"
+else
+    cp /boot/vmlinuz-virt "$kernel"
+fi
+cp /boot/initramfs-virt "$initramfs"
+kernel_digest=$(sha256sum "$kernel"); kernel_digest=${kernel_digest%% *}
+initramfs_digest=$(sha256sum "$initramfs"); initramfs_digest=${initramfs_digest%% *}
+chmod 0644 "$kernel" "$initramfs"
+mv -f "$kernel" "/boot/sandsurf/kernel-$kernel_digest"
+mv -f "$initramfs" "/boot/sandsurf/initramfs-$initramfs_digest"
+temporary=$(mktemp /boot/.sandsurf-selection.XXXXXX)
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+printf '{"architecture":"%s","kernel":"/boot/sandsurf/kernel-%s","initramfs":"/boot/sandsurf/initramfs-%s"}\n' "$architecture" "$kernel_digest" "$initramfs_digest" > "$temporary"
+chmod 0644 "$temporary"
+sync
+mv -f "$temporary" /boot/sandsurf.json
+sync

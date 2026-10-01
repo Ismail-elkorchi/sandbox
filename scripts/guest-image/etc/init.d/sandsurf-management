@@ -7,5 +7,5 @@ error_log="/var/log/sandsurf-management.log"
 respawn_delay=1
 
 depend() {
-    need localmount
+    need localmount sandsurf-clone-identity
 }

@@ -297,6 +297,9 @@ pub enum ObservationCause {
     },
     /// An independently measured native fact. It cannot complete host intent.
     Native {},
+    /// Native reset recovery, authorized by the already applied machine
+    /// envelope. The guardian advances the fence before attaching a new VM.
+    GuestReset {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +436,7 @@ fn command_metadata_digest(
     crate::digest(
         crate::Domain::Operation,
         &(
-            "sandsurf-guest-command-v2",
+            "sandsurf-guest-command-v1",
             machine_id,
             generation,
             operation_id,
@@ -569,9 +572,21 @@ pub enum GuardianRequest {
     deny_unknown_fields
 )]
 pub enum RuntimeRequest {
+    ReadConsole {
+        generation: Counter,
+        after: Counter,
+        maximum: u32,
+    },
+    WriteConsole {
+        generation: Counter,
+        bytes: Vec<u8>,
+    },
     /// Private endpoint identity only; says nothing about native VM power.
     OwnerIdentity {},
     ValidateResources {
+        resources: Resources,
+    },
+    AssessResources {
         resources: Resources,
     },
     Usage,
@@ -778,7 +793,7 @@ pub enum RuntimeEventValue {
         operation: ConfigurationOperation,
     },
     Process {
-        process: crate::ExecutionSnapshot,
+        process: Box<crate::ExecutionSnapshot>,
     },
     Output {
         execution_id: ExecutionId,
@@ -822,6 +837,8 @@ pub const MAX_EVENT_PAGE_BYTES: usize = crate::MAX_CONTROL_BYTES - 1024;
 pub struct ExecutionStatus {
     pub execution_id: ExecutionId,
     pub generation: Counter,
+    /// Host-owned admission lineage is readable without guest management.
+    pub lineage: Option<crate::ExecutionLineage>,
     pub report: Observation<crate::ExecutionSnapshot>,
     pub interruption: Option<MachineObservation>,
 }
@@ -834,6 +851,18 @@ pub struct ExecutionStatus {
     deny_unknown_fields
 )]
 pub enum RuntimeResponse {
+    ResourceAssessment {
+        assessment: crate::ResourceChangeAssessment,
+    },
+    Console {
+        page: crate::ConsolePage,
+    },
+    ConsoleMetadata {
+        page: crate::ConsolePageMetadata,
+    },
+    ConsoleInput {
+        accepted: u32,
+    },
     OutputSegment {
         segment: OutputSegment,
     },
@@ -878,6 +907,33 @@ pub enum RuntimeResponse {
 impl RuntimeResponse {
     pub fn into_wire_parts(self) -> Result<crate::WireParts<Self>, crate::Invalid> {
         match self {
+            Self::Console { page } => {
+                let metadata = crate::ConsolePageMetadata {
+                    generation: page.generation,
+                    after: page.after,
+                    cursor: page.cursor,
+                    available: page.available,
+                    length: page
+                        .bytes
+                        .len()
+                        .try_into()
+                        .map_err(|_| crate::Invalid("console page length overflow"))?,
+                    digest: crate::bytes_digest(&page.bytes),
+                    loss: page.loss,
+                    open: page.open,
+                    capture_failed: page.capture_failed,
+                };
+                metadata.validate()?;
+                let bytes = if page.bytes.is_empty() {
+                    vec![]
+                } else {
+                    vec![page.bytes]
+                };
+                Ok((Self::ConsoleMetadata { page: metadata }, Some(bytes)))
+            }
+            Self::ConsoleMetadata { .. } => {
+                Err(crate::Invalid("cannot originate console metadata"))
+            }
             Self::Output { page } => {
                 let (page, bytes) = page.into_binary_parts()?;
                 Ok((Self::OutputMetadata { page }, Some(bytes)))
@@ -889,6 +945,18 @@ impl RuntimeResponse {
 
     pub fn binary_descriptor(&self) -> Result<Option<Vec<crate::BinaryChunk>>, crate::Invalid> {
         match self {
+            Self::ConsoleMetadata { page } => {
+                page.validate()?;
+                Ok(Some(if page.length == 0 {
+                    vec![]
+                } else {
+                    vec![crate::BinaryChunk {
+                        length: page.length,
+                        digest: page.digest.clone(),
+                    }]
+                }))
+            }
+            Self::Console { .. } => Err(crate::Invalid("console bytes must use data frames")),
             Self::OutputMetadata { page } => {
                 page.validate_lengths()?;
                 let chunks = page
@@ -909,6 +977,31 @@ impl RuntimeResponse {
 
     pub fn with_wire_bytes(self, bytes: Vec<Vec<u8>>) -> Result<Self, crate::Invalid> {
         match self {
+            Self::ConsoleMetadata { page } => {
+                page.validate()?;
+                if bytes.len() != usize::from(page.length != 0) {
+                    return Err(crate::Invalid(
+                        "console data frame count differs from metadata",
+                    ));
+                }
+                let bytes: Vec<u8> = bytes.into_iter().flatten().collect();
+                if bytes.len() != page.length as usize || crate::bytes_digest(&bytes) != page.digest
+                {
+                    return Err(crate::Invalid("console bytes differ from metadata"));
+                }
+                Ok(Self::Console {
+                    page: crate::ConsolePage {
+                        generation: page.generation,
+                        after: page.after,
+                        cursor: page.cursor,
+                        available: page.available,
+                        bytes,
+                        loss: page.loss,
+                        open: page.open,
+                        capture_failed: page.capture_failed,
+                    },
+                })
+            }
             Self::OutputMetadata { page } => Ok(Self::Output {
                 page: page.with_binary_parts(bytes)?,
             }),
@@ -1058,12 +1151,30 @@ pub struct LifecycleOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Resources {
+    /// Hardware topology; this does not reserve CPU time.
     pub vcpus: Counter,
     #[serde(rename = "memoryMiB")]
     pub memory_mib: Counter,
     pub disk_bytes: Counter,
     pub output_bytes: Counter,
     pub managed_executions: Counter,
+    /// Aggregate host CPU time per fixed 100,000 microsecond period, including
+    /// the guardian, VMM, and machine-owned workers.
+    pub cpu_quota_micros: Counter,
+    /// Additional host memory above guest RAM, inside the aggregate hard cap.
+    pub host_overhead_bytes: Counter,
+    /// Maximum block-device capacity of the operator-provisioned machine volume,
+    /// including filesystem metadata, journals, disks, snapshots and output.
+    pub physical_storage_bytes: Counter,
+    pub snapshot_bytes: Counter,
+    pub channels: Counter,
+    pub inflight_requests: Counter,
+    pub network_connections: Counter,
+    /// Aggregate admitted Ethernet bytes per fixed one-second gateway window.
+    pub network_bytes_per_second: Counter,
+    /// Userspace gateway packet/TCP windows. Kernel socket memory remains
+    /// inside the aggregate external host memory cap.
+    pub network_queue_bytes: Counter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1282,6 +1393,61 @@ fn validate_guest_path_bytes(value: &[u8]) -> Result<(), Invalid> {
     Ok(())
 }
 impl Resources {
+    /// Creation defaults expand into the complete wire envelope before admission.
+    /// These are actual reservations, never absent/optional enforcement promises.
+    pub fn from_geometry(
+        vcpus: Counter,
+        memory_mib: Counter,
+        disk_bytes: Counter,
+        output_bytes: Counter,
+        managed_executions: Counter,
+    ) -> Result<Self, Invalid> {
+        let cpu_quota_micros = Counter::try_from(
+            vcpus
+                .get()
+                .checked_mul(100_000)
+                .ok_or(Invalid("CPU quota overflow"))?,
+        )?;
+        let memory = memory_mib
+            .get()
+            .checked_mul(1024 * 1024)
+            .ok_or(Invalid("memory overflow"))?;
+        let scaled = |per_cpu: u64| {
+            Counter::try_from(
+                vcpus
+                    .get()
+                    .checked_mul(per_cpu)
+                    .ok_or(Invalid("resource defaults overflow"))?,
+            )
+        };
+        let capture = disk_bytes
+            .checked_add(memory)?
+            .checked_add(scaled(64 * 1024 * 1024)?.get())?;
+        // Native staging and durable publication may coexist. Keep both charged
+        // until the storage owner confirms cleanup, including interruption.
+        let snapshot_bytes = capture.checked_add(capture.get())?;
+        let physical_storage_bytes = disk_bytes
+            .checked_add(disk_bytes.get())?
+            .checked_add(output_bytes.get())?
+            .checked_add(snapshot_bytes.get())?
+            .checked_add(scaled(64 * 1024 * 1024)?.get())?;
+        Ok(Self {
+            vcpus,
+            memory_mib,
+            disk_bytes,
+            output_bytes,
+            managed_executions,
+            cpu_quota_micros,
+            host_overhead_bytes: scaled(512 * 1024 * 1024)?,
+            snapshot_bytes,
+            physical_storage_bytes,
+            channels: scaled(32)?,
+            inflight_requests: scaled(16)?,
+            network_connections: scaled(256)?,
+            network_bytes_per_second: scaled(64 * 1024 * 1024)?,
+            network_queue_bytes: scaled(16 * 1024 * 1024)?,
+        })
+    }
     pub fn validate(&self) -> Result<(), Invalid> {
         if [
             self.vcpus,
@@ -1289,12 +1455,53 @@ impl Resources {
             self.disk_bytes,
             self.output_bytes,
             self.managed_executions,
+            self.cpu_quota_micros,
+            self.host_overhead_bytes,
+            self.physical_storage_bytes,
+            self.snapshot_bytes,
+            self.channels,
+            self.inflight_requests,
+            self.network_connections,
+            self.network_bytes_per_second,
+            self.network_queue_bytes,
         ]
         .contains(&Counter::ZERO)
         {
             return Err(Invalid("resource reservations must be positive"));
         }
+        let storage = self
+            .disk_bytes
+            .checked_add(self.disk_bytes.get())?
+            .checked_add(self.output_bytes.get())?
+            .checked_add(self.snapshot_bytes.get())?;
+        if storage > self.physical_storage_bytes {
+            return Err(Invalid(
+                "physical storage budget excludes disk, output or snapshot reservations",
+            ));
+        }
+        if self.cpu_quota_micros.get() < 1000
+            || self.cpu_quota_micros.get()
+                > self
+                    .vcpus
+                    .get()
+                    .checked_mul(100_000)
+                    .ok_or(Invalid("CPU topology overflow"))?
+        {
+            return Err(Invalid("CPU quota exceeds topology scheduling capacity"));
+        }
+        if !self.host_memory_bytes()?.get().is_multiple_of(4096) {
+            return Err(Invalid("host memory envelope must be page aligned"));
+        }
         Ok(())
+    }
+    pub fn host_memory_bytes(&self) -> Result<Counter, Invalid> {
+        Counter::try_from(
+            self.memory_mib
+                .get()
+                .checked_mul(1024 * 1024)
+                .and_then(|value| value.checked_add(self.host_overhead_bytes.get()))
+                .ok_or(Invalid("host memory envelope overflow"))?,
+        )
     }
     pub fn checked_add(&self, other: &Self) -> Result<Self, Invalid> {
         Ok(Self {
@@ -1305,6 +1512,31 @@ impl Resources {
             managed_executions: self
                 .managed_executions
                 .checked_add(other.managed_executions.get())?,
+            cpu_quota_micros: self
+                .cpu_quota_micros
+                .checked_add(other.cpu_quota_micros.get())?,
+            host_overhead_bytes: self
+                .host_overhead_bytes
+                .checked_add(other.host_overhead_bytes.get())?,
+            physical_storage_bytes: self
+                .physical_storage_bytes
+                .checked_add(other.physical_storage_bytes.get())?,
+            snapshot_bytes: self
+                .snapshot_bytes
+                .checked_add(other.snapshot_bytes.get())?,
+            channels: self.channels.checked_add(other.channels.get())?,
+            inflight_requests: self
+                .inflight_requests
+                .checked_add(other.inflight_requests.get())?,
+            network_connections: self
+                .network_connections
+                .checked_add(other.network_connections.get())?,
+            network_bytes_per_second: self
+                .network_bytes_per_second
+                .checked_add(other.network_bytes_per_second.get())?,
+            network_queue_bytes: self
+                .network_queue_bytes
+                .checked_add(other.network_queue_bytes.get())?,
         })
     }
     pub fn within(&self, limit: &Self) -> bool {
@@ -1313,6 +1545,15 @@ impl Resources {
             && self.disk_bytes <= limit.disk_bytes
             && self.output_bytes <= limit.output_bytes
             && self.managed_executions <= limit.managed_executions
+            && self.cpu_quota_micros <= limit.cpu_quota_micros
+            && self.host_overhead_bytes <= limit.host_overhead_bytes
+            && self.physical_storage_bytes <= limit.physical_storage_bytes
+            && self.snapshot_bytes <= limit.snapshot_bytes
+            && self.channels <= limit.channels
+            && self.inflight_requests <= limit.inflight_requests
+            && self.network_connections <= limit.network_connections
+            && self.network_bytes_per_second <= limit.network_bytes_per_second
+            && self.network_queue_bytes <= limit.network_queue_bytes
     }
     pub fn zero() -> Self {
         Self {
@@ -1321,6 +1562,15 @@ impl Resources {
             disk_bytes: Counter::ZERO,
             output_bytes: Counter::ZERO,
             managed_executions: Counter::ZERO,
+            cpu_quota_micros: Counter::ZERO,
+            host_overhead_bytes: Counter::ZERO,
+            physical_storage_bytes: Counter::ZERO,
+            snapshot_bytes: Counter::ZERO,
+            channels: Counter::ZERO,
+            inflight_requests: Counter::ZERO,
+            network_connections: Counter::ZERO,
+            network_bytes_per_second: Counter::ZERO,
+            network_queue_bytes: Counter::ZERO,
         }
     }
 }
@@ -1343,6 +1593,24 @@ pub struct OutputBoundary {
     pub terminal_bytes: Counter,
     pub omitted_bytes: Counter,
     pub final_hash: Digest,
+}
+
+impl OutputBoundary {
+    pub fn validate(&self) -> Result<(), Invalid> {
+        if self
+            .stdout_bytes
+            .get()
+            .checked_add(self.stderr_bytes.get())
+            .and_then(|value| value.checked_add(self.terminal_bytes.get()))
+            != Some(self.final_cursor.get())
+            || self.omitted_bytes != Counter::ZERO
+            || (self.chunks == Counter::ZERO) != (self.final_cursor == Counter::ZERO)
+            || self.chunks > self.final_cursor
+        {
+            return Err(Invalid("output boundary is incomplete or inconsistent"));
+        }
+        Ok(())
+    }
 }
 
 /// An immutable host capture. It makes no claim that the guest stream has ended.

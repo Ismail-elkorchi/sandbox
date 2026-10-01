@@ -1,8 +1,7 @@
 {
   "formatVersion": 1,
-  "buildId": "sandsurf-images-0.1.0",
+  "buildId": "sandsurf-images-1.0.0",
   "files": {
-    "development-arm64/manifest.json": "cff19e7fef70d440d5d69f7697245e6c6e6049a8720596a6740c80de101bd01f",
-    "development-x64/manifest.json": "23f25f720cf44296de3314f4942e0730ac61047ba339ef5f6ff742f4e8ef8a94"
+    "development-x64/manifest.json": "f69fc7c4a3233d1f5828caa0f003b6284b24b572c7c68567b7347eaedf1ba364"
   }
 }

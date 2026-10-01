@@ -1,10 +1,13 @@
 //! Linux guardian integration for one retained Firecracker machine.
 
+use crate::capture::{
+    full_directory as full_capture_directory, remove_full as remove_full_capture,
+};
 use crate::guardian::{
     EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
-use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
+use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::firecracker::{FirecrackerConfig, FirecrackerProcess, FirecrackerRestore};
 use sandsurf_machine::linux::{
     FirecrackerDriver, FirecrackerGenerationFactory, FirecrackerQualification,
@@ -13,14 +16,13 @@ use sandsurf_machine::linux::{
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::UnixVsockChannel;
 use sandsurf_native::storage::object_name;
-use sandsurf_network::{VmNetworkBridge, VmPortGateway};
+use sandsurf_network::NativeNetworkGateway;
 use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
-    NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination,
-    NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest,
-    digest,
+    NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources,
+    RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -35,8 +37,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const CONFIG_VERSION: u16 = 1;
-const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
-    option_env!("SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST");
 
 #[derive(Debug)]
 pub enum LinuxError {
@@ -89,6 +89,93 @@ pub struct LinuxGuardianConfig {
     guest_cid: u32,
 }
 
+impl LinuxGuardianConfig {
+    pub(crate) fn resources(&self) -> &Resources {
+        &self.resources
+    }
+}
+
+/// Exact native mechanism under qualification. Network owners must bind their
+/// actual attachment/device configuration here when changing the NIC model.
+pub fn qualification_configuration(
+    config: &LinuxGuardianConfig,
+    machine_root: &Path,
+) -> Result<crate::qualification::NativeConfiguration, LinuxError> {
+    let observation: NativeBootObservation =
+        read_json(&machine_root.join("guardian/current-boot.json"), 8192)?;
+    if observation.machine_id != config.machine_id {
+        return Err(LinuxError::Invalid(
+            "native boot observation belongs to another machine".into(),
+        ));
+    }
+    qualification_for_boot(config, &observation.boot, machine_root)
+}
+
+fn qualification_for_boot(
+    config: &LinuxGuardianConfig,
+    boot: &sandsurf_image::boot::FrozenBoot,
+    machine_root: &Path,
+) -> Result<crate::qualification::NativeConfiguration, LinuxError> {
+    let machine_volume = sandsurf_native::volume::require(
+        machine_root,
+        config.resources.physical_storage_bytes.get(),
+    )?;
+    let host_root = machine_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| LinuxError::Invalid("machine root has no host volume".into()))?;
+    let shared_volume = sandsurf_native::volume::inspect(host_root)?;
+    Ok(crate::qualification::NativeConfiguration {
+        build_digest: crate::qualification::build_digest()?,
+        platform: "linux".into(),
+        architecture: std::env::consts::ARCH.into(),
+        hardware_digest: crate::qualification::hardware_digest()?,
+        engine: VmEngine::Firecracker,
+        engine_digest: config
+            .firecracker_sha256
+            .clone()
+            .try_into()
+            .map_err(|_| LinuxError::Invalid("invalid engine identity".into()))?,
+        image_digest: config.image_digest.clone(),
+        kernel_digest: boot
+            .kernel
+            .sha256
+            .clone()
+            .try_into()
+            .map_err(|_| LinuxError::Invalid("invalid verified kernel identity".into()))?,
+        initramfs_digest: boot
+            .initramfs
+            .as_ref()
+            .map(|v| v.sha256.clone().try_into())
+            .transpose()
+            .map_err(|_| LinuxError::Invalid("invalid verified initramfs identity".into()))?,
+        nic_configuration_digest: digest(
+            Domain::Resource,
+            &(
+                "firecracker-isolated-tap-af-packet-vnet-hdr-ingress-drop-auxdata-vlan-deny",
+                "machine-derived-locally-administered-mac",
+                sandsurf_network::MTU,
+                sandsurf_network::GUEST_IPV4.to_string(),
+                sandsurf_network::GUEST_IPV6.to_string(),
+            ),
+        )
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        storage_configuration_digest: digest(
+            Domain::Resource,
+            &(
+                "raw-ext4-complete-system-disk",
+                config.resources.disk_bytes,
+                &config.system_seed_sha256,
+                "operator-bounded-ext4-volumes",
+                (machine_volume.device, machine_volume.bytes),
+                (shared_volume.device, shared_volume.bytes),
+            ),
+        )
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?,
+        resources: config.resources.clone(),
+    })
+}
+
 /// Resolve and copy an exact source-built boot/defaults bundle into the host's
 /// immutable image store before catalog admission. Local unsigned images are
 /// accepted only through the explicit qualification environment variable;
@@ -100,6 +187,12 @@ pub fn prepare_config(
     image_digest: &Digest,
     resources: &Resources,
 ) -> Result<LinuxGuardianConfig, LinuxError> {
+    sandsurf_native::capacity::require_persistent_storage(host_root)?;
+    resources
+        .validate()
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    crate::resources::require_network_capacity(resources)?;
+    crate::resources::require_machine_storage(host_root, machine_id, resources)?;
     let existing_path = host_root
         .join("machines")
         .join(object_name(machine_id.as_str()))
@@ -122,7 +215,10 @@ pub fn prepare_config(
         let template = verified.system_path.clone();
         (verified, template)
     } else {
-        resolve_source_bundle(executable)?
+        let image = crate::images::resolve_native_image(host_root, executable, image_digest)
+            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+        let template = image.system_path.clone();
+        (image, template)
     };
     if verified.manifest_digest != image_digest.as_str()
         || verified.manifest.architecture
@@ -179,59 +275,6 @@ pub fn prepare_config(
     })
 }
 
-pub(crate) fn resolve_source_bundle(
-    executable: &Path,
-) -> Result<(VerifiedImage, PathBuf), LinuxError> {
-    let local_manifest = std::env::var_os("SANDSURF_LOCAL_IMAGE_MANIFEST").map(PathBuf::from);
-    if let Some(path) = local_manifest {
-        if !path.is_absolute() {
-            return Err(LinuxError::Invalid(
-                "SANDSURF_LOCAL_IMAGE_MANIFEST must be absolute".into(),
-            ));
-        }
-        let verified = verify_image(&path, ImageTrust::ExplicitLocal)?;
-        let template = verified.system_path.clone();
-        Ok((verified, template))
-    } else {
-        let package = executable
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .ok_or_else(|| LinuxError::Invalid("native package layout is invalid".into()))?;
-        let architecture = if cfg!(target_arch = "aarch64") {
-            "arm64"
-        } else {
-            "x64"
-        };
-        let relative_manifest = format!("development-{architecture}/manifest.json");
-        let manifest = package.join("images").join(&relative_manifest);
-        let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
-        let expected = index
-            .files
-            .get(&relative_manifest)
-            .ok_or_else(|| LinuxError::Invalid("packaged boot manifest is absent".into()))?
-            .clone();
-        let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
-            LinuxError::Invalid(
-                "native host was built without a bundled image trust identity".into(),
-            )
-        })?;
-        if expected != pinned {
-            return Err(LinuxError::Invalid(
-                "packaged image index differs from the native trust identity".into(),
-            ));
-        }
-        let verified = verify_image(
-            &manifest,
-            ImageTrust::Pinned {
-                manifest_digest: pinned,
-            },
-        )?;
-        let template = verified.system_path.clone();
-        Ok((verified, template))
-    }
-}
-
 pub fn write_config(path: &Path, config: &LinuxGuardianConfig) -> Result<(), LinuxError> {
     if path.exists() {
         let existing = read_json::<LinuxGuardianConfig>(path, 1024 * 1024)?;
@@ -259,6 +302,11 @@ pub fn write_config(path: &Path, config: &LinuxGuardianConfig) -> Result<(), Lin
 
 pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<LinuxGuardianConfig, LinuxError> {
     let value: LinuxGuardianConfig = read_json(path, 1024 * 1024)?;
+    value
+        .resources
+        .validate()
+        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    crate::resources::require_network_capacity(&value.resources)?;
     if value.format_version != CONFIG_VERSION || value.machine_id != *machine_id {
         return Err(LinuxError::Invalid(
             "guardian configuration identity is invalid".into(),
@@ -301,14 +349,14 @@ pub fn execution_defaults(
 }
 
 pub struct LinuxGuardianEffect {
+    process_envelope: sandsurf_native::resources::ProcessEnvelope,
     machine_root: PathBuf,
     config: LinuxGuardianConfig,
     machine: FirecrackerDriver<LinuxGenerationFactory>,
     guest_binding: Arc<Mutex<Option<ActiveGuest>>>,
     guest_transport: Arc<LinuxGuestTransport>,
-    network: Arc<Mutex<Option<VmNetworkBridge>>>,
+    network: Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
     network_usage: NetworkUsage,
-    exposures: Arc<Mutex<Option<VmPortGateway>>>,
     installed_runtime: Option<InstalledRuntime>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
 }
@@ -319,6 +367,7 @@ struct RestoreLineage {
     snapshot_id: sandsurf_protocol::SnapshotId,
     source_machine_id: MachineId,
     source_generation: Counter,
+    executions: Vec<sandsurf_protocol::CapturedExecution>,
 }
 
 /// Evidence that a specific host-owned configuration is live in one guest
@@ -339,7 +388,7 @@ struct NetworkUsageValue {
 
 type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
 
-fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::BrokerReport) {
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::NetworkReport) {
     if let Ok(mut usage) = usage.lock() {
         usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
         usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
@@ -348,12 +397,45 @@ fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::Bro
 }
 
 impl LinuxGuardianEffect {
+    fn refresh_qualification(&mut self, resources: &Resources) -> Result<(), LinuxError> {
+        let mut configuration = self.config.clone();
+        configuration.resources = resources.clone();
+        let Some(active) = self.management_binding() else {
+            self.machine.set_qualification(FirecrackerQualification {
+                lifecycle: None,
+                full_state: None,
+            });
+            return Ok(());
+        };
+        let boot = crate::storage::read_boot(&active.boot_directory)?;
+        let exact = qualification_for_boot(&configuration, &boot, &self.machine_root)?;
+        let root = self
+            .machine_root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| LinuxError::Invalid("machine root has no host root".into()))?;
+        let evidence = |scope| match crate::qualification::lookup(root, &exact, scope) {
+            sandsurf_protocol::Qualification::Qualified { evidence } => Some(evidence),
+            _ => None,
+        };
+        self.machine.set_qualification(FirecrackerQualification {
+            lifecycle: evidence(crate::qualification::QualificationScope::Lifecycle),
+            full_state: evidence(crate::qualification::QualificationScope::FullState),
+        });
+        Ok(())
+    }
     fn management_binding(&self) -> Option<ActiveGuest> {
         self.guest_binding.lock().ok()?.clone()
     }
     pub fn open(machine_root: &Path, config: LinuxGuardianConfig) -> Result<Self, LinuxError> {
+        sandsurf_native::volume::require(
+            machine_root,
+            config.resources.physical_storage_bytes.get(),
+        )?;
+        let process_envelope =
+            sandsurf_native::resources::ProcessEnvelope::current(machine_root, &config.resources)?;
         fs::metadata("/dev/kvm").map_err(|_| LinuxError::Invalid("KVM is unavailable".into()))?;
-        let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
+        verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
         let disks = machine_root.join("disks");
         sandsurf_native::local::ensure_private_directory(&disks)?;
         sandsurf_native::storage::sync_directory(machine_root)?;
@@ -362,11 +444,11 @@ impl LinuxGuardianEffect {
         let active = Arc::new(Mutex::new(None));
         let network = Arc::new(Mutex::new(None));
         let network_usage = Arc::new(Mutex::new(NetworkUsageValue::default()));
-        let exposures = Arc::new(Mutex::new(None));
         let factory = LinuxGenerationFactory {
+            network: Arc::clone(&network),
+            network_usage: Arc::clone(&network_usage),
             config: config.clone(),
             machine_root: machine_root.to_path_buf(),
-            kernel: image.kernel_path,
             system_disk,
             active: Arc::clone(&active),
             pending: None,
@@ -382,6 +464,7 @@ impl LinuxGuardianEffect {
             factory,
         );
         Ok(Self {
+            process_envelope,
             machine_root: machine_root.to_path_buf(),
             config,
             machine,
@@ -393,7 +476,6 @@ impl LinuxGuardianEffect {
             )),
             network,
             network_usage,
-            exposures,
             installed_runtime: None,
             suspend_capture_operation: None,
         })
@@ -409,61 +491,27 @@ impl LinuxGuardianEffect {
         if let Some(installed) = self.installed_runtime.as_ref()
             && installed.generation == active.generation
             && installed.configuration == *configuration
+            && self
+                .network
+                .lock()
+                .is_ok_and(|owner| owner.as_ref().is_some_and(|gateway| gateway.is_alive()))
         {
             return RuntimeInstallation::Applied(installed.evidence.clone());
         }
         self.installed_runtime = None;
-        let rules = match network_rules(&configuration.network) {
-            Ok(value) => value,
-            Err(_) => {
-                return RuntimeInstallation::NotApplied(bytes_digest(
-                    b"network-policy-normalization-failed",
-                ));
-            }
-        };
-        let Ok(mut network) = self.network.lock() else {
+        let Ok(network) = self.network.lock() else {
             return RuntimeInstallation::Unknown;
         };
-        if let Some(old) = network.take() {
-            let report = old.stop();
-            accumulate_network_usage(&self.network_usage, &report);
-            if !report.cleanup_failures.is_empty() {
-                return RuntimeInstallation::Unknown;
-            }
-        }
-        let bridge = match VmNetworkBridge::start_partitioned(
-            &active.socket,
-            active.network_capability,
-            rules,
-        ) {
-            Ok(value) => value,
-            Err(_) => return RuntimeInstallation::Unknown,
-        };
-        *network = Some(bridge);
-        drop(network);
-
-        let Ok(mut exposures) = self.exposures.lock() else {
+        let Some(gateway) = network.as_ref() else {
             return RuntimeInstallation::Unknown;
         };
-        if let Some(old) = exposures.take()
-            && old.stop().is_err()
+        if gateway
+            .configure(&configuration.network, &configuration.exposures)
+            .is_err()
         {
             return RuntimeInstallation::Unknown;
         }
-        let gateway = match VmPortGateway::start(
-            &active.socket,
-            active.network_capability,
-            &configuration.exposures,
-        ) {
-            Ok(value) => value,
-            Err(_) => {
-                drop(exposures);
-                self.stop_runtime_data_planes();
-                return RuntimeInstallation::Unknown;
-            }
-        };
-        *exposures = Some(gateway);
-        drop(exposures);
+        drop(network);
 
         let resource_evidence = digest(
             Domain::Operation,
@@ -473,7 +521,7 @@ impl LinuxGuardianEffect {
         match digest(
             Domain::Authority,
             &(
-                "sandsurf-linux-runtime-configuration-v2",
+                "sandsurf-linux-runtime-configuration-v1",
                 resource_evidence,
                 configuration,
             ),
@@ -495,13 +543,16 @@ impl LinuxGuardianEffect {
         if let Ok(mut network) = self.network.lock()
             && let Some(bridge) = network.take()
         {
-            let report = bridge.stop();
+            let _ = bridge.configure(&NetworkPolicy::default(), &[]);
+            let snapshot = bridge.snapshot();
+            let report = sandsurf_network::NetworkReport {
+                connections: snapshot.connections,
+                violations: snapshot.violations,
+                rx_bytes: snapshot.rx_bytes,
+                tx_bytes: snapshot.tx_bytes,
+                cleanup_failures: Vec::new(),
+            };
             accumulate_network_usage(&self.network_usage, &report);
-        }
-        if let Ok(mut exposures) = self.exposures.lock()
-            && let Some(gateway) = exposures.take()
-        {
-            let _ = gateway.stop();
         }
     }
 
@@ -516,11 +567,28 @@ impl LinuxGuardianEffect {
 
 enum RuntimeInstallation {
     Applied(Digest),
-    NotApplied(Digest),
     Unknown,
 }
 
 impl GuardianEffect for LinuxGuardianEffect {
+    fn resource_envelope(&self) -> Option<Resources> {
+        Some(self.config.resources.clone())
+    }
+    fn assess_resources(
+        &self,
+        resources: &Resources,
+        current: &MachineObservation,
+    ) -> sandsurf_protocol::ResourceChangeAssessment {
+        let mut assessment = crate::resources::assess(resources, &self.config.resources, current);
+        if let Err(error) = sandsurf_native::volume::require(
+            &self.machine_root,
+            resources.physical_storage_bytes.get(),
+        ) {
+            assessment.mode = sandsurf_protocol::ResourceChangeMode::Unsupported;
+            assessment.reasons.push(error.to_string());
+        }
+        assessment
+    }
     fn guest_io_admissible(&self) -> bool {
         !self.guest_transport.capture_blocked.load(Ordering::Acquire)
     }
@@ -540,6 +608,24 @@ impl GuardianEffect for LinuxGuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> MachineOutcome {
+        // Current signed authority is installed outside the guest before any
+        // start/resume transition can execute guest code.
+        if (command.desired == sandsurf_protocol::DesiredState::Running
+            && self
+                .process_envelope
+                .apply(&command.configuration.resources)
+                .is_err())
+            || (matches!(
+                command.desired,
+                sandsurf_protocol::DesiredState::Running
+                    | sandsurf_protocol::DesiredState::Suspended
+            ) && self
+                .refresh_qualification(&command.configuration.resources)
+                .is_err())
+        {
+            self.contain_unpublished_machine();
+            return MachineOutcome::Unknown;
+        }
         let cold_boot = command.desired == sandsurf_protocol::DesiredState::Running
             && current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Failed)
@@ -554,13 +640,16 @@ impl GuardianEffect for LinuxGuardianEffect {
             if cold_boot {
                 self.config.resources = command.configuration.resources.clone();
             }
+            if self
+                .refresh_qualification(&command.configuration.resources)
+                .is_err()
+            {
+                self.contain_unpublished_machine();
+                return MachineOutcome::Unknown;
+            }
             let runtime_evidence = match self.install_runtime_configuration(&command.configuration)
             {
                 RuntimeInstallation::Applied(evidence) => evidence,
-                RuntimeInstallation::NotApplied(evidence) => {
-                    self.contain_unpublished_machine();
-                    return MachineOutcome::NotApplied(evidence);
-                }
                 RuntimeInstallation::Unknown => {
                     self.contain_unpublished_machine();
                     return MachineOutcome::Unknown;
@@ -636,6 +725,13 @@ impl GuardianEffect for LinuxGuardianEffect {
         resources
             .validate()
             .map_err(|_| ControlError::Protocol("invalid native resource envelope"))?;
+        if self.assess_resources(resources, current).mode
+            == sandsurf_protocol::ResourceChangeMode::Unsupported
+        {
+            return Err(ControlError::Unsupported(
+                "native resource change exceeds supported envelope",
+            ));
+        }
         if resources.disk_bytes != self.config.resources.disk_bytes {
             return Err(ControlError::Unsupported(
                 "disk capacity changes require the storage replacement capability",
@@ -663,6 +759,18 @@ impl GuardianEffect for LinuxGuardianEffect {
         {
             return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
         }
+        if self
+            .process_envelope
+            .apply(&command.configuration.resources)
+            .is_err()
+            || self
+                .refresh_qualification(&command.configuration.resources)
+                .is_err()
+        {
+            self.contain_unpublished_machine();
+            return EffectOutcome::Unknown;
+        }
+        self.config.resources = command.configuration.resources.clone();
         if current.state == MachineState::Stopped {
             return match self.machine.configure(command, current) {
                 sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
@@ -680,7 +788,7 @@ impl GuardianEffect for LinuxGuardianEffect {
                     RuntimeInstallation::Applied(runtime_evidence) => match digest(
                         Domain::Authority,
                         &(
-                            "sandsurf-linux-runtime-configuration-v2",
+                            "sandsurf-linux-runtime-configuration-v1",
                             machine_evidence,
                             runtime_evidence,
                             &command.configuration,
@@ -689,9 +797,6 @@ impl GuardianEffect for LinuxGuardianEffect {
                         Ok(evidence) => EffectOutcome::Applied(evidence),
                         Err(_) => EffectOutcome::Unknown,
                     },
-                    RuntimeInstallation::NotApplied(evidence) => {
-                        EffectOutcome::NotApplied(evidence)
-                    }
                     RuntimeInstallation::Unknown => EffectOutcome::Unknown,
                 }
             }
@@ -713,6 +818,27 @@ impl GuardianEffect for LinuxGuardianEffect {
         .map_err(|_| ControlError::Protocol("host time overflow"))?;
         let mut usage =
             sandsurf_protocol::ResourceUsage::host_observation("host-native-linux", observed);
+        let native = self.process_envelope.usage()?;
+        usage.cpu_micros = Some(native.cpu_micros);
+        usage.memory_current = Some(native.memory_current);
+        usage.memory_peak = native.memory_peak;
+        usage.io_read_bytes = native.io_read_bytes;
+        usage.io_write_bytes = native.io_write_bytes;
+        usage.provenance.cpu = sandsurf_protocol::MeasurementSource::HostCgroup;
+        usage.provenance.memory = sandsurf_protocol::MeasurementSource::HostCgroup;
+        usage.provenance.io = if native.io_read_bytes.is_some() {
+            sandsurf_protocol::MeasurementSource::HostCgroup
+        } else {
+            sandsurf_protocol::MeasurementSource::Unavailable
+        };
+        usage.host_counter_epoch = Some(bytes_digest(
+            std::env::var("INVOCATION_ID")
+                .map_err(|_| {
+                    ControlError::Protocol("host resource unit invocation identity unavailable")
+                })?
+                .as_bytes(),
+        ));
+        usage.provenance.network = sandsurf_protocol::MeasurementSource::HostNetwork;
         let accumulated = self
             .network_usage
             .lock()
@@ -722,7 +848,7 @@ impl GuardianEffect for LinuxGuardianEffect {
             .lock()
             .map_err(|_| crate::guardian::Error::Protocol("network bridge lock poisoned"))?
             .as_ref()
-            .map_or_else(Default::default, VmNetworkBridge::snapshot);
+            .map_or_else(Default::default, |gateway| gateway.snapshot());
         usage.network_rx_bytes = Counter::try_from(
             accumulated.rx_bytes.saturating_add(current.rx_bytes),
         )
@@ -821,11 +947,12 @@ impl GuardianEffect for LinuxGuardianEffect {
                 "restore integration generation mismatch",
             ));
         }
-        journal.rebind_processes(
+        journal.restore_executions(
             &lineage.snapshot_id,
             &lineage.source_machine_id,
             lineage.source_generation,
             generation,
+            &lineage.executions,
         )?;
         crate::restore::complete(&self.machine_root)
     }
@@ -839,6 +966,56 @@ impl GuardianEffect for LinuxGuardianEffect {
             .observe_power()
             .map_err(|_| ControlError::Protocol("native power observation unavailable"))
     }
+    fn take_console(&mut self) -> Option<sandsurf_machine::NativeConsole> {
+        self.machine.take_console()
+    }
+    fn take_guest_reset(&mut self) -> Option<Digest> {
+        self.machine.take_guest_reset()
+    }
+    fn recover_guest_reset(&mut self, current: &MachineObservation) -> ControlResult<Digest> {
+        let configuration = self
+            .installed_runtime
+            .as_ref()
+            .ok_or(ControlError::Protocol(
+                "guest reset has no applied native envelope",
+            ))?
+            .configuration
+            .clone();
+        self.stop_runtime_data_planes();
+        if let Ok(mut active) = self.guest_binding.lock() {
+            *active = None;
+        }
+        let command = LifecycleCommand {
+            machine_id: current.machine_id.clone(),
+            operation_id: sandsurf_protocol::OperationId::try_from(format!(
+                "native-reset-{}",
+                current.generation.get()
+            ))
+            .map_err(|_| ControlError::Protocol("reset identity overflow"))?,
+            desired: sandsurf_protocol::DesiredState::Running,
+            revision: current.applied_revision,
+            request_digest: current.evidence_digest.clone(),
+            configuration,
+        };
+        // Driver start advances from the contained prior generation. The
+        // guardian has already committed the target Starting fence.
+        let previous = MachineObservation {
+            generation: Counter::try_from(current.generation.get() - 1)
+                .map_err(|_| ControlError::Protocol("reset generation invalid"))?,
+            state: MachineState::Stopped,
+            ..current.clone()
+        };
+        match self.transition(&command, Some(&previous)) {
+            MachineOutcome::Observed(values)
+                if values.last().is_some_and(|value| {
+                    value.generation == current.generation && value.state == MachineState::Running
+                }) =>
+            {
+                Ok(values.last().unwrap().evidence_digest.clone())
+            }
+            _ => Err(ControlError::Protocol("native guest reset recovery failed")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -851,7 +1028,7 @@ struct ReconnectState {
     generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 impl LinuxGuardianEffect {
@@ -880,12 +1057,8 @@ impl LinuxGuardianEffect {
         let memory = expected.memory.as_ref().ok_or(ControlError::Unsupported(
             "Firecracker full snapshots require a separate memory artifact",
         ))?;
-        let host_root = self
+        let directory = self
             .machine_root
-            .parent()
-            .and_then(Path::parent)
-            .ok_or(ControlError::Protocol("machine root has no host root"))?;
-        let directory = host_root
             .join("snapshots")
             .join(object_name(snapshot_id.as_str()));
         let artifacts = [
@@ -921,10 +1094,16 @@ impl LinuxGuardianEffect {
                 "restore reconnect identity does not match snapshot",
             ));
         }
+        if reconnect.machine_id != self.config.machine_id {
+            return Err(ControlError::Unsupported(
+                "full memory forks are unsupported",
+            ));
+        }
         let source_machine_id = reconnect.machine_id.clone();
         let source_generation = reconnect.generation;
         crate::restore::stage(&self.machine_root, manifest_digest.clone(), || {
             Ok(RestoreLineage {
+                executions: expected.executions.clone(),
                 snapshot_id: snapshot_id.clone(),
                 source_machine_id: source_machine_id.clone(),
                 source_generation,
@@ -997,25 +1176,13 @@ impl LinuxGuardianEffect {
             .ok_or(ControlError::Unsupported(
                 "native capture owner unavailable",
             ))?;
-        let result = match power.state {
-            MachineState::Running | MachineState::Stopped | MachineState::Failed => {
-                self.machine.finish_capture_without_resume()
-            }
-            MachineState::Paused => {
-                self.machine
-                    .adopt_pause_for_capture()
-                    .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
-                if boundary.preserve_pause {
-                    self.machine.finish_capture_without_resume()
-                } else {
-                    self.machine.resume_after_capture()
-                }
-            }
-            _ => {
-                return Err(ControlError::Unsupported(
-                    "native capture power state is indeterminate",
-                ));
-            }
+        let result = if boundary.needs_resume(power.state)? {
+            self.machine
+                .adopt_pause_for_capture()
+                .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
+            self.machine.resume_after_capture()
+        } else {
+            self.machine.finish_capture_without_resume()
         };
         result.map_err(|_| ControlError::Unsupported("native capture completion failed"))?;
         crate::capture::CaptureBoundary::clear(&self.machine_root)?;
@@ -1023,6 +1190,25 @@ impl LinuxGuardianEffect {
     }
 
     fn prepare_full_capture(
+        &mut self,
+        snapshot_id: sandsurf_protocol::SnapshotId,
+        operation_id: sandsurf_protocol::OperationId,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        let result = self.prepare_full_capture_inner(snapshot_id, operation_id.clone(), journal);
+        if result.is_err()
+            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
+                .is_some()
+        {
+            // Do not erase an indeterminate pause owner. Only confirmed native
+            // completion permits retiring this operation's unpublished copy.
+            self.finish_native_capture()?;
+            crate::capture::remove_full(&self.machine_root, &operation_id)?;
+        }
+        result
+    }
+
+    fn prepare_full_capture_inner(
         &mut self,
         snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
@@ -1036,26 +1222,18 @@ impl LinuxGuardianEffect {
                     .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
             return Ok(NativeSnapshotResponse::Prepared { capture });
         }
+        crate::capture::reset_unpublished_full(&self.machine_root, &operation_id)?;
         let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
             .ok_or(ControlError::Protocol(
                 "full capture has no native boundary",
             ))?;
-        let executions = match journal.capture_executions(boundary.generation) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = self.finish_native_capture();
-                return Err(ControlError::State(error));
-            }
-        };
-        let snapshot = match self.machine.create_full_snapshot(&operation_id) {
-            Ok(value) => value,
-            Err(_) => {
-                let _ = self.finish_native_capture();
-                return Err(ControlError::Unsupported(
-                    "Firecracker could not create a full snapshot",
-                ));
-            }
-        };
+        let executions = journal.capture_executions(boundary.generation)?;
+        let snapshot = self
+            .machine
+            .create_full_snapshot(&operation_id)
+            .map_err(|_| {
+                ControlError::Unsupported("Firecracker could not create a full snapshot")
+            })?;
         let result = (|| -> Result<NativeFullCapture, LinuxError> {
             crate::snapshots::private_directory(
                 directory
@@ -1092,7 +1270,7 @@ impl LinuxGuardianEffect {
                 generation: active.generation,
                 boot_identity: active.boot_identity,
                 capability: active.capability,
-                network_capability: active.network_capability,
+                boot: crate::storage::copy_boot(&active.boot_directory, &directory.join("boot"))?,
             };
             let reconnect_path = directory.join("reconnect.json");
             write_private_json(&reconnect_path, &reconnect)?;
@@ -1147,13 +1325,10 @@ impl LinuxGuardianEffect {
         })();
         match result {
             Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
-            Err(error) => {
-                let _ = self.finish_native_capture();
-                Err(ControlError::Rejected {
-                    category: "snapshot".into(),
-                    message: error.to_string(),
-                })
-            }
+            Err(error) => Err(ControlError::Rejected {
+                category: "snapshot".into(),
+                message: error.to_string(),
+            }),
         }
     }
 }
@@ -1175,39 +1350,6 @@ fn firecracker_configuration_digest(
     )
 }
 
-fn full_capture_directory(
-    machine_root: &Path,
-    operation_id: &sandsurf_protocol::OperationId,
-) -> PathBuf {
-    machine_root
-        .join("guardian/full-captures")
-        .join(object_name(operation_id.as_str()))
-}
-
-fn remove_full_capture(
-    machine_root: &Path,
-    operation_id: &sandsurf_protocol::OperationId,
-) -> ControlResult<()> {
-    let directory = full_capture_directory(machine_root, operation_id);
-    for name in [
-        "capture.json",
-        "reconnect.json",
-        "snapshot.vmstate",
-        "memory",
-    ] {
-        match fs::remove_file(directory.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ControlError::Io(error)),
-        }
-    }
-    match fs::remove_dir(&directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ControlError::Io(error)),
-    }
-}
-
 fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), LinuxError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -1221,55 +1363,6 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), LinuxEr
     Ok(())
 }
 
-fn network_rules(policy: &NetworkPolicy) -> Result<sandsurf_network::BrokerPolicy, LinuxError> {
-    policy
-        .validate()
-        .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-    let mut rules = sandsurf_network::BrokerPolicy::default();
-    for rule in &policy.rules {
-        let destination = match &rule.destination {
-            NetworkDestination::Dns {
-                name,
-                include_subdomains,
-                allow_private_addresses,
-            } => sandsurf_network::policy::ManagedNetworkDestination::Dns {
-                name: sandsurf_network::policy::normalize_dns_name(name)
-                    .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-                include_subdomains: *include_subdomains,
-                allow_private_addresses: *allow_private_addresses,
-            },
-            NetworkDestination::Ip { cidr } => {
-                sandsurf_network::policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
-            }
-        };
-        let ports = rule
-            .ports
-            .iter()
-            .map(|range| {
-                if range.from == range.to {
-                    sandsurf_network::policy::ManagedNetworkPort::Single(range.from)
-                } else {
-                    sandsurf_network::policy::ManagedNetworkPort::Range {
-                        from: range.from,
-                        to: range.to,
-                    }
-                }
-            })
-            .collect();
-        let managed = sandsurf_network::policy::ManagedNetworkRule {
-            transport: "tcp".into(),
-            destination,
-            ports,
-        };
-        match rule.plane {
-            sandsurf_protocol::NetworkPlane::NamedProxy => rules.named_proxy.push(managed),
-            sandsurf_protocol::NetworkPlane::DirectTcp => rules.direct_tcp.push(managed),
-            sandsurf_protocol::NetworkPlane::Dns => rules.dns.push(managed),
-        }
-    }
-    Ok(rules)
-}
-
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveGuest {
     rebind: Option<ManagementRebind>,
@@ -1278,14 +1371,50 @@ struct ActiveGuest {
     generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
+    boot_directory: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeBootObservation {
+    machine_id: MachineId,
+    generation: Counter,
+    boot: sandsurf_image::boot::FrozenBoot,
+}
+
+impl LinuxGenerationFactory {
+    fn record_boot(&self, active: &ActiveGuest) -> Result<(), Digest> {
+        let boot = crate::storage::read_boot(&active.boot_directory)
+            .map_err(|_| bytes_digest(b"linux-native-boot-artifacts-invalid"))?;
+        let observation = NativeBootObservation {
+            machine_id: active.machine_id.clone(),
+            generation: active.generation,
+            boot,
+        };
+        let guardian = self.machine_root.join("guardian");
+        let stage = guardian.join(format!(
+            ".current-boot-{}.json",
+            hex(&random_bytes()
+                .map_err(|_| bytes_digest(b"linux-native-boot-observation-entropy"))?)
+        ));
+        write_private_json(&stage, &observation)
+            .map_err(|_| bytes_digest(b"linux-native-boot-observation-write-failed"))?;
+        let result = sandsurf_native::storage::replace_journal_file(
+            &stage,
+            &guardian.join("current-boot.json"),
+        );
+        if result.is_err() {
+            let _ = fs::remove_file(&stage);
+        }
+        result.map_err(|_| bytes_digest(b"linux-native-boot-observation-write-failed"))
+    }
 }
 
 struct PendingGuest {
     generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
+    boot_directory: PathBuf,
 }
 
 struct PendingRestore {
@@ -1293,16 +1422,46 @@ struct PendingRestore {
     next: PendingGuest,
     snapshot_id: sandsurf_protocol::SnapshotId,
     generation_seed: [u8; 32],
+    executions: Vec<sandsurf_protocol::CapturedExecution>,
 }
 
 struct LinuxGenerationFactory {
+    network: Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
+    network_usage: NetworkUsage,
     config: LinuxGuardianConfig,
     machine_root: PathBuf,
-    kernel: PathBuf,
     system_disk: PathBuf,
     active: Arc<Mutex<Option<ActiveGuest>>>,
     pending: Option<PendingGuest>,
     pending_restore: Option<PendingRestore>,
+}
+
+fn bind_network_owner(
+    owner: &Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
+    usage: &NetworkUsage,
+    next: &Arc<NativeNetworkGateway>,
+) -> Result<(), Digest> {
+    let mut owner = owner
+        .lock()
+        .map_err(|_| bytes_digest(b"native-network-owner-lock"))?;
+    if let Some(previous) = owner.as_ref()
+        && !Arc::ptr_eq(previous, next)
+    {
+        let _ = previous.configure(&NetworkPolicy::default(), &[]);
+        let snapshot = previous.snapshot();
+        accumulate_network_usage(
+            usage,
+            &sandsurf_network::NetworkReport {
+                connections: snapshot.connections,
+                violations: snapshot.violations,
+                rx_bytes: snapshot.rx_bytes,
+                tx_bytes: snapshot.tx_bytes,
+                cleanup_failures: Vec::new(),
+            },
+        );
+    }
+    *owner = Some(Arc::clone(next));
+    Ok(())
 }
 
 impl FirecrackerGenerationFactory for LinuxGenerationFactory {
@@ -1319,10 +1478,13 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             return Err(bytes_digest(b"linux-generation-factory-identity-conflict"));
         }
         self.config.resources = resources.clone();
+        let image = verify_image(&self.config.image_manifest, ImageTrust::ExplicitLocal)
+            .map_err(|_| bytes_digest(b"linux-boot-image-invalid"))?;
         ensure_mutable_disk(
             &self.config.system_seed,
             &self.system_disk,
             resources.disk_bytes.get(),
+            &image.manifest.system.clone_profile,
         )
         .map_err(|error| {
             eprintln!("sandsurf disk preparation failed: {error}");
@@ -1332,57 +1494,24 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             eprintln!("sandsurf disk attachment refused: {error}");
             bytes_digest(b"linux-system-disk-attachment-failed")
         })?;
-        let capability = random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?;
-        let network_capability =
-            random_bytes().map_err(|_| bytes_digest(b"linux-network-entropy"))?;
-        let boot_identity = digest(
-            Domain::Image,
-            &(
-                "sandsurf-linux-boot-v1",
-                &self.config.image_digest,
-                &self.config.firecracker_sha256,
-                sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
-                sandsurf_protocol::GUEST_PROTOCOL_MINOR,
-            ),
-        )
-        .map_err(|_| bytes_digest(b"linux-boot-identity"))?;
-        let nonce = hex(&random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?);
-        let guardian = self.machine_root.join("guardian");
-        let authentication_image = guardian.join(format!("auth-{}-{nonce}.img", generation.get()));
-        write_authentication(
-            &authentication_image,
+        let boot_directory = self.machine_root.join("guardian").join(format!(
+            "boot-{}-{}",
+            generation.get(),
+            hex(&random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?)
+        ));
+        let boot = crate::storage::freeze_boot(&image, &self.system_disk, &boot_directory)
+            .map_err(|error| {
+                eprintln!("sandsurf boot selection failed: {error}");
+                bytes_digest(b"linux-boot-artifacts-invalid")
+            })?;
+        self.configuration_from_boot(
             machine_id,
             generation,
-            &boot_identity,
-            &capability,
-            &network_capability,
-        )
-        .map_err(|_| bytes_digest(b"linux-authentication-disk"))?;
-        let state_directory = guardian.join(format!("vm-{}-{nonce}", generation.get()));
-        let owner_token = hex(&random_bytes().map_err(|_| bytes_digest(b"linux-owner-entropy"))?);
-        self.pending = Some(PendingGuest {
-            generation,
-            boot_identity,
-            capability,
-            network_capability,
-        });
-        Ok(FirecrackerConfig {
-            launcher_executable: self.config.launcher.clone(),
-            firecracker_executable: self.config.firecracker.clone(),
-            firecracker_sha256: self.config.firecracker_sha256.clone(),
-            state_directory,
-            kernel_image: self.kernel.clone(),
-            system_disk: self.system_disk.clone(),
+            resources,
             storage_lease,
-            authentication_image,
-            owner_token,
-            guest_cid: self.config.guest_cid,
-            guest_port: GUEST_CONTROL_PORT,
-            vcpu_count: u8::try_from(resources.vcpus.get())
-                .map_err(|_| bytes_digest(b"linux-vcpu-overflow"))?,
-            memory_mib: u32::try_from(resources.memory_mib.get())
-                .map_err(|_| bytes_digest(b"linux-memory-overflow"))?,
-        })
+            boot_directory,
+            boot,
+        )
     }
 
     fn bind_management(
@@ -1391,6 +1520,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest> {
+        bind_network_owner(&self.network, &self.network_usage, &process.network)?;
         let pending = self
             .pending
             .take()
@@ -1404,7 +1534,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             generation,
             boot_identity: pending.boot_identity,
             capability: pending.capability,
-            network_capability: pending.network_capability,
+            boot_directory: pending.boot_directory,
             rebind: None,
         };
         let evidence = digest(
@@ -1412,6 +1542,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             &("host-management-channel-bound-v1", machine_id, generation),
         )
         .map_err(|_| bytes_digest(b"management-binding-evidence"))?;
+        self.record_boot(&active)?;
         *self
             .active
             .lock()
@@ -1425,7 +1556,10 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         generation: Counter,
         source: &FirecrackerRestoreSource,
     ) -> Result<(FirecrackerConfig, FirecrackerRestore), Digest> {
-        if self.pending_restore.is_some() {
+        if *machine_id != self.config.machine_id
+            || self.pending.is_some()
+            || self.pending_restore.is_some()
+        {
             return Err(bytes_digest(b"linux-restore-already-pending"));
         }
         let reconnect: ReconnectState = read_json(&source.reconnect_state, 1024 * 1024)
@@ -1438,14 +1572,40 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         {
             return Err(bytes_digest(b"linux-restore-reconnect-identity-mismatch"));
         }
+        let boot_directory = source
+            .reconnect_state
+            .parent()
+            .ok_or_else(|| bytes_digest(b"linux-restore-boot-owner-missing"))?
+            .join("boot");
+        if crate::storage::read_boot(&boot_directory)
+            .map_err(|_| bytes_digest(b"linux-restore-boot-artifacts-invalid"))?
+            != reconnect.boot
+        {
+            return Err(bytes_digest(b"linux-restore-boot-identity-mismatch"));
+        }
+        // StageRestore already verified the restored disk against the capture.
+        // Resume does not install an OS, customize identities, or read /boot.
+        let storage_lease = crate::storage::attach(&self.system_disk)
+            .map_err(|_| bytes_digest(b"linux-restore-storage-custody"))?;
         let resources = self.config.resources.clone();
-        let configuration = self.configuration(machine_id, generation, &resources)?;
+        let configuration = self.configuration_from_boot(
+            machine_id,
+            generation,
+            &resources,
+            storage_lease,
+            boot_directory,
+            reconnect.boot.clone(),
+        )?;
         let next = self
             .pending
             .take()
             .ok_or_else(|| bytes_digest(b"linux-restore-next-capability-missing"))?;
         let generation_seed = random_bytes().map_err(|_| bytes_digest(b"linux-restore-entropy"))?;
         self.pending_restore = Some(PendingRestore {
+            executions: crate::restore::load::<RestoreLineage>(&self.machine_root)
+                .map_err(|_| bytes_digest(b"linux-restore-membership-unavailable"))?
+                .ok_or_else(|| bytes_digest(b"linux-restore-membership-missing"))?
+                .executions,
             source: reconnect,
             next,
             snapshot_id: source.snapshot_id.clone(),
@@ -1466,6 +1626,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest> {
+        bind_network_owner(&self.network, &self.network_usage, &process.network)?;
         let pending = self
             .pending_restore
             .take()
@@ -1478,6 +1639,14 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             generation: pending.source.generation,
             boot_identity: pending.source.boot_identity.clone(),
             capability: pending.source.capability,
+            staging: GuestServiceRequest::StageExecutionRestore {
+                snapshot_id: pending.snapshot_id.clone(),
+                capture_operation_id: pending.source.capture_operation_id.clone(),
+                machine_id: machine_id.clone(),
+                previous_generation: pending.source.generation,
+                generation,
+                executions: pending.executions.clone(),
+            },
             request: GuestServiceRequest::RebindGeneration {
                 snapshot_id: pending.snapshot_id.clone(),
                 capture_operation_id: pending.source.capture_operation_id.clone(),
@@ -1486,7 +1655,6 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
                 generation,
                 boot_identity: pending.next.boot_identity.clone(),
                 capability: pending.next.capability,
-                network_capability: pending.next.network_capability,
                 generation_seed: pending.generation_seed,
             },
         };
@@ -1496,9 +1664,10 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             generation,
             boot_identity: pending.next.boot_identity,
             capability: pending.next.capability,
-            network_capability: pending.next.network_capability,
+            boot_directory: pending.next.boot_directory,
             rebind: Some(rebind),
         };
+        self.record_boot(&active)?;
         *self
             .active
             .lock()
@@ -1506,12 +1675,77 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         digest(
             Domain::Operation,
             &(
-                "native-restored-management-binding-v1",
+                "host-restored-management-channel-bound-v1",
                 machine_id,
                 generation,
             ),
         )
         .map_err(|_| bytes_digest(b"management-binding-evidence"))
+    }
+}
+
+impl LinuxGenerationFactory {
+    fn configuration_from_boot(
+        &mut self,
+        machine_id: &MachineId,
+        generation: Counter,
+        resources: &Resources,
+        storage_lease: Arc<File>,
+        boot_directory: PathBuf,
+        boot: sandsurf_image::boot::FrozenBoot,
+    ) -> Result<FirecrackerConfig, Digest> {
+        let (kernel, initial_ramdisk) = sandsurf_image::boot::paths(&boot_directory, &boot);
+        let capability = random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?;
+        let boot_identity = digest(
+            Domain::Image,
+            &(
+                "sandsurf-linux-boot-v1",
+                &self.config.image_digest,
+                &self.config.firecracker_sha256,
+                &boot,
+                sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
+                sandsurf_protocol::GUEST_PROTOCOL_MINOR,
+            ),
+        )
+        .map_err(|_| bytes_digest(b"linux-boot-identity"))?;
+        let nonce = hex(&random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?);
+        let guardian = self.machine_root.join("guardian");
+        let authentication_image = guardian.join(format!("auth-{}-{nonce}.img", generation.get()));
+        write_authentication(
+            &authentication_image,
+            machine_id,
+            generation,
+            &boot_identity,
+            &capability,
+        )
+        .map_err(|_| bytes_digest(b"linux-authentication-disk"))?;
+        let state_directory = guardian.join(format!("vm-{}-{nonce}", generation.get()));
+        let owner_token = hex(&random_bytes().map_err(|_| bytes_digest(b"linux-owner-entropy"))?);
+        self.pending = Some(PendingGuest {
+            generation,
+            boot_identity,
+            capability,
+            boot_directory,
+        });
+        Ok(FirecrackerConfig {
+            network_identity: sandsurf_network::LinkIdentity::for_machine(machine_id),
+            launcher_executable: self.config.launcher.clone(),
+            firecracker_executable: self.config.firecracker.clone(),
+            firecracker_sha256: self.config.firecracker_sha256.clone(),
+            state_directory,
+            kernel_image: kernel,
+            initial_ramdisk,
+            system_disk: self.system_disk.clone(),
+            storage_lease,
+            authentication_image,
+            owner_token,
+            guest_cid: self.config.guest_cid,
+            guest_port: GUEST_CONTROL_PORT,
+            vcpu_count: u8::try_from(resources.vcpus.get())
+                .map_err(|_| bytes_digest(b"linux-vcpu-overflow"))?,
+            memory_mib: u32::try_from(resources.memory_mib.get())
+                .map_err(|_| bytes_digest(b"linux-memory-overflow"))?,
+        })
     }
 }
 
@@ -1642,7 +1876,11 @@ fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<UnixVsockChannel> {
             rebind: None,
             ..active.clone()
         };
-        PendingRebind::new(guest_client(&source), binding.request.clone())
+        PendingRebind::new(
+            guest_client(&source),
+            binding.request.clone(),
+            binding.staging.clone(),
+        )
     });
     ManagedGuestClient::new(guest_client(active), pending)
 }
@@ -1661,27 +1899,18 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<UnixVsockChannel> {
     )
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ImageIndex {
-    #[serde(rename = "formatVersion")]
-    _format_version: u16,
-    #[serde(rename = "buildId")]
-    _build_id: String,
-    files: std::collections::BTreeMap<String, String>,
-}
-
 fn ensure_mutable_disk(
     source: &Path,
     destination: &Path,
     requested_bytes: u64,
+    clone_profile: &sandsurf_image::identity::CloneProfile,
 ) -> Result<(), LinuxError> {
     crate::storage::materialize(
         source,
         destination,
         requested_bytes,
         crate::storage::DiskFormat::Raw,
-        |_| Ok(()),
+        |staged| sandsurf_image::identity::customize(staged, clone_profile),
     )?;
     Ok(())
 }
@@ -1692,7 +1921,6 @@ fn write_authentication(
     generation: Counter,
     boot_identity: &Digest,
     capability: &[u8; 32],
-    network_capability: &[u8; 32],
 ) -> Result<(), LinuxError> {
     let identity = machine_id.as_str().as_bytes();
     let size = u16::try_from(identity.len())
@@ -1705,7 +1933,6 @@ fn write_authentication(
     bytes.extend_from_slice(&generation.get().to_be_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(capability);
-    bytes.extend_from_slice(network_capability);
     bytes.resize(512, 0);
     let mut file = OpenOptions::new()
         .write(true)
@@ -1830,6 +2057,119 @@ mod storage_tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
 
+    #[test]
+    fn memory_restore_uses_saved_running_boot_without_opening_seed_or_guest_selection() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-restore-boot-{}",
+            hex(&random_bytes().unwrap())
+        ));
+        sandsurf_native::local::create_private_directory(&root).unwrap();
+        for name in ["guardian", "disks", "snapshot"] {
+            sandsurf_native::local::create_private_directory(&root.join(name)).unwrap();
+        }
+        let disk = root.join("disks/system.ext4");
+        crate::storage::publish_disk(&disk, 4096, crate::storage::DiskFormat::Raw, |stage| {
+            // Not a filesystem at all: any disk interpretation is a bug here.
+            sandsurf_native::local::create_private_file(stage)?.write_all(&[7; 4096])
+        })
+        .unwrap();
+        let kernel = root.join("running-kernel");
+        let mut bytes = vec![0; 4096];
+        bytes[0x202..0x206].copy_from_slice(b"HdrS");
+        bytes[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        bytes[0x236] = 1;
+        sandsurf_native::local::create_private_file(&kernel)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let boot = crate::storage::pin_boot(
+            &kernel,
+            None,
+            Architecture::X64,
+            &root.join("snapshot/boot"),
+        )
+        .unwrap();
+        let machine_id: MachineId = "saved-machine".try_into().unwrap();
+        let snapshot_id: sandsurf_protocol::SnapshotId = "saved-state".try_into().unwrap();
+        let operation: sandsurf_protocol::OperationId = "capture-operation".try_into().unwrap();
+        write_private_json(
+            &root.join("snapshot/reconnect.json"),
+            &ReconnectState {
+                format_version: 1,
+                snapshot_id: snapshot_id.clone(),
+                capture_operation_id: operation.clone(),
+                machine_id: machine_id.clone(),
+                generation: Counter::ONE,
+                boot_identity: bytes_digest(b"running"),
+                capability: [1; 32],
+                boot,
+            },
+        )
+        .unwrap();
+        crate::restore::stage(&root, bytes_digest(b"manifest"), || {
+            Ok(RestoreLineage {
+                snapshot_id: snapshot_id.clone(),
+                source_machine_id: machine_id.clone(),
+                source_generation: Counter::ONE,
+                executions: Vec::new(),
+            })
+        })
+        .unwrap();
+        let resources = Resources::from_geometry(
+            Counter::ONE,
+            Counter::try_from(128).unwrap(),
+            Counter::try_from(4096).unwrap(),
+            Counter::try_from(4096).unwrap(),
+            Counter::ONE,
+        )
+        .unwrap();
+        let config = LinuxGuardianConfig {
+            format_version: 1,
+            machine_id: machine_id.clone(),
+            image_digest: bytes_digest(b"seed"),
+            resources,
+            launcher: root.join("unused-launcher"),
+            firecracker: root.join("unused-vmm"),
+            firecracker_sha256: "a".repeat(64),
+            image_manifest: root.join("missing-image-manifest"),
+            system_seed: root.join("missing-seed"),
+            system_seed_sha256: "b".repeat(64),
+            guest_cid: 17,
+        };
+        let mut factory = LinuxGenerationFactory {
+            network: Arc::new(Mutex::new(None)),
+            network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),
+            config,
+            machine_root: root.clone(),
+            system_disk: disk.clone(),
+            active: Arc::new(Mutex::new(None)),
+            pending: None,
+            pending_restore: None,
+        };
+        let source = FirecrackerRestoreSource {
+            snapshot_id,
+            capture_operation_id: operation,
+            source_machine_id: machine_id.clone(),
+            source_generation: Counter::ONE,
+            manifest_digest: bytes_digest(b"manifest"),
+            snapshot_state: root.join("snapshot/vmstate"),
+            snapshot_memory: root.join("snapshot/memory"),
+            reconnect_state: root.join("snapshot/reconnect.json"),
+        };
+        let (configuration, _) = factory
+            .restore_configuration(&machine_id, Counter::try_from(2).unwrap(), &source)
+            .unwrap();
+        assert_eq!(
+            configuration.kernel_image,
+            root.join("snapshot/boot/kernel")
+        );
+        assert!(configuration.initial_ramdisk.is_none());
+        assert_eq!(fs::read(&disk).unwrap(), [7; 4096]);
+        drop(configuration);
+        drop(factory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn endpoint() -> ActiveGuest {
         ActiveGuest {
             rebind: None,
@@ -1838,7 +2178,7 @@ mod storage_tests {
             generation: Counter::ONE,
             boot_identity: bytes_digest(b"boot"),
             capability: [1; 32],
-            network_capability: [2; 32],
+            boot_directory: PathBuf::from("/not-connected/boot"),
         }
     }
 
@@ -1930,11 +2270,23 @@ mod storage_tests {
             .unwrap()
             .write_all(contents)
             .unwrap();
-        ensure_mutable_disk(&source, &destination, 8192).unwrap();
+        ensure_mutable_disk(
+            &source,
+            &destination,
+            8192,
+            &sandsurf_image::identity::CloneProfile::Preserve,
+        )
+        .unwrap();
         assert_eq!(fs::metadata(&destination).unwrap().len(), 8192);
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         fs::remove_file(source).unwrap();
-        ensure_mutable_disk(&root.join("missing-seed"), &destination, 8192).unwrap();
+        ensure_mutable_disk(
+            &root.join("missing-seed"),
+            &destination,
+            8192,
+            &sandsurf_image::identity::CloneProfile::Preserve,
+        )
+        .unwrap();
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         crate::storage::retire(&destination, 8192, crate::storage::DiskFormat::Raw).unwrap();
         fs::remove_dir_all(root).unwrap();

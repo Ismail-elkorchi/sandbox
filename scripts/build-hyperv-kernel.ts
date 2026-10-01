@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, copyFile, mkdtemp, readFile, rename, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { availableParallelism } from "node:os";
 import { spawn } from "node:child_process";
 
@@ -17,7 +17,7 @@ if (requestedOutput !== undefined && !isAbsolute(requestedOutput)) {
   throw new Error("SANDSURF_HYPERV_KERNEL_OUTPUT must be absolute");
 }
 const output = requestedOutput
-  ?? resolve("packages/sandsurf/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
+  ?? resolve("packages/sandsurf/images/development-x64/hyperv-vmlinuz-6.18.41");
 
 if (process.platform !== "linux" || process.arch !== "x64") {
   throw new Error("the Hyper-V guest kernel builder requires Linux x64");
@@ -67,7 +67,9 @@ try {
   ]) {
     if (!resolvedConfig.includes(required)) throw new Error(`Hyper-V kernel lacks ${required}`);
   }
-  const jobs = Math.max(1, Math.min(availableParallelism(), 16));
+  const requestedJobs = Number(process.env.SANDSURF_BUILD_JOBS ?? "2");
+  if (!Number.isSafeInteger(requestedJobs) || requestedJobs < 1 || requestedJobs > 16) throw new Error("SANDSURF_BUILD_JOBS must be 1..16");
+  const jobs = Math.max(1, Math.min(availableParallelism(), requestedJobs));
   await run("make", ["-C", source, `O=${build}`, `-j${jobs}`, "bzImage"], buildEnvironment);
   const kernel = resolve(build, "arch/x86/boot/bzImage");
   const bytes = await readFile(kernel);
@@ -75,6 +77,7 @@ try {
     throw new Error("built Hyper-V kernel is not an x86 bzImage");
   }
   const staging = `${output}.new-${process.pid}`;
+  await mkdir(dirname(output), { recursive: true });
   await rm(staging, { force: true });
   await copyFile(kernel, staging, constants.COPYFILE_EXCL);
   await chmod(staging, 0o444);

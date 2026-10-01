@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
-use sandsurf_network::policy::{ManagedNetworkRule, normalize_managed_network_rules};
-use sandsurf_protocol::{Frame, MAX_CONTROL_BYTES};
+use sandsurf_network::policy::PacketPolicy;
+use sandsurf_protocol::{Frame, MAX_CONTROL_BYTES, NetworkPolicy};
 
 fn main() {
     let iterations = std::env::args()
@@ -13,6 +13,14 @@ fn main() {
     for index in 0..iterations {
         fuzz_protocol(&mut random, index);
         fuzz_policy(&mut random, index);
+        let mut packet = vec![0; random.length(sandsurf_network::MAX_FRAME + 16)];
+        random.fill(&mut packet);
+        let _ = sandsurf_network::packet::parse(
+            &packet,
+            &sandsurf_network::LinkIdentity {
+                guest_mac: [2, 0, 0, 0, 0, 2],
+            },
+        );
     }
     println!("machine fuzz smoke completed {iterations} iterations per target");
 }
@@ -21,7 +29,7 @@ fn fuzz_protocol(random: &mut XorShift64, index: usize) {
     let mut bytes = vec![0_u8; random.length(MAX_CONTROL_BYTES.saturating_add(256))];
     random.fill(&mut bytes);
     if index.is_multiple_of(3) && bytes.len() >= 8 {
-        bytes[..4].copy_from_slice(b"SNDS");
+        bytes[..4].copy_from_slice(sandsurf_protocol::MAGIC);
         bytes[4..8].copy_from_slice(&random.next_u32().to_be_bytes());
     }
     let mut input = bytes.as_slice();
@@ -37,10 +45,10 @@ fn fuzz_policy(random: &mut XorShift64, index: usize) {
     let mut bytes = vec![0_u8; random.length(8192)];
     random.fill(&mut bytes);
     if index.is_multiple_of(4) {
-        bytes.splice(0..0, br#"[{"transport":"tcp","destination":{"kind":"dns","name":"example.com"},"ports":[443]}]"#.iter().copied());
+        bytes.splice(0..0, br#"{"rules":[{"plane":"tcp","destination":{"kind":"ip","cidr":"203.0.113.0/24","allowPrivateAddresses":false},"ports":[{"from":443,"to":443}]}]}"#.iter().copied());
     }
-    if let Ok(rules) = serde_json::from_slice::<Vec<ManagedNetworkRule>>(&bytes) {
-        let _ = normalize_managed_network_rules(&rules);
+    if let Ok(policy) = serde_json::from_slice::<NetworkPolicy>(&bytes) {
+        let _ = PacketPolicy::compile(&policy, Vec::new());
     }
 }
 

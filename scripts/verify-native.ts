@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
+import { verifyDiskTransport } from "./image-sources.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await verifyManifest(resolve(repository, "native/manifest.json"), resolve(repository, "native"));
@@ -25,7 +26,7 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
   required.delete(architecture);
   const imageRoot = resolve(imagesRoot, `development-${architecture}`);
   const imageManifest: unknown = JSON.parse(await readFile(resolve(imageRoot, "manifest.json"), "utf8"));
-  if (!isRecord(imageManifest) || imageManifest.formatVersion !== 3 || imageManifest.id !== "sandsurf-development" ||
+  if (!isRecord(imageManifest) || imageManifest.formatVersion !== 1 || imageManifest.id !== "sandsurf-development" ||
       imageManifest.version !== "3.24.2" || imageManifest.architecture !== architecture ||
       !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
       !isRecord(imageManifest.system) ||
@@ -34,7 +35,7 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
       !isRecord(imageManifest.system.provenance.materials)) {
     throw new Error(`${architecture} VM image manifest has an invalid shape`);
   }
-  for (const material of ["alpine-minirootfs", "alpine-packages", "sandsurf-ext4-builder"]) {
+  for (const material of ["alpine-minirootfs", "alpine-offline-packages", "alpine-package-lock", "sandsurf-system-recipe", "sandsurf-appliance-recipe", "sandsurf-management"]) {
     if (!validDigest(imageManifest.system.provenance.materials[material])) {
       throw new Error(`${architecture} VM image is missing ${material} provenance`);
     }
@@ -47,7 +48,13 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
       throw new Error(`${architecture} ${label} path is invalid`);
     }
     await verifyFile(resolve(imageRoot, entry.path), entry.sha256, `${architecture} ${label}`);
+    if (label === "VM system seed") await verifyDiskTransport(resolve(imageRoot, `${entry.path}.gz`), entry.sha256 as string);
   }
+  const initramfs = imageManifest.bootBundle.initramfs;
+  if (!isRecord(initramfs) || typeof initramfs.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(initramfs.path)) {
+    throw new Error(`${architecture} VM initramfs is malformed`);
+  }
+  await verifyFile(resolve(imageRoot, initramfs.path), initramfs.sha256, `${architecture} VM initramfs`);
   if (!isRecord(imageManifest.platformArtifacts)) throw new Error(`${architecture} platform artifacts are malformed`);
   if (architecture === "x64") {
     const windows = imageManifest.platformArtifacts.windowsX64;
@@ -57,6 +64,7 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
         throw new Error(`x64 Windows ${label} artifact is malformed`);
       }
       await verifyFile(resolve(imageRoot, entry.path), entry.sha256, `x64 Windows ${label}`);
+      if (label === "system") await verifyDiskTransport(resolve(imageRoot, `${entry.path}.gz`), entry.sha256 as string);
     }
   }
 }
@@ -80,7 +88,7 @@ async function verifyFile(path: string, expected: unknown, label: string): Promi
   }
   const metadata = await lstat(path);
   if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error(`${label} is not a regular package-owned file`);
-  const actual = createHash("sha256").update(await readFile(path)).digest("hex");
+  const actual = await sha256File(path, 8 * 1024 ** 3);
   if (actual !== expected) throw new Error(`${label} failed SHA-256 verification`);
 }
 

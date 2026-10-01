@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hydrateImageSources } from "./image-sources.ts";
+import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await hydrateImageSources();
@@ -95,7 +96,7 @@ async function writeManifest(root: string): Promise<void> {
   await collect("");
   await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
     formatVersion: 1,
-    buildId: "sandsurf-native-0.1.0",
+    buildId: "sandsurf-native-1.0.0",
     files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
   }, null, 2)}\n`, { mode: 0o644 });
 
@@ -108,7 +109,7 @@ async function writeManifest(root: string): Promise<void> {
       if (!entry.isFile() || !metadata.isFile() || metadata.isSymbolicLink()) {
         throw new Error(`${child} is not a regular native artifact`);
       }
-      files[child] = createHash("sha256").update(await readFile(resolve(root, child))).digest("hex");
+      files[child] = await sha256File(resolve(root, child), 512 * 1024 ** 2);
     }
   }
 }

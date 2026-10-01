@@ -2,6 +2,8 @@ node_modules/
 target/
 packages/sandsurf/dist/
 packages/sandsurf/images/development-*/*.ext4
+packages/sandsurf/images/development-*/*.vhdx
+packages/sandsurf/images/development-*/*.gz
 native/*/sandsurf-host-*
 native/*/sandsurf-vz-helper-*
 native/manifest.json

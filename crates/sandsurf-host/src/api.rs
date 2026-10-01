@@ -11,11 +11,14 @@ use sandsurf_state::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const HOST_API_VERSION: u16 = 12;
+pub const HOST_API_VERSION: u16 = 1;
 
 impl sandsurf_protocol::RpcRequest for HostRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
         match self {
+            Self::WriteConsole { bytes, .. } => {
+                Some((bytes, sandsurf_protocol::MAX_CONSOLE_INPUT_BYTES))
+            }
             Self::PutSecret { bytes, .. } => Some((bytes, sandsurf_protocol::MAX_RPC_DATA_BYTES)),
             Self::DispatchGuest { request, .. } => request.binary_field(),
             Self::Guest { request, .. } => request.binary_field(),
@@ -35,7 +38,13 @@ pub struct HostInspection {
     pub lifecycle: Qualification,
     pub full_state: Qualification,
     pub images: Qualification,
+    pub image_workers: sandsurf_protocol::Capability,
+    pub resources: crate::resources::ResourceCapabilities,
+    /// Each entry qualifies only its exact native configuration and scope.
+    pub qualification_records: Vec<crate::qualification::RetainedQualification>,
+    pub qualification_issues: Vec<String>,
     pub guest_power: sandsurf_protocol::GuestPowerCapabilities,
+    pub console: sandsurf_protocol::Capability,
     pub guest_platform: String,
     /// Verified defaults image packaged for this host architecture. Source
     /// builds without packaged artifacts report `None` explicitly.
@@ -399,6 +408,21 @@ pub enum HostRequest {
     GetUsage {
         machine_id: MachineId,
     },
+    ReadConsole {
+        machine_id: MachineId,
+        generation: Counter,
+        after: Counter,
+        maximum: u32,
+    },
+    WriteConsole {
+        machine_id: MachineId,
+        generation: Counter,
+        bytes: Vec<u8>,
+    },
+    AssessResources {
+        machine_id: MachineId,
+        resources: Resources,
+    },
     DispatchGuest {
         machine_id: MachineId,
         generation: Counter,
@@ -481,6 +505,14 @@ pub enum HostRequest {
     deny_unknown_fields
 )]
 pub enum HostResponse {
+    ResourceAssessment {
+        assessment: sandsurf_protocol::ResourceChangeAssessment,
+    },
+    ResourceUpdate {
+        revision: Counter,
+        machine: MachineView,
+        assessment: sandsurf_protocol::ResourceChangeAssessment,
+    },
     Complete,
     /// Private, authenticated observer endpoint. This conveys no lifecycle or
     /// configuration authority and is never a cached machine observation.
@@ -545,7 +577,7 @@ pub enum HostResponse {
     },
     Lifecycle {
         operation: LifecycleOperation,
-        machine: MachineView,
+        machine: Box<MachineView>,
     },
     Configuration {
         revision: Counter,

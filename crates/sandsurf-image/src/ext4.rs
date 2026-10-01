@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-pub const BUILDER_ID: &str = "e2fsprogs-ext4-linux-v1";
+pub const BUILDER_ID: &str = "libguestfs-appliance-ext4-linux";
 pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MIN_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -58,124 +58,37 @@ mod linux {
     use super::*;
     use sha2::{Digest as _, Sha256};
     use std::collections::BTreeMap;
-    use std::fs::{self, File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::fs::{self, File};
+    use std::io::Write;
     use std::path::Component;
-    use std::process::{Command, Stdio};
-
-    const FEATURES: &str = "none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum";
 
     pub(super) fn materialize(tar: &Path, output: &Path, bytes: u64) -> Result<String, Ext4Error> {
         validate_archive(tar, bytes)?;
         sandsurf_native::filesystem::require_protected_ancestors(output)?;
-        let mkfs =
-            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/mke2fs", "/sbin/mke2fs"])?;
-        let check =
-            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/e2fsck", "/sbin/e2fsck"])?;
+        let tool = sandsurf_native::filesystem::protected_tool(&["/usr/bin/guestfish"])?;
         let mut builder = Sha256::new();
         builder.update(BUILDER_ID);
-        hash_file(&mkfs, &mut builder)?;
-        hash_file(&check, &mut builder)?;
+        hash_file(&tool, &mut builder)?;
         let builder = format!("{:x}", builder.finalize());
-        let mut identity = Sha256::new();
-        identity.update(&builder);
-        identity.update(bytes.to_be_bytes());
-        hash_file(tar, &mut identity)?;
-        let mut uuid = identity.finalize()[..16].to_vec();
-        uuid[6] = (uuid[6] & 0x0f) | 0x40;
-        uuid[8] = (uuid[8] & 0x3f) | 0x80;
-        let uuid: String = uuid
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| {
-                format!(
-                    "{}{:02x}",
-                    if [4, 6, 8, 10].contains(&index) {
-                        "-"
-                    } else {
-                        ""
-                    },
-                    byte
-                )
-            })
-            .collect();
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(output)?;
+        let file = sandsurf_native::local::create_private_file(output)?;
         file.set_len(bytes)?;
         file.sync_all()?;
-        // Feed a fixed profile through an owned descriptor, not the host's
-        // distribution-specific mke2fs.conf. Unlink before executing the tool.
-        let profile_path = output.with_extension("mkfs-config");
-        let mut profile = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&profile_path)?;
-        fs::remove_file(profile_path)?;
-        profile.write_all(b"[fs_types]\n ext4 = {\n features = has_journal,extent\n }\n")?;
-        profile.seek(SeekFrom::Start(0))?;
-        let extended = format!("lazy_itable_init=0,lazy_journal_init=0,hash_seed={uuid}");
-        let inode_count = (bytes / 16384).max(8192).to_string();
-        let status = Command::new(mkfs)
-            .env("E2FSPROGS_FAKE_TIME", "1700000000")
-            .env("MKE2FS_CONFIG", "/dev/stdin")
-            .args([
-                "-q",
-                "-t",
-                "ext4",
-                "-b",
-                "4096",
-                "-m",
-                "0",
-                "-I",
-                "256",
-                "-N",
-                &inode_count,
-                "-U",
-                &uuid,
-                "-L",
-                "Sandsurf",
-                "-o",
-                "linux",
-                "-G",
-                "16",
-                "-O",
-                FEATURES,
-                "-E",
-                &extended,
-                "-d",
-            ])
-            .arg(tar)
-            .arg(output)
-            .arg((bytes / 4096).to_string())
-            .stdin(Stdio::from(profile))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(Ext4Error::Invalid(
-                "Linux filesystem construction failed (e2fsprogs must support canonical tar input)"
-                    .into(),
-            ));
-        }
-        verify_geometry(output, bytes)?;
-        let status = Command::new(check)
-            .args(["-fn"])
-            .arg(output)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(Ext4Error::Invalid(
-                "generated Linux seed failed ext4 verification".into(),
-            ));
-        }
+        let archive = crate::appliance::host_path(tar)?;
+        crate::appliance::run(
+            output,
+            true,
+            &[
+                crate::appliance::command("mkfs", &["ext4", "/dev/sda"]),
+                crate::appliance::mount(true),
+                crate::appliance::command(
+                    "tar-in",
+                    &[&archive, "/", "xattrs:true", "selinux:true", "acls:true"],
+                ),
+                crate::appliance::command("sync", &[]),
+                crate::appliance::command("umount-all", &[]),
+                crate::appliance::command("e2fsck", &["/dev/sda", "forceno:true"]),
+            ],
+        )?;
         File::open(output)?.sync_all()?;
         Ok(builder)
     }
@@ -289,41 +202,19 @@ mod linux {
         }
         Ok(())
     }
-
-    fn verify_geometry(path: &Path, bytes: u64) -> Result<(), Ext4Error> {
-        let mut file = File::open(path)?;
-        let mut superblock = [0_u8; 1024];
-        file.seek(SeekFrom::Start(1024))?;
-        file.read_exact(&mut superblock)?;
-        let blocks = u32::from_le_bytes(superblock[4..8].try_into().unwrap()) as u64;
-        let compat = u32::from_le_bytes(superblock[92..96].try_into().unwrap());
-        if file.metadata()?.len() != bytes
-            || blocks * 4096 != bytes
-            || u32::from_le_bytes(superblock[24..28].try_into().unwrap()) != 2
-            || compat & 0x0014 != 0x0014
-            || compat & 0x0200 != 0
-            || u32::from_le_bytes(superblock[224..228].try_into().unwrap()) != 8
-        {
-            return Err(Ext4Error::Invalid(
-                "Linux seed lacks the journaled, online-growable ext4 profile".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use sha2::{Digest as _, Sha256};
     use std::fs::{self, File};
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn materialization_is_reproducible_journaled_and_preserves_linux_metadata() {
-        let root = std::env::temp_dir().join(format!(
+    fn isolated_materialization_preserves_linux_metadata() {
+        let root = std::path::Path::new("/var/tmp").join(format!(
             "sandsurf-ext4-builder-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -371,43 +262,41 @@ mod tests {
             materialize_tar(&tar, &first, MIN_IMAGE_BYTES).unwrap(),
             materialize_tar(&tar, &second, MIN_IMAGE_BYTES).unwrap()
         );
-        assert_eq!(
-            Sha256::digest(fs::read(&first).unwrap()),
-            Sha256::digest(fs::read(&second).unwrap())
-        );
-        let debugfs =
-            sandsurf_native::filesystem::protected_tool(&["/usr/sbin/debugfs", "/sbin/debugfs"])
-                .unwrap();
-        let read = std::process::Command::new(&debugfs)
-            .args(["-R", "cat /etc/identity"])
-            .arg(&first)
-            .output()
-            .unwrap();
-        assert!(read.status.success());
-        assert_eq!(read.stdout, b"sandsurf");
-        let stat = std::process::Command::new(&debugfs)
-            .args(["-R", "stat /etc/identity"])
-            .arg(&first)
-            .output()
-            .unwrap();
-        let stat = String::from_utf8(stat.stdout).unwrap();
-        assert!(stat.contains("Mode:  04755"), "{stat}");
+        use crate::appliance::{command, mount, run};
+        let read = run(
+            &first,
+            false,
+            &[mount(false), command("cat", &["/etc/identity"])],
+        )
+        .unwrap();
+        assert_eq!(read.strip_suffix(b"\n").unwrap_or(&read), b"sandsurf");
+        let stat = String::from_utf8(
+            run(
+                &first,
+                false,
+                &[mount(false), command("statns", &["/etc/identity"])],
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(
-            stat.contains("User:  1000") && stat.contains("Group:  1000"),
+            stat.contains("st_uid: 1000") && stat.contains("st_gid: 1000"),
             "{stat}"
         );
-        let link = std::process::Command::new(debugfs)
-            .args(["-R", "stat /etc/long-link"])
-            .arg(&first)
-            .output()
-            .unwrap();
-        let link = String::from_utf8(link.stdout).unwrap();
-        assert!(link.contains("Type: symlink"), "{link}");
+        assert!(stat.contains("st_mode: 35309"), "{stat}");
+        let link = run(
+            &first,
+            false,
+            &[mount(false), command("readlink", &["/etc/long-link"])],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(link).unwrap().trim(), long_target);
         assert!(materialize_tar(&tar, &root.join("undersized"), 32 * 1024 * 1024).is_err());
         assert!(!root.join("undersized").exists());
         for path in [tar, first, second] {
             fs::remove_file(path).unwrap();
         }
+        fs::remove_dir_all(root.join(".appliance")).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

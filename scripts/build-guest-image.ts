@@ -1,25 +1,22 @@
 import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, createReadStream } from "node:fs";
 import {
   chmod,
   copyFile,
   lstat,
-  lutimes,
   mkdir,
   mkdtemp,
-  readdir,
   readFile,
   rename,
   rm,
   stat,
-  symlink,
-  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { packImageSources, writeImageIndex } from "./image-sources.ts";
+import { prepare as prepareAlpineInputs } from "./prepare-alpine-inputs.ts";
 
 process.umask(0o022);
 
@@ -33,19 +30,14 @@ if (requestedArchitecture !== "x64" && requestedArchitecture !== "arm64") {
   throw new Error("SANDSURF_IMAGE_ARCHITECTURE must be x64 or arm64");
 }
 const architecture = requestedArchitecture;
+if (process.arch !== architecture) throw new Error("machine image assembly requires native Linux/KVM for its selected architecture");
 const imageBuild = architecture === "x64" ? {
   rustTarget: "x86_64-unknown-linux-musl",
-  kernelArchitecture: "x86_64",
-  kernelSha256: "645688b5933cb257f7d4fa71eb246669233e8c2db8378217c99cf891541fe3d5",
-  kernelConfigSha256: "c9779a5f7e89c91e371c0a4d15134f46a4cdf2fce6239261edb5c169baec3f2d",
   alpineArchitecture: "x86_64",
   alpineSha256: "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
   elfMachine: 62,
 } : {
   rustTarget: "aarch64-unknown-linux-musl",
-  kernelArchitecture: "aarch64",
-  kernelSha256: "b2054e82c9d1120519882c39485a17b29657b77c93ed8c9d412996de6ba9711c",
-  kernelConfigSha256: "4307633ad8dbe3726f36dc11aca9d1eda8c8f2c8a28cdb9888fcfcc3648e409b",
   alpineArchitecture: "aarch64",
   alpineSha256: "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773",
   elfMachine: 183,
@@ -56,35 +48,7 @@ const alpineVersion = "3.24.2";
 const alpineSeries = "v3.24";
 const alpineRepository = `https://dl-cdn.alpinelinux.org/alpine/${alpineSeries}`;
 if (process.arch !== "x64" && process.arch !== "arm64") throw new Error("the guest image builder requires an x64 or arm64 host");
-const toolArchitecture = process.arch === "arm64" ? "aarch64" : "x86_64";
-const alpineToolSha256 = toolArchitecture === "aarch64"
-  ? "9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773"
-  : "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677";
-const expectedAlpinePackages = [
-  "alpine-base=3.24.2-r0", "alpine-conf=3.22.0-r0",
-  "alpine-baselayout-data=3.7.2-r1", "alpine-baselayout=3.7.2-r1", "alpine-keys=2.6-r0",
-  "alpine-release=3.24.2-r0", "apk-tools=3.0.8-r0", "brotli-libs=1.2.0-r1",
-  "busybox-binsh=1.37.0-r31", "busybox-extras=1.37.0-r31", "busybox=1.37.0-r31", "c-ares=1.34.8-r0",
-  "ca-certificates-bundle=20260909-r0", "ca-certificates=20260909-r0",
-  "git-init-template=2.54.0-r0", "git=2.54.0-r0", "libapk=3.0.8-r0",
-  "libcrypto3=3.5.8-r0", "libcurl=8.22.0-r0", "libexpat=2.8.5-r0",
-  "libidn2=2.3.8-r0", "libpsl=0.21.5-r3", "libssl3=3.5.8-r0",
-  "libunistring=1.4.2-r0", "musl-utils=1.2.6-r2", "musl=1.2.6-r2",
-  "nghttp2-libs=1.69.0-r0", "pcre2=10.48-r0", "scanelf=1.3.9-r1",
-  "ssl_client=1.37.0-r31", "zlib=1.3.2-r0", "zstd-libs=1.5.7-r2",
-  "bridge=1.5-r5", "e2fsprogs=1.47.4-r0", "e2fsprogs-extra=1.47.4-r0",
-  "e2fsprogs-libs=1.47.4-r0", "ifupdown-ng=0.13.0-r0", "libblkid=2.42.3-r1",
-  "libcap2=2.78-r0", "libcom_err=1.47.4-r0", "libeconf=0.8.3-r0",
-  "libuuid=2.42.3-r1", "openrc=0.63.2-r0", "openrc-user=0.63.2-r0",
-  "sudo=1.9.17_p2-r1",
-  "busybox-mdev-openrc=1.37.0-r31", "busybox-openrc=1.37.0-r31", "busybox-suid=1.37.0-r31", "mdev-conf=4.10-r0",
-] as const;
-const kernelName = "vmlinux-6.18.41";
-const kernelBaseUrl = `https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260819-0a745def42dd-0/${imageBuild.kernelArchitecture}`;
-const kernelUrl = `${kernelBaseUrl}/${kernelName}`;
-const kernelSha256 = imageBuild.kernelSha256;
-const kernelConfigUrl = `${kernelUrl}.config`;
-const kernelConfigSha256 = imageBuild.kernelConfigSha256;
+const kernelName = "boot-kernel";
 const hypervKernelSha256 = "bdb750c617bf47fc893c9ee849e82b4b3bc0287d693195b58bd3fa1c4c8936b5";
 const localBuild = process.env.SANDSURF_LOCAL_IMAGE === "1";
 const signingKeyPath = process.env.SANDSURF_IMAGE_SIGNING_KEY_FILE;
@@ -126,9 +90,13 @@ try {
       [`CARGO_TARGET_${guestTarget.toUpperCase().replaceAll("-", "_")}_RUSTFLAGS`]: "-C target-feature=+crt-static",
     });
   }
-  const guestAgent = binaryInput ?? resolve("target", guestTarget, buildProfile, "sandsurf-guest");
-  const guestBytes = await boundedRegularFile(guestAgent, 128 * 1024 * 1024, "guest management executable");
-  if (binaryInput !== undefined && sha256(guestBytes) !== binaryDigest) throw new Error("guest management input digest mismatch");
+  const guestInput = binaryInput ?? resolve("target", guestTarget, buildProfile, "sandsurf-guest");
+  const inputBytes = await boundedRegularFile(guestInput, 128 * 1024 * 1024, "guest management executable");
+  if (binaryInput !== undefined && sha256(inputBytes) !== binaryDigest) throw new Error("guest management input digest mismatch");
+  const guestAgent = resolve(temporary, "sandsurf-management");
+  await copyFile(guestInput, guestAgent);
+  await run("strip", ["--strip-debug", guestAgent], process.cwd());
+  const guestBytes = await boundedRegularFile(guestAgent, 128 * 1024 * 1024, "shipped management executable");
   assertElfArchitecture(guestBytes, "guest agent");
   const programOffset = Number(guestBytes.readBigUInt64LE(32));
   const programSize = guestBytes.readUInt16LE(54); const programCount = guestBytes.readUInt16LE(56);
@@ -140,20 +108,10 @@ try {
   const system = resolve(temporary, "system.ext4");
   const systemMaterials = await buildLinuxSystem(temporary, system, guestAgent);
 
-  const kernel = resolve(temporary, kernelName);
-  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernel, kernelUrl]);
-  if (sha256(await readFile(kernel)) !== kernelSha256) throw new Error("guest kernel digest mismatch");
-  const kernelConfig = resolve(temporary, `${kernelName}.config`);
-  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", kernelConfig, kernelConfigUrl]);
-  const kernelConfigBytes = await readFile(kernelConfig);
-  if (sha256(kernelConfigBytes) !== kernelConfigSha256) throw new Error("guest kernel configuration digest mismatch");
-  const kernelConfiguration = kernelConfigBytes.toString("utf8");
-  for (const required of [
-    "CONFIG_CGROUPS=y", "CONFIG_DEVTMPFS=y", "CONFIG_IPV6=y", "CONFIG_OVERLAY_FS=y",
-    "CONFIG_SECCOMP=y", "CONFIG_TUN=y", "CONFIG_VIRTIO_VSOCKETS=y", "CONFIG_VSOCKETS=y",
-  ]) {
-    if (!kernelConfiguration.split("\n").includes(required)) throw new Error(`guest kernel lacks ${required}`);
-  }
+  const kernel = resolve(temporary, "boot/kernel");
+  const initramfs = resolve(temporary, "boot/initramfs");
+  const kernelSha256 = sha256(await boundedRegularFile(kernel, 128 * 1024 * 1024, "isolated kernel output"));
+  const initramfsSha256 = sha256(await boundedRegularFile(initramfs, 256 * 1024 * 1024, "isolated initramfs output"));
 
   const explicitOutput = process.env.SANDSURF_IMAGE_OUTPUT_DIRECTORY;
   if (explicitOutput !== undefined && !isAbsolute(explicitOutput)) throw new Error("SANDSURF_IMAGE_OUTPUT_DIRECTORY must be absolute");
@@ -161,12 +119,13 @@ try {
   const destination = explicitOutput ?? resolve("packages/sandsurf/images", imageDirectory);
   await mkdir(destination, { recursive: true });
   await replaceArtifact(kernel, resolve(destination, kernelName));
+  await replaceArtifact(initramfs, resolve(destination, "boot-initramfs"));
   await replaceArtifact(system, resolve(destination, "system.ext4"));
 
   let platformArtifacts: Record<string, unknown> = {};
   if (architecture === "x64") {
     const hypervKernelSource = process.env.SANDSURF_HYPERV_KERNEL_FILE
-      ?? resolve("packages/sandsurf/image-build-inputs/x64/hyperv-vmlinuz-6.18.41");
+      ?? resolve("packages/sandsurf/images/development-x64/hyperv-vmlinuz-6.18.41");
     if (!isAbsolute(hypervKernelSource)) {
       throw new Error("SANDSURF_HYPERV_KERNEL_FILE must be absolute");
     }
@@ -206,20 +165,22 @@ try {
     platformArtifacts = {
       windowsX64: {
         kernel: { path: "hyperv-vmlinuz-6.18.41", sha256: sha256(hypervKernelBytes) },
-        system: { path: "system.vhdx", sha256: sha256(await readFile(conversions[0][1])) },
+        system: { path: "system.vhdx", sha256: await sha256BoundedFile(conversions[0][1], 8 * 1024 ** 3) },
       },
     };
   }
 
   const unsigned = {
-    formatVersion: 3,
+    formatVersion: 1,
     id: "sandsurf-development",
     version: alpineVersion,
     architecture,
     bootBundle: {
       kernel: { path: kernelName, sha256: kernelSha256 },
+      initramfs: { path: "boot-initramfs", sha256: initramfsSha256 },
+      profile: { kind: "alpine" },
       guestAgent: {
-        version: "0.1.0",
+        version: "1.0.0",
         protocolMajor: guestProtocolMajor,
         protocolMinor: guestProtocolMinor,
         sha256: sha256(guestBytes),
@@ -227,9 +188,10 @@ try {
       capabilities: { overlayfs: true, vsock: true, seccomp: true, cgroupV2: true, devpts: true },
     },
     system: {
+      cloneProfile: { kind: "alpine" },
       rootfs: {
         path: "system.ext4",
-        sha256: sha256(await readFile(system)),
+        sha256: await sha256BoundedFile(system, 8 * 1024 ** 3),
         format: "ext4",
       },
       defaults: {
@@ -273,153 +235,70 @@ async function buildLinuxSystem(
   output: string,
   guestAgent: string,
 ): Promise<{ sourceDigest: string; materials: Readonly<Record<string, string>> }> {
-  const targetArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`);
-  const toolArchive = resolve(temporary, `alpine-minirootfs-${alpineVersion}-${toolArchitecture}.tar.gz`);
-  const targetUrl = `${alpineRepository}/releases/${imageBuild.alpineArchitecture}/alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`;
-  const toolUrl = `${alpineRepository}/releases/${toolArchitecture}/alpine-minirootfs-${alpineVersion}-${toolArchitecture}.tar.gz`;
-  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", targetArchive, targetUrl]);
-  if (sha256(await readFile(targetArchive)) !== imageBuild.alpineSha256) {
-    throw new Error("Alpine development root digest mismatch");
+  if ((architecture === "x64" ? "x64" : "arm64") !== process.arch) {
+    throw new Error("the isolated Alpine builder requires a Linux host of the target architecture");
   }
-  if (targetArchive !== toolArchive) {
-    await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", toolArchive, toolUrl]);
+  const inputNames = ["SANDSURF_ALPINE_PACKAGES_ARCHIVE", "SANDSURF_ALPINE_PACKAGES_SHA256",
+    "SANDSURF_ALPINE_PACKAGE_LOCK", "SANDSURF_ALPINE_PACKAGE_LOCK_SHA256"] as const;
+  const supplied = inputNames.filter((name) => process.env[name] !== undefined);
+  if (supplied.length !== 0 && supplied.length !== inputNames.length) {
+    throw new Error("offline Alpine inputs require both files and both digests together");
   }
-  if (sha256(await readFile(toolArchive)) !== alpineToolSha256) {
-    throw new Error("Alpine package-tool root digest mismatch");
+  const inputs = supplied.length === 0 ? await prepareAlpineInputs({
+    architecture, output: resolve(temporary, "alpine-inputs"), temporaryDirectory: temporary,
+  }) : process.env;
+  const packages = inputs.SANDSURF_ALPINE_PACKAGES_ARCHIVE;
+  const packageDigest = inputs.SANDSURF_ALPINE_PACKAGES_SHA256;
+  const packageLock = inputs.SANDSURF_ALPINE_PACKAGE_LOCK;
+  const lockDigest = inputs.SANDSURF_ALPINE_PACKAGE_LOCK_SHA256;
+  if (packages === undefined || !isAbsolute(packages) || !/^[a-f0-9]{64}$/u.test(packageDigest ?? "") ||
+      packageLock === undefined || !isAbsolute(packageLock) || !/^[a-f0-9]{64}$/u.test(lockDigest ?? "")) {
+    throw new Error("offline build requires digest-pinned SANDSURF_ALPINE_PACKAGES_ARCHIVE and SANDSURF_ALPINE_PACKAGE_LOCK inputs with their SHA256 variables; packages must include linux-virt, mkinitfs and openssh");
   }
-
-  const systemRoot = resolve(temporary, "development-root");
-  const toolRoot = resolve(temporary, "apk-tool-root");
-  await mkdir(systemRoot);
-  await mkdir(toolRoot);
-  for (const [archive, destination] of [[targetArchive, systemRoot], [toolArchive, toolRoot]] as const) {
-    await run("tar", [
-      "--extract", "--gzip", "--file", archive, "--directory", destination,
-      "--no-same-owner",
-    ]);
+  const stagedPackages = resolve(temporary, "offline-apks.tar.gz");
+  const stagedLock = resolve(temporary, "package-lock");
+  await copyFile(packages, stagedPackages, constants.COPYFILE_EXCL);
+  await copyFile(packageLock, stagedLock, constants.COPYFILE_EXCL);
+  if (await sha256BoundedFile(stagedPackages, 1024 * 1024 * 1024) !== packageDigest ||
+      await sha256BoundedFile(stagedLock, 1024 * 1024) !== lockDigest) {
+    throw new Error("offline package inputs differ from their reviewed digests");
   }
-  const apk = resolve(toolRoot, "sbin/apk");
-  const loader = resolve(toolRoot, `lib/ld-musl-${toolArchitecture}.so.1`);
-  await run(loader, [
-    "--library-path", `${resolve(toolRoot, "lib")}:${resolve(toolRoot, "usr/lib")}`,
-    apk,
-    "--root", systemRoot,
-    "--arch", imageBuild.alpineArchitecture,
-    "--no-cache",
-    "--no-scripts",
-    "--repository", `${alpineRepository}/main`,
-    "--repository", `${alpineRepository}/community`,
-    "add",
-    "alpine-base=3.24.2-r0",
-    "ca-certificates=20260909-r0",
-    "busybox-extras=1.37.0-r31",
-    "git=2.54.0-r0",
-    "openrc=0.63.2-r0",
-    "sudo=1.9.17_p2-r1",
-    "e2fsprogs=1.47.4-r0",
-    "e2fsprogs-extra=1.47.4-r0",
-  ]);
-
-  const installed = await readFile(resolve(systemRoot, "lib/apk/db/installed"), "utf8");
-  const packages = parseInstalledPackages(installed);
-  if (JSON.stringify(packages) !== JSON.stringify([...expectedAlpinePackages].sort())) {
-    throw new Error("installed Alpine package closure differs from the reviewed development image lock");
+  const targetArchive = resolve(temporary, "alpine-minirootfs.tar.gz");
+  await run("curl", ["--fail", "--location", "--silent", "--show-error", "--output", targetArchive,
+    `${alpineRepository}/releases/${imageBuild.alpineArchitecture}/alpine-minirootfs-${alpineVersion}-${imageBuild.alpineArchitecture}.tar.gz`]);
+  if (sha256(await readFile(targetArchive)) !== imageBuild.alpineSha256) throw new Error("Alpine root digest mismatch");
+  // Only reviewed recipe files enter this host tree. Neither the distribution
+  // archive nor package contents are unpacked or executed by the host.
+  const overlay = resolve(temporary, "recipe");
+  await mkdir(resolve(overlay, "usr/sbin"), { recursive: true });
+  await copyFile(guestAgent, resolve(overlay, "usr/sbin/sandsurf-guest"));
+  await chmod(resolve(overlay, "usr/sbin/sandsurf-guest"), 0o755);
+  const recipePaths = ["etc/inittab", "etc/fstab", "etc/network/interfaces", "etc/init.d/sandsurf-management", "etc/init.d/sandsurf-expand-root",
+    "etc/init.d/sandsurf-clone-identity", "etc/sudoers.d/agent", "etc/apk/commit_hooks.d/sandsurf-boot",
+    "usr/sbin/sandsurf-select-boot", "sandsurf-build.sh"];
+  for (const path of recipePaths) {
+    const destination = resolve(overlay, path);
+    await mkdir(resolve(destination, ".."), { recursive: true });
+    await copyFile(resolve("scripts/guest-image", path), destination);
+    await chmod(destination, path === "sandsurf-build.sh" || path.startsWith("usr/") || path.includes("init.d/") || path.includes("commit_hooks.d/") ? 0o755 : path.includes("sudoers") ? 0o440 : 0o644);
   }
-  for (const [relative, label] of [
-    ["bin/busybox", "BusyBox"],
-    ["bin/busybox-extras", "BusyBox extras"],
-    ["sbin/apk", "apk"],
-    ["usr/bin/git", "Git"],
-  ] as const) {
-    const bytes = await boundedRegularFile(resolve(systemRoot, relative), 64 * 1024 * 1024, label, true);
-    assertElfArchitecture(bytes, label);
-  }
-  const caBundle = await boundedRegularFile(
-    resolve(systemRoot, "etc/ssl/certs/ca-certificates.crt"),
-    4 * 1024 * 1024,
-    "Alpine CA bundle",
-    true,
-  );
-  if (caBundle.includes(0) || !caBundle.includes(Buffer.from("-----BEGIN CERTIFICATE-----", "ascii"))) {
-    throw new Error("Alpine CA bundle is not a PEM certificate bundle");
-  }
-  await appendAccount(resolve(systemRoot, "etc/passwd"), "agent", "agent:x:1000:1000:agent:/home/agent:/bin/sh");
-  await appendAccount(resolve(systemRoot, "etc/group"), "agent", "agent:x:1000:");
-  await configureLinuxSystem(systemRoot, guestAgent);
-  await normalizeTimestamps(systemRoot);
-
-  await mkdir(resolve(systemRoot, "home/agent"), { recursive: true, mode: 0o775 });
-  await mkdir(resolve(systemRoot, "workspace"), { recursive: true, mode: 0o775 });
-  const canonicalTar = resolve(temporary, "development-root.tar");
-  await run("cargo", [
-    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "archive_system", "--",
-    systemRoot, canonicalTar,
-  ]);
-  const builderDigest = (await run("cargo", [
-    "run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "materialize_ext4", "--",
-    canonicalTar, output, String(128 * 1024 * 1024),
-  ], process.cwd(), {}, true)).trim();
-  if (!/^[a-f0-9]{64}$/u.test(builderDigest)) throw new Error("filesystem builder did not return its provenance digest");
-
-  const packageLock = Buffer.from(`${packages.join("\n")}\n`, "utf8");
-  const recipeFiles = ["scripts/build-guest-image.ts", "crates/sandsurf-image/examples/archive_system.rs", "crates/sandsurf-image/src/ext4.rs",
-    ...["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/init.d/sandsurf-expand-root", "etc/sudoers.d/agent"].map((path) => `scripts/guest-image/${path}`)];
-  const recipe = Object.fromEntries(await Promise.all(recipeFiles.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
+  await copyFile(stagedLock, resolve(overlay, "expected-package-lock"));
+  const archive = resolve(temporary, "recipe.tar");
+  await run("cargo", ["run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "archive_system", "--", overlay, archive]);
+  await run("cargo", ["run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "build_alpine", "--",
+    targetArchive, stagedPackages, archive, output, resolve(temporary, "boot")]);
+  const recipe = Object.fromEntries(await Promise.all(recipePaths.map(async (path) => [path, sha256(await readFile(resolve("scripts/guest-image", path)))])));
+  const helperSources = ["crates/sandsurf-image/src/appliance.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
+  const helperRecipe = Object.fromEntries(await Promise.all(helperSources.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
   const materials = {
     "alpine-minirootfs": imageBuild.alpineSha256,
-    "alpine-packages": sha256(packageLock),
-    "sandsurf-ext4-builder": builderDigest,
+    "alpine-offline-packages": packageDigest!,
+    "alpine-package-lock": lockDigest!,
     "sandsurf-system-recipe": identityDigest(recipe),
+    "sandsurf-appliance-recipe": identityDigest(helperRecipe),
     "sandsurf-management": sha256(await readFile(guestAgent)),
   };
-  return {
-    sourceDigest: identityDigest(materials),
-    materials,
-  };
-}
-
-async function configureLinuxSystem(root: string, guestAgent: string): Promise<void> {
-  for (const directory of ["usr/sbin", "var/lib/sandsurf", "var/log", "etc/sudoers.d", "dev/pts", "run"]) {
-    await mkdir(resolve(root, directory), { recursive: true });
-  }
-  await copyFile(guestAgent, resolve(root, "usr/sbin/sandsurf-guest"));
-  await chmod(resolve(root, "usr/sbin/sandsurf-guest"), 0o755);
-  for (const relative of ["etc/inittab", "etc/fstab", "etc/init.d/sandsurf-management", "etc/init.d/sandsurf-expand-root", "etc/sudoers.d/agent"]) {
-    await copyFile(resolve("scripts/guest-image", relative), resolve(root, relative));
-    await chmod(resolve(root, relative), relative.startsWith("etc/init.d/") ? 0o755 : relative.includes("sudoers") ? 0o440 : 0o644);
-  }
-  // These are ordinary guest OS permissions, changeable by its administrator.
-  await chmod(resolve(root, "usr/bin/sudo"), 0o4755);
-  await writeFile(resolve(root, "etc/rc.conf"), 'rc_cgroup_mode="unified"\n', { mode: 0o644 });
-  const runlevels = {
-    sysinit: ["devfs", "procfs", "sysfs", "mdev", "cgroups"],
-    boot: ["root", "sandsurf-expand-root", "localmount", "bootmisc", "machine-id", "hostname", "loopback"],
-    default: ["sandsurf-management"],
-    shutdown: ["killprocs", "mount-ro"],
-  } as const;
-  for (const [runlevel, services] of Object.entries(runlevels)) {
-    const directory = resolve(root, "etc/runlevels", runlevel);
-    await mkdir(directory, { recursive: true });
-    for (const service of services) await symlink(`../../init.d/${service}`, resolve(directory, service));
-  }
-}
-
-function parseInstalledPackages(database: string): string[] {
-  const packages: string[] = [];
-  for (const record of database.split("\n\n")) {
-    const name = /^P:(.+)$/mu.exec(record)?.[1];
-    const version = /^V:(.+)$/mu.exec(record)?.[1];
-    if (name !== undefined && version !== undefined) packages.push(`${name}=${version}`);
-  }
-  return packages.sort();
-}
-
-async function appendAccount(path: string, name: string, record: string): Promise<void> {
-  const current = await readFile(path, "utf8");
-  if (current.split("\n").some((line) => line.startsWith(`${name}:`))) {
-    throw new Error(`Alpine development root already defines ${name}`);
-  }
-  await writeFile(path, `${current.endsWith("\n") ? current : `${current}\n`}${record}\n`, { mode: 0o644 });
+  return { sourceDigest: identityDigest(materials), materials };
 }
 
 function assertElfArchitecture(bytes: Buffer, label: string): void {
@@ -441,20 +320,27 @@ async function boundedRegularFile(
   label: string,
   allowWritable = false,
 ): Promise<Buffer> {
-  const metadata = await stat(path);
+  const metadata = await lstat(path);
   if (!metadata.isFile() || metadata.size === 0 || metadata.size > maximum || (!allowWritable && (metadata.mode & 0o022) !== 0)) {
     throw new Error(`${label} must be a bounded, non-writable regular file`);
   }
   return readFile(path);
 }
 
-async function normalizeTimestamps(path: string): Promise<void> {
+async function sha256BoundedFile(path: string, maximum: number): Promise<string> {
   const metadata = await lstat(path);
-  if (metadata.isDirectory()) {
-    for (const entry of await readdir(path)) await normalizeTimestamps(resolve(path, entry));
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size === 0 || metadata.size > maximum) {
+    throw new Error("image input is not a bounded regular file");
   }
-  if (metadata.isSymbolicLink()) await lutimes(path, 1_700_000_000, 1_700_000_000);
-  else await utimes(path, 1_700_000_000, 1_700_000_000);
+  const hash = createHash("sha256");
+  let bytes = 0;
+  for await (const chunk of createReadStream(path)) {
+    bytes += chunk.length;
+    if (bytes > maximum) throw new Error("image input grew beyond bound");
+    hash.update(chunk);
+  }
+  if (bytes !== metadata.size) throw new Error("image input changed length");
+  return hash.digest("hex");
 }
 
 async function replaceArtifact(source: string, destination: string): Promise<void> {
@@ -471,7 +357,7 @@ async function replaceArtifact(source: string, destination: string): Promise<voi
 
 function identityDigest(value: unknown): string {
   const chunks: Buffer[] = [];
-  putBytes(chunks, Buffer.from("SBX-DIGEST-1"));
+  putBytes(chunks, Buffer.from("SANDSURF-COMPUTER-DIGEST-1"));
   putBytes(chunks, Buffer.from("IDENTITY"));
   encodeCanonical(chunks, value);
   return sha256(Buffer.concat(chunks));

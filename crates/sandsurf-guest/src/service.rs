@@ -119,7 +119,7 @@ impl ManagementService {
     pub fn rebind_generation(
         &self,
         snapshot_id: &SnapshotId,
-        _capture_operation_id: &OperationId,
+        capture_operation_id: &OperationId,
         machine_id: MachineId,
         previous_generation: Counter,
         generation: Counter,
@@ -129,13 +129,43 @@ impl ManagementService {
             .write()
             .map_err(|_| io::Error::other("workload command barrier is unavailable"))?;
         self.processes
-            .rebind_generation(snapshot_id, machine_id, previous_generation, generation)
+            .rebind_generation(
+                snapshot_id,
+                capture_operation_id,
+                machine_id,
+                previous_generation,
+                generation,
+            )
             .map_err(io::Error::other)?;
         Ok(bytes_digest(b"guest-workload-generation-rebound-v1"))
     }
 
     fn handle_inner(&self, request: GuestServiceRequest) -> ServiceResult<GuestServiceResponse> {
         match request {
+            GuestServiceRequest::StageExecutionRestore {
+                snapshot_id,
+                capture_operation_id,
+                machine_id,
+                previous_generation,
+                generation,
+                executions,
+            } => {
+                self.processes
+                    .stage_restore(
+                        snapshot_id,
+                        capture_operation_id,
+                        machine_id,
+                        previous_generation,
+                        generation,
+                        executions,
+                    )
+                    .map_err(process_error)?;
+                Ok(GuestServiceResponse::Effect {
+                    outcome: sandsurf_protocol::GuestEffectOutcome::Applied {
+                        evidence: bytes_digest(b"execution-restore-membership-staged"),
+                    },
+                })
+            }
             GuestServiceRequest::RebindGeneration { .. } | GuestServiceRequest::ProbeIdentity => {
                 Err((
                     "request.internal",

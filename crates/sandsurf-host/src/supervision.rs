@@ -17,6 +17,12 @@ const VERSION: u16 = 1;
 const MAX_CHILDREN: usize = 4096;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
+struct OwnedGuardian {
+    child: Child,
+    #[cfg(target_os = "linux")]
+    native_unit: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
@@ -74,11 +80,11 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
     let root = sandsurf_native::local::canonical_private_directory(root)?;
     sandsurf_native::local::ensure_private_directory(&root.join("supervision"))?;
     let listener = LocalListener::bind(&root.join("supervision"))?;
-    let mut children = BTreeMap::<MachineId, Child>::new();
+    let mut children = BTreeMap::<MachineId, OwnedGuardian>::new();
     loop {
         let mut reaped = Vec::new();
-        for (machine, child) in &mut children {
-            if child.try_wait()?.is_some() {
+        for (machine, owner) in &mut children {
+            if owner.child.try_wait()?.is_some() {
                 reaped.push(machine.clone());
             }
         }
@@ -100,7 +106,7 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
             Request::Check { machine } => {
                 if children
                     .get_mut(&machine)
-                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+                    .is_some_and(|owner| matches!(owner.child.try_wait(), Ok(None)))
                 {
                     Ok(())
                 } else {
@@ -117,14 +123,26 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
             Request::Shutdown => {
                 // Explicit host-account/service-manager containment, never SDK
                 // disconnection or host API shutdown. Journals/disks are kept.
-                for child in children.values_mut() {
-                    if child.try_wait()?.is_none()
-                        && let Err(error) = child.kill()
-                        && child.try_wait()?.is_none()
+                for (_machine, owner) in &mut children {
+                    #[cfg(target_os = "linux")]
+                    if owner.native_unit {
+                        let machine_root =
+                            root.join("machines").join(object_name(_machine.as_str()));
+                        let mut stop = Command::new("systemctl");
+                        stop.args([
+                            "--user",
+                            "stop",
+                            &sandsurf_native::resources::unit_name(&machine_root)?,
+                        ]);
+                        sandsurf_native::resources::run_bounded(stop)?;
+                    }
+                    if owner.child.try_wait()?.is_none()
+                        && let Err(error) = owner.child.kill()
+                        && owner.child.try_wait()?.is_none()
                     {
                         return Err(error);
                     }
-                    child.wait()?;
+                    owner.child.wait()?;
                 }
                 children.clear();
                 Ok(())
@@ -178,7 +196,7 @@ fn ensure(
     root: &Path,
     executable: &Path,
     machine: MachineId,
-    children: &mut BTreeMap<MachineId, Child>,
+    children: &mut BTreeMap<MachineId, OwnedGuardian>,
 ) -> io::Result<()> {
     if children.contains_key(&machine) {
         return Ok(());
@@ -210,6 +228,15 @@ fn ensure(
     if children.len() >= MAX_CHILDREN {
         return Err(io::Error::other("guardian supervision capacity exhausted"));
     }
+    #[cfg(target_os = "linux")]
+    let native_unit = {
+        let journal = sandsurf_state::RuntimeJournal::open(&machine_root.join("runtime"), &machine)
+            .map_err(io::Error::other)?;
+        !journal
+            .last_observation()
+            .map_err(io::Error::other)?
+            .is_some_and(|value| value.value().state == sandsurf_protocol::MachineState::Destroyed)
+    };
     let path = machine_root.join("guardian/guardian.log");
     let mut log = match sandsurf_native::local::create_private_file(&path) {
         Ok(log) => log,
@@ -222,7 +249,38 @@ fn ensure(
         Err(error) => return Err(error),
     };
     log.seek(SeekFrom::End(0))?;
-    let child = Command::new(executable)
+    #[cfg(target_os = "linux")]
+    let mut command = if native_unit {
+        let config =
+            crate::linux::read_config(&machine_root.join("guardian/config.json"), &machine)
+                .map_err(io::Error::other)?;
+        let mut command = Command::new("systemd-run");
+        command.args([
+            "--user",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--quiet",
+            "--service-type=exec",
+        ]);
+        command.arg(format!(
+            "--unit={}",
+            sandsurf_native::resources::unit_name(&machine_root)?
+        ));
+        for property in sandsurf_native::resources::systemd_properties(config.resources())? {
+            command.arg(format!("--property={property}"));
+        }
+        // The service inherits none of the supervisor's guest descriptors.
+        command.arg("--").arg(executable);
+        command
+    } else {
+        // No VM exists. Historical access is a short-lived journal owner in
+        // the bounded supervisor pool, not a resurrected VM-sized reservation.
+        Command::new(executable)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(executable);
+    let child = command
         .args(["guardian", "--directory"])
         .arg(root)
         .arg("--machine")
@@ -231,7 +289,14 @@ fn ensure(
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()?;
-    children.insert(machine, child);
+    children.insert(
+        machine,
+        OwnedGuardian {
+            child,
+            #[cfg(target_os = "linux")]
+            native_unit,
+        },
+    );
     Ok(())
 }
 

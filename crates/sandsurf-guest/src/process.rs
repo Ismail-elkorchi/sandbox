@@ -80,11 +80,12 @@ struct ProcessEntry {
     input: Mutex<Option<Input>>,
     input_lease: Mutex<Option<TerminalId>>,
     terminal: Option<File>,
-    spool: Arc<OutputSpool>,
+    spool: RwLock<Arc<OutputSpool>>,
+    incarnation: RwLock<()>,
     state: Mutex<ExecutionState>,
     changed: Condvar,
     deadline_exceeded: AtomicBool,
-    record_path: PathBuf,
+    record_path: RwLock<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +95,6 @@ pub(crate) struct ProcessRecord {
     pub(crate) request: SpawnRequest,
     pub(crate) guest_pid: u32,
     pub(crate) state: ExecutionState,
-    #[serde(default)]
     pub(crate) lineage: Option<ExecutionLineage>,
 }
 
@@ -253,11 +253,12 @@ impl ExecutionKeeper {
             input: Mutex::new(Some(spawned.input)),
             input_lease: Mutex::new(None),
             terminal: spawned.terminal,
-            spool,
+            spool: RwLock::new(spool),
+            incarnation: RwLock::new(()),
             state: Mutex::new(initial_state),
             changed: Condvar::new(),
             deadline_exceeded: AtomicBool::new(false),
-            record_path,
+            record_path: RwLock::new(record_path),
         });
         processes.insert(request.execution_id.clone(), Arc::clone(&entry));
         drop(processes);
@@ -276,67 +277,129 @@ impl ExecutionKeeper {
         entry.snapshot()
     }
 
-    pub fn rebind_generation(
+    pub fn restore_execution(
         &self,
         snapshot_id: &SnapshotId,
-        machine_id: MachineId,
-        previous_generation: Counter,
+        captured: &sandsurf_protocol::CapturedExecution,
         generation: Counter,
     ) -> Result<(), ProcessError> {
-        if generation == Counter::ZERO {
-            return Err(ProcessError::Invalid(
-                "restored generation must be positive",
-            ));
+        let (request, lineage) = captured
+            .restored(snapshot_id, &captured.admission.machine_id, generation)
+            .map_err(|_| ProcessError::Invalid("restore execution membership invalid"))?;
+        let mut processes = self
+            .processes
+            .lock()
+            .map_err(|_| ProcessError::Invalid("process map unavailable"))?;
+        if let Some(entry) = processes.get(&request.execution_id) {
+            let value = entry.snapshot()?;
+            return if value.request == request && value.lineage == Some(lineage) {
+                Ok(())
+            } else {
+                Err(ProcessError::Conflict("restored incarnation already bound"))
+            };
         }
+        let entry = processes
+            .get(&captured.admission.execution_id)
+            .cloned()
+            .ok_or(ProcessError::Missing)?;
+        let _transition = entry
+            .incarnation
+            .write()
+            .map_err(|_| ProcessError::Invalid("incarnation unavailable"))?;
+        let mut current = entry
+            .request
+            .write()
+            .map_err(|_| ProcessError::Invalid("request unavailable"))?;
+        if *current != captured.admission {
+            return Err(ProcessError::Conflict("restore source admission mismatch"));
+        }
+        let mut spool = entry
+            .spool
+            .write()
+            .map_err(|_| ProcessError::Invalid("spool unavailable"))?;
+        let mut record_location = entry
+            .record_path
+            .write()
+            .map_err(|_| ProcessError::Invalid("record path unavailable"))?;
+        let mut origin = entry
+            .lineage
+            .write()
+            .map_err(|_| ProcessError::Invalid("lineage unavailable"))?;
+        let mut lease = entry
+            .input_lease
+            .lock()
+            .map_err(|_| ProcessError::Invalid("input lease unavailable"))?;
         let mut identity = self
             .identity
             .write()
-            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-identity-poisoned")))?;
-        if identity.generation != previous_generation {
-            return Err(ProcessError::Conflict(
-                "restored source generation mismatch",
-            ));
+            .map_err(|_| ProcessError::Invalid("keeper identity unavailable"))?;
+        let directory = self.root.join(request.execution_id.as_str());
+        fs::create_dir_all(&directory)?;
+        let record_path = directory.join("process.json");
+        let published = record_path.exists();
+        if published {
+            let record = read_process_record(&record_path)?;
+            if record.request != request
+                || record.lineage != Some(lineage.clone())
+                || record.guest_pid != entry.pid
+            {
+                return Err(ProcessError::Conflict(
+                    "published restore incarnation differs",
+                ));
+            }
         }
-        let source_machine_id = identity.machine_id.clone();
+        let suffix = Arc::new(spool.restored_suffix(
+            &directory.join("output.ssf"),
+            &current,
+            &captured.output,
+            &request,
+        )?);
+        let mut state = entry
+            .state
+            .lock()
+            .map_err(|_| ProcessError::Invalid("state unavailable"))?;
+        if let ExecutionState::Exited(completion) = &mut *state {
+            completion.output = suffix.finalize()?;
+        }
+        write_process_record(
+            &record_path,
+            &ProcessRecord {
+                version: PROCESS_RECORD_VERSION,
+                request: request.clone(),
+                guest_pid: entry.pid,
+                state: state.clone(),
+                lineage: Some(lineage.clone()),
+            },
+            !published,
+        )?;
+        *record_location = record_path;
+        *origin = Some(lineage);
+        *lease = None;
+        *current = request.clone();
+        *spool = suffix;
+        identity.generation = generation;
+        processes.remove(&captured.admission.execution_id);
+        processes.insert(request.execution_id, Arc::clone(&entry));
+        Ok(())
+    }
+
+    pub fn current_execution_id(&self) -> Result<ExecutionId, ProcessError> {
         let processes = self
             .processes
             .lock()
-            .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-map-poisoned")))?;
-        for entry in processes.values() {
-            let mut request = entry
-                .request
-                .write()
-                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-request-poisoned")))?;
-            if request.generation != previous_generation {
-                continue;
-            }
-            request.machine_id = machine_id.clone();
-            request.generation = generation;
-            let lineage = ExecutionLineage {
-                source_machine_id: source_machine_id.clone(),
-                source_generation: previous_generation,
-                snapshot_id: snapshot_id.clone(),
-            };
-            *entry
-                .lineage
-                .write()
-                .map_err(|_| ProcessError::Unknown(bytes_digest(b"process-lineage-poisoned")))? =
-                Some(lineage.clone());
-            write_process_record(
-                &entry.record_path,
-                &ProcessRecord {
-                    version: PROCESS_RECORD_VERSION,
-                    request: request.clone(),
-                    guest_pid: entry.pid,
-                    state: entry.state()?,
-                    lineage: Some(lineage),
-                },
-                false,
-            )?;
-        }
-        identity.machine_id = machine_id;
-        identity.generation = generation;
-        Ok(())
+            .map_err(|_| ProcessError::Invalid("process map unavailable"))?;
+        processes
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .request
+                    .read()
+                    .ok()
+                    .map(|value| (value.generation, value.execution_id.clone()))
+            })
+            .max_by_key(|(generation, _)| *generation)
+            .map(|(_, id)| id)
+            .ok_or(ProcessError::Missing)
     }
 
     pub fn get(&self, id: &ExecutionId) -> Result<ExecutionSnapshot, ProcessError> {
@@ -554,7 +617,12 @@ impl ExecutionKeeper {
         after: Counter,
         maximum: usize,
     ) -> Result<RetainedPage, ProcessError> {
-        Ok(self.entry(id)?.spool.read(after, maximum)?)
+        Ok(self
+            .entry(id)?
+            .spool
+            .read()
+            .map_err(|_| ProcessError::Invalid("spool unavailable"))?
+            .read(after, maximum)?)
     }
 
     fn entry(&self, id: &ExecutionId) -> Result<Arc<ProcessEntry>, ProcessError> {
@@ -631,11 +699,12 @@ impl ExecutionKeeper {
                     input: Mutex::new(None),
                     input_lease: Mutex::new(None),
                     terminal: None,
-                    spool,
+                    spool: RwLock::new(spool),
+                    incarnation: RwLock::new(()),
                     state: Mutex::new(record.state),
                     changed: Condvar::new(),
                     deadline_exceeded: AtomicBool::new(false),
-                    record_path,
+                    record_path: RwLock::new(record_path),
                 }),
             );
         }
@@ -681,6 +750,10 @@ impl ProcessEntry {
     }
 
     fn snapshot(&self) -> Result<ExecutionSnapshot, ProcessError> {
+        let _transition = self
+            .incarnation
+            .read()
+            .map_err(|_| ProcessError::Invalid("incarnation unavailable"))?;
         Ok(ExecutionSnapshot {
             request: self
                 .request
@@ -697,7 +770,27 @@ impl ProcessEntry {
         })
     }
 
-    fn finish(&self, value: ExecutionState) {
+    fn finish(&self, mut value: ExecutionState) {
+        let Ok(_transition) = self.incarnation.read() else {
+            return;
+        };
+        // Finalization may have raced with restore. Bind EOF to the current
+        // incarnation's spool while the identity transition is excluded.
+        if let ExecutionState::Exited(completion) = &mut value {
+            match self
+                .spool
+                .read()
+                .ok()
+                .and_then(|spool| spool.finalize().ok())
+            {
+                Some(output) => completion.output = output,
+                None => {
+                    value = ExecutionState::Unknown {
+                        evidence: bytes_digest(b"current-output-finalization-failed"),
+                    }
+                }
+            }
+        }
         let (Ok(request), Ok(lineage)) = (self.request.read(), self.lineage.read()) else {
             if let Ok(mut state) = self.state.lock() {
                 *state = ExecutionState::Unknown {
@@ -714,7 +807,12 @@ impl ProcessEntry {
             state: value.clone(),
             lineage: lineage.clone(),
         };
-        let value = match write_process_record(&self.record_path, &record, false) {
+        let written = self
+            .record_path
+            .read()
+            .map_err(|_| ProcessError::Invalid("process record path unavailable"))
+            .and_then(|path| write_process_record(&path, &record, false));
+        let value = match written {
             Ok(()) => value,
             Err(error) => {
                 eprintln!("sandsurf process terminal record failed: {error}");
@@ -762,7 +860,7 @@ pub(crate) fn read_process_record(path: &Path) -> Result<ProcessRecord, ProcessE
     serde_json::from_slice(&bytes).map_err(|_| ProcessError::Invalid("process record is malformed"))
 }
 
-fn write_process_record(
+pub(crate) fn write_process_record(
     path: &Path,
     value: &ProcessRecord,
     create: bool,
@@ -772,30 +870,27 @@ fn write_process_record(
     if bytes.is_empty() || bytes.len() as u64 > MAX_PROCESS_RECORD_BYTES {
         return Err(ProcessError::Invalid("process record exceeds bound"));
     }
-    if create {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    } else {
-        let temporary = path.with_extension("json.new");
-        match fs::remove_file(&temporary) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
+    let temporary = path.with_extension("json.new");
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let result = if create {
+        fs::hard_link(&temporary, path)
+    } else {
+        fs::rename(&temporary, path)
+    };
+    let _ = fs::remove_file(&temporary);
+    result?;
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
@@ -979,7 +1074,10 @@ fn start_reader(
                             }
                         }
                     }
-                    if entry.spool.append(stream, &buffer[..count]).is_err() || failed {
+                    if entry.spool.read().map_or(true, |spool| {
+                        spool.append(stream, &buffer[..count]).is_err()
+                    }) || failed
+                    {
                         entry.kill_owned();
                         break;
                     }
@@ -1107,13 +1205,18 @@ fn start_waiter(entry: Arc<ProcessEntry>, child: Child, readers: Vec<JoinHandle<
         // kills them nor waits for their process-group lifetime. Only owners
         // of inherited output descriptors delay this capture boundary.
         let readers_complete = readers.into_iter().all(|reader| reader.join().is_ok());
-        if !readers_complete || entry.spool.has_failed() {
+        if !readers_complete || entry.spool.read().map_or(true, |spool| spool.has_failed()) {
             entry.finish(ExecutionState::Unknown {
                 evidence: bytes_digest(b"output-retention-incomplete"),
             });
             return;
         }
-        match entry.spool.finalize() {
+        let finalized = entry
+            .spool
+            .read()
+            .map_err(|_| SpoolError::Failed)
+            .and_then(|spool| spool.finalize());
+        match finalized {
             Ok(output) => entry.finish(ExecutionState::Exited(ExecutionCompletion {
                 outcome,
                 output,
@@ -1392,6 +1495,127 @@ mod tests {
             elapsed_deadline_unix_millis: None,
             output_bytes: (1024 * 1024u64).try_into().unwrap(),
         }
+    }
+
+    #[test]
+    fn restored_keeper_rotates_streams_and_preserves_physical_source_identity() {
+        let root = Temp::new();
+        let keeper =
+            ExecutionKeeper::create(&root.0, "box".try_into().unwrap(), Counter::ONE).unwrap();
+        let source = request(
+            "restore-source",
+            "printf prefix; read first; printf before; read second; printf after",
+            StdioMode::Pipes,
+        );
+        let observation = keeper.spawn(source.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while keeper
+            .read_output(&source.execution_id, Counter::ZERO, 1024)
+            .unwrap()
+            .available
+            .get()
+            < 6
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let page = keeper
+            .read_output(&source.execution_id, Counter::ZERO, 1024)
+            .unwrap();
+        let mut anchor = sandsurf_protocol::initial_output_boundary(
+            &source.machine_id,
+            &source.execution_id,
+            source.generation,
+        )
+        .unwrap();
+        for chunk in page.chunks {
+            anchor = sandsurf_protocol::extend_output_boundary(
+                &anchor,
+                anchor.chunks.next().unwrap(),
+                chunk.stream,
+                &chunk.bytes,
+            )
+            .unwrap();
+        }
+        let captured = sandsurf_protocol::CapturedExecution {
+            admission: source.clone(),
+            lineage: None,
+            observation: Some(observation),
+            output: anchor,
+        };
+        keeper
+            .write_input(&source.execution_id, None, b"\n")
+            .unwrap();
+        while keeper
+            .read_output(&source.execution_id, Counter::ZERO, 1024)
+            .unwrap()
+            .available
+            .get()
+            < 12
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let source_file = root.0.join(source.execution_id.as_str()).join("output.ssf");
+        let original = fs::read(&source_file).unwrap();
+        let snapshot: SnapshotId = "keeper-snapshot".try_into().unwrap();
+        let generation: Counter = 2_u64.try_into().unwrap();
+        let (restored, lineage) = captured
+            .restored(&snapshot, &source.machine_id, generation)
+            .unwrap();
+        keeper
+            .restore_execution(&snapshot, &captured, generation)
+            .unwrap();
+        keeper
+            .restore_execution(&snapshot, &captured, generation)
+            .unwrap();
+        assert!(matches!(
+            keeper.get(&source.execution_id),
+            Err(ProcessError::Missing)
+        ));
+        assert_eq!(
+            keeper.get(&restored.execution_id).unwrap().lineage,
+            Some(lineage)
+        );
+        let suffix = keeper
+            .read_output(&restored.execution_id, Counter::ZERO, 1024)
+            .unwrap();
+        assert_eq!(suffix.chunks[0].cursor, Counter::ZERO);
+        assert_eq!(suffix.chunks[0].bytes, b"before");
+        keeper
+            .write_input(&restored.execution_id, None, b"\n")
+            .unwrap();
+        let completion = keeper
+            .wait(&restored.execution_id, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(completion.output.final_cursor.get(), 11);
+        assert_eq!(fs::read(source_file).unwrap(), original);
+        let source_record = read_process_record(
+            &root
+                .0
+                .join(source.execution_id.as_str())
+                .join("process.json"),
+        )
+        .unwrap();
+        assert_eq!(source_record.request, source);
+        let record = read_process_record(
+            &root
+                .0
+                .join(restored.execution_id.as_str())
+                .join("process.json"),
+        )
+        .unwrap();
+        assert_eq!(record.request, restored);
+        let page = keeper
+            .read_output(&restored.execution_id, Counter::ZERO, 1024)
+            .unwrap();
+        assert_eq!(
+            page.chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.bytes)
+                .collect::<Vec<_>>(),
+            b"beforeafter"
+        );
     }
 
     #[test]

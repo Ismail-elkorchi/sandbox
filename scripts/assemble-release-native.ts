@@ -41,7 +41,7 @@ export async function assembleNativeRelease(stagingRoot: string, destination: st
       const manifestPath = resolve(artifact, "manifest.json");
       await regular(manifestPath, 1024 * 1024);
       const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
-      if (!record(manifest) || manifest.formatVersion !== 1 || manifest.buildId !== "sandsurf-native-0.1.0" || !record(manifest.files)) {
+      if (!record(manifest) || manifest.formatVersion !== 1 || manifest.buildId !== "sandsurf-native-1.0.0" || !record(manifest.files)) {
         throw new Error(`${platform} build manifest is invalid`);
       }
       const source = resolve(artifact, platform);
@@ -73,7 +73,7 @@ export async function assembleNativeRelease(stagingRoot: string, destination: st
       }
     }
     await writeFile(resolve(staged, "manifest.json"), `${JSON.stringify({
-      formatVersion: 1, buildId: "sandsurf-native-0.1.0",
+      formatVersion: 1, buildId: "sandsurf-native-1.0.0",
       files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
     }, null, 2)}\n`, { flag: "wx", mode: 0o644 });
     try {

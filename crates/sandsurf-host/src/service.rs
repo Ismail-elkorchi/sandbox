@@ -1,4 +1,3 @@
-use crate::api::OciSource;
 use crate::api::{
     HOST_API_VERSION, HostInspection, HostRequest, HostResponse, MachineView, ReservationView,
 };
@@ -168,12 +167,11 @@ impl HostService {
             let host_id = random_id("host")?
                 .try_into()
                 .map_err(|_| HostError::Invalid("host identity generation failed"))?;
-            HostCatalog::create(&catalog_path, host_id, catalog_limits())?
+            HostCatalog::create(&catalog_path, host_id, catalog_limits(root)?)?
         };
         prepare_directory(&root.join("api"))?;
         prepare_directory(&root.join("machines"))?;
         prepare_directory(&root.join("images"))?;
-        prepare_directory(&root.join("snapshots"))?;
         prepare_directory(&root.join("transfers"))?;
         let artifacts = Arc::new(crate::artifacts::ArtifactStore::open(
             &root.join("transfers"),
@@ -206,6 +204,9 @@ impl HostService {
 
     fn route(&mut self, request: HostRequest) -> HostDispatch {
         let result = match request {
+            request @ (HostRequest::ImportOci { .. }
+            | HostRequest::ImportNativeImage { .. }
+            | HostRequest::PublishSnapshotImage { .. }) => self.prepare_image(request),
             HostRequest::ListHostTree {
                 machine_id,
                 operation_id,
@@ -295,6 +296,150 @@ impl HostService {
         result.unwrap_or_else(|error| HostDispatch::Ready(Box::new(rejected(error))))
     }
 
+    fn prepare_image(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        sandsurf_native::volume::inspect(&self.root)?;
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "externally limited image workers are unsupported on this adapter",
+            )
+            .into());
+        }
+        match request {
+            HostRequest::ImportOci {
+                source,
+                recipe,
+                platform,
+                operation_id,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Image,
+                    &(
+                        "sandsurf-import-oci-v1",
+                        &source,
+                        &recipe,
+                        &platform,
+                        &operation_id,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
+                        operation: admitted,
+                    })));
+                }
+                Ok(HostDispatch::Task(Box::new(HostTask::Image {
+                    root: self.root.clone(),
+                    executable: self.executable.clone(),
+                    job: crate::image_worker::Job {
+                        operation: operation_id,
+                        request_digest,
+                        build: crate::image_worker::Build::Oci {
+                            source,
+                            recipe,
+                            platform,
+                        },
+                    },
+                })))
+            }
+            HostRequest::ImportNativeImage {
+                manifest_path,
+                manifest_digest,
+                operation_id,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Image,
+                    &(
+                        "sandsurf-import-native-image-v1",
+                        &manifest_path,
+                        &manifest_digest,
+                        &operation_id,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
+                        operation: admitted,
+                    })));
+                }
+                Ok(HostDispatch::Task(Box::new(HostTask::Image {
+                    root: self.root.clone(),
+                    executable: self.executable.clone(),
+                    job: crate::image_worker::Job {
+                        operation: operation_id,
+                        request_digest,
+                        build: crate::image_worker::Build::Native {
+                            manifest_path,
+                            manifest_digest,
+                        },
+                    },
+                })))
+            }
+            HostRequest::PublishSnapshotImage {
+                snapshot_id,
+                allow_sensitive,
+                operation_id,
+                approval_id,
+            } => {
+                let snapshot = self
+                    .catalog
+                    .snapshot(&snapshot_id)?
+                    .ok_or(HostError::Invalid("image snapshot does not exist"))?;
+                let request_digest = digest(
+                    Domain::Image,
+                    &(
+                        "sandsurf-publish-snapshot-image-v1",
+                        &snapshot_id,
+                        allow_sensitive,
+                        &operation_id,
+                    ),
+                )?;
+                let admitted = self.catalog.admit_image_import(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
+                        operation: admitted,
+                    })));
+                }
+                Ok(HostDispatch::Task(Box::new(HostTask::Image {
+                    root: self.root.clone(),
+                    executable: self.executable.clone(),
+                    job: crate::image_worker::Job {
+                        operation: operation_id,
+                        request_digest,
+                        build: crate::image_worker::Build::Snapshot {
+                            snapshot: Box::new(snapshot),
+                            allow_sensitive,
+                        },
+                    },
+                })))
+            }
+            _ => Err(HostError::Invalid("request is not an image operation")),
+        }
+    }
+
     fn prepare_guest_dispatch(
         &mut self,
         machine_id: MachineId,
@@ -358,6 +503,30 @@ impl HostService {
 
     fn defer_runtime_read(&mut self, request: &HostRequest) -> Result<Option<DeferredRuntimeRead>> {
         let (machine_id, query) = match request {
+            HostRequest::ReadConsole {
+                machine_id,
+                generation,
+                after,
+                maximum,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::ReadConsole {
+                    generation: *generation,
+                    after: *after,
+                    maximum: *maximum,
+                },
+            ),
+            HostRequest::WriteConsole {
+                machine_id,
+                generation,
+                bytes,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::WriteConsole {
+                    generation: *generation,
+                    bytes: bytes.clone(),
+                },
+            ),
             HostRequest::ListEvents {
                 machine_id,
                 after,
@@ -464,9 +633,12 @@ impl HostService {
                     value: self.view(record)?,
                 })
             }
-            HostRequest::GetHostOperation { operation_id } => Ok(HostResponse::HostOperation {
-                value: self.catalog.operation(&operation_id)?,
-            }),
+            HostRequest::GetHostOperation { operation_id } => {
+                self.recover_image_import(&operation_id)?;
+                Ok(HostResponse::HostOperation {
+                    value: self.catalog.operation(&operation_id)?,
+                })
+            }
             HostRequest::ListImages { after, maximum } => Ok(HostResponse::Images {
                 values: self.catalog.images(after.as_ref(), maximum)?,
             }),
@@ -476,12 +648,15 @@ impl HostService {
                     .image(&digest)?
                     .ok_or(HostError::Invalid("image does not exist"))?,
             }),
-            HostRequest::GetImageImport { operation_id } => Ok(HostResponse::ImageImport {
-                operation: self
-                    .catalog
-                    .image_import(&operation_id)?
-                    .ok_or(HostError::Invalid("image import operation does not exist"))?,
-            }),
+            HostRequest::GetImageImport { operation_id } => {
+                self.recover_image_import(&operation_id)?;
+                Ok(HostResponse::ImageImport {
+                    operation: self
+                        .catalog
+                        .image_import(&operation_id)?
+                        .ok_or(HostError::Invalid("image import operation does not exist"))?,
+                })
+            }
             HostRequest::ReleaseImage {
                 digest: image_digest,
                 operation_id,
@@ -555,7 +730,7 @@ impl HostService {
                     return Ok(HostResponse::Snapshot { value: admitted });
                 }
                 self.provision_guardian(&request.machine_id)?;
-                let capture_root = self.root.join("snapshots");
+                let capture_root = crate::snapshots::root(&self.root, &admitted);
                 if admitted.phase == SnapshotPhase::Capturing {
                     let client = GuardianClient::new(self.guardian_endpoint(&request.machine_id));
                     match request.kind {
@@ -672,161 +847,11 @@ impl HostService {
                     )?,
                 })
             }
-            HostRequest::ImportOci {
-                source,
-                recipe,
-                platform,
-                operation_id,
-                approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-import-oci-v2",
-                        &source,
-                        &recipe,
-                        &platform,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostResponse::ImageImport {
-                        operation: admitted,
-                    });
-                }
-                let registry_credential = match &source {
-                    OciSource::Registry {
-                        credential: Some(secret),
-                        ..
-                    } => {
-                        let bytes = self.secrets.read(&secret.id, &secret.version)?;
-                        if Counter::try_from(bytes.len() as u64)? != secret.bytes {
-                            return Err(HostError::Invalid(
-                                "registry credential length differs from its approved version",
-                            ));
-                        }
-                        Some(Zeroizing::new(bytes))
-                    }
-                    _ => None,
-                };
-                let image = crate::images::import_oci(
-                    &self.root,
-                    &self.executable,
-                    crate::images::OciBuildInput {
-                        source: &source,
-                        recipe: &recipe,
-                        platform: &platform,
-                    },
-                    &operation_id,
-                    &request_digest,
-                    registry_credential.as_ref().map(|value| value.as_slice()),
-                )?;
-                Ok(HostResponse::ImageImport {
-                    operation: self.catalog.complete_image_import(
-                        &operation_id,
-                        &request_digest,
-                        image,
-                    )?,
-                })
-            }
-            HostRequest::ImportNativeImage {
-                manifest_path,
-                manifest_digest,
-                operation_id,
-                approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-import-native-image-v1",
-                        &manifest_path,
-                        &manifest_digest,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostResponse::ImageImport {
-                        operation: admitted,
-                    });
-                }
-                let image = crate::images::import_native(
-                    &self.root,
-                    &manifest_path,
-                    &manifest_digest,
-                    &operation_id,
-                    &request_digest,
-                )?;
-                Ok(HostResponse::ImageImport {
-                    operation: self.catalog.complete_image_import(
-                        &operation_id,
-                        &request_digest,
-                        image,
-                    )?,
-                })
-            }
-            HostRequest::PublishSnapshotImage {
-                snapshot_id,
-                allow_sensitive,
-                operation_id,
-                approval_id,
-            } => {
-                let snapshot = self
-                    .catalog
-                    .snapshot(&snapshot_id)?
-                    .ok_or(HostError::Invalid("image snapshot does not exist"))?;
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-publish-snapshot-image-v2",
-                        &snapshot_id,
-                        allow_sensitive,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostResponse::ImageImport {
-                        operation: admitted,
-                    });
-                }
-                let image = crate::images::publish_snapshot(
-                    &self.root,
-                    &snapshot,
-                    allow_sensitive,
-                    &operation_id,
-                    &request_digest,
-                )?;
-                Ok(HostResponse::ImageImport {
-                    operation: self.catalog.complete_image_import(
-                        &operation_id,
-                        &request_digest,
-                        image,
-                    )?,
-                })
-            }
+            HostRequest::ImportOci { .. }
+            | HostRequest::ImportNativeImage { .. }
+            | HostRequest::PublishSnapshotImage { .. } => Err(HostError::Invalid(
+                "image operation requires deferred worker admission",
+            )),
             HostRequest::CaptureHostTree { .. } | HostRequest::CaptureGuestTree { .. } => {
                 Err(HostError::Invalid(
                     "artifact capture requires owner admission and worker completion",
@@ -915,7 +940,7 @@ impl HostService {
                     ))?;
                 Ok(HostResponse::Lifecycle {
                     operation: lifecycle.guardian_operation,
-                    machine: self.view(record)?,
+                    machine: Box::new(self.view(record)?),
                 })
             }
             HostRequest::ForkMachine {
@@ -969,6 +994,18 @@ impl HostService {
                     ),
                 )?;
                 let previously_admitted = self.catalog.operation(&operation_id)?.is_some();
+                let fork_image = sandsurf_image::verify_image(
+                    &self
+                        .root
+                        .join("images")
+                        .join(snapshot.image_digest.as_str())
+                        .join("manifest.json"),
+                    sandsurf_image::ImageTrust::Pinned {
+                        manifest_digest: snapshot.image_digest.as_str(),
+                    },
+                )
+                .map_err(crate::images::ImageBuildError::from)?;
+                let clone_profile = fork_image.manifest.system.clone_profile;
                 let intent = self.catalog.create_machine_from_snapshot(
                     machine_id.clone(),
                     &snapshot_id,
@@ -992,9 +1029,10 @@ impl HostService {
                 let materialized_before_owner = !system_disk.exists();
                 if materialized_before_owner {
                     crate::snapshots::materialize_fork(
-                        &self.root.join("snapshots"),
+                        &crate::snapshots::root(&self.root, &snapshot),
                         &snapshot,
                         &system_disk,
+                        &clone_profile,
                     )?;
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1019,9 +1057,10 @@ impl HostService {
                 }) {
                     if !materialized_before_owner {
                         crate::snapshots::materialize_fork(
-                            &self.root.join("snapshots"),
+                            &crate::snapshots::root(&self.root, &snapshot),
                             &snapshot,
                             &system_disk,
+                            &clone_profile,
                         )?;
                     }
                     lifecycle = Some(apply_lifecycle(
@@ -1039,7 +1078,7 @@ impl HostService {
                     .ok_or(HostError::Invalid("forked machine disappeared"))?;
                 Ok(HostResponse::Lifecycle {
                     operation: lifecycle.guardian_operation,
-                    machine: self.view(record)?,
+                    machine: Box::new(self.view(record)?),
                 })
             }
             HostRequest::RollbackFilesystem {
@@ -1097,7 +1136,7 @@ impl HostService {
                     .snapshot(&snapshot_id)?
                     .ok_or(HostError::Invalid("rollback snapshot disappeared"))?;
                 let evidence = crate::snapshots::rollback(
-                    &self.root.join("snapshots"),
+                    &crate::snapshots::root(&self.root, &snapshot),
                     &snapshot,
                     &self
                         .machine_root(&machine_id)
@@ -1154,7 +1193,7 @@ impl HostService {
                     .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
                 Ok(HostResponse::Lifecycle {
                     operation: lifecycle.guardian_operation,
-                    machine: self.view(record)?,
+                    machine: Box::new(self.view(record)?),
                 })
             }
             HostRequest::SetNetworkPolicy {
@@ -1312,7 +1351,7 @@ impl HostService {
                 let request_digest = digest(
                     Domain::Secret,
                     &(
-                        "sandsurf-put-secret-v2",
+                        "sandsurf-put-secret-v1",
                         &secret_id,
                         &version,
                         &commitment,
@@ -1347,6 +1386,15 @@ impl HostService {
                 approval_id,
             } => {
                 self.provision_guardian(&machine_id)?;
+                let response = GuardianClient::new(self.guardian_endpoint(&machine_id)).runtime(
+                    machine_id.clone(),
+                    RuntimeRequest::AssessResources {
+                        resources: resources.clone(),
+                    },
+                )?;
+                let RuntimeResponse::ResourceAssessment { assessment } = response else {
+                    return Err(HostError::Invalid("native resource assessment unavailable"));
+                };
                 let validated = GuardianClient::new(self.guardian_endpoint(&machine_id)).runtime(
                     machine_id.clone(),
                     RuntimeRequest::ValidateResources {
@@ -1388,10 +1436,23 @@ impl HostService {
                     .catalog
                     .machine(&machine_id)?
                     .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
-                Ok(HostResponse::Configuration {
+                Ok(HostResponse::ResourceUpdate {
                     revision: operation.revision,
                     machine: self.view(record)?,
+                    assessment,
                 })
+            }
+            HostRequest::AssessResources {
+                machine_id,
+                resources,
+            } => {
+                self.provision_guardian(&machine_id)?;
+                let response = GuardianClient::new(self.guardian_endpoint(&machine_id))
+                    .runtime(machine_id, RuntimeRequest::AssessResources { resources })?;
+                let RuntimeResponse::ResourceAssessment { assessment } = response else {
+                    return Err(HostError::Invalid("native resource assessment unavailable"));
+                };
+                Ok(HostResponse::ResourceAssessment { assessment })
             }
             HostRequest::GetUsage { machine_id } => {
                 self.provision_guardian(&machine_id)?;
@@ -1410,10 +1471,14 @@ impl HostService {
                     sandsurf_native::storage_usage::tree_usage(&self.machine_root(&machine_id))?;
                 usage.disk_logical_bytes = Counter::try_from(storage.logical_bytes)?;
                 usage.disk_allocated_bytes = Counter::try_from(storage.allocated_bytes)?;
+                usage.provenance.storage = sandsurf_protocol::MeasurementSource::HostFilesystem;
                 Ok(HostResponse::Usage {
                     usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
                 })
             }
+            HostRequest::ReadConsole { .. } | HostRequest::WriteConsole { .. } => Err(
+                HostError::Invalid("native console I/O requires deferred guardian routing"),
+            ),
             HostRequest::DispatchGuest { .. } | HostRequest::Guest { .. } => Err(
                 HostError::Invalid("guest I/O must leave the catalog owner after admission"),
             ),
@@ -1608,6 +1673,14 @@ impl HostService {
     }
 
     fn inspect(&self) -> HostInspection {
+        let (qualification_records, qualification_issues) =
+            match crate::qualification::inspect(&self.root) {
+                Ok(records) => (records, Vec::new()),
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!("retained native evidence unavailable: {error}")],
+                ),
+            };
         let engine = if cfg!(target_os = "macos") {
             VmEngine::AppleVirtualization
         } else if cfg!(target_os = "windows") {
@@ -1615,10 +1688,14 @@ impl HostService {
         } else {
             VmEngine::Firecracker
         };
-        let reason = format!(
-            "{} driver has no retained real-hardware qualification for this exact build/configuration",
-            std::env::consts::OS
-        );
+        let reason = if qualification_records.is_empty() {
+            format!(
+                "{} driver has no retained real-hardware qualification for this exact build/configuration",
+                std::env::consts::OS
+            )
+        } else {
+            "qualification is scoped to the exact configurations and mechanisms in qualificationRecords; no blanket platform qualification is implied".into()
+        };
         HostInspection {
             host_id: self.catalog.host_id().as_str().into(),
             platform: std::env::consts::OS.into(),
@@ -1636,7 +1713,12 @@ impl HostService {
                 reasons: vec![reason],
             },
             images: { crate::images::qualification() },
+            image_workers: crate::image_worker::capability(&self.root),
+            resources: crate::resources::capabilities(&self.root),
+            qualification_records,
+            qualification_issues,
             guest_power: sandsurf_machine::guest_power_capabilities(),
+            console: sandsurf_machine::native_console_capability(),
             guest_platform: format!(
                 "linux/{}",
                 match native_guest_architecture() {
@@ -1733,9 +1815,10 @@ impl HostService {
             admitted
         } else {
             let capturing = self.catalog.begin_snapshot(&snapshot_id, &request_digest)?;
-            if let Some(captured) =
-                crate::snapshots::published_filesystem(&self.root.join("snapshots"), &capturing)?
-            {
+            if let Some(captured) = crate::snapshots::published_filesystem(
+                &crate::snapshots::root(&self.root, &capturing),
+                &capturing,
+            )? {
                 complete_snapshot_capture(
                     &mut self.catalog,
                     &snapshot_id,
@@ -1758,7 +1841,7 @@ impl HostService {
                 };
                 let machine_root = self.machine_root(&intent.machine_id);
                 let captured = crate::snapshots::capture_full(
-                    &self.root.join("snapshots"),
+                    &crate::snapshots::root(&self.root, &capturing),
                     &capturing,
                     &machine_root.join("disks").join(system_disk_name()),
                     &machine_root
@@ -1918,7 +2001,7 @@ impl HostService {
         let request_digest = digest(
             Domain::Secret,
             &(
-                "sandsurf-deliver-secret-v2",
+                "sandsurf-deliver-secret-v1",
                 &machine_id,
                 &operation_id,
                 expected_revision,
@@ -2061,7 +2144,7 @@ impl HostService {
                 let binding = digest(
                     Domain::Transfer,
                     &(
-                        "sandsurf-guest-tree-capture-v2",
+                        "sandsurf-guest-tree-capture-v1",
                         &source,
                         &machine_id,
                         &operation_id,
@@ -2159,8 +2242,31 @@ impl HostService {
         })))
     }
 
+    fn recover_image_import(&mut self, operation: &OperationId) -> Result<()> {
+        if let Some(admitted) = self.catalog.image_import(operation)?
+            && admitted.phase == sandsurf_state::ImageImportPhase::Admitted
+            && let Some(image) =
+                crate::image_worker::completed(&self.root, operation, &admitted.request_digest)?
+        {
+            self.catalog
+                .complete_image_import(operation, &admitted.request_digest, image)?;
+        }
+        Ok(())
+    }
+
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
         match completion {
+            HostTaskCompletion::Image {
+                operation,
+                request_digest,
+                result,
+            } => Ok(HostResponse::ImageImport {
+                operation: self.catalog.complete_image_import(
+                    &operation,
+                    &request_digest,
+                    result?,
+                )?,
+            }),
             HostTaskCompletion::ArtifactTransfer { operation, result } => {
                 let response = *result?;
                 self.catalog.complete_transfer_operation(
@@ -2282,6 +2388,17 @@ impl HostService {
 
     fn provision_guardian_inner(&self, machine: &MachineId) -> Result<()> {
         let root = self.machine_root(machine);
+        #[cfg(target_os = "linux")]
+        crate::resources::require_machine_storage(
+            &self.root,
+            machine,
+            &self
+                .catalog
+                .machine(machine)?
+                .ok_or(HostError::Invalid("machine is missing from host authority"))?
+                .runtime_configuration
+                .resources,
+        )?;
         prepare_directory(&root)?;
         prepare_directory(&root.join("guardian"))?;
         prepare_directory(&root.join("disks"))?;
@@ -2818,6 +2935,11 @@ impl HostDispatch {
 /// Immutable admitted effects run away from the catalog writer. Only owner
 /// completion may change durable host state; workers never receive the catalog.
 enum HostTask {
+    Image {
+        root: PathBuf,
+        executable: PathBuf,
+        job: crate::image_worker::Job,
+    },
     ArtifactCapture {
         store: Arc<crate::artifacts::ArtifactStore>,
         operation: sandsurf_state::HostTransferOperation,
@@ -2842,6 +2964,11 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    Image {
+        operation: OperationId,
+        request_digest: Digest,
+        result: Result<sandsurf_state::ImageRecord>,
+    },
     ArtifactTransfer {
         operation: sandsurf_state::HostTransferOperation,
         result: Result<Box<HostResponse>>,
@@ -2858,6 +2985,15 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::Image {
+                root,
+                executable,
+                job,
+            } => HostTaskCompletion::Image {
+                operation: job.operation.clone(),
+                request_digest: job.request_digest.clone(),
+                result: crate::image_worker::execute(&root, &executable, job),
+            },
             Self::ArtifactCapture {
                 store,
                 operation,
@@ -3343,20 +3479,44 @@ fn require_frame(frame: &Frame) -> Result<()> {
     Ok(())
 }
 
-fn catalog_limits() -> CatalogLimits {
-    CatalogLimits {
+fn catalog_limits(root: &Path) -> Result<CatalogLimits> {
+    let available_storage = sandsurf_native::capacity::available_storage_bytes(root)?;
+    let physical = available_storage / 4 * 3;
+    #[cfg(target_os = "linux")]
+    let memory_mib = sandsurf_native::capacity::available_memory_bytes()?
+        .checked_sub(
+            sandsurf_native::service_pool::ServicePool::Api.memory_bytes()
+                + sandsurf_native::service_pool::ServicePool::Supervisor.memory_bytes()
+                + sandsurf_native::service_pool::ServicePool::Images.memory_bytes(),
+        )
+        .ok_or(HostError::Invalid(
+            "host memory cannot reserve shared service pools",
+        ))?
+        / (1024 * 1024)
+        / 4
+        * 3;
+    #[cfg(not(target_os = "linux"))]
+    let memory_mib = 4096;
+    let cpus = std::thread::available_parallelism()?.get() as u64;
+    let mut resources = Resources::from_geometry(
+        Counter::try_from(cpus)?,
+        Counter::try_from(memory_mib)?,
+        Counter::try_from(physical / 4)?,
+        Counter::try_from(physical / 8)?,
+        counter(4096),
+    )?;
+    resources.physical_storage_bytes = Counter::try_from(physical)?;
+    resources.snapshot_bytes = Counter::try_from(physical / 4)?;
+    resources.host_overhead_bytes = Counter::try_from(memory_mib * 1024 * 1024 / 4)?;
+    resources.managed_executions = counter(4096);
+    resources.validate()?;
+    Ok(CatalogLimits {
         identities: counter(4096),
         operations: counter(1_000_000),
         usage_records: counter(1_000_000),
-        image_bytes: counter(16 * 1024 * 1024 * 1024 * 1024),
-        resources: Resources {
-            vcpus: counter(4096),
-            memory_mib: counter(4 * 1024 * 1024),
-            disk_bytes: counter(16 * 1024 * 1024 * 1024 * 1024),
-            output_bytes: counter(1024 * 1024 * 1024 * 1024),
-            managed_executions: counter(1_000_000),
-        },
-    }
+        image_bytes: Counter::try_from(physical / 8)?,
+        resources,
+    })
 }
 
 fn runtime_limits(resources: &Resources) -> RuntimeLimits {
@@ -3484,6 +3644,23 @@ fn system_disk_name() -> &'static str {
 }
 
 fn error_category(error: &HostError) -> &'static str {
+    // Mechanism refusal is not transport failure, even when carried through a
+    // platform adapter. Clients must not reconnect/retry an unsupported path.
+    let native_io = match error {
+        HostError::Io(error) | HostError::Image(crate::images::ImageBuildError::Io(error)) => {
+            Some(error)
+        }
+        #[cfg(target_os = "linux")]
+        HostError::Linux(crate::linux::LinuxError::Io(error)) => Some(error),
+        #[cfg(target_os = "macos")]
+        HostError::Apple(crate::apple::AppleError::Io(error)) => Some(error),
+        #[cfg(target_os = "windows")]
+        HostError::Windows(crate::windows::WindowsError::Io(error)) => Some(error),
+        _ => None,
+    };
+    if native_io.is_some_and(|error| error.kind() == io::ErrorKind::Unsupported) {
+        return "unsupported";
+    }
     match error {
         HostError::Io(_) | HostError::EndpointUnavailable(_) => "transport",
         HostError::Json(_) | HostError::Contract(_) | HostError::Invalid(_) => "protocol",
@@ -3519,6 +3696,33 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    #[test]
+    fn mechanism_refusal_is_not_transport_failure() {
+        let unsupported =
+            || io::Error::new(io::ErrorKind::Unsupported, "operator volume unavailable");
+        assert_eq!(error_category(&HostError::Io(unsupported())), "unsupported");
+        assert_eq!(
+            error_category(&HostError::Image(crate::images::ImageBuildError::Io(
+                unsupported()
+            ))),
+            "unsupported"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            error_category(&HostError::Linux(crate::linux::LinuxError::Io(
+                unsupported()
+            ))),
+            "unsupported"
+        );
+        assert_eq!(
+            error_category(&HostError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker interrupted"
+            ))),
+            "transport"
+        );
+    }
+
     fn admit_machine(
         service: &mut HostService,
         name: &str,
@@ -3527,13 +3731,14 @@ mod tests {
         let machine: MachineId = name.try_into().unwrap();
         let create: OperationId = format!("create-{name}").try_into().unwrap();
         let image = bytes_digest(b"seed");
-        let resources = Resources {
-            vcpus: Counter::ONE,
-            memory_mib: 128_u64.try_into().unwrap(),
-            disk_bytes: 1_000_000_u64.try_into().unwrap(),
-            output_bytes: 1_000_000_u64.try_into().unwrap(),
-            managed_executions: 8_u64.try_into().unwrap(),
-        };
+        let resources = Resources::from_geometry(
+            Counter::ONE,
+            128_u64.try_into().unwrap(),
+            1_000_000_u64.try_into().unwrap(),
+            1_000_000_u64.try_into().unwrap(),
+            8_u64.try_into().unwrap(),
+        )
+        .expect("static resource envelope");
         let defaults = ExecutionDefaults::default();
         let request_digest = digest(
             Domain::Machine,

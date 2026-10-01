@@ -17,7 +17,7 @@ async function consume(directory: string, image: string): Promise<void> {
     const native: NativeImageImportOptions = { manifestPath: "/images/machine/manifest.json", manifestDigest: image };
     void host.images.importNative; void native;
     const computer = await host.machines.create({
-      image, resources: { vcpus: 2, memoryMiB: 2048, diskBytes: 20 * 1024 ** 3 },
+      id: "computer", image, resources: { vcpus: 2, memoryMiB: 2048, diskBytes: 20 * 1024 ** 3 },
       user: "agent", environment: { CI: "true" }, workingDirectory: "/home/agent",
     });
     const current: MachineInspection = await computer.inspect();
@@ -47,7 +47,7 @@ async function consume(directory: string, image: string): Promise<void> {
     for await (const bytes of artifact.readStream("source.txt")) void bytes;
     const retained = await host.artifacts.get(computer.id, artifact.id);
     const snapshot = await computer.snapshots.create({ kind: "disk", ...revision, ...generation });
-    const fork = await snapshot.fork();
+    const fork = await snapshot.fork({ id: "speculation" });
     await retained.writeTo(fork, "/tmp/captured");
     const operation = await host.operations.get(snapshot.inspection.operationId);
     if (operation !== undefined) {

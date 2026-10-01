@@ -33,9 +33,10 @@ export function renderSandsurfServiceDefinition(options: {
   for (const value of [options.directory, options.binary]) {
     if (!path.isAbsolute(value) || /[\u0000-\u001f\u007f]/u.test(value)) throw new TypeError("Sandsurf service paths must be absolute without control characters");
   }
-  const suffix = createHash("sha256").update(options.directory).digest("hex").slice(0, 12);
-  const host = `sandsurf-host-${suffix}`;
-  const supervisor = `sandsurf-supervisor-${suffix}`;
+  const directoryDigest = createHash("sha256").update(options.directory).digest("hex");
+  const suffix = directoryDigest.slice(0, 12);
+  const host = options.platform === "linux" ? `sandsurf-api-id-${directoryDigest}` : `sandsurf-host-${suffix}`;
+  const supervisor = options.platform === "linux" ? `sandsurf-supervisor-id-${directoryDigest}` : `sandsurf-supervisor-${suffix}`;
   const file = (name: string, contents: string): Readonly<{ name: string; contents: string }> => Object.freeze({ name, contents });
   switch (options.platform) {
     case "linux": {
@@ -43,7 +44,7 @@ export function renderSandsurfServiceDefinition(options: {
         // These authority services share the client's authorized host paths.
         // Per-unit PrivateTmp would create different stores at the same name.
         // Guest/VMM isolation belongs to the qualified native launcher instead.
-        `[Unit]\nDescription=Sandsurf ${name}\nAfter=network.target${dependency === "" ? "" : ` ${dependency}.service`}\n${dependency === "" ? "" : `Wants=${dependency}.service\n`}\n[Service]\nType=exec\nExecStart=${systemdArgument(options.binary)} ${mode} --directory ${systemdArgument(options.directory)}\nRestart=on-failure\nRestartSec=1\nNoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n`;
+        `[Unit]\nDescription=Sandsurf ${name}\nAfter=network.target${dependency === "" ? "" : ` ${dependency}.service`}\n${dependency === "" ? "" : `Wants=${dependency}.service\n`}\n[Service]\nType=exec\nExecStart=${systemdArgument(options.binary)} ${mode} --directory ${systemdArgument(options.directory)}\nRestart=on-failure\nRestartSec=1\nNoNewPrivileges=true\nCPUQuota=100%\nCPUQuotaPeriodSec=100ms\nMemoryMax=${mode === "serve" ? 536870912 : 134217728}\nMemorySwapMax=0\nOOMPolicy=kill\nTasksMax=${mode === "serve" ? 256 : 64}\nKillMode=control-group\nDelegate=no\n\n[Install]\nWantedBy=default.target\n`;
       return Object.freeze({ platform: "linux", format: "systemd-user",
         files: Object.freeze([file(`${supervisor}.service`, unit("guardian supervision", "supervise", "")), file(`${host}.service`, unit("host API", "serve", supervisor))]),
         installHint: `Write both units to ~/.config/systemd/user/, then run systemctl --user daemon-reload and systemctl --user enable --now ${supervisor}.service ${host}.service. Keep the account's user manager running for unattended work. Restarting the host API unit does not stop the supervisor unit or its guardians.`,

@@ -13,6 +13,14 @@ test('host API and guardian supervision have independent native service owners',
   assert.match(supervisor.contents, /supervise --directory "\/state\/agent one"/u);
   assert.match(host.contents, /serve --directory "\/state\/agent one"/u);
   assert.ok(host.contents.includes(`Wants=${supervisor.name}`));
+  assert.match(host.name, /^sandsurf-api-id-[a-f0-9]{64}\.service$/u);
+  assert.match(supervisor.name, /^sandsurf-supervisor-id-[a-f0-9]{64}\.service$/u);
+  for (const property of ["CPUQuota=100%", "MemoryMax=134217728", "MemorySwapMax=0", "TasksMax=64", "Delegate=no"]) {
+    assert.ok(supervisor.contents.includes(`${property}\n`));
+  }
+  for (const property of ["CPUQuota=100%", "MemoryMax=536870912", "MemorySwapMax=0", "TasksMax=256", "Delegate=no"]) {
+    assert.ok(host.contents.includes(`${property}\n`));
+  }
   for (const file of linux.files) {
     assert.match(file.contents, /NoNewPrivileges=true/u);
     assert.doesNotMatch(file.contents, /KillMode=process|PartOf=|BindsTo=|PrivateTmp=/u);

@@ -339,16 +339,20 @@ pub struct ExecutionSnapshot {
     pub request: SpawnRequest,
     pub guest_pid: u32,
     pub state: ExecutionState,
-    #[serde(default)]
     pub lineage: Option<ExecutionLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionLineage {
+    /// Stable identity of the first admission in this execution lineage.
+    pub logical_execution_id: ExecutionId,
+    pub source_execution_id: ExecutionId,
     pub source_machine_id: MachineId,
     pub source_generation: Counter,
     pub snapshot_id: SnapshotId,
+    /// Exact host-retained prefix at the native snapshot boundary.
+    pub output_anchor: OutputBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +363,16 @@ pub struct ExecutionLineage {
     deny_unknown_fields
 )]
 pub enum GuestServiceRequest {
+    /// Stage immutable snapshot membership before rotating the management
+    /// channel. This idempotent request never spawns an execution.
+    StageExecutionRestore {
+        snapshot_id: SnapshotId,
+        capture_operation_id: OperationId,
+        machine_id: MachineId,
+        previous_generation: Counter,
+        generation: Counter,
+        executions: Vec<crate::CapturedExecution>,
+    },
     /// Guardian-only restore handshake sent over the captured boot capability.
     /// The response is sealed under that old session; all later connections
     /// require the new generation and capability.
@@ -370,7 +384,6 @@ pub enum GuestServiceRequest {
         generation: Counter,
         boot_identity: Digest,
         capability: [u8; 32],
-        network_capability: [u8; 32],
         generation_seed: [u8; 32],
     },
     /// Guardian-only proof that a fresh authenticated transport is bound to

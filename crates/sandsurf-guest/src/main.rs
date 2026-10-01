@@ -1,7 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod binding;
-mod direct_network;
 
 use sandsurf_guest::{ExecutionRegistry, FilesystemService, ManagementService};
 #[cfg(test)]
@@ -10,17 +9,12 @@ use sandsurf_protocol::{
     AUTHENTICATION_BYTES, BootCapability, Counter, Digest, Frame, FrameKind, GuestChallenge,
     GuestFinish, GuestHandshake, GuestHello, MachineId,
 };
-use sandsurf_protocol::{
-    AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT,
-    NETWORK_AUTH_MAGIC, NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT,
-    NETWORK_SOCKS_PORT,
-};
+use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{AuthenticatedFrameChannel, send_binary};
 use sandsurf_protocol::{GuestServiceRequest, GuestServiceResponse};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
-use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::ptr;
@@ -37,7 +31,6 @@ struct BootIdentity {
     generation: Counter,
     boot_digest: Digest,
     capability: BootCapability,
-    network_capability: [u8; 32],
 }
 
 fn main() {
@@ -85,14 +78,10 @@ fn supervisor_main() -> io::Result<()> {
             identity
         }
     };
-    let network_capability = Arc::new(RwLock::new(boot_identity.network_capability));
     let identity = Arc::new(RwLock::new(boot_identity));
     let session_generation = Arc::new(RwLock::new(()));
     let listener = listen_vsock(GUEST_CONTROL_PORT)
         .map_err(|error| stage("listen on guest control", error))?;
-    start_network_relays(Arc::clone(&network_capability))
-        .map_err(|error| stage("start workload network relays", error))?;
-    direct_network::start().map_err(|error| stage("start direct TCP gateway", error))?;
     let identity_snapshot = identity
         .read()
         .map_err(|_| io::Error::other("boot identity lock is unavailable"))?
@@ -132,7 +121,6 @@ fn supervisor_main() -> io::Result<()> {
         let service = Arc::clone(&service);
         let identity = Arc::clone(&identity);
         let session_generation = Arc::clone(&session_generation);
-        let network_capability = Arc::clone(&network_capability);
         let connections = Arc::clone(&connections);
         let management = Arc::clone(&management);
         std::thread::spawn(move || {
@@ -149,7 +137,6 @@ fn supervisor_main() -> io::Result<()> {
                 &mut connection,
                 &identity,
                 &session_generation,
-                &network_capability,
                 &management,
                 &service,
             ) {
@@ -177,7 +164,6 @@ fn serve_connection(
     connection: &mut File,
     identity: &Arc<RwLock<BootIdentity>>,
     session_generation: &Arc<RwLock<()>>,
-    network_capability: &Arc<RwLock<[u8; 32]>>,
     management: &sandsurf_protocol::GuestManagementIdentity,
     service: &ManagementService,
 ) -> io::Result<()> {
@@ -265,7 +251,6 @@ fn serve_connection(
                 generation,
                 boot_identity,
                 capability,
-                network_capability: next_network_capability,
                 generation_seed,
             } => {
                 let current = identity
@@ -290,7 +275,6 @@ fn serve_connection(
                     ));
                 }
                 if capability.iter().all(|byte| *byte == 0)
-                    || next_network_capability.iter().all(|byte| *byte == 0)
                     || generation_seed.iter().all(|byte| *byte == 0)
                 {
                     return Err(io::Error::new(
@@ -311,7 +295,6 @@ fn serve_connection(
                     generation,
                     boot_digest: boot_identity,
                     capability: BootCapability::from_bytes(capability),
-                    network_capability: next_network_capability,
                 };
                 binding::save(
                     &Path::new(CONTROL_ROOT).join("binding.json"),
@@ -322,10 +305,6 @@ fn serve_connection(
                     .write()
                     .map_err(|_| io::Error::other("boot identity lock is unavailable"))? =
                     next_identity;
-                *network_capability
-                    .write()
-                    .map_err(|_| io::Error::other("network capability lock is unavailable"))? =
-                    next_network_capability;
                 GuestServiceResponse::GenerationRebound {
                     evidence: sandsurf_protocol::digest(
                         sandsurf_protocol::Domain::Operation,
@@ -531,14 +510,11 @@ fn parse_boot_identity(file: &mut impl Read) -> io::Result<BootIdentity> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut capability = [0_u8; 32];
     file.read_exact(&mut capability)?;
-    let mut network_capability = [0_u8; 32];
-    file.read_exact(&mut network_capability)?;
     Ok(BootIdentity {
         machine_id,
         generation,
         boot_digest,
         capability: BootCapability::from_bytes(capability),
-        network_capability,
     })
 }
 
@@ -561,220 +537,6 @@ fn attached_disk(index: u8) -> io::Result<String> {
         io::ErrorKind::NotFound,
         format!("Sandsurf disk attachment {index} is absent"),
     ))
-}
-
-fn start_network_relays(capability: Arc<RwLock<[u8; 32]>>) -> io::Result<()> {
-    activate_loopback()?;
-    let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 3128))?;
-    let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 1080))?;
-    let dns_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 53))?;
-    let dns_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 53))?;
-    let exposure = listen_vsock(GUEST_EXPOSURE_PORT)?;
-    let resolver = Path::new("/etc/resolv.conf");
-    if let Some(parent) = resolver.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::remove_file(resolver) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    fs::write(
-        resolver,
-        b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n",
-    )?;
-
-    for (listener, port) in [
-        (http, NETWORK_HTTP_PORT),
-        (socks, NETWORK_SOCKS_PORT),
-        (dns_tcp, NETWORK_DNS_TCP_PORT),
-    ] {
-        let capability = Arc::clone(&capability);
-        std::thread::spawn(move || {
-            for accepted in listener.incoming() {
-                let Ok(client) = accepted else { break };
-                let capability = Arc::clone(&capability);
-                std::thread::spawn(move || {
-                    let Ok(capability) = capability.read().map(|value| *value) else {
-                        return;
-                    };
-                    let _ = relay_network_stream(client, port, capability);
-                });
-            }
-        });
-    }
-    let dns_capability = Arc::clone(&capability);
-    std::thread::spawn(move || {
-        let mut query = [0_u8; 4096];
-        loop {
-            let Ok((count, peer)) = dns_udp.recv_from(&mut query) else {
-                continue;
-            };
-            let response = dns_capability
-                .read()
-                .map(|value| *value)
-                .map_err(|_| io::Error::other("network capability lock is unavailable"))
-                .and_then(|value| dns_query(&query[..count], value));
-            if let Ok(response) = response {
-                let _ = dns_udp.send_to(&response, peer);
-            }
-        }
-    });
-    let exposure_capability = Arc::clone(&capability);
-    std::thread::spawn(move || {
-        loop {
-            let Ok(connection) = accept_connection(exposure.as_raw_fd()) else {
-                continue;
-            };
-            let capability = Arc::clone(&exposure_capability);
-            std::thread::spawn(move || {
-                // SAFETY: this worker receives sole ownership of the accepted descriptor.
-                let connection = unsafe { File::from_raw_fd(connection) };
-                let Ok(capability) = capability.read().map(|value| *value) else {
-                    return;
-                };
-                let _ = serve_exposure(connection, capability);
-            });
-        }
-    });
-    Ok(())
-}
-
-fn activate_loopback() -> io::Result<()> {
-    // SAFETY: arguments request one standard close-on-exec IPv4 control socket.
-    let descriptor =
-        unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful socket creation transfers sole ownership here.
-    let socket = unsafe { File::from_raw_fd(descriptor) };
-    // SAFETY: zero initializes every ifreq union representation, after which
-    // the interface name and flags member are the only fields used by ioctl.
-    let mut request: libc::ifreq = unsafe { zeroed() };
-    request.ifr_name[0] = b'l' as libc::c_char;
-    request.ifr_name[1] = b'o' as libc::c_char;
-    // SAFETY: SIOCGIFFLAGS receives a writable, correctly sized ifreq.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut request) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: SIOCGIFFLAGS initialized the flags union member selected here.
-    let flags = unsafe { request.ifr_ifru.ifru_flags } | libc::IFF_UP as libc::c_short;
-    request.ifr_ifru.ifru_flags = flags;
-    // SAFETY: SIOCSIFFLAGS reads the initialized interface name and flags.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS as _, &request) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn serve_exposure(mut host: File, capability: [u8; 32]) -> io::Result<()> {
-    let mut authentication = [0_u8; 8 + 32];
-    host.read_exact(&mut authentication)?;
-    let valid_magic = &authentication[..8] == b"SSFPORT1";
-    let difference = authentication[8..]
-        .iter()
-        .zip(capability)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        });
-    if !valid_magic || difference != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "port exposure authentication failed",
-        ));
-    }
-    let mut port = [0_u8; 2];
-    host.read_exact(&mut port)?;
-    let port = u16::from_be_bytes(port);
-    if port == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "port exposure target is invalid",
-        ));
-    }
-    let mut workload = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
-    let mut host_reader = host.try_clone()?;
-    let mut workload_writer = workload.try_clone()?;
-    let outbound = std::thread::spawn(move || io::copy(&mut host_reader, &mut workload_writer));
-    let inbound = io::copy(&mut workload, &mut host);
-    let _ = workload.shutdown(Shutdown::Both);
-    let outbound = outbound
-        .join()
-        .map_err(|_| io::Error::other("exposure relay worker panicked"))?;
-    inbound.and(outbound).map(drop)
-}
-
-fn relay_network_stream(mut client: TcpStream, port: u32, capability: [u8; 32]) -> io::Result<()> {
-    let mut host = connect_host_vsock(port)?;
-    host.write_all(NETWORK_AUTH_MAGIC)?;
-    host.write_all(&capability)?;
-    host.flush()?;
-    let mut client_reader = client.try_clone()?;
-    let mut host_writer = host.try_clone()?;
-    let outbound = std::thread::spawn(move || io::copy(&mut client_reader, &mut host_writer));
-    let inbound = io::copy(&mut host, &mut client);
-    let _ = client.shutdown(Shutdown::Both);
-    let outbound = outbound
-        .join()
-        .map_err(|_| io::Error::other("network relay worker panicked"))?;
-    inbound.and(outbound).map(drop)
-}
-
-fn dns_query(query: &[u8], capability: [u8; 32]) -> io::Result<Vec<u8>> {
-    if query.is_empty() || query.len() > 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "DNS query is outside its bound",
-        ));
-    }
-    let mut host = connect_host_vsock(NETWORK_DNS_UDP_PORT)?;
-    host.write_all(NETWORK_AUTH_MAGIC)?;
-    host.write_all(&capability)?;
-    host.write_all(&(query.len() as u16).to_be_bytes())?;
-    host.write_all(query)?;
-    host.flush()?;
-    let mut length = [0_u8; 2];
-    host.read_exact(&mut length)?;
-    let length = usize::from(u16::from_be_bytes(length));
-    if length == 0 || length > 4096 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response is outside its bound",
-        ));
-    }
-    let mut response = vec![0; length];
-    host.read_exact(&mut response)?;
-    Ok(response)
-}
-
-fn connect_host_vsock(port: u32) -> io::Result<File> {
-    // SAFETY: arguments request one standard close-on-exec AF_VSOCK stream.
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: zero is a valid initial representation for sockaddr_vm.
-    let mut address: libc::sockaddr_vm = unsafe { zeroed() };
-    address.svm_family = libc::AF_VSOCK as libc::sa_family_t;
-    address.svm_port = port;
-    address.svm_cid = libc::VMADDR_CID_HOST;
-    // SAFETY: address has the exact sockaddr_vm layout and lifetime.
-    let result = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_vm).cast(),
-            size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        )
-    };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        // SAFETY: fd remains locally owned on connection failure.
-        unsafe { libc::close(fd) };
-        return Err(error);
-    }
-    // SAFETY: successful setup transfers sole ownership of fd.
-    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn listen_vsock(port: u32) -> io::Result<File> {
@@ -888,7 +650,6 @@ mod tests {
             generation: Counter::ONE,
             boot_digest: bytes_digest(b"boot-one"),
             capability: BootCapability::from_bytes([1; 32]),
-            network_capability: [2; 32],
         };
         assert!(session_matches_identity(&session, &session));
         let mut current = session.clone();

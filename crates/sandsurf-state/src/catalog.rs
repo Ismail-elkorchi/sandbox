@@ -1214,6 +1214,12 @@ impl HostCatalog {
         }
         let machine = machine_record(&tx, &request.machine_id)?
             .ok_or(Error::Missing("snapshot machine is missing"))?;
+        reserve_snapshot_capacity(
+            &tx,
+            &request.machine_id,
+            &machine.runtime_configuration.resources,
+            request.kind,
+        )?;
         capacity(&tx, "snapshots", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let full = request.kind == SnapshotKind::Full;
@@ -1284,6 +1290,12 @@ impl HostCatalog {
                 "suspension lifecycle is no longer the current host intent",
             ));
         }
+        reserve_snapshot_capacity(
+            &tx,
+            &request.machine_id,
+            &machine.runtime_configuration.resources,
+            request.kind,
+        )?;
         capacity(&tx, "snapshots", self.limits.operations)?;
         let value = Snapshot {
             request,
@@ -1498,15 +1510,7 @@ impl HostCatalog {
             return Err(Error::Conflict("machine image is retired"));
         }
         let sensitive = image_state.is_some_and(|(image, _, _)| image.sensitive);
-        let mut total = resources.clone();
-        {
-            let mut statement =
-                tx.prepare("SELECT configuration FROM machines WHERE released=0")?;
-            let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
-            for row in rows {
-                total = total.checked_add(&decode::<RuntimeConfiguration>(&row?)?.resources)?;
-            }
-        }
+        let total = resources.checked_add(&catalog_resources_held(&tx, None)?)?;
         if !total.within(&self.limits.resources) {
             return Err(Error::Capacity("host resource reservations exhausted"));
         }
@@ -1584,12 +1588,7 @@ impl HostCatalog {
         }
         capacity(&tx, "machines", self.limits.identities)?;
         capacity(&tx, "intents", self.limits.operations)?;
-        let mut total = resources.clone();
-        let mut statement = tx.prepare("SELECT configuration FROM machines WHERE released=0")?;
-        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-            total = total.checked_add(&decode::<RuntimeConfiguration>(&row?)?.resources)?;
-        }
-        drop(statement);
+        let total = resources.checked_add(&catalog_resources_held(&tx, None)?)?;
         if !total.within(&self.limits.resources) {
             return Err(Error::Capacity("host resource reservations exhausted"));
         }
@@ -1827,7 +1826,7 @@ impl HostCatalog {
         let request_digest = digest(
             Domain::Authority,
             &(
-                "sandsurf-apply-configuration-v2",
+                "sandsurf-apply-configuration-v1",
                 machine,
                 revision,
                 &configuration,
@@ -1957,14 +1956,7 @@ impl HostCatalog {
         let tx = self.db.connection.transaction()?;
         host_operation_identity_available(&tx, operation)?;
         require_revision(&tx, machine, expected)?;
-        let mut total = resources.clone();
-        {
-            let mut statement =
-                tx.prepare("SELECT configuration FROM machines WHERE released=0 AND id<>?1")?;
-            for row in statement.query_map([machine.as_str()], |row| row.get::<_, String>(0))? {
-                total = total.checked_add(&decode::<RuntimeConfiguration>(&row?)?.resources)?;
-            }
-        }
+        let total = resources.checked_add(&catalog_resources_held(&tx, Some(machine))?)?;
         if !total.within(&self.limits.resources) {
             return Err(Error::Capacity("host resource reservations exhausted"));
         }
@@ -1975,6 +1967,11 @@ impl HostCatalog {
             |row| row.get(0),
         )?;
         let mut configuration: RuntimeConfiguration = decode(&encoded)?;
+        if snapshot_capacity_held(&tx, machine)? > resources.snapshot_bytes.get() {
+            return Err(Error::Capacity(
+                "resource reduction excludes retained snapshot reservations",
+            ));
+        }
         configuration.resources = resources.clone();
         let revision = expected.next()?;
         tx.execute(
@@ -2221,7 +2218,11 @@ impl HostCatalog {
             }
             let old_raw: ResourceUsage = decode(&old_raw)?;
             let mut value: ResourceUsage = decode(&old_cumulative)?;
-            if generation == old_generation
+            let same_host_counter = raw.host_counter_epoch.is_some()
+                && raw.host_counter_epoch == old_raw.host_counter_epoch;
+            let same_counter = same_host_counter
+                || (raw.host_counter_epoch.is_none() && generation == old_generation);
+            if same_counter
                 && [
                     (raw.network_rx_bytes, old_raw.network_rx_bytes),
                     (raw.network_tx_bytes, old_raw.network_tx_bytes),
@@ -2234,24 +2235,30 @@ impl HostCatalog {
                     "resource usage rewound within one machine generation",
                 ));
             }
-            if generation == old_generation && [
+            if same_counter && [
                 (raw.cpu_micros, old_raw.cpu_micros),
                 (raw.io_read_bytes, old_raw.io_read_bytes),
                 (raw.io_write_bytes, old_raw.io_write_bytes),
             ].iter().any(|(current, previous)| matches!((current, previous), (Some(current), Some(previous)) if current < previous)) {
                 return Err(Error::Conflict("native counters rewound within one generation"));
             }
-            let previous_cpu = if generation == old_generation {
+            let previous_cpu = if same_host_counter
+                || (raw.host_counter_epoch.is_none() && generation == old_generation)
+            {
                 old_raw.cpu_micros
             } else {
                 Some(Counter::ZERO)
             };
-            let previous_read = if generation == old_generation {
+            let previous_read = if same_host_counter
+                || (raw.host_counter_epoch.is_none() && generation == old_generation)
+            {
                 old_raw.io_read_bytes
             } else {
                 Some(Counter::ZERO)
             };
-            let previous_write = if generation == old_generation {
+            let previous_write = if same_host_counter
+                || (raw.host_counter_epoch.is_none() && generation == old_generation)
+            {
                 old_raw.io_write_bytes
             } else {
                 Some(Counter::ZERO)
@@ -2265,17 +2272,29 @@ impl HostCatalog {
             value.network_rx_bytes = add_observed(
                 value.network_rx_bytes,
                 raw.network_rx_bytes,
-                old_raw.network_rx_bytes,
+                if same_counter {
+                    old_raw.network_rx_bytes
+                } else {
+                    Counter::ZERO
+                },
             )?;
             value.network_tx_bytes = add_observed(
                 value.network_tx_bytes,
                 raw.network_tx_bytes,
-                old_raw.network_tx_bytes,
+                if same_counter {
+                    old_raw.network_tx_bytes
+                } else {
+                    Counter::ZERO
+                },
             )?;
             value.network_connections = add_observed(
                 value.network_connections,
                 raw.network_connections,
-                old_raw.network_connections,
+                if same_counter {
+                    old_raw.network_connections
+                } else {
+                    Counter::ZERO
+                },
             )?;
             value.memory_current = raw.memory_current;
             value.memory_peak = value.memory_peak.max(raw.memory_peak);
@@ -2283,6 +2302,10 @@ impl HostCatalog {
             value.disk_allocated_bytes = raw.disk_allocated_bytes;
             value.output_retained_bytes = raw.output_retained_bytes;
             value.executions_current = raw.executions_current;
+            value.channels_current = raw.channels_current;
+            value.inflight_requests_current = raw.inflight_requests_current;
+            value.provenance = raw.provenance.clone();
+            value.host_counter_epoch = raw.host_counter_epoch.clone();
             value.complete = value.complete && raw.complete;
             value.source = format!("host-catalog-cumulative({})", raw.source);
             value.observed_unix_millis = raw.observed_unix_millis;
@@ -2460,6 +2483,94 @@ fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<
         Ok(value)
     })
     .transpose()
+}
+
+fn catalog_resources_held(
+    db: &rusqlite::Connection,
+    excluding: Option<&MachineId>,
+) -> Result<Resources> {
+    let mut total = Resources::zero();
+    let mut statement =
+        db.prepare("SELECT id,configuration,released FROM machines WHERE id<>?1")?;
+    for row in statement.query_map([excluding.map_or("", MachineId::as_str)], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
+    })? {
+        let (_id, configuration, released) = row?;
+        let resources = decode::<RuntimeConfiguration>(&configuration)?.resources;
+        let held = if released {
+            // Native destruction frees compute and attached disks. Archives,
+            // snapshots and image references remain independently retained.
+            // Conservatively retain their original reservations until their
+            // respective byte owners support verified archive reclamation.
+            let mut held = Resources::zero();
+            held.output_bytes = resources.output_bytes;
+            held.snapshot_bytes = resources.snapshot_bytes;
+            // The mounted volume remains exclusively owned even after native
+            // destruction. Retained metadata/evidence prevents slot recycling.
+            held.physical_storage_bytes = resources.physical_storage_bytes;
+            held
+        } else {
+            resources
+        };
+        total = total.checked_add(&held)?;
+    }
+    Ok(total)
+}
+
+fn snapshot_charge(resources: &Resources, kind: SnapshotKind) -> Result<u64> {
+    let mut bytes = resources.disk_bytes.get();
+    if kind == SnapshotKind::Full {
+        bytes = bytes
+            .checked_add(
+                resources
+                    .memory_mib
+                    .get()
+                    .checked_mul(1024 * 1024)
+                    .ok_or(Error::Capacity("snapshot RAM reservation overflow"))?,
+            )
+            .ok_or(Error::Capacity("snapshot reservation overflow"))?;
+    }
+    bytes
+        .checked_add(64 * 1024 * 1024)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or(Error::Capacity(
+            "snapshot staging/publication reservation overflow",
+        ))
+}
+
+fn snapshot_capacity_held(db: &rusqlite::Connection, machine: &MachineId) -> Result<u64> {
+    let mut statement = db.prepare("SELECT value FROM snapshots WHERE machine=?1")?;
+    let mut total = 0_u64;
+    for row in statement.query_map([machine.as_str()], |row| row.get::<_, String>(0))? {
+        let record: Snapshot = decode(&row?)?;
+        // Interrupted captures and published bytes retain capacity until the
+        // storage owner confirms actual deletion; VM destruction is irrelevant.
+        total = total
+            .checked_add(snapshot_charge(&record.resources, record.request.kind)?)
+            .ok_or(Error::Capacity("retained snapshot capacity overflow"))?;
+    }
+    Ok(total)
+}
+
+fn reserve_snapshot_capacity(
+    db: &rusqlite::Connection,
+    machine: &MachineId,
+    resources: &Resources,
+    kind: SnapshotKind,
+) -> Result<()> {
+    let total = snapshot_capacity_held(db, machine)?
+        .checked_add(snapshot_charge(resources, kind)?)
+        .ok_or(Error::Capacity("snapshot reservation overflow"))?;
+    if total > resources.snapshot_bytes.get() {
+        return Err(Error::Capacity(
+            "snapshot physical storage budget exhausted",
+        ));
+    }
+    Ok(())
 }
 
 fn secret_version_revoked(

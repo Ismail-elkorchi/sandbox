@@ -5,8 +5,12 @@
 
 pub mod capacity;
 pub mod guest_channel;
+pub mod resources;
+#[cfg(target_os = "linux")]
+pub mod service_pool;
 pub mod storage;
 pub mod storage_usage;
+pub mod volume;
 
 /// Access requested for an account-private file. Validation never repairs or
 /// adopts a foreign ACL, mode, owner, link, or reparse identity.

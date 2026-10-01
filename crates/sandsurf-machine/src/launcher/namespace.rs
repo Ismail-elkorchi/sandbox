@@ -222,7 +222,13 @@ fn namespace_command(launcher: &File, network: bool) -> Command {
         "/dev",
     ]);
     if network {
-        command.arg("--unshare-net");
+        command.args([
+            "--unshare-net",
+            "--cap-add",
+            "CAP_NET_ADMIN",
+            "--cap-add",
+            "CAP_NET_RAW",
+        ]);
     }
     command
 }
@@ -233,7 +239,18 @@ pub(super) fn probe(network: bool) -> ProbeOutcome {
         let runtime = File::open(std::env::current_exe()?)?;
         let mut command = namespace_command(&launcher.file, network);
         data_mount(&mut command, &runtime, RUNTIME_PATH, "0500");
-        command.args(["--", RUNTIME_PATH, "--linux-namespace-probe"]);
+        if network {
+            command.args(["--dev-bind", "/dev/net/tun", "/dev/net/tun"]);
+        }
+        command.args([
+            "--",
+            RUNTIME_PATH,
+            if network {
+                "--linux-network-namespace-probe"
+            } else {
+                "--linux-namespace-probe"
+            },
+        ]);
         inherit(&launcher.file)?;
         inherit(&runtime)?;
         let output = command.output()?;
@@ -264,6 +281,19 @@ pub fn namespace_probe_main() -> i32 {
         0
     } else {
         1
+    }
+}
+
+pub fn network_namespace_probe_main() -> i32 {
+    if namespace_probe_main() != 0 {
+        return 1;
+    }
+    match sandsurf_network::linux::create_isolated_packet_socket() {
+        Ok(_) => 0,
+        Err(error) => {
+            eprintln!("isolated TAP/packet enforcement setup unavailable: {error}");
+            1
+        }
     }
 }
 

@@ -14,7 +14,14 @@ export type ExecutionState =
   | { readonly kind: "draining"; readonly outcome: ExecutionOutcome; readonly accountingDigest: string }
   | { readonly kind: "exited"; readonly outcome: ExecutionOutcome; readonly output: OutputBoundary; readonly cleanupDigest: string; readonly accountingDigest: string }
   | { readonly kind: "unknown"; readonly evidence: string };
-export interface ExecutionLineage { readonly sourceMachineId: string; readonly sourceGeneration: number; readonly snapshotId: string; }
+export interface ExecutionLineage {
+  readonly logicalExecutionId: string;
+  readonly sourceExecutionId: string;
+  readonly sourceMachineId: string;
+  readonly sourceGeneration: number;
+  readonly snapshotId: string;
+  readonly outputAnchor: OutputBoundary;
+}
 export interface ExecutionInspection {
   readonly request: ExecutionRequest;
   readonly guestPid: number;
@@ -78,13 +85,16 @@ export function parseExecutionInspection(value: unknown): ExecutionInspection {
   const result = object(value, ["request", "guestPid", "state", "lineage"]);
   const request = parseExecutionRequest(result.request); const guestPid = integer(result.guestPid);
   if (guestPid > 0xffffffff) invalid();
-  let lineage: ExecutionLineage | null = null;
-  if (result.lineage !== null) {
-    const origin = object(result.lineage, ["sourceMachineId", "sourceGeneration", "snapshotId"]);
-    lineage = { sourceMachineId: id(origin.sourceMachineId), sourceGeneration: positive(origin.sourceGeneration), snapshotId: id(origin.snapshotId) };
-    if (lineage.sourceGeneration >= request.generation) invalid();
-  }
+  const lineage = parseExecutionLineage(result.lineage, request);
   return { request, guestPid, state: parseExecutionState(result.state), lineage };
+}
+export function parseExecutionLineage(value: unknown, request: Pick<ExecutionRequest, "machineId" | "generation" | "executionId">): ExecutionLineage | null {
+  if (value === null) return null;
+  const origin = object(value, ["logicalExecutionId", "sourceExecutionId", "sourceMachineId", "sourceGeneration", "snapshotId", "outputAnchor"]);
+  const lineage: ExecutionLineage = { logicalExecutionId: id(origin.logicalExecutionId), sourceExecutionId: id(origin.sourceExecutionId),
+    sourceMachineId: id(origin.sourceMachineId), sourceGeneration: positive(origin.sourceGeneration), snapshotId: id(origin.snapshotId), outputAnchor: boundary(origin.outputAnchor) };
+  if (lineage.sourceGeneration >= request.generation || lineage.sourceMachineId !== request.machineId || lineage.sourceExecutionId === request.executionId) invalid();
+  return lineage;
 }
 export function parseExecutionReceipt(value: unknown, expectedDigest: string): Receipt {
   const result = object(value, ["machineId", "generation", "executionId", "operationId", "requestDigest", "outcome", "output", "cleanupDigest", "accountingDigest"]);

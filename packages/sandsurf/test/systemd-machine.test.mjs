@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
+import { qualificationDirectory } from "./qualification-storage.mjs";
 
 const packageRoot = process.env.SANDSURF_TEST_PACKAGE_ROOT ?? fileURLToPath(new URL("..", import.meta.url));
 const { Sandsurf, renderSandsurfServiceDefinition } = await import(pathToFileURL(join(packageRoot, "dist/index.js")).href);
@@ -18,7 +19,7 @@ test("installed systemd host restart leaves the independently supervised Linux m
   // This test never installs a system-wide unit, changes AppArmor, or enables linger.
   await command("systemctl", ["--user", "show-environment"]);
   const root = await mkdtemp("/var/tmp/sandsurf-systemd-");
-  const directory = join(root, "state");
+  const directory = await qualificationDirectory("systemd");
   const binary = await resolveSandsurfNativeHost();
   const definition = renderSandsurfServiceDefinition({ directory, binary, platform: "linux" });
   const [supervisorUnit, hostUnit] = definition.files;
@@ -28,7 +29,7 @@ test("installed systemd host restart leaves the independently supervised Linux m
     for (const file of definition.files) {
       // Separate service groups must have separate memory caps: they do not
       // inherit the test command's resource scope. No guest limits are relaxed.
-      await writeFile(join(root, file.name), file.contents.replace("NoNewPrivileges=true\n", `NoNewPrivileges=true\nMemoryMax=${file === supervisorUnit ? "1G" : "256M"}\nMemorySwapMax=0\n`));
+      await writeFile(join(root, file.name), file.contents);
       await command("systemctl", ["--user", "link", join(root, file.name)]);
     }
     await command("systemctl", ["--user", "daemon-reload"]);
@@ -37,7 +38,7 @@ test("installed systemd host restart leaves the independently supervised Linux m
     const manifest = process.env.SANDSURF_LOCAL_IMAGE_MANIFEST ?? join(packageRoot, "images/development-x64/manifest.json");
     const image = createHash("sha256").update(await readFile(manifest)).digest("hex");
     machine = await host.machines.create({ id: "independent-machine", image,
-      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 256 * 1024 ** 2, outputBytes: 4 * 1024 ** 2, managedExecutions: 8 } });
+      resources: { vcpus: 1, memoryMiB: 256, diskBytes: 2 * 1024 ** 3, outputBytes: 4 * 1024 ** 2, managedExecutions: 8 } });
     await managementReady(machine);
     const generation = machine.generation;
     const execution = await machine.executions.start({ executionId: "surviving-process",
@@ -45,10 +46,12 @@ test("installed systemd host restart leaves the independently supervised Linux m
     const supervisorPid = (await command("systemctl", ["--user", "show", supervisorUnit.name, "--property=MainPID", "--value"])).trim();
     const apiPid = (await command("systemctl", ["--user", "show", hostUnit.name, "--property=MainPID", "--value"])).trim();
     assert.match(supervisorPid, /^[1-9][0-9]*$/u);
-    const children = (await readFile(`/proc/${supervisorPid}/task/${supervisorPid}/children`, "utf8")).trim().split(/\s+/u);
-    assert.equal(children.length, 1, "the supervisor, not the host API, must own this guardian child");
-    const guardianPid = children[0];
-    assert.match(await readFile(`/proc/${guardianPid}/cgroup`, "utf8"), new RegExp(supervisorUnit.name.replaceAll(".", "\\."), "u"));
+    const machinePath = join(directory, "machines", "id-" + createHash("sha256").update(machine.id).digest("hex"));
+    const machineUnit = "sandsurf-machine-id-" + createHash("sha256").update(machinePath).digest("hex") + ".service";
+    const guardianPid = (await command("systemctl", ["--user", "show", machineUnit, "--property=MainPID", "--value"])).trim();
+    assert.match(guardianPid, /^[1-9][0-9]*$/u);
+    assert.match(await readFile(`/proc/${guardianPid}/cgroup`, "utf8"), new RegExp(machineUnit.replaceAll(".", "\\."), "u"));
+    assert.doesNotMatch(await readFile(`/proc/${guardianPid}/cgroup`, "utf8"), new RegExp(supervisorUnit.name.replaceAll(".", "\\."), "u"));
     assert.doesNotMatch(await readFile(`/proc/${guardianPid}/cgroup`, "utf8"), new RegExp(hostUnit.name.replaceAll(".", "\\."), "u"));
     await host.close(); host = undefined;
     await command("systemctl", ["--user", "restart", hostUnit.name]);
@@ -58,7 +61,7 @@ test("installed systemd host restart leaves the independently supervised Linux m
     machine = await host.machines.connect("independent-machine");
     assert.equal(machine.generation, generation);
     assert.equal((await machine.inspect()).machine.value.state, "running");
-    assert.equal((await readFile(`/proc/${supervisorPid}/task/${supervisorPid}/children`, "utf8")).trim(), guardianPid);
+    assert.equal((await command("systemctl", ["--user", "show", machineUnit, "--property=MainPID", "--value"])).trim(), guardianPid);
     const terminal = await machine.terminals.get(execution.id);
     await terminal.acquireInput();
     await terminal.input.write(new TextEncoder().encode("continued\n"));

@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { chmod, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { createGunzip, createGzip } from "node:zlib";
+import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const images = resolve(repository, "packages/sandsurf/images");
@@ -13,6 +14,8 @@ const sources = resolve(repository, "image-sources");
 const maximumImageBytes = 8 * 1024 ** 3;
 
 type ImageEntry = { readonly raw: string; readonly compressed: string; readonly sha256: string };
+type ImageRoots = { readonly images: string; readonly sources: string };
+const defaultRoots: ImageRoots = { images, sources };
 
 export async function writeImageIndex(root = images, required: readonly string[] = []): Promise<void> {
   const missing = new Set(required);
@@ -31,7 +34,7 @@ export async function writeImageIndex(root = images, required: readonly string[]
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 ** 2) throw new Error(`${relative} is not a bounded regular manifest`);
     const bytes = await readFile(path);
     const manifest: unknown = JSON.parse(bytes.toString("utf8"));
-    if (!record(manifest) || manifest.formatVersion !== 3 || manifest.architecture !== match[1]
+    if (!record(manifest) || manifest.formatVersion !== 1 || manifest.architecture !== match[1]
       || !record(manifest.system) || !record(manifest.system.rootfs) || !record(manifest.bootBundle)) {
       throw new Error(`${relative} is not a current machine image`);
     }
@@ -40,51 +43,59 @@ export async function writeImageIndex(root = images, required: readonly string[]
   }
   if (missing.size !== 0) throw new Error(`required guest images are absent: ${[...missing].join(", ")}`);
   if (Object.keys(files).length === 0) throw new Error("no machine images were found");
-  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({ formatVersion: 1, buildId: "sandsurf-images-0.1.0", files }, null, 2)}\n`, { mode: 0o644 });
+  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({ formatVersion: 1, buildId: "sandsurf-images-1.0.0", files }, null, 2)}\n`, { mode: 0o644 });
 }
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function entries(architecture: "x64" | "arm64"): Promise<ImageEntry[]> {
+async function entries(architecture: "x64" | "arm64", roots: ImageRoots): Promise<ImageEntry[]> {
   const directory = `development-${architecture}`;
-  const manifest: unknown = JSON.parse(await readFile(resolve(images, directory, "manifest.json"), "utf8"));
+  const manifest: unknown = JSON.parse(await readFile(resolve(roots.images, directory, "manifest.json"), "utf8"));
   if (!record(manifest) || !record(manifest.bootBundle) || !record(manifest.system)) {
     throw new Error(`${directory} image manifest is malformed`);
   }
-  if (manifest.formatVersion !== 3) throw new Error(`${directory} is not a machine image`);
-  const artifacts = [manifest.system.rootfs];
-  return artifacts.map((artifact) => {
-    if (!record(artifact) || typeof artifact.path !== "string" ||
-        !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.ext4$/u.test(artifact.path) ||
-        typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.sha256)) {
-      throw new Error(`${directory} has an invalid ext4 artifact identity`);
+  if (manifest.formatVersion !== 1) throw new Error(`${directory} is not a machine image`);
+  const artifacts: { artifact: unknown; extension: "ext4" | "vhdx" }[] = [
+    { artifact: manifest.system.rootfs, extension: "ext4" },
+  ];
+  if (manifest.platformArtifacts !== undefined) {
+    if (!record(manifest.platformArtifacts)) throw new Error(`${directory} has invalid platform artifacts`);
+    if (manifest.platformArtifacts.windowsX64 !== undefined) {
+      if (!record(manifest.platformArtifacts.windowsX64) || architecture !== "x64") {
+        throw new Error(`${directory} has invalid Windows artifacts`);
+      }
+      artifacts.push({ artifact: manifest.platformArtifacts.windowsX64.system, extension: "vhdx" });
     }
+  }
+  const paths = new Set<string>();
+  return artifacts.map(({ artifact, extension }) => {
+    if (!record(artifact) || typeof artifact.path !== "string" ||
+        !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.(?:ext4|vhdx)$/u.test(artifact.path) ||
+        !artifact.path.endsWith(`.${extension}`) || paths.has(artifact.path) ||
+        typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.sha256)) {
+      throw new Error(`${directory} has an invalid ${extension} artifact identity`);
+    }
+    paths.add(artifact.path);
     return {
-      raw: resolve(images, directory, artifact.path),
-      compressed: resolve(sources, directory, `${artifact.path}.gz`),
+      raw: resolve(roots.images, directory, artifact.path),
+      compressed: resolve(roots.sources, directory, `${artifact.path}.gz`),
       sha256: artifact.sha256,
     };
   });
 }
 
 async function digestFile(path: string): Promise<string> {
-  const metadata = await lstat(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > maximumImageBytes) {
-    throw new Error(`${path} is not a bounded regular image file`);
-  }
-  const hash = createHash("sha256");
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return hash.digest("hex");
+  return sha256File(path, maximumImageBytes);
 }
 
 function temporary(path: string): string {
   return `${path}.new-${process.pid}-${randomUUID()}`;
 }
 
-export async function packImageSources(architecture: "x64" | "arm64"): Promise<void> {
-  for (const entry of await entries(architecture)) {
+export async function packImageSources(architecture: "x64" | "arm64", roots: ImageRoots = defaultRoots): Promise<void> {
+  for (const entry of await entries(architecture, roots)) {
     if (await digestFile(entry.raw) !== entry.sha256) {
       throw new Error(`${entry.raw} differs from its image manifest`);
     }
@@ -94,19 +105,26 @@ export async function packImageSources(architecture: "x64" | "arm64"): Promise<v
       await pipeline(createReadStream(entry.raw), createGzip({ level: 9 }),
         createWriteStream(staged, { flags: "wx", mode: 0o644 }));
       await rename(staged, entry.compressed);
+      await publishDistributionSource(entry);
     } finally {
       await rm(staged, { force: true });
     }
   }
 }
 
-export async function hydrateImageSources(): Promise<void> {
-  const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
-  if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
-  for (const relative of Object.keys(index.files)) {
+export async function hydrateImageSources(roots: ImageRoots = defaultRoots): Promise<void> {
+  const index: unknown = JSON.parse(await readFile(resolve(roots.images, "manifest.json"), "utf8"));
+  if (!record(index) || index.formatVersion !== 1 || index.buildId !== "sandsurf-images-1.0.0" ||
+      !record(index.files)) throw new Error("bundled image index is malformed");
+  for (const [relative, digest] of Object.entries(index.files)) {
     const match = /^development-(x64|arm64)\/manifest\.json$/u.exec(relative);
     if (match === null) throw new Error(`invalid bundled image entry ${relative}`);
-    for (const entry of await entries(match[1] as "x64" | "arm64")) {
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest) ||
+        await digestFile(resolve(roots.images, relative)) !== digest) {
+      throw new Error(`${relative} differs from the image index`);
+    }
+    for (const entry of await entries(match[1] as "x64" | "arm64", roots)) {
+      await publishDistributionSource(entry);
       try {
         if (await digestFile(entry.raw) !== entry.sha256) {
           throw new Error(`${entry.raw} differs from its image manifest`);
@@ -124,14 +142,14 @@ export async function hydrateImageSources(): Promise<void> {
       const bound = new Transform({
         transform(chunk: Buffer, _encoding, callback) {
           bytes += chunk.length;
-          callback(bytes > maximumImageBytes ? new Error("image source exceeds the ext4 bound") : null, chunk);
+          callback(bytes > maximumImageBytes ? new Error("image source exceeds the disk bound") : null, chunk);
         },
       });
       try {
         await pipeline(createReadStream(entry.compressed), createGunzip(), bound,
           createWriteStream(staged, { flags: "wx", mode: 0o600 }));
         if (await digestFile(staged) !== entry.sha256) {
-          throw new Error(`${entry.compressed} does not reconstruct its verified ext4 image`);
+          throw new Error(`${entry.compressed} does not reconstruct its verified disk image`);
         }
         await chmod(staged, 0o444);
         await rename(staged, entry.raw);
@@ -140,6 +158,34 @@ export async function hydrateImageSources(): Promise<void> {
       }
     }
   }
+}
+
+async function publishDistributionSource(entry: ImageEntry): Promise<void> {
+  const compressedDigest = await digestFile(entry.compressed);
+  await verifyDiskTransport(entry.compressed, entry.sha256);
+  const target = `${entry.raw}.gz`;
+  const staged = temporary(target);
+  try {
+    await copyFile(entry.compressed, staged);
+    if (await digestFile(staged) !== compressedDigest) throw new Error("distribution source changed during publication");
+    await chmod(staged, 0o444);
+    await rename(staged, target);
+  } finally { await rm(staged, { force: true }); }
+}
+
+export async function verifyDiskTransport(path: string, expectedDigest: string): Promise<void> {
+  if (!/^[a-f0-9]{64}$/u.test(expectedDigest)) throw new Error("invalid decoded disk digest");
+  await digestFile(path);
+  const hash = createHash("sha256");
+  let bytes = 0;
+  await pipeline(createReadStream(path), createGunzip(), new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.length;
+      if (bytes > maximumImageBytes) callback(new Error("distribution disk exceeds capacity bound"));
+      else { hash.update(chunk); callback(); }
+    },
+  }));
+  if (hash.digest("hex") !== expectedDigest) throw new Error(`${path} does not reconstruct its verified disk image`);
 }
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

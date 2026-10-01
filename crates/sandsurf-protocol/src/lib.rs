@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod binary;
+mod console;
 mod environment;
 mod frame;
 mod guest;
@@ -10,6 +11,7 @@ mod snapshot;
 mod types;
 
 pub use binary::*;
+pub use console::*;
 pub use environment::*;
 pub use frame::*;
 pub use guest::*;

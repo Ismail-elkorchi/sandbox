@@ -2,7 +2,9 @@
 //! the management daemon owns neither pipe/PTY descriptors nor their lifetime.
 
 use crate::OutputSpool;
-use crate::process::{ExecutionKeeper, ProcessError, read_process_record};
+use crate::process::{
+    ExecutionKeeper, ProcessError, ProcessRecord, read_process_record, write_process_record,
+};
 use sandsurf_protocol::{
     Counter, Digest, ExecutionCompletion, ExecutionId, ExecutionSnapshot, ExecutionState, Frame,
     FrameKind, MachineId, RetainedPage, RetainedPageMetadata, SnapshotId, SpawnRequest, TerminalId,
@@ -78,10 +80,9 @@ enum KeeperRequest {
         after: Counter,
         maximum: u32,
     },
-    Rebind {
+    Restore {
         snapshot: SnapshotId,
-        machine: MachineId,
-        previous: Counter,
+        captured: Box<sandsurf_protocol::CapturedExecution>,
         generation: Counter,
     },
 }
@@ -105,6 +106,30 @@ enum KeeperResponse {
         category: String,
         evidence: Option<Digest>,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeeperEnvelope {
+    execution_id: ExecutionId,
+    request: KeeperRequest,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KeeperRoute {
+    keeper_id: ExecutionId,
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreMembership {
+    snapshot_id: SnapshotId,
+    capture_operation_id: sandsurf_protocol::OperationId,
+    machine_id: MachineId,
+    previous_generation: Counter,
+    generation: Counter,
+    executions: Vec<sandsurf_protocol::CapturedExecution>,
 }
 
 impl ExecutionRegistry {
@@ -233,13 +258,15 @@ impl ExecutionRegistry {
         match self.call(id, KeeperRequest::Inspect, None) {
             Ok(KeeperResponse::Execution { value }) => Ok(*value),
             Ok(_) => Err(ProcessError::Invalid("keeper returned wrong inspection")),
-            Err(ProcessError::Io(_)) | Err(ProcessError::Unknown(_)) => self.retained_snapshot(id),
+            Err(ProcessError::Io(_))
+            | Err(ProcessError::Unknown(_))
+            | Err(ProcessError::Missing) => self.retained_snapshot(id),
             Err(error) => Err(error),
         }
     }
 
     fn retained_snapshot(&self, id: &ExecutionId) -> Result<ExecutionSnapshot, ProcessError> {
-        let mut record = read_process_record(&self.record(id))?;
+        let mut record = read_process_record(&self.record(id)?)?;
         if record.version != 1 || record.request.execution_id != *id {
             return Err(ProcessError::Invalid("retained execution identity invalid"));
         }
@@ -268,6 +295,17 @@ impl ExecutionRegistry {
                 return Err(ProcessError::Invalid("execution registry exceeds bound"));
             }
             let entry = entry?;
+            if entry.file_name() == ".restore.json"
+                || entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix(".routing-")
+                        .and_then(|name| name.strip_suffix(".tmp"))
+                        .is_some_and(|nonce| {
+                            nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                })
+            {
+                continue;
+            }
             if !entry.file_type()?.is_dir() {
                 return Err(ProcessError::Invalid(
                     "execution registry contains non-directory",
@@ -279,8 +317,17 @@ impl ExecutionRegistry {
                 .ok_or(ProcessError::Invalid("execution directory not UTF-8"))?
                 .try_into()
                 .map_err(|_| ProcessError::Invalid("execution directory identity invalid"))?;
-            let value = self.get(&id)?;
-            if (value.request.machine_id.clone(), value.request.generation) == identity {
+            let value = match self.get(&id) {
+                Ok(value) => value,
+                // Admission is not a PID assertion; a lost spawn response or
+                // absent keeper remains unobserved in the host journal.
+                Err(ProcessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(ProcessError::Missing) => continue,
+                Err(error) => return Err(error),
+            };
+            if value.guest_pid != 0
+                && (value.request.machine_id.clone(), value.request.generation) == identity
+            {
                 result.push(value);
             }
         }
@@ -398,12 +445,14 @@ impl ExecutionRegistry {
         }
         match self.call_output(id, after, maximum) {
             Ok(page) => Ok(page),
-            Err(ProcessError::Io(_)) | Err(ProcessError::Unknown(_)) => {
+            Err(ProcessError::Io(_))
+            | Err(ProcessError::Unknown(_))
+            | Err(ProcessError::Missing) => {
                 let mut archives = self.archives.lock().map_err(|_| unavailable())?;
                 if !archives.contains_key(id) {
                     let snapshot = self.retained_snapshot(id)?;
                     let reader = OutputSpool::open_read_only(
-                        &self.record(id).with_file_name("output.ssf"),
+                        &self.record(id)?.with_file_name("output.ssf"),
                         snapshot.request.output_bytes,
                         &snapshot.request.machine_id,
                         id,
@@ -426,68 +475,249 @@ impl ExecutionRegistry {
     ) -> Result<RegistryCompletionObserver, ProcessError> {
         self.get(id)?;
         Ok(RegistryCompletionObserver {
-            directory: self.directory(id),
+            directory: self.keeper_directory(id)?,
             id: id.clone(),
         })
+    }
+
+    pub fn stage_restore(
+        &self,
+        snapshot_id: SnapshotId,
+        capture_operation_id: sandsurf_protocol::OperationId,
+        machine_id: MachineId,
+        previous_generation: Counter,
+        generation: Counter,
+        executions: Vec<sandsurf_protocol::CapturedExecution>,
+    ) -> Result<(), ProcessError> {
+        let identity = self.identity()?;
+        if identity.0 != machine_id
+            || (identity.1 != previous_generation && identity.1 != generation)
+            || generation <= previous_generation
+        {
+            return Err(ProcessError::Conflict(
+                "restore membership identity mismatch",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for execution in &executions {
+            if execution.admission.generation != previous_generation
+                || !seen.insert(execution.admission.execution_id.clone())
+            {
+                return Err(ProcessError::Invalid("restore membership invalid"));
+            }
+            execution
+                .restored(&snapshot_id, &machine_id, generation)
+                .map_err(|_| ProcessError::Invalid("restore membership invalid"))?;
+        }
+        let value = RestoreMembership {
+            snapshot_id,
+            capture_operation_id,
+            machine_id,
+            previous_generation,
+            generation,
+            executions,
+        };
+        let path = self.root.join(".restore.json");
+        if path.exists() {
+            let old: RestoreMembership = read_json(&path)?;
+            if old == value {
+                return Ok(());
+            }
+            if identity.1 != previous_generation {
+                return Err(ProcessError::Conflict(
+                    "restored generation already has another membership",
+                ));
+            }
+            if old.machine_id != value.machine_id || old.generation > previous_generation {
+                return Err(ProcessError::Conflict("restore membership already bound"));
+            }
+            return write_json(&path, &value, true);
+        }
+        if identity.1 != previous_generation {
+            return Err(ProcessError::Conflict(
+                "restored generation has no admitted membership",
+            ));
+        }
+        write_json_new(&path, &value)
     }
 
     pub fn rebind_generation(
         &self,
         snapshot: &SnapshotId,
+        capture_operation: &sandsurf_protocol::OperationId,
         machine: MachineId,
         previous: Counter,
         generation: Counter,
     ) -> Result<(), ProcessError> {
         let mut identity = self.identity.write().map_err(|_| unavailable())?;
-        if identity.1 != previous {
-            return Err(ProcessError::Conflict("restore source generation mismatch"));
+        let staged: RestoreMembership = read_json(&self.root.join(".restore.json"))?;
+        if staged.snapshot_id != *snapshot
+            || staged.capture_operation_id != *capture_operation
+            || staged.machine_id != machine
+            || staged.previous_generation != previous
+            || staged.generation != generation
+            || identity.0 != machine
+            || (identity.1 != previous && identity.1 != generation)
+        {
+            return Err(ProcessError::Conflict(
+                "restore source or staged membership mismatch",
+            ));
         }
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                return Err(ProcessError::Invalid("invalid execution directory"));
-            }
-            let id: ExecutionId = entry
+        for captured in &staged.executions {
+            let (request, lineage) = captured
+                .restored(snapshot, &machine, generation)
+                .map_err(|_| ProcessError::Invalid("restore admission invalid"))?;
+            let id = &request.execution_id;
+            let physical = self.keeper_directory(&captured.admission.execution_id)?;
+            let keeper_id: ExecutionId = physical
                 .file_name()
-                .to_str()
-                .ok_or(ProcessError::Invalid("invalid execution directory"))?
+                .and_then(|name| name.to_str())
+                .ok_or(ProcessError::Invalid("keeper route invalid"))?
                 .try_into()
-                .map_err(|_| ProcessError::Invalid("invalid execution identity"))?;
-            let request = admission(&entry.path())?;
-            if request.generation == previous && request.machine_id == identity.0 {
-                // Only a live restored keeper can bind its in-memory instance.
-                // Closed execution history is not rewritten on guest restore.
-                if matches!(
-                    self.retained_snapshot(&id)?.state,
-                    ExecutionState::Exited(_) | ExecutionState::Unknown { .. }
-                ) && UnixStream::connect(entry.path().join("keeper.sock")).is_err()
-                {
-                    continue;
+                .map_err(|_| ProcessError::Invalid("keeper route invalid"))?;
+            let directory = self.directory(id);
+            if directory.exists() {
+                match admission(&directory) {
+                    Ok(old) if old == request => {}
+                    Err(ProcessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        write_admission(&directory, &request)?
+                    }
+                    Ok(_) => return Err(ProcessError::Conflict("restore admission already bound")),
+                    Err(error) => return Err(error),
                 }
-                self.complete(
-                    &id,
-                    KeeperRequest::Rebind {
-                        snapshot: snapshot.clone(),
-                        machine: machine.clone(),
-                        previous,
-                        generation,
-                    },
-                    None,
-                )?;
+            } else {
+                fs::DirBuilder::new().mode(0o700).create(&directory)?;
+                write_admission(&directory, &request)?;
+            }
+            let route_path = directory.join("route.json");
+            if route_path.exists() {
+                if read_json::<KeeperRoute>(&route_path)?.keeper_id != keeper_id {
+                    return Err(ProcessError::Conflict("restore keeper route changed"));
+                }
+            } else {
+                write_json_new(&route_path, &KeeperRoute { keeper_id })?;
+            }
+            match self.complete(
+                &captured.admission.execution_id,
+                KeeperRequest::Restore {
+                    snapshot: snapshot.clone(),
+                    captured: Box::new(captured.clone()),
+                    generation,
+                },
+                None,
+            ) {
+                Ok(()) => {}
+                Err(ProcessError::Io(_))
+                | Err(ProcessError::Unknown(_))
+                | Err(ProcessError::Missing) => {
+                    if UnixStream::connect(physical.join("keeper.sock")).is_ok() {
+                        match self.call(id, KeeperRequest::Inspect, None) {
+                            Ok(KeeperResponse::Execution { value })
+                                if value.request == request
+                                    && value.lineage == Some(lineage.clone()) =>
+                            {
+                                continue;
+                            }
+                            _ => return Err(unavailable()),
+                        }
+                    }
+                    let target = physical.join("data").join(id.as_str());
+                    if target.join("process.json").exists() {
+                        let restored = read_process_record(&target.join("process.json"))?;
+                        if restored.request != request || restored.lineage != Some(lineage.clone())
+                        {
+                            return Err(ProcessError::Conflict(
+                                "restored archive identity changed",
+                            ));
+                        }
+                        continue;
+                    }
+                    let source = match read_process_record(
+                        &self.record(&captured.admission.execution_id)?,
+                    ) {
+                        Ok(source) => source,
+                        Err(ProcessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if source.request != captured.admission || source.lineage != captured.lineage {
+                        return Err(ProcessError::Conflict(
+                            "archived restore source differs from captured admission",
+                        ));
+                    }
+                    // A missing live keeper never receives a replayed spawn.
+                    // Closed spools can still acquire independent archive lineage.
+                    fs::create_dir_all(&target)?;
+                    let old = OutputSpool::open_read_only(
+                        &self
+                            .record(&captured.admission.execution_id)?
+                            .with_file_name("output.ssf"),
+                        source.request.output_bytes,
+                        &source.request.machine_id,
+                        &source.request.execution_id,
+                        source.request.generation,
+                    )?;
+                    let spool = old.restored_suffix(
+                        &target.join("output.ssf"),
+                        &source.request,
+                        &captured.output,
+                        &request,
+                    )?;
+                    let mut state = source.state;
+                    match &mut state {
+                        ExecutionState::Exited(completion) => {
+                            completion.output = spool.finalize()?
+                        }
+                        ExecutionState::Running | ExecutionState::Draining { .. } => {
+                            state = ExecutionState::Unknown {
+                                evidence: bytes_digest(b"restored-execution-keeper-unavailable"),
+                            }
+                        }
+                        _ => {}
+                    }
+                    write_process_record(
+                        &target.join("process.json"),
+                        &ProcessRecord {
+                            version: 1,
+                            request,
+                            guest_pid: source.guest_pid,
+                            state,
+                            lineage: Some(lineage),
+                        },
+                        true,
+                    )?;
+                }
+                Err(error) => return Err(error),
             }
         }
+        self.connections.lock().map_err(|_| unavailable())?.clear();
+        self.archives.lock().map_err(|_| unavailable())?.clear();
         *identity = (machine, generation);
+        // Keep the admission through ambiguous handshakes. A subsequent snapshot
+        // restores its own registry state; routine reconnect needs no mutation.
         Ok(())
     }
 
+    fn keeper_directory(&self, id: &ExecutionId) -> Result<PathBuf, ProcessError> {
+        let route = self.directory(id).join("route.json");
+        match read_json::<KeeperRoute>(&route) {
+            Ok(route) => Ok(self.root.join(route.keeper_id.as_str())),
+            Err(ProcessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(self.directory(id))
+            }
+            Err(error) => Err(error),
+        }
+    }
     fn directory(&self, id: &ExecutionId) -> PathBuf {
         self.root.join(id.as_str())
     }
-    fn record(&self, id: &ExecutionId) -> PathBuf {
-        self.directory(id)
+    fn record(&self, id: &ExecutionId) -> Result<PathBuf, ProcessError> {
+        Ok(self
+            .keeper_directory(id)?
             .join("data")
             .join(id.as_str())
-            .join("process.json")
+            .join("process.json"))
     }
     fn connection(&self, id: &ExecutionId) -> Result<Connection, ProcessError> {
         let mut connections = self.connections.lock().map_err(|_| unavailable())?;
@@ -525,12 +755,18 @@ impl ExecutionRegistry {
         let mut held = connection.lock().map_err(|_| unavailable())?;
         let result = (|| {
             if held.is_none() {
-                let stream = UnixStream::connect(self.directory(id).join("keeper.sock"))?;
+                let stream = UnixStream::connect(self.keeper_directory(id)?.join("keeper.sock"))?;
                 set_timeout(&stream)?;
                 *held = Some(stream);
             }
             let stream = held.as_mut().ok_or_else(unavailable)?;
-            write_control(stream, &request)?;
+            write_control(
+                stream,
+                &KeeperEnvelope {
+                    execution_id: id.clone(),
+                    request,
+                },
+            )?;
             if let Some(bytes) = bytes {
                 write_data(stream, bytes)?;
             }
@@ -552,16 +788,19 @@ impl ExecutionRegistry {
         let mut held = connection.lock().map_err(|_| unavailable())?;
         let result = (|| {
             if held.is_none() {
-                let stream = UnixStream::connect(self.directory(id).join("keeper.sock"))?;
+                let stream = UnixStream::connect(self.keeper_directory(id)?.join("keeper.sock"))?;
                 set_timeout(&stream)?;
                 *held = Some(stream);
             }
             let stream = held.as_mut().ok_or_else(unavailable)?;
             write_control(
                 stream,
-                &KeeperRequest::Output {
-                    after,
-                    maximum: maximum as u32,
+                &KeeperEnvelope {
+                    execution_id: id.clone(),
+                    request: KeeperRequest::Output {
+                        after,
+                        maximum: maximum as u32,
+                    },
                 },
             )?;
             let response: KeeperResponse = read_control(stream)?;
@@ -661,7 +900,7 @@ pub fn execution_keeper_main(directory: &Path) -> io::Result<()> {
     let pending = Arc::new(AtomicUsize::new(0));
     let startup = Instant::now();
     loop {
-        match engine.get(&request.execution_id) {
+        match engine.current_execution_id().and_then(|id| engine.get(&id)) {
             Ok(value)
                 if matches!(
                     value.state,
@@ -717,7 +956,8 @@ fn serve_keeper(
     pending: &AtomicUsize,
 ) -> io::Result<()> {
     loop {
-        let request: KeeperRequest = read_control(&mut stream)?;
+        let envelope: KeeperEnvelope = read_control(&mut stream)?;
+        let request = envelope.request;
         pending.fetch_add(1, Ordering::AcqRel);
         struct Pending<'a>(&'a AtomicUsize);
         impl Drop for Pending<'_> {
@@ -726,12 +966,19 @@ fn serve_keeper(
             }
         }
         let _pending = Pending(pending);
-        let id = &admitted.execution_id;
+        let id = &envelope.execution_id;
         let result: Result<(KeeperResponse, Vec<Vec<u8>>), ProcessError> = (|| {
             let response = match request {
-                KeeperRequest::Start { environment } => KeeperResponse::Execution {
-                    value: Box::new(engine.spawn_with_environment(admitted.clone(), &environment)?),
-                },
+                KeeperRequest::Start { environment } => {
+                    if id != &admitted.execution_id {
+                        return Err(ProcessError::Conflict("keeper start admission differs"));
+                    }
+                    KeeperResponse::Execution {
+                        value: Box::new(
+                            engine.spawn_with_environment(admitted.clone(), &environment)?,
+                        ),
+                    }
+                }
                 KeeperRequest::Inspect => KeeperResponse::Execution {
                     value: Box::new(engine.get(id)?),
                 },
@@ -774,13 +1021,15 @@ fn serve_keeper(
                         .map_err(|_| ProcessError::Invalid("output metadata invalid"))?;
                     return Ok((KeeperResponse::Output { metadata }, data));
                 }
-                KeeperRequest::Rebind {
+                KeeperRequest::Restore {
                     snapshot,
-                    machine,
-                    previous,
+                    captured,
                     generation,
                 } => {
-                    engine.rebind_generation(&snapshot, machine, previous, generation)?;
+                    if id != &captured.admission.execution_id {
+                        return Err(ProcessError::Conflict("keeper restore source differs"));
+                    }
+                    engine.restore_execution(&snapshot, &captured, generation)?;
                     KeeperResponse::Complete
                 }
             };
@@ -829,28 +1078,9 @@ fn admission(directory: &Path) -> Result<SpawnRequest, ProcessError> {
     Ok(request)
 }
 fn write_admission(directory: &Path, request: &SpawnRequest) -> Result<(), ProcessError> {
-    use std::io::Write;
-    let bytes = serde_json::to_vec(request)
-        .map_err(|_| ProcessError::Invalid("keeper admission encoding failed"))?;
-    if bytes.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
-        return Err(ProcessError::Invalid("keeper admission exceeds bound"));
-    }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(directory.join("request.json"))?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    File::open(directory)?.sync_all()?;
-    File::open(
-        directory
-            .parent()
-            .ok_or(ProcessError::Invalid("keeper directory has no parent"))?,
-    )?
-    .sync_all()?;
-    Ok(())
+    write_json_new(&directory.join("request.json"), request)
 }
+
 fn write_control(stream: &mut UnixStream, value: &impl Serialize) -> io::Result<()> {
     Frame {
         kind: FrameKind::Control,
@@ -929,5 +1159,260 @@ fn response_result(response: KeeperResponse) -> Result<KeeperResponse, ProcessEr
             ),
         }),
         response => Ok(response),
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ProcessError> {
+    use std::io::Read;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file()
+        || file.metadata()?.len() > sandsurf_protocol::MAX_CONTROL_BYTES as u64
+    {
+        return Err(ProcessError::Invalid(
+            "execution routing record exceeds bound",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(sandsurf_protocol::MAX_CONTROL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ProcessError::Invalid("execution routing record invalid"))
+}
+fn write_json_new(path: &Path, value: &impl Serialize) -> Result<(), ProcessError> {
+    write_json(path, value, false)
+}
+fn write_json(path: &Path, value: &impl Serialize, replace: bool) -> Result<(), ProcessError> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| ProcessError::Invalid("execution routing encoding failed"))?;
+    if bytes.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
+        return Err(ProcessError::Invalid(
+            "execution routing record exceeds bound",
+        ));
+    }
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|_| ProcessError::Invalid("routing publication entropy unavailable"))?;
+    let temporary =
+        path.with_file_name(format!(".routing-{:032x}.tmp", u128::from_le_bytes(nonce)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let result = if replace {
+        fs::rename(&temporary, path)
+    } else {
+        fs::hard_link(&temporary, path)
+    };
+    let _ = fs::remove_file(&temporary);
+    result?;
+    File::open(
+        path.parent()
+            .ok_or(ProcessError::Invalid("execution routing parent missing"))?,
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use sandsurf_protocol::{
+        CapturedExecution, ExecutionOutcome, StdioMode, Stream, extend_output_boundary,
+        initial_output_boundary,
+    };
+
+    #[test]
+    fn archive_routes_survive_reconnect_and_repeated_restore_without_rewriting_physical_admissions()
+    {
+        let mut nonce = [0_u8; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-registry-restore-{:032x}",
+            u128::from_le_bytes(nonce)
+        ));
+        let machine: MachineId = "box".try_into().unwrap();
+        let registry = ExecutionRegistry::create(
+            &root,
+            machine.clone(),
+            Counter::ONE,
+            Path::new("/bin/false"),
+        )
+        .unwrap();
+        let source = SpawnRequest {
+            machine_id: machine.clone(),
+            generation: Counter::ONE,
+            execution_id: "source".try_into().unwrap(),
+            operation_id: "source-operation".try_into().unwrap(),
+            argv: vec!["/bin/true".into()],
+            cwd: "/".into(),
+            environment: BTreeMap::new(),
+            user: None,
+            stdio: StdioMode::Pipes,
+            terminal_size: None,
+            active_deadline_millis: None,
+            elapsed_deadline_unix_millis: None,
+            output_bytes: 100_u64.try_into().unwrap(),
+        };
+        let physical = root.join(source.execution_id.as_str());
+        fs::create_dir(&physical).unwrap();
+        write_admission(&physical, &source).unwrap();
+        let data = physical.join("data").join(source.execution_id.as_str());
+        let spool = OutputSpool::create(
+            &data.join("output.ssf"),
+            source.output_bytes,
+            &machine,
+            &source.execution_id,
+            Counter::ONE,
+        )
+        .unwrap();
+        spool.append(Stream::Stdout, b"prefix").unwrap();
+        let empty = initial_output_boundary(&machine, &source.execution_id, Counter::ONE).unwrap();
+        let anchor =
+            extend_output_boundary(&empty, Counter::ONE, Stream::Stdout, b"prefix").unwrap();
+        spool.append(Stream::Stdout, b"suffix").unwrap();
+        let output = spool.finalize().unwrap();
+        let state = ExecutionState::Exited(ExecutionCompletion {
+            outcome: ExecutionOutcome::Exit { code: 0 },
+            output,
+            cleanup_digest: bytes_digest(b"reported"),
+            accounting_digest: bytes_digest(b"reported"),
+        });
+        write_process_record(
+            &data.join("process.json"),
+            &ProcessRecord {
+                version: 1,
+                request: source.clone(),
+                guest_pid: 123,
+                state,
+                lineage: None,
+            },
+            true,
+        )
+        .unwrap();
+        let source_record = fs::read(data.join("process.json")).unwrap();
+        let source_output = fs::read(data.join("output.ssf")).unwrap();
+        let captured = CapturedExecution {
+            admission: source.clone(),
+            lineage: None,
+            observation: None,
+            output: anchor,
+        };
+        let snapshot: SnapshotId = "first-snapshot".try_into().unwrap();
+        let capture_operation: sandsurf_protocol::OperationId =
+            "capture-operation".try_into().unwrap();
+        let generation: Counter = 2_u64.try_into().unwrap();
+        registry
+            .stage_restore(
+                snapshot.clone(),
+                capture_operation.clone(),
+                machine.clone(),
+                Counter::ONE,
+                generation,
+                vec![captured.clone()],
+            )
+            .unwrap();
+        registry
+            .rebind_generation(
+                &snapshot,
+                &capture_operation,
+                machine.clone(),
+                Counter::ONE,
+                generation,
+            )
+            .unwrap();
+        registry
+            .rebind_generation(
+                &snapshot,
+                &capture_operation,
+                machine.clone(),
+                Counter::ONE,
+                generation,
+            )
+            .unwrap();
+        let (restored, lineage) = captured.restored(&snapshot, &machine, generation).unwrap();
+        assert_eq!(
+            registry.keeper_directory(&restored.execution_id).unwrap(),
+            physical
+        );
+        assert_eq!(
+            registry.get(&restored.execution_id).unwrap().lineage,
+            Some(lineage.clone())
+        );
+        assert_eq!(
+            registry
+                .read_output(&restored.execution_id, Counter::ZERO, 1024)
+                .unwrap()
+                .chunks[0]
+                .bytes,
+            b"suffix"
+        );
+        assert_eq!(admission(&physical).unwrap(), source);
+        assert_eq!(fs::read(data.join("process.json")).unwrap(), source_record);
+        assert_eq!(fs::read(data.join("output.ssf")).unwrap(), source_output);
+        drop(registry);
+        let reopened =
+            ExecutionRegistry::create(&root, machine.clone(), generation, Path::new("/bin/false"))
+                .unwrap();
+        let report = reopened.get(&restored.execution_id).unwrap();
+        let ExecutionState::Exited(completion) = &report.state else {
+            panic!("archive lost completion");
+        };
+        let next = CapturedExecution {
+            admission: restored.clone(),
+            lineage: Some(lineage),
+            observation: Some(report.clone()),
+            output: completion.output.clone(),
+        };
+        let snapshot: SnapshotId = "second-snapshot".try_into().unwrap();
+        let capture_operation: sandsurf_protocol::OperationId =
+            "capture-second".try_into().unwrap();
+        let third_generation: Counter = 3_u64.try_into().unwrap();
+        reopened
+            .stage_restore(
+                snapshot.clone(),
+                capture_operation.clone(),
+                machine.clone(),
+                generation,
+                third_generation,
+                vec![next.clone()],
+            )
+            .unwrap();
+        reopened
+            .rebind_generation(
+                &snapshot,
+                &capture_operation,
+                machine.clone(),
+                generation,
+                third_generation,
+            )
+            .unwrap();
+        let (third, origin) = next
+            .restored(&snapshot, &machine, third_generation)
+            .unwrap();
+        assert_eq!(origin.logical_execution_id, source.execution_id);
+        assert_eq!(
+            reopened.keeper_directory(&third.execution_id).unwrap(),
+            physical
+        );
+        assert_eq!(
+            reopened.get(&third.execution_id).unwrap().lineage,
+            Some(origin)
+        );
+        assert!(
+            reopened
+                .read_output(&third.execution_id, Counter::ZERO, 1024)
+                .unwrap()
+                .chunks
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

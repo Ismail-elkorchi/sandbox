@@ -6,8 +6,8 @@ import { createSandsurfGuestPath, sandsurfDigest, validateSandsurfOutputBoundary
 import type { OutputBoundary } from "./sandsurf-protocol.js";
 import { parseDirectoryPage, parseFileMetadata, parseFileRange, parseFileRevision, parseFilesystemWatchPage, parseFilesystemBytes } from "./filesystem.js";
 import type { DirectoryPage, FileMetadata, FileRange, FileRevision, FilesystemWatchEvent, FilesystemWatchPage, FilesystemWatcherIdentity } from "./filesystem.js";
-import { parseExecutionInspection, parseExecutionReceipt, parseExecutionRequest } from "./execution.js";
-import type { ExecutionInspection, Receipt } from "./execution.js";
+import { parseExecutionInspection, parseExecutionLineage, parseExecutionReceipt, parseExecutionRequest } from "./execution.js";
+import type { ExecutionInspection, ExecutionLineage, Receipt } from "./execution.js";
 
 const transport = Symbol("host transport");
 const subscribe = Symbol("event subscription");
@@ -23,9 +23,23 @@ export interface AuthorityChange { readonly kind: "machine-create" | "lifecycle"
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 export type SandsurfAuthorizer = (change: AuthorityChange) => AuthorityDecision | Promise<AuthorityDecision>;
 export interface SandsurfOpenOptions { readonly directory: string; readonly authorizer?: SandsurfAuthorizer; readonly service?: "auto" | "connect"; }
-export interface ResourceEnvelope { readonly vcpus: number; readonly memoryMiB: number; readonly diskBytes: number; readonly outputBytes?: number; readonly managedExecutions?: number; }
+export interface ResourceEnvelope {
+  /** Virtual CPU topology; CPU time is limited separately per 100ms period. */
+  readonly vcpus: number; readonly memoryMiB: number; readonly diskBytes: number;
+  readonly outputBytes?: number; readonly managedExecutions?: number;
+  readonly cpuQuotaMicros?: number; readonly hostOverheadBytes?: number;
+  readonly physicalStorageBytes?: number; readonly snapshotBytes?: number;
+  readonly channels?: number; readonly inflightRequests?: number;
+  readonly networkConnections?: number; readonly networkBytesPerSecond?: number; readonly networkQueueBytes?: number;
+}
+export type ResourceChangeMode = "live" | "requires-reboot" | "unsupported";
+export interface ResourceChangeAssessment { readonly mode: ResourceChangeMode; readonly reasons: readonly string[]; }
+export interface ResourceUpdateResult { readonly machine: MachineInspection; readonly assessment: ResourceChangeAssessment; }
+export type MeasurementSource = "unavailable" | "host-cgroup" | "host-filesystem" | "host-retention" | "host-admission" | "host-network" | "guest-reported";
+export interface ResourceProvenance { readonly cpu: MeasurementSource; readonly memory: MeasurementSource; readonly io: MeasurementSource; readonly storage: MeasurementSource; readonly output: MeasurementSource; readonly executions: MeasurementSource; readonly channels: MeasurementSource; readonly network: MeasurementSource; }
 export interface MachineCreateOptions {
-  readonly id?: string;
+  /** Identity whose bounded storage slot was provisioned by the operator. */
+  readonly id: string;
   readonly operationId?: string;
   readonly image: string;
   readonly resources: ResourceEnvelope;
@@ -43,16 +57,19 @@ export type SnapshotConsistency = "crash" | "machine";
 export interface SnapshotInspection { readonly id: string; readonly operationId: string; readonly machineId: string; readonly expectedGeneration: number; readonly expectedRevision: number; readonly kind: SnapshotKind; readonly parent: string | null; readonly requestDigest: string; readonly phase: "admitted" | "capturing" | "ready"; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly consistency: SnapshotConsistency | null; readonly systemDiskDigest: string | null; readonly systemDiskBytes: number; readonly manifestDigest: string | null; readonly sensitive: boolean; }
 export interface SnapshotCreateOptions extends MachineGenerationPrecondition, MachineRevisionPrecondition { readonly id?: string; readonly operationId?: string; readonly kind?: SnapshotKind; readonly parent?: string; }
 export interface DerivedImagePublishOptions { readonly operationId?: string; readonly allowSensitive?: boolean; }
-export interface MachineForkOptions { readonly id?: string; readonly operationId?: string; readonly resources?: ResourceEnvelope; readonly lifetime?: MachineLifetimePolicy; }
+export interface MachineForkOptions { readonly id: string; readonly operationId?: string; readonly resources?: ResourceEnvelope; readonly lifetime?: MachineLifetimePolicy; }
 export type Qualification = { readonly kind: "qualified"; readonly evidence: string } | { readonly kind: "unqualified"; readonly reasons: readonly string[] };
 export type Capability = { readonly kind: "supported"; readonly qualification: Qualification } | { readonly kind: "unsupported"; readonly reasons: readonly string[] };
 export interface GuestPowerCapabilities { readonly shutdown: Capability; readonly reboot: Capability; }
-export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly guestPower: GuestPowerCapabilities; readonly defaultImageDigest: string | null; }
+export interface ResourceCapabilities { readonly nativeTopology: Capability; readonly cpuTime: Capability; readonly aggregateHostMemory: Capability; readonly managedAdmission: Capability; readonly outputRetention: Capability; readonly storageReservations: Capability; readonly networkEnvelope: Capability; readonly aggregatePhysicalStorage: Capability; readonly sharedHostWorkers: Capability; readonly completeEnforcement: Capability; }
+export interface NativeQualificationConfiguration { readonly buildDigest: string; readonly platform: string; readonly architecture: string; readonly hardwareDigest: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly engineDigest: string; readonly imageDigest: string; readonly kernelDigest: string; readonly initramfsDigest: string | null; readonly nicConfigurationDigest: string; readonly storageConfigurationDigest: string; readonly resources: Required<ResourceEnvelope>; }
+export interface RetainedQualification { readonly run: { readonly configuration: NativeQualificationConfiguration; readonly scope: "lifecycle" | "resources" | "cpu-time" | "host-memory" | "storage-budgets" | "managed-channels" | "native-network" | "disk-snapshots" | "full-state" | "images" | "distribution"; readonly observedUnixMillis: number; readonly passedChecks: readonly string[]; readonly evidenceDigest: string; }; readonly acceptedBy: string; readonly acceptedUnixMillis: number; readonly recordDigest: string; }
+export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly imageWorkers: Capability; readonly resources: ResourceCapabilities; readonly qualificationRecords: readonly RetainedQualification[]; readonly qualificationIssues: readonly string[]; readonly guestPower: GuestPowerCapabilities; readonly console: Capability; readonly defaultImageDigest: string | null; }
 export interface ImageDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; }
 export interface ManagementReport { readonly generation: number; readonly identity: { readonly bootId: string; readonly instanceId: string }; readonly observedUnixMillis: number; }
 export type ManagementObservation = { readonly kind: "current"; readonly value: ManagementReport } | { readonly kind: "unavailable"; readonly lastKnown: ManagementReport | null };
 export type MachineState = "creating" | "starting" | "running" | "paused" | "stopped" | "suspended" | "restoring" | "destroying" | "destroyed" | "failed";
-export type ObservationCause = { readonly kind: "lifecycle" | "configuration"; readonly operationId: string } | { readonly kind: "native" };
+export type ObservationCause = { readonly kind: "lifecycle" | "configuration"; readonly operationId: string } | { readonly kind: "native" | "guest-reset" };
 export interface NativeMachineObservation { readonly machineId: string; readonly generation: number; readonly sequence: number; readonly state: MachineState; readonly appliedRevision: number; readonly cause: ObservationCause; readonly evidenceDigest: string; }
 export type MachineObservation = { readonly kind: "current"; readonly value: NativeMachineObservation } | { readonly kind: "unavailable"; readonly lastKnown: NativeMachineObservation | null };
 export interface ObservationReference { readonly machineId: string; readonly generation: number; readonly sequence: number; readonly digest: string; }
@@ -61,13 +78,13 @@ export type StoragePayload = { readonly kind: "present" | "capacity-mismatch"; r
 /** Host storage observations do not attest to the integrity of the Linux filesystem. */
 export type StorageInspection = { readonly kind: "current"; readonly phase: "preparing" | "published" | "attached" | "replacing" | "retiring" | "retired"; readonly format: "raw" | "vhdx"; readonly capacityBytes: number; readonly operationId: string | null; readonly payload: StoragePayload } | { readonly kind: "unavailable"; readonly reason: "ownership-missing" | "ownership-invalid" | "access-unavailable" };
 export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: MachineLifecycleIntent; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly storage: StorageInspection; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
-export type NetworkDestination = { readonly kind: "dns"; readonly name: string; readonly includeSubdomains?: boolean; readonly allowPrivateAddresses?: boolean } | { readonly kind: "ip"; readonly cidr: string };
-export interface NetworkRule { readonly plane: "named-proxy" | "direct-tcp" | "dns"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
+export type NetworkDestination = { readonly kind: "ip"; readonly cidr: string; readonly allowPrivateAddresses?: boolean };
+export interface NetworkRule { readonly plane: "tcp" | "udp"; readonly destination: NetworkDestination; readonly ports: readonly ({ readonly from: number; readonly to: number } | number)[]; }
 export interface NetworkPolicy { readonly rules: readonly NetworkRule[]; }
 export interface ExposureSpec { readonly guestAddress?: string; readonly guestPort: number; readonly hostAddress?: string; readonly hostPort?: number; readonly public?: boolean; }
 export interface Exposure { readonly id: string; readonly machineId: string; readonly revision: number; readonly spec: { readonly guestAddress: string; readonly guestPort: number; readonly hostAddress: string; readonly hostPort: number; readonly public: boolean }; readonly active: boolean; readonly boundPort: number | null; }
 export interface RuntimeConfiguration { readonly network: NetworkPolicy; readonly exposures: readonly Exposure[]; readonly resources: Required<ResourceEnvelope>; }
-export interface ResourceUsage { readonly cpuMicros: number | null; readonly memoryCurrent: number | null; readonly memoryPeak: number | null; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number | null; readonly ioWriteBytes: number | null; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly executionsCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
+export interface ResourceUsage { readonly provenance: ResourceProvenance; readonly hostCounterEpoch: string | null; readonly channelsCurrent: number | null; readonly inflightRequestsCurrent: number | null; readonly cpuMicros: number | null; readonly memoryCurrent: number | null; readonly memoryPeak: number | null; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number | null; readonly ioWriteBytes: number | null; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly executionsCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
 export interface SecretDeliveryResult { readonly operationId: string; readonly machineId: string; readonly secret: SecretVersion; readonly disclosure: "not-sent" | "possible" | "guest-reported-received"; readonly revoked: boolean; }
 export interface SecretRevocation {
@@ -172,11 +189,17 @@ export class Sandsurf {
     const engine = text(value.engine);
     if (engine !== "firecracker" && engine !== "apple-virtualization" && engine !== "hyper-v") throw protocol("native engine");
     if (!record(value.guestPower)) throw protocol("guest power capabilities");
+    if (!record(value.resources)) throw protocol("host resource capabilities");
+    if (!Array.isArray(value.qualificationRecords) || value.qualificationRecords.length > 16 || !Array.isArray(value.qualificationIssues)) throw protocol("retained native qualifications");
     return {
       hostId: validateIdentity(text(value.hostId)), platform: text(value.platform), architecture: text(value.architecture),
       guestArchitecture: text(value.guestArchitecture), guestPlatform: text(value.guestPlatform), engine,
       lifecycle: parseQualification(value.lifecycle), fullState: parseQualification(value.fullState), images: parseQualification(value.images),
+      imageWorkers: parseCapability(value.imageWorkers),
+      qualificationRecords: value.qualificationRecords.map(parseRetainedQualification), qualificationIssues: value.qualificationIssues.map(text),
+      resources: parseResourceCapabilities(value.resources),
       guestPower: { shutdown: parseCapability(value.guestPower.shutdown), reboot: parseCapability(value.guestPower.reboot) },
+      console: parseCapability(value.console),
       defaultImageDigest: value.defaultImageDigest === null ? null : digest(text(value.defaultImageDigest)),
     };
   }
@@ -298,7 +321,7 @@ function parseOperationRecord(raw: unknown, expectedId: string, expectedMachine:
         if (generation < 1 || !["spawn", "close-input", "write-input", "acquire-terminal-input", "release-terminal-input", "resize-terminal", "signal", "terminate", "filesystem"].includes(requestKind) ||
             !["admitted", "dispatched", "applied", "not-applied", "unknown"].includes(delivery)) throw protocol("guest operation observation");
         const metadata = { request: command.request, binary: operation.admission.binary };
-        if (requestDigest !== sandsurfDigest("operation", ["sandsurf-guest-command-v2", machineId, generation, operationId, metadata])) throw protocol("guest operation admission digest");
+        if (requestDigest !== sandsurfDigest("operation", ["sandsurf-guest-command-v1", machineId, generation, operationId, metadata])) throw protocol("guest operation admission digest");
         observation = { kind, generation, requestKind: requestKind as Extract<OperationObservation, { kind: "guest" }>["requestKind"], delivery: delivery as OperationDelivery, evidenceDigest: operationEvidence(operation.evidenceDigest) }; break;
       }
       case "receipt-acknowledgement":
@@ -410,9 +433,9 @@ export class Snapshot {
   readonly inspection: SnapshotInspection;
   readonly #host: Sandsurf;
   constructor(host: Sandsurf, inspection: SnapshotInspection) { this.#host = host; this.inspection = inspection; this.id = inspection.id; }
-  async fork(options: MachineForkOptions = {}): Promise<Machine> {
+  async fork(options: MachineForkOptions): Promise<Machine> {
     if (this.inspection.phase !== "ready" || this.inspection.kind !== "disk") throw new SandsurfHostError("conflict", "Only a ready disk snapshot can be forked");
-    const machineId = validateIdentity(options.id ?? identity("machine")); const operationId = validateIdentity(options.operationId ?? identity("fork")); const resources = normalizeResources(options.resources ?? this.inspection.resources);
+    const machineId = validateIdentity(options.id); const operationId = validateIdentity(options.operationId ?? identity("fork")); const resources = normalizeResources(options.resources ?? this.inspection.resources);
     const lifetime = normalizeLifetime(options.lifetime);
     const approvalId = await this.#host[authorize]({ kind: "fork", machineId, operationId, request: { snapshotId: this.id, sourceMachineId: this.inspection.machineId, resources, lifetime } });
     const response = await this.#host[transport]({ kind: "fork-machine", machineId, snapshotId: this.id, resources, lifetime, operationId, approvalId });
@@ -434,7 +457,7 @@ export class MachineCollection {
   readonly #host: Sandsurf;
   constructor(host: Sandsurf) { this.#host = host; }
   async create(options: MachineCreateOptions): Promise<Machine> {
-    const machineId = validateIdentity(options.id ?? identity("machine"));
+    const machineId = validateIdentity(options.id);
     const operationId = validateIdentity(options.operationId ?? identity("create"));
     digest(options.image); const resources = normalizeResources(options.resources);
     const lifetime = normalizeLifetime(options.lifetime);
@@ -456,6 +479,7 @@ export class MachineCollection {
 }
 
 export class Machine {
+  readonly console = new MachineConsole(this);
   readonly id: string;
   readonly executions: ExecutionCollection;
   readonly terminals: TerminalCollection;
@@ -525,6 +549,89 @@ export class Machine {
   }
 }
 
+/** Host-retained serial bytes. Loss ranges count observed bytes that exceeded
+ * the fixed capture budget; captureFailed means completeness is unavailable. */
+export interface ConsolePage {
+  readonly generation: number;
+  readonly after: number;
+  readonly cursor: number;
+  readonly available: number;
+  readonly bytes: Uint8Array;
+  readonly loss: { readonly from: number; readonly to: number } | null;
+  readonly open: boolean;
+  readonly captureFailed: boolean;
+}
+
+function runtimeResponse(value: Record<string, unknown>): Record<string, unknown> {
+  if (value.kind !== "runtime" || !record(value.response)) throw protocol("native runtime response");
+  return value.response;
+}
+
+export class MachineConsole {
+  readonly #machine: Machine;
+  constructor(machine: Machine) { this.#machine = machine; }
+  /** A fresh attachment binds a generation. Supplying a generation permits
+   * historical reads; writes still require the current native generation. */
+  async attach(options: { readonly generation?: number } = {}): Promise<NativeConsole> {
+    const generation = expectedCounter(options.generation, "console generation") ?? currentMachine(await this.#machine.inspect()).generation;
+    const attachment = new NativeConsole(this.#machine, generation);
+    await attachment.read({ maximum: 1 });
+    return attachment;
+  }
+}
+
+export class NativeConsole {
+  readonly generation: number;
+  readonly #machine: Machine;
+  #detached = false;
+  constructor(machine: Machine, generation: number) {
+    this.#machine = machine; this.generation = expectedCounter(generation, "console generation")!;
+  }
+  /** Detach only this SDK handle. The VM and guardian capture continue. */
+  detach(): void { this.#detached = true; }
+  async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<ConsolePage> {
+    this.#attached();
+    const after = integer(options.after ?? 0); const maximum = integer(options.maximum ?? 64 * 1024);
+    if (maximum < 1 || maximum > 64 * 1024) throw new RangeError("console page must be 1..65536 bytes");
+    const response = runtimeResponse(await this.#machine[transport]({ kind: "read-console", machineId: this.#machine.id, generation: this.generation, after, maximum }));
+    if (response.kind !== "console" || !record(response.page)) throw protocol("native console response");
+    const page = response.page;
+    const cursor = integer(page.cursor); const available = integer(page.available);
+    if (page.generation !== this.generation || page.after !== after || !(page.bytes instanceof Uint8Array) ||
+        page.bytes.byteLength > maximum || cursor < after || cursor > available ||
+        typeof page.open !== "boolean" || typeof page.captureFailed !== "boolean") throw protocol("native console page");
+    const end = after + page.bytes.byteLength;
+    const loss = page.loss === null ? null : record(page.loss) ? { from: integer(page.loss.from), to: integer(page.loss.to) } : undefined;
+    if (loss === undefined || (loss === null ? end !== cursor : loss.from !== end || loss.to !== cursor || loss.from >= loss.to)) throw protocol("native console loss coverage");
+    return { generation: this.generation, after, cursor, available, bytes: page.bytes, loss, open: page.open, captureFailed: page.captureFailed };
+  }
+  /** Returns the accepted prefix only. Delivery uncertainty is surfaced by the
+   * transport; input is never automatically retried. */
+  async write(bytes: Uint8Array): Promise<number> {
+    this.#attached();
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > 4096) throw new RangeError("console input must be 1..4096 bytes");
+    const response = runtimeResponse(await this.#machine[transport]({ kind: "write-console", machineId: this.#machine.id, generation: this.generation, bytes }));
+    if (response.kind !== "console-input") throw protocol("native console input response");
+    const accepted = integer(response.accepted);
+    if (accepted > bytes.byteLength) throw protocol("native console accepted prefix");
+    return accepted;
+  }
+  /** Poll bounded durable pages. Each generation reserves a 512 KiB prefix;
+   * excess output advances the cursor with explicit loss. The guardian admits
+   * 64 archived generations, 1 MiB/s of reads and 32 KiB/s of input per computer. */
+  async *follow(options: { readonly after?: number; readonly maximum?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<ConsolePage, void> {
+    let after = integer(options.after ?? 0);
+    while (!this.#detached && !options.signal?.aborted) {
+      const page = await this.read({ after, ...(options.maximum === undefined ? {} : { maximum: options.maximum }) });
+      if (page.bytes.byteLength !== 0 || page.loss !== null || !page.open || page.captureFailed) yield page;
+      after = page.cursor;
+      if (!page.open || page.captureFailed) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  #attached(): void { if (this.#detached) throw new SandsurfHostError("detached", "Native console handle is detached"); }
+}
+
 export class MachineSnapshots {
   readonly #machine: Machine;
   readonly #host: Sandsurf;
@@ -590,17 +697,22 @@ export class MachinePorts {
 export class MachineResources {
   readonly #machine: Machine;
   constructor(machine: Machine) { this.#machine = machine; }
+  async assess(resources: ResourceEnvelope): Promise<ResourceChangeAssessment> {
+    const response = await this.#machine[transport]({ kind: "assess-resources", machineId: this.#machine.id, resources: normalizeResources(resources) });
+    if (response.kind !== "resource-assessment" || !record(response.assessment)) throw protocol("resource change assessment");
+    return parseResourceAssessment(response.assessment);
+  }
   async usage(): Promise<ResourceUsage> {
     const response = await this.#machine[transport]({ kind: "get-usage", machineId: this.#machine.id });
     if (response.kind !== "usage" || !record(response.usage)) throw protocol("resource usage response");
     return parseUsage(response.usage);
   }
-  async update(resources: ResourceEnvelope, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<MachineInspection> {
+  async update(resources: ResourceEnvelope, options: MachineRevisionPrecondition & { readonly operationId?: string } = {}): Promise<ResourceUpdateResult> {
     const operationId = validateIdentity(options.operationId ?? identity("resources")); const expectedRevision = await resolveRevisionPrecondition(this.#machine, options.expectedRevision); const normalized = normalizeResources(resources);
     const approvalId = await this.#machine[authorize]({ kind: "resource-increase", machineId: this.#machine.id, operationId, request: { expectedRevision, resources: normalized } });
     const response = await this.#machine[transport]({ kind: "update-resources", machineId: this.#machine.id, operationId, expectedRevision, resources: normalized, approvalId });
-    if (response.kind !== "configuration" || !record(response.machine)) throw protocol("resource update response");
-    return this.#machine[observe](parseView(response.machine));
+    if (response.kind !== "resource-update" || !record(response.machine) || !record(response.assessment)) throw protocol("resource update response");
+    return { machine: this.#machine[observe](parseView(response.machine)), assessment: parseResourceAssessment(response.assessment) };
   }
 }
 
@@ -685,7 +797,7 @@ export type ShellOptions = Omit<SpawnOptions, "argv"> & { readonly shell?: strin
 export type ExecShellOptions = Omit<ExecOptions, "argv"> & { readonly shell?: string };
 export interface ExecResult { readonly process: Execution; readonly inspection: ExecutionInspection; }
 export type ExecutionObservation = { readonly kind: "current"; readonly value: ExecutionInspection } | { readonly kind: "unavailable"; readonly lastKnown: ExecutionInspection | null };
-export interface ExecutionStatus { readonly executionId: string; readonly generation: number; readonly report: ExecutionObservation; readonly interruption: NativeMachineObservation | null; }
+export interface ExecutionStatus { readonly executionId: string; readonly generation: number; readonly lineage: ExecutionLineage | null; readonly report: ExecutionObservation; readonly interruption: NativeMachineObservation | null; }
 export class ExecutionInterruptedError extends SandsurfHostError {
   readonly executionId: string; readonly generation: number; readonly observation: NativeMachineObservation;
   constructor(execution: Execution, observation: NativeMachineObservation) {
@@ -802,7 +914,7 @@ export class Execution {
     const response = await this.#machine[transport]({ kind: "get-process", machineId: this.#machine.id, executionId: this.id });
     if (response.kind !== "runtime" || !record(response.response) || response.response.kind !== "process") throw protocol("process response");
     const status = parseExecutionStatus(response.response.process, this.#machine.id);
-    if (status.executionId !== this.id) throw protocol("execution status identity");
+    if (status.executionId !== this.id || status.generation !== this.generation) throw protocol("execution status identity");
     return status;
   }
   waitLeader(options: { readonly signal?: AbortSignal } = {}): Promise<ExecutionInspection> { return this.#wait("leader", options); }
@@ -1293,10 +1405,31 @@ export type TreeChange = { readonly kind: "upsert"; readonly entry: TreeEntry } 
 export interface ChangeSet { readonly baseManifestDigest: string; readonly base: readonly TreeEntry[]; readonly changes: readonly TreeChange[]; readonly digest: string; readonly captureOperationId: string; }
 export interface HostApplyReport { readonly operationId: string; readonly changeSetDigest: string; readonly applied: number; readonly recovered: boolean; }
 
+const resourceFields = ["vcpus", "memoryMiB", "diskBytes", "outputBytes", "managedExecutions", "cpuQuotaMicros", "hostOverheadBytes", "physicalStorageBytes", "snapshotBytes", "channels", "inflightRequests", "networkConnections", "networkBytesPerSecond", "networkQueueBytes"] as const;
 function normalizeResources(value: ResourceEnvelope): Required<ResourceEnvelope> {
+  if (Object.keys(value).some((key) => !(resourceFields as readonly string[]).includes(key))) throw new TypeError("unknown host resource field");
   const outputBytes = value.outputBytes ?? 1024 * 1024 * 1024; const managedExecutions = value.managedExecutions ?? 1024;
-  for (const item of [value.vcpus, value.memoryMiB, value.diskBytes, outputBytes, managedExecutions]) if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError("resource values must be positive safe integers");
-  return { vcpus: value.vcpus, memoryMiB: value.memoryMiB, diskBytes: value.diskBytes, outputBytes, managedExecutions };
+  const cpuQuotaMicros = value.cpuQuotaMicros ?? value.vcpus * 100_000;
+  const hostOverheadBytes = value.hostOverheadBytes ?? value.vcpus * 512 * 1024 * 1024;
+  const snapshotBytes = value.snapshotBytes ?? 2 * (value.diskBytes + value.memoryMiB * 1024 * 1024 + value.vcpus * 64 * 1024 * 1024);
+  const physicalStorageBytes = value.physicalStorageBytes ?? 2 * value.diskBytes + outputBytes + snapshotBytes + value.vcpus * 64 * 1024 * 1024;
+  const channels = value.channels ?? value.vcpus * 32; const inflightRequests = value.inflightRequests ?? value.vcpus * 16;
+  const networkConnections = value.networkConnections ?? value.vcpus * 256;
+  const networkBytesPerSecond = value.networkBytesPerSecond ?? value.vcpus * 64 * 1024 * 1024;
+  const networkQueueBytes = value.networkQueueBytes ?? value.vcpus * 16 * 1024 * 1024;
+  const result = { vcpus: value.vcpus, memoryMiB: value.memoryMiB, diskBytes: value.diskBytes, outputBytes, managedExecutions, cpuQuotaMicros, hostOverheadBytes, snapshotBytes, physicalStorageBytes, channels, inflightRequests, networkConnections, networkBytesPerSecond, networkQueueBytes };
+  for (const item of Object.values(result)) if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError("resource values must be positive safe integers");
+  if (cpuQuotaMicros < 1000 || cpuQuotaMicros > value.vcpus * 100_000) throw new TypeError("CPU time quota must be at least 1000µs and cannot exceed vCPU scheduling capacity");
+  const storage = 2 * value.diskBytes + outputBytes + snapshotBytes;
+  const memory = value.memoryMiB * 1024 * 1024 + hostOverheadBytes;
+  if (!Number.isSafeInteger(storage) || physicalStorageBytes < storage || !Number.isSafeInteger(memory) || memory % 4096 !== 0) throw new TypeError("physical storage or total host memory envelope is invalid");
+  return result;
+}
+function parseResources(value: Record<string, unknown>): Required<ResourceEnvelope> {
+  // No legacy decoder: host responses must contain the complete envelope.
+  if (Object.keys(value).some((key) => !(resourceFields as readonly string[]).includes(key))) throw protocol("unknown host resource field");
+  for (const name of resourceFields) if (!(name in value)) throw protocol("complete host resource envelope");
+  return normalizeResources(value as unknown as Required<ResourceEnvelope>);
 }
 function normalizeExecutionDefaults(options: Pick<MachineCreateOptions, "environment" | "user" | "workingDirectory">): ImageDefaults {
   const environment = { ...(options.environment ?? {}) };
@@ -1414,11 +1547,11 @@ function parseMachineObservation(observation: Record<string, unknown>, machineId
     const state = text(value.state);
     if (!["creating", "starting", "running", "paused", "stopped", "suspended", "restoring", "destroying", "destroyed", "failed"].includes(state)) throw protocol("native machine observation state");
     const causeKind = value.cause.kind;
-    const cause: ObservationCause | undefined = causeKind === "native" ? { kind: "native" }
+    const cause: ObservationCause | undefined = causeKind === "native" || causeKind === "guest-reset" ? { kind: causeKind }
       : causeKind === "lifecycle" || causeKind === "configuration"
         ? { kind: causeKind, operationId: validateIdentity(text(value.cause.operationId)) }
         : undefined;
-    if (cause === undefined || Object.keys(value.cause).some((key) => key !== "kind" && (cause.kind === "native" || key !== "operationId"))) throw protocol("native observation cause");
+    if (cause === undefined || Object.keys(value.cause).some((key) => key !== "kind" && ((cause.kind === "native" || cause.kind === "guest-reset") || key !== "operationId"))) throw protocol("native observation cause");
     const generation = integer(value.generation); const sequence = integer(value.sequence);
     if (generation < 1 || sequence < 1) throw protocol("native machine observation fence");
     return { machineId, generation, sequence, state: state as MachineState, appliedRevision: integer(value.appliedRevision), cause, evidenceDigest: digest(text(value.evidenceDigest)) };
@@ -1442,6 +1575,7 @@ function parseExecutionStatus(value: unknown, machineId: string): ExecutionStatu
   const generation = integer(value.generation);
   if (generation < 1) throw protocol("execution status generation");
   const executionId = validateIdentity(text(value.executionId));
+  const lineage = parseExecutionLineage(value.lineage, { machineId, generation, executionId });
   const report = parseExecutionObservation(value.report);
   let interruption: NativeMachineObservation | null = null;
   if (value.interruption !== null) {
@@ -1452,7 +1586,8 @@ function parseExecutionStatus(value: unknown, machineId: string): ExecutionStatu
   }
   const reported = report.kind === "current" ? report.value : report.lastKnown;
   if (reported !== null && (reported.request.generation !== generation || reported.request.executionId !== executionId || reported.request.machineId !== machineId)) throw protocol("execution status identity");
-  return { executionId, generation, report, interruption };
+  if (reported !== null && sandsurfDigest("snapshot", reported.lineage) !== sandsurfDigest("snapshot", lineage)) throw protocol("execution observation lineage differs from host admission");
+  return { executionId, generation, lineage, report, interruption };
 }
 function nativeBoundaryAffects(value: unknown, generation: number): boolean {
   return record(value) && (integer(value.generation) > generation ||
@@ -1460,7 +1595,7 @@ function nativeBoundaryAffects(value: unknown, generation: number): boolean {
 }
 function requireExecutionContinuity(execution: Execution, status: ExecutionStatus): void {
   if (status.executionId !== execution.id) throw protocol("execution status identity");
-  if (status.generation !== execution.generation) throw new SandsurfHostError("stale-generation", `Execution ${execution.id} must be reattached to its restored generation`);
+  if (status.generation !== execution.generation) throw protocol("immutable execution incarnation changed generation");
   if (status.interruption !== null) throw new ExecutionInterruptedError(execution, status.interruption);
 }
 function runtimeEventBelongsToProcess(event: MachineEvent, executionId: string): boolean {
@@ -1557,17 +1692,69 @@ function normalizeOutputRead(options: { readonly after?: number; readonly maximu
 function normalizeNetworkPolicy(value: NetworkPolicy): NetworkPolicy {
   if (!Array.isArray(value.rules) || value.rules.length > 4096) throw new TypeError("network policy exceeds its rule bound");
   const rules = value.rules.map((rule: NetworkRule) => {
-    if (!(["named-proxy", "direct-tcp", "dns"] as const).includes(rule.plane) || !Array.isArray(rule.ports) || rule.ports.length === 0 || rule.ports.length > 4096) throw new TypeError("network rule is malformed");
+    if (!(["tcp", "udp"] as const).includes(rule.plane) || !Array.isArray(rule.ports) || rule.ports.length === 0 || rule.ports.length > 4096) throw new TypeError("network rule is malformed");
     const ports = rule.ports.map((port: number | { readonly from: number; readonly to: number }) => { const range = typeof port === "number" ? { from: port, to: port } : port; if (!Number.isInteger(range.from) || !Number.isInteger(range.to) || range.from < 1 || range.from > range.to || range.to > 65535) throw new TypeError("network port range is malformed"); return range; });
-    let destination: NetworkDestination;
-    if (rule.destination.kind === "dns") { const name = rule.destination.name.toLowerCase().replace(/\.$/u, ""); if (name.length === 0 || name.length > 253 || name.includes("*") || name.split(".").some((label: string) => label.length === 0 || label.length > 63)) throw new TypeError("network DNS name is malformed"); if (rule.plane === "direct-tcp") throw new TypeError("direct TCP rules require an IP CIDR"); destination = { kind: "dns", name, includeSubdomains: rule.destination.includeSubdomains ?? false, allowPrivateAddresses: rule.destination.allowPrivateAddresses ?? false }; }
-    else { const [address, prefixText, extra] = rule.destination.cidr.split("/"); const family = address === undefined ? 0 : isIP(address); const prefix = Number(prefixText); if (extra !== undefined || family === 0 || !Number.isInteger(prefix) || prefix < 0 || prefix > (family === 4 ? 32 : 128) || rule.plane !== "direct-tcp") throw new TypeError("direct TCP CIDR is malformed"); destination = { kind: "ip", cidr: `${address}/${prefix}` }; }
+    if (rule.destination.kind !== "ip") throw new TypeError("native network rules require a destination CIDR");
+    if (rule.destination.allowPrivateAddresses !== undefined && typeof rule.destination.allowPrivateAddresses !== "boolean") throw new TypeError("private network authority must be a Boolean");
+    const [address, prefixText, extra] = rule.destination.cidr.split("/");
+    const family = address === undefined ? 0 : isIP(address); const prefix = Number(prefixText);
+    if (extra !== undefined || family === 0 || prefixText === undefined || !/^\d+$/u.test(prefixText) || !Number.isInteger(prefix) || prefix < 0 || prefix > (family === 4 ? 32 : 128)) throw new TypeError("network CIDR is malformed");
+    const destination: NetworkDestination = { kind: "ip", cidr: canonicalNetworkCidr(address!, prefix, family), allowPrivateAddresses: rule.destination.allowPrivateAddresses ?? false };
     return { plane: rule.plane, destination, ports };
   });
-  return { rules };
+  if (rules.reduce((total, rule) => total + rule.ports.length, 0) > 16384) throw new TypeError("network policy exceeds its total port range bound");
+  for (const rule of rules) {
+    const ranges = [...rule.ports].sort((a, b) => a.from - b.from || a.to - b.to);
+    const merged: { from: number; to: number }[] = [];
+    for (const range of ranges) {
+      const last = merged.at(-1);
+      if (last !== undefined && range.from <= last.to + 1) last.to = Math.max(last.to, range.to);
+      else merged.push({ from: range.from, to: range.to });
+    }
+    rule.ports = merged;
+  }
+  const unique = new Map(rules.map((rule) => [JSON.stringify(rule), rule]));
+  return { rules: [...unique.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, rule]) => rule) };
 }
-function normalizeExposure(value: ExposureSpec): Exposure["spec"] { const guestAddress = value.guestAddress ?? "127.0.0.1"; const hostAddress = value.hostAddress ?? "127.0.0.1"; const guestPort = value.guestPort; const hostPort = value.hostPort ?? 0; const publicValue = value.public ?? false; if (isIP(guestAddress) === 0 || !["127.0.0.1", "::1"].includes(guestAddress) || isIP(hostAddress) === 0 || (!publicValue && !["127.0.0.1", "::1"].includes(hostAddress)) || !Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535 || !Number.isInteger(hostPort) || hostPort < 0 || hostPort > 65535) throw new TypeError("port exposure is malformed"); return { guestAddress, guestPort, hostAddress, hostPort, public: publicValue }; }
-function parseRuntimeConfiguration(value: Record<string, unknown>): RuntimeConfiguration { if (!record(value.network) || !Array.isArray(value.network.rules) || !Array.isArray(value.exposures) || !record(value.resources)) throw protocol("runtime configuration"); return { network: normalizeNetworkPolicy(value.network as unknown as NetworkPolicy), exposures: value.exposures.map(parseExposure), resources: normalizeResources(value.resources as unknown as ResourceEnvelope) }; }
+function canonicalNetworkCidr(address: string, prefix: number, family: number): string {
+  if (address.includes("%")) throw new TypeError("scoped network CIDR is unsupported");
+  const width = family === 4 ? 32 : 128;
+  let words: number[];
+  if (family === 4) words = address.split(".").map(Number);
+  else {
+    let text = address.toLowerCase();
+    if (text.includes(".")) {
+      const last = text.lastIndexOf(":");
+      const octets = text.slice(last + 1).split(".").map(Number);
+      text = text.slice(0, last + 1) + ((octets[0]! << 8) | octets[1]!).toString(16) + ":" + ((octets[2]! << 8) | octets[3]!).toString(16);
+    }
+    const halves = text.split("::");
+    const left = halves[0] === "" ? [] : halves[0]!.split(":").map((part) => Number.parseInt(part, 16));
+    const right = halves.length === 1 || halves[1] === "" ? [] : halves[1]!.split(":").map((part) => Number.parseInt(part, 16));
+    words = halves.length === 1 ? left : [...left, ...Array<number>(8 - left.length - right.length).fill(0), ...right];
+  }
+  const wordBits = family === 4 ? 8 : 16;
+  let bits = words.reduce((value, word) => (value << BigInt(wordBits)) | BigInt(word), 0n);
+  bits = prefix === 0 ? 0n : (bits >> BigInt(width - prefix)) << BigInt(width - prefix);
+  const mask = (1n << BigInt(wordBits)) - 1n;
+  const out = Array.from({ length: width / wordBits }, (_, i) => Number((bits >> BigInt(width - wordBits * (i + 1))) & mask));
+  if (family === 4) return out.join(".") + "/" + prefix;
+  if (out.slice(0, 5).every((v) => v === 0) && out[5] === 0xffff) {
+    return `::ffff:${out[6]! >> 8}.${out[6]! & 255}.${out[7]! >> 8}.${out[7]! & 255}/${prefix}`;
+  }
+  let bestStart = -1; let bestLength = 1;
+  for (let i = 0; i < out.length;) {
+    if (out[i] !== 0) { i++; continue; }
+    let end = i; while (end < out.length && out[end] === 0) end++;
+    if (end - i > bestLength) { bestStart = i; bestLength = end - i; }
+    i = end;
+  }
+  const formatted = bestStart < 0 ? out.map((v) => v.toString(16)).join(":")
+    : out.slice(0, bestStart).map((v) => v.toString(16)).join(":") + "::" + out.slice(bestStart + bestLength).map((v) => v.toString(16)).join(":");
+  return formatted + "/" + prefix;
+}
+function normalizeExposure(value: ExposureSpec): Exposure["spec"] { const guestAddress = value.guestAddress ?? "100.64.0.2"; const hostAddress = value.hostAddress ?? "127.0.0.1"; const guestPort = value.guestPort; const hostPort = value.hostPort ?? 0; const publicValue = value.public ?? false; if (!["100.64.0.2", "fd00::2"].includes(guestAddress) || isIP(hostAddress) === 0 || (!publicValue && !["127.0.0.1", "::1"].includes(hostAddress)) || !Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535 || !Number.isInteger(hostPort) || hostPort < 0 || hostPort > 65535) throw new TypeError("port exposure is malformed"); return { guestAddress, guestPort, hostAddress, hostPort, public: publicValue }; }
+function parseRuntimeConfiguration(value: Record<string, unknown>): RuntimeConfiguration { if (!record(value.network) || !Array.isArray(value.network.rules) || !Array.isArray(value.exposures) || !record(value.resources)) throw protocol("runtime configuration"); return { network: normalizeNetworkPolicy(value.network as unknown as NetworkPolicy), exposures: value.exposures.map(parseExposure), resources: parseResources(value.resources) }; }
 function parseExposure(value: unknown): Exposure { if (!record(value) || !record(value.spec)) throw protocol("exposure"); return { id: validateIdentity(text(value.id)), machineId: validateIdentity(text(value.machineId)), revision: integer(value.revision), spec: normalizeExposure({ guestAddress: text(value.spec.guestAddress), guestPort: integer(value.spec.guestPort), hostAddress: text(value.spec.hostAddress), hostPort: integer(value.spec.hostPort), public: value.spec.public === true }), active: value.active === true, boundPort: value.boundPort === null ? null : integer(value.boundPort) }; }
 function parseSecret(value: Record<string, unknown>): SecretVersion { return { id: validateIdentity(text(value.id)), version: validateIdentity(text(value.version)), bytes: integer(value.bytes) }; }
 function parseSecretRevocation(value: Record<string, unknown>): SecretRevocation {
@@ -1584,7 +1771,33 @@ function parseSecretRevocation(value: Record<string, unknown>): SecretRevocation
   return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.secret), terminateRecipients: operationBoolean(value.terminateRecipients), futureDeliveryRevoked: true, guestCleanupReport: parsedEvidence };
 }
 function identityList(value: unknown): readonly string[] { if (!Array.isArray(value) || value.length > 1024) throw protocol("identity list"); return value.map((item) => validateIdentity(text(item))); }
-function parseUsage(value: Record<string, unknown>): ResourceUsage { return { cpuMicros: value.cpuMicros === null ? null : integer(value.cpuMicros), memoryCurrent: value.memoryCurrent === null ? null : integer(value.memoryCurrent), memoryPeak: value.memoryPeak === null ? null : integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: value.ioReadBytes === null ? null : integer(value.ioReadBytes), ioWriteBytes: value.ioWriteBytes === null ? null : integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), executionsCurrent: integer(value.executionsCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
+function parseUsage(value: Record<string, unknown>): ResourceUsage { if (!record(value.provenance)) throw protocol("resource measurement provenance"); const nullable = (item: unknown): number | null => item === null ? null : integer(item); return { provenance: parseResourceProvenance(value.provenance), hostCounterEpoch: value.hostCounterEpoch === null ? null : digest(text(value.hostCounterEpoch)), channelsCurrent: nullable(value.channelsCurrent), inflightRequestsCurrent: nullable(value.inflightRequestsCurrent), cpuMicros: value.cpuMicros === null ? null : integer(value.cpuMicros), memoryCurrent: value.memoryCurrent === null ? null : integer(value.memoryCurrent), memoryPeak: value.memoryPeak === null ? null : integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: value.ioReadBytes === null ? null : integer(value.ioReadBytes), ioWriteBytes: value.ioWriteBytes === null ? null : integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), executionsCurrent: integer(value.executionsCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
+function parseResourceCapabilities(value: Record<string, unknown>): ResourceCapabilities {
+  return { nativeTopology: parseCapability(value.nativeTopology), cpuTime: parseCapability(value.cpuTime), aggregateHostMemory: parseCapability(value.aggregateHostMemory), managedAdmission: parseCapability(value.managedAdmission), outputRetention: parseCapability(value.outputRetention), storageReservations: parseCapability(value.storageReservations), networkEnvelope: parseCapability(value.networkEnvelope), aggregatePhysicalStorage: parseCapability(value.aggregatePhysicalStorage), sharedHostWorkers: parseCapability(value.sharedHostWorkers), completeEnforcement: parseCapability(value.completeEnforcement) };
+}
+function parseResourceAssessment(value: Record<string, unknown>): ResourceChangeAssessment {
+  const mode = text(value.mode);
+  if (mode !== "live" && mode !== "requires-reboot" && mode !== "unsupported") throw protocol("resource change mode");
+  if (!Array.isArray(value.reasons) || value.reasons.length > 64) throw protocol("resource change reasons");
+  return { mode, reasons: value.reasons.map(text) };
+}
+function parseResourceProvenance(value: Record<string, unknown>): ResourceProvenance {
+  const source = (key: string): MeasurementSource => {
+    const item = text(value[key]);
+    if (item !== "unavailable" && item !== "host-cgroup" && item !== "host-filesystem" && item !== "host-retention" && item !== "host-admission" && item !== "host-network" && item !== "guest-reported") throw protocol("measurement source");
+    return item;
+  };
+  return { cpu: source("cpu"), memory: source("memory"), io: source("io"), storage: source("storage"), output: source("output"), executions: source("executions"), channels: source("channels"), network: source("network") };
+}
+function parseRetainedQualification(value: unknown): RetainedQualification {
+  if (!record(value) || !record(value.run) || !record(value.run.configuration) || !record(value.run.configuration.resources)) throw protocol("retained native qualification");
+  const run = value.run; const config = value.run.configuration;
+  const scope = text(run.scope); const engine = text(config.engine);
+  if (scope !== "lifecycle" && scope !== "resources" && scope !== "cpu-time" && scope !== "host-memory" && scope !== "storage-budgets" && scope !== "managed-channels" && scope !== "native-network" && scope !== "disk-snapshots" && scope !== "full-state" && scope !== "images" && scope !== "distribution") throw protocol("qualification scope");
+  if (engine !== "firecracker" && engine !== "apple-virtualization" && engine !== "hyper-v") throw protocol("qualification engine");
+  if (!Array.isArray(run.passedChecks) || run.passedChecks.length > 64) throw protocol("hardware checks");
+  return { run: { configuration: { buildDigest: digest(text(config.buildDigest)), platform: text(config.platform), architecture: text(config.architecture), hardwareDigest: digest(text(config.hardwareDigest)), engine, engineDigest: digest(text(config.engineDigest)), imageDigest: digest(text(config.imageDigest)), kernelDigest: digest(text(config.kernelDigest)), initramfsDigest: config.initramfsDigest === null ? null : digest(text(config.initramfsDigest)), nicConfigurationDigest: digest(text(config.nicConfigurationDigest)), storageConfigurationDigest: digest(text(config.storageConfigurationDigest)), resources: parseResources(value.run.configuration.resources) }, scope, observedUnixMillis: integer(run.observedUnixMillis), passedChecks: run.passedChecks.map(text), evidenceDigest: digest(text(run.evidenceDigest)) }, acceptedBy: text(value.acceptedBy), acceptedUnixMillis: integer(value.acceptedUnixMillis), recordDigest: digest(text(value.recordDigest)) };
+}
 function normalizeOciSource(options: ImageImportOptions): Readonly<Record<string, unknown>> {
   if (options.source !== undefined && options.reference !== undefined) throw new TypeError("Specify either source or reference for OCI import");
   const source = options.source ?? (options.reference === undefined ? undefined : { kind: "registry" as const, reference: options.reference });
@@ -1607,7 +1820,7 @@ function parseSnapshot(value: unknown): SnapshotInspection {
   if (consistency !== null && !["crash", "machine"].includes(consistency)) throw protocol("snapshot consistency");
   const kind = text(value.request.kind) as SnapshotKind; if (kind !== "disk" && kind !== "full") throw protocol("snapshot kind");
   const phase = text(value.phase) as SnapshotInspection["phase"]; if (!["admitted", "capturing", "ready"].includes(phase)) throw protocol("snapshot phase");
-  return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), machineId: validateIdentity(text(value.request.machineId)), expectedGeneration: integer(value.request.expectedGeneration), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: normalizeResources(value.resources as unknown as ResourceEnvelope), consistency, systemDiskDigest: value.systemDiskDigest === null ? null : digest(text(value.systemDiskDigest)), systemDiskBytes: integer(value.systemDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: operationBoolean(value.sensitive) };
+  return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), machineId: validateIdentity(text(value.request.machineId)), expectedGeneration: integer(value.request.expectedGeneration), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: parseResources(value.resources), consistency, systemDiskDigest: value.systemDiskDigest === null ? null : digest(text(value.systemDiskDigest)), systemDiskBytes: integer(value.systemDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: operationBoolean(value.sensitive) };
 }
 function parseReleaseStatus(value: Record<string, unknown>): ReleaseStatus { return { requestDigest: digest(text(value.requestDigest)), cleanupPending: operationBoolean(value.cleanupPending) }; }
 function normalizeExclusions(values: readonly string[]): ReadonlySet<string> {
@@ -1655,6 +1868,6 @@ function parseHostCapture(value: Record<string, unknown>): ArtifactInspection {
 }
 function identity(prefix: string): string { return `${prefix}-${randomUUID()}`; }
 function childIdentity(operationId: string, part: string): string { return `op-${sandsurfDigest("operation", ["sandsurf-child-operation-v1", validateIdentity(operationId), part]).slice(0, 48)}`; }
-function validateIdentity(value: string): string { if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value)) throw new TypeError("Sandsurf identity is malformed"); return value; }
+function validateIdentity(value: string): string { if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(value)) throw new TypeError("Sandsurf identity is malformed"); return value; }
 function digest(value: string): string { if (!/^[a-f0-9]{64}$/u.test(value)) throw new TypeError("Sandsurf digest is malformed"); return value; }
 function protocol(subject: string): SandsurfHostError { return new SandsurfHostError("protocol", `native host returned an invalid ${subject}`); }

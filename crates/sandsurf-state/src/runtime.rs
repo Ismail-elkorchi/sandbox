@@ -13,10 +13,11 @@ CREATE TABLE observations(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL) STR
 CREATE INDEX observations_by_generation ON observations(json_extract(value,'$.generation'), sequence);
 CREATE TABLE management_reports(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL) STRICT;
 CREATE TABLE operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+CREATE TABLE restore_admissions(generation INTEGER PRIMARY KEY, request_digest TEXT NOT NULL) STRICT;
 CREATE TABLE lifecycle_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT NOT NULL, digest TEXT NOT NULL) STRICT;
-CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL REFERENCES operations(id), generation INTEGER NOT NULL, output_origin_generation INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE processes(id TEXT PRIMARY KEY, operation TEXT NOT NULL REFERENCES operations(id), admission TEXT NOT NULL, lineage TEXT, generation INTEGER NOT NULL, output_limit INTEGER NOT NULL, reservation_active INTEGER NOT NULL DEFAULT 1 CHECK(reservation_active IN (0,1)), terminal_mode INTEGER NOT NULL, boundary TEXT NOT NULL, snapshot TEXT, receipt TEXT, receipt_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, release TEXT, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE chunks(process TEXT NOT NULL REFERENCES processes(id), sequence INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, stream TEXT NOT NULL, bytes_digest TEXT NOT NULL, chain_digest TEXT NOT NULL, PRIMARY KEY(process,sequence)) STRICT;
 CREATE INDEX chunks_by_offset ON chunks(process,offset);
 CREATE INDEX chunks_by_digest ON chunks(bytes_digest);
@@ -197,6 +198,11 @@ impl RuntimeJournal {
     }
     pub fn open(path: &Path, machine: &MachineId) -> Result<Self> {
         let db = Database::open(path, "guardian")?;
+        // Reject a prior execution layout before any output-write recovery.
+        // There is one active schema, with no migration or rebind reader.
+        db.connection.prepare(
+            "SELECT p.admission,p.lineage,r.request_digest FROM processes p LEFT JOIN restore_admissions r ON r.generation=p.generation LIMIT 0",
+        ).map_err(|_| Error::Corrupt("incompatible execution journal; preserved intact"))?;
         let (identity, limits, binding): (String, String, String) = db.connection.query_row(
             "SELECT machine,limits,authority FROM configuration WHERE id=1",
             [],
@@ -277,6 +283,24 @@ impl RuntimeJournal {
                 return Ok(CommittedObservation(old));
             }
             match &value.cause {
+                ObservationCause::GuestReset {}
+                    if value.applied_revision != old.applied_revision
+                        || !((old.state == MachineState::Stopped
+                            && old.cause == ObservationCause::Native {}
+                            && value.state == MachineState::Starting
+                            && value.generation == old.generation.next()?)
+                            || (old.state == MachineState::Starting
+                                && old.cause == ObservationCause::GuestReset {}
+                                && value.generation == old.generation
+                                && matches!(
+                                    value.state,
+                                    MachineState::Running | MachineState::Failed
+                                ))) =>
+                {
+                    return Err(Error::Conflict(
+                        "guest reset requires a contained stop and preserves applied authority",
+                    ));
+                }
                 ObservationCause::Native {}
                     if value.generation != old.generation
                         || value.applied_revision != old.applied_revision =>
@@ -346,6 +370,10 @@ impl RuntimeJournal {
     }
     pub fn operation(&self, id: &OperationId) -> Result<Option<Operation>> {
         operation(&self.db.connection, id)
+    }
+    /// Host-owned retention directory; guest paths never select this root.
+    pub fn retention_root(&self) -> &std::path::Path {
+        &self.db.root
     }
 
     pub fn runtime_operation(&self, id: &OperationId) -> Result<Option<RuntimeOperationRecord>> {
@@ -939,6 +967,7 @@ impl RuntimeJournal {
                 "machine generation or power state does not admit work",
             ));
         }
+        require_execution_target(&tx, &request)?;
         operation_capacity(&tx, self.limits.operations)?;
         let value = Operation {
             admission,
@@ -988,6 +1017,7 @@ impl RuntimeJournal {
         {
             return Err(Error::Conflict("machine no longer admits dispatch"));
         }
+        require_execution_target(&tx, request)?;
         value.delivery = Delivery::Dispatched;
         tx.execute(
             "UPDATE operations SET value=?2 WHERE id=?1",
@@ -1049,7 +1079,7 @@ impl RuntimeJournal {
             && matches!(&value.admission.request.request, GuestRequest::Spawn { .. })
         {
             let progressed: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM processes p WHERE p.operation=?1 AND (p.snapshot IS NOT NULL OR p.receipt IS NOT NULL OR EXISTS(SELECT 1 FROM chunks c WHERE c.process=p.id)))",
+                "SELECT EXISTS(SELECT 1 FROM processes p WHERE p.operation=?1 AND p.lineage IS NULL AND (p.snapshot IS NOT NULL OR p.receipt IS NOT NULL OR EXISTS(SELECT 1 FROM chunks c WHERE c.process=p.id)))",
                 [id.as_str()],
                 |row| row.get(0),
             )?;
@@ -1059,7 +1089,7 @@ impl RuntimeJournal {
                 ));
             }
             tx.execute(
-                "UPDATE processes SET reservation_active=0 WHERE operation=?1",
+                "UPDATE processes SET reservation_active=0 WHERE operation=?1 AND lineage IS NULL",
                 [id.as_str()],
             )?;
         }
@@ -1169,7 +1199,7 @@ impl RuntimeJournal {
             return Err(Error::Capacity("output reservations exhausted"));
         }
         let boundary = empty_boundary(&self.machine, &id, op.admission.request.generation)?;
-        tx.execute("INSERT INTO processes(id,operation,generation,output_origin_generation,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?3,?4,?5,?6)", params![id.as_str(), operation_id.as_str(), op.admission.request.generation.get(), output_limit.get(), terminal, encode(&boundary)?])?;
+        tx.execute("INSERT INTO processes(id,operation,generation,output_limit,terminal_mode,boundary,admission) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![id.as_str(), operation_id.as_str(), op.admission.request.generation.get(), output_limit.get(), terminal, encode(&boundary)?, encode(&**request)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -1195,30 +1225,21 @@ impl RuntimeJournal {
             [snapshot.request.execution_id.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let operation_id: OperationId = operation_id.try_into()?;
-        let admitted =
-            operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
-        let GuestRequest::Spawn { request } = &admitted.admission.request.request else {
-            return Err(Error::Corrupt("process operation is not a spawn"));
-        };
-        let admitted_matches = if **request == snapshot.request {
-            true
-        } else if let Some(lineage) = &snapshot.lineage {
-            let mut restored = (**request).clone();
-            restored.machine_id = snapshot.request.machine_id.clone();
-            restored.generation = snapshot.request.generation;
-            lineage.source_machine_id == request.machine_id
-                && lineage.source_generation == request.generation
-                && restored == snapshot.request
-        } else {
-            false
-        };
-        if !admitted_matches
+        let _ = operation_id;
+        let (admission, lineage): (String, Option<String>) = tx.query_row(
+            "SELECT admission,lineage FROM processes WHERE id=?1",
+            [snapshot.request.execution_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let admission: SpawnRequest = decode(&admission)?;
+        let lineage: Option<ExecutionLineage> = lineage.map(|value| decode(&value)).transpose()?;
+        if admission != snapshot.request
+            || lineage != snapshot.lineage
             || snapshot.request.generation.get() != generation
             || snapshot.guest_pid == 0
         {
             return Err(Error::Conflict(
-                "process observation does not match admitted spawn",
+                "process observation does not match immutable admission",
             ));
         }
         if let Some(old) = old {
@@ -1257,7 +1278,7 @@ impl RuntimeJournal {
             &self.machine,
             self.limits.events,
             RuntimeEventValue::Process {
-                process: snapshot.clone(),
+                process: Box::new(snapshot.clone()),
             },
         )?;
         tx.commit()?;
@@ -1329,23 +1350,21 @@ impl RuntimeJournal {
     }
 
     pub fn process_request(&self, id: &ExecutionId) -> Result<sandsurf_protocol::SpawnRequest> {
-        let operation_id: String = self.db.connection.query_row(
-            "SELECT operation FROM processes WHERE id=?1",
+        let admission: String = self.db.connection.query_row(
+            "SELECT admission FROM processes WHERE id=?1",
             [id.as_str()],
             |row| row.get(0),
         )?;
-        let operation_id: OperationId = operation_id.try_into()?;
-        let operation = operation(&self.db.connection, &operation_id)?
-            .ok_or(Error::Corrupt("reserved process has no admission"))?;
-        let GuestRequest::Spawn { request } = operation.admission.request.request else {
-            return Err(Error::Corrupt("reserved process has no spawn request"));
-        };
-        if request.execution_id != *id {
-            return Err(Error::Corrupt(
-                "process identity differs from its admission",
-            ));
-        }
-        Ok(*request)
+        decode(&admission)
+    }
+
+    pub fn execution_lineage(&self, id: &ExecutionId) -> Result<Option<ExecutionLineage>> {
+        let raw: Option<String> = self.db.connection.query_row(
+            "SELECT lineage FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )?;
+        raw.map(|value| decode(&value)).transpose()
     }
 
     pub fn process_snapshots(&self) -> Result<Vec<ExecutionSnapshot>> {
@@ -1398,6 +1417,7 @@ impl RuntimeJournal {
                 return Err(Error::Conflict("capture observation identity mismatch"));
             }
             let value = CapturedExecution {
+                lineage: self.execution_lineage(&id)?,
                 admission,
                 observation,
                 output: decode(&boundary)?,
@@ -1434,69 +1454,127 @@ impl RuntimeJournal {
         .collect()
     }
 
-    /// Rebind process observations after a trusted full-state restore. Host
-    /// operations and receipts remain historical; only the current process
-    /// handle generation and explicit snapshot lineage move forward.
-    pub fn rebind_processes(
+    /// Admit immutable incarnations from the published capture. Later source
+    /// observations and boundaries cannot change this admission or its anchor.
+    pub fn restore_executions(
         &mut self,
         snapshot_id: &SnapshotId,
         source_machine_id: &MachineId,
         source_generation: Counter,
         generation: Counter,
+        captured: &[CapturedExecution],
     ) -> Result<()> {
-        if generation == Counter::ZERO || generation == source_generation {
-            return Err(Error::Conflict("restored process generation is invalid"));
+        if source_machine_id != &self.machine || generation <= source_generation {
+            return Err(Error::Conflict(
+                "memory restore requires the same machine and a newer generation",
+            ));
         }
         let tx = self.db.connection.transaction()?;
-        let mut statement =
-            tx.prepare("SELECT id,generation,snapshot FROM processes ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        let mut updates = Vec::new();
-        for row in rows {
-            let (id, old_generation, snapshot) = row?;
-            if Counter::try_from(old_generation)? != source_generation {
-                // Historical processes from earlier cold-boot generations are not
-                // live in this captured VM and retain their original identity.
-                continue;
-            }
-            let snapshot = snapshot
-                .map(|value| decode::<ExecutionSnapshot>(&value))
-                .transpose()?;
-            let Some(mut snapshot) = snapshot else {
-                return Err(Error::Corrupt(
-                    "captured process reservation has no observation",
-                ));
+        let restore_digest = digest(
+            Domain::Snapshot,
+            &(
+                snapshot_id,
+                source_machine_id,
+                source_generation,
+                generation,
+                captured,
+            ),
+        )?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT request_digest FROM restore_admissions WHERE generation=?1",
+                [generation.get()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return if existing == restore_digest.as_str() {
+                Ok(())
+            } else {
+                Err(Error::Conflict(
+                    "restore generation already has different captured membership",
+                ))
             };
-            if snapshot.request.machine_id != *source_machine_id
-                || snapshot.request.generation != source_generation
-                || snapshot.request.execution_id.as_str() != id
+        }
+        capacity(&tx, "restore_admissions", self.limits.identities)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for source in captured {
+            if source.admission.generation != source_generation
+                || !seen.insert(source.admission.execution_id.clone())
+            {
+                return Err(Error::Conflict("invalid captured execution membership"));
+            }
+            let (admission, lineage) = source.restored(snapshot_id, &self.machine, generation)?;
+            let original: Option<(String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT admission,lineage,operation FROM processes WHERE id=?1",
+                    [source.admission.execution_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (original_admission, original_lineage, operation) = original.ok_or(
+                Error::Missing("captured execution admission is unavailable"),
+            )?;
+            if decode::<SpawnRequest>(&original_admission)? != source.admission
+                || original_lineage
+                    .map(|value| decode::<ExecutionLineage>(&value))
+                    .transpose()?
+                    != source.lineage
             {
                 return Err(Error::Conflict(
-                    "captured process identity does not match restore lineage",
+                    "captured execution differs from historical admission",
                 ));
             }
-            snapshot.request.machine_id = self.machine.clone();
-            snapshot.request.generation = generation;
-            snapshot.lineage = Some(ExecutionLineage {
-                source_machine_id: source_machine_id.clone(),
-                source_generation,
-                snapshot_id: snapshot_id.clone(),
-            });
-            updates.push((id, encode(&snapshot)?));
-        }
-        drop(statement);
-        for (id, snapshot) in updates {
+            verify_captured_prefix(&tx, &self.machine, source)?;
+            let existing: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT admission,lineage FROM processes WHERE id=?1",
+                    [admission.execution_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((old, origin)) = existing {
+                if decode::<SpawnRequest>(&old)? != admission
+                    || origin
+                        .map(|value| decode::<ExecutionLineage>(&value))
+                        .transpose()?
+                        != Some(lineage)
+                {
+                    return Err(Error::Conflict(
+                        "restore incarnation identity already bound",
+                    ));
+                }
+                continue;
+            }
+            capacity(&tx, "processes", self.limits.identities)?;
+            if managed_execution_slots(&tx)? >= self.limits.managed_executions.get() {
+                return Err(Error::Capacity(
+                    "restored managed execution reservations exhausted",
+                ));
+            }
+            let reserved: u64 = tx.query_row(
+                "SELECT coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let retained: u64 = tx.query_row("SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0", [], |row| row.get(0))?;
+            if reserved
+                .checked_add(retained)
+                .and_then(|value| value.checked_add(admission.output_bytes.get()))
+                .is_none_or(|value| value > self.limits.output_bytes.get())
+            {
+                return Err(Error::Capacity("restored output reservations exhausted"));
+            }
+            let boundary = empty_boundary(&self.machine, &admission.execution_id, generation)?;
             tx.execute(
-                "UPDATE processes SET generation=?2,snapshot=?3 WHERE id=?1",
-                params![id, generation.get(), snapshot],
+                "INSERT INTO processes(id,operation,admission,lineage,generation,output_limit,terminal_mode,boundary) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![admission.execution_id.as_str(), operation, encode(&admission)?, encode(&lineage)?, generation.get(), admission.output_bytes.get(), admission.stdio == StdioMode::Terminal, encode(&boundary)?],
             )?;
         }
+        tx.execute(
+            "INSERT INTO restore_admissions VALUES (?1,?2)",
+            params![generation.get(), restore_digest.as_str()],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1743,7 +1821,7 @@ impl RuntimeJournal {
             ));
         }
         let generation: u64 = self.db.connection.query_row(
-            "SELECT output_origin_generation FROM processes WHERE id=?1",
+            "SELECT generation FROM processes WHERE id=?1",
             [id.as_str()],
             |r| r.get(0),
         )?;
@@ -1896,10 +1974,18 @@ impl RuntimeJournal {
         let operation_id: OperationId = operation_id.try_into()?;
         let mut op =
             operation(&tx, &operation_id)?.ok_or(Error::Corrupt("process operation is missing"))?;
-        if !matches!(
-            op.delivery,
-            Delivery::Dispatched | Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
-        ) {
+        let (admission, restored): (String, bool) = tx.query_row(
+            "SELECT admission,lineage IS NOT NULL FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let admission: SpawnRequest = decode(&admission)?;
+        if !restored
+            && !matches!(
+                op.delivery,
+                Delivery::Dispatched | Delivery::Applied | Delivery::NotApplied | Delivery::Unknown
+            )
+        {
             return Err(Error::Conflict(
                 "cannot settle a process before dispatch or confirmed non-application",
             ));
@@ -1909,7 +1995,13 @@ impl RuntimeJournal {
             generation: generation.try_into()?,
             execution_id: id.clone(),
             operation_id,
-            request_digest: op.admission.request.request_digest.clone(),
+            request_digest: if restored {
+                // Identifies the new admission without manufacturing another
+                // dispatch or changing the original operation's evidence.
+                digest(Domain::Snapshot, &admission)?
+            } else {
+                op.admission.request.request_digest.clone()
+            },
             outcome,
             output: decode(&boundary)?,
             cleanup_digest: cleanup,
@@ -1929,32 +2021,39 @@ impl RuntimeJournal {
             ExecutionOutcome::SpawnFailed { .. } => Delivery::NotApplied,
             ExecutionOutcome::Interrupted { .. } => op.delivery,
         };
-        if matches!(
-            (op.delivery, delivery),
-            (Delivery::Applied, Delivery::NotApplied) | (Delivery::NotApplied, Delivery::Applied)
-        ) {
+        if !restored
+            && matches!(
+                (op.delivery, delivery),
+                (Delivery::Applied, Delivery::NotApplied)
+                    | (Delivery::NotApplied, Delivery::Applied)
+            )
+        {
             return Err(Error::Conflict(
                 "receipt contradicts committed execution evidence",
             ));
         }
-        op.delivery = delivery;
-        op.evidence_digest = Some(receipt_digest.clone());
-        tx.execute(
-            "UPDATE operations SET value=?2 WHERE id=?1",
-            params![op.admission.request.operation_id.as_str(), encode(&op)?],
-        )?;
+        if !restored {
+            op.delivery = delivery;
+            op.evidence_digest = Some(receipt_digest.clone());
+            tx.execute(
+                "UPDATE operations SET value=?2 WHERE id=?1",
+                params![op.admission.request.operation_id.as_str(), encode(&op)?],
+            )?;
+        }
         tx.execute(
             "UPDATE processes SET receipt=?2,receipt_digest=?3,reservation_active=0 WHERE id=?1",
             params![id.as_str(), encode(&receipt)?, receipt_digest.as_str()],
         )?;
-        append_event(
-            &tx,
-            &self.machine,
-            self.limits.events,
-            RuntimeEventValue::GuestOperation {
-                operation: op.clone(),
-            },
-        )?;
+        if !restored {
+            append_event(
+                &tx,
+                &self.machine,
+                self.limits.events,
+                RuntimeEventValue::GuestOperation {
+                    operation: op.clone(),
+                },
+            )?;
+        }
         append_event(
             &tx,
             &self.machine,
@@ -2034,7 +2133,7 @@ impl RuntimeJournal {
         }
         let (raw, origin_generation, released): (String, u64, Option<String>) =
             self.db.connection.query_row(
-                "SELECT boundary,output_origin_generation,release FROM processes WHERE id=?1",
+                "SELECT boundary,generation,release FROM processes WHERE id=?1",
                 [id.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
@@ -2660,4 +2759,110 @@ fn empty_boundary(
     generation: Counter,
 ) -> Result<OutputBoundary> {
     Ok(initial_output_boundary(machine, id, generation)?)
+}
+
+fn verify_captured_prefix(
+    connection: &rusqlite::Connection,
+    machine: &MachineId,
+    captured: &CapturedExecution,
+) -> Result<()> {
+    let expected = &captured.output;
+    expected.validate()?;
+    let (latest, released): (String, bool) = connection.query_row(
+        "SELECT boundary,release IS NOT NULL FROM processes WHERE id=?1",
+        [captured.admission.execution_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let latest: OutputBoundary = decode(&latest)?;
+    if expected.final_cursor > latest.final_cursor || expected.chunks > latest.chunks {
+        return Err(Error::Conflict(
+            "snapshot output exceeds historical source evidence",
+        ));
+    }
+    // A separately authorized release can retire original framing after capture.
+    // The immutable published capture still names its original anchor; this
+    // creates no replacement claim and does not discharge another obligation.
+    if released {
+        return Ok(());
+    }
+    let mut boundary = empty_boundary(
+        machine,
+        &captured.admission.execution_id,
+        captured.admission.generation,
+    )?;
+    let mut statement = connection.prepare("SELECT sequence,offset,length,stream,chain_digest FROM chunks WHERE process=?1 AND sequence<=?2 ORDER BY sequence")?;
+    let rows = statement.query_map(
+        params![
+            captured.admission.execution_id.as_str(),
+            expected.chunks.get()
+        ],
+        |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (sequence, offset, length, stream, chain) = row?;
+        if sequence != boundary.chunks.next()?.get() || offset != boundary.final_cursor.get() {
+            return Err(Error::Corrupt(
+                "captured output prefix framing is unavailable",
+            ));
+        }
+        boundary.chunks = sequence.try_into()?;
+        boundary.final_cursor = offset
+            .checked_add(length)
+            .ok_or(Error::Corrupt("captured output overflow"))?
+            .try_into()?;
+        let count = match decode::<Stream>(&stream)? {
+            Stream::Stdout => &mut boundary.stdout_bytes,
+            Stream::Stderr => &mut boundary.stderr_bytes,
+            Stream::Terminal => &mut boundary.terminal_bytes,
+        };
+        *count = count
+            .get()
+            .checked_add(length)
+            .ok_or(Error::Corrupt("captured output overflow"))?
+            .try_into()?;
+        boundary.final_hash = chain.try_into()?;
+    }
+    if &boundary != expected {
+        return Err(Error::Conflict(
+            "snapshot output anchor differs from retained prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn require_execution_target(
+    connection: &rusqlite::Connection,
+    command: &GuestCommand,
+) -> Result<()> {
+    let id = match &command.request {
+        GuestRequest::WriteInput { execution_id, .. }
+        | GuestRequest::CloseInput { execution_id, .. }
+        | GuestRequest::AcquireTerminalInput { execution_id, .. }
+        | GuestRequest::ReleaseTerminalInput { execution_id, .. }
+        | GuestRequest::ResizeTerminal { execution_id, .. }
+        | GuestRequest::Signal { execution_id, .. }
+        | GuestRequest::Terminate { execution_id, .. } => execution_id,
+        _ => return Ok(()),
+    };
+    let generation: Option<u64> = connection
+        .query_row(
+            "SELECT generation FROM processes WHERE id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if generation != Some(command.generation.get()) {
+        return Err(Error::Conflict(
+            "execution mutation targets a stale or missing incarnation",
+        ));
+    }
+    Ok(())
 }

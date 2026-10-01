@@ -59,13 +59,8 @@ fn hash(value: &str) -> Digest {
     bytes_digest(value.as_bytes())
 }
 fn resources() -> Resources {
-    Resources {
-        vcpus: n(2),
-        memory_mib: n(2048),
-        disk_bytes: n(100_000),
-        output_bytes: n(1000),
-        managed_executions: n(8),
-    }
+    Resources::from_geometry(n(2), n(2048), n(100_000), n(1000), n(8))
+        .expect("static resource envelope")
 }
 fn catalog_limits() -> CatalogLimits {
     CatalogLimits {
@@ -73,13 +68,8 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(64),
         usage_records: n(64),
         image_bytes: n(400_000),
-        resources: Resources {
-            vcpus: n(8),
-            memory_mib: n(8192),
-            disk_bytes: n(400_000),
-            output_bytes: n(4000),
-            managed_executions: n(32),
-        },
+        resources: Resources::from_geometry(n(8), n(8192), n(400_000), n(4000), n(32))
+            .expect("static resource envelope"),
     }
 }
 fn runtime_limits() -> RuntimeLimits {

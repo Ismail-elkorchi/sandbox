@@ -4,7 +4,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const APPLICATION_ID: i64 = 0x53534d31;
+// A new format family, not a migration of earlier Sandsurf catalogs. Resetting
+// the schema version must not accidentally admit an old version-one database.
+const APPLICATION_ID: i64 = 0x53434d31;
 
 pub(crate) struct Database {
     pub connection: Connection,
@@ -40,7 +42,7 @@ impl Database {
         let mut connection = connect(&database_path)?;
         configure_durability(&connection)?;
         let tx = connection.transaction()?;
-        tx.execute_batch("PRAGMA application_id = 1397968177; PRAGMA user_version = 14; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
+        tx.execute_batch("PRAGMA application_id = 1396919601; PRAGMA user_version = 1; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
         tx.execute("INSERT INTO identity VALUES (?1)", [role])?;
         tx.execute_batch(schema)?;
         tx.commit()?;
@@ -64,7 +66,7 @@ impl Database {
         let connection = connect(&path)?;
         let application: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if application != APPLICATION_ID || version != 14 {
+        if application != APPLICATION_ID || version != 1 {
             return Err(Error::Corrupt(
                 "incompatible authority catalog; preserved intact",
             ));

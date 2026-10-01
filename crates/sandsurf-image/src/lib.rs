@@ -1,7 +1,11 @@
 #![deny(unsafe_code)]
 
+pub mod appliance;
 pub mod archive;
+pub mod boot;
+pub mod distribution;
 pub mod ext4;
+pub mod identity;
 pub mod oci;
 pub mod registry;
 
@@ -48,6 +52,8 @@ pub struct WindowsArtifacts {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BootBundleManifest {
     pub kernel: ImageArtifact,
+    pub initramfs: Option<ImageArtifact>,
+    pub profile: boot::BootProfile,
     /// Build-time component provenance, not an attestation of the running guest.
     pub guest_agent: Option<GuestAgentArtifact>,
     pub capabilities: ImageCapabilities,
@@ -57,6 +63,7 @@ pub struct BootBundleManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SystemDiskManifest {
     pub rootfs: RootfsArtifact,
+    pub clone_profile: identity::CloneProfile,
     pub defaults: ImageDefaults,
     pub provenance: ImageProvenance,
 }
@@ -164,6 +171,7 @@ pub struct VerifiedImage {
     pub manifest_path: PathBuf,
     pub manifest_digest: String,
     pub kernel_path: PathBuf,
+    pub initramfs_path: Option<PathBuf>,
     pub system_path: PathBuf,
     pub windows_x64: Option<VerifiedWindowsArtifacts>,
 }
@@ -202,6 +210,54 @@ impl From<io::Error> for ImageError {
 }
 
 pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage, ImageError> {
+    let (manifest, manifest_digest, _) = read_manifest(path, trust)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| ImageError::Invalid("manifest has no parent directory".into()))?;
+    let kernel_path = resolve_beneath(directory, &manifest.boot_bundle.kernel.path)?;
+    let system_path = resolve_beneath(directory, &manifest.system.rootfs.path)?;
+    verify_artifact(&kernel_path, &manifest.boot_bundle.kernel.sha256, "kernel")?;
+    let initramfs_path = manifest
+        .boot_bundle
+        .initramfs
+        .as_ref()
+        .map(|artifact| {
+            let path = resolve_beneath(directory, &artifact.path)?;
+            verify_artifact(&path, &artifact.sha256, "initramfs")?;
+            Ok::<_, ImageError>(path)
+        })
+        .transpose()?;
+    verify_artifact(&system_path, &manifest.system.rootfs.sha256, "system")?;
+    let windows_x64 = manifest
+        .platform_artifacts
+        .windows_x64
+        .as_ref()
+        .map(|artifacts| {
+            let kernel_path = resolve_beneath(directory, &artifacts.kernel.path)?;
+            let system_path = resolve_beneath(directory, &artifacts.system.path)?;
+            verify_artifact(&kernel_path, &artifacts.kernel.sha256, "Windows kernel")?;
+            verify_artifact(&system_path, &artifacts.system.sha256, "Windows system")?;
+            Ok::<_, ImageError>(VerifiedWindowsArtifacts {
+                kernel_path,
+                system_path,
+            })
+        })
+        .transpose()?;
+    Ok(VerifiedImage {
+        manifest,
+        manifest_path: path.to_path_buf(),
+        manifest_digest,
+        kernel_path,
+        initramfs_path,
+        system_path,
+        windows_x64,
+    })
+}
+
+fn read_manifest(
+    path: &Path,
+    trust: ImageTrust<'_>,
+) -> Result<(ImageManifest, String, Vec<u8>), ImageError> {
     if !path.is_absolute() {
         return Err(ImageError::Invalid("manifest path must be absolute".into()));
     }
@@ -238,40 +294,11 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
             verify_signature(&manifest, release_public_key)?;
         }
     }
-    let directory = path
-        .parent()
-        .ok_or_else(|| ImageError::Invalid("manifest has no parent directory".into()))?;
-    let kernel_path = resolve_beneath(directory, &manifest.boot_bundle.kernel.path)?;
-    let system_path = resolve_beneath(directory, &manifest.system.rootfs.path)?;
-    verify_artifact(&kernel_path, &manifest.boot_bundle.kernel.sha256, "kernel")?;
-    verify_artifact(&system_path, &manifest.system.rootfs.sha256, "system")?;
-    let windows_x64 = manifest
-        .platform_artifacts
-        .windows_x64
-        .as_ref()
-        .map(|artifacts| {
-            let kernel_path = resolve_beneath(directory, &artifacts.kernel.path)?;
-            let system_path = resolve_beneath(directory, &artifacts.system.path)?;
-            verify_artifact(&kernel_path, &artifacts.kernel.sha256, "Windows kernel")?;
-            verify_artifact(&system_path, &artifacts.system.sha256, "Windows system")?;
-            Ok::<_, ImageError>(VerifiedWindowsArtifacts {
-                kernel_path,
-                system_path,
-            })
-        })
-        .transpose()?;
-    Ok(VerifiedImage {
-        manifest,
-        manifest_path: path.to_path_buf(),
-        manifest_digest,
-        kernel_path,
-        system_path,
-        windows_x64,
-    })
+    Ok((manifest, manifest_digest, manifest_bytes))
 }
 
 pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageError> {
-    if manifest.format_version != 3
+    if manifest.format_version != 1
         || manifest.id.is_empty()
         || manifest.id.len() > 128
         || manifest.version.is_empty()
@@ -286,11 +313,47 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
             "invalid management build provenance".into(),
         ));
     }
+    let mut paths = std::collections::BTreeSet::from(["manifest.json".to_owned()]);
+    for value in [
+        &manifest.boot_bundle.kernel.path,
+        &manifest.system.rootfs.path,
+    ]
+    .into_iter()
+    .chain(manifest.boot_bundle.initramfs.iter().map(|v| &v.path))
+    .chain(
+        manifest
+            .platform_artifacts
+            .windows_x64
+            .iter()
+            .flat_map(|v| [&v.kernel.path, &v.system.path]),
+    ) {
+        let path = Path::new(value);
+        if value.is_empty()
+            || value.contains(['\\', '\0', ':'])
+            || value.split('/').any(|part| matches!(part, "" | "." | ".."))
+            || path.is_absolute()
+            || !path
+                .components()
+                .all(|v| matches!(v, std::path::Component::Normal(_)))
+            || !paths.insert(value.to_lowercase())
+        {
+            return Err(ImageError::Invalid(
+                "artifact paths must be distinct portable relative files".into(),
+            ));
+        }
+    }
     for digest in [
         &manifest.boot_bundle.kernel.sha256,
         &manifest.system.rootfs.sha256,
     ]
     .into_iter()
+    .chain(
+        manifest
+            .boot_bundle
+            .initramfs
+            .iter()
+            .map(|artifact| &artifact.sha256),
+    )
     .chain(
         manifest
             .boot_bundle
@@ -381,9 +444,7 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
 /// atomic; the digest-named destination is immutable and reverified on reuse.
 /// This store never contains an attached machine's writable disk.
 pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, ImageError> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    sandsurf_native::local::ensure_private_directory(store)?;
+    let owner = ImageStage::acquire(store, &image.manifest_digest)?;
     let destination = store.join(&image.manifest_digest);
     if destination.exists() {
         let installed = verify_image(
@@ -395,11 +456,7 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
         }
         return Ok(destination);
     }
-    let staging = store.join(format!(
-        ".image-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let staging = owner.path.clone();
     sandsurf_native::local::create_private_directory(&staging)?;
     let result = (|| {
         let mut artifacts = BTreeMap::from([
@@ -413,6 +470,14 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
                 image.system_path.clone(),
             ),
         ]);
+        if let (Some(path), Some(metadata)) =
+            (&image.initramfs_path, &image.manifest.boot_bundle.initramfs)
+            && artifacts
+                .insert(metadata.path.clone(), path.clone())
+                .is_some()
+        {
+            return Err(ImageError::Invalid("boot artifact paths collide".into()));
+        }
         if let (Some(paths), Some(metadata)) = (
             &image.windows_x64,
             &image.manifest.platform_artifacts.windows_x64,
@@ -456,37 +521,87 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
             }
             sandsurf_native::storage::sync_file(&output)?;
         }
-        let copied = verify_image(&staging.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        if copied.manifest_digest != image.manifest_digest {
-            return Err(ImageError::DigestMismatch("copied manifest"));
-        }
         for directory in directories.iter().rev() {
             sync_directory(directory)?;
         }
-        sync_directory(&staging)?;
-        match sandsurf_native::storage::publish_new_directory(&staging, &destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let installed = verify_image(
-                    &destination.join("manifest.json"),
-                    ImageTrust::Pinned {
-                        manifest_digest: &image.manifest_digest,
-                    },
-                )?;
-                if installed.manifest_digest != image.manifest_digest {
-                    return Err(ImageError::DigestMismatch("concurrent installed manifest"));
-                }
-                std::fs::remove_dir_all(&staging)?;
-                sync_directory(store)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(destination)
+        publish_image_stage(store, &staging, &image.manifest_digest)
     })();
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
     }
     result
+}
+
+struct ImageStage {
+    path: PathBuf,
+    _lease: File,
+}
+
+impl ImageStage {
+    fn acquire(store: &Path, digest: &str) -> Result<Self, ImageError> {
+        validate_digest(digest)?;
+        sandsurf_native::local::ensure_private_directory(store)?;
+        let lease_path = store.join(format!(".image-owner-{digest}"));
+        let lease = match sandsurf_native::local::create_private_file(&lease_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                sandsurf_native::local::open_private_file(
+                    &lease_path,
+                    sandsurf_native::PrivateFileAccess::ReadWrite,
+                )?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        lease.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "image materialization already has an owner",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        let path = store.join(format!(".image-stage-{digest}"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                // The exact deterministic stage belongs to this image. The
+                // exclusive owner lease proves no interrupted writer remains.
+                sandsurf_native::local::canonical_private_directory(&path)?;
+                std::fs::remove_dir_all(&path)?;
+                sync_directory(store)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Self {
+            path,
+            _lease: lease,
+        })
+    }
+}
+
+fn publish_image_stage(store: &Path, staging: &Path, digest: &str) -> Result<PathBuf, ImageError> {
+    let destination = store.join(digest);
+    verify_image(
+        &staging.join("manifest.json"),
+        ImageTrust::Pinned {
+            manifest_digest: digest,
+        },
+    )?;
+    sync_directory(staging)?;
+    match sandsurf_native::storage::publish_new_directory(staging, &destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_image(
+                &destination.join("manifest.json"),
+                ImageTrust::Pinned {
+                    manifest_digest: digest,
+                },
+            )?;
+            std::fs::remove_dir_all(staging)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    sync_directory(store)?;
+    Ok(destination)
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -655,19 +770,21 @@ mod tests {
 
     fn test_manifest(kernel: &[u8], rootfs: &[u8]) -> ImageManifest {
         ImageManifest {
-            format_version: 3,
+            format_version: 1,
             id: "test-image".into(),
             version: "1".into(),
             architecture: Architecture::X64,
             boot_bundle: BootBundleManifest {
+                initramfs: None,
+                profile: boot::BootProfile::Pinned,
                 kernel: ImageArtifact {
                     path: "kernel".into(),
                     sha256: hex_sha256(kernel),
                 },
                 guest_agent: Some(GuestAgentArtifact {
                     version: "1".into(),
-                    protocol_major: 4,
-                    protocol_minor: 3,
+                    protocol_major: 1,
+                    protocol_minor: 0,
                     sha256: hex_sha256(b"guest-agent"),
                 }),
                 capabilities: ImageCapabilities {
@@ -679,6 +796,7 @@ mod tests {
                 },
             },
             system: SystemDiskManifest {
+                clone_profile: identity::CloneProfile::Preserve,
                 rootfs: RootfsArtifact {
                     path: "rootfs".into(),
                     sha256: hex_sha256(rootfs),
@@ -772,7 +890,17 @@ mod tests {
         let store = temporary.0.join("store");
         assert!(install_image(&store, &verified).is_err());
         assert!(!store.join(&verified.manifest_digest).exists());
-        assert_eq!(fs::read_dir(store).unwrap().count(), 0);
+        let remaining: Vec<_> = fs::read_dir(store)
+            .unwrap()
+            .map(|v| v.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            remaining,
+            [std::ffi::OsString::from(format!(
+                ".image-owner-{}",
+                verified.manifest_digest
+            ))]
+        );
     }
 
     #[test]
@@ -945,5 +1073,74 @@ mod tests {
             ));
         }
         fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
+    fn distribution_verifies_decoded_disks_publishes_once_and_never_uses_raw_source_fallback() {
+        use std::io::Write;
+        let temporary = TempDirectory::new();
+        let source = temporary.0.join("source");
+        let store = temporary.0.join("store");
+        sandsurf_native::local::create_private_directory(&source).unwrap();
+        let manifest = test_manifest(b"kernel", b"computer");
+        let path = write_image(&source, &manifest, b"kernel", b"computer");
+        let digest = hex_sha256(&fs::read(&path).unwrap());
+        // A raw build object is not an external distribution bundle.
+        assert!(distribution::install(&store, &path, ImageTrust::ExplicitLocal).is_err());
+        fs::write(source.join("rootfs.gz"), b"corrupt transport").unwrap();
+        assert!(distribution::install(&store, &path, ImageTrust::ExplicitLocal).is_err());
+        assert!(!store.join(&digest).exists());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"computer").unwrap();
+        fs::write(source.join("rootfs.gz"), encoder.finish().unwrap()).unwrap();
+        fs::remove_file(source.join("rootfs")).unwrap();
+        let image = distribution::install(
+            &store,
+            &path,
+            ImageTrust::Pinned {
+                manifest_digest: &digest,
+            },
+        )
+        .unwrap();
+        assert_eq!(image.manifest_digest, digest);
+        assert_eq!(fs::read(&image.system_path).unwrap(), b"computer");
+        fs::remove_file(source.join("rootfs.gz")).unwrap();
+        distribution::install(
+            &store,
+            &path,
+            ImageTrust::Pinned {
+                manifest_digest: &digest,
+            },
+        )
+        .unwrap();
+        fs::remove_file(&image.system_path).unwrap();
+        fs::write(&image.system_path, b"changed published disk").unwrap();
+        assert!(
+            distribution::install(
+                &store,
+                &path,
+                ImageTrust::Pinned {
+                    manifest_digest: &digest
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn interrupted_image_stage_is_reclaimed_only_after_its_owner_releases_custody() {
+        let temporary = TempDirectory::new();
+        let store = temporary.0.join("store");
+        let digest = "a".repeat(64);
+        let owner = ImageStage::acquire(&store, &digest).unwrap();
+        sandsurf_native::local::create_private_directory(&owner.path).unwrap();
+        fs::write(owner.path.join("incomplete"), b"partial image").unwrap();
+        assert!(ImageStage::acquire(&store, &digest).is_err());
+        assert!(owner.path.join("incomplete").exists());
+        let stage = owner.path.clone();
+        drop(owner);
+        let recovered = ImageStage::acquire(&store, &digest).unwrap();
+        assert_eq!(stage, recovered.path);
+        assert!(!stage.exists());
     }
 }

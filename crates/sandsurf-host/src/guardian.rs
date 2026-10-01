@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const SERVICE_VERSION: u16 = 11;
+pub const SERVICE_VERSION: u16 = 1;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 // Full-state VM capture/restore is synchronous at this private ownership
 // boundary and can include bounded hashing of memory plus multiple disks.
@@ -94,6 +94,19 @@ use crate::guest_worker::{ExecutionHint, GuestJob, GuestJobResult};
 pub use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 
 pub trait GuardianEffect {
+    fn take_console(&mut self) -> Option<sandsurf_machine::NativeConsole> {
+        None
+    }
+    fn take_guest_reset(&mut self) -> Option<Digest> {
+        None
+    }
+    /// The caller has durably advanced the generation before this cold boot.
+    /// Native reset is within the existing applied envelope, not new intent.
+    fn recover_guest_reset(&mut self, _current: &MachineObservation) -> Result<Digest> {
+        Err(Error::Unsupported(
+            "native guest reset recovery is unsupported",
+        ))
+    }
     /// The durable capture transaction owns the pause, including uncertain
     /// native delivery. A volatile native "paused" flag is not this authority.
     fn capture_owner(&self) -> Result<Option<OperationId>>;
@@ -130,6 +143,19 @@ pub trait GuardianEffect {
         Err(Error::Unsupported(
             "native resource accounting is not implemented",
         ))
+    }
+    fn resource_envelope(&self) -> Option<sandsurf_protocol::Resources> {
+        None
+    }
+    fn assess_resources(
+        &self,
+        _resources: &sandsurf_protocol::Resources,
+        _current: &MachineObservation,
+    ) -> sandsurf_protocol::ResourceChangeAssessment {
+        sandsurf_protocol::ResourceChangeAssessment {
+            mode: sandsurf_protocol::ResourceChangeMode::Unsupported,
+            reasons: vec!["native resource enforcement is unsupported".into()],
+        }
     }
     fn native_snapshot(
         &mut self,
@@ -174,6 +200,7 @@ pub struct Guardian<E> {
     effect: Option<E>,
     management_seen: Option<std::time::Instant>,
     execution_seen: std::collections::BTreeMap<ExecutionId, std::time::Instant>,
+    console: crate::console::ConsoleStore,
 }
 
 enum GuestAdmission {
@@ -206,11 +233,13 @@ fn rejected(error: Error) -> GuardianResponse {
 
 impl<E: GuardianEffect> Guardian<E> {
     pub fn new(journal: RuntimeJournal, effect: E) -> Self {
+        let console = crate::console::ConsoleStore::new(journal.retention_root());
         Self {
             journal,
             effect: Some(effect),
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
+            console,
         }
     }
 
@@ -223,11 +252,13 @@ impl<E: GuardianEffect> Guardian<E> {
                 "retained evidence requires confirmed native destruction",
             ));
         }
+        let console = crate::console::ConsoleStore::new(journal.retention_root());
         Ok(Self {
             journal,
             effect: None,
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
+            console,
         })
     }
 
@@ -527,13 +558,16 @@ impl<E: GuardianEffect> Guardian<E> {
         Ok(ExecutionStatus {
             execution_id: id.clone(),
             generation,
+            lineage: self.journal.execution_lineage(id)?,
             report,
             interruption: self.journal.execution_interruption(generation)?,
         })
     }
 
     pub fn handle(&mut self, request: GuardianRequest) -> GuardianResponse {
-        match self.handle_inner(request) {
+        let result = self.handle_inner(request);
+        self.attach_native_console();
+        match result {
             Ok(response) => response,
             Err(error) => {
                 eprintln!("sandsurf guardian request rejected: {error}");
@@ -585,6 +619,9 @@ impl<E: GuardianEffect> Guardian<E> {
                     | MachineState::Failed
             ));
         };
+        // Only a positive, consumed native reset witness can enter recovery.
+        // Neither arbitrary VMM exit nor management loss reaches this branch.
+        let reset = effect.take_guest_reset();
         if !matches!(
             measured.state,
             MachineState::Running
@@ -602,7 +639,7 @@ impl<E: GuardianEffect> Guardian<E> {
         }
         if measured.state != current.state {
             self.journal.observe(MachineObservation {
-                machine_id: current.machine_id,
+                machine_id: current.machine_id.clone(),
                 generation: current.generation,
                 sequence: current
                     .sequence
@@ -616,9 +653,68 @@ impl<E: GuardianEffect> Guardian<E> {
             if matches!(measured.state, MachineState::Stopped | MachineState::Failed) {
                 self.management_seen = None;
                 self.execution_seen.clear();
+                self.console.detach();
             }
         }
+        if measured.state == MachineState::Stopped
+            && matches!(current.state, MachineState::Running | MachineState::Paused)
+            && let Some(evidence) = reset
+        {
+            let stopped = self
+                .journal
+                .last_observation()?
+                .ok_or(Error::Protocol("reset stop boundary missing"))?;
+            let starting = MachineObservation {
+                machine_id: current.machine_id,
+                generation: current
+                    .generation
+                    .next()
+                    .map_err(|_| Error::Protocol("reset generation overflow"))?,
+                sequence: stopped
+                    .value()
+                    .sequence
+                    .next()
+                    .map_err(|_| Error::Protocol("reset sequence overflow"))?,
+                state: MachineState::Starting,
+                applied_revision: current.applied_revision,
+                cause: ObservationCause::GuestReset {},
+                evidence_digest: evidence,
+            };
+            // Commit the fence before any replacement attachment can run.
+            self.journal.observe(starting.clone())?;
+            let outcome = effect.recover_guest_reset(&starting);
+            let (state, evidence_digest) = match outcome {
+                Ok(evidence) => (MachineState::Running, evidence),
+                Err(error) => (
+                    MachineState::Failed,
+                    bytes_digest(error.to_string().as_bytes()),
+                ),
+            };
+            self.journal.observe(MachineObservation {
+                sequence: starting
+                    .sequence
+                    .next()
+                    .map_err(|_| Error::Protocol("reset sequence overflow"))?,
+                state,
+                evidence_digest,
+                ..starting
+            })?;
+        }
+        self.attach_native_console();
         Ok(true)
+    }
+
+    fn attach_native_console(&mut self) {
+        if let Ok(Some(current)) = self.journal.last_observation()
+            && matches!(
+                current.value().state,
+                MachineState::Running | MachineState::Paused
+            )
+            && let Some(console) = self.effect.as_mut().and_then(GuardianEffect::take_console)
+            && let Err(error) = self.console.attach(current.value().generation, console)
+        {
+            eprintln!("sandsurf native console capture unavailable: {error}");
+        }
     }
 
     fn handle_inner(&mut self, request: GuardianRequest) -> Result<GuardianResponse> {
@@ -900,9 +996,49 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
                 let response = match request {
+                    RuntimeRequest::ReadConsole {
+                        generation,
+                        after,
+                        maximum,
+                    } => RuntimeResponse::Console {
+                        page: self.console.read(generation, after, maximum)?,
+                    },
+                    RuntimeRequest::WriteConsole { generation, bytes } => {
+                        self.refresh_native_observation()?;
+                        let current = self
+                            .journal
+                            .last_observation()?
+                            .ok_or(Error::Protocol("console generation unavailable"))?;
+                        if generation != current.value().generation {
+                            return Err(Error::Rejected { category: "stale-generation".into(), message: "native console input belongs to an earlier execution generation".into() });
+                        }
+                        if current.value().state != MachineState::Running {
+                            return Err(Error::Unsupported(
+                                "native console input requires a running computer",
+                            ));
+                        }
+                        RuntimeResponse::ConsoleInput {
+                            accepted: self.console.write(generation, &bytes)?,
+                        }
+                    }
                     RuntimeRequest::OwnerIdentity {} => RuntimeResponse::OwnerIdentity {
                         machine_id: self.journal.machine_id().clone(),
                     },
+                    RuntimeRequest::AssessResources { resources } => {
+                        let current = self
+                            .journal
+                            .last_observation()?
+                            .ok_or(Error::Protocol("native resource state unavailable"))?;
+                        RuntimeResponse::ResourceAssessment {
+                            assessment: self
+                                .effect
+                                .as_ref()
+                                .ok_or(Error::Unsupported(
+                                    "destroyed machine has no native resource owner",
+                                ))?
+                                .assess_resources(&resources, current.value()),
+                        }
+                    }
                     RuntimeRequest::ValidateResources { resources } => {
                         let current = self
                             .journal
@@ -931,6 +1067,10 @@ impl<E: GuardianEffect> Guardian<E> {
                             .resource_usage()?;
                         usage.output_retained_bytes = self.journal.retained_output_bytes()?;
                         usage.executions_current = self.journal.managed_execution_slots_held()?;
+                        usage.provenance.output =
+                            sandsurf_protocol::MeasurementSource::HostRetention;
+                        usage.provenance.executions =
+                            sandsurf_protocol::MeasurementSource::HostAdmission;
                         RuntimeResponse::Usage { generation, usage }
                     }
                     RuntimeRequest::Events { after, maximum } => RuntimeResponse::Events {
@@ -1526,6 +1666,15 @@ pub fn serve_guardian<E: GuardianEffect>(
     let listener = LocalListener::bind(endpoint)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
+    let channel_limit = Arc::new(AtomicUsize::new(
+        guardian
+            .effect
+            .as_ref()
+            .and_then(GuardianEffect::resource_envelope)
+            .map_or(MAX_GUARDIAN_CONNECTIONS, |value| {
+                value.channels.get().min(MAX_GUARDIAN_CONNECTIONS as u64) as usize
+            }),
+    ));
     let events = Arc::new(event_stream::EventSignal::new(
         guardian.journal.event_cursor()?,
     ));
@@ -1568,6 +1717,7 @@ pub fn serve_guardian<E: GuardianEffect>(
     std::thread::scope(|scope| {
         let stopped_accept = Arc::clone(&stopped);
         let active_accept = Arc::clone(&active);
+        let limit_accept = Arc::clone(&channel_limit);
         let events_accept = Arc::clone(&events);
         let accept_worker = scope.spawn(move || {
             while !stopped_accept.load(Ordering::Acquire) {
@@ -1579,7 +1729,9 @@ pub fn serve_guardian<E: GuardianEffect>(
                         return;
                     }
                 };
-                if active_accept.fetch_add(1, Ordering::AcqRel) >= MAX_GUARDIAN_CONNECTIONS {
+                if active_accept.fetch_add(1, Ordering::AcqRel)
+                    >= limit_accept.load(Ordering::Acquire)
+                {
                     active_accept.fetch_sub(1, Ordering::AcqRel);
                     continue;
                 }
@@ -1690,6 +1842,19 @@ pub fn serve_guardian<E: GuardianEffect>(
             // Publish after every committed owner turn, including admission
             // paths that continue before periodic native/guest observation.
             events.publish(guardian.journal.event_cursor()?);
+            let envelope = guardian
+                .effect
+                .as_ref()
+                .and_then(GuardianEffect::resource_envelope);
+            let inflight_limit = envelope
+                .as_ref()
+                .map_or(16, |value| value.inflight_requests.get().min(16) as usize);
+            channel_limit.store(
+                envelope.as_ref().map_or(MAX_GUARDIAN_CONNECTIONS, |value| {
+                    value.channels.get().min(MAX_GUARDIAN_CONNECTIONS as u64) as usize
+                }),
+                Ordering::Release,
+            );
             match receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok(GuardianIngress::Request { parsed, reply }) => {
                     last_request = std::time::Instant::now();
@@ -1702,6 +1867,13 @@ pub fn serve_guardian<E: GuardianEffect>(
                                     | GuardianRequest::Guest { .. }
                             ) =>
                         {
+                            if outstanding_guest_jobs >= inflight_limit {
+                                let _ = reply.send(rejected(Error::Rejected {
+                                    category: "capacity".into(),
+                                    message: "host in-flight resource budget exhausted".into(),
+                                }));
+                                continue;
+                            }
                             match guardian.begin_guest(request) {
                                 Ok(GuestAdmission::Ready(response)) => response,
                                 Ok(GuestAdmission::Queued { job, pending }) => {
@@ -1745,7 +1917,41 @@ pub fn serve_guardian<E: GuardianEffect>(
                                 Err(error) => rejected(error),
                             }
                         }
-                        Ok(request) => guardian.handle(request),
+                        Ok(GuardianRequest::Runtime {
+                            request: RuntimeRequest::ValidateResources { ref resources },
+                            ..
+                        }) if resources.channels.get() < active.load(Ordering::Acquire) as u64
+                            || resources.inflight_requests.get()
+                                < outstanding_guest_jobs as u64 =>
+                        {
+                            rejected(Error::Rejected {
+                                category: "capacity".into(),
+                                message: "resource reduction excludes active channels or requests"
+                                    .into(),
+                            })
+                        }
+                        Ok(request) => {
+                            let mut response = guardian.handle(request);
+                            if let GuardianResponse::Runtime {
+                                response: RuntimeResponse::Usage { ref mut usage, .. },
+                            } = response
+                            {
+                                usage.channels_current = Some(
+                                    Counter::try_from(active.load(Ordering::Acquire) as u64)
+                                        .map_err(|_| {
+                                            Error::Protocol("channel accounting overflow")
+                                        })?,
+                                );
+                                usage.inflight_requests_current = Some(
+                                    Counter::try_from(outstanding_guest_jobs as u64).map_err(
+                                        |_| Error::Protocol("request accounting overflow"),
+                                    )?,
+                                );
+                                usage.provenance.channels =
+                                    sandsurf_protocol::MeasurementSource::HostAdmission;
+                            }
+                            response
+                        }
                         Err(error) => GuardianResponse::Rejected {
                             category: error_category(&error).to_owned(),
                             message: error.to_string(),
@@ -1796,6 +2002,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                 guardian.refresh_native_observation()?;
                 guardian.reconcile_execution_integration();
                 if !poll_in_flight
+                    && outstanding_guest_jobs < inflight_limit
                     && let Some(job) = guardian.poll_job()?
                     && guest_jobs
                         .try_send(GuestWorkItem {

@@ -1,563 +1,321 @@
-//! Guardian-owned Hyper-V socket networking for Windows hosts.
+//! HCN native isolated endpoint ownership. Creation needs HCN setup privileges;
+//! enforcement is an intrinsic private switch and endpoint ACL, never a guest
+//! firewall. External routing and inbound forwarding are explicitly unsupported
+//! until a packet gateway transport is implemented and qualified on Windows.
+use sandsurf_protocol::{Exposure, NetworkPolicy};
+use serde_json::{Value, json};
+use std::ffi::c_void;
+use std::io;
+use std::ptr;
+use windows_sys::core::GUID;
 
-use crate::{
-    BrokerHandle, BrokerPolicy, BrokerReport, BrokerSnapshot, BrokerSockets, NetworkViolation,
-};
-use sandsurf_native::{GuestChannel, GuestConnection, HyperVChannel, HyperVListener};
-use sandsurf_protocol::Exposure;
-use sandsurf_protocol::{
-    GUEST_EXPOSURE_PORT, NETWORK_AUTH_MAGIC, NETWORK_DNS_TCP_PORT, NETWORK_DNS_UDP_PORT,
-    NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
-};
-use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-
-const MAX_DNS_MESSAGE: usize = 4096;
-const MAX_RECORDED_VIOLATIONS: usize = 1024;
-const EXPOSURE_MAGIC: &[u8; 8] = b"SSFPORT1";
-
-type ActiveTunnels = Arc<Mutex<HashMap<u64, TcpStream>>>;
-
-#[derive(Clone)]
-struct TunnelContext {
-    stop: Arc<AtomicBool>,
-    active: Arc<AtomicUsize>,
-    streams: ActiveTunnels,
-    next: Arc<AtomicU64>,
-    rx_bytes: Arc<AtomicU64>,
-    tx_bytes: Arc<AtomicU64>,
+#[link(name = "computenetwork")]
+// SAFETY: these declarations match the Windows HCN C ABI. Each call below
+// supplies terminated UTF-16, live GUIDs and owned handle/output slots.
+unsafe extern "system" {
+    fn HcnCreateNetwork(
+        id: *const GUID,
+        settings: *const u16,
+        network: *mut *mut c_void,
+        error: *mut *mut u16,
+    ) -> i32;
+    fn HcnCreateEndpoint(
+        network: *mut c_void,
+        id: *const GUID,
+        settings: *const u16,
+        endpoint: *mut *mut c_void,
+        error: *mut *mut u16,
+    ) -> i32;
+    fn HcnQueryNetworkProperties(
+        network: *mut c_void,
+        query: *const u16,
+        properties: *mut *mut u16,
+        error: *mut *mut u16,
+    ) -> i32;
+    fn HcnQueryEndpointProperties(
+        endpoint: *mut c_void,
+        query: *const u16,
+        properties: *mut *mut u16,
+        error: *mut *mut u16,
+    ) -> i32;
+    fn HcnCloseNetwork(network: *mut c_void) -> i32;
+    fn HcnCloseEndpoint(endpoint: *mut c_void) -> i32;
+    fn HcnDeleteNetwork(id: *const GUID, error: *mut *mut u16) -> i32;
+    fn HcnDeleteEndpoint(id: *const GUID, error: *mut *mut u16) -> i32;
+}
+#[link(name = "ole32")]
+// SAFETY: CoTaskMemFree uses the Windows allocator ABI and receives only the
+// HCN-owned result pointers returned by that ABI, never Rust allocations.
+unsafe extern "system" {
+    fn CoTaskMemFree(memory: *const c_void);
 }
 
-struct TunnelRegistration {
-    id: u64,
-    streams: ActiveTunnels,
+pub struct IsolatedEndpoint {
+    mac_address: String,
+    network_id: GUID,
+    endpoint_id: GUID,
+    endpoint_text: String,
+    network: *mut c_void,
+    endpoint: *mut c_void,
 }
 
-impl TunnelRegistration {
-    fn new(id: u64, streams: ActiveTunnels, stream: &TcpStream) -> io::Result<Self> {
-        streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, stream.try_clone()?);
-        Ok(Self { id, streams })
-    }
-}
-
-impl Drop for TunnelRegistration {
-    fn drop(&mut self) {
-        self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
-    }
-}
-
-pub struct WindowsNetworkBridge {
-    broker: Option<BrokerHandle>,
-    stop: Arc<AtomicBool>,
-    active: Arc<AtomicUsize>,
-    streams: ActiveTunnels,
-    listeners: Vec<JoinHandle<()>>,
-    violations: Arc<Mutex<Vec<NetworkViolation>>>,
-    rx_bytes: Arc<AtomicU64>,
-    tx_bytes: Arc<AtomicU64>,
-    stopped: bool,
-}
-
-impl WindowsNetworkBridge {
-    pub fn start(vm_id: &str, capability: [u8; 32], policy: BrokerPolicy) -> io::Result<Self> {
-        let http = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let http_address = http.local_addr()?;
-        let socks = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let socks_address = socks.local_addr()?;
-        let dns_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let dns_udp_address = dns_udp.local_addr()?;
-        let dns_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let dns_tcp_address = dns_tcp.local_addr()?;
-
-        let specifications = [
-            (NETWORK_HTTP_PORT, TunnelTarget::Tcp(http_address)),
-            (NETWORK_SOCKS_PORT, TunnelTarget::Tcp(socks_address)),
-            (NETWORK_DNS_TCP_PORT, TunnelTarget::Tcp(dns_tcp_address)),
-            (NETWORK_DNS_UDP_PORT, TunnelTarget::Udp(dns_udp_address)),
-        ];
-        let mut bound = Vec::with_capacity(specifications.len());
-        for (port, target) in specifications {
-            bound.push((HyperVListener::bind(vm_id, port)?, target));
-        }
-
-        let violations = Arc::new(Mutex::new(Vec::new()));
-        let callback_violations = Arc::clone(&violations);
-        let broker = BrokerHandle::start_sockets(
-            BrokerSockets {
-                http,
-                socks,
-                dns_udp,
-                dns_tcp,
-            },
-            policy,
-            move |violation| {
-                if let Ok(mut values) = callback_violations.lock()
-                    && values.len() < MAX_RECORDED_VIOLATIONS
-                {
-                    values.push(violation);
-                }
-            },
+impl IsolatedEndpoint {
+    pub fn create(link: crate::LinkIdentity) -> io::Result<Self> {
+        let (network_id, network_text) = identity()?;
+        let (endpoint_id, endpoint_text) = identity()?;
+        let document = wide(&network_document(&network_text).to_string());
+        let mut network = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        // SAFETY: live GUID/UTF-16 input and writable handle/error out pointers.
+        let hr =
+            unsafe { HcnCreateNetwork(&network_id, document.as_ptr(), &mut network, &mut error) };
+        check(
+            hr,
+            error,
+            "HCN private switch creation requires native setup privileges",
         )?;
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(AtomicUsize::new(0));
-        let streams = Arc::new(Mutex::new(HashMap::new()));
-        let rx_bytes = Arc::new(AtomicU64::new(0));
-        let tx_bytes = Arc::new(AtomicU64::new(0));
-        let context = TunnelContext {
-            stop: Arc::clone(&stop),
-            active: Arc::clone(&active),
-            streams: Arc::clone(&streams),
-            next: Arc::new(AtomicU64::new(1)),
-            rx_bytes: Arc::clone(&rx_bytes),
-            tx_bytes: Arc::clone(&tx_bytes),
+        if network.is_null() {
+            return Err(io::Error::other("HCN returned a null network handle"));
+        }
+        let mut owner = Self {
+            network_id,
+            endpoint_id,
+            endpoint_text,
+            network,
+            endpoint: ptr::null_mut(),
+            mac_address: link.mac_address().replace(':', "-"),
         };
-        let listeners = bound
-            .into_iter()
-            .map(|(listener, target)| {
-                tunnel_accept_loop(listener, target, capability, context.clone())
-            })
-            .collect();
-        Ok(Self {
-            broker: Some(broker),
-            stop,
-            active,
-            streams,
-            listeners,
-            violations,
-            rx_bytes,
-            tx_bytes,
-            stopped: false,
-        })
-    }
-
-    pub fn snapshot(&self) -> BrokerSnapshot {
-        let mut value = self
-            .broker
-            .as_ref()
-            .map_or_else(BrokerSnapshot::default, BrokerHandle::snapshot);
-        value.rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
-        value.tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
-        value
-    }
-
-    #[allow(dead_code)]
-    pub fn take_violations(&self) -> Vec<NetworkViolation> {
-        self.violations
-            .lock()
-            .map(|mut values| values.drain(..).collect())
-            .unwrap_or_default()
-    }
-
-    pub fn stop(mut self) -> BrokerReport {
-        self.stop_inner()
-    }
-
-    fn stop_inner(&mut self) -> BrokerReport {
-        if self.stopped {
-            return BrokerReport::default();
-        }
-        self.stopped = true;
-        self.stop.store(true, Ordering::Release);
-        shutdown_streams(&self.streams);
-        let mut report = BrokerReport::default();
-        for listener in self.listeners.drain(..) {
-            if listener.join().is_err() {
-                report
-                    .cleanup_failures
-                    .push("Hyper-V network listener panicked".into());
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while self.active.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
-            shutdown_streams(&self.streams);
-            thread::sleep(Duration::from_millis(10));
-        }
-        if self.active.load(Ordering::Acquire) != 0 {
-            report
-                .cleanup_failures
-                .push("Hyper-V network tunnels did not drain".into());
-        }
-        if let Some(broker) = self.broker.take() {
-            let broker = broker.stop();
-            report.connections = broker.connections;
-            report.violations = broker.violations;
-            report.cleanup_failures.extend(broker.cleanup_failures);
-        }
-        report.rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
-        report.tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
-        report
-    }
-}
-
-impl Drop for WindowsNetworkBridge {
-    fn drop(&mut self) {
-        let _ = self.stop_inner();
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TunnelTarget {
-    Tcp(SocketAddr),
-    Udp(SocketAddr),
-}
-
-fn tunnel_accept_loop(
-    listener: HyperVListener,
-    target: TunnelTarget,
-    capability: [u8; 32],
-    context: TunnelContext,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        while !context.stop.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok(stream) => {
-                    context.active.fetch_add(1, Ordering::AcqRel);
-                    let context = context.clone();
-                    let id = context.next.fetch_add(1, Ordering::Relaxed);
-                    thread::spawn(move || {
-                        let _ = TunnelRegistration::new(id, Arc::clone(&context.streams), &stream)
-                            .and_then(|_registration| {
-                                handle_tunnel(stream, target, capability, &context)
-                            });
-                        context.active.fetch_sub(1, Ordering::AcqRel);
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::Interrupted
-                            | io::ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
-    })
-}
-
-fn handle_tunnel(
-    mut guest: TcpStream,
-    target: TunnelTarget,
-    capability: [u8; 32],
-    context: &TunnelContext,
-) -> io::Result<()> {
-    guest.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut authentication = [0_u8; NETWORK_AUTH_MAGIC.len() + 32];
-    guest.read_exact(&mut authentication)?;
-    if authentication[..NETWORK_AUTH_MAGIC.len()] != *NETWORK_AUTH_MAGIC
-        || !constant_time_equal(&authentication[NETWORK_AUTH_MAGIC.len()..], &capability)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Hyper-V network authentication failed",
-        ));
-    }
-    match target {
-        TunnelTarget::Tcp(address) => relay_tcp(
-            guest,
-            TcpStream::connect(address)?,
-            &context.stop,
-            &context.rx_bytes,
-            &context.tx_bytes,
-        ),
-        TunnelTarget::Udp(address) => relay_udp(
-            guest,
-            address,
-            &context.stop,
-            &context.rx_bytes,
-            &context.tx_bytes,
-        ),
-    }
-}
-
-fn relay_tcp(
-    mut guest: TcpStream,
-    mut broker: TcpStream,
-    stop: &Arc<AtomicBool>,
-    rx_bytes: &Arc<AtomicU64>,
-    tx_bytes: &Arc<AtomicU64>,
-) -> io::Result<()> {
-    let timeout = Some(Duration::from_millis(200));
-    guest.set_read_timeout(timeout)?;
-    guest.set_write_timeout(timeout)?;
-    broker.set_read_timeout(timeout)?;
-    broker.set_write_timeout(timeout)?;
-    let mut guest_reader = guest.try_clone()?;
-    let mut broker_writer = broker.try_clone()?;
-    let copy_stop = Arc::clone(stop);
-    let outbound_bytes = Arc::clone(tx_bytes);
-    let outbound = thread::spawn(move || {
-        copy_with_stop(
-            &mut guest_reader,
-            &mut broker_writer,
-            &copy_stop,
-            &outbound_bytes,
-        )
-    });
-    let inbound = copy_with_stop(&mut broker, &mut guest, stop, rx_bytes);
-    let _ = guest.shutdown(Shutdown::Both);
-    let _ = broker.shutdown(Shutdown::Both);
-    let outbound = outbound
-        .join()
-        .map_err(|_| io::Error::other("Hyper-V network relay panicked"))?;
-    inbound.and(outbound)
-}
-
-fn copy_with_stop(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
-    stop: &AtomicBool,
-    bytes: &AtomicU64,
-) -> io::Result<()> {
-    let mut buffer = [0_u8; 64 * 1024];
-    while !stop.load(Ordering::Acquire) {
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(count) => {
-                writer.write_all(&buffer[..count])?;
-                bytes.fetch_add(count as u64, Ordering::Relaxed);
-            }
-            Err(error) if transient(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn relay_udp(
-    mut guest: TcpStream,
-    broker: SocketAddr,
-    stop: &AtomicBool,
-    rx_bytes: &AtomicU64,
-    tx_bytes: &AtomicU64,
-) -> io::Result<()> {
-    let mut length = [0_u8; 2];
-    guest.read_exact(&mut length)?;
-    let length = u16::from_be_bytes(length) as usize;
-    if length == 0 || length > MAX_DNS_MESSAGE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid tunneled DNS query length",
-        ));
-    }
-    let mut query = vec![0_u8; length];
-    guest.read_exact(&mut query)?;
-    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-    socket.send_to(&query, broker)?;
-    tx_bytes.fetch_add(query.len() as u64, Ordering::Relaxed);
-    let mut response = [0_u8; MAX_DNS_MESSAGE];
-    let count = loop {
-        if stop.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Hyper-V network bridge is stopping",
+        let installed = owner.query(false)?;
+        if installed["Type"] != "Private"
+            || installed["Flags"]
+                .as_u64()
+                .is_none_or(|flags| flags & 1024 == 0)
+        {
+            return Err(io::Error::other(
+                "HCN did not retain the required isolated switch without a host port",
             ));
         }
-        match socket.recv(&mut response) {
-            Ok(count) => break count,
-            Err(error) if transient(&error) => {}
-            Err(error) => return Err(error),
+        let document = wide(&endpoint_document(&network_text, &owner.mac_address).to_string());
+        let mut error = ptr::null_mut();
+        // SAFETY: owner retains network; GUID/input/out pointers are live.
+        let hr = unsafe {
+            HcnCreateEndpoint(
+                owner.network,
+                &owner.endpoint_id,
+                document.as_ptr(),
+                &mut owner.endpoint,
+                &mut error,
+            )
+        };
+        check(
+            hr,
+            error,
+            "HCN isolated endpoint/default-deny ACL installation",
+        )?;
+        if owner.endpoint.is_null() {
+            return Err(io::Error::other("HCN returned a null endpoint handle"));
         }
-    };
-    rx_bytes.fetch_add(count as u64, Ordering::Relaxed);
-    guest.write_all(&(count as u16).to_be_bytes())?;
-    guest.write_all(&response[..count])
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .fold(0_u8, |difference, (left, right)| {
-                difference | (left ^ right)
-            })
-            == 0
-}
-
-fn shutdown_streams(streams: &ActiveTunnels) {
-    for stream in streams
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-    {
-        let _ = stream.shutdown(Shutdown::Both);
-    }
-}
-
-fn transient(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-    )
-}
-
-pub struct WindowsPortGateway {
-    stop: Arc<AtomicBool>,
-    listeners: Vec<JoinHandle<()>>,
-    active: Arc<Mutex<HashMap<u64, TcpStream>>>,
-}
-
-impl WindowsPortGateway {
-    pub fn start(vm_id: &str, capability: [u8; 32], exposures: &[Exposure]) -> io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(Mutex::new(HashMap::new()));
-        let next = Arc::new(AtomicU64::new(1));
-        let mut listeners = Vec::new();
-        for exposure in exposures.iter().filter(|value| value.active) {
-            exposure
-                .spec
-                .validate()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            if exposure.spec.host_port == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "host exposure port was not assigned",
+        let installed = owner.query(true)?;
+        let policies = installed["Policies"]
+            .as_array()
+            .ok_or_else(|| io::Error::other("HCN did not retain endpoint policies"))?;
+        for direction in ["In", "Out"] {
+            if !policies.iter().any(|p| {
+                p["Type"] == "ACL"
+                    && p["Settings"]["Action"] == "Block"
+                    && p["Settings"]["Direction"] == direction
+                    && p["Settings"]["RuleType"] == "Switch"
+            }) {
+                return Err(io::Error::other(
+                    "HCN did not retain the required default-deny switch ACL",
                 ));
             }
-            let listener =
-                TcpListener::bind((exposure.spec.host_address.as_str(), exposure.spec.host_port))?;
-            listener.set_nonblocking(true)?;
-            let guest_port = exposure.spec.guest_port;
-            let vm_id = vm_id.to_owned();
-            let thread_stop = Arc::clone(&stop);
-            let thread_active = Arc::clone(&active);
-            let thread_next = Arc::clone(&next);
-            listeners.push(thread::spawn(move || {
-                while !thread_stop.load(Ordering::Acquire) {
-                    match listener.accept() {
-                        Ok((client, _)) => {
-                            let id = thread_next.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(clone) = client.try_clone()
-                                && let Ok(mut streams) = thread_active.lock()
-                            {
-                                streams.insert(id, clone);
-                            }
-                            let active = Arc::clone(&thread_active);
-                            let stop = Arc::clone(&thread_stop);
-                            let vm_id = vm_id.clone();
-                            thread::spawn(move || {
-                                let result = connect_guest(&vm_id, capability, guest_port)
-                                    .and_then(|guest| relay_exposure(client, guest, &stop));
-                                if let Ok(mut streams) = active.lock() {
-                                    streams.remove(&id);
-                                }
-                                let _ = result;
-                            });
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }));
         }
-        Ok(Self {
-            stop,
-            listeners,
-            active,
-        })
+        if !policies.iter().any(|p| {
+            p["Type"] == "QOS"
+                && p["Settings"]["MaximumOutgoingBandwidthInBytes"]
+                    .as_u64()
+                    .is_some_and(|limit| limit > 0 && limit <= 8388608)
+        }) {
+            return Err(io::Error::other(
+                "HCN did not retain the required endpoint bandwidth bound",
+            ));
+        }
+        Ok(owner)
     }
-
-    pub fn stop(mut self) -> io::Result<()> {
-        self.stop_inner()
-    }
-
-    fn stop_inner(&mut self) -> io::Result<()> {
-        self.stop.store(true, Ordering::Release);
-        if let Ok(streams) = self.active.lock() {
-            for stream in streams.values() {
-                let _ = stream.shutdown(Shutdown::Both);
+    fn query(&self, endpoint: bool) -> io::Result<Value> {
+        let query = wide(r#"{"SchemaVersion":{"Major":2,"Minor":0}}"#);
+        let mut properties = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        // SAFETY: this owner retains the native handle; query and out pointers
+        // are live for the synchronous HCN call.
+        let hr = unsafe {
+            if endpoint {
+                HcnQueryEndpointProperties(
+                    self.endpoint,
+                    query.as_ptr(),
+                    &mut properties,
+                    &mut error,
+                )
+            } else {
+                HcnQueryNetworkProperties(self.network, query.as_ptr(), &mut properties, &mut error)
             }
-        }
-        let mut failed = false;
-        for listener in self.listeners.drain(..) {
-            failed |= listener.join().is_err();
-        }
-        if failed {
-            Err(io::Error::other("Hyper-V port exposure listener panicked"))
+        };
+        let status = check(hr, error, "HCN isolation policy readback");
+        let parsed = if status.is_ok() {
+            native_json(properties)
         } else {
-            Ok(())
+            status.map(|_| Value::Null)
+        };
+        if !properties.is_null() {
+            // SAFETY: HCN documents CoTaskMemFree for this returned allocation.
+            unsafe { CoTaskMemFree(properties.cast()) };
         }
+        parsed
+    }
+    pub fn id(&self) -> &str {
+        &self.endpoint_text
+    }
+    pub fn mac_address(&self) -> &str {
+        &self.mac_address
+    }
+    pub fn configure(&self, policy: &NetworkPolicy, exposures: &[Exposure]) -> io::Result<()> {
+        policy
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if !policy.rules.is_empty() || exposures.iter().any(|e| e.active) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows native isolated NIC supports deny only; external packet gateway and native inbound forwarding are unavailable",
+            ));
+        }
+        // No connections can exist: the private switch has no host port,
+        // physical adapter, NAT, route, or second machine endpoint.
+        Ok(())
     }
 }
-
-impl Drop for WindowsPortGateway {
+impl Drop for IsolatedEndpoint {
     fn drop(&mut self) {
-        let _ = self.stop_inner();
+        // SAFETY: this owner alone closes the live handles. Deletion is by its
+        // fresh GUIDs only; never discover/delete another machine's network.
+        unsafe {
+            if !self.endpoint.is_null() {
+                let _ = HcnCloseEndpoint(self.endpoint);
+                let mut error = ptr::null_mut();
+                let hr = HcnDeleteEndpoint(&self.endpoint_id, &mut error);
+                if let Err(e) = check(hr, error, "HCN endpoint deletion") {
+                    eprintln!("{e}");
+                }
+            }
+            if !self.network.is_null() {
+                let _ = HcnCloseNetwork(self.network);
+                let mut error = ptr::null_mut();
+                let hr = HcnDeleteNetwork(&self.network_id, &mut error);
+                if let Err(e) = check(hr, error, "HCN private switch deletion") {
+                    eprintln!("{e}");
+                }
+            }
+        }
     }
 }
-
-fn connect_guest(
-    vm_id: &str,
-    capability: [u8; 32],
-    port: u16,
-) -> io::Result<Box<dyn GuestConnection>> {
-    let mut channel = HyperVChannel {
-        vm_id: vm_id.to_owned(),
-        guest_port: GUEST_EXPOSURE_PORT,
-        timeout: Duration::from_secs(5),
+fn network_document(id: &str) -> Value {
+    json!({
+        "Name": format!("sandsurf-{id}"), "Type": "Private", "Flags": 1032,
+        "Ipams": [{"Type": "Static", "Subnets": [{"IpAddressPrefix": "100.64.0.0/30"}]}],
+        "SchemaVersion": {"Major": 2, "Minor": 0}
+    })
+}
+fn endpoint_document(network: &str, mac_address: &str) -> Value {
+    json!({
+        "HostComputeNetwork": network, "MacAddress": mac_address,
+        "IpConfigurations": [{"IpAddress": "100.64.0.2", "PrefixLength": 30}],
+        "Policies": [
+            {"Type": "ACL", "Settings": {"Action": "Block", "Direction": "Out", "RuleType": "Switch", "Priority": 100}},
+            {"Type": "ACL", "Settings": {"Action": "Block", "Direction": "In", "RuleType": "Switch", "Priority": 100}},
+            {"Type": "QOS", "Settings": {"MaximumOutgoingBandwidthInBytes": 8388608}}
+        ],
+        "SchemaVersion": {"Major": 2, "Minor": 0}
+    })
+}
+fn identity() -> io::Result<(GUID, String)> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(io::Error::other)?;
+    bytes[6] = bytes[6] & 15 | 64;
+    bytes[8] = bytes[8] & 63 | 128;
+    let guid = GUID {
+        data1: u32::from_be_bytes(bytes[..4].try_into().expect("fixed UUID")),
+        data2: u16::from_be_bytes(bytes[4..6].try_into().expect("fixed UUID")),
+        data3: u16::from_be_bytes(bytes[6..8].try_into().expect("fixed UUID")),
+        data4: bytes[8..].try_into().expect("fixed UUID"),
     };
-    let mut guest = channel.connect().map_err(io::Error::other)?;
-    guest.write_all(EXPOSURE_MAGIC)?;
-    guest.write_all(&capability)?;
-    guest.write_all(&port.to_be_bytes())?;
-    guest.flush()?;
-    Ok(guest)
+    let text = format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7]
+    );
+    Ok((guid, text))
 }
-
-fn relay_exposure(
-    mut client: TcpStream,
-    mut guest: Box<dyn GuestConnection>,
-    stop: &AtomicBool,
-) -> io::Result<()> {
-    let timeout = Some(Duration::from_millis(100));
-    client.set_read_timeout(timeout)?;
-    client.set_write_timeout(timeout)?;
-    guest.set_io_timeout(timeout)?;
-    let mut buffer = [0_u8; 64 * 1024];
-    while !stop.load(Ordering::Acquire) {
-        let mut progressed = false;
-        match client.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                guest.write_all(&buffer[..count])?;
-                guest.flush()?;
-                progressed = true;
-            }
-            Err(error) if transient(&error) => {}
-            Err(error) => return Err(error),
-        }
-        match guest.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                client.write_all(&buffer[..count])?;
-                progressed = true;
-            }
-            Err(error) if transient(&error) => {}
-            Err(error) => return Err(error),
-        }
-        if !progressed {
-            thread::yield_now();
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
+fn native_json(pointer: *const u16) -> io::Result<Value> {
+    if pointer.is_null() {
+        return Err(io::Error::other("HCN isolation readback is absent"));
+    }
+    for len in 0..512 * 1024 {
+        // SAFETY: HCN guarantees a valid NUL-terminated UTF-16 allocation.
+        if unsafe { *pointer.add(len) } == 0 {
+            // SAFETY: every unit in this prefix precedes the terminator in the
+            // live HCN-owned allocation and the prefix length is bounded.
+            let units = unsafe { std::slice::from_raw_parts(pointer, len) };
+            let text = String::from_utf16(units).map_err(io::Error::other)?;
+            return serde_json::from_str(&text).map_err(io::Error::other);
         }
     }
-    let _ = client.shutdown(Shutdown::Both);
-    Ok(())
+    Err(io::Error::other("HCN isolation readback exceeds its bound"))
+}
+fn check(hr: i32, error: *mut u16, operation: &str) -> io::Result<()> {
+    if !error.is_null() {
+        // SAFETY: HCN owns this allocation and documents CoTaskMemFree. Do not
+        // parse or retain unbounded native diagnostic JSON.
+        unsafe { CoTaskMemFree(error.cast()) };
+    }
+    if hr < 0 {
+        Err(io::Error::other(format!("{operation}: HRESULT {hr:#x}")))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn isolated_switch_has_no_host_port_nat_or_physical_adapter() {
+        let n = network_document("fixture");
+        let e = endpoint_document("fixture", "26-F8-56-7F-25-69");
+        assert_eq!(n["Type"], "Private");
+        assert_eq!(n["Flags"], 1032);
+        let encoded = format!("{n}{e}");
+        for denied in [
+            "OutboundNAT",
+            "OutBoundNAT",
+            "PortMapping",
+            "NetAdapterName",
+            "Routes",
+        ] {
+            assert!(!encoded.contains(denied));
+        }
+        assert_eq!(e["Policies"][0]["Settings"]["Action"], "Block");
+        assert_eq!(e["Policies"][1]["Settings"]["Action"], "Block");
+    }
 }

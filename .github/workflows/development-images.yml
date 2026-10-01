@@ -2,6 +2,7 @@ name: development guest images
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -28,7 +29,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools qemu-utils
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools qemu-utils guestfish ${{ matrix.architecture == 'arm64' && 'qemu-system-arm' || 'qemu-system-x86' }} acl
+      - name: Require native hardware isolation for image builds
+        run: test -r /dev/kvm && test -w /dev/kvm
+      - name: Read-only appliance kernel access
+        run: sudo setfacl -m "u:$(id -un):r" /boot/vmlinuz-*
       - run: npm ci
       - run: rustup toolchain install stable --profile minimal
       - run: rustup target add ${{ matrix.rust_target }}

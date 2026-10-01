@@ -13,7 +13,7 @@ const HEADER_BYTES: usize = 4 + 8 + 1 + 4 + 32;
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_CHUNKS: u64 = 1_000_000;
 const INDEX_STRIDE: u64 = 128;
-const MAX_PAGE_CHUNKS: usize = 512;
+const MAX_PAGE_CHUNKS: usize = sandsurf_protocol::MAX_RPC_DATA_CHUNKS;
 
 #[derive(Debug)]
 pub enum SpoolError {
@@ -68,6 +68,131 @@ fn initial_index() -> Vec<SpoolIndex> {
 }
 
 impl OutputSpool {
+    /// Rechain only the source suffix into a fresh incarnation. The caller
+    /// excludes descriptor readers, then seals the source by swapping spools.
+    pub fn restored_suffix(
+        &self,
+        path: &Path,
+        source: &sandsurf_protocol::SpawnRequest,
+        anchor: &OutputBoundary,
+        restored: &sandsurf_protocol::SpawnRequest,
+    ) -> Result<Self, SpoolError> {
+        let final_boundary = {
+            let state = self.state.lock().map_err(|_| SpoolError::Failed)?;
+            if state.failed {
+                return Err(SpoolError::Failed);
+            }
+            state.boundary.clone()
+        };
+        let mut prefix =
+            initial_output_boundary(&source.machine_id, &source.execution_id, source.generation)
+                .map_err(|_| SpoolError::Invalid("source output identity invalid"))?;
+        while prefix.final_cursor < anchor.final_cursor {
+            let page = self.read(prefix.final_cursor, sandsurf_protocol::MAX_STREAM_BYTES)?;
+            if page.chunks.is_empty() {
+                return Err(SpoolError::Invalid("snapshot prefix unavailable"));
+            }
+            for chunk in page.chunks {
+                if prefix.final_cursor >= anchor.final_cursor {
+                    break;
+                }
+                prefix = extend_output_boundary(
+                    &prefix,
+                    prefix.chunks.next().map_err(|_| SpoolError::Capacity)?,
+                    chunk.stream,
+                    &chunk.bytes,
+                )
+                .map_err(|_| SpoolError::Invalid("source output prefix invalid"))?;
+            }
+        }
+        if &prefix != anchor {
+            return Err(SpoolError::Invalid("snapshot output anchor mismatch"));
+        }
+        // This file is unpublished until its process record is committed.
+        // A failed attempt can leave a partial suffix, but cannot replace a
+        // previously published incarnation's output.
+        let published = path.with_file_name("process.json").exists();
+        if path.exists() && !published {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(SpoolError::Invalid(
+                    "unpublished output is not a regular file",
+                ));
+            }
+            fs::remove_file(path)?;
+        }
+        let spool = if published {
+            Self::open(
+                path,
+                restored.output_bytes,
+                &restored.machine_id,
+                &restored.execution_id,
+                restored.generation,
+                false,
+            )?
+        } else {
+            Self::create(
+                path,
+                restored.output_bytes,
+                &restored.machine_id,
+                &restored.execution_id,
+                restored.generation,
+            )?
+        };
+        let existing = spool
+            .state
+            .lock()
+            .map_err(|_| SpoolError::Failed)?
+            .boundary
+            .clone();
+        let mut suffix = initial_output_boundary(
+            &restored.machine_id,
+            &restored.execution_id,
+            restored.generation,
+        )
+        .map_err(|_| SpoolError::Invalid("restored output identity invalid"))?;
+        let mut cursor = anchor.final_cursor;
+        while cursor < final_boundary.final_cursor {
+            let page = self.read(cursor, sandsurf_protocol::MAX_STREAM_BYTES)?;
+            if page.chunks.is_empty() {
+                return Err(SpoolError::Invalid("source output suffix unavailable"));
+            }
+            for chunk in page.chunks {
+                let before = suffix.clone();
+                suffix = extend_output_boundary(
+                    &suffix,
+                    suffix.chunks.next().map_err(|_| SpoolError::Capacity)?,
+                    chunk.stream,
+                    &chunk.bytes,
+                )
+                .map_err(|_| SpoolError::Invalid("restored output suffix invalid"))?;
+                if before.final_cursor == existing.final_cursor && before != existing {
+                    return Err(SpoolError::Invalid("published restored prefix changed"));
+                }
+                if suffix.final_cursor > existing.final_cursor {
+                    if before.final_cursor < existing.final_cursor {
+                        return Err(SpoolError::Invalid(
+                            "published restored cursor is not a source boundary",
+                        ));
+                    }
+                    spool.append(chunk.stream, &chunk.bytes)?;
+                }
+                cursor = chunk
+                    .cursor
+                    .checked_add(chunk.bytes.len() as u64)
+                    .map_err(|_| SpoolError::Capacity)?;
+            }
+        }
+        if suffix.final_cursor < existing.final_cursor
+            || (suffix.final_cursor == existing.final_cursor && suffix != existing)
+        {
+            return Err(SpoolError::Invalid(
+                "published restored prefix differs from source",
+            ));
+        }
+        Ok(spool)
+    }
+
     pub fn create(
         path: &Path,
         maximum: Counter,
@@ -493,6 +618,7 @@ mod tests {
         let first = spool.read(Counter::ZERO, 1024).unwrap();
         assert_eq!(first.chunks.len(), MAX_PAGE_CHUNKS);
         assert_eq!(first.available.get(), 600);
+        first.clone().into_binary_parts().unwrap();
         let second = spool.read(512u64.try_into().unwrap(), 1024).unwrap();
         assert_eq!(second.chunks.len(), 88);
         assert_eq!(second.chunks[0].bytes, [0]);

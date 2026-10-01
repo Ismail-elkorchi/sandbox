@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { execFile } from "node:child_process";
+import { resolveSandsurfNativeHost } from "./native-host.js";
 import { Sandsurf, type HostInspection } from "./sandsurf.js";
 import {
   sandsurfServiceDefinition,
@@ -14,6 +16,19 @@ export async function main(arguments_: readonly string[]): Promise<number> {
     return 0;
   }
   const options = parse(argumentsRest);
+  if (command === "storage-path" || command === "storage-volume") {
+    if (command === "storage-path" && options.machine === undefined) throw new TypeError("storage-path requires --machine");
+    const binary = await resolveSandsurfNativeHost();
+    return new Promise<number>((resolveRun, rejectRun) => {
+      execFile(binary, [command, "--directory", options.directory, ...(options.machine === undefined ? [] : ["--machine", options.machine])],
+        { timeout: 10_000, maxBuffer: 16 * 1024 }, (error, stdout, stderr) => {
+          process.stdout.write(stdout); process.stderr.write(stderr);
+          if (error === null) resolveRun(0);
+          else if (error.code === 2) resolveRun(2);
+          else rejectRun(error);
+        });
+    });
+  }
   if (command === "qualify") {
     const host = await Sandsurf.open({ directory: options.directory });
     try {
@@ -47,14 +62,20 @@ function parse(arguments_: readonly string[]): {
   readonly directory: string;
   readonly json: boolean;
   readonly platform?: SandsurfServicePlatform;
+  readonly machine?: string;
 } {
   let directory: string | undefined;
   let json = false;
   let platform: SandsurfServicePlatform | undefined;
+  let machine: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
     if (argument === "--json") json = true;
     else if (argument === "--directory") directory = requiredValue(arguments_, ++index, argument);
+    else if (argument === "--machine") {
+      machine = requiredValue(arguments_, ++index, argument);
+      if (!/^[A-Za-z0-9_-]{1,128}$/u.test(machine)) throw new TypeError("invalid machine identity");
+    }
     else if (argument === "--platform") {
       const supplied = requiredValue(arguments_, ++index, argument);
       if (supplied !== "linux" && supplied !== "macos" && supplied !== "windows")
@@ -67,6 +88,7 @@ function parse(arguments_: readonly string[]): {
     directory: resolve(directory),
     json,
     ...(platform === undefined ? {} : { platform }),
+    ...(machine === undefined ? {} : { machine }),
   };
 }
 
@@ -93,7 +115,7 @@ function qualificationText(inspection: HostInspection): string {
 }
 
 function help(): string {
-  return "Usage:\n  sandsurf qualify --directory <absolute-state-directory> [--json]\n  sandsurf setup --directory <absolute-state-directory> [--platform linux|macos|windows] [--json]\n\nsetup renders an explicit service-manager definition; it does not install services or enable privileged host features.\n";
+  return "Usage:\n  sandsurf qualify --directory <absolute-state-directory> [--json]\n  sandsurf setup --directory <absolute-state-directory> [--platform linux|macos|windows] [--json]\n  sandsurf storage-path --directory <absolute-state-directory> --machine <identity>\n  sandsurf storage-volume --directory <absolute-state-directory> [--machine <identity>]\n\nsetup renders explicit service definitions; storage commands locate or inspect operator volumes. Neither installs services, mounts volumes or enables privileged features.\n";
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

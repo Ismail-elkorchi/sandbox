@@ -1,0 +1,24 @@
+#!/bin/sh
+# apk invokes this hook before filesystem changes and after package commit.
+# Every update deliberately invalidates direct boot until matching boot files
+# have been regenerated. A failed/interrupted update is an explicit boot error.
+set -eu
+case "$1" in
+    pre-commit)
+        mkdir -p /boot
+        temporary=$(mktemp /boot/.sandsurf-update.XXXXXX)
+        printf '{"updateIncomplete":true}\n' > "$temporary"
+        sync
+        mv -f "$temporary" /boot/sandsurf.json
+        sync
+        ;;
+    post-commit)
+        # linux-virt's module tree names the installed kernel, not the kernel
+        # running this package transaction. Exactly one supported tree is needed.
+        set -- /lib/modules/*-virt
+        [ "$#" = 1 ] && [ -f "$1/modules.order" ] || exit 1
+        mkinitfs -o /boot/initramfs-virt "${1##*/}"
+        /usr/sbin/sandsurf-select-boot
+        ;;
+    *) exit 1 ;;
+esac

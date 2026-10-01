@@ -115,6 +115,10 @@ impl RpcRequest for crate::GuestServiceRequest {
 impl RpcRequest for crate::GuardianRequest {
     fn binary_field(&mut self) -> Option<(&mut Vec<u8>, usize)> {
         match self {
+            Self::Runtime {
+                request: crate::RuntimeRequest::WriteConsole { bytes, .. },
+                ..
+            } => Some((bytes, crate::MAX_CONSOLE_INPUT_BYTES)),
             Self::Dispatch { command } => command.binary_field(),
             Self::Guest { request, .. } | Self::QueryGuest { request, .. } => {
                 request.binary_field()

@@ -241,8 +241,8 @@ pub fn unpack_layout_archive(
 }
 
 /// Write a canonical uncompressed tar stream whose headers preserve the OCI
-/// UID/GID/mode/link metadata. `mke2fs -d` consumes this stream without the
-/// host mounting or chowning the untrusted tree.
+/// UID/GID/mode/link metadata. The isolated appliance consumes this stream
+/// without the host mounting or chowning the untrusted tree.
 pub fn write_filesystem_tar(
     tree_root: &Path,
     tree: &ConvertedTree,

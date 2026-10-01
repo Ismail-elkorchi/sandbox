@@ -302,8 +302,17 @@ private final class GuestConnectionDelegate: NSObject, VZVirtioSocketListenerDel
 
 
 private final class MachineOwner {
+    private let networkPackets: FileHandle
     private var machine: VZVirtualMachine?
     private var relay: SocketRelay?
+    private let serialInput: FileHandle
+    private let serialOutput: FileHandle
+
+    init(serialInput: Int32, serialOutput: Int32, networkPackets: Int32) {
+        self.networkPackets = FileHandle(fileDescriptor: networkPackets, closeOnDealloc: true)
+        self.serialInput = FileHandle(fileDescriptor: serialInput, closeOnDealloc: true)
+        self.serialOutput = FileHandle(fileDescriptor: serialOutput, closeOnDealloc: true)
+    }
 
     func handle(_ request: Request) throws -> Response {
         switch request.kind {
@@ -384,6 +393,8 @@ private final class MachineOwner {
               let controlSocket = request.controlSocket,
               let hostConnectPorts = request.hostConnectPorts,
               let guestListenPorts = request.guestListenPorts,
+              let guestMAC = request.guestMac,
+              let macAddress = VZMACAddress(string: guestMAC),
               request.machineId != nil,
               savedState == nil || savedState!.hasPrefix("/") else {
             throw OwnerError.invalidRequest
@@ -403,7 +414,15 @@ private final class MachineOwner {
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
-        configuration.networkDevices = []
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+        serial.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: serialInput, fileHandleForWriting: serialOutput
+        )
+        configuration.serialPorts = [serial]
+        let network = VZVirtioNetworkDeviceConfiguration()
+        network.macAddress = macAddress
+        network.attachment = VZFileHandleNetworkDeviceAttachment(fileHandle: networkPackets)
+        configuration.networkDevices = [network]
         configuration.storageDevices = try disks.map { disk in
             let attachment = try VZDiskImageStorageDeviceAttachment(
                 url: URL(fileURLWithPath: disk.path),
@@ -557,11 +576,19 @@ private func writeResponse(_ response: Response) throws {
 private enum SandsurfVMHelper {
     static func main() throws {
         let arguments = CommandLine.arguments
-        guard arguments.count == 4,
-              arguments[1] == "--sandsurf-owner-v2",
+        guard arguments.count == 10,
+              arguments[1] == "--sandsurf-owner-v1",
               arguments[2] == "--storage-custody-fd",
               let custody = Int32(arguments[3]), custody >= 3,
-              fcntl(custody, F_GETFD) >= 0 else {
+              fcntl(custody, F_GETFD) >= 0,
+              arguments[4] == "--serial-input-fd", let serialInput = Int32(arguments[5]),
+              arguments[6] == "--serial-output-fd", let serialOutput = Int32(arguments[7]),
+              serialInput >= 3, serialOutput >= 3,
+              arguments[8] == "--network-fd", let networkPackets = Int32(arguments[9]),
+              networkPackets >= 3,
+              Set([custody, serialInput, serialOutput, networkPackets]).count == 4,
+              fcntl(serialInput, F_GETFD) >= 0, fcntl(serialOutput, F_GETFD) >= 0,
+              fcntl(networkPackets, F_GETFD) >= 0 else {
             throw OwnerError.invalidInvocation
         }
 
@@ -583,7 +610,11 @@ private enum SandsurfVMHelper {
         _ = umask(0o077)
         signal(SIGPIPE, SIG_IGN)
 
-        let owner = MachineOwner()
+        var socketType: Int32 = 0
+        var socketTypeLength = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(networkPackets, SOL_SOCKET, SO_TYPE, &socketType, &socketTypeLength) == 0,
+              socketType == SOCK_DGRAM else { throw OwnerError.invalidInvocation }
+        let owner = MachineOwner(serialInput: serialInput, serialOutput: serialOutput, networkPackets: networkPackets)
         do {
             while let request = try readRequest() {
                 do {

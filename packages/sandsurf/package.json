@@ -1,6 +1,6 @@
 {
   "name": "sandsurf",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Persistent hardware-isolated Linux environments for autonomous agents",
   "license": "Apache-2.0",
   "repository": {
@@ -36,7 +36,10 @@
   "files": [
     "dist",
     "native",
-    "images",
+    "images/**/*.json",
+    "images/**/boot-*",
+    "images/**/*.gz",
+    "images/**/hyperv-vmlinuz-*",
     "LICENSE",
     "SBOM.cdx.json",
     "THIRD-PARTY"

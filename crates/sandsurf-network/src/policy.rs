@@ -1,223 +1,293 @@
-#![deny(unsafe_code)]
+use sandsurf_protocol::{NetworkDestination, NetworkPlane, NetworkPolicy};
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 
-//! Host-enforced network policy values shared by the Sandsurf gateways.
-//!
-//! This crate deliberately contains no prepared-process, backend-selection, or
-//! host-filesystem policy. A Machine configuration is the authority boundary;
-//! these values are only the normalized destination rules installed by its
-//! guardian.
-
-use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
-use std::net::IpAddr;
-
-const MAX_RULES: usize = 4096;
-const MAX_PORTS_PER_RULE: usize = 4096;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ManagedNetworkRule {
-    pub transport: String,
-    pub destination: ManagedNetworkDestination,
-    pub ports: Vec<ManagedNetworkPort>,
+/// Compiled authority. DNS resolution never creates authority for IP traffic.
+#[derive(Clone, Default)]
+pub struct PacketPolicy {
+    rules: Vec<Rule>,
+    host_addresses: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum ManagedNetworkDestination {
-    Dns {
-        name: String,
-        #[serde(default)]
-        include_subdomains: bool,
-        #[serde(default)]
-        allow_private_addresses: bool,
-    },
-    Ip {
-        cidr: String,
-    },
+#[derive(Clone)]
+struct Rule {
+    plane: NetworkPlane,
+    address: IpAddr,
+    prefix: u8,
+    private: bool,
+    ports: Vec<sandsurf_protocol::PortRange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ManagedNetworkPort {
-    Single(u16),
-    Range { from: u16, to: u16 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkPolicyError(&'static str);
-
-impl Display for NetworkPolicyError {
-    fn fmt(&self, output: &mut Formatter<'_>) -> std::fmt::Result {
-        output.write_str(self.0)
-    }
-}
-
-impl std::error::Error for NetworkPolicyError {}
-
-/// Validate and canonicalize a complete gateway rule set before installation.
-pub fn normalize_managed_network_rules(
-    rules: &[ManagedNetworkRule],
-) -> Result<Vec<ManagedNetworkRule>, NetworkPolicyError> {
-    if rules.len() > MAX_RULES {
-        return Err(NetworkPolicyError("network policy exceeds its rule bound"));
-    }
-    let mut normalized = Vec::with_capacity(rules.len());
-    for rule in rules {
-        if rule.transport != "tcp" || rule.ports.is_empty() || rule.ports.len() > MAX_PORTS_PER_RULE
-        {
-            return Err(NetworkPolicyError(
-                "network rule transport or port set is invalid",
-            ));
-        }
-        let ports = rule
-            .ports
-            .iter()
-            .map(|port| match port {
-                ManagedNetworkPort::Single(0) => {
-                    Err(NetworkPolicyError("network port zero is invalid"))
-                }
-                ManagedNetworkPort::Single(value) => Ok(ManagedNetworkPort::Single(*value)),
-                ManagedNetworkPort::Range { from, to } if *from == 0 || from > to => {
-                    Err(NetworkPolicyError("network port range is invalid"))
-                }
-                ManagedNetworkPort::Range { from, to } => Ok(ManagedNetworkPort::Range {
-                    from: *from,
-                    to: *to,
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let destination = match &rule.destination {
-            ManagedNetworkDestination::Dns {
-                name,
-                include_subdomains,
+impl PacketPolicy {
+    pub fn compile(policy: &NetworkPolicy, host_addresses: Vec<IpAddr>) -> io::Result<Self> {
+        let policy = policy
+            .normalized()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut rules = Vec::with_capacity(policy.rules.len());
+        for rule in &policy.rules {
+            let NetworkDestination::Ip {
+                cidr,
                 allow_private_addresses,
-            } => ManagedNetworkDestination::Dns {
-                name: normalize_dns_name(name)?,
-                include_subdomains: *include_subdomains,
-                allow_private_addresses: *allow_private_addresses,
-            },
-            ManagedNetworkDestination::Ip { cidr } => ManagedNetworkDestination::Ip {
-                cidr: normalize_cidr(cidr)?,
-            },
-        };
-        normalized.push(ManagedNetworkRule {
-            transport: "tcp".into(),
-            destination,
-            ports,
-        });
+            } = &rule.destination;
+            let (ip, bits) = cidr
+                .split_once('/')
+                .ok_or_else(|| io::Error::other("invalid CIDR"))?;
+            rules.push(Rule {
+                plane: rule.plane,
+                address: ip
+                    .parse()
+                    .map_err(|_| io::Error::other("invalid CIDR address"))?,
+                prefix: bits
+                    .parse()
+                    .map_err(|_| io::Error::other("invalid CIDR prefix"))?,
+                private: *allow_private_addresses,
+                ports: rule.ports.clone(),
+            });
+        }
+        Ok(Self {
+            rules,
+            host_addresses,
+        })
     }
-    normalized.sort_by(|left, right| {
-        serde_json::to_vec(left)
-            .unwrap_or_default()
-            .cmp(&serde_json::to_vec(right).unwrap_or_default())
-    });
-    normalized.dedup();
-    Ok(normalized)
+
+    pub fn allows(&self, plane: NetworkPlane, destination: SocketAddr) -> bool {
+        let ip = destination.ip();
+        if forbidden(ip) || self.host_addresses.contains(&ip) || destination.port() == 0 {
+            return false;
+        }
+        self.rules.iter().any(|rule| {
+            rule.plane == plane
+                && (!private(ip) || rule.private)
+                && contains(rule.address, rule.prefix, ip)
+                && rule
+                    .ports
+                    .iter()
+                    .any(|p| p.from <= destination.port() && destination.port() <= p.to)
+        })
+    }
 }
 
-pub fn normalize_dns_name(value: &str) -> Result<String, NetworkPolicyError> {
-    let value = value.strip_suffix('.').unwrap_or(value);
-    if value.is_empty() || value.contains('*') {
-        return Err(NetworkPolicyError(
-            "DNS name must be an explicit name without wildcards",
-        ));
+fn contains(network: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    match (network, ip) {
+        (IpAddr::V4(a), IpAddr::V4(b)) if prefix <= 32 => {
+            prefix == 0 || (u32::from(a) ^ u32::from(b)) >> (32 - prefix) == 0
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) if prefix <= 128 => {
+            prefix == 0 || (u128::from(a) ^ u128::from(b)) >> (128 - prefix) == 0
+        }
+        _ => false,
     }
-    let value = idna::domain_to_ascii_strict(value)
-        .map_err(|_| NetworkPolicyError("DNS name is not valid IDNA"))?
-        .to_ascii_lowercase();
-    if value.is_empty() || value.len() > 253 {
-        return Err(NetworkPolicyError("normalized DNS name exceeds its limit"));
-    }
-    if value.split('.').any(|label| {
-        label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
-        return Err(NetworkPolicyError("DNS name contains an invalid label"));
-    }
-    Ok(value)
 }
 
-fn normalize_cidr(value: &str) -> Result<String, NetworkPolicyError> {
-    let (address, prefix) = value
-        .split_once('/')
-        .ok_or(NetworkPolicyError("network CIDR is malformed"))?;
-    if prefix.contains('/') {
-        return Err(NetworkPolicyError("network CIDR is malformed"));
+/// Always denied, even by a broad/private allow: host loopback, metadata,
+/// multicast, translation aliases, reserved space, and every machine link.
+fn forbidden(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let [a, b, _, _] = v.octets();
+            a == 0
+                || a == 127
+                || a >= 224
+                || (a == 169 && b == 254)
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 198 && (b == 18 || b == 19))
+                || v.octets() == [168, 63, 129, 16]
+                || v.octets()[..3] == [192, 0, 0]
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            v.is_unspecified() || v.is_loopback() || v.is_multicast()
+                || (s[0] & 0xffc0 == 0xfe80) || s[0] == 0xfd00
+                || (s[0] == 0xfd20 && s[1] == 0x00ce)
+                || v.to_ipv4_mapped().is_some()
+                || s[0] & 0xe000 != 0x2000 && s[0] & 0xfe00 != 0xfc00
+                // Disallow transition mechanisms which may hide an IPv4 target.
+                || s[0] == 0x2002 || (s[0] == 0x2001 && s[1] == 0)
+        }
     }
-    let address: IpAddr = address
-        .parse()
-        .map_err(|_| NetworkPolicyError("network CIDR address is invalid"))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| NetworkPolicyError("network CIDR prefix is invalid"))?;
-    if prefix > if address.is_ipv4() { 32 } else { 128 } {
-        return Err(NetworkPolicyError("network CIDR prefix exceeds its width"));
+}
+
+fn private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_private(),
+        IpAddr::V6(v) => v.segments()[0] & 0xfe00 == 0xfc00,
     }
-    Ok(format!("{address}/{prefix}"))
+}
+
+#[cfg(unix)]
+pub fn host_addresses() -> io::Result<Vec<IpAddr>> {
+    let mut first = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes an owned list through a valid out pointer.
+    if unsafe { libc::getifaddrs(&mut first) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut result = Vec::new();
+    let mut cursor = first;
+    while !cursor.is_null() {
+        // SAFETY: cursor belongs to the live getifaddrs list until freeifaddrs.
+        let entry = unsafe { &*cursor };
+        if !entry.ifa_addr.is_null() {
+            // SAFETY: each non-null address has the family-specific native layout.
+            unsafe {
+                match i32::from((*entry.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let a = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
+                        result.push(IpAddr::V4(std::net::Ipv4Addr::from(
+                            a.sin_addr.s_addr.to_ne_bytes(),
+                        )));
+                    }
+                    libc::AF_INET6 => {
+                        let a = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
+                        result.push(IpAddr::V6(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cursor = entry.ifa_next;
+    }
+    // SAFETY: first is the exact allocation returned by successful getifaddrs.
+    unsafe { libc::freeifaddrs(first) };
+    result.sort();
+    result.dedup();
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use sandsurf_protocol::{NetworkRule, PortRange};
     #[test]
-    fn managed_dns_names_have_one_canonical_idna_form() {
-        assert_eq!(normalize_dns_name("Example.COM.").unwrap(), "example.com");
-        assert_eq!(
-            normalize_dns_name("bücher.example").unwrap(),
-            "xn--bcher-kva.example"
-        );
-        for invalid in [
-            "*.example.com",
-            ".example.com",
-            "example.com..",
-            "-bad.example",
+    fn deny_is_intrinsic_and_private_is_explicit() {
+        let policy = NetworkPolicy {
+            rules: vec![NetworkRule {
+                plane: NetworkPlane::Tcp,
+                destination: NetworkDestination::Ip {
+                    cidr: "0.0.0.0/0".into(),
+                    allow_private_addresses: false,
+                },
+                ports: vec![PortRange { from: 443, to: 443 }],
+            }],
+        };
+        let p = PacketPolicy::compile(&policy, vec!["8.8.8.8".parse().unwrap()]).unwrap();
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.3",
+            "10.0.0.1",
+            "8.8.8.8",
+            "224.0.0.1",
         ] {
-            assert!(normalize_dns_name(invalid).is_err(), "{invalid}");
+            assert!(!p.allows(NetworkPlane::Tcp, format!("{ip}:443").parse().unwrap()));
+        }
+        assert!(p.allows(NetworkPlane::Tcp, "1.1.1.1:443".parse().unwrap()));
+        assert!(!p.allows(NetworkPlane::Udp, "1.1.1.1:443".parse().unwrap()));
+        assert!(!p.allows(NetworkPlane::Tcp, "1.1.1.1:80".parse().unwrap()));
+    }
+    #[test]
+    fn cidr_canonicalization_is_idempotent_for_every_prefix() {
+        for (ip, width) in [("192.168.27.99", 32), ("2001:db8:1:2:3:4:5:6", 128)] {
+            for prefix in 0..=width {
+                let policy = NetworkPolicy {
+                    rules: vec![NetworkRule {
+                        plane: NetworkPlane::Tcp,
+                        destination: NetworkDestination::Ip {
+                            cidr: format!("{ip}/{prefix}"),
+                            allow_private_addresses: false,
+                        },
+                        ports: vec![PortRange { from: 1, to: 65535 }],
+                    }],
+                };
+                let normalized = policy.normalized().unwrap();
+                assert_eq!(normalized.normalized().unwrap(), normalized);
+            }
+        }
+    }
+    #[test]
+    fn ipv6_translation_and_machine_aliases_are_denied() {
+        for ip in [
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:7f00:1::",
+            "2001::1",
+            "fd00::2",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(forbidden(ip.parse().unwrap()), "{ip}");
         }
     }
 
     #[test]
-    fn rules_are_bounded_normalized_and_deduplicated() {
-        let rule = ManagedNetworkRule {
-            transport: "tcp".into(),
-            destination: ManagedNetworkDestination::Dns {
-                name: "Example.COM.".into(),
-                include_subdomains: true,
-                allow_private_addresses: false,
-            },
-            ports: vec![ManagedNetworkPort::Range { from: 80, to: 443 }],
+    fn explicit_private_authority_never_grants_host_or_machine_links() {
+        let policy = NetworkPolicy {
+            rules: ["0.0.0.0/0", "::/0"]
+                .map(|cidr| NetworkRule {
+                    plane: NetworkPlane::Udp,
+                    destination: NetworkDestination::Ip {
+                        cidr: cidr.into(),
+                        allow_private_addresses: true,
+                    },
+                    ports: vec![PortRange { from: 53, to: 53 }],
+                })
+                .into(),
         };
-        let normalized = normalize_managed_network_rules(&[rule.clone(), rule]).unwrap();
-        assert_eq!(normalized.len(), 1);
-        assert!(matches!(
-            &normalized[0].destination,
-            ManagedNetworkDestination::Dns { name, .. } if name == "example.com"
-        ));
+        let p = PacketPolicy::compile(
+            &policy,
+            vec!["10.0.0.2".parse().unwrap(), "fc01::2".parse().unwrap()],
+        )
+        .unwrap();
+        for ip in ["10.0.0.1", "fc01::1"] {
+            assert!(p.allows(NetworkPlane::Udp, SocketAddr::new(ip.parse().unwrap(), 53)));
+        }
+        for ip in [
+            "10.0.0.2",
+            "fc01::2",
+            "fd00::2",
+            "fd20:ce::254",
+            "168.63.129.16",
+            "100.100.100.200",
+            "127.0.0.1",
+        ] {
+            assert!(
+                !p.allows(NetworkPlane::Udp, SocketAddr::new(ip.parse().unwrap(), 53)),
+                "{ip}"
+            );
+        }
     }
 
     #[test]
-    fn managed_dns_wire_fields_use_camel_case() {
-        let destination: ManagedNetworkDestination = serde_json::from_value(serde_json::json!({
-            "kind": "dns",
-            "name": "localhost",
-            "includeSubdomains": true,
-            "allowPrivateAddresses": true
-        }))
-        .unwrap();
-        let encoded = serde_json::to_value(destination).unwrap();
-        assert_eq!(encoded["includeSubdomains"], true);
-        assert_eq!(encoded["allowPrivateAddresses"], true);
+    fn normalization_preserves_port_membership_and_deduplicates_equivalent_cidrs() {
+        let ports = vec![
+            PortRange { from: 82, to: 82 },
+            PortRange { from: 80, to: 81 },
+            PortRange { from: 443, to: 443 },
+        ];
+        let policy = NetworkPolicy {
+            rules: ["10.1.2.3/8", "10.9.8.7/8"]
+                .map(|cidr| NetworkRule {
+                    plane: NetworkPlane::Tcp,
+                    destination: NetworkDestination::Ip {
+                        cidr: cidr.into(),
+                        allow_private_addresses: true,
+                    },
+                    ports: ports.clone(),
+                })
+                .into(),
+        };
+        let normalized = policy.normalized().unwrap();
+        assert_eq!(normalized.rules.len(), 1);
+        let p = PacketPolicy::compile(&normalized, Vec::new()).unwrap();
+        for port in 1..=65535 {
+            assert_eq!(
+                p.allows(
+                    NetworkPlane::Tcp,
+                    SocketAddr::new("10.10.20.30".parse().unwrap(), port)
+                ),
+                ports
+                    .iter()
+                    .any(|range| range.from <= port && port <= range.to)
+            );
+        }
     }
 }

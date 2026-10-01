@@ -30,7 +30,7 @@ async function fixture(context) {
       await writeFile(join(artifact, platform, name), bytes);
       files[`${platform}/${name}`] = createHash("sha256").update(bytes).digest("hex");
     }
-    await writeFile(join(artifact, "manifest.json"), JSON.stringify({ formatVersion: 1, buildId: "sandsurf-native-0.1.0", files }));
+    await writeFile(join(artifact, "manifest.json"), JSON.stringify({ formatVersion: 1, buildId: "sandsurf-native-1.0.0", files }));
   }
   return { root, staging, destination,
     artifact: (platform) => join(staging, `runtime-${platform}`),

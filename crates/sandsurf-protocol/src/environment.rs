@@ -77,9 +77,8 @@ impl ExecutionDefaults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkPlane {
-    NamedProxy,
-    DirectTcp,
-    Dns,
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,13 +89,9 @@ pub enum NetworkPlane {
     deny_unknown_fields
 )]
 pub enum NetworkDestination {
-    Dns {
-        name: String,
-        include_subdomains: bool,
-        allow_private_addresses: bool,
-    },
     Ip {
         cidr: String,
+        allow_private_addresses: bool,
     },
 }
 
@@ -122,9 +117,68 @@ pub struct NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// Canonicalize CIDRs, merge port ranges, and remove duplicate rules.
+    /// Native traffic is authorized by address, never by a DNS observation.
+    pub fn normalized(&self) -> Result<Self, Invalid> {
+        self.validate()?;
+        let mut result = self.clone();
+        for rule in &mut result.rules {
+            let NetworkDestination::Ip { cidr, .. } = &mut rule.destination;
+            let (address, prefix) = cidr.split_once('/').ok_or(Invalid("CIDR prefix missing"))?;
+            let address: std::net::IpAddr = address
+                .parse()
+                .map_err(|_| Invalid("invalid CIDR address"))?;
+            let prefix: u8 = prefix.parse().map_err(|_| Invalid("invalid CIDR prefix"))?;
+            *cidr = match address {
+                std::net::IpAddr::V4(ip) => {
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    format!(
+                        "{}/{prefix}",
+                        std::net::Ipv4Addr::from(u32::from(ip) & mask)
+                    )
+                }
+                std::net::IpAddr::V6(ip) => {
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - prefix)
+                    };
+                    format!(
+                        "{}/{prefix}",
+                        std::net::Ipv6Addr::from(u128::from(ip) & mask)
+                    )
+                }
+            };
+            rule.ports.sort_by_key(|p| (p.from, p.to));
+            let mut merged: Vec<PortRange> = Vec::new();
+            for port in &rule.ports {
+                if let Some(last) = merged.last_mut()
+                    && u32::from(port.from) <= u32::from(last.to) + 1
+                {
+                    last.to = last.to.max(port.to);
+                } else {
+                    merged.push(*port);
+                }
+            }
+            rule.ports = merged;
+        }
+        result.rules.sort_by_cached_key(|rule| {
+            serde_json::to_vec(rule).expect("network rule serialization")
+        });
+        result.rules.dedup();
+        Ok(result)
+    }
+
     pub fn validate(&self) -> Result<(), Invalid> {
         if self.rules.len() > 4096 {
             return Err(Invalid("network policy exceeds 4096 rules"));
+        }
+        if self.rules.iter().map(|r| r.ports.len()).sum::<usize>() > 16384 {
+            return Err(Invalid("network policy exceeds 16384 total port ranges"));
         }
         for rule in &self.rules {
             if rule.ports.is_empty() || rule.ports.len() > 4096 {
@@ -137,27 +191,14 @@ impl NetworkPolicy {
             {
                 return Err(Invalid("network rule has an invalid port range"));
             }
-            match (&rule.plane, &rule.destination) {
-                (NetworkPlane::Dns, NetworkDestination::Dns { .. })
-                | (NetworkPlane::NamedProxy, NetworkDestination::Dns { .. })
-                | (NetworkPlane::DirectTcp, NetworkDestination::Ip { .. }) => {}
-                _ => return Err(Invalid("network plane and destination do not match")),
-            }
             match &rule.destination {
-                NetworkDestination::Dns { name, .. } => {
-                    if name.is_empty()
-                        || name.len() > 253
-                        || name.contains(['*', '\0'])
-                        || name.starts_with('.')
-                        || name.ends_with('.')
-                    {
-                        return Err(Invalid("network DNS destination is malformed"));
-                    }
-                }
-                NetworkDestination::Ip { cidr } => {
+                NetworkDestination::Ip { cidr, .. } => {
                     let (address, prefix) = cidr
                         .split_once('/')
                         .ok_or(Invalid("network IP destination requires CIDR notation"))?;
+                    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+                        return Err(Invalid("network CIDR prefix is malformed"));
+                    }
                     let address: std::net::IpAddr = address
                         .parse()
                         .map_err(|_| Invalid("network CIDR address is malformed"))?;
@@ -195,7 +236,14 @@ impl ExposureSpec {
             .parse()
             .map_err(|_| Invalid("host exposure address is malformed"))?;
         if self.guest_port == 0
-            || !guest.is_loopback()
+            || (guest
+                != "100.64.0.2"
+                    .parse::<std::net::IpAddr>()
+                    .expect("constant NIC IP")
+                && guest
+                    != "fd00::2"
+                        .parse::<std::net::IpAddr>()
+                        .expect("constant NIC IP"))
             || (!self.public && !host.is_loopback())
             || host.is_unspecified()
         {
@@ -322,13 +370,14 @@ impl Default for RuntimeConfiguration {
         Self {
             network: NetworkPolicy { rules: Vec::new() },
             exposures: Vec::new(),
-            resources: Resources {
-                vcpus: Counter::ONE,
-                memory_mib: Counter::try_from(128).expect("static memory bound"),
-                disk_bytes: Counter::try_from(64 * 1024 * 1024).expect("static disk bound"),
-                output_bytes: Counter::ONE,
-                managed_executions: Counter::ONE,
-            },
+            resources: Resources::from_geometry(
+                Counter::ONE,
+                Counter::try_from(128).expect("static memory bound"),
+                Counter::try_from(64 * 1024 * 1024).expect("static disk bound"),
+                Counter::ONE,
+                Counter::ONE,
+            )
+            .expect("static resource envelope"),
         }
     }
 }
@@ -350,6 +399,11 @@ impl RuntimeConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceUsage {
+    pub provenance: ResourceProvenance,
+    /// Host process-unit lifetime, independent of guest reboot/generation.
+    pub host_counter_epoch: Option<crate::Digest>,
+    pub channels_current: Option<Counter>,
+    pub inflight_requests_current: Option<Counter>,
     pub cpu_micros: Option<Counter>,
     pub memory_current: Option<Counter>,
     pub memory_peak: Option<Counter>,
@@ -379,6 +433,10 @@ impl ResourceUsage {
     /// Unsupported native measurements are absent, never manufactured zeroes.
     pub fn host_observation(source: &str, observed_unix_millis: Counter) -> Self {
         Self {
+            provenance: ResourceProvenance::default(),
+            host_counter_epoch: None,
+            channels_current: None,
+            inflight_requests_current: None,
             cpu_micros: None,
             memory_current: None,
             memory_peak: None,
@@ -396,4 +454,45 @@ impl ResourceUsage {
             observed_unix_millis,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeasurementSource {
+    #[default]
+    Unavailable,
+    HostCgroup,
+    HostFilesystem,
+    HostRetention,
+    HostAdmission,
+    HostNetwork,
+    GuestReported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceProvenance {
+    pub cpu: MeasurementSource,
+    pub memory: MeasurementSource,
+    pub io: MeasurementSource,
+    pub storage: MeasurementSource,
+    pub output: MeasurementSource,
+    pub executions: MeasurementSource,
+    pub channels: MeasurementSource,
+    pub network: MeasurementSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceChangeMode {
+    Live,
+    RequiresReboot,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceChangeAssessment {
+    pub mode: ResourceChangeMode,
+    pub reasons: Vec<String>,
 }

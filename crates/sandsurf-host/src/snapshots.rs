@@ -12,6 +12,15 @@ use std::path::{Path, PathBuf};
 
 const COPY_BUFFER: usize = 1024 * 1024;
 
+/// Retention follows the source machine's physical volume, including after
+/// native destruction. Forks read here and write to their own distinct volume.
+pub fn root(host_root: &Path, snapshot: &Snapshot) -> PathBuf {
+    host_root
+        .join("machines")
+        .join(object_name(snapshot.request.machine_id.as_str()))
+        .join("snapshots")
+}
+
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(io::Error),
@@ -66,6 +75,7 @@ struct SnapshotManifest {
     sensitive: bool,
     kind: SnapshotKind,
     full: Option<FullSnapshotMetadata>,
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,7 +147,7 @@ pub fn capture_filesystem(
         source_container,
     )?;
     let manifest = SnapshotManifest {
-        format_version: 4,
+        format_version: 1,
         snapshot_id: snapshot.request.id.clone(),
         request_digest: snapshot.request_digest.clone(),
         image_digest: snapshot.image_digest.clone(),
@@ -150,6 +160,7 @@ pub fn capture_filesystem(
         sensitive: snapshot.sensitive,
         kind: SnapshotKind::Disk,
         full: None,
+        boot: capture_boot(root, snapshot, &disk, &stage)?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
@@ -280,7 +291,7 @@ pub fn capture_full(
         fork_safe: false,
     };
     let manifest = SnapshotManifest {
-        format_version: 4,
+        format_version: 1,
         snapshot_id: snapshot.request.id.clone(),
         request_digest: snapshot.request_digest.clone(),
         image_digest: snapshot.image_digest.clone(),
@@ -293,6 +304,7 @@ pub fn capture_full(
         sensitive: true,
         kind: SnapshotKind::Full,
         full: Some(full.clone()),
+        boot: crate::storage::copy_boot(&native_directory.join("boot"), &stage.join("boot"))?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     write_manifest(&stage.join("manifest.json"), &manifest)?;
@@ -313,7 +325,12 @@ pub fn capture_full(
     })
 }
 
-pub fn materialize_fork(root: &Path, snapshot: &Snapshot, destination: &Path) -> Result<()> {
+pub fn materialize_fork(
+    root: &Path,
+    snapshot: &Snapshot,
+    destination: &Path,
+    profile: &sandsurf_image::identity::CloneProfile,
+) -> Result<()> {
     let expected = snapshot
         .system_disk_digest
         .as_ref()
@@ -326,6 +343,14 @@ pub fn materialize_fork(root: &Path, snapshot: &Snapshot, destination: &Path) ->
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
     let format = destination_container.storage_format()?;
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ForkReceipt {
+        source: Digest,
+        profile: sandsurf_image::identity::CloneProfile,
+        customized: Digest,
+    }
+    let receipt_path = destination.with_extension("fork.json");
     crate::storage::publish_disk(
         destination,
         snapshot.system_disk_bytes.get(),
@@ -339,14 +364,59 @@ pub fn materialize_fork(root: &Path, snapshot: &Snapshot, destination: &Path) ->
                 source_container,
                 destination_container,
             )
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+            if *profile != sandsurf_image::identity::CloneProfile::Preserve {
+                if destination_container != DiskContainer::RawExt4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "managed VHDX cloning requires an isolated helper",
+                    ));
+                }
+                sandsurf_image::identity::customize(staged, profile)?;
+            }
+            let customized = materialized_digest(
+                staged,
+                snapshot.system_disk_bytes.get(),
+                destination_container,
+            )
+            .map_err(io::Error::other)?;
+            let receipt = ForkReceipt {
+                source: expected.clone(),
+                profile: *profile,
+                customized,
+            };
+            let staged_receipt = receipt_path.with_extension("fork-building");
+            if staged_receipt.exists() {
+                fs::remove_file(&staged_receipt)?;
+            }
+            let mut file = sandsurf_native::local::create_private_file(&staged_receipt)?;
+            file.write_all(&serde_json::to_vec(&receipt).map_err(io::Error::other)?)?;
+            file.sync_all()?;
+            drop(file);
+            sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
         },
     )?;
+    let mut receipt_bytes = Vec::new();
+    sandsurf_native::local::open_private_file(
+        &receipt_path,
+        sandsurf_native::PrivateFileAccess::ReadOnly,
+    )?
+    .take(8193)
+    .read_to_end(&mut receipt_bytes)?;
+    if receipt_bytes.len() > 8192 {
+        return Err(SnapshotError::Invalid("fork receipt exceeds bound"));
+    }
+    let receipt: ForkReceipt = serde_json::from_slice(&receipt_bytes)?;
+    if receipt.source != *expected || receipt.profile != *profile {
+        return Err(SnapshotError::Invalid(
+            "fork customization contract changed",
+        ));
+    }
     if materialized_digest(
         destination,
         snapshot.system_disk_bytes.get(),
         destination_container,
-    )? != *expected
+    )? != receipt.customized
     {
         return Err(SnapshotError::Invalid(
             "fork destination contains different state",
@@ -451,11 +521,51 @@ fn published_container(root: &Path, snapshot: &Snapshot) -> Result<DiskContainer
     .container)
 }
 
+fn capture_boot(
+    root: &Path,
+    snapshot: &Snapshot,
+    disk: &Path,
+    stage: &Path,
+) -> Result<sandsurf_image::boot::FrozenBoot> {
+    let host_root = root
+        .parent()
+        .ok_or(SnapshotError::Invalid("snapshot store has no owner"))?;
+    let image = sandsurf_image::verify_image(
+        &host_root
+            .join("images")
+            .join(snapshot.image_digest.as_str())
+            .join("manifest.json"),
+        sandsurf_image::ImageTrust::Pinned {
+            manifest_digest: snapshot.image_digest.as_str(),
+        },
+    )
+    .map_err(io::Error::other)?;
+    // Stages are private and never attachable. Interrupted extraction is
+    // discarded, while published boot artifacts are always digest verified.
+    let directory = stage.join("boot");
+    if directory.exists() {
+        fs::remove_dir_all(&directory)?;
+    }
+    Ok(crate::storage::freeze_boot(&image, disk, &directory)?)
+}
+
+pub(crate) fn boot_artifacts(
+    root: &Path,
+    snapshot: &Snapshot,
+) -> Result<(PathBuf, sandsurf_image::boot::FrozenBoot)> {
+    let directory = root.join(object_name(snapshot.request.id.as_str()));
+    verify_published(&directory, snapshot)?;
+    let manifest: SnapshotManifest =
+        serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    Ok((directory.join("boot"), manifest.boot))
+}
+
 fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResult> {
     private_directory(directory)?;
     let manifest: SnapshotManifest =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
-    if manifest.format_version != 4
+    sandsurf_image::boot::verify(&directory.join("boot"), &manifest.boot)?;
+    if manifest.format_version != 1
         || manifest.snapshot_id != snapshot.request.id
         || manifest.request_digest != snapshot.request_digest
         || manifest.image_digest != snapshot.image_digest
@@ -734,6 +844,9 @@ fn disk_container(path: &Path) -> Result<DiskContainer> {
 }
 
 fn remove_stage(stage: &Path) -> Result<()> {
+    if stage.join("boot").exists() {
+        fs::remove_dir_all(stage.join("boot"))?;
+    }
     for name in [
         "manifest.json",
         "system.ext4",
@@ -790,6 +903,21 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             private_directory(&path).unwrap();
+            let (manifest, kernel) = fixture_image();
+            let images = path.join("images");
+            private_directory(&images).unwrap();
+            let image = images.join(bytes_digest(&manifest).as_str());
+            private_directory(&image).unwrap();
+            for (name, bytes) in [
+                ("manifest.json", manifest),
+                ("kernel", kernel),
+                ("system.ext4", b"seed".to_vec()),
+            ] {
+                open_write(&image.join(name))
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
             Self(path)
         }
     }
@@ -800,6 +928,34 @@ mod tests {
     }
     fn n(value: u64) -> Counter {
         value.try_into().unwrap()
+    }
+    fn fixture_image() -> (Vec<u8>, Vec<u8>) {
+        let mut kernel = vec![0; 120];
+        kernel[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        kernel[6] = 1;
+        kernel[16..18].copy_from_slice(&2u16.to_le_bytes());
+        kernel[18..20].copy_from_slice(&62u16.to_le_bytes());
+        kernel[24..32].copy_from_slice(&0x100000u64.to_le_bytes());
+        kernel[32..40].copy_from_slice(&64u64.to_le_bytes());
+        kernel[54..56].copy_from_slice(&56u16.to_le_bytes());
+        kernel[56..58].copy_from_slice(&1u16.to_le_bytes());
+        kernel[64..68].copy_from_slice(&1u32.to_le_bytes());
+        kernel[68..72].copy_from_slice(&1u32.to_le_bytes());
+        kernel[80..88].copy_from_slice(&0x100000u64.to_le_bytes());
+        kernel[88..96].copy_from_slice(&0x100000u64.to_le_bytes());
+        kernel[96..104].copy_from_slice(&120u64.to_le_bytes());
+        kernel[104..112].copy_from_slice(&120u64.to_le_bytes());
+        let manifest = serde_json::json!({
+            "formatVersion": 1, "id": "snapshot-fixture", "version": "1", "architecture": "x64",
+            "bootBundle": { "kernel": { "path": "kernel", "sha256": bytes_digest(&kernel) },
+                "initramfs": null, "profile": { "kind": "pinned" }, "guestAgent": null,
+                "capabilities": { "overlayfs": false, "vsock": false, "seccomp": false, "cgroupV2": false, "devpts": false } },
+            "system": { "rootfs": { "path": "system.ext4", "sha256": bytes_digest(b"seed"), "format": "ext4" },
+                "cloneProfile": { "kind": "preserve" }, "defaults": { "environment": {}, "user": null, "workingDirectory": null },
+                "provenance": { "kind": "source-built", "sourceDigest": "a".repeat(64), "materials": { "fixture": "b".repeat(64) } } },
+            "platformArtifacts": { "windowsX64": null }, "signature": null
+        });
+        (serde_json::to_vec(&manifest).unwrap(), kernel)
     }
     fn snapshot() -> Snapshot {
         let request = SnapshotRequest {
@@ -815,14 +971,9 @@ mod tests {
             request_digest: digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap(),
             request,
             phase: SnapshotPhase::Capturing,
-            image_digest: bytes_digest(b"image"),
-            resources: Resources {
-                vcpus: n(1),
-                memory_mib: n(128),
-                disk_bytes: n(4096),
-                output_bytes: n(4096),
-                managed_executions: n(8),
-            },
+            image_digest: bytes_digest(&fixture_image().0),
+            resources: Resources::from_geometry(n(1), n(128), n(4096), n(4096), n(8))
+                .expect("static resource envelope"),
             consistency: None,
             system_disk_digest: None,
             system_disk_bytes: n(4096),
@@ -830,6 +981,33 @@ mod tests {
             sensitive: false,
             full: None,
         }
+    }
+
+    #[test]
+    fn snapshot_boot_identity_rejects_changed_kernel_and_never_uses_pristine_seed() {
+        let temp = Temp::new();
+        let root = temp.0.join("snapshots");
+        let disk = temp.0.join("source.raw");
+        open_write(&disk).unwrap().write_all(&[3; 4096]).unwrap();
+        let snapshot = snapshot();
+        capture_filesystem(&root, &snapshot, &disk).unwrap();
+        let directory = root.join(object_name(snapshot.request.id.as_str()));
+        let kernel = directory.join("boot/kernel");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&kernel, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&kernel).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&kernel, permissions).unwrap();
+        }
+        fs::write(&kernel, b"corrupt-updated-kernel").unwrap();
+        assert!(published_filesystem(&root, &snapshot).is_err());
+        assert!(boot_artifacts(&root, &snapshot).is_err());
+        assert_eq!(fs::read(kernel).unwrap(), b"corrupt-updated-kernel");
     }
 
     #[test]
@@ -844,6 +1022,20 @@ mod tests {
             .unwrap();
         let native_root = temp.0.join("native");
         private_directory(&native_root).unwrap();
+        let (_, mut kernel) = fixture_image();
+        kernel.extend_from_slice(b"running-kernel-not-seed");
+        let running_kernel = temp.0.join("running-kernel");
+        open_write(&running_kernel)
+            .unwrap()
+            .write_all(&kernel)
+            .unwrap();
+        crate::storage::pin_boot(
+            &running_kernel,
+            None,
+            sandsurf_image::Architecture::X64,
+            &native_root.join("boot"),
+        )
+        .unwrap();
         // Artifact/publication fixture only, not a native-machine witness.
         let artifact = |name: &str, bytes: &[u8]| {
             open_write(&native_root.join(name))
@@ -886,6 +1078,7 @@ mod tests {
             )
             .unwrap(),
             admission,
+            lineage: None,
             observation: None,
         };
         let native = NativeFullCapture {
@@ -913,6 +1106,21 @@ mod tests {
 
         let captured =
             capture_full(&root, &snapshot, &source, &native_root, native.clone()).unwrap();
+        let (directory, running) = boot_artifacts(
+            &root,
+            &Snapshot {
+                system_disk_digest: Some(captured.disk_digest.clone()),
+                manifest_digest: Some(captured.manifest_digest.clone()),
+                ..snapshot.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(running.kernel.sha256, bytes_digest(&kernel).as_str());
+        assert_eq!(fs::read(directory.join("kernel")).unwrap(), kernel);
+        assert_ne!(
+            running.kernel.sha256,
+            bytes_digest(&fixture_image().1).as_str()
+        );
         assert_eq!(
             captured.full.as_ref().unwrap().executions,
             vec![membership.clone()]
@@ -930,7 +1138,7 @@ mod tests {
         let directory = root.join(object_name(snapshot.request.id.as_str()));
         let mut old: SnapshotManifest =
             serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
-        old.format_version = 3;
+        old.format_version = 2;
         fs::write(
             directory.join("manifest.json"),
             serde_json::to_vec(&old).unwrap(),
@@ -968,11 +1176,25 @@ mod tests {
             .unwrap()
             .write_all(b"partial fork")
             .unwrap();
-        materialize_fork(&root, &snapshot, &fork).unwrap();
+        materialize_fork(
+            &root,
+            &snapshot,
+            &fork,
+            &sandsurf_image::identity::CloneProfile::Preserve,
+        )
+        .unwrap();
         assert!(!interrupted.exists());
         assert_eq!(file_digest(&fork, 4096).unwrap(), captured.disk_digest);
         fs::write(&fork, vec![8_u8; 4096]).unwrap();
-        assert!(materialize_fork(&root, &snapshot, &fork).is_err());
+        assert!(
+            materialize_fork(
+                &root,
+                &snapshot,
+                &fork,
+                &sandsurf_image::identity::CloneProfile::Preserve
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(&fork).unwrap(), vec![8_u8; 4096]);
         assert_eq!(
             file_digest(

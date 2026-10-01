@@ -10,6 +10,7 @@ struct Disk: Decodable {
 struct Request: Decodable {
     let kind: String
     let machineId: String?
+    let guestMac: String?
     let kernel: String?
     let initialRamdisk: String?
     let commandLine: String?
@@ -22,7 +23,7 @@ struct Request: Decodable {
     let savedState: String?
 
     private enum Fields: String, CodingKey, CaseIterable {
-        case kind, machineId, kernel, initialRamdisk, commandLine, disks, memoryBytes,
+        case kind, machineId, guestMac, kernel, initialRamdisk, commandLine, disks, memoryBytes,
              vcpus, controlSocket, hostConnectPorts, guestListenPorts, savedState
     }
     private struct Key: CodingKey {
@@ -40,6 +41,7 @@ struct Request: Decodable {
         let fields = try decoder.container(keyedBy: Fields.self)
         kind = try fields.decode(String.self, forKey: .kind)
         machineId = try fields.decodeIfPresent(String.self, forKey: .machineId)
+        guestMac = try fields.decodeIfPresent(String.self, forKey: .guestMac)
         kernel = try fields.decodeIfPresent(String.self, forKey: .kernel)
         initialRamdisk = try fields.decodeIfPresent(String.self, forKey: .initialRamdisk)
         commandLine = try fields.decodeIfPresent(String.self, forKey: .commandLine)

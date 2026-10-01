@@ -1,6 +1,6 @@
 [package]
 name = "machine-cargo-fuzz"
-version = "0.0.0"
+version = "1.0.0"
 publish = false
 edition = "2024"
 license = "Apache-2.0"
@@ -49,22 +49,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "dns"
-path = "fuzz_targets/dns.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "socks5"
-path = "fuzz_targets/socks5.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "http_connect"
-path = "fuzz_targets/http_connect.rs"
+name = "network_packet"
+path = "fuzz_targets/network_packet.rs"
 test = false
 doc = false
 bench = false

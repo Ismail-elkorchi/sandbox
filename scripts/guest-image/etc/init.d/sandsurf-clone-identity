@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+description="Finish the declared managed Alpine clone identity contract"
+depend() {
+    need localmount
+    before sshd sandsurf-management
+}
+start() {
+    [ -f /etc/sandsurf-clone-pending ] || return 0
+    ebegin "Generating this machine's SSH host identity"
+    ssh-keygen -A || { eend 1; return 1; }
+    # Clearing the marker follows successful key generation, never precedes it.
+    rm -f /etc/sandsurf-clone-pending
+    sync
+    eend 0
+}

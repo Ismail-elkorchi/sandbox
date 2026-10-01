@@ -1,0 +1,10 @@
+name: Account service manager
+description: Prepare only the CI account's manager for independent native service tests
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo loginctl enable-linger "$(id -un)"
+        echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+        echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"

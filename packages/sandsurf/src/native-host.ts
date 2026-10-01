@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
+import { sha256File } from "./file-integrity.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Readable } from "node:stream";
 
-const BRIDGE_VERSION = 9;
+const BRIDGE_VERSION = 1;
 const MAX_BRIDGE_BYTES = 1024 * 1024 + 256 * 1024 + 4;
 const MAX_BRIDGE_PENDING = 64;
 const MAX_EVENT_STREAMS = 8;
@@ -302,6 +303,7 @@ function encodeBridgeRequest(id: number, request: Readonly<Record<string, unknow
     if (value.kind === "write" || value.kind === "write-chunk") path = [...prefix, "bytes"];
   };
   if (request.kind === "put-secret") { path = ["bytes"]; maximum = 1024 * 1024; }
+  else if (request.kind === "write-console") { path = ["bytes"]; maximum = 4096; }
   else if (request.kind === "dispatch-guest" && record(request.request)) guestRequest(request.request, ["request"]);
   else if (request.kind === "guest" && record(request.request)) {
     const value = request.request;
@@ -379,8 +381,23 @@ function decodeBridgeResponse(value: Record<string, unknown>, binary: Buffer): R
     }
     if (response.kind === "output" || (response.kind === "file" && record(response.response) && response.response.kind === "read")) throw new SandsurfHostError("protocol", "RPC bytes must use binary data");
   }
+  if (value.kind === "runtime" && record(value.response) && value.response.kind === "console-metadata") {
+    const page = value.response.page;
+    if (!record(page)) throw new SandsurfHostError("protocol", "invalid native console metadata");
+    const length = integer(page.length); const after = integer(page.after); const cursor = integer(page.cursor);
+    const available = integer(page.available); const generation = integer(page.generation);
+    if (generation < 1 || length > 64 * 1024 || length !== binary.byteLength || after > cursor || cursor > available ||
+        typeof page.open !== "boolean" || typeof page.captureFailed !== "boolean" ||
+        createHash("sha256").update(binary).digest("hex") !== text(page.digest)) throw new SandsurfHostError("protocol", "invalid native console boundary");
+    if (page.loss === null) {
+      if (after + length !== cursor) throw new SandsurfHostError("protocol", "incomplete native console coverage");
+    } else if (!record(page.loss) || integer(page.loss.from) !== after + length || integer(page.loss.to) !== cursor || cursor <= after + length) {
+      throw new SandsurfHostError("protocol", "invalid native console loss coverage");
+    }
+    return { kind: "runtime", response: { kind: "console", page: { ...page, bytes: binary } } };
+  }
   if (value.kind !== "runtime" || !record(value.response) || value.response.kind !== "output-metadata") {
-    if (binary.byteLength !== 0 || value.kind === "host-blob" || (value.kind === "runtime" && record(value.response) && value.response.kind === "output")) throw new SandsurfHostError("protocol", "unexpected native bridge data");
+    if (binary.byteLength !== 0 || value.kind === "host-blob" || (value.kind === "runtime" && record(value.response) && (value.response.kind === "output" || value.response.kind === "console"))) throw new SandsurfHostError("protocol", "unexpected native bridge data");
     return value;
   }
   const response = value.response;
@@ -425,7 +442,7 @@ export async function resolveSandsurfNativeHost(): Promise<string> {
   const binary = resolve(packageRoot, "native", relative);
   const metadata = await lstat(binary);
   if (!metadata.isFile() || metadata.isSymbolicLink()) throw new SandsurfHostError("integrity", "native host is not a regular file");
-  const actual = createHash("sha256").update(await readFile(binary)).digest("hex");
+  const actual = await sha256File(binary, 512 * 1024 ** 2);
   if (actual !== expected) throw new SandsurfHostError("integrity", "native host failed integrity verification");
   return binary;
 }

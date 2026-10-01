@@ -7,7 +7,52 @@ use sandsurf_protocol::{Counter, MachineState, OperationId};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn full_directory(root: &Path, operation_id: &OperationId) -> PathBuf {
+    root.join("guardian/full-captures")
+        .join(sandsurf_native::storage::object_name(operation_id.as_str()))
+}
+
+/// Reclaim only an unpublished host copy, while this operation still owns the
+/// native pause. The engine's own save files are not in this directory. A
+/// committed capture is immutable and must instead be released after copying
+/// its complete contents into the durable snapshot store.
+pub(crate) fn reset_unpublished_full(root: &Path, operation_id: &OperationId) -> Result<()> {
+    CaptureBoundary::require(root, operation_id)?
+        .ok_or(Error::Protocol("capture staging has no pause owner"))?;
+    let directory = full_directory(root, operation_id);
+    match sandsurf_native::local::open_private_file(
+        &directory.join("capture.json"),
+        sandsurf_native::PrivateFileAccess::ReadOnly,
+    ) {
+        Ok(_) => return Err(Error::Protocol("cannot reset a committed full capture")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    remove_full(root, operation_id)
+}
+
+/// Remove the exact guardian-owned working copy, never a published snapshot.
+pub(crate) fn remove_full(root: &Path, operation_id: &OperationId) -> Result<()> {
+    let directory = full_directory(root, operation_id);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(Error::Protocol("capture staging is not an owned directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    sandsurf_native::local::ensure_private_directory(&directory)?;
+    // Recursive removal does not follow symlinks. Unknown files remain owned
+    // by this unpublished stage too (e.g. an interrupted boot publication).
+    fs::remove_dir_all(&directory)?;
+    sandsurf_native::storage::sync_directory(
+        directory
+            .parent()
+            .ok_or(Error::Protocol("capture staging has no parent"))?,
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -18,6 +63,18 @@ pub(crate) struct CaptureBoundary {
 }
 
 impl CaptureBoundary {
+    /// A lost native resume response is not permission to resume twice, and a
+    /// failed preparation is not proof that the computer was ever paused.
+    pub fn needs_resume(&self, observed: MachineState) -> Result<bool> {
+        match observed {
+            MachineState::Paused => Ok(!self.preserve_pause),
+            MachineState::Running | MachineState::Stopped | MachineState::Failed => Ok(false),
+            _ => Err(Error::Unsupported(
+                "native capture power state is indeterminate",
+            )),
+        }
+    }
+
     pub fn read(root: &Path) -> Result<Option<Self>> {
         let path = root.join("guardian/capture-boundary.json");
         let file = match sandsurf_native::local::open_private_file(
@@ -121,6 +178,137 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "sandsurf-capture-stage-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            sandsurf_native::local::create_private_directory(&root).unwrap();
+            Self(root)
+        }
+        fn stage(&self, operation: &OperationId) -> PathBuf {
+            let directory = full_directory(&self.0, operation);
+            sandsurf_native::local::create_private_directory(directory.parent().unwrap()).unwrap();
+            sandsurf_native::local::create_private_directory(&directory).unwrap();
+            directory
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn capture_release_uses_native_power_not_a_prior_resume_response() {
+        let mut boundary = CaptureBoundary {
+            operation_id: "capture".try_into().unwrap(),
+            generation: Counter::ONE,
+            preserve_pause: false,
+        };
+        assert!(boundary.needs_resume(MachineState::Paused).unwrap());
+        for state in [
+            MachineState::Running,
+            MachineState::Stopped,
+            MachineState::Failed,
+        ] {
+            assert!(!boundary.needs_resume(state).unwrap());
+        }
+        assert!(boundary.needs_resume(MachineState::Starting).is_err());
+        boundary.preserve_pause = true;
+        assert!(!boundary.needs_resume(MachineState::Paused).unwrap());
+    }
+
+    #[test]
+    fn interrupted_full_capture_reclaims_all_partial_bytes_without_losing_ownership() {
+        let root = Temp::new();
+        let operation: OperationId = "capture".try_into().unwrap();
+        let boundary = CaptureBoundary::begin(
+            &root.0,
+            operation.clone(),
+            Counter::ONE,
+            MachineState::Running,
+        )
+        .unwrap();
+        let directory = root.stage(&operation);
+        for name in ["reconnect.json", "snapshot.vmstate", "memory"] {
+            fs::write(directory.join(name), b"incomplete").unwrap();
+        }
+        sandsurf_native::local::create_private_directory(&directory.join("boot")).unwrap();
+        fs::write(
+            directory.join("boot/.publication.tmp"),
+            b"incomplete kernel",
+        )
+        .unwrap();
+        reset_unpublished_full(&root.0, &operation).unwrap();
+        assert!(!directory.exists());
+        assert_eq!(CaptureBoundary::read(&root.0).unwrap(), Some(boundary));
+        reset_unpublished_full(&root.0, &operation).unwrap();
+        assert!(
+            CaptureBoundary::require(&root.0, &operation)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn full_capture_cleanup_rejects_other_owners_and_keeps_committed_bytes() {
+        let root = Temp::new();
+        let operation: OperationId = "capture".try_into().unwrap();
+        CaptureBoundary::begin(
+            &root.0,
+            operation.clone(),
+            Counter::ONE,
+            MachineState::Paused,
+        )
+        .unwrap();
+        let directory = root.stage(&operation);
+        sandsurf_native::local::create_private_file(&directory.join("capture.json"))
+            .unwrap()
+            .write_all(b"committed")
+            .unwrap();
+        assert!(reset_unpublished_full(&root.0, &operation).is_err());
+        assert!(reset_unpublished_full(&root.0, &"different".try_into().unwrap()).is_err());
+        assert_eq!(
+            fs::read(directory.join("capture.json")).unwrap(),
+            b"committed"
+        );
+        fs::create_dir(root.0.join("snapshot-store")).unwrap();
+        fs::write(root.0.join("snapshot-store/receipt"), b"published").unwrap();
+        CaptureBoundary::clear(&root.0).unwrap();
+        assert!(reset_unpublished_full(&root.0, &operation).is_err());
+        remove_full(&root.0, &operation).unwrap();
+        remove_full(&root.0, &operation).unwrap();
+        assert_eq!(
+            fs::read(root.0.join("snapshot-store/receipt")).unwrap(),
+            b"published"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_cleanup_never_follows_a_stage_symlink() {
+        let root = Temp::new();
+        let operation: OperationId = "capture".try_into().unwrap();
+        CaptureBoundary::begin(
+            &root.0,
+            operation.clone(),
+            Counter::ONE,
+            MachineState::Paused,
+        )
+        .unwrap();
+        let directory = root.stage(&operation);
+        fs::remove_dir(&directory).unwrap();
+        fs::create_dir(root.0.join("external")).unwrap();
+        fs::write(root.0.join("external/data"), b"keep").unwrap();
+        std::os::unix::fs::symlink(root.0.join("external"), directory).unwrap();
+        assert!(remove_full(&root.0, &operation).is_err());
+        assert_eq!(fs::read(root.0.join("external/data")).unwrap(), b"keep");
+    }
 
     #[test]
     fn interrupted_capture_retains_exact_operation_and_public_pause() {

@@ -1,26 +1,26 @@
 //! macOS guardian integration for one retained Virtualization.framework VM.
 
+use crate::capture::{
+    full_directory as apple_full_capture_directory, remove_full as remove_apple_full_capture,
+};
 use crate::guardian::{
     EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
-use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, VerifiedImage, verify_image};
+use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::macos::{
     AppleConfig, AppleDisk, AppleDriver, AppleQualification, AppleRestoreSource,
 };
 use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::UnixVsockChannel;
 use sandsurf_native::storage::object_name;
-use sandsurf_network::{VmNetworkBridge, VmPortGateway};
-use sandsurf_protocol::{
-    AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT, NETWORK_DNS_TCP_PORT,
-    NETWORK_DNS_UDP_PORT, NETWORK_HTTP_PORT, NETWORK_SOCKS_PORT,
-};
+use sandsurf_network::NativeNetworkGateway;
+use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
-    NativeSnapshotRequest, NativeSnapshotResponse, NetworkDestination, NetworkPolicy, Resources,
-    RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
+    NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources, RuntimeConfiguration,
+    SnapshotArtifact, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const CONFIG_VERSION: u16 = 1;
-const BUNDLED_IMAGE_MANIFEST_DIGEST: Option<&str> =
-    option_env!("SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST");
 
 #[derive(Debug)]
 pub enum AppleError {
@@ -94,6 +92,7 @@ pub fn prepare_config(
     image_digest: &Digest,
     resources: &Resources,
 ) -> Result<AppleGuardianConfig, AppleError> {
+    crate::resources::require_external_support("apple")?;
     let existing_path = host_root
         .join("machines")
         .join(object_name(machine_id.as_str()))
@@ -107,7 +106,9 @@ pub fn prepare_config(
         }
         return Ok(existing);
     }
-    let (verified, template) = resolve_source_bundle(host_root, executable, image_digest)?;
+    let verified = crate::images::resolve_native_image(host_root, executable, image_digest)
+        .map_err(|error| AppleError::Invalid(error.to_string()))?;
+    let template = verified.system_path.clone();
     if verified.manifest.architecture
         != if cfg!(target_arch = "aarch64") {
             Architecture::Arm64
@@ -244,9 +245,8 @@ pub struct AppleGuardianEffect {
     pending: Option<ActiveGuest>,
     authentication_disk: PathBuf,
     control_socket: PathBuf,
-    network: Arc<Mutex<Option<VmNetworkBridge>>>,
+    network: Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
     network_usage: NetworkUsage,
-    exposures: Arc<Mutex<Option<VmPortGateway>>>,
     installed_runtime: Option<InstalledRuntime>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
 }
@@ -259,7 +259,7 @@ struct ActiveGuest {
     generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
+    boot_directory: PathBuf,
 }
 
 struct AppleGuest {
@@ -280,6 +280,7 @@ struct RestoreLineage {
     source: ReconnectState,
     staged_state: PathBuf,
     generation_seed: [u8; 32],
+    executions: Vec<sandsurf_protocol::CapturedExecution>,
 }
 
 #[derive(Default)]
@@ -291,7 +292,7 @@ struct NetworkUsageValue {
 
 type NetworkUsage = Arc<Mutex<NetworkUsageValue>>;
 
-fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::BrokerReport) {
+fn accumulate_network_usage(usage: &NetworkUsage, report: &sandsurf_network::NetworkReport) {
     if let Ok(mut usage) = usage.lock() {
         usage.rx_bytes = usage.rx_bytes.saturating_add(report.rx_bytes);
         usage.tx_bytes = usage.tx_bytes.saturating_add(report.tx_bytes);
@@ -304,6 +305,7 @@ impl AppleGuardianEffect {
         self.guest_binding.lock().ok()?.clone()
     }
     pub fn open(machine_root: &Path, config: AppleGuardianConfig) -> Result<Self, AppleError> {
+        crate::resources::require_external_support("apple")?;
         let image = verify_image(&config.image_manifest, ImageTrust::ExplicitLocal)?;
         let disks = machine_root.join("disks");
         ensure_private_directory(&disks)?;
@@ -316,7 +318,7 @@ impl AppleGuardianEffect {
             helper_digest: config.helper_digest.clone(),
             guest_architecture: crate::service::native_guest_architecture(),
             kernel: image.kernel_path,
-            initial_ramdisk: None,
+            initial_ramdisk: image.initramfs_path,
             command_line: sandsurf_machine::linux_boot_arguments("hvc0", "/dev/vda"),
             disks: vec![
                 AppleDisk {
@@ -337,13 +339,8 @@ impl AppleGuardianEffect {
             vcpus: u32::try_from(config.resources.vcpus.get())
                 .map_err(|_| AppleError::Invalid("vCPU count overflow".into()))?,
             control_socket: config.control_socket.clone(),
-            host_connect_ports: vec![GUEST_CONTROL_PORT, GUEST_EXPOSURE_PORT],
-            guest_listen_ports: vec![
-                NETWORK_HTTP_PORT,
-                NETWORK_SOCKS_PORT,
-                NETWORK_DNS_TCP_PORT,
-                NETWORK_DNS_UDP_PORT,
-            ],
+            host_connect_ports: vec![GUEST_CONTROL_PORT],
+            guest_listen_ports: vec![],
             operation_timeout: AppleDriver::default_timeout(),
             qualification: AppleQualification {
                 lifecycle: None,
@@ -363,7 +360,6 @@ impl AppleGuardianEffect {
             control_socket: config.control_socket,
             network: Arc::new(Mutex::new(None)),
             network_usage,
-            exposures: Arc::new(Mutex::new(None)),
             installed_runtime: None,
             suspend_capture_operation: None,
         })
@@ -374,23 +370,64 @@ impl AppleGuardianEffect {
         command: &LifecycleCommand,
         generation: Counter,
     ) -> Result<(), Digest> {
-        ensure_mutable_disk(
-            &self.config.system_seed,
-            &self.machine_root.join("disks/system.ext4"),
-            command.configuration.resources.disk_bytes.get(),
-        )
-        .map_err(|error| {
-            eprintln!("sandsurf disk preparation failed: {error}");
-            bytes_digest(b"apple-system-disk-preparation-failed")
-        })?;
+        let image = verify_image(&self.config.image_manifest, ImageTrust::ExplicitLocal)
+            .map_err(|_| bytes_digest(b"apple-boot-image-invalid"))?;
+        let restoring = crate::restore::load::<RestoreLineage>(&self.machine_root)
+            .map_err(|_| bytes_digest(b"apple-restore-lineage-invalid"))?;
+        if restoring.is_none() {
+            ensure_mutable_disk(
+                &self.config.system_seed,
+                &self.machine_root.join("disks/system.ext4"),
+                command.configuration.resources.disk_bytes.get(),
+                &image.manifest.system.clone_profile,
+            )
+            .map_err(|error| {
+                eprintln!("sandsurf disk preparation failed: {error}");
+                bytes_digest(b"apple-system-disk-preparation-failed")
+            })?;
+        }
+        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
+            .map_err(|_| bytes_digest(b"apple-system-disk-attachment-failed"))?;
+        let boot_directory = self.machine_root.join("guardian").join(format!(
+            "boot-{}-{}",
+            generation.get(),
+            random_bytes()
+                .map_err(|_| bytes_digest(b"apple-boot-entropy"))?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let boot = if let Some(lineage) = &restoring {
+            let source = self
+                .machine_root
+                .join("snapshots")
+                .join(object_name(lineage.snapshot_id.as_str()))
+                .join("boot");
+            let boot = crate::storage::copy_boot(&source, &boot_directory)
+                .map_err(|_| bytes_digest(b"apple-restore-boot-artifacts-invalid"))?;
+            if boot != lineage.source.boot {
+                return Err(bytes_digest(b"apple-restore-boot-identity-mismatch"));
+            }
+            boot
+        } else {
+            crate::storage::freeze_boot(
+                &image,
+                &self.machine_root.join("disks/system.ext4"),
+                &boot_directory,
+            )
+            .map_err(|_| bytes_digest(b"apple-boot-artifacts-invalid"))?
+        };
+        let (kernel, initramfs) = sandsurf_image::boot::paths(&boot_directory, &boot);
+        self.machine
+            .stage_boot_artifacts(kernel, initramfs)
+            .map_err(|_| bytes_digest(b"apple-boot-staging-failed"))?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"apple-boot-entropy"))?;
-        let network_capability =
-            random_bytes().map_err(|_| bytes_digest(b"apple-network-entropy"))?;
         let boot_identity = digest(
             Domain::Image,
             &(
                 "sandsurf-apple-boot-v1",
                 &command.machine_id,
+                &boot,
                 sandsurf_protocol::GUEST_PROTOCOL_MAJOR,
                 sandsurf_protocol::GUEST_PROTOCOL_MINOR,
             ),
@@ -402,7 +439,6 @@ impl AppleGuardianEffect {
             generation,
             &boot_identity,
             &capability,
-            &network_capability,
         )
         .map_err(|_| bytes_digest(b"apple-authentication-disk"))?;
         self.pending = Some(ActiveGuest {
@@ -411,11 +447,9 @@ impl AppleGuardianEffect {
             generation,
             boot_identity,
             capability,
-            network_capability,
+            boot_directory,
             rebind: None,
         });
-        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
-            .map_err(|_| bytes_digest(b"apple-system-disk-attachment-failed"))?;
         self.machine
             .stage_storage_custody(custody)
             .map_err(|_| bytes_digest(b"apple-system-disk-custody-conflict"))?;
@@ -444,6 +478,14 @@ impl AppleGuardianEffect {
             generation: lineage.source.generation,
             boot_identity: lineage.source.boot_identity.clone(),
             capability: lineage.source.capability,
+            staging: GuestServiceRequest::StageExecutionRestore {
+                snapshot_id: lineage.snapshot_id.clone(),
+                capture_operation_id: lineage.source.capture_operation_id.clone(),
+                machine_id: active.machine_id.clone(),
+                previous_generation: lineage.source.generation,
+                generation,
+                executions: lineage.executions.clone(),
+            },
             request: GuestServiceRequest::RebindGeneration {
                 snapshot_id: lineage.snapshot_id.clone(),
                 capture_operation_id: lineage.source.capture_operation_id.clone(),
@@ -452,7 +494,6 @@ impl AppleGuardianEffect {
                 generation,
                 boot_identity: active.boot_identity.clone(),
                 capability: active.capability,
-                network_capability: active.network_capability,
                 generation_seed: lineage.generation_seed,
             },
         });
@@ -485,21 +526,43 @@ impl AppleGuardianEffect {
         let Some(boundary) = crate::capture::CaptureBoundary::read(&self.machine_root)? else {
             return Ok(());
         };
-        // Re-adopt the held native pause after an interrupted request before
-        // releasing it; a missing management connection is irrelevant.
-        self.machine
-            .adopt_pause_for_capture()
-            .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
-        let result = if boundary.preserve_pause {
-            self.machine.finish_capture_preserving_pause()
-        } else {
+        let power = self
+            .machine
+            .observe_power()
+            .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?
+            .ok_or(ControlError::Unsupported(
+                "native capture owner unavailable",
+            ))?;
+        let result = if boundary.needs_resume(power.state)? {
+            self.machine
+                .adopt_pause_for_capture()
+                .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
             self.machine.resume_after_capture()
+        } else {
+            self.machine.finish_capture_without_resume()
         };
         result.map_err(|_| ControlError::Unsupported("native capture completion failed"))?;
         crate::capture::CaptureBoundary::clear(&self.machine_root)
     }
 
     fn prepare_full_capture(
+        &mut self,
+        snapshot_id: sandsurf_protocol::SnapshotId,
+        operation_id: sandsurf_protocol::OperationId,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        let result = self.prepare_full_capture_inner(snapshot_id, operation_id.clone(), journal);
+        if result.is_err()
+            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
+                .is_some()
+        {
+            self.finish_native_capture()?;
+            crate::capture::remove_full(&self.machine_root, &operation_id)?;
+        }
+        result
+    }
+
+    fn prepare_full_capture_inner(
         &mut self,
         snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
@@ -512,17 +575,12 @@ impl AppleGuardianEffect {
                 .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
             return Ok(NativeSnapshotResponse::Prepared { capture });
         }
+        crate::capture::reset_unpublished_full(&self.machine_root, &operation_id)?;
         let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
             .ok_or(ControlError::Protocol(
                 "full capture has no native boundary",
             ))?;
-        let executions = match journal.capture_executions(boundary.generation) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = self.finish_native_capture();
-                return Err(ControlError::State(error));
-            }
-        };
+        let executions = journal.capture_executions(boundary.generation)?;
         crate::snapshots::private_directory(
             directory
                 .parent()
@@ -532,19 +590,11 @@ impl AppleGuardianEffect {
         crate::snapshots::private_directory(&directory)
             .map_err(|_| ControlError::Protocol("full capture directory is not private"))?;
         let saved_state = directory.join("snapshot.vmstate");
-        for path in [&saved_state, &directory.join("reconnect.json")] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ControlError::Io(error)),
-            }
-        }
         if self
             .machine
             .save_full_state(&operation_id, &saved_state)
             .is_err()
         {
-            let _ = self.finish_native_capture();
             return Err(ControlError::Unsupported(
                 "Apple Virtualization could not save full machine state",
             ));
@@ -561,7 +611,7 @@ impl AppleGuardianEffect {
                 generation: active.generation,
                 boot_identity: active.boot_identity,
                 capability: active.capability,
-                network_capability: active.network_capability,
+                boot: crate::storage::copy_boot(&active.boot_directory, &directory.join("boot"))?,
             };
             let reconnect_path = directory.join("reconnect.json");
             write_private_json(&reconnect_path, &reconnect)?;
@@ -616,13 +666,10 @@ impl AppleGuardianEffect {
         })();
         match result {
             Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
-            Err(error) => {
-                let _ = self.finish_native_capture();
-                Err(ControlError::Rejected {
-                    category: "snapshot".into(),
-                    message: error.to_string(),
-                })
-            }
+            Err(error) => Err(ControlError::Rejected {
+                category: "snapshot".into(),
+                message: error.to_string(),
+            }),
         }
     }
 
@@ -645,12 +692,8 @@ impl AppleGuardianEffect {
                 "full snapshot is incompatible with this Apple VM configuration",
             ));
         }
-        let host_root = self
+        let directory = self
             .machine_root
-            .parent()
-            .and_then(Path::parent)
-            .ok_or(ControlError::Protocol("machine root has no host root"))?;
-        let directory = host_root
             .join("snapshots")
             .join(object_name(snapshot_id.as_str()));
         for (name, artifact) in [
@@ -684,6 +727,11 @@ impl AppleGuardianEffect {
                 "restore reconnect identity does not match snapshot",
             ));
         }
+        if reconnect.machine_id != self.config.machine_id {
+            return Err(ControlError::Unsupported(
+                "full memory forks are unsupported",
+            ));
+        }
         let restore_root = self.machine_root.join("guardian/restores");
         crate::snapshots::private_directory(&restore_root)
             .map_err(|_| ControlError::Protocol("restore staging root is not private"))?;
@@ -703,6 +751,7 @@ impl AppleGuardianEffect {
             .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
         crate::restore::stage(&self.machine_root, manifest_digest.clone(), || {
             Ok(RestoreLineage {
+                executions: expected.executions.clone(),
                 snapshot_id: snapshot_id.clone(),
                 source: reconnect,
                 staged_state,
@@ -731,46 +780,42 @@ impl AppleGuardianEffect {
         if let Some(installed) = self.installed_runtime.as_ref()
             && installed.generation == active.generation
             && installed.configuration == *configuration
+            && self
+                .network
+                .lock()
+                .is_ok_and(|owner| owner.as_ref().is_some_and(|gateway| gateway.is_alive()))
         {
             return RuntimeInstallation::Applied(installed.evidence.clone());
         }
-        self.stop_data_planes();
-        let rules = match network_rules(&configuration.network) {
-            Ok(value) => value,
-            Err(_) => {
-                return RuntimeInstallation::NotApplied(bytes_digest(
-                    b"apple-network-policy-normalization-failed",
-                ));
-            }
+        self.installed_runtime = None;
+        let Some(gateway) = self.machine.network() else {
+            return RuntimeInstallation::Unknown;
         };
-        let bridge = match VmNetworkBridge::start_partitioned(
-            &active.socket,
-            active.network_capability,
-            rules,
-        ) {
-            Ok(value) => value,
-            Err(_) => return RuntimeInstallation::Unknown,
-        };
-        if let Ok(mut network) = self.network.lock() {
-            *network = Some(bridge);
-        } else {
+        if gateway
+            .configure(&configuration.network, &configuration.exposures)
+            .is_err()
+        {
             return RuntimeInstallation::Unknown;
         }
-        let gateway = match VmPortGateway::start(
-            &active.socket,
-            active.network_capability,
-            &configuration.exposures,
-        ) {
-            Ok(value) => value,
-            Err(_) => {
-                self.stop_data_planes();
-                return RuntimeInstallation::Unknown;
+        if let Ok(mut network) = self.network.lock() {
+            if let Some(previous) = network.as_ref()
+                && !Arc::ptr_eq(previous, &gateway)
+            {
+                let _ = previous.configure(&NetworkPolicy::default(), &[]);
+                let s = previous.snapshot();
+                accumulate_network_usage(
+                    &self.network_usage,
+                    &sandsurf_network::NetworkReport {
+                        connections: s.connections,
+                        violations: s.violations,
+                        rx_bytes: s.rx_bytes,
+                        tx_bytes: s.tx_bytes,
+                        cleanup_failures: Vec::new(),
+                    },
+                );
             }
-        };
-        if let Ok(mut exposures) = self.exposures.lock() {
-            *exposures = Some(gateway);
+            *network = Some(gateway);
         } else {
-            self.stop_data_planes();
             return RuntimeInstallation::Unknown;
         }
         let resource_evidence = digest(Domain::Resource, &configuration.resources)
@@ -801,13 +846,16 @@ impl AppleGuardianEffect {
         if let Ok(mut network) = self.network.lock()
             && let Some(bridge) = network.take()
         {
-            let report = bridge.stop();
+            let _ = bridge.configure(&NetworkPolicy::default(), &[]);
+            let snapshot = bridge.snapshot();
+            let report = sandsurf_network::NetworkReport {
+                connections: snapshot.connections,
+                violations: snapshot.violations,
+                rx_bytes: snapshot.rx_bytes,
+                tx_bytes: snapshot.tx_bytes,
+                cleanup_failures: Vec::new(),
+            };
             accumulate_network_usage(&self.network_usage, &report);
-        }
-        if let Ok(mut exposures) = self.exposures.lock()
-            && let Some(gateway) = exposures.take()
-        {
-            let _ = gateway.stop();
         }
     }
 
@@ -823,7 +871,6 @@ impl AppleGuardianEffect {
 
 enum RuntimeInstallation {
     Applied(Digest),
-    NotApplied(Digest),
     Unknown,
 }
 
@@ -950,10 +997,6 @@ impl GuardianEffect for AppleGuardianEffect {
             }
             let runtime = match self.install_runtime(&command.configuration) {
                 RuntimeInstallation::Applied(value) => value,
-                RuntimeInstallation::NotApplied(value) => {
-                    self.contain_unpublished();
-                    return MachineOutcome::NotApplied(value);
-                }
                 RuntimeInstallation::Unknown => {
                     self.contain_unpublished();
                     return MachineOutcome::Unknown;
@@ -1014,6 +1057,7 @@ impl GuardianEffect for AppleGuardianEffect {
         resources: &Resources,
         current: &MachineObservation,
     ) -> ControlResult<()> {
+        crate::resources::require_external_support("apple")?;
         resources
             .validate()
             .map_err(|_| ControlError::Protocol("invalid native resource envelope"))?;
@@ -1068,7 +1112,6 @@ impl GuardianEffect for AppleGuardianEffect {
                         ),
                     )
                     .map_or(EffectOutcome::Unknown, EffectOutcome::Applied),
-                    RuntimeInstallation::NotApplied(value) => EffectOutcome::NotApplied(value),
                     RuntimeInstallation::Unknown => EffectOutcome::Unknown,
                 }
             }
@@ -1099,7 +1142,7 @@ impl GuardianEffect for AppleGuardianEffect {
             .lock()
             .map_err(|_| ControlError::Protocol("network bridge lock poisoned"))?
             .as_ref()
-            .map_or_else(Default::default, VmNetworkBridge::snapshot);
+            .map_or_else(Default::default, |gateway| gateway.snapshot());
         usage.network_rx_bytes =
             Counter::try_from(accumulated.rx_bytes.saturating_add(current.rx_bytes))
                 .map_err(|_| ControlError::Protocol("network receive accounting overflow"))?;
@@ -1194,11 +1237,12 @@ impl GuardianEffect for AppleGuardianEffect {
                 "restore integration generation mismatch",
             ));
         }
-        journal.rebind_processes(
+        journal.restore_executions(
             &lineage.snapshot_id,
             &lineage.source.machine_id,
             lineage.source.generation,
             generation,
+            &lineage.executions,
         )?;
         self.retire_restore_intent()
     }
@@ -1215,6 +1259,9 @@ impl GuardianEffect for AppleGuardianEffect {
             .observe_power()
             .map_err(|_| ControlError::Protocol("native power observation unavailable"))
     }
+    fn take_console(&mut self) -> Option<sandsurf_machine::NativeConsole> {
+        self.machine.take_console()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1227,7 +1274,7 @@ struct ReconnectState {
     generation: Counter,
     boot_identity: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 fn native_architecture_name() -> &'static str {
@@ -1254,34 +1301,6 @@ fn apple_configuration_digest(
     )
 }
 
-fn apple_full_capture_directory(
-    machine_root: &Path,
-    operation_id: &sandsurf_protocol::OperationId,
-) -> PathBuf {
-    machine_root
-        .join("guardian/full-captures")
-        .join(object_name(operation_id.as_str()))
-}
-
-fn remove_apple_full_capture(
-    machine_root: &Path,
-    operation_id: &sandsurf_protocol::OperationId,
-) -> ControlResult<()> {
-    let directory = apple_full_capture_directory(machine_root, operation_id);
-    for name in ["capture.json", "reconnect.json", "snapshot.vmstate"] {
-        match fs::remove_file(directory.join(name)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ControlError::Io(error)),
-        }
-    }
-    match fs::remove_dir(&directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(ControlError::Io(error)),
-    }
-}
-
 fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), AppleError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -1305,7 +1324,11 @@ fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<UnixVsockChannel> {
             rebind: None,
             ..active.clone()
         };
-        PendingRebind::new(guest_client(&source), binding.request.clone())
+        PendingRebind::new(
+            guest_client(&source),
+            binding.request.clone(),
+            binding.staging.clone(),
+        )
     });
     ManagedGuestClient::new(guest_client(active), pending)
 }
@@ -1324,119 +1347,18 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<UnixVsockChannel> {
     )
 }
 
-fn network_rules(policy: &NetworkPolicy) -> Result<sandsurf_network::BrokerPolicy, AppleError> {
-    policy
-        .validate()
-        .map_err(|error| AppleError::Invalid(error.to_string()))?;
-    let mut rules = sandsurf_network::BrokerPolicy::default();
-    for rule in &policy.rules {
-        let destination = match &rule.destination {
-            NetworkDestination::Dns {
-                name,
-                include_subdomains,
-                allow_private_addresses,
-            } => sandsurf_network::policy::ManagedNetworkDestination::Dns {
-                name: sandsurf_network::policy::normalize_dns_name(name)
-                    .map_err(|error| AppleError::Invalid(error.to_string()))?,
-                include_subdomains: *include_subdomains,
-                allow_private_addresses: *allow_private_addresses,
-            },
-            NetworkDestination::Ip { cidr } => {
-                sandsurf_network::policy::ManagedNetworkDestination::Ip { cidr: cidr.clone() }
-            }
-        };
-        let ports = rule
-            .ports
-            .iter()
-            .map(|range| {
-                if range.from == range.to {
-                    sandsurf_network::policy::ManagedNetworkPort::Single(range.from)
-                } else {
-                    sandsurf_network::policy::ManagedNetworkPort::Range {
-                        from: range.from,
-                        to: range.to,
-                    }
-                }
-            })
-            .collect();
-        let managed = sandsurf_network::policy::ManagedNetworkRule {
-            transport: "tcp".into(),
-            destination,
-            ports,
-        };
-        match rule.plane {
-            sandsurf_protocol::NetworkPlane::NamedProxy => rules.named_proxy.push(managed),
-            sandsurf_protocol::NetworkPlane::DirectTcp => rules.direct_tcp.push(managed),
-            sandsurf_protocol::NetworkPlane::Dns => rules.dns.push(managed),
-        }
-    }
-    Ok(rules)
-}
-
-fn resolve_source_bundle(
-    host_root: &Path,
-    executable: &Path,
-    expected: &Digest,
-) -> Result<(VerifiedImage, PathBuf), AppleError> {
-    let installed = host_root.join("images").join(expected.as_str());
-    if installed.exists() {
-        let image = verify_image(&installed.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-        let template = image.system_path.clone();
-        return Ok((image, template));
-    }
-    let package = executable
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or_else(|| AppleError::Invalid("native package layout is invalid".into()))?;
-    let architecture = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x64"
-    };
-    let relative = format!("development-{architecture}/manifest.json");
-    let index: ImageIndex = read_json(&package.join("images/manifest.json"), 1024 * 1024)?;
-    let indexed = index
-        .files
-        .get(&relative)
-        .ok_or_else(|| AppleError::Invalid("packaged image manifest is absent".into()))?;
-    let pinned = BUNDLED_IMAGE_MANIFEST_DIGEST.ok_or_else(|| {
-        AppleError::Invalid("native host has no bundled image trust identity".into())
-    })?;
-    if indexed != pinned || expected.as_str() != pinned {
-        return Err(AppleError::Invalid(
-            "packaged image index differs from the native trust identity".into(),
-        ));
-    }
-    let image = verify_image(
-        &package.join("images").join(relative),
-        ImageTrust::Pinned {
-            manifest_digest: pinned,
-        },
-    )?;
-    let installed = sandsurf_image::install_image(&host_root.join("images"), &image)?;
-    let copied = verify_image(&installed.join("manifest.json"), ImageTrust::ExplicitLocal)?;
-    let copied_template = copied.system_path.clone();
-    Ok((copied, copied_template))
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ImageIndex {
-    #[serde(rename = "formatVersion")]
-    _format_version: u16,
-    #[serde(rename = "buildId")]
-    _build_id: String,
-    files: std::collections::BTreeMap<String, String>,
-}
-
-fn ensure_mutable_disk(source: &Path, destination: &Path, bytes: u64) -> Result<(), AppleError> {
+fn ensure_mutable_disk(
+    source: &Path,
+    destination: &Path,
+    bytes: u64,
+    profile: &sandsurf_image::identity::CloneProfile,
+) -> Result<(), AppleError> {
     crate::storage::materialize(
         source,
         destination,
         bytes,
         crate::storage::DiskFormat::Raw,
-        |_| Ok(()),
+        |staged| sandsurf_image::identity::customize(staged, profile),
     )?;
     Ok(())
 }
@@ -1447,7 +1369,6 @@ fn write_authentication(
     generation: Counter,
     boot_identity: &Digest,
     capability: &[u8; 32],
-    network_capability: &[u8; 32],
 ) -> Result<(), AppleError> {
     let identity = machine_id.as_str().as_bytes();
     let size = u16::try_from(identity.len())
@@ -1460,7 +1381,6 @@ fn write_authentication(
     bytes.extend_from_slice(&generation.get().to_be_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(capability);
-    bytes.extend_from_slice(network_capability);
     bytes.resize(512, 0);
     let mut file = OpenOptions::new()
         .write(true)

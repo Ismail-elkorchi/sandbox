@@ -21,13 +21,14 @@ fn intentional_writer_close_releases_a_fork_inherited_lease() {
         operations: Counter::ONE,
         usage_records: Counter::ONE,
         image_bytes: Counter::ONE,
-        resources: Resources {
-            vcpus: Counter::ONE,
-            memory_mib: Counter::ONE,
-            disk_bytes: Counter::ONE,
-            output_bytes: Counter::ONE,
-            managed_executions: Counter::ONE,
-        },
+        resources: Resources::from_geometry(
+            Counter::ONE,
+            Counter::ONE,
+            Counter::ONE,
+            Counter::ONE,
+            Counter::ONE,
+        )
+        .expect("static resource envelope"),
     };
     let host =
         HostCatalog::create(&root.join("host"), "fork-host".try_into().unwrap(), limits).unwrap();

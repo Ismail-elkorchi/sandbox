@@ -13,6 +13,17 @@ function executionRequest(id = "command", stdio = "pipes") {
     environment: {}, user: "agent", stdio, terminalSize: stdio === "terminal" ? { columns: 80, rows: 24, pixelWidth: 0, pixelHeight: 0 } : null,
     activeDeadlineMillis: null, elapsedDeadlineUnixMillis: null, outputBytes: 1024 };
 }
+
+test("machine storage identities are explicit and obsolete resource fields are rejected", async () => {
+  const host = new Sandsurf({ request: async () => assert.fail("invalid machine request reached transport") }, () => assert.fail("invalid machine request reached authorization"));
+  const resources = fixtureView().runtimeConfiguration.resources;
+  await assert.rejects(host.machines.create({ image: "a".repeat(64), resources }), /identity is malformed/u);
+  await assert.rejects(host.machines.create({ id: "box", image: "a".repeat(64), resources: { ...resources, imageBytes: 1024 } }), /unknown host resource field/u);
+  const view = fixtureView();
+  view.runtimeConfiguration.resources.imageBytes = 1024;
+  const malformed = new Sandsurf({ request: async () => ({ kind: "machine", value: view }) }, () => true);
+  await assert.rejects(malformed.machines.connect("box"), (error) => error.category === "protocol");
+});
 function completedState() {
   return { kind: "exited", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64), cleanupDigest: "d".repeat(64),
     output: { finalCursor: 0, chunks: 0, stdoutBytes: 0, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "a".repeat(64) } };
@@ -140,7 +151,10 @@ test("execution reports expose one validated request, state and lineage model", 
     { ...value, request: { ...request, hostAuthority: "guest-owned" } },
     { ...value, lineage: { sourceMachineId: "box", sourceGeneration: 1, snapshotId: "snapshot" } },
   ]) assert.throws(() => parseExecutionInspection(invalid), SandsurfHostError);
-  const restored = { ...value, request: { ...request, generation: 2 }, lineage: { sourceMachineId: "box", sourceGeneration: 1, snapshotId: "snapshot" } };
+  const restored = { ...value, request: { ...request, executionId: "restored-command", generation: 2 }, lineage: {
+    logicalExecutionId: "command", sourceExecutionId: "command", sourceMachineId: "box",
+    sourceGeneration: 1, snapshotId: "snapshot", outputAnchor: completedState().output,
+  } };
   assert.deepEqual(parseExecutionInspection(restored).lineage, restored.lineage);
   const parsed = parseExecutionInspection(value);
   request.environment.UNRELATED = "changed-after-parse";
@@ -397,9 +411,18 @@ test("retained events expose typed facts and reject digest-valid malformed repor
 });
 
 function fixtureView(generation = 1) {
+  const diskBytes = 1024 ** 3;
+  const outputBytes = 1024 ** 2;
+  const snapshotBytes = 2 * (diskBytes + 512 * 1024 ** 2 + 64 * 1024 ** 2);
   return {
     id: "box", imageDigest: "a".repeat(64), knownSensitive: false,
-    runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: { vcpus: 1, memoryMiB: 512, diskBytes: 1024 ** 3, outputBytes: 1024 ** 2, managedExecutions: 64 } },
+    runtimeConfiguration: { network: { rules: [] }, exposures: [], resources: {
+      vcpus: 1, memoryMiB: 512, diskBytes, outputBytes, managedExecutions: 64,
+      cpuQuotaMicros: 100_000, hostOverheadBytes: 512 * 1024 ** 2,
+      snapshotBytes, physicalStorageBytes: 2 * diskBytes + outputBytes + snapshotBytes + 64 * 1024 ** 2,
+      channels: 32, inflightRequests: 16, networkConnections: 256,
+      networkBytesPerSecond: 64 * 1024 ** 2, networkQueueBytes: 16 * 1024 ** 2,
+    } },
     configurationRevision: 99, reservation: "held", lifecycleIntent: { machineId: "box", operationId: "create", desired: "running", revision: 99, requestDigest: "a".repeat(64), completion: null }, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
     storage: { kind: "current", phase: "published", format: "raw", capacityBytes: 1024 ** 3, operationId: null, payload: { kind: "present", fileBytes: 1024 ** 3 } },
     management: { kind: "unavailable", lastKnown: null },
@@ -460,7 +483,7 @@ test("authority-changing responses advance cached revisions without inspection",
   let view = fixtureView();
   const requests = [];
   const exposure = { id: "web", machineId: "box", revision: 102,
-    spec: { guestAddress: "127.0.0.1", guestPort: 8080, hostAddress: "127.0.0.1", hostPort: 8080, public: false },
+    spec: { guestAddress: "100.64.0.2", guestPort: 8080, hostAddress: "127.0.0.1", hostPort: 8080, public: false },
     active: true, boundPort: 8080 };
   const machine = fixtureMachine(async (request) => {
     requests.push(request);
@@ -469,6 +492,8 @@ test("authority-changing responses advance cached revisions without inspection",
     view = { ...view, configurationRevision: view.configurationRevision + 1 };
     if (request.kind === "set-exposure") return { kind: "exposure", machine: view, exposure };
     if (request.kind === "lifecycle") return { kind: "lifecycle", machine: view, operation: { delivery: "applied" } };
+    if (request.kind === "update-resources") return { kind: "resource-update", machine: view,
+      assessment: { mode: "live", reasons: [] } };
     return { kind: "configuration", machine: view };
   }, 1, async () => true);
   const original = view;
@@ -510,6 +535,12 @@ test("host power support is distinct from qualification and malformed claims are
   let value = {
     hostId: "host", platform: "linux", architecture: "x86_64", guestArchitecture: "amd64", guestPlatform: "linux/amd64", engine: "firecracker",
     lifecycle: unqualified, fullState: unqualified, images: unqualified, defaultImageDigest: null,
+    imageWorkers: { kind: "supported", qualification: unqualified },
+    console: { kind: "supported", qualification: unqualified },
+    resources: Object.fromEntries(["nativeTopology", "cpuTime", "aggregateHostMemory", "managedAdmission",
+      "outputRetention", "storageReservations", "networkEnvelope", "aggregatePhysicalStorage", "sharedHostWorkers",
+      "completeEnforcement"].map((name) => [name, { kind: "unsupported", reasons: ["fixture mechanism not installed"] }])),
+    qualificationRecords: [], qualificationIssues: [],
     guestPower: { shutdown: { kind: "unsupported", reasons: ["no ACPI"] }, reboot: { kind: "unsupported", reasons: ["no reset recovery"] } },
   };
   const host = new Sandsurf({ request: async () => ({ kind: "inspection", value }) });
@@ -879,7 +910,7 @@ test("leader exit and output capture are independent boundaries", async () => {
       assert.equal(query.after, 0, "wait performed an RPC poll");
       return eventPage(0, [{ kind: "machine", observation: fixtureView().machine.value }]);
     }
-    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64) } } } } } };
+    if (query.kind === "get-process") return { kind: "runtime", response: { kind: "process", process: { lineage: null, executionId: "command", generation: 1, interruption: null, report: { kind: "current", value: { request, guestPid: 23, lineage: null, state: { kind: "draining", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64) } } } } } };
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(receiptPublished ? executionReceipt() : { receipt: null, digest: null }) } };
     throw new Error(`unexpected request: ${query.kind}`);
   }, 1, undefined, async function* (_id, after) {
@@ -906,7 +937,7 @@ test("waiting through unavailable management does not invent termination or repl
     }
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(pages >= 3 ? executionReceipt() : { receipt: null, digest: null }) } };
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
+    return { kind: "runtime", response: { kind: "process", process: { lineage: null, executionId: "command", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
   }, 1, undefined, async function* (_id, after) {
     assert.equal(after, 0);
     pages++;
@@ -921,7 +952,7 @@ test("durable spawn reservations reconnect before the first guest observation", 
   const request = executionRequest("terminal", "terminal");
   const machine = fixtureMachine(async (query) => {
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", request, process: { executionId: "terminal", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
+    return { kind: "runtime", response: { kind: "process", request, process: { lineage: null, executionId: "terminal", generation: 1, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
   });
   assert.equal((await machine.executions.get("terminal")).generation, 1);
   const terminal = await machine.terminals.get("terminal");
@@ -938,7 +969,7 @@ test("native interruption wakes execution waits without inventing guest exit or 
   const machine = fixtureMachine(async (query) => {
     if (query.kind === "list-events") return eventPage(0, []);
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1,
+    return { kind: "runtime", response: { kind: "process", process: { lineage: null, executionId: "command", generation: 1,
       report: { kind: "unavailable", lastKnown }, interruption: interrupted ? stopped : null } } };
   }, 1, undefined, async function* () {
     subscriptions++;
@@ -963,7 +994,7 @@ test("native interruption preserves reported leader exit but never substitutes f
     if (query.kind === "list-events") return eventPage(0, []);
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", ...(captured ? executionReceipt() : { receipt: null, digest: null }) } };
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1, interruption: stopped,
+    return { kind: "runtime", response: { kind: "process", process: { lineage: null, executionId: "command", generation: 1, interruption: stopped,
       report: { kind: "unavailable", lastKnown: { request, guestPid: 23, lineage: null, state } } } } };
   });
   const execution = new Execution(machine, "command", 1);
@@ -975,16 +1006,30 @@ test("native interruption preserves reported leader exit but never substitutes f
   assert.equal((await execution.waitCapture()).state.kind, "exited");
 });
 
-test("restored execution reservations require reattachment rather than rebinding an old handle", async () => {
+test("restore preserves historical admissions and exposes an independent execution incarnation", async () => {
   const request = executionRequest();
+  const restored = { ...request, executionId: "restored-command", generation: 2 };
+  const lineage = { logicalExecutionId: "command", sourceExecutionId: "command", sourceMachineId: "box",
+    sourceGeneration: 1, snapshotId: "snapshot", outputAnchor: completedState().output };
   const machine = fixtureMachine(async (query) => {
-    if (query.kind === "list-events") return eventPage(0, []);
+    if (query.kind === "dispatch-guest") {
+      assert.equal(query.generation, 1, "the old handle must never borrow the restored generation");
+      throw new SandsurfHostError("stale-generation", "host rejected the historical mutation");
+    }
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", request,
-      process: { executionId: "command", generation: 2, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
-  });
-  await assert.rejects(new Execution(machine, "command", 1).waitLeader(), (error) => error instanceof SandsurfHostError && error.category === "stale-generation");
-  assert.equal((await machine.executions.get("command")).generation, 2);
+    const historical = query.executionId === "command";
+    assert.ok(historical || query.executionId === restored.executionId);
+    return { kind: "runtime", response: { kind: "process", request: historical ? request : restored,
+      process: { lineage: historical ? null : lineage, executionId: query.executionId,
+        generation: historical ? 1 : 2, interruption: null, report: { kind: "unavailable", lastKnown: null } } } };
+  }, 2);
+  const original = await machine.executions.get("command");
+  assert.equal(original.generation, 1);
+  assert.equal((await original.inspect()).lineage, null);
+  await assert.rejects(original.terminate(), (error) => error instanceof SandsurfHostError && error.category === "stale-generation");
+  const resumed = await machine.executions.get(restored.executionId);
+  assert.equal(resumed.generation, 2);
+  assert.deepEqual((await resumed.inspect()).lineage, lineage);
 });
 
 test("output follow yields retained bytes before reporting native interruption", async () => {
@@ -998,7 +1043,7 @@ test("output follow yields retained bytes before reporting native interruption",
     }
     if (query.kind === "get-receipt") return { kind: "runtime", response: { kind: "receipt", receipt: null, digest: null } };
     assert.equal(query.kind, "get-process");
-    return { kind: "runtime", response: { kind: "process", process: { executionId: "command", generation: 1,
+    return { kind: "runtime", response: { kind: "process", process: { lineage: null, executionId: "command", generation: 1,
       report: { kind: "unavailable", lastKnown: null }, interruption: stopped } } };
   });
   const execution = new Execution(machine, "command", 1);

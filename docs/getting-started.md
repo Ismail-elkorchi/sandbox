@@ -6,7 +6,7 @@ Install Node.js 24 or newer and the unscoped package:
 npm install sandsurf
 ```
 
-Use a private state directory and an application authorizer for host-authority changes. Ordinary commands and guest filesystem operations do not request new host authority.
+Use a private state directory and an application authorizer for host-authority changes. Ordinary commands and guest filesystem operations do not request new host authority. Linux VM creation requires operator-provisioned bounded ext4 volumes for shared host storage and each machine identity; see the package README's storage requirements. Ordinary directories are not silently treated as physical quotas.
 
 ```ts
 import { Sandsurf } from "sandsurf";
@@ -19,6 +19,7 @@ const support = await host.inspect();
 console.dir(support); // Unsupported mechanisms and unqualified ones are distinct.
 
 const machine = await host.machines.create({
+  id: "agent-computer",
   image: "<verified-machine-image-sha256>",
   resources: {
     vcpus: 2,
@@ -67,7 +68,11 @@ const nativeImage = await host.images.importNative({
 ```
 
 Approval binds both the source path and manifest digest. The host verifies every
-artifact and durably publishes its own immutable copy. A published operation
+artifact and durably publishes its own immutable copy. Native distribution
+bundles carry each logical system disk as `<manifest-artifact-path>.gz`; boot
+artifacts remain their declared files. Imports decode with bounded buffers and
+verify the decoded disk digest before publication. npm installation never
+expands VM disks or runs image installation hooks. A published operation
 can be retrieved or retried after restart even if the source bundle has been
 deleted. The same image has one catalog representation regardless of whether
 it was imported natively, converted from OCI, or published from a snapshot.
@@ -133,7 +138,9 @@ const sameExecution = await reconnected.executions.get(execution.id);
 
 The default guest account obtains root through ordinary `sudo`. Root can change the OS and disable management. Management failure is reported independently of native power state; `powerOff()` and `destroy()` do not require a responsive management service. Guest process results are observations, not host attestations.
 
-`host.inspect().guestPower` distinguishes unsupported guest shutdown/reboot mechanisms from implemented but unqualified ones. Firecracker x86 currently lacks ACPI poweroff: Linux can halt while the native VM remains running. Its guest CPU reset terminates the VMM, and ordinary reboot recovery is not implemented. A verified native exit does not change the host's last lifecycle intent or automatically restart the computer. An authorized `start()` preserves disk identity and begins a new execution generation.
+`host.inspect().guestPower` distinguishes unsupported guest shutdown/reboot mechanisms from implemented but unqualified ones. Firecracker x86 lacks ACPI poweroff: Linux can halt while the native VM remains running. Ordinary guest reboot recovery requires a native i8042 reset metric, a clean native exit, and confirmed containment. The guardian commits a new execution generation before booting the same persistent disk under the applied configuration. Arbitrary exits and management loss do not trigger recovery. Kernel panic has no automatic reboot timeout. Other native adapters report reboot unsupported until they provide distinct reset evidence and generation fencing.
+
+`const console = await machine.console.attach()` binds a native serial handle to the current generation independently of guest management. `console.read({ after, maximum })` returns binary bytes, durable cursors, explicit retention loss, and capture status; `console.follow()` polls bounded pages. Each computer reserves 64 generations with a 512 KiB retained prefix per generation, 1 MiB/s of reads, and 32 KiB/s of input. `console.write(bytes)` accepts at most 4096 bytes and reports the accepted prefix without automatic retry. Reboot fences old input handles; historical output remains readable. `console.detach()` releases the SDK handle while guardian capture continues. `host.inspect().console` reports native attachment support separately from hardware qualification.
 
 Use `machine.fs` for guest paths. Artifact import, capture, comparison and host application operate on explicitly selected content. Host publication requires approval of immutable retained content and its destination. Snapshots, forks, rollback, networking, secrets and publication are independent capabilities, not a prescribed workflow.
 
@@ -197,7 +204,7 @@ SDK's projected value. `machine.snapshots.rollback()` returns the same
 reconnectable `Operation` model; it does not silently replace live handles.
 Authorized resource geometry is available at
 `inspection.runtimeConfiguration.resources`, not a competing top-level copy.
-The current state format is 14 and the native SDK bridge is version 9. Incompatible
+The computer state format and native SDK bridge are version 1. Incompatible
 stores and bridges are rejected; existing stores are preserved, not migrated.
 
 `execution.output.seal(id, { operationId, boundary? })` creates an independent,
@@ -211,4 +218,4 @@ For a complete segment, use `{ kind: "continuing-retention", segment: id }`:
 source cleanup retains precisely the frames still owned by segments. Sealing
 alone does not rotate a producer's output quota or discard its guest spool.
 
-The breaking redesign remains incomplete. Native network attachments, unified storage recovery, full-state execution lineage and platform hardware qualification still require implementation or qualification; consult the reported capabilities and [security scope](../SECURITY.md).
+Native networking, unified storage recovery and immutable restored execution/output lineage are implemented but not qualified by compilation or API tests. Linux hardware qualification is a separate prerequisite-gated run. macOS and Windows complete external resource enforcement remains unsupported; these adapters refuse unenforced machine creation. Consult the reported capabilities and [security scope](../SECURITY.md).

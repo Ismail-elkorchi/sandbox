@@ -28,7 +28,7 @@ pub mod windows;
 /// confer host disk access; the adapter attaches only machine-owned disks.
 pub fn linux_boot_arguments(console: &str, root_device: &str) -> String {
     format!(
-        "console={console} reboot=k panic=1 root={root_device} rw init=/sbin/init bdev_allow_write_mounted=1"
+        "console={console} reboot=k panic=0 root={root_device} rw init=/sbin/init bdev_allow_write_mounted=1"
     )
 }
 
@@ -38,8 +38,32 @@ pub enum GuestArchitecture {
     Arm64,
 }
 
-/// Native guest power mechanisms, not management-service health. A guest
-/// reset which exits the VMM is not a supported ordinary computer reboot.
+/// A serial device attachment. Input is never the native launch/control
+/// channel. Dropping this attachment does not request native power changes.
+pub struct NativeConsole {
+    pub input: Box<dyn std::io::Write + Send>,
+    pub output: Box<dyn std::io::Read + Send>,
+}
+
+pub fn native_console_capability() -> Capability {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )) {
+        Capability::Supported { qualification: Qualification::Unqualified {
+            reasons: vec!["Native serial attachment and bounded host capture require real-hardware qualification for this image and device configuration".into()],
+        } }
+    } else {
+        Capability::Unsupported {
+            reasons: vec![
+                "This native adapter has no independent bidirectional serial attachment".into(),
+            ],
+        }
+    }
+}
+
+/// Native guest power mechanisms, independently of management-service health.
 pub fn guest_power_capabilities() -> GuestPowerCapabilities {
     let shutdown = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Capability::Unsupported {
@@ -58,10 +82,16 @@ pub fn guest_power_capabilities() -> GuestPowerCapabilities {
     };
     GuestPowerCapabilities {
         shutdown,
-        reboot: Capability::Unsupported {
+        reboot: if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Capability::Supported { qualification: Qualification::Unqualified {
+                reasons: vec!["Firecracker 1.17 i8042 reset metrics plus clean contained exit permit generation-fenced recovery; real-hardware qualification is missing".into()],
+            } }
+        } else {
+            Capability::Unsupported {
             reasons: vec![
-                "Ordinary guest reboot does not yet have native reset recovery and execution-generation rebinding; a native exit is observed as termination, not silently cold-booted".into(),
+                "The native adapter does not expose a distinct guest reset event for generation-fenced recovery; clean exit alone cannot distinguish reset from shutdown".into(),
             ],
+        }
         },
     }
 }
@@ -107,6 +137,13 @@ pub enum ConfigurationOutcome {
 /// for restore, infer success from API request delivery, or return before the
 /// reported native postcondition has been observed.
 pub trait MachineDriver {
+    fn take_console(&mut self) -> Option<NativeConsole> {
+        None
+    }
+    /// Consumed once, after the old VM and its process tree are contained.
+    fn take_guest_reset(&mut self) -> Option<Digest> {
+        None
+    }
     fn qualification(&self) -> DriverQualification;
     /// None means no live native attachment. Errors mean unavailable evidence,
     /// never a stopped computer. Observation must not start or replace a VM.
@@ -271,12 +308,21 @@ fn validate_outcome(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn power_support_does_not_claim_guest_reset_recovery_or_acpi_on_firecracker_x86() {
+    fn power_support_reports_native_reset_recovery_without_hardware_qualification() {
         let capabilities = super::guest_power_capabilities();
-        assert!(matches!(
-            capabilities.reboot,
-            super::Capability::Unsupported { .. }
-        ));
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(matches!(
+                capabilities.reboot,
+                super::Capability::Supported {
+                    qualification: super::Qualification::Unqualified { .. }
+                }
+            ));
+        } else {
+            assert!(matches!(
+                capabilities.reboot,
+                super::Capability::Unsupported { .. }
+            ));
+        }
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert!(matches!(
                 capabilities.shutdown,
@@ -536,6 +582,10 @@ mod tests {
             let arguments = linux_boot_arguments(console, disk);
             assert!(arguments.contains(&format!("console={console} ")));
             assert!(arguments.contains(&format!("root={disk} ")));
+            assert!(
+                arguments.contains("reboot=k panic=0"),
+                "kernel panic cannot authorize native reset recovery"
+            );
             assert!(arguments.contains("rw init=/sbin/init bdev_allow_write_mounted=1"));
         }
     }

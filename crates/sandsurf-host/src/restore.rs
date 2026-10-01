@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::path::Path;
 
-const MAX_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_RECORD_BYTES: u64 = sandsurf_protocol::MAX_CONTROL_BYTES as u64;
 const RECORD: &str = "restore-integration.json";
 
 #[derive(Serialize, Deserialize)]

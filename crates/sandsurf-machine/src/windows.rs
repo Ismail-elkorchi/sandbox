@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::System::HostComputeSystem::{
@@ -33,6 +36,46 @@ use windows_sys::core::{HRESULT, PWSTR};
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const OBSERVATION_TIMEOUT_MS: u32 = 250;
 const OWNER: &str = "Sandsurf";
+
+/// HCS exposes COM1 through its native named-pipe server (schema 2.1+).
+/// NOWAIT bounds guardian input; output polling belongs to the capture worker.
+struct SerialPipe {
+    file: File,
+    stopped: Arc<AtomicBool>,
+}
+impl Read for SerialPipe {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.file.read(bytes) {
+                Err(error) if error.raw_os_error() == Some(232) => {
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Ok(0);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.raw_os_error() == Some(109) => return Ok(0),
+                result => return result,
+            }
+        }
+    }
+}
+impl Write for SerialPipe {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native serial attachment stopped",
+            ));
+        }
+        match self.file.write(bytes) {
+            Err(error) if error.raw_os_error() == Some(232) => Ok(0),
+            result => result,
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HyperVQualification {
@@ -97,6 +140,10 @@ pub enum HyperVOperationError {
 
 /// The exclusive guardian owner of one HCS compute-system handle.
 pub struct HyperVDriver {
+    pending_network: Option<sandsurf_network::windows::IsolatedEndpoint>,
+    serial_pipe: String,
+    serial_taken: bool,
+    serial_stopped: Arc<AtomicBool>,
     config: HyperVConfig,
     system: Option<SystemHandle>,
     granted_disks: Vec<PathBuf>,
@@ -173,6 +220,10 @@ impl HyperVDriver {
     pub fn new(config: HyperVConfig) -> Result<Self, HyperVConfigError> {
         config.validate()?;
         Ok(Self {
+            pending_network: None,
+            serial_pipe: format!(r"\\.\pipe\sandsurf-serial-{}-0", config.vm_id),
+            serial_taken: false,
+            serial_stopped: Arc::new(AtomicBool::new(false)),
             config,
             system: None,
             granted_disks: Vec::new(),
@@ -188,6 +239,20 @@ impl HyperVDriver {
 
     pub fn default_timeout() -> Duration {
         DEFAULT_OPERATION_TIMEOUT
+    }
+
+    pub fn configure_network(
+        &self,
+        policy: &sandsurf_protocol::NetworkPolicy,
+        exposures: &[sandsurf_protocol::Exposure],
+    ) -> io::Result<()> {
+        let endpoint = self
+            .system
+            .as_ref()
+            .map(|s| &s._network)
+            .or(self.pending_network.as_ref())
+            .ok_or_else(|| io::Error::other("native isolated NIC is unavailable"))?;
+        endpoint.configure(policy, exposures)
     }
 
     pub fn stage_storage_custody(&mut self, custody: Arc<File>) -> std::io::Result<()> {
@@ -240,15 +305,7 @@ impl HyperVDriver {
             unsafe { HcsResumeComputeSystem(system, operation, wide("{}").as_ptr()) }
         })
         .map_err(HyperVOperationError::from)?;
-        self.capture_paused = false;
-        self.full_capture_operation = None;
-        self.committed_suspend = None;
-        if let Some(path) = self.full_capture_state.take()
-            && !self.revoke_path_access(&path)
-        {
-            return Err(HyperVOperationError::OutcomeUnknown);
-        }
-        Ok(())
+        self.finish_capture_without_resume()
     }
 
     /// Adopt an already published native pause without executing guest code.
@@ -260,16 +317,17 @@ impl HyperVDriver {
         Ok(())
     }
 
-    /// Finish a capture without silently resuming a publicly paused machine.
-    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), HyperVOperationError> {
+    /// Retire capture bookkeeping without changing observed native power.
+    pub fn finish_capture_without_resume(&mut self) -> Result<(), HyperVOperationError> {
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;
-        if let Some(path) = self.full_capture_state.take()
+        if let Some(path) = self.full_capture_state.clone()
             && !self.revoke_path_access(&path)
         {
             return Err(HyperVOperationError::OutcomeUnknown);
         }
+        self.full_capture_state = None;
         Ok(())
     }
 
@@ -392,6 +450,36 @@ impl HyperVDriver {
             return self.rollback_grants_or(self.unavailable(b"hcs-restore-state-access"));
         }
 
+        self.serial_stopped.store(true, Ordering::Release);
+        self.serial_stopped = Arc::new(AtomicBool::new(false));
+        self.serial_taken = false;
+        self.serial_pipe = format!(
+            r"\\.\pipe\sandsurf-serial-{}-{}",
+            self.config.vm_id,
+            generation.get()
+        );
+        let endpoint = match sandsurf_network::windows::IsolatedEndpoint::create(
+            sandsurf_network::LinkIdentity::for_machine(&self.config.machine_id),
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                return self.rollback_grants_or(
+                    self.unavailable(b"hcn-native-isolated-endpoint-setup-failed"),
+                );
+            }
+        };
+        if endpoint
+            .configure(
+                &command.configuration.network,
+                &command.configuration.exposures,
+            )
+            .is_err()
+        {
+            return self.rollback_grants_or(
+                self.unavailable(b"windows-native-external-network-unsupported"),
+            );
+        }
+        self.pending_network = Some(endpoint);
         let configuration = match serde_json::to_string(&self.hcs_configuration(restore_state)) {
             Ok(value) => value,
             Err(_) => {
@@ -421,6 +509,10 @@ impl HyperVDriver {
             return self.rollback_grants_or(not_applied_hresult("hcs-create", dispatched));
         }
         let Some(system) = NonNull::new(raw_system).map(|raw| SystemHandle {
+            _network: self
+                .pending_network
+                .take()
+                .expect("native endpoint was prepared"),
             raw,
             _storage_custody: storage_custody,
         }) else {
@@ -585,6 +677,9 @@ impl HyperVDriver {
     }
 
     fn rollback_grants_or(&mut self, outcome: MachineOutcome) -> MachineOutcome {
+        if self.system.is_none() {
+            self.pending_network.take();
+        }
         if self.revoke_disk_access() {
             outcome
         } else {
@@ -616,6 +711,7 @@ impl HyperVDriver {
                 }
             }
             self.system.take();
+            self.serial_stopped.store(true, Ordering::Release);
         }
         if !self.revoke_disk_access() {
             confirmed = false;
@@ -684,6 +780,26 @@ impl HyperVDriver {
                     },
                 },
                 devices: Devices {
+                    network_adapters: self
+                        .pending_network
+                        .as_ref()
+                        .or_else(|| self.system.as_ref().map(|s| &s._network))
+                        .map(|endpoint| {
+                            BTreeMap::from([(
+                                endpoint.id().to_owned(),
+                                NetworkAdapter {
+                                    endpoint_id: endpoint.id().to_owned(),
+                                    mac_address: endpoint.mac_address(),
+                                },
+                            )])
+                        })
+                        .unwrap_or_default(),
+                    com_ports: BTreeMap::from([(
+                        "0",
+                        ComPort {
+                            named_pipe: &self.serial_pipe,
+                        },
+                    )]),
                     scsi: Scsi {
                         primary_disk: Controller { attachments },
                     },
@@ -705,6 +821,43 @@ impl HyperVDriver {
 }
 
 impl MachineDriver for HyperVDriver {
+    fn take_console(&mut self) -> Option<crate::NativeConsole> {
+        if self.system.is_none() || self.serial_taken {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.serial_pipe)
+            .ok()?;
+        let mode = windows_sys::Win32::System::Pipes::PIPE_READMODE_BYTE
+            | windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
+        // SAFETY: a live, owned native pipe handle and valid scalar mode;
+        // null buffer-size/time pointers leave the other pipe settings intact.
+        if unsafe {
+            windows_sys::Win32::System::Pipes::SetNamedPipeHandleState(
+                file.as_raw_handle(),
+                &mode,
+                ptr::null(),
+                ptr::null(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        let input = file.try_clone().ok()?;
+        self.serial_taken = true;
+        Some(crate::NativeConsole {
+            input: Box::new(SerialPipe {
+                file: input,
+                stopped: self.serial_stopped.clone(),
+            }),
+            output: Box::new(SerialPipe {
+                file,
+                stopped: self.serial_stopped.clone(),
+            }),
+        })
+    }
     fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
         if self.system.is_none() {
             self.revoke_disk_access();
@@ -730,6 +883,7 @@ impl MachineDriver for HyperVDriver {
             )
             .map_err(|_| bytes_digest(b"hyper-v-native-exit-evidence-invalid"))?;
             self.system.take();
+            self.serial_stopped.store(true, Ordering::Release);
             // Failed revocation remains owned for retry; it does not erase
             // confirmed native exit evidence.
             self.revoke_disk_access();
@@ -911,6 +1065,7 @@ impl MachineDriver for HyperVDriver {
         // its sole handle with last-handle termination configured releases the
         // native system without allowing further guest disk writes.
         self.system.take();
+        self.serial_stopped.store(true, Ordering::Release);
         if !self.revoke_disk_access() {
             return MachineOutcome::Unknown;
         }
@@ -1006,6 +1161,7 @@ impl MachineDriver for HyperVDriver {
 
 impl Drop for HyperVDriver {
     fn drop(&mut self) {
+        self.serial_stopped.store(true, Ordering::Release);
         // Last-handle termination is configured as a second containment layer;
         // explicit terminate/wait remains required for a confirmed outcome.
         self.contain_uncertain_machine();
@@ -1044,6 +1200,7 @@ impl Drop for OperationHandle {
 }
 
 struct SystemHandle {
+    _network: sandsurf_network::windows::IsolatedEndpoint,
     raw: NonNull<c_void>,
     _storage_custody: Arc<File>,
 }
@@ -1256,9 +1413,25 @@ struct Processor {
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct Devices<'a> {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    network_adapters: BTreeMap<String, NetworkAdapter<'a>>,
+    com_ports: BTreeMap<&'static str, ComPort<'a>>,
     scsi: Scsi<'a>,
     #[serde(rename = "HvSocket")]
     hv_socket: HvSocket<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NetworkAdapter<'a> {
+    endpoint_id: String,
+    mac_address: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ComPort<'a> {
+    named_pipe: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1368,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_closed_no_network_configuration() {
+    fn unprepared_configuration_has_no_unowned_network_attachment() {
         let driver = HyperVDriver::new(config()).unwrap();
         let value = serde_json::to_value(driver.hcs_configuration(None)).unwrap();
         assert_eq!(value["SchemaVersion"]["Major"], 2);
@@ -1415,6 +1588,10 @@ mod tests {
     fn emits_linux_direct_boot_and_vsock_services() {
         let driver = HyperVDriver::new(config()).unwrap();
         let value = serde_json::to_value(driver.hcs_configuration(None)).unwrap();
+        assert_eq!(
+            value["VirtualMachine"]["Devices"]["ComPorts"]["0"]["NamedPipe"],
+            r"\\.\pipe\sandsurf-serial-da57a1f0-3ca8-4f20-9802-21e8df32a9b1-0"
+        );
         assert_eq!(
             value["VirtualMachine"]["Chipset"]["LinuxKernelDirect"]["KernelFilePath"],
             r"C:\Sandsurf\kernel"

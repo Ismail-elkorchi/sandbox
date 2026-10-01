@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -41,7 +41,7 @@ for (const [path, expected] of Object.entries(nativeManifest.files)) {
   if (match === null) continue;
   const architecture = match[1]!;
   if ((architecture === "x64") !== (match[3] === "x86_64")) throw new Error("Firecracker architecture mismatch");
-  const actual = createHash("sha256").update(await readFile(resolve(nativeRoot, path))).digest("hex");
+  const actual = await sha256File(resolve(nativeRoot, path), 512 * 1024 ** 2);
   if (expected !== actual) throw new Error(`native supply-chain digest mismatch: ${path}`);
   nativeComponents.push({
     type: "application",
@@ -77,7 +77,7 @@ async function generate(rootNames: readonly string[], npmName: string, destinati
     bomFormat: "CycloneDX",
     specVersion: "1.5",
     version: 1,
-    metadata: { component: { type: "application", name: npmName, version: "0.1.0" } },
+    metadata: { component: { type: "application", name: npmName, version: "1.0.0" } },
     components,
   };
   await writeFile(resolve(destination, "SBOM.cdx.json"), `${JSON.stringify(sbom, null, 2)}\n`, { mode: 0o644 });

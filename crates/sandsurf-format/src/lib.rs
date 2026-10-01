@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter};
 
-const FORMAT_DOMAIN: &[u8] = b"SBX-DIGEST-1";
+const FORMAT_DOMAIN: &[u8] = b"SANDSURF-COMPUTER-DIGEST-1";
 
 #[derive(Debug)]
 pub enum DigestError {

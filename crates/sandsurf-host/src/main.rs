@@ -9,7 +9,7 @@ const MAX_BRIDGE_BYTES: usize =
     sandsurf_protocol::MAX_RPC_DATA_BYTES + sandsurf_protocol::MAX_CONTROL_BYTES + 4;
 const MAX_BRIDGE_PENDING: usize = 64;
 const BRIDGE_WORKERS: usize = 8;
-const BRIDGE_VERSION: u16 = 9;
+const BRIDGE_VERSION: u16 = 1;
 
 fn main() {
     if let Err(error) = run() {
@@ -43,11 +43,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "--linux-namespace-probe" {
         std::process::exit(sandsurf_machine::launcher::namespace_probe_main());
     }
+    #[cfg(target_os = "linux")]
+    if mode == "--linux-network-namespace-probe" {
+        std::process::exit(sandsurf_machine::launcher::network_namespace_probe_main());
+    }
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;
     match mode.as_str() {
-        "serve" => serve_host(&directory, std::env::current_exe()?)?,
-        "supervise" => sandsurf_host::supervision::serve(&directory, std::env::current_exe()?)?,
+        "storage-path" => {
+            let machine: MachineId = text_argument(&values, "--machine")?.try_into()?;
+            if !directory.is_absolute() {
+                return Err("storage directory must be absolute".into());
+            }
+            println!(
+                "{}",
+                directory
+                    .join("machines")
+                    .join(sandsurf_native::storage::object_name(machine.as_str()))
+                    .display()
+            );
+        }
+        "storage-volume" => {
+            let root = if values.iter().any(|value| value == "--machine") {
+                let machine: MachineId = text_argument(&values, "--machine")?.try_into()?;
+                directory
+                    .join("machines")
+                    .join(sandsurf_native::storage::object_name(machine.as_str()))
+            } else {
+                directory
+            };
+            match sandsurf_native::volume::inspect(&root) {
+                Ok(volume) => println!(
+                    "{}",
+                    serde_json::json!({"formatVersion":1,"path":root,"kind":"bounded","device":volume.device,"bytes":volume.bytes})
+                ),
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"formatVersion":1,"path":root,"kind":"unsupported","reason":error.to_string()})
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        "image-worker" => sandsurf_host::image_worker::serve(
+            &directory,
+            text_argument(&values, "--operation")?.try_into()?,
+        )?,
+        "serve" => {
+            #[cfg(target_os = "linux")]
+            if !managed_pool(
+                &directory,
+                sandsurf_native::service_pool::ServicePool::Api,
+                "serve",
+            )? {
+                return Ok(());
+            }
+            serve_host(&directory, std::env::current_exe()?)?;
+        }
+        "supervise" => {
+            #[cfg(target_os = "linux")]
+            if !managed_pool(
+                &directory,
+                sandsurf_native::service_pool::ServicePool::Supervisor,
+                "supervise",
+            )? {
+                return Ok(());
+            }
+            sandsurf_host::supervision::serve(&directory, std::env::current_exe()?)?;
+        }
         "supervisor-status" => {
             match sandsurf_host::supervision::call(
                 &directory,
@@ -78,6 +142,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("invalid native service role".into()),
             };
             windows_service::run(directory, service_name, std::env::current_exe()?, role)?;
+        }
+        "qualification-config" => {
+            #[cfg(target_os = "linux")]
+            {
+                let machine: MachineId = text_argument(&values, "--machine")?.try_into()?;
+                let machine_root = directory
+                    .join("machines")
+                    .join(sandsurf_native::storage::object_name(machine.as_str()));
+                let config = sandsurf_host::linux::read_config(
+                    &machine_root.join("guardian/config.json"),
+                    &machine,
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&sandsurf_host::linux::qualification_configuration(
+                        &config,
+                        &machine_root
+                    )?)?
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err("native hardware qualification is unavailable on this platform".into());
+        }
+        "qualification-accept" => {
+            let run_path = argument(&values, "--run")?;
+            let file = sandsurf_native::local::open_private_file(
+                &run_path,
+                sandsurf_native::PrivateFileAccess::ReadOnly,
+            )?;
+            let mut bytes = Vec::new();
+            file.take(65537).read_to_end(&mut bytes)?;
+            if bytes.len() > 65536 {
+                return Err("hardware run record exceeds bound".into());
+            }
+            let run = serde_json::from_slice(&bytes)?;
+            let evidence = argument(&values, "--evidence")?;
+            let operator = text_argument(&values, "--operator")?;
+            let record =
+                sandsurf_host::qualification::accept_linux(&directory, run, &evidence, &operator)?;
+            println!("{}", serde_json::to_string(&record)?);
         }
         "guardian" => {
             let machine: MachineId = argument(&values, "--machine")?
@@ -124,6 +228,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("invalid Sandsurf host mode".into()),
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn managed_pool(
+    directory: &Path,
+    pool: sandsurf_native::service_pool::ServicePool,
+    mode: &str,
+) -> io::Result<bool> {
+    sandsurf_native::local::ensure_private_directory(directory)?;
+    let root = sandsurf_native::local::canonical_private_directory(directory)?;
+    if pool.current(&root)? {
+        return Ok(true);
+    }
+    let unit = pool.unit(&root)?;
+    let mut start = std::process::Command::new("systemd-run");
+    start.args([
+        "--user",
+        "--quiet",
+        "--collect",
+        "--service-type=exec",
+        "--unit",
+        &unit,
+    ]);
+    for property in pool.properties() {
+        start.arg(format!("--property={property}"));
+    }
+    start
+        .arg(std::env::current_exe()?)
+        .arg(mode)
+        .arg("--directory")
+        .arg(root);
+    sandsurf_native::resources::run_bounded(start)?;
+    Ok(false)
 }
 
 fn run_bridge(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -355,7 +492,7 @@ fn bridge_payload(id: u64, response: &HostResponse, data: &[u8]) -> Vec<u8> {
     payload
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn text_argument(values: &[std::ffi::OsString], name: &str) -> Result<String, &'static str> {
     argument(values, name)?
         .into_os_string()

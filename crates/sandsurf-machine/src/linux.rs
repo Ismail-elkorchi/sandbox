@@ -81,9 +81,15 @@ pub struct FirecrackerDriver<F> {
     full_snapshot: Option<FirecrackerSnapshot>,
     committed_suspend: Option<(OperationId, Digest)>,
     staged_restore: Option<FirecrackerRestoreSource>,
+    guest_reset: Option<Digest>,
 }
 
 impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
+    /// Native qualification changes whenever exact host device/resources
+    /// configuration changes. A prior hardware run cannot qualify a new shape.
+    pub fn set_qualification(&mut self, qualification: FirecrackerQualification) {
+        self.qualification = qualification;
+    }
     pub fn new(
         machine_id: MachineId,
         guest_architecture: GuestArchitecture,
@@ -102,6 +108,7 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
             full_snapshot: None,
             committed_suspend: None,
             staged_restore: None,
+            guest_reset: None,
         }
     }
 
@@ -346,21 +353,30 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
     }
 
     fn remove_full_snapshot(&mut self) -> Result<(), Digest> {
-        let Some(snapshot) = self.full_snapshot.take() else {
+        let Some(snapshot) = self.full_snapshot.as_ref() else {
             return Ok(());
         };
-        for path in [snapshot.snapshot_state, snapshot.snapshot_memory] {
+        for path in [&snapshot.snapshot_state, &snapshot.snapshot_memory] {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(bytes_digest(b"firecracker-snapshot-cleanup-failed")),
             }
         }
+        self.full_snapshot = None;
         Ok(())
     }
 }
 
 impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
+    fn take_console(&mut self) -> Option<crate::NativeConsole> {
+        self.process
+            .as_mut()
+            .and_then(FirecrackerProcess::take_console)
+    }
+    fn take_guest_reset(&mut self) -> Option<Digest> {
+        self.guest_reset.take()
+    }
     fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
         let Some(process) = self.process.as_mut() else {
             return Ok(None);
@@ -373,6 +389,7 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
             MachineState::Stopped | MachineState::Failed
         ) {
             // observe_power confirmed and reaped the confined process tree.
+            self.guest_reset = process.guest_reset_evidence();
             self.process.take();
             self.boot_resources = None;
             self.capture_paused = false;

@@ -18,7 +18,6 @@ struct Binding {
     generation: Counter,
     boot_digest: Digest,
     capability: [u8; 32],
-    network_capability: [u8; 32],
 }
 
 pub fn load(path: &Path, boot_id: &GuestBootId) -> io::Result<Option<BootIdentity>> {
@@ -61,7 +60,6 @@ pub fn load(path: &Path, boot_id: &GuestBootId) -> io::Result<Option<BootIdentit
         generation: value.generation,
         boot_digest: value.boot_digest,
         capability: BootCapability::from_bytes(value.capability),
-        network_capability: value.network_capability,
     }))
 }
 
@@ -72,7 +70,6 @@ pub fn save(path: &Path, boot_id: &GuestBootId, identity: &BootIdentity) -> io::
         generation: identity.generation,
         boot_digest: identity.boot_digest.clone(),
         capability: identity.capability.secret_bytes(),
-        network_capability: identity.network_capability,
     };
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
@@ -113,7 +110,6 @@ mod tests {
             generation: Counter::ONE,
             boot_digest: sandsurf_protocol::bytes_digest(b"initial"),
             capability: BootCapability::from_bytes([1; 32]),
-            network_capability: [2; 32],
         };
         assert!(load(&path, &boot).unwrap().is_none());
         save(&path, &boot, &identity).unwrap();

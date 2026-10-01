@@ -16,6 +16,165 @@ use std::path::{Path, PathBuf};
 
 const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
+/// Read the host's frozen boot record, never the mutable guest's next selection.
+pub(crate) fn read_boot(directory: &Path) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    let file = open_private_file(&directory.join("boot.json"), PrivateFileAccess::ReadOnly)?;
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes)?;
+    if bytes.len() > 8192 {
+        return Err(invalid("frozen boot record exceeds bound"));
+    }
+    let boot = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    sandsurf_image::boot::verify(directory, &boot)?;
+    Ok(boot)
+}
+
+/// Transfer the actual boot artifacts of a native owner or full snapshot.
+/// Publication is atomic and retryable; a memory capture never interprets the
+/// guest disk or substitutes the kernel selected for its next cold boot.
+pub(crate) fn copy_boot(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    let boot = read_boot(source)?;
+    if destination.exists() {
+        if read_boot(destination)? != boot {
+            return Err(invalid("frozen boot publication conflict"));
+        }
+        return Ok(boot);
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid("boot destination has no owner"))?;
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let stage = parent.join(format!(".boot-{nonce}.stage"));
+    sandsurf_native::local::create_private_directory(&stage)?;
+    let result = (|| {
+        for (artifact, bound) in std::iter::once((&boot.kernel, sandsurf_image::boot::MAX_KERNEL))
+            .chain(
+                boot.initramfs
+                    .iter()
+                    .map(|v| (v, sandsurf_image::boot::MAX_INITRAMFS)),
+            )
+        {
+            let mut input =
+                open_private_file(&source.join(&artifact.path), PrivateFileAccess::ReadOnly)?;
+            let mut output = create_private_file(&stage.join(&artifact.path))?;
+            if io::copy(&mut Read::by_ref(&mut input).take(bound + 1), &mut output)? > bound {
+                return Err(invalid("frozen boot artifact exceeds bound"));
+            }
+            sync_file(&output)?;
+            drop(output);
+            let mut permissions = fs::metadata(stage.join(&artifact.path))?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(stage.join(&artifact.path), permissions)?;
+        }
+        sandsurf_image::boot::verify(&stage, &boot)?;
+        let mut record = create_private_file(&stage.join("boot.json"))?;
+        record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
+        sync_file(&record)?;
+        sync_directory(&stage)?;
+        match sandsurf_native::storage::publish_new_directory(&stage, destination) {
+            Ok(()) => sync_directory(parent),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_boot(destination)? != boot {
+                    return Err(invalid("frozen boot publication conflict"));
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    // Only this call's freshly created stage is reclaimed.
+    if stage.exists() {
+        fs::remove_dir_all(&stage)?;
+    }
+    result?;
+    Ok(boot)
+}
+
+pub(crate) fn pin_boot(
+    kernel: &Path,
+    initramfs: Option<&Path>,
+    architecture: sandsurf_image::Architecture,
+    directory: &Path,
+) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    use sandsurf_image::boot;
+    sandsurf_native::local::create_private_directory(directory)?;
+    let copy =
+        |input: &Path, name: &str, maximum: u64| -> io::Result<sandsurf_image::ImageArtifact> {
+            let mut source = open_private_file(input, PrivateFileAccess::ReadOnly)?;
+            let mut output = create_private_file(&directory.join(name))?;
+            if io::copy(
+                &mut Read::by_ref(&mut source).take(maximum + 1),
+                &mut output,
+            )? > maximum
+            {
+                return Err(invalid("pinned boot artifact exceeds bound"));
+            }
+            sync_file(&output)?;
+            drop(output);
+            let artifact = boot::artifact(&directory.join(name), name, maximum)?;
+            let mut permissions = fs::metadata(directory.join(name))?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(directory.join(name), permissions)?;
+            Ok(artifact)
+        };
+    let boot = boot::FrozenBoot {
+        architecture,
+        kernel: copy(kernel, "kernel", boot::MAX_KERNEL)?,
+        initramfs: initramfs
+            .map(|path| copy(path, "initramfs", boot::MAX_INITRAMFS))
+            .transpose()?,
+    };
+    boot::verify(directory, &boot)?;
+    let mut record = create_private_file(&directory.join("boot.json"))?;
+    record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
+    sync_file(&record)?;
+    sync_directory(directory)?;
+    Ok(boot)
+}
+
+/// Caller owns a detached disk lease or an immutable captured disk. Corrupt
+/// selection never falls back to the creation kernel.
+pub(crate) fn freeze_boot(
+    image: &sandsurf_image::VerifiedImage,
+    disk: &Path,
+    directory: &Path,
+) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    use sandsurf_image::boot::{self, BootProfile};
+    if image.manifest.boot_bundle.profile == BootProfile::Pinned {
+        let boot = pin_boot(
+            &image.kernel_path,
+            image.initramfs_path.as_deref(),
+            image.manifest.architecture,
+            directory,
+        )?;
+        if boot.kernel.sha256 != image.manifest.boot_bundle.kernel.sha256
+            || boot.initramfs.as_ref().map(|v| &v.sha256)
+                != image
+                    .manifest
+                    .boot_bundle
+                    .initramfs
+                    .as_ref()
+                    .map(|v| &v.sha256)
+        {
+            return Err(invalid("pinned boot inputs changed"));
+        }
+        return Ok(boot);
+    }
+    sandsurf_native::local::create_private_directory(directory)?;
+    let boot = boot::extract(disk, directory, image.manifest.architecture)?;
+    boot::verify(directory, &boot)?;
+    let mut record = create_private_file(&directory.join("boot.json"))?;
+    record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
+    sync_file(&record)?;
+    sync_directory(directory)?;
+    Ok(boot)
+}
+
 /// Never acquire a mutation/attachment lease, repair a slot, open a filesystem,
 /// or infer native detach just to report storage observations.
 pub(crate) fn inspect(destination: &Path) -> crate::api::StorageInspection {
@@ -78,11 +237,18 @@ pub(crate) enum DiskFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DiskObject {
+    family: DiskFamily,
     version: u32,
     filename: String,
     bytes: u64,
     format: DiskFormat,
     phase: DiskPhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DiskFamily {
+    LinuxComputer,
 }
 
 /// One bounded reader/validator for both storage mutation and observation.
@@ -105,7 +271,7 @@ fn read_record(destination: &Path) -> io::Result<Option<DiskObject>> {
     }
     let record: DiskObject =
         serde_json::from_slice(&bytes).map_err(|_| invalid("invalid storage ownership record"))?;
-    if record.version != 2
+    if record.version != 1
         || destination.file_name().and_then(|name| name.to_str()) != Some(record.filename.as_str())
         || record.bytes == 0
         || record.bytes > MAX_DISK_BYTES
@@ -199,7 +365,8 @@ impl DiskOwner {
                 return Err(invalid("untracked storage cannot be adopted or replaced"));
             }
             DiskObject {
-                version: 2,
+                family: DiskFamily::LinuxComputer,
+                version: 1,
                 filename: filename.to_owned(),
                 bytes,
                 format,
@@ -635,6 +802,37 @@ mod tests {
     use std::io::Write;
 
     struct Fixture(std::path::PathBuf);
+
+    #[test]
+    fn running_boot_publication_preserves_bytes_and_rejects_reference_only_or_changed_sources() {
+        let fixture = Fixture::new();
+        let kernel = fixture.0.join("kernel");
+        let mut bytes = vec![0; 4096];
+        bytes[0x202..0x206].copy_from_slice(b"HdrS");
+        bytes[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        bytes[0x236] = 1;
+        create_private_file(&kernel)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let source = fixture.0.join("native-boot");
+        let published = fixture.0.join("snapshot-boot");
+        let boot = pin_boot(&kernel, None, sandsurf_image::Architecture::X64, &source).unwrap();
+        assert_eq!(copy_boot(&source, &published).unwrap(), boot);
+        assert_eq!(
+            copy_boot(&source, &published).unwrap(),
+            boot,
+            "exact retries reuse publication"
+        );
+        fs::remove_file(source.join("kernel")).unwrap();
+        assert!(copy_boot(&source, &fixture.0.join("reference-only")).is_err());
+        assert_eq!(
+            read_boot(&published).unwrap(),
+            boot,
+            "original deletion cannot erase captured bytes"
+        );
+        assert_eq!(fs::read(published.join("kernel")).unwrap(), bytes);
+    }
 
     impl Fixture {
         fn new() -> Self {
@@ -1256,7 +1454,7 @@ mod tests {
         create_disk(&target, 1);
         let path = target.with_extension("storage.json");
         let mut old: DiskObject = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        old.version = 1;
+        old.version = 2;
         let original = serde_json::to_vec(&old).unwrap();
         fs::write(&path, &original).unwrap();
         assert!(DiskOwner::open(&target, None).is_err());

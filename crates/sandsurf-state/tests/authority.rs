@@ -36,13 +36,8 @@ fn hash(value: &str) -> Digest {
     bytes_digest(value.as_bytes())
 }
 fn resources() -> Resources {
-    Resources {
-        vcpus: n(2),
-        memory_mib: n(4096),
-        disk_bytes: n(100_000),
-        output_bytes: n(1000),
-        managed_executions: n(8),
-    }
+    Resources::from_geometry(n(2), n(4096), n(100_000), n(1000), n(8))
+        .expect("static resource envelope")
 }
 fn catalog_limits() -> CatalogLimits {
     CatalogLimits {
@@ -50,13 +45,8 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(100),
         usage_records: n(100),
         image_bytes: n(400_000),
-        resources: Resources {
-            vcpus: n(8),
-            memory_mib: n(16384),
-            disk_bytes: n(400_000),
-            output_bytes: n(4000),
-            managed_executions: n(32),
-        },
+        resources: Resources::from_geometry(n(8), n(16384), n(400_000), n(4000), n(32))
+            .expect("static resource envelope"),
     }
 }
 
@@ -69,7 +59,23 @@ fn incompatible_state_generation_is_rejected_without_rewriting_the_catalog() {
     drop(host);
     let database = path.join("authority.sqlite");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection.execute_batch("PRAGMA user_version=13;").unwrap();
+    connection.execute_batch("PRAGMA user_version=2;").unwrap();
+    drop(connection);
+    let original = fs::read(&database).unwrap();
+    assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
+    assert_eq!(fs::read(&database).unwrap(), original);
+}
+
+#[test]
+fn earlier_version_one_catalog_family_is_rejected_without_migration() {
+    let root = TempRoot::new();
+    let path = root.0.join("old-family");
+    drop(HostCatalog::create(&path, "version-test".try_into().unwrap(), catalog_limits()).unwrap());
+    let database = path.join("authority.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA application_id=1397968177; PRAGMA user_version=1;")
+        .unwrap();
     drop(connection);
     let original = fs::read(&database).unwrap();
     assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
@@ -1096,9 +1102,13 @@ fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
 }
 
 #[test]
-fn live_usage_stays_monotonic_across_a_new_machine_generation() {
+fn native_counter_identity_is_independent_of_execution_generation() {
     let mut fixture = Fixture::new();
-    let sample = |cpu, network, peak| ResourceUsage {
+    let sample = |epoch: &str, cpu, network, peak| ResourceUsage {
+        provenance: sandsurf_protocol::ResourceProvenance::default(),
+        host_counter_epoch: Some(hash(epoch)),
+        channels_current: None,
+        inflight_requests_current: None,
         cpu_micros: Some(n(cpu)),
         memory_current: Some(n(10)),
         memory_peak: Some(n(peak)),
@@ -1112,28 +1122,39 @@ fn live_usage_stays_monotonic_across_a_new_machine_generation() {
         network_connections: n(network),
         executions_current: n(1),
         complete: false,
-        source: "guest".into(),
+        source: "native-guardian".into(),
         observed_unix_millis: n(1000 + cpu),
     };
     let first = fixture
         .host
-        .observe_usage(&fixture.machine, n(1), sample(10, 20, 30))
+        .observe_usage(&fixture.machine, n(1), sample("guardian-one", 10, 20, 30))
         .unwrap();
     assert_eq!(first.cpu_micros, Some(n(10)));
     let same_generation = fixture
         .host
-        .observe_usage(&fixture.machine, n(1), sample(15, 24, 40))
+        .observe_usage(&fixture.machine, n(1), sample("guardian-one", 15, 24, 40))
         .unwrap();
     assert_eq!(same_generation.cpu_micros, Some(n(15)));
     assert_eq!(same_generation.network_rx_bytes, n(24));
     let next_generation = fixture
         .host
-        .observe_usage(&fixture.machine, n(2), sample(3, 25, 12))
+        .observe_usage(&fixture.machine, n(2), sample("guardian-one", 18, 25, 12))
         .unwrap();
     assert_eq!(next_generation.cpu_micros, Some(n(18)));
     assert_eq!(next_generation.io_write_bytes, Some(n(36)));
     assert_eq!(next_generation.network_rx_bytes, n(25));
     assert_eq!(next_generation.memory_peak, Some(n(40)));
+    let restarted_owner = fixture
+        .host
+        .observe_usage(&fixture.machine, n(3), sample("guardian-two", 2, 4, 12))
+        .unwrap();
+    assert_eq!(restarted_owner.cpu_micros, Some(n(20)));
+    assert_eq!(restarted_owner.network_rx_bytes, n(29));
+    let duplicate = fixture
+        .host
+        .observe_usage(&fixture.machine, n(3), sample("guardian-two", 2, 4, 12))
+        .unwrap();
+    assert_eq!(duplicate, restarted_owner);
 }
 
 fn rebind_command(value: &GuestCommand, identity: &str) -> GuestCommand {
@@ -1257,7 +1278,7 @@ fn dense_binary_admission_retains_commitments_and_never_replays_bytes_after_rest
         Counter::ONE,
         "dense-input".try_into().unwrap(),
         GuestRequest::WriteInput {
-            execution_id: "execution".try_into().unwrap(),
+            execution_id: f.process.clone(),
             terminal_lease_id: None,
             bytes: vec![255; MAX_STREAM_BYTES],
         },
@@ -1772,9 +1793,10 @@ fn host_configuration_operations_replay_immutable_results_without_reapplying_old
     let first_digest = hash("configure-first-request");
     let mut first_configuration = original.runtime_configuration.clone();
     first_configuration.network.rules = vec![NetworkRule {
-        plane: NetworkPlane::DirectTcp,
+        plane: NetworkPlane::Tcp,
         destination: NetworkDestination::Ip {
             cidr: "198.51.100.0/24".into(),
+            allow_private_addresses: false,
         },
         ports: vec![PortRange { from: 443, to: 443 }],
     }];
@@ -1897,9 +1919,10 @@ fn guardian_retries_only_configuration_dispatches_proven_not_applied() {
         .unwrap()
         .runtime_configuration;
     configuration.network.rules = vec![NetworkRule {
-        plane: NetworkPlane::DirectTcp,
+        plane: NetworkPlane::Tcp,
         destination: NetworkDestination::Ip {
             cidr: "198.51.100.0/24".into(),
+            allow_private_addresses: false,
         },
         ports: vec![PortRange { from: 443, to: 443 }],
     }];
@@ -3419,6 +3442,268 @@ fn captured_execution_membership_does_not_resurrect_released_history() {
     assert!(f.runtime.capture_executions(n(1)).unwrap().is_empty());
     assert_eq!(f.runtime.process_boundary(&f.process).unwrap(), boundary);
     assert!(f.runtime.receipt(&f.process).unwrap().is_some());
+}
+
+#[test]
+fn restore_admits_unobserved_incarnations_without_rewriting_history_or_sampling_a_later_anchor() {
+    let mut f = Fixture::new();
+    f.runtime
+        .append_output(&f.process, n(1), Stream::Stdout, b"captured")
+        .unwrap();
+    let capture = f.runtime.capture_executions(n(1)).unwrap();
+    let snapshot: SnapshotId = "snapshot-boundary".try_into().unwrap();
+    let (restored, lineage) = capture[0].restored(&snapshot, &f.machine, n(2)).unwrap();
+    f.runtime
+        .append_output(&f.process, n(2), Stream::Stderr, b"later-history")
+        .unwrap();
+    let original = f.runtime.process_request(&f.process).unwrap();
+    let original_boundary = f.runtime.process_boundary(&f.process).unwrap();
+    f.runtime
+        .restore_executions(&snapshot, &f.machine, n(1), n(2), &capture)
+        .unwrap();
+    assert_eq!(f.runtime.process_request(&f.process).unwrap(), original);
+    assert_eq!(f.runtime.execution_generation(&f.process).unwrap(), n(1));
+    assert_eq!(
+        f.runtime.process_boundary(&f.process).unwrap(),
+        original_boundary
+    );
+    assert!(f.runtime.process_snapshot(&f.process).unwrap().is_none());
+    assert!(
+        f.runtime
+            .process_snapshot(&restored.execution_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.runtime.process_request(&restored.execution_id).unwrap(),
+        restored
+    );
+    assert_eq!(lineage.output_anchor, capture[0].output);
+    assert_ne!(lineage.output_anchor, original_boundary);
+    assert_eq!(
+        f.runtime.execution_lineage(&restored.execution_id).unwrap(),
+        Some(lineage.clone())
+    );
+    let empty = initial_output_boundary(&f.machine, &restored.execution_id, n(2)).unwrap();
+    assert_eq!(
+        f.runtime.process_boundary(&restored.execution_id).unwrap(),
+        empty
+    );
+    f.runtime
+        .append_output(&restored.execution_id, n(1), Stream::Stdout, b"resumed")
+        .unwrap();
+    assert_eq!(
+        f.runtime
+            .read_output(&f.process, n(0), 128)
+            .unwrap()
+            .chunks
+            .len(),
+        2
+    );
+    assert_eq!(
+        f.runtime
+            .read_output(&restored.execution_id, n(0), 128)
+            .unwrap()
+            .chunks[0]
+            .bytes,
+        b"resumed"
+    );
+    let membership = f.runtime.capture_executions(n(2)).unwrap();
+    assert_eq!(membership.len(), 1);
+    assert!(membership[0].observation.is_none());
+    assert_eq!(membership[0].lineage, Some(lineage));
+    let next_snapshot: SnapshotId = "second-snapshot".try_into().unwrap();
+    f.runtime
+        .restore_executions(&next_snapshot, &f.machine, n(2), n(3), &membership)
+        .unwrap();
+    let (third, third_lineage) = membership[0]
+        .restored(&next_snapshot, &f.machine, n(3))
+        .unwrap();
+    assert_eq!(third_lineage.logical_execution_id, f.process);
+    assert_eq!(third_lineage.source_execution_id, restored.execution_id);
+    assert_eq!(
+        f.runtime.process_request(&third.execution_id).unwrap(),
+        third
+    );
+    // A retry after more history returns the same admission; changed capture
+    // membership cannot be smuggled into the already admitted generation.
+    f.runtime
+        .restore_executions(&snapshot, &f.machine, n(1), n(2), &capture)
+        .unwrap();
+    assert!(
+        f.runtime
+            .restore_executions(&snapshot, &f.machine, n(1), n(2), &[])
+            .is_err()
+    );
+    let other: MachineId = "different-machine".try_into().unwrap();
+    assert!(
+        f.runtime
+            .restore_executions(&snapshot, &other, n(1), n(4), &capture)
+            .is_err()
+    );
+    let root = f.root.0.join("runtime");
+    drop(f.runtime);
+    let reopened = RuntimeJournal::open(&root, &f.machine).unwrap();
+    assert_eq!(reopened.process_request(&f.process).unwrap(), original);
+    assert_eq!(
+        reopened.process_boundary(&f.process).unwrap(),
+        original_boundary
+    );
+    assert_eq!(reopened.capture_executions(n(2)).unwrap(), membership);
+}
+
+#[test]
+fn restored_receipts_do_not_replace_source_receipts_operations_or_retention_obligations() {
+    let mut f = Fixture::new();
+    let (source_receipt, source_digest) = f.terminal();
+    let source_operation = f.runtime.operation(&f.command.operation_id).unwrap();
+    let capture = f.runtime.capture_executions(n(1)).unwrap();
+    let snapshot: SnapshotId = "receipt-snapshot".try_into().unwrap();
+    f.runtime
+        .restore_executions(&snapshot, &f.machine, n(1), n(2), &capture)
+        .unwrap();
+    let (restored, _) = capture[0].restored(&snapshot, &f.machine, n(2)).unwrap();
+    f.runtime
+        .append_output(&restored.execution_id, n(1), Stream::Stdout, b"new-output")
+        .unwrap();
+    let (receipt, digest) = f
+        .runtime
+        .publish_receipt(
+            &restored.execution_id,
+            ExecutionOutcome::Exit { code: 7 },
+            hash("restored-cleanup"),
+            hash("restored-accounting"),
+        )
+        .unwrap();
+    assert_eq!(receipt.generation, n(2));
+    assert_ne!(receipt.output.final_hash, source_receipt.output.final_hash);
+    assert_eq!(
+        f.runtime.receipt(&f.process).unwrap(),
+        Some((source_receipt.clone(), source_digest.clone()))
+    );
+    assert_eq!(
+        f.runtime.operation(&f.command.operation_id).unwrap(),
+        source_operation
+    );
+    f.runtime
+        .acknowledge_receipt(
+            &"ack-restored".try_into().unwrap(),
+            &restored.execution_id,
+            &digest,
+        )
+        .unwrap();
+    assert_eq!(
+        f.runtime
+            .read_output(&f.process, n(0), 128)
+            .unwrap()
+            .chunks
+            .len(),
+        2
+    );
+    // Source evidence alone cannot discharge a restored stream obligation.
+    let source_segment: OutputSegmentId = "source-retention".try_into().unwrap();
+    f.runtime
+        .seal_output(
+            &"seal-source".try_into().unwrap(),
+            &f.process,
+            n(1),
+            Some(&source_receipt.output),
+            source_segment.clone(),
+        )
+        .unwrap();
+    let release = ReleaseRequest {
+        operation_id: "release-restored".try_into().unwrap(),
+        receipt_digest: digest,
+        output: receipt.output,
+        disposition: ReleaseDisposition::ContinuingRetention {
+            segment: source_segment,
+        },
+    };
+    assert!(f.runtime.release(&restored.execution_id, release).is_err());
+    assert_eq!(
+        f.runtime
+            .read_output(&restored.execution_id, n(0), 128)
+            .unwrap()
+            .chunks[0]
+            .bytes,
+        b"new-output"
+    );
+}
+
+#[test]
+fn restore_membership_and_anchor_validation_is_atomic_and_old_incarnations_reject_mutation() {
+    let mut f = Fixture::new();
+    let capture = f.runtime.capture_executions(n(1)).unwrap();
+    let snapshot: SnapshotId = "atomic-restore".try_into().unwrap();
+    let mut invalid = capture.clone();
+    invalid[0].output.final_hash = hash("forged-anchor");
+    let (restored, _) = capture[0].restored(&snapshot, &f.machine, n(2)).unwrap();
+    assert!(
+        f.runtime
+            .restore_executions(&snapshot, &f.machine, n(1), n(2), &invalid)
+            .is_err()
+    );
+    assert!(f.runtime.process_request(&restored.execution_id).is_err());
+    assert!(
+        f.runtime
+            .restore_executions(
+                &snapshot,
+                &f.machine,
+                n(1),
+                n(2),
+                &[capture[0].clone(), capture[0].clone()]
+            )
+            .is_err()
+    );
+    assert!(f.runtime.process_request(&restored.execution_id).is_err());
+    let mut native = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    native.sequence = n(4);
+    native.state = MachineState::Suspended;
+    f.runtime.observe(native.clone()).unwrap();
+    native.sequence = n(5);
+    native.generation = n(2);
+    native.state = MachineState::Restoring;
+    f.runtime.observe(native.clone()).unwrap();
+    f.runtime
+        .restore_executions(&snapshot, &f.machine, n(1), n(2), &capture)
+        .unwrap();
+    native.sequence = n(6);
+    native.state = MachineState::Running;
+    f.runtime.observe(native).unwrap();
+    let stale = GuestCommand::new(
+        f.machine.clone(),
+        n(2),
+        "stale-incarnation".try_into().unwrap(),
+        GuestRequest::Signal {
+            execution_id: f.process.clone(),
+            signal: 15,
+            group: false,
+        },
+    )
+    .unwrap();
+    assert!(f.runtime.admit(stale).is_err());
+    let current = GuestCommand::new(
+        f.machine.clone(),
+        n(2),
+        "current-incarnation".try_into().unwrap(),
+        GuestRequest::Signal {
+            execution_id: restored.execution_id,
+            signal: 15,
+            group: false,
+        },
+    )
+    .unwrap();
+    f.runtime.admit(current.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_dispatch(current).unwrap(),
+        DispatchDecision::Perform(_)
+    ));
 }
 
 #[test]

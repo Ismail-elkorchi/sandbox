@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -159,6 +160,9 @@ impl AppleConfig {
 }
 
 impl AppleDriver {
+    pub fn network(&self) -> Option<Arc<sandsurf_network::NativeNetworkGateway>> {
+        self.owner.as_ref().and_then(|owner| owner.network.clone())
+    }
     pub fn new(config: AppleConfig) -> Result<Self, AppleConfigError> {
         config.validate()?;
         Ok(Self {
@@ -174,6 +178,25 @@ impl AppleDriver {
 
     pub fn default_timeout() -> Duration {
         DEFAULT_OPERATION_TIMEOUT
+    }
+
+    pub fn stage_boot_artifacts(
+        &mut self,
+        kernel: PathBuf,
+        initial_ramdisk: Option<PathBuf>,
+    ) -> io::Result<()> {
+        if self.owner.is_some()
+            || !kernel.is_absolute()
+            || initial_ramdisk.as_ref().is_some_and(|p| !p.is_absolute())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "boot artifacts require a detached native owner",
+            ));
+        }
+        self.config.kernel = kernel;
+        self.config.initial_ramdisk = initial_ramdisk;
+        Ok(())
     }
 
     /// A pending native launch receives the storage owner's already-held
@@ -199,6 +222,7 @@ impl AppleDriver {
 
     fn helper_create(&self, machine_id: MachineId) -> HelperCreate {
         HelperCreate {
+            guest_mac: sandsurf_network::LinkIdentity::for_machine(&machine_id).mac_address(),
             machine_id,
             kernel: self.config.kernel.clone(),
             initial_ramdisk: self.config.initial_ramdisk.clone(),
@@ -238,11 +262,15 @@ impl AppleDriver {
         let Some(custody) = self.pending_storage_custody.take() else {
             return Self::unavailable(b"apple-storage-custody-missing");
         };
-        let mut owner =
-            match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout, custody) {
-                Ok(value) => value,
-                Err(_) => return Self::unavailable(b"apple-helper-not-started"),
-            };
+        let mut owner = match HelperOwner::spawn(
+            &self.config.helper,
+            self.config.operation_timeout,
+            custody,
+            sandsurf_network::LinkIdentity::for_machine(&self.config.machine_id),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+        };
         let response = owner.request(&HelperRequest::Create(Box::new(
             self.helper_create(command.machine_id.clone()),
         )));
@@ -394,8 +422,8 @@ impl AppleDriver {
         Ok(())
     }
 
-    /// Finish a capture without silently resuming a publicly paused machine.
-    pub fn finish_capture_preserving_pause(&mut self) -> Result<(), AppleRuntimeError> {
+    /// Retire capture bookkeeping without changing observed native power.
+    pub fn finish_capture_without_resume(&mut self) -> Result<(), AppleRuntimeError> {
         self.capture_paused = false;
         self.full_capture_operation = None;
         self.committed_suspend = None;
@@ -484,6 +512,9 @@ pub enum AppleRuntimeError {
 }
 
 impl MachineDriver for AppleDriver {
+    fn take_console(&mut self) -> Option<crate::NativeConsole> {
+        self.owner.as_mut().and_then(|owner| owner.console.take())
+    }
     fn observe_power(&mut self) -> Result<Option<crate::NativePowerObservation>, Digest> {
         let Some(owner) = self.owner.as_mut() else {
             return Ok(None);
@@ -713,11 +744,15 @@ impl MachineDriver for AppleDriver {
         let Some(custody) = self.pending_storage_custody.take() else {
             return Self::unavailable(b"apple-storage-custody-missing");
         };
-        let mut owner =
-            match HelperOwner::spawn(&self.config.helper, self.config.operation_timeout, custody) {
-                Ok(value) => value,
-                Err(_) => return Self::unavailable(b"apple-helper-not-started"),
-            };
+        let mut owner = match HelperOwner::spawn(
+            &self.config.helper,
+            self.config.operation_timeout,
+            custody,
+            sandsurf_network::LinkIdentity::for_machine(&self.config.machine_id),
+        ) {
+            Ok(value) => value,
+            Err(_) => return Self::unavailable(b"apple-helper-not-started"),
+        };
         let response = owner.request(&HelperRequest::Restore(Box::new(HelperRestore {
             machine: self.helper_create(command.machine_id.clone()),
             saved_state: source.saved_state,
@@ -813,6 +848,8 @@ impl Drop for AppleDriver {
 }
 
 struct HelperOwner {
+    network: Option<Arc<sandsurf_network::NativeNetworkGateway>>,
+    console: Option<crate::NativeConsole>,
     child: Child,
     input: Option<ChildStdin>,
     output: Arc<Mutex<ChildStdout>>,
@@ -827,12 +864,37 @@ struct PendingInspection {
 }
 
 impl HelperOwner {
-    fn spawn(path: &Path, timeout: Duration, custody: Arc<File>) -> io::Result<Self> {
+    fn spawn(
+        path: &Path,
+        timeout: Duration,
+        custody: Arc<File>,
+        link: sandsurf_network::LinkIdentity,
+    ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let (packets, device) = sandsurf_network::macos::packet_pair()?;
+        #[cfg(not(target_os = "macos"))]
+        let (packets, device) = std::os::unix::net::UnixDatagram::pair()?;
+        let network = Arc::new(sandsurf_network::NativeNetworkGateway::start(
+            sandsurf_network::PacketTransport::Datagram(packets),
+            link,
+        )?);
+        let network_device = Arc::new(File::from(std::os::fd::OwnedFd::from(device)));
+        let (serial_input, native_input) = UnixStream::pair()?;
+        let (serial_output, native_output) = UnixStream::pair()?;
+        serial_input.set_nonblocking(true)?;
+        let native_input = Arc::new(File::from(std::os::fd::OwnedFd::from(native_input)));
+        let native_output = Arc::new(File::from(std::os::fd::OwnedFd::from(native_output)));
         let mut command = Command::new(path);
         command
-            .arg("--sandsurf-owner-v2")
+            .arg("--sandsurf-owner-v1")
             .arg("--storage-custody-fd")
             .arg(custody.as_raw_fd().to_string())
+            .arg("--serial-input-fd")
+            .arg(native_input.as_raw_fd().to_string())
+            .arg("--serial-output-fd")
+            .arg(native_output.as_raw_fd().to_string())
+            .arg("--network-fd")
+            .arg(network_device.as_raw_fd().to_string())
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -840,8 +902,12 @@ impl HelperOwner {
         // SAFETY: the post-fork child only changes a descriptor flag through
         // an async-signal-safe syscall; custody owns the inherited description.
         unsafe {
-            command
-                .pre_exec(move || sandsurf_native::storage::retain_descriptor_for_exec(&custody));
+            command.pre_exec(move || {
+                sandsurf_native::storage::retain_descriptor_for_exec(&custody)?;
+                sandsurf_native::storage::retain_descriptor_for_exec(&native_input)?;
+                sandsurf_native::storage::retain_descriptor_for_exec(&native_output)?;
+                sandsurf_native::storage::retain_descriptor_for_exec(&network_device)
+            });
         }
         let mut child = command.spawn()?;
         let input = child
@@ -853,6 +919,11 @@ impl HelperOwner {
             .take()
             .ok_or_else(|| io::Error::other("helper stdout unavailable"))?;
         Ok(Self {
+            network: Some(network),
+            console: Some(crate::NativeConsole {
+                input: Box::new(serial_input),
+                output: Box::new(serial_output),
+            }),
             child,
             input: Some(input),
             output: Arc::new(Mutex::new(output)),
@@ -1077,6 +1148,7 @@ enum HelperRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HelperCreate {
     machine_id: MachineId,
+    guest_mac: String,
     kernel: PathBuf,
     initial_ramdisk: Option<PathBuf>,
     command_line: String,
@@ -1216,8 +1288,13 @@ mod tests {
         let path = root.join("storage.lock");
         let custody = create_private_file(&path).unwrap();
         custody.try_lock().unwrap();
-        let mut owner =
-            HelperOwner::spawn(&helper, Duration::from_secs(1), Arc::new(custody)).unwrap();
+        let mut owner = HelperOwner::spawn(
+            &helper,
+            Duration::from_secs(1),
+            Arc::new(custody),
+            sandsurf_network::LinkIdentity::for_machine(&"box".try_into().unwrap()),
+        )
+        .unwrap();
         let next = open_private_file(&path, PrivateFileAccess::ReadWrite).unwrap();
         assert!(matches!(
             next.try_lock(),
@@ -1300,6 +1377,8 @@ mod tests {
             .spawn()
             .unwrap();
         let mut owner = HelperOwner {
+            network: None,
+            console: None,
             input: child.stdin.take(),
             output: Arc::new(Mutex::new(child.stdout.take().unwrap())),
             child,
@@ -1344,6 +1423,8 @@ mod tests {
             }))
             .unwrap();
         let mut owner = HelperOwner {
+            console: None,
+            network: None,
             input: child.stdin.take(),
             output: Arc::new(Mutex::new(child.stdout.take().unwrap())),
             child,
@@ -1364,6 +1445,8 @@ mod tests {
     fn create_request_keeps_the_flat_helper_contract() {
         let machine = HelperCreate {
             machine_id: "box".try_into().unwrap(),
+            guest_mac: sandsurf_network::LinkIdentity::for_machine(&"box".try_into().unwrap())
+                .mac_address(),
             kernel: "/kernel".into(),
             initial_ramdisk: None,
             command_line: "root=/dev/vda".into(),

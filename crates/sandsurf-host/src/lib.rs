@@ -5,13 +5,17 @@ pub mod api;
 pub mod apple;
 pub mod artifacts;
 mod capture;
+mod console;
 pub mod guardian;
 pub mod guest;
 mod guest_worker;
+pub mod image_worker;
 pub mod images;
 mod ipc_frames;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod qualification;
+pub mod resources;
 mod restore;
 pub mod secrets;
 pub mod service;
