@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
-import { chmod, copyFile, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hydrateImageSources } from "./image-sources.ts";
 import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
+import { bundledImageManifestDigest } from "./native-image.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await hydrateImageSources();
@@ -33,11 +33,14 @@ const buildArguments = [
   "--bin", "sandsurf-host",
   ...(target === undefined ? [] : ["--target", target]),
 ];
-const buildEnvironment: Record<string, string> = target?.endsWith("-unknown-linux-musl")
+const buildEnvironment: Record<string, string | undefined> = target?.endsWith("-unknown-linux-musl")
   ? { [`CARGO_TARGET_${target.toUpperCase().replaceAll("-", "_")}_LINKER`]: "rust-lld" }
   : {};
 if (["linux", "macos", "windows"].includes(nativePlatform)) {
-  buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest(architecture);
+  buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST = await bundledImageManifestDigest(resolve(repository, "packages/sandsurf/images"), architecture);
+  if (buildEnvironment.SANDSURF_BUNDLED_IMAGE_MANIFEST_DIGEST === undefined) {
+    process.stdout.write(`No bundled ${architecture} OS: native host will report no default image. Imported machine images remain a separate capability.\n`);
+  }
 }
 if (nativePlatform === "linux" && (target === undefined || target.endsWith("-unknown-linux-gnu"))) {
   const linuxTarget = target ?? `${process.arch === "x64" ? "x86_64" : "aarch64"}-unknown-linux-gnu`;
@@ -114,31 +117,11 @@ async function writeManifest(root: string): Promise<void> {
   }
 }
 
-async function bundledImageManifestDigest(guestArchitecture: "x64" | "arm64"): Promise<string> {
-  const images = resolve(repository, "packages/sandsurf/images");
-  const index: unknown = JSON.parse(await readFile(resolve(images, "manifest.json"), "utf8"));
-  if (!record(index) || !record(index.files)) throw new Error("bundled image index is malformed");
-  const relative = `development-${guestArchitecture}/manifest.json`;
-  const expected = index.files[relative];
-  if (typeof expected !== "string" || !/^[a-f0-9]{64}$/u.test(expected)) {
-    throw new Error(`bundled ${guestArchitecture} image identity is absent from the image index`);
-  }
-  const actual = createHash("sha256")
-    .update(await readFile(resolve(images, relative)))
-    .digest("hex");
-  if (actual !== expected) throw new Error("bundled image manifest differs from its image index");
-  return actual;
-}
-
 function classifyTarget(target: string): { platform: "linux" | "macos" | "windows"; architecture: "x64" | "arm64" } {
   const architecture = target.startsWith("x86_64-") ? "x64" : target.startsWith("aarch64-") ? "arm64" : undefined;
   const platform = target.includes("linux") ? "linux" : target.includes("apple-darwin") ? "macos" : target.includes("windows") ? "windows" : undefined;
   if (architecture === undefined || platform === undefined) throw new Error(`unsupported Rust target ${target}`);
   return { platform, architecture };
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function replaceArtifact(source: string, destination: string): Promise<void> {
@@ -153,7 +136,7 @@ async function replaceArtifact(source: string, destination: string): Promise<voi
   }
 }
 
-function run(command: string, args: readonly string[], environment: Readonly<Record<string, string>>): Promise<void> {
+function run(command: string, args: readonly string[], environment: Readonly<Record<string, string | undefined>>): Promise<void> {
   return new Promise<void>((resolveRun, rejectRun) => {
     const child = spawn(command, args, { cwd: repository, stdio: "inherit", env: { ...process.env, ...environment } });
     child.on("error", rejectRun);

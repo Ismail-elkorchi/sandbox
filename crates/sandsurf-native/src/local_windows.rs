@@ -415,7 +415,7 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Rename the held source inode, relative to its held private parent. In
+/// Rename the held source inode within its held private parent. In
 /// particular, no-replace publication does not ask for DELETE access to an
 /// existing immutable destination which other readers legitimately retain.
 pub(crate) fn rename_private_object(
@@ -471,15 +471,18 @@ pub(crate) fn rename_private_object(
             Anonymous: FILE_RENAME_INFORMATION_0 {
                 ReplaceIfExists: replace,
             },
-            RootDirectory: parent.held.as_raw_handle().cast(),
+            // An ordinary name with a null root is an in-place rename. The
+            // source and its parent both deny DELETE sharing, so their identity
+            // cannot change while the native source handle commits this name.
+            RootDirectory: null_mut(),
             FileNameLength: length as u32,
             FileName: [0],
         });
         std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
     }
     let mut completion = IO_STATUS_BLOCK::default();
-    // The native API accepts a held RootDirectory with a relative name. Only
-    // the owner journal requests replacement; publication never does.
+    // No pathname lookup can select another parent: this operation changes
+    // only the name of the held source. Only journals request replacement.
     // SAFETY: source, parent, aligned input and completion remain held through
     // this synchronous call; the non-overlapped source completes before return.
     let status = unsafe {
@@ -497,6 +500,7 @@ pub(crate) fn rename_private_object(
         let code = unsafe { RtlNtStatusToDosError(status) };
         return Err(io::Error::from_raw_os_error(code as i32));
     }
+    parent.check()?;
     Ok(())
 }
 

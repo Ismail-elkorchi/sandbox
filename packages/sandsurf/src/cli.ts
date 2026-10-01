@@ -3,7 +3,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { resolveSandsurfNativeHost } from "./native-host.js";
-import { Sandsurf, type HostInspection } from "./sandsurf.js";
+import { Sandsurf } from "./sandsurf.js";
+import type { HostInspection } from "./contracts.js";
 import {
   sandsurfServiceDefinition,
   type SandsurfServicePlatform,

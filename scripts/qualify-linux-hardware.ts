@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 
 /** Availability is a gate, not evidence of a running or contained VM. */
 export function blockers(probe: unknown): string[] {
@@ -58,7 +59,8 @@ async function main(): Promise<void> {
       }
     }
   }
-  const report = { formatVersion: 1, status: unavailable.length === 0 ? "eligible-not-qualified" : "blocked",
+  const report = { formatVersion: 1, nativeBinaryDigest: await sha256File(candidate, 512 * 1024 ** 2),
+    observedUnixMillis: Date.now(), status: unavailable.length === 0 ? "eligible-not-qualified" : "blocked",
     blockers: unavailable, probe, storageFixtures: fixtures };
   const output = process.argv[2];
   if (output !== undefined) await writeFile(resolve(output), `${JSON.stringify(report, null, 2)}\n`, { flag: "wx", mode: 0o600 });

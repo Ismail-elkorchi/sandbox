@@ -34,6 +34,9 @@ pub fn install(
         let mut record = sandsurf_native::local::create_private_file(&stage.join("manifest.json"))?;
         record.write_all(&bytes)?;
         sandsurf_native::storage::sync_file(&record)?;
+        // Publication transfers the whole directory. Windows readers/writers
+        // intentionally deny DELETE sharing; drain this writer before rename.
+        drop(record);
         let mut artifacts = vec![(&manifest.boot_bundle.kernel.path, false)];
         if let Some(initramfs) = &manifest.boot_bundle.initramfs {
             artifacts.push((&initramfs.path, false));

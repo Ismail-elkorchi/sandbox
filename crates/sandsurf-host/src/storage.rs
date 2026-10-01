@@ -67,14 +67,18 @@ pub(crate) fn copy_boot(
             }
             sync_file(&output)?;
             drop(output);
-            let mut permissions = fs::metadata(stage.join(&artifact.path))?.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(stage.join(&artifact.path), permissions)?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(stage.join(&artifact.path))?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(stage.join(&artifact.path), permissions)?;
+            }
         }
         sandsurf_image::boot::verify(&stage, &boot)?;
         let mut record = create_private_file(&stage.join("boot.json"))?;
         record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
         sync_file(&record)?;
+        drop(record);
         sync_directory(&stage)?;
         match sandsurf_native::storage::publish_new_directory(&stage, destination) {
             Ok(()) => sync_directory(parent),
@@ -117,9 +121,15 @@ pub(crate) fn pin_boot(
             sync_file(&output)?;
             drop(output);
             let artifact = boot::artifact(&directory.join(name), name, maximum)?;
-            let mut permissions = fs::metadata(directory.join(name))?.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(directory.join(name), permissions)?;
+            // Windows private DACLs and digest-bound publication protect these
+            // bytes. Its readonly attribute is not an authority boundary and
+            // would prevent the owning storage transaction from reclaiming them.
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(directory.join(name))?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(directory.join(name), permissions)?;
+            }
             Ok(artifact)
         };
     let boot = boot::FrozenBoot {
