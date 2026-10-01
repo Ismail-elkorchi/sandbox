@@ -176,7 +176,7 @@ export function sandsurfGuestRequestMetadata(request: SandsurfGuestRequest): {
 }
 
 function validateGuestRequest(value: unknown): asserts value is SandsurfGuestRequest {
-  if (value === null || typeof value !== "object" || !("kind" in value)) throw new Error("missing Sandsurf workload kind");
+  if (value === null || typeof value !== "object" || !("kind" in value)) throw new Error("missing Sandsurf guest command kind");
   const fields = value as Record<string, unknown>;
   switch (fields.kind) {
     case "spawn": record(fields, ["kind", "request"]); validateExecutionRequest(fields.request); break;
@@ -208,7 +208,7 @@ function validateGuestRequest(value: unknown): asserts value is SandsurfGuestReq
       record(fields, ["kind", "request"]);
       if (!recordValue(fields.request) || typeof fields.request.kind !== "string") throw new Error("invalid Sandsurf filesystem request");
       break;
-    default: throw new Error("unknown Sandsurf workload request");
+    default: throw new Error("unknown Sandsurf guest command");
   }
 }
 
@@ -231,7 +231,7 @@ export function validateExecutionRequest(value: unknown): asserts value is Execu
       || typeof item !== "string" || item.length > 64 * 1024 || item.includes("\0")) throw new Error("invalid Sandsurf environment");
   }
   if (value.user !== null && (typeof value.user !== "string" || value.user.length < 1 || value.user.length > 4096 || value.user.includes("\0"))) {
-    throw new Error("invalid Sandsurf workload user");
+    throw new Error("invalid Sandsurf Linux user");
   }
   if (value.stdio === "terminal") validateTerminalSize(value.terminalSize);
   else if (value.stdio !== "pipes" || value.terminalSize !== null) throw new Error("invalid Sandsurf stdio mode");
