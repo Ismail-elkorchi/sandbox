@@ -1,5 +1,6 @@
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { runtimeDigest } from "./qemu-runtime.ts";
 import { evaluateLicense } from "./license-expression.ts";
 
@@ -29,6 +30,7 @@ export async function collectDependencySources(destination: string, libraries: R
   scratch: string, run: BuildRunner): Promise<void> {
   if (!['darwin', 'win32'].includes(process.platform)) throw new Error("native library source collection requires its build host");
   const components = new Map<string, DependencyComponent>();
+  const obligations = new Map<string, Set<string>>();
   const cellar = process.platform === "darwin" ? await realpath((await run("brew", ["--cellar"], scratch, true)).trim()) : undefined;
   for (const [binary, input] of libraries) {
     if (await runtimeDigest(input.path) !== input.sha256) throw new Error("installed QEMU dependency changed during build");
@@ -37,6 +39,7 @@ export async function collectDependencySources(destination: string, libraries: R
       : await msysOrigin(input.path, scratch, run);
     const identity = `${origin.manager}:${origin.name}:${origin.version}`;
     let component = components.get(identity);
+    const output = resolve(destination, "qemu-dependencies", origin.name);
     if (component === undefined) {
       if (components.size >= 32) throw new Error("native dependency package count exceeds its bound");
       if ([...components.values()].some((item) => item.name.toLowerCase() === origin.name.toLowerCase())) {
@@ -44,10 +47,25 @@ export async function collectDependencySources(destination: string, libraries: R
       }
       component = { manager: origin.manager, name: origin.name, version: origin.version,
         license: origin.license, binaries: {}, materials: {} };
-      const output = resolve(destination, "qemu-dependencies", origin.name);
       await mkdir(output, { recursive: true });
       await origin.capture(output, component.materials);
       components.set(identity, component);
+    }
+    // A source package can supply several binary packages with different
+    // terms. Deduplicate its archive, not its declarations or obligations.
+    const terms = obligations.get(identity) ?? new Set<string>();
+    terms.add(origin.license); obligations.set(identity, terms);
+    component.license = licenseExpression(terms.size === 1 ? origin.license :
+      `(${[...terms].sort().map((term) => `(${term})`).join(" AND ")})`);
+    if (origin.declaration !== undefined) {
+      const { path, name, sha256: expected } = origin.declaration;
+      if (Object.hasOwn(component.materials, name)) {
+        if (component.materials[name] !== expected || await runtimeDigest(path) !== expected) {
+          throw new Error("installed package declaration changed during capture");
+        }
+      } else if (await material(path, output, name, component.materials) !== expected) {
+        throw new Error("installed package declaration changed during capture");
+      }
     }
     component.binaries[binary] = { inputSha256: input.sha256, sha256: await runtimeDigest(resolve(destination, binary)) };
     if (await runtimeDigest(input.path) !== input.sha256) throw new Error("installed QEMU dependency changed during source capture");
@@ -59,6 +77,7 @@ export async function collectDependencySources(destination: string, libraries: R
 interface Origin {
   manager: DependencyComponent["manager"]; name: string; version: string; license: string;
   capture(output: string, materials: Record<string, string>): Promise<void>;
+  declaration?: { path: string; name: string; sha256: string };
 }
 
 async function homebrewOrigin(library: string, cellar: string, scratch: string, run: BuildRunner): Promise<Origin> {
@@ -107,13 +126,14 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
   const entries = await readdir(local);
   if (entries.length > 4096) throw new Error("MSYS2 package database exceeds its bound");
   const candidates = entries.filter((entry) => entry.startsWith(`${owner}-`));
-  let selected: { fields: Map<string, string[]>; path: string } | undefined;
+  let selected: { fields: Map<string, string[]>; path: string; sha256: string } | undefined;
   for (const entry of candidates) {
     const path = resolve(local, entry, "desc"); await regular(path, 65536);
-    const fields = pacmanDescription(await readFile(path, "utf8"));
+    const bytes = await readFile(path);
+    const fields = pacmanDescription(bytes.toString("utf8"));
     if (single(fields, "NAME") !== owner) continue;
     if (selected !== undefined) throw new Error("ambiguous installed DLL package");
-    selected = { fields, path };
+    selected = { fields, path, sha256: createHash("sha256").update(bytes).digest("hex") };
   }
   if (selected === undefined) throw new Error("installed DLL package metadata missing");
   const name = single(selected.fields, "BASE"), version = single(selected.fields, "VERSION");
@@ -125,10 +145,10 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
   catch (cause) {
     throw new Error(`MSYS2 ${owner} ${version} has unresolved installed license metadata: ${JSON.stringify(licenses)}`, { cause });
   }
-  const description = selected.path;
   const filename = `${name}-${version.replace(/^[0-9]+:/u, "")}.src.tar.zst`;
-  return { manager: "msys2", name, version, license, async capture(output, materials) {
-    await material(description, output, "installed-package.txt", materials);
+  return { manager: "msys2", name, version, license,
+    declaration: { path: selected.path, name: `installed-package.${owner}.txt`, sha256: selected.sha256 },
+    async capture(output, materials) {
     const source = resolve(scratch, filename), signature = `${source}.sig`;
     const url = `https://mirror.msys2.org/mingw/sources/${filename}`;
     for (const [destination, address, limit] of [[source, url, maximumBytes], [signature, `${url}.sig`, 65536]] as const) {
@@ -252,7 +272,7 @@ export function licenseExpression(value: unknown, depth = 0): string {
       if (/unknown|custom|proprietary|LicenseRef/iu.test(id)) throw new Error("native library license requires unresolved terms");
       return true;
     };
-    if (value.length <= 256 && evaluateLicense(value, named, named)) return value;
+    if (evaluateLicense(value, named, named)) return value;
     throw new Error("native library lacks an explicit supported license expression");
   }
   if (record(value) && Object.keys(value).length === 1) {
@@ -264,16 +284,24 @@ export function licenseExpression(value: unknown, depth = 0): string {
   throw new Error("native library has no distributable license expression");
 }
 
-/** MSYS2's installed metadata uses spdx: expressions. Separate array entries
- * are alternatives, not cumulative obligations. Mixed/custom legacy labels
- * have undefined semantics and cannot authorize this closed distribution.
- * https://www.msys2.org/dev/package-licensing/#the-license-array-field */
+/** Unqualified spdx: entries are alternatives. documentation:spdx: qualifies
+ * different content, not an alternative license for the library. We ship the
+ * complete source archive, including that content, and retain its obligations.
+ * No legacy-label conversion or assumption that documentation was removed.
+ * https://www.msys2.org/dev/package-licensing/#the-license-array-field
+ * https://github.com/msys2/MINGW-packages/blob/master/mingw-w64-libiconv/PKGBUILD */
 export function msysLicenseExpression(values: readonly string[]): string {
-  if (values.length === 0 || values.length > 16 || values.some((value) => !value.startsWith("spdx:"))) {
+  if (values.length === 0 || values.length > 16 || values.some((value) =>
+      !value.startsWith("spdx:") && !value.startsWith("documentation:spdx:"))) {
     throw new Error("installed MSYS2 package requires explicit SPDX license expressions");
   }
-  const expressions = values.map((value) => licenseExpression(value.slice(5)));
-  return licenseExpression(expressions.length === 1 ? expressions[0]! : `(${expressions.map((value) => `(${value})`).join(" OR ")})`);
+  const runtime = values.filter((value) => value.startsWith("spdx:")).map((value) => licenseExpression(value.slice(5)));
+  const documentation = values.filter((value) => value.startsWith("documentation:spdx:"))
+    .map((value) => licenseExpression(value.slice("documentation:spdx:".length)));
+  if (runtime.length === 0) throw new Error("documentation terms do not establish the native library license");
+  const expression = runtime.length === 1 ? runtime[0]! : `(${runtime.map((value) => `(${value})`).join(" OR ")})`;
+  return licenseExpression(documentation.length === 0 ? expression :
+    `(${[expression, ...documentation].map((value) => `(${value})`).join(" AND ")})`);
 }
 
 async function material(source: string, output: string, name: string, materials: Record<string, string>): Promise<string> {
@@ -321,7 +349,8 @@ export async function verifyDependencySources(root: string, runtime: Readonly<Re
       hasArchive ||= /\.(?:tar\.(?:xz|gz|bz2|zst)|tgz|zip)$/u.test(name);
     }
     if (!hasArchive || component.manager === "homebrew" && (materials['formula.rb'] === undefined || materials['install-receipt.json'] === undefined)
-      || component.manager === "msys2" && (materials['installed-package.txt'] === undefined || !Object.keys(materials).some((name) => name.endsWith('.src.tar.zst.sig')))) {
+      || component.manager === "msys2" && (!Object.keys(materials).some((name) => /^installed-package\.[A-Za-z0-9_.+-]+\.txt$/u.test(name))
+        || !Object.keys(materials).some((name) => name.endsWith('.src.tar.zst.sig')))) {
       throw new Error("native dependency lacks complete source and the installed build recipe binding");
     }
   }

@@ -43,7 +43,7 @@ async function fixture(context) {
       files[`${platform}/qemu-runtime.json`] = createHash("sha256").update(bytes).digest("hex");
       const binary = platform.startsWith("windows-") ? "libglib.dll" : "lib/libglib.dylib";
       const manager = platform.startsWith("windows-") ? "msys2" : "homebrew";
-      const sourceNames = manager === "msys2" ? ["installed-package.txt", "glib.src.tar.zst", "glib.src.tar.zst.sig"]
+      const sourceNames = manager === "msys2" ? ["installed-package.mingw-w64-glib.txt", "glib.src.tar.zst", "glib.src.tar.zst.sig"]
         : ["formula.rb", "install-receipt.json", "glib.tar.xz"];
       const materials = {};
       for (const name of sourceNames) {

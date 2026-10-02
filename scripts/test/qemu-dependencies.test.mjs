@@ -164,9 +164,58 @@ test("MSYS2 SPDX metadata preserves expressions and alternative licensing withou
   assert.equal(msysLicenseExpression(["spdx:MIT AND BSD-3-Clause-Clear"]), "MIT AND BSD-3-Clause-Clear");
   assert.equal(msysLicenseExpression(["spdx:LGPL-2.1-only", "spdx:MPL-1.1"]), "((LGPL-2.1-only) OR (MPL-1.1))");
   assert.equal(msysLicenseExpression(["spdx:MIT OR BSD-2-Clause", "spdx:ISC AND Zlib"]), "((MIT OR BSD-2-Clause) OR (ISC AND Zlib))");
-  for (const values of [[], ["MIT"], ["custom:MIT"], ["spdx:MIT", "BSD"], ["spdx:"], ["spdx:UNKNOWN"], Array(17).fill("spdx:MIT")]) {
+  assert.equal(msysLicenseExpression(["spdx:LGPL-2.1-or-later", "documentation:spdx:GPL-3.0-or-later"]),
+    "((LGPL-2.1-or-later) AND (GPL-3.0-or-later))");
+  assert.equal(msysLicenseExpression(["spdx:MIT", "spdx:BSD-2-Clause", "documentation:spdx:GFDL-1.3-or-later"]),
+    "((((MIT) OR (BSD-2-Clause))) AND (GFDL-1.3-or-later))");
+  for (const values of [[], ["MIT"], ["custom:MIT"], ["spdx:MIT", "BSD"], ["spdx:"], ["spdx:UNKNOWN"],
+    ["documentation:spdx:MIT"], ["spdx:MIT", "documentation:spdx:UNKNOWN"], ["spdx:MIT", "documentation:GPL"],
+    ["spdx:MIT", "examples:spdx:MIT"], Array(17).fill("spdx:MIT")]) {
     assert.throws(() => msysLicenseExpression(values));
   }
+});
+
+test("split binary packages retain every declaration and combine obligations while capturing one source archive", async (context) => {
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  const root = await mkdtemp(resolve(tmpdir(), "sandsurf-msys-split-source-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const scratch = resolve(root, "scratch"), output = resolve(root, "output"), database = resolve(root, "db");
+  await mkdir(scratch); await mkdir(output);
+  const libraries = new Map(), runtime = {};
+  const owners = new Map();
+  for (const [name, license] of [["first", "spdx:LGPL-2.1-or-later"], ["second", "spdx:GPL-3.0-or-later"], ["third", "spdx:LGPL-2.1-or-later"]]) {
+    const owner = `mingw-w64-ucrt-x86_64-${name}`, bin = `${name}.dll`, input = resolve(root, bin);
+    const desc = resolve(database, "local", `${owner}-1.0-1`);
+    await mkdir(desc, { recursive: true });
+    await writeFile(resolve(desc, "desc"), `%NAME%\n${owner}\n\n%BASE%\nmingw-w64-shared\n\n%VERSION%\n1.0-1\n\n%LICENSE%\n${license}\n`);
+    await writeFile(input, `bytes:${name}`); await copyFile(input, resolve(output, bin));
+    const sha256 = createHash("sha256").update(`bytes:${name}`).digest("hex");
+    libraries.set(bin, { path: input, sha256 }); runtime[bin] = sha256; owners.set(input, owner);
+  }
+  let downloads = 0;
+  async function run(command, args) {
+    if (command === "cygpath") return args[1];
+    if (command === "pacman") return owners.get(args.at(-1));
+    if (command === "pacman-conf") return args[0] === "DBPath" ? database : "/distribution/keyring";
+    if (command === "curl") {
+      downloads++;
+      const destination = args[args.indexOf("--output") + 1];
+      await writeFile(destination, destination.endsWith(".sig") ? Buffer.from([0x88, 1, 4]) : "one corresponding source archive"); return "";
+    }
+    if (command === "gpg") return trustedStatus;
+    throw new Error(`unexpected command ${command}`);
+  }
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    await collectDependencySources(output, libraries, scratch, run);
+    const manifest = await verifyDependencySources(output, runtime);
+    assert.equal(manifest.components.length, 1);
+    assert.equal(downloads, 2, "one source archive and its signature, not one copy per DLL");
+    const component = manifest.components[0];
+    assert.equal(component.license, "((GPL-3.0-or-later) AND (LGPL-2.1-or-later))");
+    assert.equal(Object.keys(component.materials).filter((name) => name.startsWith("installed-package.")).length, 3);
+    assert.equal(Object.keys(component.binaries).length, 3);
+  } finally { Object.defineProperty(process, "platform", original); }
 });
 
 async function fixture(context, manager = "homebrew") {
@@ -176,7 +225,7 @@ async function fixture(context, manager = "homebrew") {
   const materials = {}, directory = resolve(root, "qemu-dependencies/glib");
   await mkdir(directory, { recursive: true });
   const files = manager === "homebrew" ? ["formula.rb", "install-receipt.json", "glib.tar.xz"]
-    : ["installed-package.txt", "glib.src.tar.zst", "glib.src.tar.zst.sig"];
+    : ["installed-package.mingw-w64-glib.txt", "glib.src.tar.zst", "glib.src.tar.zst.sig"];
   for (const name of files) {
     const bytes = Buffer.from(`source:${name}`); await writeFile(resolve(directory, name), bytes); materials[name] = digest(bytes);
   }
