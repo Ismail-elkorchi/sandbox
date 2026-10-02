@@ -3,6 +3,17 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+// SAFETY: these declarations match the public Mach host/port C ABI. Callers
+// retain the send right and provide initialized outputs with the exact types.
+unsafe extern "C" {
+    fn host_page_size(host: libc::mach_port_t, size: *mut libc::vm_size_t) -> libc::kern_return_t;
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
+
 /// Known RAM filesystems cannot back persistent VM disks. Their file pages
 /// consume the writer's host memory budget and cannot be reclaimed to disk.
 pub fn require_persistent_storage(root: &Path) -> io::Result<()> {
@@ -69,6 +80,62 @@ pub fn available_storage_bytes(root: &Path) -> io::Result<u64> {
     let value = unsafe { value.assume_init() };
     u64::try_from(u128::from(value.f_bavail) * u128::from(value.f_frsize))
         .map_err(|_| io::Error::other("filesystem capacity exceeds accounting range"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn available_memory_bytes() -> io::Result<u64> {
+    // Mach VM statistics observe the native host. Inactive pages are reclaimable
+    // estimates, not exclusive memory reservations; native envelopes enforce
+    // each admitted allocation independently of subsequent host pressure.
+    #[allow(deprecated)]
+    let (statistics, page_size) = {
+        // SAFETY: vm_statistics64 is an integer-only Mach ABI output layout.
+        let mut statistics: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        let mut page_size = 0;
+        // SAFETY: mach_host_self has no pointer preconditions and returns this
+        // process's host send right. Both outputs have the exact ABI sizes.
+        let host = unsafe { libc::mach_host_self() };
+        // SAFETY: the host right is live and count bounds the writable statistics.
+        let status = unsafe {
+            libc::host_statistics64(
+                host,
+                libc::HOST_VM_INFO64,
+                (&raw mut statistics).cast(),
+                &mut count,
+            )
+        };
+        // SAFETY: host right is live and page_size is a writable vm_size_t.
+        let page_status = unsafe { host_page_size(host, &mut page_size) };
+        // SAFETY: this function owns the host send right returned above, not a
+        // pseudo-port. Releasing it does not terminate or mutate host authority.
+        unsafe { mach_port_deallocate(libc::mach_task_self(), host) };
+        if status != 0 || page_status != 0 || count != libc::HOST_VM_INFO64_COUNT || page_size == 0
+        {
+            return Err(io::Error::other(
+                "native host memory observation unavailable",
+            ));
+        }
+        (statistics, page_size)
+    };
+    u64::from(statistics.free_count)
+        .checked_add(u64::from(statistics.inactive_count))
+        .and_then(|pages| pages.checked_mul(page_size as u64))
+        .ok_or_else(|| io::Error::other("native host memory observation overflow"))
+}
+
+#[cfg(windows)]
+pub fn available_memory_bytes() -> io::Result<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: dwLength identifies a complete initialized MEMORYSTATUSEX output.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(status.ullAvailPhys)
 }
 
 #[cfg(windows)]

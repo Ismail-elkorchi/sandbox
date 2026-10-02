@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { qualificationDirectory } from "./qualification-storage.mjs";
+import { qualificationDirectory, recordChecks } from "./qualification-storage.mjs";
 import { join, resolve } from "node:path";
 import { createConnection } from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -55,8 +55,10 @@ test("KVM native NIC survives removal of management and inbound revocation close
     await machine.ports.revoke(exposed.id);
     await closed;
     await assert.rejects(connect(port));
+    await recordChecks(directory, machine, ["management-disabled", "policy-revocation"], { revokedExposure: exposed.id, closedExistingFlow: true });
     await machine.powerOff();
     assert.equal((await machine.inspect()).machine.value.state, "stopped");
+    await recordChecks(directory, machine, ["forced-power-off"], { managementRemoved: true, observedState: "stopped" });
   } finally {
     client?.destroy();
     if (machine !== undefined) { await machine.powerOff().catch(() => {}); await machine.destroy(); }

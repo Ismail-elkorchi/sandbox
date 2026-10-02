@@ -73,20 +73,19 @@ mod linux {
         let file = sandsurf_native::local::create_private_file(output)?;
         file.set_len(bytes)?;
         file.sync_all()?;
-        let archive = crate::appliance::host_path(tar)?;
         crate::appliance::run(
             output,
             true,
             &[
-                crate::appliance::command("mkfs", &["ext4", "/dev/sda"]),
-                crate::appliance::mount(true),
-                crate::appliance::command(
-                    "tar-in",
-                    &[&archive, "/", "xattrs:true", "selinux:true", "acls:true"],
-                ),
-                crate::appliance::command("sync", &[]),
-                crate::appliance::command("umount-all", &[]),
-                crate::appliance::command("e2fsck", &["/dev/sda", "forceno:true"]),
+                crate::appliance::Operation::MakeExt4,
+                crate::appliance::Operation::Mount { writable: true },
+                crate::appliance::Operation::ImportTar {
+                    source: tar.into(),
+                    compression: crate::appliance::Compression::None,
+                },
+                crate::appliance::Operation::Sync,
+                crate::appliance::Operation::Unmount,
+                crate::appliance::Operation::CheckExt4,
             ],
         )?;
         File::open(output)?.sync_all()?;
@@ -263,35 +262,55 @@ mod tests {
             materialize_tar(&tar, &first, MIN_IMAGE_BYTES).unwrap(),
             materialize_tar(&tar, &second, MIN_IMAGE_BYTES).unwrap()
         );
-        use crate::appliance::{command, mount, run};
+        use crate::appliance::{Operation, Reply, run};
         let read = run(
             &first,
             false,
-            &[mount(false), command("cat", &["/etc/identity"])],
+            &[
+                Operation::Mount { writable: false },
+                Operation::Cat {
+                    path: "/etc/identity".into(),
+                },
+            ],
+        )
+        .unwrap()
+        .text()
+        .unwrap();
+        assert_eq!(read.trim_end_matches('\n'), "sandsurf");
+        let stat = run(
+            &first,
+            false,
+            &[
+                Operation::Mount { writable: false },
+                Operation::Stat {
+                    path: "/etc/identity".into(),
+                },
+            ],
         )
         .unwrap();
-        assert_eq!(read.strip_suffix(b"\n").unwrap_or(&read), b"sandsurf");
-        let stat = String::from_utf8(
-            run(
-                &first,
-                false,
-                &[mount(false), command("statns", &["/etc/identity"])],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            stat.contains("st_uid: 1000") && stat.contains("st_gid: 1000"),
-            "{stat}"
+        assert_eq!(
+            stat,
+            Reply::Stat(crate::appliance::Stat {
+                uid: 1000,
+                gid: 1000,
+                mode: 35309,
+                bytes: 8
+            })
         );
-        assert!(stat.contains("st_mode: 35309"), "{stat}");
         let link = run(
             &first,
             false,
-            &[mount(false), command("readlink", &["/etc/long-link"])],
+            &[
+                Operation::Mount { writable: false },
+                Operation::Readlink {
+                    path: "/etc/long-link".into(),
+                },
+            ],
         )
+        .unwrap()
+        .text()
         .unwrap();
-        assert_eq!(String::from_utf8(link).unwrap().trim(), long_target);
+        assert_eq!(link, long_target);
         assert!(materialize_tar(&tar, &root.join("undersized"), 32 * 1024 * 1024).is_err());
         assert!(!root.join("undersized").exists());
         for path in [tar, first, second] {

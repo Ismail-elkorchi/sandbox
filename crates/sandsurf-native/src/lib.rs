@@ -5,12 +5,21 @@
 
 pub mod capacity;
 pub mod guest_channel;
-pub mod resources;
 #[cfg(target_os = "linux")]
+pub mod network_sockets;
+#[cfg(windows)]
+pub mod owned_windows;
+pub mod process_budget;
+pub mod resource_broker;
+pub mod resources;
+pub mod serial_channel;
 pub mod service_pool;
+pub mod socket_io;
 pub mod storage;
 pub mod storage_usage;
 pub mod volume;
+#[cfg(any(windows, test))]
+mod windows_arguments;
 
 /// Access requested for an account-private file. Validation never repairs or
 /// adopts a foreign ACL, mode, owner, link, or reparse identity.
@@ -29,11 +38,6 @@ pub use guest_channel::UnixGuestConnection;
 #[cfg(unix)]
 pub use guest_channel::UnixVsockChannel;
 pub use guest_channel::{GuestChannel, GuestChannelError, GuestConnection};
-#[cfg(target_os = "windows")]
-pub use guest_channel::{HyperVChannel, HyperVListener};
-
-#[cfg(target_os = "windows")]
-pub mod virtual_disk;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

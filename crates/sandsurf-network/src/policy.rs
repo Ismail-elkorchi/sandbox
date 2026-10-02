@@ -153,6 +153,125 @@ pub fn host_addresses() -> io::Result<Vec<IpAddr>> {
     Ok(result)
 }
 
+#[cfg(windows)]
+pub fn host_addresses() -> io::Result<Vec<IpAddr>> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_INCLUDE_ALL_COMPARTMENTS, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+        IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+    const MAX_BYTES: usize = 1024 * 1024;
+    let mut size = 16 * 1024u32;
+    let mut result = Vec::new();
+    for _ in 0..4 {
+        if size as usize > MAX_BYTES {
+            return Err(io::Error::other("host interface inventory exceeds bound"));
+        }
+        // The API requires native alignment and returns pointers into this
+        // allocation. Scalars in the backing storage admit every bit pattern.
+        let mut storage = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        let first = storage.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        let mut available = (storage.len() * std::mem::size_of::<usize>()) as u32;
+        // SAFETY: first addresses an aligned writable allocation of available
+        // bytes. No returned pointer is used after storage is dropped.
+        let status = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_INCLUDE_ALL_COMPARTMENTS
+                    | GAA_FLAG_INCLUDE_ALL_INTERFACES
+                    | GAA_FLAG_SKIP_ANYCAST
+                    | GAA_FLAG_SKIP_DNS_SERVER
+                    | GAA_FLAG_SKIP_MULTICAST,
+                std::ptr::null(),
+                first,
+                &mut available,
+            )
+        };
+        if status == ERROR_BUFFER_OVERFLOW {
+            size = available;
+            continue;
+        }
+        if status != NO_ERROR {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let mut adapter = first;
+        let mut entries = 0usize;
+        while !adapter.is_null() {
+            entries += 1;
+            if entries > 4096 {
+                return Err(io::Error::other(
+                    "host interface inventory is cyclic or excessive",
+                ));
+            }
+            let item = native_inventory_value(&storage, adapter)?;
+            let mut address = item.FirstUnicastAddress;
+            while !address.is_null() {
+                entries += 1;
+                if entries > 4096 {
+                    return Err(io::Error::other(
+                        "host address inventory is cyclic or excessive",
+                    ));
+                }
+                let unicast: IP_ADAPTER_UNICAST_ADDRESS_LH =
+                    native_inventory_value(&storage, address)?;
+                let sockaddr = unicast.Address.lpSockaddr;
+                if !sockaddr.is_null() {
+                    let family: u16 = native_inventory_value(&storage, sockaddr.cast())?;
+                    if family == AF_INET
+                        && unicast.Address.iSockaddrLength
+                            >= std::mem::size_of::<SOCKADDR_IN>() as i32
+                    {
+                        let ipv4: SOCKADDR_IN = native_inventory_value(&storage, sockaddr.cast())?;
+                        // SAFETY: AF_INET establishes the active address layout;
+                        // S_addr is the complete four-byte union representation.
+                        result.push(IpAddr::V4(std::net::Ipv4Addr::from(
+                            unsafe { ipv4.sin_addr.S_un.S_addr }.to_ne_bytes(),
+                        )));
+                    } else if family == AF_INET6
+                        && unicast.Address.iSockaddrLength
+                            >= std::mem::size_of::<SOCKADDR_IN6>() as i32
+                    {
+                        let ipv6: SOCKADDR_IN6 = native_inventory_value(&storage, sockaddr.cast())?;
+                        // SAFETY: AF_INET6 establishes this 16-byte address layout.
+                        result.push(IpAddr::V6(std::net::Ipv6Addr::from(unsafe {
+                            ipv6.sin6_addr.u.Byte
+                        })));
+                    }
+                }
+                address = unicast.Next;
+            }
+            adapter = item.Next;
+        }
+        result.sort();
+        result.dedup();
+        return Ok(result);
+    }
+    Err(io::Error::other("host interface inventory kept changing"))
+}
+
+#[cfg(windows)]
+fn native_inventory_value<T: Copy>(storage: &[usize], pointer: *const T) -> io::Result<T> {
+    let start = storage.as_ptr() as usize;
+    let end = start + std::mem::size_of_val(storage);
+    let address = pointer as usize;
+    if address < start
+        || address
+            .checked_add(std::mem::size_of::<T>())
+            .is_none_or(|limit| limit > end)
+    {
+        return Err(io::Error::other(
+            "native host inventory pointer exceeds its allocation",
+        ));
+    }
+    // SAFETY: the pointer refers to initialized native output within the live
+    // storage allocation. T is one of the Copy Win32 inventory/address layouts.
+    Ok(unsafe { std::ptr::read_unaligned(pointer) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

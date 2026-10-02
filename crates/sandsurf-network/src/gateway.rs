@@ -8,11 +8,12 @@ use smoltcp::socket::tcp::{Socket, SocketBuffer};
 use smoltcp::time::{Duration as StackDuration, Instant as StackInstant};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
 use std::collections::{HashMap, VecDeque};
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixDatagram;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,16 +25,19 @@ const BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(120);
 
 /// Already-owned packet endpoint. Linux uses an AF_PACKET socket in the VMM's
-/// private namespace; macOS uses the other half of a datagram attachment.
+/// private namespace; HVF/WHPX use QEMU's framed Ethernet stream.
 pub enum PacketTransport {
+    #[cfg(target_os = "linux")]
     LinuxPacket(File),
-    Datagram(UnixDatagram),
+    /// QEMU's native Ethernet socket attachment, not a guest proxy.
+    Stream(Box<crate::PacketStream>),
 }
 
 impl PacketTransport {
     fn nonblocking(&self) -> io::Result<()> {
         match self {
-            Self::Datagram(s) => s.set_nonblocking(true),
+            Self::Stream(s) => s.nonblocking(),
+            #[cfg(target_os = "linux")]
             Self::LinuxPacket(s) => {
                 // SAFETY: the owned descriptor remains live for both fcntl calls.
                 let flags = unsafe { libc::fcntl(s.as_raw_fd(), libc::F_GETFL) };
@@ -51,15 +55,8 @@ impl PacketTransport {
     }
     fn receive(&mut self) -> io::Result<Vec<Vec<u8>>> {
         match self {
-            Self::Datagram(s) => {
-                let mut bytes = [0_u8; MAX_FRAME + 1];
-                let len = s.recv(&mut bytes)?;
-                if len > MAX_FRAME {
-                    Ok(Vec::new())
-                } else {
-                    Ok(vec![bytes[..len].to_vec()])
-                }
-            }
+            Self::Stream(s) => s.receive().map(|frame| vec![frame]),
+            #[cfg(target_os = "linux")]
             Self::LinuxPacket(s) => {
                 // One GSO super-packet has an absolute bound. Offload metadata
                 // is normalized before strict Ethernet/IP policy admission.
@@ -121,8 +118,9 @@ impl PacketTransport {
         }
     }
     fn send(&mut self, frame: &[u8]) -> io::Result<()> {
-        let count = match self {
-            Self::Datagram(s) => s.send(frame)?,
+        match self {
+            Self::Stream(s) => s.send(frame),
+            #[cfg(target_os = "linux")]
             Self::LinuxPacket(s) => {
                 let mut bytes = Vec::with_capacity(frame.len() + 10);
                 bytes.extend_from_slice(&[0; 10]);
@@ -134,16 +132,8 @@ impl PacketTransport {
                         "partial packet write",
                     ));
                 }
-                return Ok(());
+                Ok(())
             }
-        };
-        if count != frame.len() {
-            Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "partial datagram write",
-            ))
-        } else {
-            Ok(())
         }
     }
 }
@@ -327,6 +317,11 @@ struct Inbound {
     target: SocketAddr,
 }
 
+#[cfg(target_os = "linux")]
+struct PendingFlow {
+    admission: sandsurf_native::network_sockets::SocketAdmission,
+    frame: Vec<u8>,
+}
 struct Worker {
     link: LinkIdentity,
     transport: PacketTransport,
@@ -335,6 +330,8 @@ struct Worker {
     sockets: SocketSet<'static>,
     tcp: HashMap<FlowKey, TcpFlow>,
     udp: HashMap<FlowKey, UdpFlow>,
+    #[cfg(target_os = "linux")]
+    pending: HashMap<(FlowKey, bool), PendingFlow>,
     inbound: Vec<Inbound>,
     policy: PacketPolicy,
     authority: NetworkPolicy,
@@ -385,6 +382,8 @@ impl Worker {
             sockets: SocketSet::new(Vec::new()),
             tcp: HashMap::new(),
             udp: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            pending: HashMap::new(),
             inbound: Vec::new(),
             policy: PacketPolicy::compile(&NetworkPolicy::default(), hosts).expect("empty policy"),
             authority: NetworkPolicy::default(),
@@ -439,6 +438,8 @@ impl Worker {
             self.sockets.remove(f.handle);
         }
         self.udp.clear();
+        #[cfg(target_os = "linux")]
+        self.pending.clear();
         self.inbound.clear();
         self.device.input.clear();
         self.device.output.clear();
@@ -449,6 +450,17 @@ impl Worker {
         // Install deny and close native sockets before validation/bind. Failure
         // remains deny with no listeners, never successful partial revocation.
         self.close_flows();
+        #[cfg(not(target_os = "linux"))]
+        if !policy.rules.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native kernel local-delivery enforcement is unavailable; address observations cannot safely authorize egress",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if !policy.rules.is_empty() {
+            sandsurf_native::network_sockets::probe()?;
+        }
         let compiled = PacketPolicy::compile(&policy, host_addresses()?)?;
         let mut listeners = Vec::new();
         for exposure in exposures.iter().filter(|e| e.active) {
@@ -551,6 +563,8 @@ impl Worker {
                     Err(e) => return Err(e),
                 }
             }
+            #[cfg(target_os = "linux")]
+            self.pump_admissions()?;
             self.accept_inbound();
             self.pump_tcp();
             self.pump_udp();
@@ -599,7 +613,7 @@ impl Worker {
                 }
                 if !self.tcp.contains_key(&key) {
                     if !syn
-                        || self.tcp.len() + self.udp.len() >= MAX_FLOWS
+                        || self.flow_count() >= MAX_FLOWS
                         || !self.device.input.is_empty()
                         || self.device.output.len() >= QUEUE
                     {
@@ -609,26 +623,15 @@ impl Worker {
                         self.deny(Some(key), "host address denied");
                         return Ok(());
                     }
-                    let Ok(native) = connect_nonblocking(key.remote) else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.admit(key, false, frame)?;
                         return Ok(());
-                    };
-                    let mut socket = tcp_socket();
-                    socket.listen(key.remote).map_err(io::Error::other)?;
-                    let handle = self.sockets.add(socket);
-                    self.tcp.insert(
-                        key,
-                        TcpFlow {
-                            native,
-                            handle,
-                            connecting: true,
-                            host_eof: false,
-                            guest_eof: false,
-                            started: Instant::now(),
-                            touched: Instant::now(),
-                            inbound: false,
-                        },
-                    );
-                    self.connection();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return Err(io::ErrorKind::Unsupported.into());
+                    }
                 }
                 if let Some(f) = self.tcp.get_mut(&key) {
                     f.touched = Instant::now();
@@ -641,25 +644,22 @@ impl Worker {
                     return Ok(());
                 }
                 if !self.udp.contains_key(&key) {
-                    if self.tcp.len() + self.udp.len() >= MAX_FLOWS {
+                    if self.flow_count() >= MAX_FLOWS {
                         return Ok(());
                     }
                     if host_addresses()?.contains(&key.remote.ip()) {
                         self.deny(Some(key), "host address denied");
                         return Ok(());
                     }
-                    let Ok(socket) = connect_udp(key.remote) else {
-                        self.deny(Some(key), "native UDP endpoint unavailable");
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.admit(key, true, frame)?;
                         return Ok(());
-                    };
-                    self.udp.insert(
-                        key,
-                        UdpFlow {
-                            native: socket,
-                            touched: Instant::now(),
-                        },
-                    );
-                    self.connection();
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return Err(io::ErrorKind::Unsupported.into());
+                    }
                 }
                 let end = if key.guest.is_ipv4() {
                     14 + usize::from(u16::from_be_bytes([frame[16], frame[17]]))
@@ -677,6 +677,110 @@ impl Worker {
         self.iface.poll(time, &mut self.device, &mut self.sockets);
         Ok(())
     }
+    fn flow_count(&self) -> usize {
+        let count = self.tcp.len() + self.udp.len();
+        #[cfg(target_os = "linux")]
+        let count = count + self.pending.len();
+        count
+    }
+    #[cfg(target_os = "linux")]
+    fn insert_tcp(&mut self, key: FlowKey, native: TcpStream) -> io::Result<()> {
+        let mut socket = tcp_socket();
+        socket.listen(key.remote).map_err(io::Error::other)?;
+        let handle = self.sockets.add(socket);
+        self.tcp.insert(
+            key,
+            TcpFlow {
+                native,
+                handle,
+                connecting: true,
+                host_eof: false,
+                guest_eof: false,
+                started: Instant::now(),
+                touched: Instant::now(),
+                inbound: false,
+            },
+        );
+        self.connection();
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn insert_udp(&mut self, key: FlowKey, native: UdpSocket) {
+        self.udp.insert(
+            key,
+            UdpFlow {
+                native,
+                touched: Instant::now(),
+            },
+        );
+        self.connection();
+    }
+    #[cfg(target_os = "linux")]
+    fn admit(&mut self, key: FlowKey, udp: bool, frame: Vec<u8>) -> io::Result<()> {
+        if self.pending.contains_key(&(key, udp)) {
+            return Ok(());
+        }
+        match sandsurf_native::network_sockets::SocketAdmission::begin(key.remote.is_ipv6(), udp) {
+            Ok(admission) => {
+                self.pending
+                    .insert((key, udp), PendingFlow { admission, frame });
+            }
+            Err(_) => self.deny(Some(key), "kernel-restricted socket admission unavailable"),
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn pump_admissions(&mut self) -> io::Result<()> {
+        let mut completed = Vec::new();
+        for (key, flow) in &mut self.pending {
+            match flow.admission.poll() {
+                Ok(None) => {}
+                value => completed.push((*key, value)),
+            }
+            if completed.len() == 16 {
+                break;
+            }
+        }
+        for ((key, udp), result) in completed {
+            let pending = self
+                .pending
+                .remove(&(key, udp))
+                .expect("owned pending admission");
+            let plane = if udp {
+                NetworkPlane::Udp
+            } else {
+                NetworkPlane::Tcp
+            };
+            // Current authority is checked again. An address-inventory refresh
+            // or revision can never turn a pending request into stale authority.
+            if !self.policy.allows(plane, key.remote) {
+                continue;
+            }
+            let Ok(Some(socket)) = result else {
+                self.deny(Some(key), "kernel-restricted socket admission failed");
+                continue;
+            };
+            if bound_socket_buffers(&socket).is_err() {
+                continue;
+            }
+            if udp {
+                let socket: UdpSocket = socket.into();
+                if socket.connect(key.remote).is_err() {
+                    continue;
+                }
+                self.insert_udp(key, socket);
+            } else {
+                let Ok(native) = connect_socket_nonblocking(socket, key.remote) else {
+                    continue;
+                };
+                self.insert_tcp(key, native)?;
+            }
+            // Only one initial datagram/SYN was retained; later UDP packets may
+            // be dropped and TCP retransmits. No unbounded pending output queue.
+            self.ingress(pending.frame)?;
+        }
+        Ok(())
+    }
     fn connection(&self) {
         self.snapshot
             .lock()
@@ -690,7 +794,7 @@ impl Worker {
     }
     fn accept_inbound(&mut self) {
         for i in 0..self.inbound.len() {
-            if self.tcp.len() + self.udp.len() >= MAX_FLOWS {
+            if self.flow_count() >= MAX_FLOWS {
                 break;
             }
             let Ok((native, _)) = self.inbound[i].listener.accept() else {
@@ -699,7 +803,7 @@ impl Worker {
             if native.set_nonblocking(true).is_err() {
                 continue;
             }
-            if bound_socket_buffers(native.as_raw_fd()).is_err() {
+            if bound_socket_buffers(&socket2::SockRef::from(&native)).is_err() {
                 continue;
             }
             let guest = self.inbound[i].target;
@@ -883,162 +987,68 @@ fn tcp_socket() -> Socket<'static> {
     socket.set_ack_delay(None);
     socket
 }
-fn connect_nonblocking(address: SocketAddr) -> io::Result<TcpStream> {
-    let socket = new_tcp_socket(address)?;
-    let result = socket_address_call(socket.as_raw_fd(), address, true);
-    if result < 0 {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINPROGRESS) {
-            return Err(e);
+#[cfg(target_os = "linux")]
+fn connect_socket_nonblocking(
+    socket: socket2::Socket,
+    address: SocketAddr,
+) -> io::Result<TcpStream> {
+    if let Err(error) = socket.connect(&address.into()) {
+        let pending = error.raw_os_error() == Some(libc::EINPROGRESS);
+        if !pending {
+            return Err(error);
         }
     }
-    Ok(TcpStream::from(OwnedFd::from(socket)))
+    Ok(socket.into())
 }
 fn native_listener(address: SocketAddr) -> io::Result<TcpListener> {
     let socket = new_tcp_socket(address)?;
-    let fd = socket.as_raw_fd();
-    let reuse = 1_i32;
-    // SAFETY: initialized option for a live owned socket. SO_REUSEPORT is never
-    // enabled; another process cannot share this listener's authority.
-    if unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, (&reuse as *const i32).cast(), std::mem::size_of_val(&reuse) as _) } < 0
-        || socket_address_call(fd, address, false) < 0
-        // SAFETY: fd is a successfully bound TCP socket with bounded buffers.
-        || unsafe { libc::listen(fd, 1) } < 0
-    {
-        return Err(io::Error::last_os_error());
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
     }
-    Ok(TcpListener::from(OwnedFd::from(socket)))
+    // Windows SO_REUSEADDR permits a competing listener. Never enable it;
+    // Unix reuse does not permit sharing without SO_REUSEPORT.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(1)?;
+    Ok(socket.into())
 }
-fn new_tcp_socket(address: SocketAddr) -> io::Result<File> {
-    #[cfg(target_os = "linux")]
-    let socket_kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
-    #[cfg(not(target_os = "linux"))]
-    let socket_kind = libc::SOCK_STREAM;
-    // SAFETY: socket creates a new descriptor; ownership transfers once below.
-    let fd = unsafe {
-        libc::socket(
-            if address.is_ipv4() {
-                libc::AF_INET
-            } else {
-                libc::AF_INET6
-            },
-            socket_kind,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a new successful socket allocation.
-    let socket = unsafe { File::from_raw_fd(fd) };
-    // SAFETY: owned descriptor stays live for all flag operations. Set CLOEXEC
-    // before publishing the socket to any other thread or native owner.
-    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    // SAFETY: socket owns fd throughout this native status-flag query.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if descriptor_flags < 0
-        || flags < 0
-        // SAFETY: successful flag queries and the held socket keep fd live;
-        // these scalar updates retain existing flags and add only confinement.
-        || unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) } < 0
-        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    bound_socket_buffers(fd)?;
+fn new_tcp_socket(address: SocketAddr) -> io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_nonblocking(true)?;
+    bound_socket_buffers(&socket)?;
     Ok(socket)
-}
-fn socket_address_call(fd: libc::c_int, address: SocketAddr, connect: bool) -> libc::c_int {
-    // SAFETY: each initialized native sockaddr remains live for bind/connect and
-    // has the exact length for its family. No guest pathname is interpreted.
-    unsafe {
-        match address {
-            SocketAddr::V4(v) => {
-                let mut a: libc::sockaddr_in = std::mem::zeroed();
-                #[cfg(target_os = "macos")]
-                {
-                    a.sin_len = std::mem::size_of_val(&a) as _;
-                }
-                a.sin_family = libc::AF_INET as _;
-                a.sin_port = v.port().to_be();
-                a.sin_addr.s_addr = u32::from_ne_bytes(v.ip().octets());
-                let pointer = (&a as *const libc::sockaddr_in).cast();
-                let size = std::mem::size_of_val(&a) as _;
-                if connect {
-                    libc::connect(fd, pointer, size)
-                } else {
-                    libc::bind(fd, pointer, size)
-                }
-            }
-            SocketAddr::V6(v) => {
-                let mut a: libc::sockaddr_in6 = std::mem::zeroed();
-                #[cfg(target_os = "macos")]
-                {
-                    a.sin6_len = std::mem::size_of_val(&a) as _;
-                }
-                a.sin6_family = libc::AF_INET6 as _;
-                a.sin6_port = v.port().to_be();
-                a.sin6_addr.s6_addr = v.ip().octets();
-                a.sin6_scope_id = v.scope_id();
-                let pointer = (&a as *const libc::sockaddr_in6).cast();
-                let size = std::mem::size_of_val(&a) as _;
-                if connect {
-                    libc::connect(fd, pointer, size)
-                } else {
-                    libc::bind(fd, pointer, size)
-                }
-            }
-        }
-    }
 }
 fn connected(stream: &TcpStream) -> io::Result<bool> {
-    let mut p = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: p is writable storage for exactly one live descriptor; timeout zero.
-    let n = unsafe { libc::poll(&mut p, 1, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+    if let Some(error) = stream.take_error()? {
+        return Err(error);
     }
-    if n == 0 {
-        return Ok(false);
-    }
-    if let Some(e) = stream.take_error()? {
-        return Err(e);
-    }
-    Ok(true)
-}
-
-fn connect_udp(address: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(if address.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
-    bound_socket_buffers(socket.as_raw_fd())?;
-    socket.set_nonblocking(true)?;
-    socket.connect(address)?;
-    Ok(socket)
-}
-
-fn bound_socket_buffers(fd: libc::c_int) -> io::Result<()> {
-    let size = WINDOW as libc::c_int;
-    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
-        // SAFETY: caller owns fd and size is initialized c_int storage.
-        if unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&size as *const libc::c_int).cast(),
-                std::mem::size_of_val(&size) as _,
-            )
-        } < 0
+    match stream.peer_addr() {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+            ) =>
         {
-            return Err(io::Error::last_os_error());
+            Ok(false)
         }
+        Err(error) => Err(error),
+    }
+}
+
+fn bound_socket_buffers(socket: &socket2::Socket) -> io::Result<()> {
+    socket.set_recv_buffer_size(WINDOW)?;
+    socket.set_send_buffer_size(WINDOW)?;
+    // Linux reports doubled values, accounting for its kernel bookkeeping.
+    if socket.recv_buffer_size()? > 2 * WINDOW || socket.send_buffer_size()? > 2 * WINDOW {
+        return Err(io::Error::other(
+            "native socket did not retain its bounded buffers",
+        ));
     }
     Ok(())
 }

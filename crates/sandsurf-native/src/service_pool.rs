@@ -11,6 +11,29 @@ pub enum ServicePool {
 }
 
 impl ServicePool {
+    pub fn worker_kind(self) -> crate::resource_broker::WorkerKind {
+        match self {
+            Self::Api => crate::resource_broker::WorkerKind::Api,
+            Self::Supervisor => crate::resource_broker::WorkerKind::Supervisor,
+            Self::Images => crate::resource_broker::WorkerKind::Images,
+        }
+    }
+
+    pub fn process_budget(self) -> crate::process_budget::ProcessBudget {
+        crate::process_budget::ProcessBudget {
+            cpu_quota_micros: if matches!(self, Self::Images) && !cfg!(target_os = "linux") {
+                25000
+            } else {
+                100000
+            },
+            memory_bytes: if matches!(self, Self::Images) && !cfg!(target_os = "linux") {
+                256 * 1024 * 1024
+            } else {
+                self.memory_bytes()
+            },
+            processes: if cfg!(target_os = "macos") { 2 } else { 1 },
+        }
+    }
     pub fn unit(self, root: &Path) -> io::Result<String> {
         let root = crate::local::canonical_private_directory(root)?;
         let root = root

@@ -562,6 +562,12 @@ pub enum GuardianRequest {
         after: Counter,
         maximum: u16,
     },
+    SubscribeConsole {
+        machine_id: MachineId,
+        generation: Counter,
+        after: Counter,
+        maximum: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1159,7 +1165,7 @@ pub struct Resources {
     pub output_bytes: Counter,
     pub managed_executions: Counter,
     /// Aggregate host CPU time per fixed 100,000 microsecond period, including
-    /// the guardian, VMM, and machine-owned workers.
+    /// the guardian, VMM, and machine-owned workers. Granularity is 10µs.
     pub cpu_quota_micros: Counter,
     /// Additional host memory above guest RAM, inside the aggregate hard cap.
     pub host_overhead_bytes: Counter,
@@ -1477,7 +1483,8 @@ impl Resources {
                 "physical storage budget excludes disk, output or snapshot reservations",
             ));
         }
-        if self.cpu_quota_micros.get() < 1000
+        if !self.cpu_quota_micros.get().is_multiple_of(10)
+            || self.cpu_quota_micros.get() < 1000
             || self.cpu_quota_micros.get()
                 > self
                     .vcpus
@@ -1485,7 +1492,9 @@ impl Resources {
                     .checked_mul(100_000)
                     .ok_or(Invalid("CPU topology overflow"))?
         {
-            return Err(Invalid("CPU quota exceeds topology scheduling capacity"));
+            return Err(Invalid(
+                "CPU quota requires 10µs granularity, at least 1000µs, within topology scheduling capacity",
+            ));
         }
         if !self.host_memory_bytes()?.get().is_multiple_of(4096) {
             return Err(Invalid("host memory envelope must be page aligned"));
@@ -1500,76 +1509,6 @@ impl Resources {
                 .and_then(|value| value.checked_add(self.host_overhead_bytes.get()))
                 .ok_or(Invalid("host memory envelope overflow"))?,
         )
-    }
-    pub fn checked_add(&self, other: &Self) -> Result<Self, Invalid> {
-        Ok(Self {
-            vcpus: self.vcpus.checked_add(other.vcpus.get())?,
-            memory_mib: self.memory_mib.checked_add(other.memory_mib.get())?,
-            disk_bytes: self.disk_bytes.checked_add(other.disk_bytes.get())?,
-            output_bytes: self.output_bytes.checked_add(other.output_bytes.get())?,
-            managed_executions: self
-                .managed_executions
-                .checked_add(other.managed_executions.get())?,
-            cpu_quota_micros: self
-                .cpu_quota_micros
-                .checked_add(other.cpu_quota_micros.get())?,
-            host_overhead_bytes: self
-                .host_overhead_bytes
-                .checked_add(other.host_overhead_bytes.get())?,
-            physical_storage_bytes: self
-                .physical_storage_bytes
-                .checked_add(other.physical_storage_bytes.get())?,
-            snapshot_bytes: self
-                .snapshot_bytes
-                .checked_add(other.snapshot_bytes.get())?,
-            channels: self.channels.checked_add(other.channels.get())?,
-            inflight_requests: self
-                .inflight_requests
-                .checked_add(other.inflight_requests.get())?,
-            network_connections: self
-                .network_connections
-                .checked_add(other.network_connections.get())?,
-            network_bytes_per_second: self
-                .network_bytes_per_second
-                .checked_add(other.network_bytes_per_second.get())?,
-            network_queue_bytes: self
-                .network_queue_bytes
-                .checked_add(other.network_queue_bytes.get())?,
-        })
-    }
-    pub fn within(&self, limit: &Self) -> bool {
-        self.vcpus <= limit.vcpus
-            && self.memory_mib <= limit.memory_mib
-            && self.disk_bytes <= limit.disk_bytes
-            && self.output_bytes <= limit.output_bytes
-            && self.managed_executions <= limit.managed_executions
-            && self.cpu_quota_micros <= limit.cpu_quota_micros
-            && self.host_overhead_bytes <= limit.host_overhead_bytes
-            && self.physical_storage_bytes <= limit.physical_storage_bytes
-            && self.snapshot_bytes <= limit.snapshot_bytes
-            && self.channels <= limit.channels
-            && self.inflight_requests <= limit.inflight_requests
-            && self.network_connections <= limit.network_connections
-            && self.network_bytes_per_second <= limit.network_bytes_per_second
-            && self.network_queue_bytes <= limit.network_queue_bytes
-    }
-    pub fn zero() -> Self {
-        Self {
-            vcpus: Counter::ZERO,
-            memory_mib: Counter::ZERO,
-            disk_bytes: Counter::ZERO,
-            output_bytes: Counter::ZERO,
-            managed_executions: Counter::ZERO,
-            cpu_quota_micros: Counter::ZERO,
-            host_overhead_bytes: Counter::ZERO,
-            physical_storage_bytes: Counter::ZERO,
-            snapshot_bytes: Counter::ZERO,
-            channels: Counter::ZERO,
-            inflight_requests: Counter::ZERO,
-            network_connections: Counter::ZERO,
-            network_bytes_per_second: Counter::ZERO,
-            network_queue_bytes: Counter::ZERO,
-        }
     }
 }
 
@@ -1687,8 +1626,8 @@ pub struct ReleaseStatus {
 #[serde(rename_all = "kebab-case")]
 pub enum VmEngine {
     Firecracker,
-    AppleVirtualization,
-    HyperV,
+    QemuHvf,
+    QemuWhpx,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

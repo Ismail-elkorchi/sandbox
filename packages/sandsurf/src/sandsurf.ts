@@ -5,7 +5,7 @@ import { MachineCollection, SnapshotCollection } from "./machines.js";
 import { NativeHostClient, record, SandsurfHostError, text } from "./native-host.js";
 import { parseCapability, parseQualification, parseResourceCapabilities, parseRetainedQualification } from "./observations.js";
 import { SandsurfOperations } from "./operations.js";
-import { authorize, childIdentity, digest, protocol, subscribe, transport, validateIdentity } from "./sdk-internal.js";
+import { authorize, childIdentity, digest, protocol, subscribe, subscribeConsole, transport, validateIdentity } from "./sdk-internal.js";
 import { SecretCollection } from "./secrets.js";
 import { resolve } from "node:path";
 
@@ -26,15 +26,16 @@ export class Sandsurf {
     if (response.kind !== "inspection" || !record(response.value)) throw protocol("host inspection response");
     const value = response.value;
     const engine = text(value.engine);
-    if (engine !== "firecracker" && engine !== "apple-virtualization" && engine !== "hyper-v") throw protocol("native engine");
+    if (engine !== "firecracker" && engine !== "qemu-hvf" && engine !== "qemu-whpx") throw protocol("native engine");
     if (!record(value.guestPower)) throw protocol("guest power capabilities");
     if (!record(value.resources)) throw protocol("host resource capabilities");
     if (!Array.isArray(value.qualificationRecords) || value.qualificationRecords.length > 16 || !Array.isArray(value.qualificationIssues)) throw protocol("retained native qualifications");
     return {
       hostId: validateIdentity(text(value.hostId)), platform: text(value.platform), architecture: text(value.architecture),
       guestArchitecture: text(value.guestArchitecture), guestPlatform: text(value.guestPlatform), engine,
-      lifecycle: parseQualification(value.lifecycle), fullState: parseQualification(value.fullState), images: parseQualification(value.images),
+      lifecycle: parseQualification(value.lifecycle), fullState: parseCapability(value.fullState), images: parseQualification(value.images),
       imageWorkers: parseCapability(value.imageWorkers),
+      networkEgress: parseCapability(value.networkEgress),
       qualificationRecords: value.qualificationRecords.map(parseRetainedQualification), qualificationIssues: value.qualificationIssues.map(text),
       resources: parseResourceCapabilities(value.resources),
       guestPower: { shutdown: parseCapability(value.guestPower.shutdown), reboot: parseCapability(value.guestPower.reboot) },
@@ -45,6 +46,7 @@ export class Sandsurf {
   async close(): Promise<void> { this.#closed = true; await this.#client.close(); }
   async [transport](request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { this.#open(); return this.#client.request(request); }
   [subscribe](machineId: string, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { this.#open(); return this.#client.eventPages(machineId, after, maximum, signal); }
+  [subscribeConsole](machineId: string, generation: number, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { this.#open(); return this.#client.consolePages(machineId, generation, after, maximum, signal); }
   async [authorize](change: AuthorityChange): Promise<string> {
     if (this.#authorizer === undefined) throw new SandsurfHostError("authorization", `No authorizer is installed for ${change.kind}`);
     const decision = await this.#authorizer(change);

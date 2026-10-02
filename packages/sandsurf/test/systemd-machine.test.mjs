@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { qualificationDirectory } from "./qualification-storage.mjs";
+import { qualificationDirectory, recordChecks } from "./qualification-storage.mjs";
 
 const packageRoot = process.env.SANDSURF_TEST_PACKAGE_ROOT ?? fileURLToPath(new URL("..", import.meta.url));
 const { Sandsurf, renderSandsurfServiceDefinition } = await import(pathToFileURL(join(packageRoot, "dist/index.js")).href);
@@ -72,6 +72,8 @@ test("installed systemd host restart leaves the independently supervised Linux m
     const output = Buffer.concat(page.chunks.map((chunk) => Buffer.from(chunk.bytes))).toString();
     assert.match(output, /before[\s\S]*after:continued/u);
     context.diagnostic("real KVM machine, keeper and PTY survive a default-cgroup systemd API-service restart");
+    await recordChecks(directory, machine, ["installed-package", "service-restart", "host-service-restart"], { generation, guardianPid, supervisorPid,
+      machineUnit, apiUnit: hostUnit.name, continuedTerminal: output });
   } finally {
     try { if (machine !== undefined) { await machine.inspect(); await machine.destroy(); } }
     finally {

@@ -2,18 +2,34 @@
 //! There is no host bridge, kernel forwarding, NAT, or guest management relay.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(unix)]
 mod gateway;
 pub mod packet;
 pub mod policy;
-#[cfg(unix)]
 pub use gateway::{NativeNetworkGateway, PacketTransport};
+mod stream;
+pub use stream::PacketStream;
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
-pub mod macos;
-#[cfg(windows)]
-pub mod windows;
+
+/// Enforcement implementation/installation, independently of VM qualification.
+/// Address enumeration alone cannot establish a kernel local-delivery boundary.
+pub fn egress_capability() -> sandsurf_protocol::Capability {
+    #[cfg(target_os = "linux")]
+    match sandsurf_native::network_sockets::probe() {
+        Ok(()) => sandsurf_protocol::Capability::Supported {
+            qualification: sandsurf_protocol::Qualification::Unqualified {
+                reasons: vec!["the installed socket factory, routing/filter configuration, and real NIC require configuration-specific qualification".into()],
+            },
+        },
+        Err(error) => sandsurf_protocol::Capability::Unsupported {
+            reasons: vec![format!("native kernel socket boundary unavailable: {error}")],
+        },
+    }
+    #[cfg(not(target_os = "linux"))]
+    sandsurf_protocol::Capability::Unsupported {
+        reasons: vec!["native kernel local-delivery enforcement is not implemented for this host; host-address observations alone are insufficient".into()],
+    }
+}
 
 /// The host machine identity selects a stable locally administered NIC address.
 /// Addresses are link identifiers, never substitutes for host authorization.

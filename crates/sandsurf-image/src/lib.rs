@@ -30,22 +30,7 @@ pub struct ImageManifest {
     pub architecture: Architecture,
     pub boot_bundle: BootBundleManifest,
     pub system: SystemDiskManifest,
-    #[serde(default)]
-    pub platform_artifacts: PlatformArtifacts,
     pub signature: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PlatformArtifacts {
-    pub windows_x64: Option<WindowsArtifacts>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WindowsArtifacts {
-    pub kernel: ImageArtifact,
-    pub system: ImageArtifact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,13 +158,6 @@ pub struct VerifiedImage {
     pub kernel_path: PathBuf,
     pub initramfs_path: Option<PathBuf>,
     pub system_path: PathBuf,
-    pub windows_x64: Option<VerifiedWindowsArtifacts>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VerifiedWindowsArtifacts {
-    pub kernel_path: PathBuf,
-    pub system_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -228,21 +206,6 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
         })
         .transpose()?;
     verify_artifact(&system_path, &manifest.system.rootfs.sha256, "system")?;
-    let windows_x64 = manifest
-        .platform_artifacts
-        .windows_x64
-        .as_ref()
-        .map(|artifacts| {
-            let kernel_path = resolve_beneath(directory, &artifacts.kernel.path)?;
-            let system_path = resolve_beneath(directory, &artifacts.system.path)?;
-            verify_artifact(&kernel_path, &artifacts.kernel.sha256, "Windows kernel")?;
-            verify_artifact(&system_path, &artifacts.system.sha256, "Windows system")?;
-            Ok::<_, ImageError>(VerifiedWindowsArtifacts {
-                kernel_path,
-                system_path,
-            })
-        })
-        .transpose()?;
     Ok(VerifiedImage {
         manifest,
         manifest_path: path.to_path_buf(),
@@ -250,7 +213,6 @@ pub fn verify_image(path: &Path, trust: ImageTrust<'_>) -> Result<VerifiedImage,
         kernel_path,
         initramfs_path,
         system_path,
-        windows_x64,
     })
 }
 
@@ -320,13 +282,7 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
     ]
     .into_iter()
     .chain(manifest.boot_bundle.initramfs.iter().map(|v| &v.path))
-    .chain(
-        manifest
-            .platform_artifacts
-            .windows_x64
-            .iter()
-            .flat_map(|v| [&v.kernel.path, &v.system.path]),
-    ) {
+    {
         let path = Path::new(value);
         if value.is_empty()
             || value.contains(['\\', '\0', ':'])
@@ -360,13 +316,6 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
             .guest_agent
             .iter()
             .map(|agent| &agent.sha256),
-    )
-    .chain(
-        manifest
-            .platform_artifacts
-            .windows_x64
-            .iter()
-            .flat_map(|value| [&value.kernel.sha256, &value.system.sha256]),
     ) {
         if digest.len() != 64
             || !digest
@@ -477,13 +426,6 @@ pub fn install_image(store: &Path, image: &VerifiedImage) -> Result<PathBuf, Ima
                 .is_some()
         {
             return Err(ImageError::Invalid("boot artifact paths collide".into()));
-        }
-        if let (Some(paths), Some(metadata)) = (
-            &image.windows_x64,
-            &image.manifest.platform_artifacts.windows_x64,
-        ) {
-            artifacts.insert(metadata.kernel.path.clone(), paths.kernel_path.clone());
-            artifacts.insert(metadata.system.path.clone(), paths.system_path.clone());
         }
         let mut directories = std::collections::BTreeSet::new();
         for (relative, source) in artifacts {
@@ -815,7 +757,6 @@ mod tests {
                     materials: BTreeMap::from([("fixture".into(), hex_sha256(b"fixture"))]),
                 },
             },
-            platform_artifacts: PlatformArtifacts::default(),
             signature: None,
         }
     }

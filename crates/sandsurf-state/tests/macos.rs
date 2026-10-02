@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 
-use sandsurf_protocol::{Counter, Resources};
+use sandsurf_protocol::Counter;
 use sandsurf_state::{CatalogLimits, HostCatalog};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -24,8 +24,8 @@ fn macos_acl_grants_make_authority_unavailable_without_repair_or_deletion() {
         operations: one,
         usage_records: one,
         image_bytes: one,
-        resources: Resources::from_geometry(one, one, one, one, one)
-            .expect("static resource envelope"),
+        cpu_quota_micros: one,
+        host_memory_bytes: one,
     };
     drop(HostCatalog::create(&catalog, "acl-host".try_into().unwrap(), limits).unwrap());
     for (path, grant) in [

@@ -1,0 +1,33 @@
+[Unit]
+Description=Sandsurf restrictive native socket factory
+After=network.target
+
+[Service]
+Type=exec
+User=root
+ExecStartPre=/usr/sbin/nft -f /usr/local/libexec/sandsurf/network-boundary.nft
+ExecStart=/usr/local/libexec/sandsurf/sandsurf-host --linux-network-sockets
+Restart=on-failure
+RestartSec=1
+RuntimeDirectory=sandsurf-network
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/run/sandsurf-network
+CPUQuota=25%
+CPUQuotaPeriodSec=100ms
+MemoryMax=67108864
+MemorySwapMax=0
+OOMPolicy=kill
+TasksMax=40
+KillMode=control-group
+Delegate=no
+
+[Install]
+WantedBy=multi-user.target

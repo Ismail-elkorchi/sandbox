@@ -1,4 +1,4 @@
-use crate::appliance::{self, command};
+use crate::appliance::{self, Operation};
 use crate::{Architecture, ImageArtifact};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,11 +81,13 @@ pub fn extract(
         let resolved = appliance::run(
             disk,
             false,
-            &[appliance::mount(false), command("realpath", &[path])],
-        )?;
-        let resolved = std::str::from_utf8(&resolved)
-            .map_err(|_| invalid("boot path encoding"))?
-            .trim();
+            &[
+                Operation::Mount { writable: false },
+                Operation::Realpath { path: path.clone() },
+            ],
+        )?
+        .text()?;
+        let resolved = resolved.trim();
         let check = BootSelection {
             architecture,
             kernel: resolved.into(),
@@ -169,7 +171,7 @@ pub fn verify(directory: &Path, boot: &FrozenBoot) -> io::Result<()> {
     if let Some(value) = &boot.initramfs {
         validate_initramfs(&directory.join(&value.path))?;
     }
-    validate_kernel(&directory.join("kernel"), boot.architecture)
+    validate_kernel(&directory.join("kernel"), boot.architecture).map(|_| ())
 }
 
 pub fn validate_initramfs(path: &Path) -> io::Result<()> {
@@ -186,7 +188,26 @@ pub fn validate_initramfs(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelFormat {
+    Elf { pvh_entry: Option<u32> },
+    LinuxBoot,
+    ArmImage,
+}
+
+impl KernelFormat {
+    pub fn require_qemu(self) -> io::Result<()> {
+        if matches!(self, Self::Elf { pvh_entry: None }) {
+            Err(invalid(
+                "QEMU x86 direct boot requires a physical PVH ELF entry",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<KernelFormat> {
     let mut file = fs::File::open(path)?;
     let length = file.metadata()?.len();
     if length == 0 || length > MAX_KERNEL {
@@ -207,7 +228,8 @@ pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<()
         && h.len() >= 0x238
         && &h[0x202..0x206] == b"HdrS"
         && h[0x1fe..0x200] == [0x55, 0xaa]
-        && h[0x236] & 1 != 0;
+        && h[0x236] & 1 != 0
+        && u16::from_le_bytes([h[0x206], h[0x207]]) >= 0x020c;
     let arm = architecture == Architecture::Arm64
         && h.len() >= 64
         && &h[56..60] == b"ARM\x64"
@@ -234,10 +256,29 @@ pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<()
         }
         file.seek(SeekFrom::Start(offset))?;
         let mut executable_entry = false;
+        let mut physical_executable = Vec::new();
+        let mut notes = Vec::new();
+        let mut note_bytes = 0_u64;
         for _ in 0..segments {
             let mut segment = [0; 56];
             file.read_exact(&mut segment)?;
-            if u32::from_le_bytes(segment[..4].try_into().unwrap()) != 1 {
+            let kind = u32::from_le_bytes(segment[..4].try_into().unwrap());
+            if kind == 4 {
+                let start = u64::from_le_bytes(segment[8..16].try_into().unwrap());
+                let bytes = u64::from_le_bytes(segment[32..40].try_into().unwrap());
+                let alignment = u64::from_le_bytes(segment[48..56].try_into().unwrap());
+                note_bytes = note_bytes
+                    .checked_add(bytes)
+                    .filter(|bytes| *bytes <= 1024 * 1024)
+                    .ok_or_else(|| invalid("ELF note byte envelope"))?;
+                if !(alignment == 4 || alignment == 8)
+                    || start.checked_add(bytes).is_none_or(|end| end > length)
+                {
+                    return Err(invalid("malformed ELF note segment"));
+                }
+                notes.push((start, bytes, alignment));
+            }
+            if kind != 1 {
                 continue;
             }
             let file_offset = u64::from_le_bytes(segment[8..16].try_into().unwrap());
@@ -257,6 +298,9 @@ pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<()
             {
                 return Err(invalid("ELF load segment exceeds boot bounds"));
             }
+            if u32::from_le_bytes(segment[4..8].try_into().unwrap()) & 1 != 0 {
+                physical_executable.push((physical, physical + bytes));
+            }
             executable_entry |= u32::from_le_bytes(segment[4..8].try_into().unwrap()) & 1 != 0
                 && entry >= address
                 && entry < address + memory;
@@ -264,8 +308,60 @@ pub fn validate_kernel(path: &Path, architecture: Architecture) -> io::Result<()
         if !executable_entry {
             return Err(invalid("ELF entry is outside executable load segments"));
         }
+        let mut pvh_entry = None;
+        for (offset, length, alignment) in notes {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![0; length as usize];
+            file.read_exact(&mut bytes)?;
+            let mut cursor = 0_usize;
+            let aligned = |length: u32| -> io::Result<usize> {
+                u64::from(length)
+                    .checked_add(alignment - 1)
+                    .map(|length| (length & !(alignment - 1)) as usize)
+                    .ok_or_else(|| invalid("ELF note alignment overflow"))
+            };
+            while cursor < bytes.len() {
+                let header = bytes
+                    .get(cursor..cursor + 12)
+                    .ok_or_else(|| invalid("truncated ELF note header"))?;
+                let name_length = u32::from_le_bytes(header[..4].try_into().unwrap());
+                let value_length = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                let kind = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                cursor += 12;
+                let name_end = cursor
+                    .checked_add(aligned(name_length)?)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| invalid("ELF note name exceeds its segment"))?;
+                let name = &bytes[cursor..cursor + name_length as usize];
+                cursor = name_end;
+                let value_end = cursor
+                    .checked_add(aligned(value_length)?)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| invalid("ELF note value exceeds its segment"))?;
+                if name == b"Xen\0" && kind == 18 {
+                    if value_length != 4 || pvh_entry.is_some() {
+                        return Err(invalid("ambiguous or malformed physical PVH entry"));
+                    }
+                    let entry = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                    if entry == 0
+                        || !physical_executable.iter().any(|(start, end)| {
+                            u64::from(entry) >= *start && u64::from(entry) < *end
+                        })
+                    {
+                        return Err(invalid("PVH entry is outside physical executable payload"));
+                    }
+                    pvh_entry = Some(entry);
+                }
+                cursor = value_end;
+            }
+        }
+        return Ok(KernelFormat::Elf { pvh_entry });
     }
-    Ok(())
+    Ok(if bz {
+        KernelFormat::LinuxBoot
+    } else {
+        KernelFormat::ArmImage
+    })
 }
 
 pub fn paths(directory: &Path, value: &FrozenBoot) -> (PathBuf, Option<PathBuf>) {
@@ -278,6 +374,87 @@ pub fn paths(directory: &Path, value: &FrozenBoot) -> (PathBuf, Option<PathBuf>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kernel_formats_share_one_parser_but_obey_native_loader_contracts() {
+        let mut random = [0; 16];
+        getrandom::getrandom(&mut random).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "sandsurf-kernel-loader-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        sandsurf_native::local::create_private_directory(&directory).unwrap();
+        let path = directory.join("kernel");
+        let mut elf = [0_u8; 512];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x100100u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf[80..88].copy_from_slice(&0x100000u64.to_le_bytes());
+        elf[88..96].copy_from_slice(&0x100000u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&512u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&512u64.to_le_bytes());
+        elf[120..124].copy_from_slice(&4u32.to_le_bytes());
+        elf[128..136].copy_from_slice(&256u64.to_le_bytes());
+        elf[152..160].copy_from_slice(&20u64.to_le_bytes());
+        elf[168..176].copy_from_slice(&4u64.to_le_bytes());
+        elf[256..260].copy_from_slice(&4u32.to_le_bytes());
+        elf[260..264].copy_from_slice(&4u32.to_le_bytes());
+        elf[264..268].copy_from_slice(&18u32.to_le_bytes());
+        elf[268..272].copy_from_slice(b"Xen\0");
+        elf[272..276].copy_from_slice(&0x100100u32.to_le_bytes());
+        fs::write(&path, elf).unwrap();
+        let format = validate_kernel(&path, Architecture::X64).unwrap();
+        assert_eq!(
+            format,
+            KernelFormat::Elf {
+                pvh_entry: Some(0x100100)
+            }
+        );
+        assert!(format.require_qemu().is_ok());
+        let mut no_pvh = elf;
+        no_pvh[264..268].copy_from_slice(&0u32.to_le_bytes());
+        fs::write(&path, no_pvh).unwrap();
+        let format = validate_kernel(&path, Architecture::X64).unwrap();
+        assert_eq!(format, KernelFormat::Elf { pvh_entry: None });
+        assert!(format.require_qemu().is_err());
+        for corruption in [0, 1, 2, 3] {
+            let mut invalid = elf;
+            match corruption {
+                0 => invalid[272..276].copy_from_slice(&u32::MAX.to_le_bytes()),
+                1 => invalid[260..264].copy_from_slice(&8u32.to_le_bytes()),
+                2 => invalid[152..160].copy_from_slice(&u64::MAX.to_le_bytes()),
+                _ => {
+                    invalid[56..58].copy_from_slice(&3u16.to_le_bytes());
+                    invalid[176..232].copy_from_slice(&elf[120..176]);
+                }
+            }
+            fs::write(&path, invalid).unwrap();
+            assert!(validate_kernel(&path, Architecture::X64).is_err());
+        }
+        let mut linux = [0; 4096];
+        linux[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        linux[0x202..0x206].copy_from_slice(b"HdrS");
+        linux[0x206..0x208].copy_from_slice(&0x020cu16.to_le_bytes());
+        linux[0x236] = 1;
+        fs::write(&path, linux).unwrap();
+        assert_eq!(
+            validate_kernel(&path, Architecture::X64).unwrap(),
+            KernelFormat::LinuxBoot
+        );
+        linux[0x206..0x208].copy_from_slice(&0x020bu16.to_le_bytes());
+        fs::write(&path, linux).unwrap();
+        assert!(validate_kernel(&path, Architecture::X64).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn boot_selection_rejects_host_paths_traversal_commands_and_wrong_architecture() {
         for path in [

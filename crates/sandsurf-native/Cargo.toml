@@ -5,14 +5,24 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "sandsurf-resource-broker"
+path = "src/bin/resource_broker.rs"
+
+[[bin]]
+name = "sandsurf-artifact-publisher"
+path = "src/bin/artifact_publisher.rs"
+
 [dependencies]
 libc.workspace = true
-
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }
+socket2 = "=0.6.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-sandsurf-protocol = { path = "../sandsurf-protocol" }
 windows-sys = { workspace = true, features = [
   "Wdk_Storage_FileSystem",
   "Win32_Foundation",
@@ -20,10 +30,11 @@ windows-sys = { workspace = true, features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
-  "Win32_Storage_Vhd",
   "Win32_System_IO",
-  "Win32_System_Hypervisor",
-  "Win32_System_HostComputeSystem",
+  "Win32_System_Ioctl",
+  "Win32_System_JobObjects",
+  "Win32_System_SystemInformation",
   "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
   "Win32_System_Threading",
 ] }

@@ -114,7 +114,7 @@ pub(crate) fn complete(root: &Path) -> Result<()> {
 
 /// Remove only this guardian's verified native restore-stage copy. The
 /// immutable snapshot and every retained execution original remain intact.
-#[cfg(any(target_os = "macos", windows, feature = "apple-source-check", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 pub(crate) fn retire_stage(root: &Path, stage: &Path) -> Result<()> {
     let directory = root.join("guardian/restores");
     let valid_name = stage
@@ -124,7 +124,7 @@ pub(crate) fn retire_stage(root: &Path, stage: &Path) -> Result<()> {
     let valid_extension = stage
         .extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension, "vmstate" | "vmrs"));
+        .is_some_and(|extension| extension == "vmstate");
     if stage.parent() != Some(directory.as_path()) || !valid_name || !valid_extension {
         return Err(Error::Protocol("restore stage escapes guardian ownership"));
     }

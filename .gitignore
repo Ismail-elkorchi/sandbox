@@ -2,10 +2,8 @@ node_modules/
 target/
 packages/sandsurf/dist/
 packages/sandsurf/images/development-*/*.ext4
-packages/sandsurf/images/development-*/*.vhdx
 packages/sandsurf/images/development-*/*.gz
 native/*/sandsurf-host-*
-native/*/sandsurf-vz-helper-*
 native/manifest.json
 release/
 fuzz/artifacts/
@@ -13,3 +11,9 @@ fuzz/corpus/
 *.tsbuildinfo
 *.log
 .DS_Store
+.native-publication.lock
+.native-publication.json
+.native-publication-*.pending
+.native-build-*/
+.native-previous-*/
+.native-release-*/

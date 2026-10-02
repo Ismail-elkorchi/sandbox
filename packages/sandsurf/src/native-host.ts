@@ -9,7 +9,7 @@ import type { Readable } from "node:stream";
 const BRIDGE_VERSION = 1;
 const MAX_BRIDGE_BYTES = 1024 * 1024 + 256 * 1024 + 4;
 const MAX_BRIDGE_PENDING = 64;
-const MAX_EVENT_STREAMS = 8;
+const MAX_OBSERVATION_STREAMS = 8;
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export class SandsurfHostError extends Error {
@@ -121,12 +121,20 @@ export class NativeHostClient {
   }
 
   async *eventPages(machineId: string, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> {
+    yield* this.#observationPages("events", ["event-stream", "--machine", machineId, "--after", String(after), "--maximum", String(maximum)], signal);
+  }
+
+  async *consolePages(machineId: string, generation: number, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> {
+    yield* this.#observationPages("console", ["console-stream", "--machine", machineId, "--generation", String(generation), "--after", String(after), "--maximum", String(maximum)], signal);
+  }
+
+  async *#observationPages(kind: "events" | "console", args: readonly string[], signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> {
     const aborted = (): boolean => signal?.aborted === true;
     if (this.#closed) throw new SandsurfHostError("client", "Sandsurf client is closed");
     if (this.#failed !== undefined) throw this.#failed;
     if (aborted()) throw signal?.reason;
-    if (this.#streams.size >= MAX_EVENT_STREAMS) throw new SandsurfHostError("capacity", "native event stream capacity is full");
-    const child = spawn(this.#binary, ["event-stream", "--directory", this.directory, "--machine", machineId, "--after", String(after), "--maximum", String(maximum)], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    if (this.#streams.size >= MAX_OBSERVATION_STREAMS) throw new SandsurfHostError("capacity", "native observation stream capacity is full");
+    const child = spawn(this.#binary, [...args, "--directory", this.directory], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let errorText = "";
     let failure: Error | undefined;
     child.stderr.on("data", (chunk: Buffer) => { errorText = (errorText + chunk.toString("utf8")).slice(-4096); });
@@ -140,7 +148,8 @@ export class NativeHostClient {
       for await (const frame of bridgeFrames(child.stdout)) {
         if (aborted()) throw signal?.reason;
         const [id, value] = decodeBridgeFrame(frame);
-        if (id !== 1 || value.kind !== "runtime" || !record(value.response) || value.response.kind !== "events" || !record(value.response.page)) throw new SandsurfHostError("protocol", "invalid native event stream page");
+        if (value.kind === "rejected") throw new SandsurfHostError(text(value.category), text(value.message));
+        if (id !== 1 || value.kind !== "runtime" || !record(value.response) || value.response.kind !== kind || !record(value.response.page)) throw new SandsurfHostError("protocol", "invalid native observation stream page");
         const cursor = integer(value.response.page.cursor);
         yield value;
         if (this.#closed) return;
@@ -149,10 +158,10 @@ export class NativeHostClient {
         await new Promise<void>((done, reject) => child.stdin.write(credit, (error?: Error | null) => error == null ? done() : reject(error)));
       }
       if (aborted()) throw signal?.reason;
-      if (!this.#closed) throw new SandsurfHostError("transport", `native event stream ended: ${failure?.message ?? errorText}`);
+      if (!this.#closed) throw new SandsurfHostError("transport", `native observation stream ended: ${failure?.message ?? errorText}`);
     } catch (error) {
       if (aborted()) throw signal?.reason;
-      if (!this.#closed) throw error instanceof SandsurfHostError ? error : new SandsurfHostError("transport", `native event stream failed: ${String(error)}`);
+      if (!this.#closed) throw error instanceof SandsurfHostError ? error : new SandsurfHostError("transport", `native observation stream failed: ${String(error)}`);
     } finally {
       signal?.removeEventListener("abort", abort);
       child.kill();
@@ -434,7 +443,10 @@ export async function resolveSandsurfNativeHost(): Promise<string> {
   const suffix = platform === "windows" ? ".exe" : "";
   const relative = `${platform}-${architecture}/sandsurf-host-${platform}-${architecture}${suffix}`;
   const manifest: unknown = JSON.parse(await readFile(resolve(packageRoot, "native/manifest.json"), "utf8"));
-  if (!record(manifest) || !record(manifest.files)) throw new SandsurfHostError("integrity", "native manifest is malformed");
+  if (!record(manifest) || manifest.formatVersion !== 1 || manifest.buildId !== "sandsurf-native-1.0.0"
+    || !record(manifest.files) || Object.keys(manifest).sort().join(",") !== "buildId,files,formatVersion") {
+    throw new SandsurfHostError("integrity", "native manifest is malformed");
+  }
   const expected = manifest.files[relative];
   if (typeof expected !== "string" || !/^[a-f0-9]{64}$/u.test(expected)) {
     throw new SandsurfHostError("unsupported", `native Sandsurf host is not packaged for ${platform}-${architecture}`);

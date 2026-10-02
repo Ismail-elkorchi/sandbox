@@ -6,6 +6,63 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
+/// A single native disk-slot lease. On Unix flock follows the shared open
+/// description. Windows uses share denial on the file object, not a byte lock
+/// owned by a process that can die before its out-of-process VMM is contained.
+pub fn disk_lease(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        crate::local::disk_lease(path)
+    }
+    #[cfg(unix)]
+    {
+        let lease = match crate::local::create_private_file(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                crate::local::open_private_file(path, crate::PrivateFileAccess::ReadWrite)?
+            }
+            Err(error) => return Err(error),
+        };
+        lease.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage slot already has an owner",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(lease)
+    }
+}
+
+/// Check the received original lease against the admitted private name without
+/// locking another description. Retention, not pathname observation, owns it.
+pub fn verify_transferred_lease(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::local::verify_transferred_lease(file, path)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let observed = crate::local::open_private_file(path, crate::PrivateFileAccess::ReadOnly)?;
+        let held = file.metadata()?;
+        let named = observed.metadata()?;
+        // SAFETY: getuid is a scalar credential query.
+        if !held.is_file()
+            || held.nlink() != 1
+            || held.mode() & 0o077 != 0
+            || held.uid() != unsafe { libc::getuid() }
+            || (held.dev(), held.ino()) != (named.dev(), named.ino())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "transferred storage custody changed private identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Portable address for an opaque logical identifier, not another identity or
 /// authorization decision. Never embed identifiers directly in host filenames:
 /// case folding and reserved device names must not collapse distinct owners.
@@ -33,115 +90,6 @@ pub fn retain_descriptor_for_exec(file: &File) -> io::Result<()> {
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
-}
-
-/// Only explicit absence of the exact HCS identity frees its attachment fence.
-/// Stopped, query errors and unavailable HCS are not absence. The probe never
-/// starts or modifies a compute system.
-#[cfg(windows)]
-pub fn compute_system_absent(id: &str) -> io::Result<bool> {
-    use windows_sys::Win32::Foundation::GENERIC_ALL;
-    use windows_sys::Win32::System::HostComputeSystem::{
-        HCS_SYSTEM, HcsCloseComputeSystem, HcsOpenComputeSystem,
-    };
-    if id.len() != 36
-        || !id.bytes().enumerate().all(|(index, byte)| {
-            if [8, 13, 18, 23].contains(&index) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
-            }
-        })
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid native compute-system identity",
-        ));
-    }
-    let encoded: Vec<u16> = id.encode_utf16().chain([0]).collect();
-    let mut system: HCS_SYSTEM = std::ptr::null_mut();
-    // SAFETY: encoded is NUL-terminated and system is a live output slot. HCS
-    // requires GENERIC_ALL even for this existence-only probe.
-    let result = unsafe { HcsOpenComputeSystem(encoded.as_ptr(), GENERIC_ALL, &mut system) };
-    let absent = compute_system_outcome(result, !system.is_null())?;
-    if !absent {
-        // SAFETY: successful open transferred exactly this live native handle.
-        unsafe { HcsCloseComputeSystem(system) };
-    }
-    Ok(absent)
-}
-
-#[cfg(windows)]
-fn compute_system_outcome(result: i32, has_handle: bool) -> io::Result<bool> {
-    use windows_sys::Win32::Foundation::HCS_E_SYSTEM_NOT_FOUND;
-    if result >= 0 && has_handle {
-        return Ok(false);
-    }
-    if result == HCS_E_SYSTEM_NOT_FOUND && !has_handle {
-        return Ok(true);
-    }
-    Err(io::Error::other(format!(
-        "native attachment observation unavailable: {result:#x}"
-    )))
-}
-
-/// Remove only the recorded native attachment's access entry after absence.
-/// Never repairs unrelated file ownership.
-#[cfg(windows)]
-pub fn revoke_disk_attachment_access(id: &str, path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        GetFileInformationByHandle,
-    };
-    use windows_sys::Win32::System::HostComputeSystem::HcsRevokeVmAccess;
-    let identity: Vec<u16> = id.encode_utf16().chain([0]).collect();
-    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if id.contains('\0') || encoded.contains(&0) || !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid recorded attachment access",
-        ));
-    }
-    encoded.push(0);
-    // Exclusive data-file access proves old native disk handles have drained,
-    // and prevents pathname replacement while the owned ACL entry is removed.
-    // Do not require the final private ACL before removing the recorded VM ACE.
-    let disk = OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = disk.metadata()?;
-    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: disk retains the live handle and information is a writable output.
-    if unsafe { GetFileInformationByHandle(disk.as_raw_handle(), information.as_mut_ptr()) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful native call initialized information completely.
-    let information = unsafe { information.assume_init() };
-    if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || information.nNumberOfLinks != 1
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recorded attachment disk has an alias",
-        ));
-    }
-    // SAFETY: the exact host-recorded identity and absolute path are terminated
-    // and live for this removal of that VM's access entry only.
-    let result = unsafe { HcsRevokeVmAccess(identity.as_ptr(), encoded.as_ptr()) };
-    if result < 0 {
-        return Err(io::Error::other(format!(
-            "native attachment access cleanup failed: {result:#x}"
-        )));
-    }
-    drop(disk);
-    crate::local::open_private_file(path, crate::PrivateFileAccess::ReadOnly)?;
     Ok(())
 }
 
@@ -343,34 +291,56 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
-    #[cfg(windows)]
     #[test]
-    fn native_compute_absence_is_not_stopped_unavailable_or_denied() {
-        use windows_sys::Win32::Foundation::{
-            E_ACCESSDENIED, HCS_E_SERVICE_DISCONNECT, HCS_E_SYSTEM_ALREADY_STOPPED,
-            HCS_E_SYSTEM_NOT_FOUND,
-        };
-        assert!(compute_system_outcome(HCS_E_SYSTEM_NOT_FOUND, false).unwrap());
-        assert!(!compute_system_outcome(0, true).unwrap());
-        for (result, handle) in [
-            (HCS_E_SYSTEM_ALREADY_STOPPED, false),
-            (HCS_E_SERVICE_DISCONNECT, false),
-            (E_ACCESSDENIED, false),
-            (0, false),
-            (HCS_E_SYSTEM_NOT_FOUND, true),
-        ] {
-            assert!(compute_system_outcome(result, handle).is_err());
-        }
-        for id in [
-            "",
-            "not-a-compute-system",
-            "00000000-0000-0000-0000-00000000000G",
-        ] {
-            assert_eq!(
-                compute_system_absent(id).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-        }
+    fn transferred_custody_verification_never_reacquires_or_releases_the_slot() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-transferred-slot-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::local::create_private_directory(&root).unwrap();
+        let path = root.join("pool.lock");
+        let other = root.join("other.lock");
+        let parent = disk_lease(&path).unwrap();
+        let child = parent.try_clone().unwrap();
+        drop(parent);
+        verify_transferred_lease(&child, &path).unwrap();
+        let unrelated = disk_lease(&other).unwrap();
+        assert!(verify_transferred_lease(&child, &other).is_err());
+        assert_eq!(
+            disk_lease(&path).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(unrelated);
+        drop(child);
+        let replacement = disk_lease(&path).unwrap();
+        verify_transferred_lease(&replacement, &path).unwrap();
+        drop(replacement);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mutation_custody_survives_transfer_until_the_last_native_owner_closes() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-disk-transaction-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::local::create_private_directory(&root).unwrap();
+        let path = root.join("disk.lock");
+        let transaction = disk_lease(&path).unwrap();
+        let worker = transaction.try_clone().unwrap();
+        assert!(disk_lease(&path).is_err());
+        drop(transaction);
+        // A filesystem mutation may have transferred this exact description
+        // to an appliance. Parent completion must not unlock a surviving VM.
+        assert!(disk_lease(&path).is_err());
+        let native = worker.try_clone().unwrap();
+        drop(worker);
+        assert!(disk_lease(&path).is_err());
+        drop(native);
+        drop(disk_lease(&path).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

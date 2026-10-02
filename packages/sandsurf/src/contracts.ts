@@ -30,7 +30,7 @@ export interface ResourceChangeAssessment { readonly mode: ResourceChangeMode; r
 
 export interface ResourceUpdateResult { readonly machine: MachineInspection; readonly assessment: ResourceChangeAssessment; }
 
-export type MeasurementSource = "unavailable" | "host-cgroup" | "host-filesystem" | "host-retention" | "host-admission" | "host-network" | "guest-reported";
+export type MeasurementSource = "unavailable" | "host-cgroup" | "host-darwin-task" | "host-job" | "host-partition" | "host-filesystem" | "host-retention" | "host-admission" | "host-network" | "guest-reported";
 
 export interface ResourceProvenance { readonly cpu: MeasurementSource; readonly memory: MeasurementSource; readonly io: MeasurementSource; readonly storage: MeasurementSource; readonly output: MeasurementSource; readonly executions: MeasurementSource; readonly channels: MeasurementSource; readonly network: MeasurementSource; }
 
@@ -74,11 +74,11 @@ export interface GuestPowerCapabilities { readonly shutdown: Capability; readonl
 
 export interface ResourceCapabilities { readonly nativeTopology: Capability; readonly cpuTime: Capability; readonly aggregateHostMemory: Capability; readonly managedAdmission: Capability; readonly outputRetention: Capability; readonly storageReservations: Capability; readonly networkEnvelope: Capability; readonly aggregatePhysicalStorage: Capability; readonly sharedHostWorkers: Capability; readonly completeEnforcement: Capability; }
 
-export interface NativeQualificationConfiguration { readonly buildDigest: string; readonly platform: string; readonly architecture: string; readonly hardwareDigest: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly engineDigest: string; readonly imageDigest: string; readonly kernelDigest: string; readonly initramfsDigest: string | null; readonly nicConfigurationDigest: string; readonly storageConfigurationDigest: string; readonly resources: Required<ResourceEnvelope>; }
+export interface NativeQualificationConfiguration { readonly buildDigest: string; readonly platform: string; readonly architecture: string; readonly hardwareDigest: string; readonly engine: "firecracker" | "qemu-hvf" | "qemu-whpx"; readonly engineDigest: string; readonly imageDigest: string; readonly kernelDigest: string; readonly initramfsDigest: string | null; readonly nicConfigurationDigest: string; readonly storageConfigurationDigest: string; readonly resources: Required<ResourceEnvelope>; }
 
 export interface RetainedQualification { readonly run: { readonly configuration: NativeQualificationConfiguration; readonly scope: "lifecycle" | "resources" | "cpu-time" | "host-memory" | "storage-budgets" | "managed-channels" | "native-network" | "disk-snapshots" | "full-state" | "images" | "distribution"; readonly observedUnixMillis: number; readonly passedChecks: readonly string[]; readonly evidenceDigest: string; }; readonly acceptedBy: string; readonly acceptedUnixMillis: number; readonly recordDigest: string; }
 
-export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "apple-virtualization" | "hyper-v"; readonly lifecycle: Qualification; readonly fullState: Qualification; readonly images: Qualification; readonly imageWorkers: Capability; readonly resources: ResourceCapabilities; readonly qualificationRecords: readonly RetainedQualification[]; readonly qualificationIssues: readonly string[]; readonly guestPower: GuestPowerCapabilities; readonly console: Capability; readonly defaultImageDigest: string | null; }
+export interface HostInspection { readonly hostId: string; readonly platform: string; readonly architecture: string; readonly guestArchitecture: string; readonly guestPlatform: string; readonly engine: "firecracker" | "qemu-hvf" | "qemu-whpx"; readonly lifecycle: Qualification; readonly fullState: Capability; readonly images: Qualification; readonly imageWorkers: Capability; readonly networkEgress: Capability; readonly resources: ResourceCapabilities; readonly qualificationRecords: readonly RetainedQualification[]; readonly qualificationIssues: readonly string[]; readonly guestPower: GuestPowerCapabilities; readonly console: Capability; readonly defaultImageDigest: string | null; }
 
 export interface ImageDefaults { readonly environment: Readonly<Record<string, string>>; readonly user: string | null; readonly workingDirectory: string | null; }
 
@@ -101,7 +101,7 @@ export interface MachineLifecycleIntent { readonly machineId: string; readonly o
 export type StoragePayload = { readonly kind: "present" | "capacity-mismatch"; readonly fileBytes: number } | { readonly kind: "missing" | "unavailable" };
 
 /** Host storage observations do not attest to the integrity of the Linux filesystem. */
-export type StorageInspection = { readonly kind: "current"; readonly phase: "preparing" | "published" | "attached" | "replacing" | "retiring" | "retired"; readonly format: "raw" | "vhdx"; readonly capacityBytes: number; readonly operationId: string | null; readonly payload: StoragePayload } | { readonly kind: "unavailable"; readonly reason: "ownership-missing" | "ownership-invalid" | "access-unavailable" };
+export type StorageInspection = { readonly kind: "current"; readonly phase: "preparing" | "published" | "replacing" | "retiring" | "retired"; readonly capacityBytes: number; readonly operationId: string | null; readonly payload: StoragePayload } | { readonly kind: "unavailable"; readonly reason: "ownership-missing" | "ownership-invalid" | "access-unavailable" };
 
 export interface MachineInspection { readonly id: string; readonly imageDigest: string; readonly runtimeConfiguration: RuntimeConfiguration; readonly configurationRevision: number; readonly reservation: "held" | "released"; readonly knownSensitive: boolean; readonly lifecycleIntent: MachineLifecycleIntent; readonly machine: MachineObservation; readonly management: ManagementObservation; readonly storage: StorageInspection; readonly executionDefaults: ImageDefaults; readonly lifetime: Readonly<{ expiresAtUnixMillis: number | null; expirationAction: "stop" | "destroy" }>; readonly lastActivityUnixMillis: number; }
 
@@ -117,7 +117,9 @@ export interface Exposure { readonly id: string; readonly machineId: string; rea
 
 export interface RuntimeConfiguration { readonly network: NetworkPolicy; readonly exposures: readonly Exposure[]; readonly resources: Required<ResourceEnvelope>; }
 
-export interface ResourceUsage { readonly provenance: ResourceProvenance; readonly hostCounterEpoch: string | null; readonly channelsCurrent: number | null; readonly inflightRequestsCurrent: number | null; readonly cpuMicros: number | null; readonly memoryCurrent: number | null; readonly memoryPeak: number | null; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number | null; readonly ioWriteBytes: number | null; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly executionsCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
+/** Separate native CPU domains; these are not an additive whole-computer total. */
+export interface CpuLedgers { readonly nativeMicros: number | null; readonly nativeSource: MeasurementSource; readonly partitionMicros: number | null; readonly partitionHypervisorMicros: number | null; readonly partitionSource: MeasurementSource; }
+export interface ResourceUsage { readonly provenance: ResourceProvenance; readonly hostCounterEpoch: string | null; readonly channelsCurrent: number | null; readonly inflightRequestsCurrent: number | null; readonly cpuMicros: number | null; readonly cpuLedgers: CpuLedgers | null; readonly memoryCurrent: number | null; readonly memoryPeak: number | null; readonly diskLogicalBytes: number; readonly diskAllocatedBytes: number; readonly ioReadBytes: number | null; readonly ioWriteBytes: number | null; readonly outputRetainedBytes: number; readonly networkRxBytes: number; readonly networkTxBytes: number; readonly networkConnections: number; readonly executionsCurrent: number; readonly complete: boolean; readonly source: string; readonly observedUnixMillis: number; }
 
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
 

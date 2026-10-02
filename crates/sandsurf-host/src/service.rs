@@ -47,10 +47,8 @@ pub enum HostError {
     GuardianStartup(String),
     #[cfg(target_os = "linux")]
     Linux(crate::linux::LinuxError),
-    #[cfg(target_os = "macos")]
-    Apple(crate::apple::AppleError),
-    #[cfg(target_os = "windows")]
-    Windows(crate::windows::WindowsError),
+    #[cfg(any(target_os = "macos", windows))]
+    Qemu(crate::qemu::QemuError),
     Invalid(&'static str),
 }
 
@@ -72,10 +70,8 @@ impl fmt::Display for HostError {
             Self::GuardianStartup(message) => output.write_str(message),
             #[cfg(target_os = "linux")]
             Self::Linux(error) => error.fmt(output),
-            #[cfg(target_os = "macos")]
-            Self::Apple(error) => error.fmt(output),
-            #[cfg(target_os = "windows")]
-            Self::Windows(error) => error.fmt(output),
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Qemu(error) => error.fmt(output),
             Self::Invalid(message) => output.write_str(message),
         }
     }
@@ -132,16 +128,10 @@ impl From<crate::linux::LinuxError> for HostError {
         Self::Linux(value)
     }
 }
-#[cfg(target_os = "macos")]
-impl From<crate::apple::AppleError> for HostError {
-    fn from(value: crate::apple::AppleError) -> Self {
-        Self::Apple(value)
-    }
-}
-#[cfg(target_os = "windows")]
-impl From<crate::windows::WindowsError> for HostError {
-    fn from(value: crate::windows::WindowsError) -> Self {
-        Self::Windows(value)
+#[cfg(any(target_os = "macos", windows))]
+impl From<crate::qemu::QemuError> for HostError {
+    fn from(value: crate::qemu::QemuError) -> Self {
+        Self::Qemu(value)
     }
 }
 
@@ -298,13 +288,6 @@ impl HostService {
 
     fn prepare_image(&mut self, request: HostRequest) -> Result<HostDispatch> {
         sandsurf_native::volume::inspect(&self.root)?;
-        if !cfg!(target_os = "linux") {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "externally limited image workers are unsupported on this adapter",
-            )
-            .into());
-        }
         match request {
             HostRequest::ImportOci {
                 source,
@@ -613,9 +596,9 @@ impl HostService {
                 value: self.inspect(),
             }),
             HostRequest::StopService => Ok(HostResponse::Complete),
-            HostRequest::OpenEventStream { machine_id } => {
+            HostRequest::OpenObservationStream { machine_id } => {
                 self.provision_guardian(&machine_id)?;
-                Ok(HostResponse::EventStream {
+                Ok(HostResponse::ObservationStream {
                     endpoint: self.guardian_endpoint(&machine_id),
                 })
             }
@@ -894,27 +877,18 @@ impl HostService {
                     &image_digest,
                     &resources,
                 )?;
-                #[cfg(target_os = "macos")]
-                let native_config = crate::apple::prepare_config(
+                #[cfg(any(target_os = "macos", windows))]
+                let native_config = crate::qemu::prepare_config(
                     &self.root,
                     &self.executable,
                     &machine_id,
                     &image_digest,
                     &resources,
                 )?;
-                #[cfg(target_os = "windows")]
-                let native_config = crate::windows::prepare_config(
-                    &self.root,
-                    &machine_id,
-                    &image_digest,
-                    &resources,
-                )?;
                 #[cfg(target_os = "linux")]
                 let image_defaults = crate::linux::execution_defaults(&self.root, &image_digest)?;
-                #[cfg(target_os = "macos")]
-                let image_defaults = crate::apple::execution_defaults(&self.root, &image_digest)?;
-                #[cfg(target_os = "windows")]
-                let image_defaults = crate::windows::execution_defaults(&self.root, &image_digest)?;
+                #[cfg(any(target_os = "macos", windows))]
+                let image_defaults = crate::qemu::execution_defaults(&self.root, &image_digest)?;
                 let approval = Approval {
                     id: approval_id,
                     request_digest: digest(
@@ -979,17 +953,10 @@ impl HostService {
                     &snapshot.image_digest,
                     &resources,
                 )?;
-                #[cfg(target_os = "macos")]
-                let native_config = crate::apple::prepare_config(
+                #[cfg(any(target_os = "macos", windows))]
+                let native_config = crate::qemu::prepare_config(
                     &self.root,
                     &self.executable,
-                    &machine_id,
-                    &snapshot.image_digest,
-                    &resources,
-                )?;
-                #[cfg(target_os = "windows")]
-                let native_config = crate::windows::prepare_config(
-                    &self.root,
                     &machine_id,
                     &snapshot.image_digest,
                     &resources,
@@ -1685,6 +1652,7 @@ impl HostService {
     }
 
     fn inspect(&self) -> HostInspection {
+        let network_egress = sandsurf_network::egress_capability();
         let (qualification_records, qualification_issues) =
             match crate::qualification::inspect(&self.root) {
                 Ok(records) => (records, Vec::new()),
@@ -1694,9 +1662,9 @@ impl HostService {
                 ),
             };
         let engine = if cfg!(target_os = "macos") {
-            VmEngine::AppleVirtualization
+            VmEngine::QemuHvf
         } else if cfg!(target_os = "windows") {
-            VmEngine::HyperV
+            VmEngine::QemuWhpx
         } else {
             VmEngine::Firecracker
         };
@@ -1721,12 +1689,24 @@ impl HostService {
             lifecycle: Qualification::Unqualified {
                 reasons: vec![reason.clone()],
             },
-            full_state: Qualification::Unqualified {
-                reasons: vec![reason],
+            full_state: {
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    sandsurf_machine::qemu_driver::full_state_capability()
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                {
+                    Capability::Supported {
+                        qualification: Qualification::Unqualified {
+                            reasons: vec![reason],
+                        },
+                    }
+                }
             },
             images: { crate::images::qualification() },
             image_workers: crate::image_worker::capability(&self.root),
-            resources: crate::resources::capabilities(&self.root),
+            resources: crate::resources::capabilities(&self.root, &network_egress),
+            network_egress,
             qualification_records,
             qualification_issues,
             guest_power: sandsurf_machine::guest_power_capabilities(),
@@ -2358,41 +2338,21 @@ impl HostService {
         self.provision_guardian_inner(machine)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn provision_guardian_with_config(
         &mut self,
         machine: &MachineId,
-        config: Option<&crate::apple::AppleGuardianConfig>,
+        config: Option<&crate::qemu::QemuGuardianConfig>,
     ) -> Result<()> {
         let root = self.machine_root(machine);
         prepare_directory(&root)?;
         prepare_directory(&root.join("guardian"))?;
         let config_path = root.join("guardian/config.json");
         if let Some(config) = config {
-            crate::apple::write_config(&config_path, config)?;
+            crate::qemu::write_config(&config_path, config)?;
             self.verified_guardians.insert(machine.clone());
         } else if !self.verified_guardians.contains(machine) {
-            crate::apple::read_config(&config_path, machine)?;
-            self.verified_guardians.insert(machine.clone());
-        }
-        self.provision_guardian_inner(machine)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn provision_guardian_with_config(
-        &mut self,
-        machine: &MachineId,
-        config: Option<&crate::windows::WindowsGuardianConfig>,
-    ) -> Result<()> {
-        let root = self.machine_root(machine);
-        prepare_directory(&root)?;
-        prepare_directory(&root.join("guardian"))?;
-        let config_path = root.join("guardian/config.json");
-        if let Some(config) = config {
-            crate::windows::write_config(&config_path, config)?;
-            self.verified_guardians.insert(machine.clone());
-        } else if !self.verified_guardians.contains(machine) {
-            crate::windows::read_config(&config_path, machine)?;
+            crate::qemu::read_config(&config_path, machine)?;
             self.verified_guardians.insert(machine.clone());
         }
         self.provision_guardian_inner(machine)
@@ -2732,16 +2692,6 @@ impl HostService {
                 .join("disks")
                 .join(system_disk_name()),
             record.runtime_configuration.resources.disk_bytes.get(),
-            {
-                #[cfg(windows)]
-                {
-                    crate::storage::DiskFormat::Vhdx
-                }
-                #[cfg(not(windows))]
-                {
-                    crate::storage::DiskFormat::Raw
-                }
-            },
         )?;
         self.catalog.release_retired_storage(machine)?;
         Ok(())
@@ -3316,10 +3266,8 @@ pub fn serve_machine_guardian(root: &Path, machine: MachineId) -> Result<()> {
     {
         #[cfg(target_os = "linux")]
         let mut guardian = Guardian::<crate::linux::LinuxGuardianEffect>::retained(journal)?;
-        #[cfg(target_os = "macos")]
-        let mut guardian = Guardian::<crate::apple::AppleGuardianEffect>::retained(journal)?;
-        #[cfg(target_os = "windows")]
-        let mut guardian = Guardian::<crate::windows::WindowsGuardianEffect>::retained(journal)?;
+        #[cfg(any(target_os = "macos", windows))]
+        let mut guardian = Guardian::<crate::qemu::QemuGuardianEffect>::retained(journal)?;
         serve_guardian(&machine_root.join("guardian"), &mut guardian)?;
         return Ok(());
     }
@@ -3331,19 +3279,11 @@ pub fn serve_machine_guardian(root: &Path, machine: MachineId) -> Result<()> {
         let mut guardian = Guardian::new(journal, effect);
         serve_guardian(&machine_root.join("guardian"), &mut guardian)?;
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let config =
-            crate::apple::read_config(&machine_root.join("guardian/config.json"), &machine)?;
-        let effect = crate::apple::AppleGuardianEffect::open(&machine_root, config)?;
-        let mut guardian = Guardian::new(journal, effect);
-        serve_guardian(&machine_root.join("guardian"), &mut guardian)?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let config =
-            crate::windows::read_config(&machine_root.join("guardian/config.json"), &machine)?;
-        let effect = crate::windows::WindowsGuardianEffect::open(&machine_root, config)?;
+            crate::qemu::read_config(&machine_root.join("guardian/config.json"), &machine)?;
+        let effect = crate::qemu::QemuGuardianEffect::open(&machine_root, config)?;
         let mut guardian = Guardian::new(journal, effect);
         serve_guardian(&machine_root.join("guardian"), &mut guardian)?;
     }
@@ -3494,7 +3434,6 @@ fn require_frame(frame: &Frame) -> Result<()> {
 fn catalog_limits(root: &Path) -> Result<CatalogLimits> {
     let available_storage = sandsurf_native::capacity::available_storage_bytes(root)?;
     let physical = available_storage / 4 * 3;
-    #[cfg(target_os = "linux")]
     let memory_mib = sandsurf_native::capacity::available_memory_bytes()?
         .checked_sub(
             sandsurf_native::service_pool::ServicePool::Api.memory_bytes()
@@ -3507,27 +3446,16 @@ fn catalog_limits(root: &Path) -> Result<CatalogLimits> {
         / (1024 * 1024)
         / 4
         * 3;
-    #[cfg(not(target_os = "linux"))]
-    let memory_mib = 4096;
     let cpus = std::thread::available_parallelism()?.get() as u64;
-    let mut resources = Resources::from_geometry(
-        Counter::try_from(cpus)?,
-        Counter::try_from(memory_mib)?,
-        Counter::try_from(physical / 4)?,
-        Counter::try_from(physical / 8)?,
-        counter(4096),
-    )?;
-    resources.physical_storage_bytes = Counter::try_from(physical)?;
-    resources.snapshot_bytes = Counter::try_from(physical / 4)?;
-    resources.host_overhead_bytes = Counter::try_from(memory_mib * 1024 * 1024 / 4)?;
-    resources.managed_executions = counter(4096);
-    resources.validate()?;
     Ok(CatalogLimits {
         identities: counter(4096),
         operations: counter(1_000_000),
         usage_records: counter(1_000_000),
-        image_bytes: Counter::try_from(physical / 8)?,
-        resources,
+        // The other half covers isolated publication staging and the catalog.
+        // Machine volumes are independently bounded, never charged here.
+        image_bytes: Counter::try_from(physical / 2)?,
+        cpu_quota_micros: Counter::try_from(cpus * 100_000)?,
+        host_memory_bytes: Counter::try_from(memory_mib * 1024 * 1024)?,
     })
 }
 
@@ -3645,12 +3573,6 @@ pub(crate) fn native_guest_architecture() -> GuestArchitecture {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn system_disk_name() -> &'static str {
-    "system.vhdx"
-}
-
-#[cfg(not(target_os = "windows"))]
 fn system_disk_name() -> &'static str {
     "system.ext4"
 }
@@ -3664,10 +3586,8 @@ fn error_category(error: &HostError) -> &'static str {
         }
         #[cfg(target_os = "linux")]
         HostError::Linux(crate::linux::LinuxError::Io(error)) => Some(error),
-        #[cfg(target_os = "macos")]
-        HostError::Apple(crate::apple::AppleError::Io(error)) => Some(error),
-        #[cfg(target_os = "windows")]
-        HostError::Windows(crate::windows::WindowsError::Io(error)) => Some(error),
+        #[cfg(any(target_os = "macos", windows))]
+        HostError::Qemu(crate::qemu::QemuError::Io(error)) => Some(error),
         _ => None,
     };
     if native_io.is_some_and(|error| error.kind() == io::ErrorKind::Unsupported) {
@@ -3678,10 +3598,8 @@ fn error_category(error: &HostError) -> &'static str {
         HostError::Json(_) | HostError::Contract(_) | HostError::Invalid(_) => "protocol",
         #[cfg(target_os = "linux")]
         HostError::Linux(_) => "native",
-        #[cfg(target_os = "macos")]
-        HostError::Apple(_) => "native",
-        #[cfg(target_os = "windows")]
-        HostError::Windows(_) => "native",
+        #[cfg(any(target_os = "macos", windows))]
+        HostError::Qemu(_) => "native",
         HostError::State(_) => "state",
         HostError::Control(_) | HostError::GuardianStartup(_) => "guardian",
         HostError::Artifact(crate::artifacts::ArtifactError::Conflict(_)) => "conflict",

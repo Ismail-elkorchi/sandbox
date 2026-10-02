@@ -49,7 +49,6 @@ const alpineSeries = "v3.24";
 const alpineRepository = `https://dl-cdn.alpinelinux.org/alpine/${alpineSeries}`;
 if (process.arch !== "x64" && process.arch !== "arm64") throw new Error("the guest image builder requires an x64 or arm64 host");
 const kernelName = "boot-kernel";
-const hypervKernelSha256 = "bdb750c617bf47fc893c9ee849e82b4b3bc0287d693195b58bd3fa1c4c8936b5";
 const localBuild = process.env.SANDSURF_LOCAL_IMAGE === "1";
 const signingKeyPath = process.env.SANDSURF_IMAGE_SIGNING_KEY_FILE;
 let releaseSeed: Buffer | undefined;
@@ -122,54 +121,6 @@ try {
   await replaceArtifact(initramfs, resolve(destination, "boot-initramfs"));
   await replaceArtifact(system, resolve(destination, "system.ext4"));
 
-  let platformArtifacts: Record<string, unknown> = {};
-  if (architecture === "x64") {
-    const hypervKernelSource = process.env.SANDSURF_HYPERV_KERNEL_FILE
-      ?? resolve("packages/sandsurf/images/development-x64/hyperv-vmlinuz-6.18.41");
-    if (!isAbsolute(hypervKernelSource)) {
-      throw new Error("SANDSURF_HYPERV_KERNEL_FILE must be absolute");
-    }
-    const hypervKernel = resolve(destination, "hyperv-vmlinuz-6.18.41");
-    if (resolve(hypervKernelSource) !== hypervKernel) {
-      await replaceArtifact(hypervKernelSource, hypervKernel);
-    }
-    const hypervKernelBytes = await boundedRegularFile(
-      hypervKernel,
-      128 * 1024 * 1024,
-      "Hyper-V kernel",
-      true,
-    );
-    if (sha256(hypervKernelBytes) !== hypervKernelSha256) {
-      throw new Error("Hyper-V kernel digest mismatch; rebuild it with npm run build:hyperv-kernel");
-    }
-    assertElfOrBzImage(hypervKernelBytes, "Hyper-V kernel");
-    const qemuImg = process.env.SANDSURF_QEMU_IMG ?? "qemu-img";
-    const conversions = [
-      [system, resolve(destination, "system.vhdx")],
-    ] as const;
-    for (const [source, output] of conversions) {
-      const staging = `${output}.new-${process.pid}`;
-      await rm(staging, { force: true });
-      try {
-        await run(qemuImg, [
-          "convert", "-f", "raw", "-O", "vhdx",
-          "-o", "subformat=dynamic,block_size=1048576",
-          source, staging,
-        ]);
-        await chmod(staging, 0o444);
-        await rename(staging, output);
-      } finally {
-        await rm(staging, { force: true });
-      }
-    }
-    platformArtifacts = {
-      windowsX64: {
-        kernel: { path: "hyperv-vmlinuz-6.18.41", sha256: sha256(hypervKernelBytes) },
-        system: { path: "system.vhdx", sha256: await sha256BoundedFile(conversions[0][1], 8 * 1024 ** 3) },
-      },
-    };
-  }
-
   const unsigned = {
     formatVersion: 1,
     id: "sandsurf-development",
@@ -205,7 +156,6 @@ try {
         materials: systemMaterials.materials,
       },
     },
-    platformArtifacts,
   } as const;
   // Rust serializes the cleared optional signature as JSON null before canonical hashing.
   const identity = identityDigest({ ...unsigned, signature: null });
@@ -306,12 +256,6 @@ function assertElfArchitecture(bytes: Buffer, label: string): void {
       bytes[4] !== 2 || bytes[5] !== 1 || bytes.readUInt16LE(18) !== imageBuild.elfMachine) {
     throw new Error(`${label} is not a little-endian 64-bit ${architecture} ELF executable`);
   }
-}
-
-function assertElfOrBzImage(bytes: Buffer, label: string): void {
-  const elf = bytes.length >= 4 && bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
-  const bzImage = bytes.length >= 0x206 && bytes.subarray(0x202, 0x206).toString("ascii") === "HdrS";
-  if (!elf && !bzImage) throw new Error(`${label} is neither an ELF kernel nor an x86 bzImage`);
 }
 
 async function boundedRegularFile(

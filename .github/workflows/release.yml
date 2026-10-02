@@ -95,19 +95,37 @@ jobs:
           name: guest-image-${{ matrix.image_architecture }}
           path: packages/sandsurf/images/development-${{ matrix.image_architecture }}
       - run: npm run manifest:images
-      - if: startsWith(matrix.artifact, 'linux-')
-        run: npm run fetch:firecracker
       - run: npm run build:ts
-      - run: npm run build:native
+      - if: runner.os == 'macOS'
+        run: brew install glib pixman ninja pkgconf meson python
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          update: true
+          install: >-
+            make diffutils tar curl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-meson
+      - if: runner.os != 'Windows'
+        run: npm run build:native
+      - if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: npm run build:native
       - run: npm run test:ts
-      - if: startsWith(matrix.artifact, 'linux-')
-        run: node scripts/qualify-linux-backend.ts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-${{ matrix.artifact }}
           path: |
             packages/sandsurf/native/${{ matrix.artifact }}
             packages/sandsurf/native/manifest.json
+            packages/sandsurf/native/qemu-source
           if-no-files-found: error
 
   assemble:

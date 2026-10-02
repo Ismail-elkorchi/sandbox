@@ -466,10 +466,9 @@ fn main() {
         Some("--check") => {
             let destination = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../packages/sandsurf/src/protocol-generated.ts");
-            assert_eq!(
-                std::fs::read_to_string(destination).expect("generated contract"),
-                output,
-                "run npm run generate:protocol"
+            assert!(
+                std::fs::read_to_string(destination).expect("generated contract") == output,
+                "generated protocol is stale; run npm run generate:protocol"
             );
         }
         _ => panic!("usage: sandsurf-protocol-typescript [--check]"),

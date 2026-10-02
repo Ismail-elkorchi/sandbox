@@ -112,8 +112,6 @@ pub(crate) fn import(
     if let Some(initramfs) = &base.initramfs_path {
         copy_regular(initramfs, &artifact.join("boot-initramfs"))?;
     }
-    let platform_artifacts =
-        materialize_platform_artifacts(&base, &system_path, &artifact, rootfs_bytes)?;
     let mut environment = BTreeMap::new();
     for assignment in &tree.source.defaults.environment {
         let (name, value) = assignment
@@ -157,7 +155,6 @@ pub(crate) fn import(
                 conversion_digest: conversion_digest.as_str().to_owned(),
             },
         },
-        platform_artifacts,
         signature: None,
     };
     manifest.boot_bundle.kernel.path = kernel_name.into();

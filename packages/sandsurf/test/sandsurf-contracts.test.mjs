@@ -343,10 +343,54 @@ test("retained artifacts publish without a live machine, revision or redundant u
   assert.equal(approvals[0].request.changeSetDigest, requests[0].changeSet.digest);
 });
 
-function fixtureMachine(request, generation = 1, authorizer = async () => { throw new Error("ordinary guest access requested host approval"); }, eventPages) {
-  const host = new Sandsurf({ request, eventPages }, authorizer);
+function fixtureMachine(request, generation = 1, authorizer = async () => { throw new Error("ordinary guest access requested host approval"); }, eventPages, consolePages) {
+  const host = new Sandsurf({ request, eventPages, consolePages }, authorizer);
   return new Machine(host, fixtureView(generation));
 }
+
+test("native console follows bounded credited pages without polling and drains closed history", async () => {
+  let subscriptions = 0;
+  const machine = fixtureMachine(async (request) => {
+    assert.equal(request.kind, "read-console");
+    return { kind: "runtime", response: { kind: "console", page: {
+      generation: 1, after: 0, cursor: 0, available: 0, bytes: new Uint8Array(), loss: null, open: true, captureFailed: false,
+    } } };
+  }, 1, undefined, undefined, async function* (id, generation, after, maximum, signal) {
+    assert.equal(id, "box"); assert.equal(generation, 1); assert.equal(after, 0); assert.equal(maximum, 2);
+    assert.equal(signal.aborted, false); subscriptions++;
+    for (const [cursor, bytes] of [[2, [1, 2]], [4, [3, 4]]]) yield {
+      kind: "runtime", response: { kind: "console", page: { generation, after: cursor - 2, cursor, available: 4,
+        bytes: Uint8Array.from(bytes), loss: null, open: false, captureFailed: false } },
+    };
+  });
+  const console = await machine.console.attach({ generation: 1 });
+  const pages = [];
+  for await (const page of console.follow({ maximum: 2 })) pages.push(...page.bytes);
+  assert.deepEqual(pages, [1, 2, 3, 4]);
+  assert.equal(subscriptions, 1);
+});
+
+test("console detach cancels an idle stream and external abort retains its reason", async () => {
+  const machine = fixtureMachine(async () => ({ kind: "runtime", response: { kind: "console", page: {
+    generation: 1, after: 0, cursor: 0, available: 0, bytes: new Uint8Array(), loss: null, open: true, captureFailed: false,
+  } } }), 1, undefined, undefined, async function* (_id, _generation, _after, _maximum, signal) {
+    await new Promise((_, reject) => {
+      if (signal.aborted) reject(signal.reason);
+      else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  });
+  const console = await machine.console.attach({ generation: 1 });
+  const stream = console.follow();
+  const pending = stream.next();
+  console.detach();
+  await assert.rejects(pending, (error) => error.category === "detached");
+  const other = await machine.console.attach({ generation: 1 });
+  const controller = new AbortController();
+  const reason = new Error("stop observing");
+  const waiting = other.follow({ signal: controller.signal }).next();
+  controller.abort(reason);
+  await assert.rejects(waiting, (error) => error === reason);
+});
 
 function eventPage(after, values) {
   const events = values.map((value, index) => {
@@ -455,7 +499,7 @@ function fixtureView(generation = 1) {
       networkBytesPerSecond: 64 * 1024 ** 2, networkQueueBytes: 16 * 1024 ** 2,
     } },
     configurationRevision: 99, reservation: "held", lifecycleIntent: { machineId: "box", operationId: "create", desired: "running", revision: 99, requestDigest: "a".repeat(64), completion: null }, machine: { kind: "current", value: { machineId: "box", generation, sequence: 1, state: "running", appliedRevision: 99, cause: { kind: "lifecycle", operationId: "create" }, evidenceDigest: "b".repeat(64) } },
-    storage: { kind: "current", phase: "published", format: "raw", capacityBytes: 1024 ** 3, operationId: null, payload: { kind: "present", fileBytes: 1024 ** 3 } },
+    storage: { kind: "current", phase: "published", capacityBytes: 1024 ** 3, operationId: null, payload: { kind: "present", fileBytes: 1024 ** 3 } },
     management: { kind: "unavailable", lastKnown: null },
     executionDefaults: { environment: {}, user: "agent", workingDirectory: "/workspace" },
     lifetime: { expiresAtUnixMillis: null, expirationAction: "stop" }, lastActivityUnixMillis: 1,
@@ -565,8 +609,9 @@ test("host power support is distinct from qualification and malformed claims are
   const unqualified = { kind: "unqualified", reasons: ["no hardware qualification"] };
   let value = {
     hostId: "host", platform: "linux", architecture: "x86_64", guestArchitecture: "amd64", guestPlatform: "linux/amd64", engine: "firecracker",
-    lifecycle: unqualified, fullState: unqualified, images: unqualified, defaultImageDigest: null,
+    lifecycle: unqualified, fullState: { kind: "supported", qualification: unqualified }, images: unqualified, defaultImageDigest: null,
     imageWorkers: { kind: "supported", qualification: unqualified },
+    networkEgress: { kind: "unsupported", reasons: ["kernel boundary not installed"] },
     console: { kind: "supported", qualification: unqualified },
     resources: Object.fromEntries(["nativeTopology", "cpuTime", "aggregateHostMemory", "managedAdmission",
       "outputRetention", "storageReservations", "networkEnvelope", "aggregatePhysicalStorage", "sharedHostWorkers",
@@ -576,6 +621,19 @@ test("host power support is distinct from qualification and malformed claims are
   };
   const host = new Sandsurf({ request: async () => ({ kind: "inspection", value }) });
   assert.deepEqual((await host.inspect()).guestPower, value.guestPower);
+  assert.deepEqual((await host.inspect()).fullState, value.fullState);
+  assert.deepEqual((await host.inspect()).networkEgress, value.networkEgress);
+  const networkEgress = value.networkEgress;
+  for (const claim of [undefined, { kind: "supported" }, { kind: "unsupported", reasons: [] }]) {
+    value = { ...value, networkEgress: claim };
+    await assert.rejects(host.inspect(), SandsurfHostError);
+  }
+  value = { ...value, networkEgress };
+  value = { ...value, fullState: { kind: "unsupported", reasons: ["native device state cannot be restored"] } };
+  assert.deepEqual((await host.inspect()).fullState, value.fullState);
+  value = { ...value, fullState: unqualified };
+  await assert.rejects(host.inspect(), SandsurfHostError);
+  value = { ...value, fullState: { kind: "supported", qualification: unqualified } };
   value = { ...value, guestPower: { ...value.guestPower, shutdown: { kind: "supported", qualification: unqualified } } };
   assert.deepEqual((await host.inspect()).guestPower.shutdown, { kind: "supported", qualification: unqualified });
   for (const claim of [
@@ -814,7 +872,7 @@ test("storage inspection does not collapse unavailable native power into missing
   const view = { ...fixtureView(), machine: { kind: "unavailable", lastKnown: null }, management: { kind: "unavailable", lastKnown: null } };
   const machine = fixtureMachine(async () => ({ kind: "machine", value: view }));
   assert.equal((await machine.inspect()).storage.phase, "published");
-  view.storage = { kind: "current", phase: "published", format: "raw", capacityBytes: 4096, operationId: null, payload: { kind: "capacity-mismatch", fileBytes: 7 } };
+  view.storage = { kind: "current", phase: "published", capacityBytes: 4096, operationId: null, payload: { kind: "capacity-mismatch", fileBytes: 7 } };
   assert.equal((await machine.inspect()).storage.payload.kind, "capacity-mismatch");
   view.storage = { kind: "unavailable", reason: "ownership-invalid" };
   assert.equal((await machine.inspect()).storage.reason, "ownership-invalid");

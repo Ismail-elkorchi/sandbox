@@ -7,6 +7,9 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 
+mod operations;
+pub use operations::{Compression, Operation, Reply, Stat};
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -24,10 +27,28 @@ pub fn host_path(path: &Path) -> io::Result<String> {
 /// Commands are argv tokens, separated with guestfish's ':' argument. Never
 /// submit a guest-controlled guestfish script: '!', pipes and interpolation
 /// are host execution facilities in its script language.
-pub fn run(disk: &Path, writable: bool, commands: &[Vec<String>]) -> io::Result<Vec<u8>> {
+pub fn run(disk: &Path, writable: bool, operations: &[Operation]) -> io::Result<Reply> {
+    if operations.is_empty() || operations.len() > 64 {
+        return Err(invalid("invalid disk operation count"));
+    }
+    for (index, operation) in operations.iter().enumerate() {
+        if operation.mutation() && !writable {
+            return Err(invalid("mutation requested against a read-only disk"));
+        }
+        if operation.query()
+            && (index + 1 != operations.len()
+                || operations
+                    .iter()
+                    .any(|op| matches!(op, Operation::Execute { .. })))
+        {
+            return Err(invalid(
+                "only the final disk operation may return an observation",
+            ));
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (disk, writable, commands);
+        let _ = (disk, writable, operations);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "isolated disk/build appliance requires a Linux libguestfs host",
@@ -101,41 +122,8 @@ pub fn run(disk: &Path, writable: bool, commands: &[Vec<String>]) -> io::Result<
             ":",
             "run",
         ]);
-        for tokens in commands {
-            if tokens.is_empty()
-                || tokens.len() > 64
-                || tokens
-                    .iter()
-                    .any(|token| token.len() > 8192 || token.contains('\0') || token == ":")
-            {
-                return Err(invalid("invalid appliance command envelope"));
-            }
-            if ![
-                "mount-options",
-                "filesize",
-                "realpath",
-                "download-offset",
-                "mkfs",
-                "tar-in",
-                "command",
-                "sync",
-                "umount-all",
-                "e2fsck",
-                "rm-f",
-                "write",
-                "chmod",
-                "cat",
-                "statns",
-                "readlink",
-                "mkdir-p",
-                "zero-free-space",
-                "exists",
-            ]
-            .contains(&tokens[0].as_str())
-            {
-                return Err(invalid("appliance command is outside its contract"));
-            }
-            command.arg(":").args(tokens);
+        for operation in operations {
+            command.arg(":").args(operation.arguments()?);
         }
         let mut child = command
             .stdin(Stdio::null())
@@ -162,42 +150,46 @@ pub fn run(disk: &Path, writable: bool, commands: &[Vec<String>]) -> io::Result<
                 "isolated appliance failed, timed out, or exceeded output bound",
             ));
         }
-        Ok(bytes)
+        operations
+            .last()
+            .expect("validated operation count")
+            .reply(bytes)
     }
-}
-
-pub fn command(name: &str, arguments: &[&str]) -> Vec<String> {
-    std::iter::once(name)
-        .chain(arguments.iter().copied())
-        .map(str::to_owned)
-        .collect()
-}
-
-pub fn mount(writable: bool) -> Vec<String> {
-    command(
-        "mount-options",
-        &[if writable { "rw" } else { "ro,noload" }, "/dev/sda", "/"],
-    )
 }
 
 /// Copy exactly a bounded file from the appliance. Size and transfer both occur
 /// against the same offline disk; the host never walks its filesystem.
 pub fn download(disk: &Path, guest: &str, output: &Path, maximum: u64) -> io::Result<()> {
-    let response = run(disk, false, &[mount(false), command("filesize", &[guest])])?;
-    let size = std::str::from_utf8(&response)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|size| *size > 0 && *size <= maximum)
-        .ok_or_else(|| invalid("guest artifact is empty or exceeds its bound"))?;
-    let output = host_path(output)?;
-    sandsurf_native::local::create_private_file(Path::new(&output))?;
+    let size = run(
+        disk,
+        false,
+        &[
+            Operation::Mount { writable: false },
+            Operation::FileSize { path: guest.into() },
+        ],
+    )?
+    .size()?;
+    if size == 0 || size > maximum {
+        return Err(invalid("guest artifact is empty or exceeds its bound"));
+    }
+    let output_name = host_path(output)?;
+    let output = sandsurf_native::local::create_private_file(Path::new(&output_name))?;
     run(
         disk,
         false,
         &[
-            mount(false),
-            command("download-offset", &[guest, &output, "0", &size.to_string()]),
+            Operation::Mount { writable: false },
+            Operation::Download {
+                path: guest.into(),
+                destination: output_name.into(),
+                offset: 0,
+                bytes: size,
+            },
         ],
     )?;
+    sandsurf_native::storage::sync_file(&output)?;
+    if output.metadata()?.len() != size {
+        return Err(invalid("disk download did not cover the selected artifact"));
+    }
     Ok(())
 }

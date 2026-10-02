@@ -20,13 +20,13 @@ try {
     run("cc", ["-std=c11", "-D_GNU_SOURCE", "-Wall", "-Wextra", "-Werror", join(source, "kvm.c"), "-o", binary]);
     raw = run(binary, []);
   } else if (platform() === "darwin") {
-    const binary = join(temporary, "apple-probe");
-    run("xcrun", ["swiftc", "-warnings-as-errors", join(source, "apple.swift"), "-o", binary]);
-    run("codesign", ["--sign", "-", "--entitlements", join(source, "apple.entitlements"), binary]);
+    const binary = join(temporary, "hvf-probe");
+    run("xcrun", ["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", "-framework", "Hypervisor", join(source, "hvf.c"), "-o", binary]);
+    run("codesign", ["--sign", "-", "--entitlements", resolve(source, "../../vmm/qemu/hvf.entitlements"), binary]);
     run("codesign", ["--verify", "--strict", binary]);
     raw = run(binary, []);
   } else if (platform() === "win32") {
-    raw = run("pwsh", ["-NoProfile", "-NonInteractive", "-File", join(source, "hyperv.ps1")]);
+    raw = run("pwsh", ["-NoProfile", "-NonInteractive", "-File", join(source, "whpx.ps1")]);
   } else {
     throw new Error(`No Sandsurf native-host implementation is planned for ${platform()}`);
   }

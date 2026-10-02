@@ -39,7 +39,6 @@
     "images/**/*.json",
     "images/**/boot-*",
     "images/**/*.gz",
-    "images/**/hyperv-vmlinuz-*",
     "LICENSE",
     "SBOM.cdx.json",
     "THIRD-PARTY"

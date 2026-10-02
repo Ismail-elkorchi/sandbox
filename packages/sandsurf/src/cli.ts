@@ -16,30 +16,38 @@ export async function main(arguments_: readonly string[]): Promise<number> {
     process.stdout.write(help());
     return 0;
   }
-  const options = parse(argumentsRest);
+  const allowed = {
+    "qualification-config": ["--machine"], "qualification-requirements": [],
+    "qualification-accept": ["--run", "--evidence", "--operator"],
+    "storage-path": ["--machine"], "storage-volume": ["--machine"],
+    inspect: ["--json"], setup: ["--platform", "--json"],
+  } as const;
+  if (!Object.hasOwn(allowed, command)) throw new TypeError(`Unknown Sandsurf command: ${command}`);
+  const options = parse(argumentsRest, allowed[command as keyof typeof allowed]);
+  if (["qualification-config", "qualification-requirements", "qualification-accept"].includes(command)) {
+    const args = [command, "--directory", options.directory];
+    if (command === "qualification-config") {
+      if (options.machine === undefined) throw new TypeError("qualification-config requires --machine");
+      args.push("--machine", options.machine);
+    }
+    if (command === "qualification-accept") {
+      if (options.run === undefined || options.evidence === undefined || options.operator === undefined) throw new TypeError("qualification-accept requires --run, --evidence and --operator");
+      args.push("--run", options.run, "--evidence", options.evidence, "--operator", options.operator);
+    }
+    return runNative(args);
+  }
   if (command === "storage-path" || command === "storage-volume") {
     if (command === "storage-path" && options.machine === undefined) throw new TypeError("storage-path requires --machine");
-    const binary = await resolveSandsurfNativeHost();
-    return new Promise<number>((resolveRun, rejectRun) => {
-      execFile(binary, [command, "--directory", options.directory, ...(options.machine === undefined ? [] : ["--machine", options.machine])],
-        { timeout: 10_000, maxBuffer: 16 * 1024 }, (error, stdout, stderr) => {
-          process.stdout.write(stdout); process.stderr.write(stderr);
-          if (error === null) resolveRun(0);
-          else if (error.code === 2) resolveRun(2);
-          else rejectRun(error);
-        });
-    });
+    return runNative([command, "--directory", options.directory, ...(options.machine === undefined ? [] : ["--machine", options.machine])]);
   }
-  if (command === "qualify") {
+  if (command === "inspect") {
     const host = await Sandsurf.open({ directory: options.directory });
     try {
       const inspection = await host.inspect();
       process.stdout.write(
-        options.json ? `${JSON.stringify(inspection, null, 2)}\n` : qualificationText(inspection),
+        options.json ? `${JSON.stringify(inspection, null, 2)}\n` : inspectionText(inspection),
       );
-      return inspection.lifecycle.kind === "qualified" && inspection.images.kind === "qualified"
-        ? 0
-        : 2;
+      return 0;
     } finally {
       await host.close();
     }
@@ -59,20 +67,45 @@ export async function main(arguments_: readonly string[]): Promise<number> {
   throw new TypeError(`Unknown Sandsurf command: ${command}`);
 }
 
-function parse(arguments_: readonly string[]): {
+async function runNative(arguments_: string[]): Promise<number> {
+  const binary = await resolveSandsurfNativeHost();
+  return new Promise<number>((resolveRun, rejectRun) => {
+    execFile(binary, arguments_, { timeout: 30_000, maxBuffer: 64 * 1024 }, (error, stdout, stderr) => {
+      process.stdout.write(stdout); process.stderr.write(stderr);
+      if (error === null) resolveRun(0);
+      else if (typeof error.code === "number") resolveRun(error.code);
+      else rejectRun(error);
+    });
+  });
+}
+
+function parse(arguments_: readonly string[], allowed: readonly string[]): {
   readonly directory: string;
   readonly json: boolean;
   readonly platform?: SandsurfServicePlatform;
   readonly machine?: string;
+  readonly run?: string;
+  readonly evidence?: string;
+  readonly operator?: string;
 } {
   let directory: string | undefined;
   let json = false;
   let platform: SandsurfServicePlatform | undefined;
   let machine: string | undefined;
+  let run: string | undefined;
+  let evidence: string | undefined;
+  let operator: string | undefined;
+  const seen = new Set<string>();
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
+    if (argument === undefined || seen.has(argument)) throw new TypeError("duplicate or absent Sandsurf option");
+    if (argument !== "--directory" && !allowed.includes(argument)) throw new TypeError(`Invalid option for this Sandsurf command: ${argument}`);
+    seen.add(argument);
     if (argument === "--json") json = true;
     else if (argument === "--directory") directory = requiredValue(arguments_, ++index, argument);
+    else if (argument === "--run") run = resolve(requiredValue(arguments_, ++index, argument));
+    else if (argument === "--evidence") evidence = resolve(requiredValue(arguments_, ++index, argument));
+    else if (argument === "--operator") operator = requiredValue(arguments_, ++index, argument);
     else if (argument === "--machine") {
       machine = requiredValue(arguments_, ++index, argument);
       if (!/^[A-Za-z0-9_-]{1,128}$/u.test(machine)) throw new TypeError("invalid machine identity");
@@ -90,6 +123,9 @@ function parse(arguments_: readonly string[]): {
     json,
     ...(platform === undefined ? {} : { platform }),
     ...(machine === undefined ? {} : { machine }),
+    ...(run === undefined ? {} : { run }),
+    ...(evidence === undefined ? {} : { evidence }),
+    ...(operator === undefined ? {} : { operator }),
   };
 }
 
@@ -100,7 +136,7 @@ function requiredValue(arguments_: readonly string[], index: number, option: str
   return value;
 }
 
-function qualificationText(inspection: HostInspection): string {
+function inspectionText(inspection: HostInspection): string {
   const line = (name: string, value: HostInspection["lifecycle"]): string =>
     value.kind === "qualified"
       ? `${name}: qualified (${value.evidence})`
@@ -110,13 +146,19 @@ function qualificationText(inspection: HostInspection): string {
     `engine: ${inspection.engine} (${inspection.platform}/${inspection.architecture} -> ${inspection.guestPlatform})`,
     line("lifecycle", inspection.lifecycle),
     line("images", inspection.images),
-    line("full-state", inspection.fullState),
+    inspection.fullState.kind === "unsupported"
+      ? `full-state: unsupported (${inspection.fullState.reasons.join("; ")})`
+      : line("full-state", inspection.fullState.qualification),
+    ...inspection.qualificationRecords.map((record) =>
+      `accepted ${record.run.scope}: ${record.recordDigest} (build ${record.run.configuration.buildDigest}, hardware ${record.run.configuration.hardwareDigest})`,
+    ),
+    ...inspection.qualificationIssues.map((issue) => `qualification issue: ${issue}`),
     "",
   ].join("\n");
 }
 
 function help(): string {
-  return "Usage:\n  sandsurf qualify --directory <absolute-state-directory> [--json]\n  sandsurf setup --directory <absolute-state-directory> [--platform linux|macos|windows] [--json]\n  sandsurf storage-path --directory <absolute-state-directory> --machine <identity>\n  sandsurf storage-volume --directory <absolute-state-directory> [--machine <identity>]\n\nsetup renders explicit service definitions; storage commands locate or inspect operator volumes. Neither installs services, mounts volumes or enables privileged features.\n";
+  return "Usage:\n  sandsurf inspect --directory <absolute-state-directory> [--json]\n  sandsurf setup --directory <absolute-state-directory> [--platform linux|macos|windows] [--json]\n  sandsurf storage-path --directory <absolute-state-directory> --machine <identity>\n  sandsurf storage-volume --directory <absolute-state-directory> [--machine <identity>]\n  sandsurf qualification-config --directory <state-directory> --machine <identity>\n  sandsurf qualification-requirements --directory <state-directory>\n  sandsurf qualification-accept --directory <state-directory> --run <private-run.json> --evidence <private-evidence-file> --operator <identity>\n\ninspect reports capabilities and retained configuration-scoped evidence; it does not perform qualification. setup renders explicit service definitions; storage commands locate or inspect operator volumes. Neither installs services, mounts volumes or enables privileged features. Qualification acceptance retains verified evidence bytes and explicit operator attestation; probes and test execution cannot perform acceptance.\n";
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

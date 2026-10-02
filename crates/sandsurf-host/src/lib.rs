@@ -1,19 +1,20 @@
 #![deny(unsafe_code)]
 
 pub mod api;
-#[cfg(any(target_os = "macos", feature = "apple-source-check"))]
-pub mod apple;
 pub mod artifacts;
 mod capture;
 mod console;
 pub mod guardian;
 pub mod guest;
 mod guest_worker;
+mod image_records;
 pub mod image_worker;
 pub mod images;
 mod ipc_frames;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(any(target_os = "macos", windows))]
+pub mod qemu;
 pub mod qualification;
 pub mod resources;
 mod restore;
@@ -22,5 +23,3 @@ pub mod service;
 mod snapshots;
 mod storage;
 pub mod supervision;
-#[cfg(target_os = "windows")]
-pub mod windows;

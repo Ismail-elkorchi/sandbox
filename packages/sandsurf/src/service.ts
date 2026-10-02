@@ -56,7 +56,7 @@ export function renderSandsurfServiceDefinition(options: {
         return file(`${label}.plist`, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array><string>${xml(options.binary)}</string><string>${mode}</string><string>--directory</string><string>${xml(options.directory)}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n</dict></plist>\n`);
       };
       return Object.freeze({ platform: "macos", format: "launchd-agent", files: Object.freeze([agent("supervisor", "supervise"), agent("host", "serve")]),
-        installHint: "Write both plists to ~/Library/LaunchAgents/ and bootstrap each with launchctl in the account's GUI domain. The VM owner still needs its Apple virtualization entitlement/signature and real-hardware qualification. A GUI LaunchAgent does not promise survival of account logout.",
+        installHint: "First provision the root-owned Sandsurf host, resource broker, and complete signed HVF runtime at /usr/local/libexec/sandsurf. Write both plists to ~/Library/LaunchAgents/ and bootstrap each with launchctl in the account's GUI domain. A GUI LaunchAgent does not promise survival of account logout. Native build validation and real-hardware qualification are separate.",
       });
     }
     case "windows": {
@@ -64,7 +64,7 @@ export function renderSandsurfServiceDefinition(options: {
       const command = (role: string, name: string): string => powershell(`\"${options.binary}\" service --directory \"${options.directory}\" --service-name \"${name}\" --role ${role}`);
       return Object.freeze({ platform: "windows", format: "windows-scm-powershell", files: Object.freeze([file(`${host}.ps1`,
         `$serviceUser = \"$env:USERDOMAIN\\$env:USERNAME\"\n$credential = Get-Credential -UserName $serviceUser -Message 'Account for Sandsurf services'\nNew-Item -ItemType Directory -Force -Path '${powershell(options.directory)}' | Out-Null\nicacls '${powershell(options.directory)}' /inheritance:r /grant:r \"$($serviceUser):(OI)(CI)F\" 'SYSTEM:(OI)(CI)F' | Out-Null\nNew-Service -Name '${supervisor}' -BinaryPathName '${command("supervisor", supervisor)}' -Credential $credential -StartupType Automatic\nNew-Service -Name '${host}' -BinaryPathName '${command("host", host)}' -Credential $credential -DependsOn '${supervisor}' -StartupType Automatic\nStart-Service -Name '${supervisor}'\nStart-Service -Name '${host}'\n`)]),
-        installHint: "Run the PowerShell definition from an elevated shell after enabling and rebooting into Hyper-V. Both independent services use the chosen unprivileged account, which needs Log on as a service and access to the qualified HCS implementation. Stopping the host API service does not stop guardian supervision.",
+        installHint: "Run the PowerShell definition from an elevated shell after enabling Windows Hypervisor Platform and rebooting. Both independent services use the chosen unprivileged account, which needs Log on as a service. Install the complete Sandsurf WHPX runtime beside the host executable. Stopping the host API service does not stop guardian supervision. Native build validation and real-hardware qualification are separate.",
       });
     }
   }

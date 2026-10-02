@@ -1,10 +1,13 @@
-import { chmod, copyFile, lstat, mkdir, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hydrateImageSources } from "./image-sources.ts";
-import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
+import { publishNativePlatform } from "./native-artifacts.ts";
 import { bundledImageManifestDigest } from "./native-image.ts";
+import { tmpdir } from "node:os";
+import { buildQemu } from "./build-qemu.ts";
+import { fetchFirecracker } from "./firecracker-source.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await hydrateImageSources();
@@ -31,6 +34,7 @@ const buildArguments = [
   ...(debugBuild ? [] : ["--release"]),
   "-p", "sandsurf-host",
   "--bin", "sandsurf-host",
+  ...(nativePlatform === "macos" ? ["-p", "sandsurf-native", "--bin", "sandsurf-resource-broker"] : []),
   ...(target === undefined ? [] : ["--target", target]),
 ];
 const buildEnvironment: Record<string, string | undefined> = target?.endsWith("-unknown-linux-musl")
@@ -52,69 +56,45 @@ if (nativePlatform === "windows" && !debugBuild) {
 await run("cargo", buildArguments, buildEnvironment);
 
 const executableSuffix = nativePlatform === "windows" ? ".exe" : "";
-const destinationDirectory = resolve(repository, "native", `${nativePlatform}-${architecture}`);
-const destinationName = `sandsurf-host-${nativePlatform}-${architecture}${executableSuffix}`;
-const destination = resolve(destinationDirectory, destinationName);
-await mkdir(destinationDirectory, { recursive: true });
-await replaceArtifact(resolve(
-  repository,
-  "target",
-  ...(target === undefined ? [] : [target]),
-  debugBuild ? "debug" : "release",
-  `sandsurf-host${executableSuffix}`,
-), destination);
-if (nativePlatform === "linux") {
-  await run("strip", ["--strip-debug", destination], {});
-  await assertStaticElf(destination);
-}
-if (nativePlatform === "macos") {
-  await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
-}
-const packageNativeRoot = resolve(repository, "packages", "sandsurf", "native");
-const packageDestinationDirectory = resolve(packageNativeRoot, `${nativePlatform}-${architecture}`);
-await mkdir(packageDestinationDirectory, { recursive: true });
-await replaceArtifact(destination, resolve(packageDestinationDirectory, destinationName));
-if (nativePlatform === "macos") {
-  const helperName = `sandsurf-vz-helper-${architecture}`;
-  const helper = resolve(destinationDirectory, helperName);
-  await run("/usr/bin/swiftc", [
-    "-parse-as-library",
-    resolve(repository, "native/macos/unix-socket.swift"),
-    resolve(repository, "native/macos/owner-protocol.swift"),
-    resolve(repository, "native/macos/sandsurf-vz-helper.swift"),
-    "-o", helper,
-  ], {});
-  await run("/usr/bin/codesign", [
-    "--force", "--sign", "-", "--options", "runtime",
-    "--entitlements", resolve(repository, "scripts/qualification/apple.entitlements"),
-    helper,
-  ], {});
-  await replaceArtifact(helper, resolve(packageDestinationDirectory, helperName));
-}
-await writeManifest(resolve(repository, "native"));
-await writeManifest(packageNativeRoot);
-
-async function writeManifest(root: string): Promise<void> {
-  const files: Record<string, string> = {};
-  await collect("");
-  await writeFile(resolve(root, "manifest.json"), `${JSON.stringify({
-    formatVersion: 1,
-    buildId: "sandsurf-native-1.0.0",
-    files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
-  }, null, 2)}\n`, { mode: 0o644 });
-
-  async function collect(relative: string): Promise<void> {
-    for (const entry of await readdir(resolve(root, relative), { withFileTypes: true })) {
-      const child = relative === "" ? entry.name : `${relative}/${entry.name}`;
-      if (child === "manifest.json") continue;
-      if (entry.isDirectory()) { await collect(child); continue; }
-      const metadata = await lstat(resolve(root, child));
-      if (!entry.isFile() || !metadata.isFile() || metadata.isSymbolicLink()) {
-        throw new Error(`${child} is not a regular native artifact`);
-      }
-      files[child] = await sha256File(resolve(root, child), 512 * 1024 ** 2);
+const platform = `${nativePlatform}-${architecture}`;
+const stage = await mkdtemp(resolve(tmpdir(), "sandsurf-native-build-"));
+try {
+  const payload = resolve(stage, platform);
+  await mkdir(payload);
+  const destinationName = `sandsurf-host-${platform}${executableSuffix}`;
+  const destination = resolve(payload, destinationName);
+  await replaceArtifact(resolve(repository, "target", ...(target === undefined ? [] : [target]),
+    debugBuild ? "debug" : "release", `sandsurf-host${executableSuffix}`), destination);
+  if (nativePlatform === "linux") {
+    await run("strip", ["--strip-debug", destination], {});
+    await assertStaticElf(destination);
+    await fetchFirecracker(payload, architecture as "x64" | "arm64");
+    for (const name of ["network-boundary.nft", "sandsurf-network.service"]) {
+      await replaceArtifact(resolve(repository, "vmm/linux", name), resolve(payload, name), 0o644);
     }
   }
+  if (nativePlatform === "macos") {
+    await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
+    const broker = resolve(payload, "sandsurf-resource-broker");
+    await replaceArtifact(resolve(repository, "target", ...(target === undefined ? [] : [target]),
+      debugBuild ? "debug" : "release", "sandsurf-resource-broker"), broker);
+    await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", broker], {});
+  }
+  let corresponding: string | undefined;
+  if (nativePlatform === "macos" || nativePlatform === "windows") {
+    if (architecture !== process.arch || nativePlatform !== (process.platform === "darwin" ? "macos" : "windows")) {
+      throw new Error("QEMU runtime must be built on its native host architecture");
+    }
+    await buildQemu(payload);
+    corresponding = resolve(stage, "qemu-source");
+    await rename(resolve(payload, "qemu-source"), corresponding);
+  }
+  for (const root of [resolve(repository, "native"), resolve(repository, "packages/sandsurf/native")]) {
+    await publishNativePlatform(root, platform, payload, corresponding);
+  }
+} finally {
+  // Only this invocation's staged generated build, never machine storage.
+  await rm(stage, { recursive: true, force: true });
 }
 
 function classifyTarget(target: string): { platform: "linux" | "macos" | "windows"; architecture: "x64" | "arm64" } {
@@ -124,12 +104,12 @@ function classifyTarget(target: string): { platform: "linux" | "macos" | "window
   return { platform, architecture };
 }
 
-async function replaceArtifact(source: string, destination: string): Promise<void> {
+async function replaceArtifact(source: string, destination: string, mode = 0o755): Promise<void> {
   const temporary = `${destination}.new-${process.pid}`;
   await rm(temporary, { force: true });
   try {
     await copyFile(source, temporary);
-    await chmod(temporary, 0o755);
+    await chmod(temporary, mode);
     await rename(temporary, destination);
   } finally {
     await rm(temporary, { force: true });

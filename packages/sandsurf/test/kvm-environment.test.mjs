@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { qualificationDirectory } from "./qualification-storage.mjs";
+import { qualificationDirectory, recordChecks } from "./qualification-storage.mjs";
 import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
@@ -54,6 +54,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(storage.payload.kind, "present");
     assert.equal(await run(machine, "id -un"), "agent\n");
     assert.equal(await run(machine, "sudo -n id -u"), "0\n");
+    await recordChecks(directory, machine, ["administrator-root"], { normalPrivilegeEscalation: "sudo -n id -u", uid: 0 });
     assert.ok(Number(await run(machine, "df -k / | tail -1 | awk '{print $2}'")) >= 1_900_000, "the root filesystem must cover the reserved 2 GiB disk");
     assert.match(await run(machine, "sudo -n readlink /proc/1/exe; rc-status --runlevel"), /busybox[\s\S]*default/u);
     assert.equal(await run(machine, "sudo -n sh -c 'test -w /etc && test -w /usr && test -w /var && test -w /root' && test -w /home/agent"), "");
@@ -160,7 +161,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(pausedCapture.configurationRevision, pausedRevision);
     await machine.resume();
     const identity = machine.id;
-    const generation = machine.generation;
+    let generation = machine.generation;
     await host.close();
     host = await Sandsurf.open({ directory, authorizer: () => true, service: "connect" });
     machine = await host.machines.connect(identity);
@@ -204,6 +205,50 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assertSameBytes(await machine.fs.readFile("/root/independent-copy"), secretBytes);
     assert.equal((await machine.inspect()).knownSensitive, true);
 
+    context.diagnostic("full-state suspend/resume preserves the Linux session, not old execution authority or output identity");
+    const suspendedTerminal = await machine.terminals.open({ executionId: "suspend-terminal",
+      argv: ["/bin/sh", "-c", "printf suspend-before; read value; printf 'resume-after:%s' \"$value\""], outputBytes: 65536 });
+    const prefixDeadline = Date.now() + 30_000;
+    while ((await suspendedTerminal.process.output.read()).available === 0) {
+      assert.ok(Date.now() < prefixDeadline, "suspend session prefix was not durably captured");
+      await new Promise((done) => setTimeout(done, 100));
+    }
+    const historicalBytes = await output(suspendedTerminal.process);
+    const historicalRequest = (await suspendedTerminal.inspect()).report.value.request;
+    const beforeSuspend = machine.generation;
+    await machine.network.configure({ rules: [{ plane: "tcp", destination: { kind: "ip", cidr: "1.1.1.1/32", allowPrivateAddresses: false }, ports: [443] }] });
+    const resumeSecret = await host.secrets.put("suspend-secret", Buffer.from("disclosed-before-suspend"));
+    await machine.secrets.deliver(resumeSecret, { path: "/root/suspend-secret" });
+    assert.equal((await machine.suspend({ operationId: "suspend-live-computer" })).machine.value.state, "suspended");
+    await machine.network.configure({ rules: [] });
+    assert.equal((await machine.secrets.revoke(resumeSecret)).futureDeliveryRevoked, true);
+    await machine.start({ operationId: "resume-live-computer" });
+    await managementReady(machine);
+    assert.ok(machine.generation > beforeSuspend);
+    assertSameBytes(await output(suspendedTerminal.process), historicalBytes);
+    const historicalStatus = await suspendedTerminal.process.inspect();
+    assert.deepEqual((historicalStatus.report.kind === "current" ? historicalStatus.report.value : historicalStatus.report.lastKnown).request, historicalRequest);
+    await assert.rejects(suspendedTerminal.input.write(Buffer.from("must-not-replay\n")), /generation/iu);
+    const restoredStatus = (await machine.executions.list()).find((value) => value.lineage?.sourceExecutionId === "suspend-terminal" && value.generation === machine.generation);
+    assert.ok(restoredStatus, "native resume must create an independent managed-execution incarnation");
+    assert.notEqual(restoredStatus.executionId, suspendedTerminal.id);
+    assert.equal(restoredStatus.lineage.sourceGeneration, beforeSuspend);
+    const restoredTerminal = await machine.terminals.get(restoredStatus.executionId);
+    await restoredTerminal.acquireInput();
+    await restoredTerminal.input.write(Buffer.from("continued\n"));
+    assert.equal(exitCode(await restoredTerminal.waitCapture({ signal: AbortSignal.timeout(30_000) })), 0);
+    assert.match((await output(restoredTerminal.process)).toString(), /resume-after:continued/u);
+    assertSameBytes(await output(suspendedTerminal.process), historicalBytes);
+    assert.deepEqual((await machine.inspect()).runtimeConfiguration.network, { rules: [] });
+    await assert.rejects(machine.secrets.deliver(resumeSecret, { path: "/root/must-not-redeliver" }));
+    assert.equal(await run(machine, "sudo -n cat /root/suspend-secret"), "disclosed-before-suspend");
+    generation = machine.generation;
+    await recordChecks(directory, machine, ["suspend-resume", "restore-authority", "restore-output-lineage"], {
+      sourceGeneration: beforeSuspend, restoredGeneration: generation, sourceExecutionId: suspendedTerminal.id,
+      restoredExecutionId: restoredStatus.executionId, historicalOutputDigest: createHash("sha256").update(historicalBytes).digest("hex"),
+      revokedSecretVersion: resumeSecret.version, restoredNetwork: { rules: [] },
+    });
+
     observer = await Sandsurf.open({ directory, service: "connect" });
     const observedMachine = await observer.machines.connect(identity);
     const stream = observedMachine.events.follow({ maximum: 8, signal: AbortSignal.timeout(30_000) });
@@ -218,6 +263,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(machine.generation, generation);
     assert.equal((await machine.inspect()).machine.value.state, "running");
     assert.equal(await run(machine, "cat /home/agent/cache/value"), "durable");
+    await recordChecks(directory, machine, ["host-service-restart"], { generationPreserved: generation });
     const streamed = await machine.executions.start({ executionId: "stream-after-host-restart", argv: ["/bin/true"] });
     try {
       for (;;) {
@@ -297,6 +343,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     ]);
     await machine.powerOff();
     assertStorageCustody(storageLease, false);
+    await recordChecks(directory, machine, ["forced-power-off"], { generation: machine.generation, storageAttachmentReleased: true });
     assert.equal((await machine.resources.usage()).executionsCurrent, 0, "native interruption frees managed admission capacity, not output retention");
     for (const result of await waits) {
       assert.equal(result.status, "rejected");
@@ -326,6 +373,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(Buffer.from(await machine.fs.readFile("/etc/sandsurf-test")).toString(), "computer");
     assert.equal(Buffer.from(await machine.fs.readFile("/home/agent/cache/value")).toString(), "durable");
     assert.equal((await machine.inspect()).knownSensitive, true, "rollback cannot clear disclosure history");
+    await recordChecks(directory, machine, ["disk-capture", "independent-fork", "rollback-authority"], { snapshotId: snapshot.id, knownSensitive: true });
 
     context.diagnostic("ordinary guest reset recovers with persistent disks and fences old console input");
     const beforeShutdown = await machine.inspect();
@@ -355,6 +403,9 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.match(Buffer.from(await machine.fs.readFile("/usr/local/bin/agent-tool")).toString(), /printf installed/u);
     assert.equal(await run(machine, "/usr/local/bin/agent-tool; cat /etc/sandsurf-test /home/agent/cache/value"), "installedcomputerdurable");
 
+    await recordChecks(directory, machine, ["ordinary-reboot"], { previousGeneration: beforeShutdown.machine.value.generation,
+      generation: machine.generation, cause: rebooted.machine.value.cause });
+
     await machine.executions.start({ argv: ["/bin/sh", "-c", "sudo -n sh -c 'sleep 1; rc-service sandsurf-management stop'"], executionId: "disable-management" });
     await new Promise((done) => setTimeout(done, 2000));
     await assert.rejects(machine.fs.stat("/etc/passwd"));
@@ -364,6 +415,7 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     assert.equal(nativeOutput.generation, machine.generation);
     assert.equal(nativeOutput.captureFailed, false);
     assert.equal(await nativeConsole.write(Buffer.from("\n")), 1, "serial input survives management loss");
+    await recordChecks(directory, machine, ["management-disabled"], { machine: (await machine.inspect()).machine, consoleBytes: nativeOutput.bytes.length });
     await machine.pause();
     assert.equal((await machine.inspect()).machine.value.state, "paused");
     context.diagnostic("native destruction supersedes failed host configuration");
@@ -491,7 +543,7 @@ async function qualifyImageBuildReports(sourceManifest) {
   try {
     await mkdir(bundle);
     const source = JSON.parse(await readFile(sourceManifest, "utf8"));
-    const manifest = { ...source, signature: null, platformArtifacts: { windowsX64: null }, bootBundle: {
+    const manifest = { ...source, signature: null, bootBundle: {
       ...source.bootBundle,
       capabilities: { overlayfs: false, vsock: false, seccomp: false, cgroupV2: false, devpts: false },
       guestAgent: { ...source.bootBundle.guestAgent, version: "provenance-only", protocolMajor: 99, protocolMinor: 0 },

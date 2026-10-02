@@ -203,16 +203,6 @@ fn require_current_user(process_id: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// SDDL granting generic-all only to LocalSystem and the current account.
-/// HCS uses this for the per-VM Hyper-V socket service table; guest protocol
-/// authentication remains a separate, generation-bound boundary.
-pub fn current_user_sddl() -> io::Result<String> {
-    Ok(format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;{})",
-        UserToken::current()?.sid_string()?
-    ))
-}
-
 struct SecurityDescriptor {
     allocation: LocalAllocation,
 }
@@ -304,27 +294,88 @@ struct Directory {
     path: PathBuf,
     held: File,
     identity: FileIdentity,
+    mount: Option<MountPoint>,
 }
+
+/// Keep both objects: the account-private mount entry and the independent
+/// volume root it names. An arbitrary junction never enters this path.
+struct MountPoint {
+    path: PathBuf,
+    held: File,
+    identity: FileIdentity,
+    target: PathBuf,
+}
+impl MountPoint {
+    fn check(&self) -> io::Result<()> {
+        let current = open_directory(&self.path)?;
+        if mount_identity(&current)? != self.identity
+            || mount_identity(&self.held)? != self.identity
+            || crate::volume::mount_point_target(&current, &self.path)? != self.target
+        {
+            return Err(denied(
+                "private volume mount changed its identity or target",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn mount_identity(file: &File) -> io::Result<FileIdentity> {
+    let information = file_information(file)?;
+    if information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+        != FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+    {
+        return Err(denied("private volume mount has an unsafe object type"));
+    }
+    validate_acl(file, true)?;
+    Ok(FileIdentity {
+        volume: information.dwVolumeSerialNumber,
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
 impl Directory {
     fn open(path: &Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("local endpoint root must be absolute"));
         }
-        let original = open_directory(path)?;
+        let mut original = open_directory(path)?;
+        let mount =
+            if file_information(&original)?.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                let identity = mount_identity(&original)?;
+                let target = crate::volume::mount_point_target(&original, path)?;
+                let resolved = open_directory(&target)?;
+                let point = MountPoint {
+                    path: path.to_path_buf(),
+                    held: original,
+                    identity,
+                    target,
+                };
+                original = resolved;
+                Some(point)
+            } else {
+                None
+            };
         let identity = validate_private(&original, true, true)?;
         let canonical = fs::canonicalize(path)?;
         let resolved = open_directory(&canonical)?;
         if validate_private(&resolved, true, true)? != identity {
             return Err(denied("local endpoint root changed during resolution"));
         }
-        Ok(Self {
+        let directory = Self {
             path: canonical,
             held: original,
             identity,
-        })
+            mount,
+        };
+        directory.check()?;
+        Ok(directory)
     }
 
     fn check(&self) -> io::Result<()> {
+        if let Some(mount) = &self.mount {
+            mount.check()?;
+        }
         let current = open_directory(&self.path)?;
         if validate_private(&current, true, true)? != self.identity
             || validate_private(&self.held, true, true)? != self.identity
@@ -370,6 +421,10 @@ impl Lease {
 }
 
 pub fn open_private_file(path: &Path, access: crate::PrivateFileAccess) -> io::Result<File> {
+    open_file(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE)
+}
+
+fn open_file(path: &Path, access: crate::PrivateFileAccess, sharing: u32) -> io::Result<File> {
     Directory::open(
         path.parent()
             .ok_or_else(|| invalid("private file requires a parent"))?,
@@ -377,7 +432,7 @@ pub fn open_private_file(path: &Path, access: crate::PrivateFileAccess) -> io::R
     let file = OpenOptions::new()
         .read(true)
         .write(access == crate::PrivateFileAccess::ReadWrite)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(sharing)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     validate_private(&file, false, false)?;
@@ -385,6 +440,10 @@ pub fn open_private_file(path: &Path, access: crate::PrivateFileAccess) -> io::R
 }
 
 pub fn create_private_file(path: &Path) -> io::Result<File> {
+    create_file(path, FILE_SHARE_READ | FILE_SHARE_WRITE)
+}
+
+fn create_file(path: &Path, sharing: u32) -> io::Result<File> {
     Directory::open(
         path.parent()
             .ok_or_else(|| invalid("private file requires a parent"))?,
@@ -398,7 +457,7 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
         CreateFileW(
             path_wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            sharing,
             &attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -413,6 +472,39 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
     validate_private(&file, false, false)?;
     drop(descriptor);
     Ok(file)
+}
+
+/// Share denial belongs to the open kernel file object, unlike process-owned
+/// LockFileEx byte locks. Duplicating this handle into an owned VMM preserves
+/// exclusion when the guardian dies, until the last native reference closes.
+pub(crate) fn disk_lease(path: &Path) -> io::Result<File> {
+    let result = match create_file(path, FILE_SHARE_READ) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_file(path, crate::PrivateFileAccess::ReadWrite, FILE_SHARE_READ)
+        }
+        Err(error) => Err(error),
+    };
+    result.map_err(|error| {
+        if matches!(error.raw_os_error(), Some(32 | 33)) {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage slot already has an owner",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// Compare custody with a read-only observation of its admitted name. This
+/// neither reacquires the writer's share-denial lease nor creates a new owner.
+pub(crate) fn verify_transferred_lease(file: &File, path: &Path) -> io::Result<()> {
+    let observed = open_private_file(path, crate::PrivateFileAccess::ReadOnly)?;
+    if validate_private(file, false, false)? != validate_private(&observed, false, false)? {
+        return Err(denied("transferred storage custody changed identity"));
+    }
+    Ok(())
 }
 
 /// Rename the held source inode within its held private parent. In

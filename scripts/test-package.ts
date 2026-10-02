@@ -4,6 +4,9 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { packageArchive } from "./package-archive.ts";
+import { QEMU_CORRESPONDING_FILES } from "./qemu-source.ts";
+import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependencies.ts";
+import { verifyQemuRuntime } from "./qemu-runtime.ts";
 
 const temporary = await mkdtemp(resolve(process.platform === "linux" ? "/var/tmp" : tmpdir(), "machine-package-test-"));
 const npmCli = requiredEnvironment("npm_execpath");
@@ -27,7 +30,7 @@ try {
     if (paths.some((path) => /(?:minimal-|trusted-bootstrap|development-workload|empty-workspace)/u.test(path))) {
       throw new Error(`${tarball} contains a retired guest image artifact`);
     }
-    if (paths.some((path) => /\.(?:ext4|vhdx)$/u.test(path))) throw new Error("package contains unpacked machine disks");
+    if (paths.some((path) => /\.ext4$/u.test(path))) throw new Error("package contains unpacked machine disks");
   }
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);
@@ -46,7 +49,7 @@ try {
     try {
       const before = await host.inspect();
       assert.ok(before.defaultImageDigest);
-      assert.equal(before.guestPower.reboot.kind, process.platform === "linux" && process.arch === "x64" ? "supported" : "unsupported");
+      assert.equal(before.guestPower.reboot.kind, process.platform !== "linux" || process.arch === "x64" ? "supported" : "unsupported");
       assert.equal(before.console.kind, "supported");
       assert.equal(before.guestPower.shutdown.kind, process.platform === "linux" && process.arch === "x64" ? "unsupported" : "supported");
       const nativeImport = {
@@ -126,15 +129,6 @@ async function packagedImagePaths(): Promise<readonly string[]> {
     if (!record(manifest.bootBundle.initramfs)) throw new Error(`${relative} lacks the distribution initramfs`);
     const artifacts = [manifest.bootBundle.kernel, manifest.bootBundle.initramfs];
     const disks = [manifest.system.rootfs];
-    if (match[2] === "x64") {
-      if (!record(manifest.platformArtifacts) || !record(manifest.platformArtifacts.windowsX64)) {
-        throw new Error(`${relative} lacks Windows VM artifacts`);
-      }
-      const windows = manifest.platformArtifacts.windowsX64;
-      if (!record(windows.kernel) || !record(windows.system)) throw new Error(`${relative} has malformed Windows artifacts`);
-      artifacts.push(windows.kernel);
-      disks.push(windows.system);
-    }
     for (const artifact of artifacts) {
       if (typeof artifact.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(artifact.path)) throw new Error(`${relative} has an unsafe artifact path`);
       paths.push(`package/images/${match[1]}/${artifact.path}`);
@@ -156,10 +150,25 @@ async function packagedNativePaths(): Promise<readonly string[]> {
   const paths = ["package/native/manifest.json"];
   const required = new Set((process.env.SANDSURF_REQUIRED_NATIVE_PLATFORMS ?? "").split(",").filter(Boolean));
   for (const [relative, digest] of Object.entries(index.files)) {
-    const match = /^((?:linux|macos|windows)-(?:x64|arm64))\/[A-Za-z0-9._-]+$/u.exec(relative);
-    if (match === null || typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) throw new Error(`invalid native package entry ${relative}`);
-    required.delete(match[1]!);
+    const match = /^((?:linux|macos)-(?:x64|arm64)|windows-x64)\/(?:[A-Za-z0-9._+-]+\/)*[A-Za-z0-9._+-]+$/u.exec(relative);
+    const commonSource = relative.startsWith("qemu-source/") && (QEMU_CORRESPONDING_FILES as readonly string[]).includes(relative.slice("qemu-source/".length));
+    if (match === null && !commonSource || typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) throw new Error(`invalid native package entry ${relative}`);
+    if (match !== null && relative === `${match[1]}/sandsurf-host-${match[1]}${match[1]!.startsWith("windows-") ? ".exe" : ""}`) required.delete(match[1]!);
     paths.push(`package/native/${relative}`);
+  }
+  const platforms = new Set(Object.keys(index.files).map((name) => name.split("/")[0]!));
+  for (const platform of platforms) {
+    if (!/^(?:macos-(?:x64|arm64)|windows-x64)$/u.test(platform)) continue;
+    const inputs = await verifyQemuRuntime(resolve("packages/sandsurf/native", platform), platform);
+    for (const [name, digest] of Object.entries(inputs)) {
+      if (index.files[`${platform}/${name}`] !== digest) throw new Error("packaged QEMU runtime identity differs");
+    }
+    for (const name of dependencySourceFiles(await verifyDependencySources(resolve("packages/sandsurf/native", platform), inputs))) {
+      if (index.files[`${platform}/${name}`] === undefined) throw new Error("packaged native dependency source is incomplete");
+    }
+    for (const name of QEMU_CORRESPONDING_FILES) {
+      if (index.files[`qemu-source/${name}`] === undefined) throw new Error("packaged QEMU corresponding source is incomplete");
+    }
   }
   if (required.size !== 0) throw new Error(`required native platforms are absent: ${[...required].join(", ")}`);
   return paths;

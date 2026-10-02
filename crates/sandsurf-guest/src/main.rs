@@ -1,15 +1,19 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod binding;
+mod control_transport;
 
+use control_transport::Connection;
 use sandsurf_guest::{ConnectionBudget, ExecutionRegistry, FilesystemService, ManagementService};
+use sandsurf_protocol::GUEST_CONTROL_PORT;
 #[cfg(test)]
 use sandsurf_protocol::bytes_digest;
 use sandsurf_protocol::{
-    AUTHENTICATION_BYTES, BootCapability, Counter, Digest, Frame, FrameKind, GuestChallenge,
-    GuestFinish, GuestHandshake, GuestHello, MachineId,
+    AUTHENTICATION_BYTES, BOOT_RECORD_BYTES, BootCapability, BootIdentity, Counter, Frame,
+    FrameKind, GuestChallenge, GuestFinish, GuestHandshake, GuestHello,
 };
-use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_BOOTSTRAP_PORT, GUEST_CONTROL_PORT};
+#[cfg(test)]
+use sandsurf_protocol::{AUTHENTICATION_MAGIC, MachineId};
 use sandsurf_protocol::{AuthenticatedFrameChannel, send_binary};
 use sandsurf_protocol::{GuestServiceRequest, GuestServiceResponse};
 use std::fs::{self, File, OpenOptions};
@@ -20,17 +24,8 @@ use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, RwLock};
 
-const MAX_AUTHENTICATION_DISK: u64 = 4096;
 const CONTROL_ROOT: &str = "/var/lib/sandsurf";
 const MAX_CONTROL_CONNECTIONS: usize = 64;
-
-#[derive(Clone)]
-struct BootIdentity {
-    machine_id: MachineId,
-    generation: Counter,
-    boot_digest: Digest,
-    capability: BootCapability,
-}
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -79,8 +74,6 @@ fn supervisor_main() -> io::Result<()> {
     };
     let identity = Arc::new(RwLock::new(boot_identity));
     let session_generation = Arc::new(RwLock::new(()));
-    let listener = listen_vsock(GUEST_CONTROL_PORT)
-        .map_err(|error| stage("listen on guest control", error))?;
     let identity_snapshot = identity
         .read()
         .map_err(|_| io::Error::other("boot identity lock is unavailable"))?
@@ -91,6 +84,34 @@ fn supervisor_main() -> io::Result<()> {
         .map_err(|error| stage("open filesystem watch journal", io::Error::other(error)))?;
     let ledger = Path::new(CONTROL_ROOT).join("operations");
     let service = Arc::new(ManagementService::open(processes, filesystem, &ledger)?);
+    if let Some(ports) =
+        control_transport::serial_ports(Path::new("/sys/class/virtio-ports"), Path::new("/dev"))?
+    {
+        let mut ports = ports.into_iter();
+        let foreground = ports
+            .next()
+            .ok_or_else(|| io::Error::other("guest control ports are empty"))?;
+        for (index, port) in ports.enumerate() {
+            let service = Arc::clone(&service);
+            let identity = Arc::clone(&identity);
+            let session_generation = Arc::clone(&session_generation);
+            let management = Arc::clone(&management);
+            std::thread::Builder::new()
+                .name(format!("control-{}", index + 1))
+                .spawn(move || {
+                    serve_serial_port(&port, &identity, &session_generation, &management, &service)
+                })?;
+        }
+        serve_serial_port(
+            &foreground,
+            &identity,
+            &session_generation,
+            &management,
+            &service,
+        );
+    }
+    let listener = listen_vsock(GUEST_CONTROL_PORT)
+        .map_err(|error| stage("listen on guest control", error))?;
     let connections = ConnectionBudget::new(MAX_CONTROL_CONNECTIONS);
 
     loop {
@@ -102,23 +123,15 @@ fn supervisor_main() -> io::Result<()> {
             unsafe { libc::close(connection) };
             continue;
         };
-        if let Err(error) = set_socket_timeout(connection, std::time::Duration::from_secs(15)) {
-            // SAFETY: setup failed before ownership transfer.
-            unsafe { libc::close(connection) };
-            eprintln!(
-                "sandsurf guest control timeout setup failed: {}",
-                bounded(&error.to_string())
-            );
-            continue;
-        }
+        // SAFETY: this accepted descriptor has sole ownership transferred here.
+        let file = unsafe { File::from_raw_fd(connection) };
+        let mut connection = Connection::new(file)?;
         let service = Arc::clone(&service);
         let identity = Arc::clone(&identity);
         let session_generation = Arc::clone(&session_generation);
         let management = Arc::clone(&management);
         std::thread::spawn(move || {
             let _lease = lease;
-            // SAFETY: this worker receives sole ownership of the accepted descriptor.
-            let mut connection = unsafe { File::from_raw_fd(connection) };
             if let Err(error) = serve_connection(
                 &mut connection,
                 &identity,
@@ -135,6 +148,28 @@ fn supervisor_main() -> io::Result<()> {
     }
 }
 
+fn serve_serial_port(
+    port: &Path,
+    identity: &Arc<RwLock<BootIdentity>>,
+    session_generation: &Arc<RwLock<()>>,
+    management: &sandsurf_protocol::GuestManagementIdentity,
+    service: &ManagementService,
+) -> ! {
+    loop {
+        // Reopening repairs only this session, not the Linux computer.
+        if let Ok(mut connection) = Connection::open_port(port) {
+            let _ = serve_connection(
+                &mut connection,
+                identity,
+                session_generation,
+                management,
+                service,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 fn create_process_supervisor(identity: &BootIdentity) -> io::Result<ExecutionRegistry> {
     let spool = Path::new(CONTROL_ROOT).join("executions");
     ExecutionRegistry::create(
@@ -147,7 +182,7 @@ fn create_process_supervisor(identity: &BootIdentity) -> io::Result<ExecutionReg
 }
 
 fn serve_connection(
-    connection: &mut File,
+    connection: &mut Connection,
     identity: &Arc<RwLock<BootIdentity>>,
     session_generation: &Arc<RwLock<()>>,
     management: &sandsurf_protocol::GuestManagementIdentity,
@@ -164,7 +199,7 @@ fn serve_connection(
         .finish(&finish)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     // The guardian owns this authenticated transport for the guest generation.
-    set_socket_timeout(connection.as_raw_fd(), std::time::Duration::ZERO)?;
+    connection.authenticated();
     let mut outgoing = Counter::ZERO;
 
     loop {
@@ -385,7 +420,7 @@ fn mix_generation_seed(seed: &[u8; 32]) -> io::Result<()> {
 }
 
 fn accept_handshake(
-    connection: &mut File,
+    connection: &mut impl Read,
     identity: &BootIdentity,
 ) -> io::Result<(GuestHandshake, GuestChallenge)> {
     let hello: GuestHello = read_unauthed(connection)?;
@@ -405,7 +440,7 @@ fn session_matches_identity(session: &BootIdentity, current: &BootIdentity) -> b
         && session.boot_digest == current.boot_digest
 }
 
-fn read_unauthed<T: serde::de::DeserializeOwned>(connection: &mut File) -> io::Result<T> {
+fn read_unauthed<T: serde::de::DeserializeOwned>(connection: &mut impl Read) -> io::Result<T> {
     let frame = Frame::read(connection)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "guest handshake ended"))?;
     if frame.kind != FrameKind::Control
@@ -422,7 +457,7 @@ fn read_unauthed<T: serde::de::DeserializeOwned>(connection: &mut File) -> io::R
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn send_unauthed<T: serde::Serialize>(connection: &mut File, value: &T) -> io::Result<()> {
+fn send_unauthed<T: serde::Serialize>(connection: &mut impl Write, value: &T) -> io::Result<()> {
     let frame = Frame {
         kind: FrameKind::Control,
         stream: 0,
@@ -435,76 +470,27 @@ fn send_unauthed<T: serde::Serialize>(connection: &mut File, value: &T) -> io::R
 }
 
 fn read_boot_identity() -> io::Result<BootIdentity> {
-    if let Ok(path) = attached_disk(1) {
-        let mut file = File::open(path)?;
-        if file.metadata()?.len() > MAX_AUTHENTICATION_DISK {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "authentication disk exceeds bound",
-            ));
-        }
-        return parse_boot_identity(&mut file);
+    let mut file = File::open(attached_disk(1)?)?;
+    // Block-device st_size is zero on Linux. Bound the actual record and
+    // require device EOF rather than confusing stat size with capacity.
+    let identity = parse_boot_identity(&mut file)?;
+    if file.read(&mut [0; 1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authentication disk has invalid size",
+        ));
     }
-    // Hyper-V direct boot has no safe host-side raw block update path. HCS
-    // confines this one-shot service to the VM-specific owner SDDL, after
-    // which the same capability-bound control protocol is used everywhere.
-    let listener = listen_vsock(GUEST_BOOTSTRAP_PORT)?;
-    let connection = accept_connection(listener.as_raw_fd())?;
-    // SAFETY: this accepted descriptor is uniquely owned by the bootstrap
-    // exchange and is closed after the bounded identity record is consumed.
-    let mut connection = unsafe { File::from_raw_fd(connection) };
-    parse_boot_identity(&mut connection)
+    Ok(identity)
 }
 
 fn parse_boot_identity(file: &mut impl Read) -> io::Result<BootIdentity> {
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)?;
-    if &magic != AUTHENTICATION_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authentication disk identity is invalid",
-        ));
-    }
-    let mut size = [0_u8; 2];
-    file.read_exact(&mut size)?;
-    let size = usize::from(u16::from_be_bytes(size));
-    if size == 0 || size > 128 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "machine identity is invalid",
-        ));
-    }
-    let mut machine = vec![0; size];
-    file.read_exact(&mut machine)?;
-    let machine_id = std::str::from_utf8(&machine)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "machine identity is not UTF-8"))?
-        .try_into()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut generation = [0_u8; 8];
-    file.read_exact(&mut generation)?;
-    let generation = Counter::try_from(u64::from_be_bytes(generation))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if generation == Counter::ZERO {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "generation is zero",
-        ));
-    }
-    let mut digest = [0_u8; 32];
-    file.read_exact(&mut digest)?;
-    let boot_digest = Digest::try_from(hex(&digest))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut capability = [0_u8; 32];
-    file.read_exact(&mut capability)?;
-    Ok(BootIdentity {
-        machine_id,
-        generation,
-        boot_digest,
-        capability: BootCapability::from_bytes(capability),
-    })
+    let mut bytes = zeroize::Zeroizing::new([0; BOOT_RECORD_BYTES]);
+    file.read_exact(&mut bytes[..])?;
+    BootIdentity::decode(&bytes[..])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Resolve the stable attachment slot across virtio-blk and Hyper-V SCSI.
+/// Resolve the stable virtio-blk attachment slot.
 /// Sandsurf owns the complete VM device model, so an attachment index is an
 /// authenticated boot-bundle fact rather than guest discovery of arbitrary
 /// host storage.
@@ -513,11 +499,9 @@ fn attached_disk(index: u8) -> io::Result<String> {
         b'a'.checked_add(index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "disk index overflow"))?,
     );
-    for prefix in ["vd", "sd"] {
-        let path = format!("/dev/{prefix}{suffix}");
-        if Path::new(&path).exists() {
-            return Ok(path);
-        }
+    let path = format!("/dev/vd{suffix}");
+    if Path::new(&path).exists() {
+        return Ok(path);
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -570,34 +554,6 @@ fn accept_connection(listener: RawFd) -> io::Result<RawFd> {
     } else {
         Ok(fd)
     }
-}
-
-fn set_socket_timeout(fd: RawFd, timeout: std::time::Duration) -> io::Result<()> {
-    let seconds = timeout
-        .as_secs()
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket timeout overflow"))?;
-    let value = libc::timeval {
-        tv_sec: seconds,
-        tv_usec: 0,
-    };
-    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-        // SAFETY: fd is one live owned socket and value has the exact timeval
-        // layout required by these scalar socket options.
-        if unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                option,
-                (&value as *const libc::timeval).cast(),
-                size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

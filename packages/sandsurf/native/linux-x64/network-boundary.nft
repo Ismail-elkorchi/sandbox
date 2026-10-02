@@ -1,0 +1,7 @@
+destroy table inet sandsurf_boundary
+table inet sandsurf_boundary {
+  chain local_delivery {
+    type filter hook input priority -300; policy accept;
+    meta mark 0x53534601 drop
+  }
+}

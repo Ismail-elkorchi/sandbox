@@ -1,5 +1,5 @@
 use sandsurf_protocol::{
-    CommitmentId, Counter, Digest, ExecutionDefaults, ExecutionId, GuestServiceRequest,
+    Capability, CommitmentId, Counter, Digest, ExecutionDefaults, ExecutionId, GuestServiceRequest,
     GuestServiceResponse, LifecycleIntent, LifecycleOperation, MachineId, MachineLifetime,
     MachineObservation, Observation, Operation, OperationId, OutputSegmentId, Qualification,
     ReleaseRequest, Resources, RollbackRecord, RuntimeResponse, Snapshot, SnapshotId,
@@ -36,9 +36,10 @@ pub struct HostInspection {
     pub guest_architecture: String,
     pub engine: VmEngine,
     pub lifecycle: Qualification,
-    pub full_state: Qualification,
+    pub full_state: Capability,
     pub images: Qualification,
     pub image_workers: sandsurf_protocol::Capability,
+    pub network_egress: sandsurf_protocol::Capability,
     pub resources: crate::resources::ResourceCapabilities,
     /// Each entry qualifies only its exact native configuration and scope.
     pub qualification_records: Vec<crate::qualification::RetainedQualification>,
@@ -98,7 +99,6 @@ pub enum ReservationView {
 pub enum StorageInspection {
     Current {
         phase: StoragePhase,
-        format: StorageFormat,
         capacity_bytes: u64,
         operation_id: Option<OperationId>,
         payload: StoragePayload,
@@ -113,16 +113,9 @@ pub enum StorageInspection {
 pub enum StoragePhase {
     Preparing,
     Published,
-    Attached,
     Replacing,
     Retiring,
     Retired,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum StorageFormat {
-    Raw,
-    Vhdx,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -240,7 +233,7 @@ pub enum HostRequest {
     GetMachine {
         machine_id: MachineId,
     },
-    OpenEventStream {
+    OpenObservationStream {
         machine_id: MachineId,
     },
     GetHostOperation {
@@ -516,7 +509,7 @@ pub enum HostResponse {
     Complete,
     /// Private, authenticated observer endpoint. This conveys no lifecycle or
     /// configuration authority and is never a cached machine observation.
-    EventStream {
+    ObservationStream {
         endpoint: PathBuf,
     },
     Inspection {

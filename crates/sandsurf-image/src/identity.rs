@@ -1,4 +1,4 @@
-use crate::appliance::{self, command};
+use crate::appliance::{self, Operation};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -23,7 +23,7 @@ pub fn customize(disk: &Path, profile: &CloneProfile) -> io::Result<()> {
     let mut bytes = [0; 16];
     getrandom::getrandom(&mut bytes).map_err(io::Error::other)?;
     let identity: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut commands = vec![appliance::mount(true)];
+    let mut operations = vec![Operation::Mount { writable: true }];
     // Remove final links first. Appliance containment also prevents malicious
     // directory links from reaching host paths; failures abort publication.
     for path in [
@@ -40,19 +40,22 @@ pub fn customize(disk: &Path, profile: &CloneProfile) -> io::Result<()> {
         "/etc/ssh/ssh_host_dsa_key",
         "/etc/ssh/ssh_host_dsa_key.pub",
     ] {
-        commands.push(command("rm-f", &[path]));
+        operations.push(Operation::Remove { path: path.into() });
     }
-    commands.push(command(
-        "write",
-        &["/etc/machine-id", &format!("{identity}\n")],
-    ));
-    commands.push(command("chmod", &["0644", "/etc/machine-id"]));
-    commands.push(command(
-        "write",
-        &["/etc/sandsurf-clone-pending", "managed-alpine\n"],
-    ));
-    commands.push(command("sync", &[]));
-    appliance::run(disk, true, &commands)?;
+    operations.push(Operation::Write {
+        path: "/etc/machine-id".into(),
+        bytes: format!("{identity}\n"),
+    });
+    operations.push(Operation::Chmod {
+        path: "/etc/machine-id".into(),
+        mode: 0o644,
+    });
+    operations.push(Operation::Write {
+        path: "/etc/sandsurf-clone-pending".into(),
+        bytes: "managed-alpine\n".into(),
+    });
+    operations.push(Operation::Sync);
+    appliance::run(disk, true, &operations)?;
     Ok(())
 }
 
@@ -79,19 +82,23 @@ mod tests {
             &source,
             true,
             &[
-                command("mkfs", &["ext4", "/dev/sda"]),
-                appliance::mount(true),
-                command("mkdir-p", &["/etc/ssh"]),
-                command("mkdir-p", &["/var/lib/dbus"]),
-                command(
-                    "write",
-                    &["/etc/machine-id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"],
-                ),
-                command(
-                    "write",
-                    &["/etc/ssh/ssh_host_ed25519_key", "source-host-key"],
-                ),
-                command("sync", &[]),
+                Operation::MakeExt4,
+                Operation::Mount { writable: true },
+                Operation::Mkdir {
+                    path: "/etc/ssh".into(),
+                },
+                Operation::Mkdir {
+                    path: "/var/lib/dbus".into(),
+                },
+                Operation::Write {
+                    path: "/etc/machine-id".into(),
+                    bytes: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n".into(),
+                },
+                Operation::Write {
+                    path: "/etc/ssh/ssh_host_ed25519_key".into(),
+                    bytes: "source-host-key".into(),
+                },
+                Operation::Sync,
             ],
         )
         .unwrap();
@@ -102,17 +109,18 @@ mod tests {
         customize(&first, &CloneProfile::Alpine).unwrap();
         customize(&second, &CloneProfile::Alpine).unwrap();
         let read = |disk: &Path| {
-            String::from_utf8(
-                appliance::run(
-                    disk,
-                    false,
-                    &[
-                        appliance::mount(false),
-                        command("cat", &["/etc/machine-id"]),
-                    ],
-                )
-                .unwrap(),
+            appliance::run(
+                disk,
+                false,
+                &[
+                    Operation::Mount { writable: false },
+                    Operation::Cat {
+                        path: "/etc/machine-id".into(),
+                    },
+                ],
             )
+            .unwrap()
+            .text()
             .unwrap()
             .trim()
             .to_owned()
@@ -128,14 +136,16 @@ mod tests {
                 disk,
                 false,
                 &[
-                    appliance::mount(false),
-                    command("exists", &["/etc/ssh/ssh_host_ed25519_key"]),
+                    Operation::Mount { writable: false },
+                    Operation::Exists {
+                        path: "/etc/ssh/ssh_host_ed25519_key".into(),
+                    },
                 ],
             )
             .unwrap()
         };
-        assert_eq!(String::from_utf8(exists(&source)).unwrap().trim(), "true");
-        assert_eq!(String::from_utf8(exists(&first)).unwrap().trim(), "false");
+        assert_eq!(exists(&source), appliance::Reply::Exists(true));
+        assert_eq!(exists(&first), appliance::Reply::Exists(false));
         let before = std::fs::read(&second).unwrap();
         customize(&second, &CloneProfile::Preserve).unwrap();
         assert_eq!(std::fs::read(&second).unwrap(), before);

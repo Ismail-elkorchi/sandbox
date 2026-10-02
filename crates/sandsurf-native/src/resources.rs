@@ -24,11 +24,12 @@ pub fn systemd_properties(resources: &Resources) -> io::Result<Vec<String>> {
     resources
         .validate()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    // systemd CPUQuota is percent of one CPU. Three decimal places preserve
-    // every microsecond in the fixed 100ms CPU period without float rounding.
+    // systemd's transient-unit parser accepts hundredths of one CPU percent.
+    // With the fixed 100ms period that is exactly 10µs; admission rejects finer
+    // values rather than rounding authority into a different native limit.
     let quota = resources.cpu_quota_micros.get();
     Ok(vec![
-        format!("CPUQuota={}.{:03}%", quota / 1000, quota % 1000),
+        format!("CPUQuota={}.{:02}%", quota / 1000, (quota % 1000) / 10),
         "CPUQuotaPeriodSec=100ms".into(),
         format!(
             "MemoryMax={}",
@@ -46,21 +47,24 @@ pub fn systemd_properties(resources: &Resources) -> io::Result<Vec<String>> {
         "Restart=no".into(),
         // Native threads and channel/session workers are covered. This is a
         // host-task cap, never a promise about root-controlled guest PIDs.
-        format!(
-            "TasksMax={}",
+        format!("TasksMax={}", task_budget(resources)?),
+    ])
+}
+
+fn task_budget(resources: &Resources) -> io::Result<u64> {
+    resources
+        .channels
+        .get()
+        .checked_mul(8)
+        .and_then(|channels| {
             resources
-                .channels
+                .vcpus
                 .get()
                 .checked_mul(8)
-                .and_then(|value| resources
-                    .vcpus
-                    .get()
-                    .checked_mul(8)
-                    .and_then(|cpu| value.checked_add(cpu)))
-                .and_then(|value| value.checked_add(128))
-                .ok_or_else(|| invalid("native task budget overflow"))?
-        ),
-    ])
+                .and_then(|cpus| channels.checked_add(cpus))
+        })
+        .and_then(|tasks| tasks.checked_add(128))
+        .ok_or_else(|| invalid("native task budget overflow"))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -130,20 +134,7 @@ impl ProcessEnvelope {
                 "external CPU/memory enforcement differs from host authority",
             ));
         }
-        let tasks = resources
-            .channels
-            .get()
-            .checked_mul(8)
-            .and_then(|value| {
-                resources
-                    .vcpus
-                    .get()
-                    .checked_mul(8)
-                    .and_then(|cpu| value.checked_add(cpu))
-            })
-            .and_then(|value| value.checked_add(128))
-            .ok_or_else(|| invalid("native task budget overflow"))?;
-        if self.number("pids.max")? != tasks {
+        if self.number("pids.max")? != task_budget(resources)? {
             return Err(invalid("external task cap differs from host authority"));
         }
         Ok(())
@@ -279,9 +270,9 @@ mod tests {
             Counter::ONE,
         )
         .unwrap();
-        limits.cpu_quota_micros = Counter::try_from(25_001).unwrap();
+        limits.cpu_quota_micros = Counter::try_from(25_010).unwrap();
         let properties = systemd_properties(&limits).unwrap();
-        assert!(properties.contains(&"CPUQuota=25.001%".to_owned()));
+        assert!(properties.contains(&"CPUQuota=25.01%".to_owned()));
         assert!(properties.contains(&format!(
             "MemoryMax={}",
             256 * 1024 * 1024 + limits.host_overhead_bytes.get()
@@ -307,6 +298,8 @@ mod tests {
         .unwrap();
         assert!(limits.validate().is_ok());
         limits.cpu_quota_micros = Counter::try_from(999).unwrap();
+        assert!(systemd_properties(&limits).is_err());
+        limits.cpu_quota_micros = Counter::try_from(25_001).unwrap();
         assert!(systemd_properties(&limits).is_err());
         limits.cpu_quota_micros = Counter::try_from(100_000).unwrap();
         limits.physical_storage_bytes = limits.disk_bytes;

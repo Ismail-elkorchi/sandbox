@@ -10,7 +10,7 @@
     },
     "initramfs": {
       "path": "boot-initramfs",
-      "sha256": "6841a9f92262417005d683ac1535c7b96b54ec0fb24241c24e9f9988a15c1b1f"
+      "sha256": "ac322ed05a5c9b75596f46aca2fe68ea300775f4de28e24c4ea74fce79f8ea1e"
     },
     "profile": {
       "kind": "alpine"
@@ -19,7 +19,7 @@
       "version": "1.0.0",
       "protocolMajor": 1,
       "protocolMinor": 0,
-      "sha256": "06fcfbfbb2a87d339ab7e3e4f112e66df076245f8465fcb3e04d467f4bca3b09"
+      "sha256": "203d8071f31c6e4142b3d734e65210f819a01bbac0e93d7ae0b0b021aca091e7"
     },
     "capabilities": {
       "overlayfs": true,
@@ -35,7 +35,7 @@
     },
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "0eaadb586f8a8e138eb14e5cee4bcde482296bd6ed5f5641888a8c9cb0540a62",
+      "sha256": "c983fe249c59457b06d2632e2231a3f76b6fd67a2473e445d26636e66c920258",
       "format": "ext4"
     },
     "defaults": {
@@ -47,26 +47,14 @@
     },
     "provenance": {
       "kind": "source-built",
-      "sourceDigest": "65f32f38128d6cca28075e88e4bd6e10bbff77f7a7fa08eadd8cb6ef954794a6",
+      "sourceDigest": "de61b0f1bf2e1babcd80a3ea6d366f61b976956227746f82082b86c2e57ce869",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
-        "alpine-offline-packages": "3ed1eca104a718faec7f04ae14a4d199bf542573e3ac88cbc47b2cc0e7b8d7d0",
-        "alpine-package-lock": "e058e1e64e00d019f9f5e4155353f3604684fb09d6e12a1c5bd5fe2ed6eb44e2",
-        "sandsurf-system-recipe": "0123ff63f23f77a7f0d00cd22858687ab08faa30fe45b8a6906efa772fda35e3",
-        "sandsurf-appliance-recipe": "6ea6e15a0d058fad89741b2ef940f356f81ed888505d0b65dcd0de434c32a4fa",
-        "sandsurf-management": "06fcfbfbb2a87d339ab7e3e4f112e66df076245f8465fcb3e04d467f4bca3b09"
-      }
-    }
-  },
-  "platformArtifacts": {
-    "windowsX64": {
-      "kernel": {
-        "path": "hyperv-vmlinuz-6.18.41",
-        "sha256": "bdb750c617bf47fc893c9ee849e82b4b3bc0287d693195b58bd3fa1c4c8936b5"
-      },
-      "system": {
-        "path": "system.vhdx",
-        "sha256": "5e473d790f95e5c4a0ed1c5e236a733b97a360830b518db3d22b84305cd45e7e"
+        "alpine-offline-packages": "586d7d9105c15ab4654c3e68a13020af710165e35ef4a8c57b52b785d41d8c90",
+        "alpine-package-lock": "d9cf6d79714ee4bc3dc87f3c85961ea56ec763efe82027bf0e41c0f65216a97b",
+        "sandsurf-system-recipe": "077215a44204c4dc5fd7ea9ba4504ce2678ca965903e2fb46ccddd51c22d69cc",
+        "sandsurf-appliance-recipe": "e7a398db88530aafc81c0d94e64d2879b750eea30ba9b4d83205126913c6ff02",
+        "sandsurf-management": "203d8071f31c6e4142b3d734e65210f819a01bbac0e93d7ae0b0b021aca091e7"
       }
     }
   },

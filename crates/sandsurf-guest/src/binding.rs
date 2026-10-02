@@ -1,7 +1,6 @@
 //! Guest-owned reconnect data. Root may change or delete it; it is not host authority.
 
-use super::BootIdentity;
-use sandsurf_protocol::{BootCapability, Counter, Digest, GuestBootId, MachineId};
+use sandsurf_protocol::{BootCapability, BootIdentity, Counter, Digest, GuestBootId, MachineId};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};

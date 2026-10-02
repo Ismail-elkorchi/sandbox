@@ -4,11 +4,8 @@
 #[cfg(all(test, target_os = "linux"))]
 use sandsurf_image::ext4::materialize_tar;
 use sandsurf_image::{
-    Architecture, ImageProvenance, ImageTrust, PlatformArtifacts, VerifiedImage, install_image,
-    verify_image,
+    Architecture, ImageProvenance, ImageTrust, VerifiedImage, install_image, verify_image,
 };
-#[cfg(target_os = "windows")]
-use sandsurf_image::{ImageArtifact, WindowsArtifacts};
 #[cfg(test)]
 use sandsurf_image::{
     ImageDefaults, ImageManifest, RootfsArtifact, RootfsFormat, SystemDiskManifest,
@@ -30,7 +27,6 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
 pub(crate) mod oci;
 
 const MAX_ROOTFS_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -90,7 +86,6 @@ pub fn qualification() -> Qualification {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 pub(crate) fn import_native(
     host_root: &Path,
     manifest_path: &Path,
@@ -167,16 +162,8 @@ fn prepare_import(
     let imports = host_root.join("images/imports");
     prepare_private_directory(&imports)?;
     let stage = imports.join(object_name(operation.as_str()));
-    let result_path = stage.join("result.json");
-    if result_path.exists() {
-        let old: ImportResult = read_json(&result_path, 1024 * 1024)?;
-        if old.request_digest != *request_digest {
-            return Err(ImageBuildError::Invalid(
-                "image import staging identity conflicts with the request".into(),
-            ));
-        }
-        verify_published(host_root, &old.image)?;
-        return Ok((stage, Some(old.image)));
+    if let Some(image) = completed(host_root, operation, request_digest)? {
+        return Ok((stage, Some(image)));
     }
     if stage.exists() {
         let quarantine = imports.join(format!(
@@ -190,12 +177,37 @@ fn prepare_import(
     Ok((stage, None))
 }
 
+/// The sole durable materialization outcome. The worker and API read this same
+/// record; it is evidence for the catalog owner, never a second image catalog.
+pub(crate) fn completed(
+    root: &Path,
+    operation: &OperationId,
+    request_digest: &Digest,
+) -> Result<Option<ImageRecord>, ImageBuildError> {
+    let path = root
+        .join("images/imports")
+        .join(object_name(operation.as_str()))
+        .join("result.json");
+    let result = match crate::image_records::read::<ImportResult>(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if result.request_digest != *request_digest {
+        return Err(ImageBuildError::Invalid(
+            "image operation result binding changed".into(),
+        ));
+    }
+    verify_published(root, &result.image)?;
+    Ok(Some(result.image))
+}
+
 fn finish_import(
     stage: &Path,
     request_digest: &Digest,
     image: &ImageRecord,
 ) -> Result<(), ImageBuildError> {
-    write_json(
+    crate::image_records::publish(
         &stage.join("result.json"),
         &ImportResult {
             request_digest: request_digest.clone(),
@@ -349,12 +361,6 @@ pub fn publish_snapshot(
         ),
     )
     .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
-    let platform_artifacts = materialize_derived_platform_artifacts(
-        &source,
-        &template,
-        &artifact,
-        snapshot.system_disk_bytes.get(),
-    )?;
     let mut manifest = source.manifest;
     manifest.id = format!("derived-{}", &provenance_digest.as_str()[..16]);
     manifest.version = snapshot_manifest.as_str()[..16].to_owned();
@@ -366,7 +372,6 @@ pub fn publish_snapshot(
     });
     manifest.system.rootfs.path = "derived-system.ext4".into();
     manifest.system.rootfs.sha256 = sha256_file(&template, MAX_ROOTFS_BYTES)?;
-    manifest.platform_artifacts = platform_artifacts;
     manifest.system.provenance = ImageProvenance::Derived {
         source_image_digest: snapshot.image_digest.as_str().to_owned(),
         snapshot_manifest_digest: snapshot_manifest.as_str().to_owned(),
@@ -425,55 +430,6 @@ pub(crate) fn resolve_native_image(
         )),
         Err(error) => Err(error.into()),
     }
-}
-
-#[cfg(target_os = "windows")]
-fn materialize_platform_artifacts(
-    base: &VerifiedImage,
-    defaults: &Path,
-    destination: &Path,
-    bytes: u64,
-) -> Result<PlatformArtifacts, ImageBuildError> {
-    let windows = base.windows_x64.as_ref().ok_or_else(|| {
-        ImageBuildError::Invalid("packaged boot bundle has no Windows artifacts".into())
-    })?;
-    let kernel = destination.join("windows-kernel");
-    let workload_vhdx = destination.join("windows-system.vhdx");
-    copy_regular(&windows.kernel_path, &kernel)?;
-    sandsurf_native::virtual_disk::import_raw(defaults, &workload_vhdx, bytes)?;
-    Ok(PlatformArtifacts {
-        windows_x64: Some(WindowsArtifacts {
-            kernel: image_artifact(&kernel, "windows-kernel")?,
-            system: image_artifact(&workload_vhdx, "windows-system.vhdx")?,
-        }),
-    })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn materialize_platform_artifacts(
-    _base: &VerifiedImage,
-    _workload: &Path,
-    _destination: &Path,
-    _bytes: u64,
-) -> Result<PlatformArtifacts, ImageBuildError> {
-    Ok(PlatformArtifacts::default())
-}
-
-fn materialize_derived_platform_artifacts(
-    source: &VerifiedImage,
-    system: &Path,
-    destination: &Path,
-    bytes: u64,
-) -> Result<PlatformArtifacts, ImageBuildError> {
-    materialize_platform_artifacts(source, system, destination, bytes)
-}
-
-#[cfg(target_os = "windows")]
-fn image_artifact(path: &Path, name: &str) -> Result<ImageArtifact, ImageBuildError> {
-    Ok(ImageArtifact {
-        path: name.into(),
-        sha256: sha256_file(path, MAX_ROOTFS_BYTES)?,
-    })
 }
 
 fn copy_regular(source: &Path, destination: &Path) -> Result<(), ImageBuildError> {
@@ -570,31 +526,6 @@ fn sha256_file(path: &Path, maximum: u64) -> Result<String, ImageBuildError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ImageBuildError> {
-    let bytes = serde_json::to_vec(value)?;
-    let mut file = create_private_file(path)?;
-    file.write_all(&bytes)?;
-    sandsurf_native::storage::sync_file(&file)?;
-    Ok(())
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(
-    path: &Path,
-    maximum: u64,
-) -> Result<T, ImageBuildError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > maximum {
-        return Err(ImageBuildError::Invalid(
-            "image import result is malformed".into(),
-        ));
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(maximum + 1)
-        .read_to_end(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
 fn short_nonce() -> Result<String, ImageBuildError> {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes)
@@ -666,11 +597,10 @@ mod native_import_tests {
                         materials: BTreeMap::from([("source".into(), "b".repeat(64))]),
                     },
                 },
-                platform_artifacts: PlatformArtifacts::default(),
                 signature: None,
             };
             let path = source.join("manifest.json");
-            write_json(&path, &manifest).unwrap();
+            crate::image_records::publish(&path, &manifest).unwrap();
             let mut compressed = flate2::write::GzEncoder::new(
                 fs::File::create(source.join("system.ext4.gz")).unwrap(),
                 flate2::Compression::default(),
@@ -772,6 +702,35 @@ mod native_import_tests {
     }
 
     #[test]
+    fn worker_and_materializer_share_one_complete_verified_result() {
+        let fixture = Fixture::new();
+        let image = fixture.import("worker-operation", "c").unwrap();
+        let operation: OperationId = "worker-operation".try_into().unwrap();
+        let binding: Digest = "c".repeat(64).try_into().unwrap();
+        assert_eq!(
+            crate::image_worker::completed(&fixture.root, &operation, &binding).unwrap(),
+            Some(image.clone())
+        );
+        assert!(
+            !fixture.root.join("image-workers").exists(),
+            "completion must not create a duplicate outcome"
+        );
+        fs::remove_dir_all(fixture.manifest.parent().unwrap()).unwrap();
+        assert_eq!(
+            crate::image_worker::completed(&fixture.root, &operation, &binding).unwrap(),
+            Some(image)
+        );
+        assert!(
+            crate::image_worker::completed(
+                &fixture.root,
+                &operation,
+                &"d".repeat(64).try_into().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn native_import_rejects_unpinned_or_modified_input_before_publication() {
         let fixture = Fixture::new();
         let wrong = Digest::try_from("d".repeat(64)).unwrap();
@@ -806,7 +765,7 @@ mod native_import_tests {
     #[test]
     fn every_image_source_uses_one_canonical_record_and_preserves_sensitive_provenance() {
         let fixture = Fixture::new();
-        let mut manifest: ImageManifest = read_json(&fixture.manifest, 1024 * 1024).unwrap();
+        let mut manifest: ImageManifest = crate::image_records::read(&fixture.manifest).unwrap();
         for provenance in [
             ImageProvenance::Oci {
                 index_digest: "a".repeat(64),

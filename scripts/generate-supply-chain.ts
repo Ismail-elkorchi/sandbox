@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
+import { nativeComponents } from "./native-supply-chain.ts";
+import type { Component, ComponentLicense } from "./native-supply-chain.ts";
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
@@ -16,17 +17,6 @@ interface CargoNode {
   dependencies: readonly string[];
 }
 
-type ComponentLicense = { expression: string } | { license: { id: string } };
-
-interface Component {
-  type: string;
-  name: string;
-  version: string;
-  licenses: readonly ComponentLicense[];
-  purl?: string;
-  hashes?: readonly { alg: string; content: string }[];
-}
-
 const metadataValue: unknown = JSON.parse(await capture("cargo", ["metadata", "--locked", "--format-version", "1"]));
 const metadata = parseMetadata(metadataValue);
 const packages = new Map(metadata.packages.map((package_) => [package_.id, package_]));
@@ -35,24 +25,8 @@ const nodes = new Map(metadata.nodes.map((node) => [node.id, node]));
 const nativeRoot = resolve("packages/sandsurf/native");
 const nativeManifest: unknown = JSON.parse(await readFile(resolve(nativeRoot, "manifest.json"), "utf8"));
 if (!isRecord(nativeManifest) || !isRecord(nativeManifest.files)) throw new Error("invalid native manifest");
-const nativeComponents: Component[] = [];
-for (const [path, expected] of Object.entries(nativeManifest.files)) {
-  const match = /^linux-(x64|arm64)\/firecracker-v([0-9]+\.[0-9]+\.[0-9]+)-(x86_64|aarch64)$/u.exec(path);
-  if (match === null) continue;
-  const architecture = match[1]!;
-  if ((architecture === "x64") !== (match[3] === "x86_64")) throw new Error("Firecracker architecture mismatch");
-  const actual = await sha256File(resolve(nativeRoot, path), 512 * 1024 ** 2);
-  if (expected !== actual) throw new Error(`native supply-chain digest mismatch: ${path}`);
-  nativeComponents.push({
-    type: "application",
-    name: "firecracker",
-    version: match[2]!,
-    purl: `pkg:generic/firecracker@${match[2]}?arch=${architecture}`,
-    licenses: [{ license: { id: "Apache-2.0" } }],
-    hashes: [{ alg: "SHA-256", content: actual }],
-  });
-}
-await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), nativeComponents);
+const native = await nativeComponents(nativeRoot, nativeManifest.files);
+await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), native);
 
 async function generate(rootNames: readonly string[], npmName: string, destination: string, additional: readonly Component[]): Promise<void> {
   const roots = rootNames.map((rootName) => {

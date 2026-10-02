@@ -25,6 +25,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .and_then(|value| value.into_string().ok())
         .ok_or("missing Sandsurf host mode")?;
+    #[cfg(target_os = "macos")]
+    let (mode, native_worker) = if mode == "--broker-worker" {
+        let role = sandsurf_native::resource_broker::WorkerKind::parse(
+            &arguments
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .ok_or("missing owned worker role")?,
+        )?;
+        let mode = role
+            .host_mode()
+            .ok_or("VM workers must use the installed VMM executable")?;
+        let budget = sandsurf_native::resource_broker::macos::enter_worker()?;
+        (mode.to_owned(), Some((role, budget)))
+    } else {
+        (mode, None)
+    };
+    #[cfg(target_os = "linux")]
+    if mode == "--linux-network-sockets" {
+        if arguments.next().is_some() {
+            return Err("native socket owner accepts no arguments".into());
+        }
+        sandsurf_native::network_sockets::serve()?;
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     if mode == "--linux-vmm-launcher" {
         std::process::exit(sandsurf_machine::launcher::vmm_launcher_main());
@@ -49,6 +73,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;
+    #[cfg(windows)]
+    let _service_job = match mode.as_str() {
+        "serve" => Some(windows_pool(
+            sandsurf_native::service_pool::ServicePool::Api,
+        )?),
+        "supervise" => Some(windows_pool(
+            sandsurf_native::service_pool::ServicePool::Supervisor,
+        )?),
+        _ => None,
+    };
     match mode.as_str() {
         "storage-path" => {
             let machine: MachineId = text_argument(&values, "--machine")?.try_into()?;
@@ -86,16 +120,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        "image-worker" => sandsurf_host::image_worker::serve(
-            &directory,
-            text_argument(&values, "--operation")?.try_into()?,
-        )?,
+        "image-worker" => {
+            let pool = directory.join("image-workers/.lease");
+            #[cfg(target_os = "linux")]
+            let lease = {
+                if !sandsurf_native::service_pool::ServicePool::Images.current(&directory)? {
+                    return Err("image worker outside its owned unit".into());
+                }
+                sandsurf_native::storage::disk_lease(&pool)?
+            };
+            #[cfg(target_os = "macos")]
+            let lease = {
+                if native_worker.map(|v| v.0)
+                    != Some(sandsurf_native::resource_broker::WorkerKind::Images)
+                {
+                    return Err("image worker requires the installed native owner".into());
+                }
+                sandsurf_native::resource_broker::macos::receive_image_lease(&pool)?
+            };
+            #[cfg(windows)]
+            let lease = sandsurf_native::owned_windows::OwnedWorker::receive_image_lease(
+                text_argument(&values, "--owned-lease")?.parse()?,
+                &pool,
+            )?;
+            sandsurf_host::image_worker::serve(
+                &directory,
+                text_argument(&values, "--operation")?.try_into()?,
+                lease,
+            )?;
+        }
         "serve" => {
             #[cfg(target_os = "linux")]
             if !managed_pool(
                 &directory,
                 sandsurf_native::service_pool::ServicePool::Api,
                 "serve",
+            )? {
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            if !managed_pool(
+                &directory,
+                sandsurf_native::service_pool::ServicePool::Api,
+                native_worker,
             )? {
                 return Ok(());
             }
@@ -107,6 +174,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &directory,
                 sandsurf_native::service_pool::ServicePool::Supervisor,
                 "supervise",
+            )? {
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            if !managed_pool(
+                &directory,
+                sandsurf_native::service_pool::ServicePool::Supervisor,
+                native_worker,
             )? {
                 return Ok(());
             }
@@ -142,6 +217,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("invalid native service role".into()),
             };
             windows_service::run(directory, service_name, std::env::current_exe()?, role)?;
+        }
+        "qualification-requirements" => {
+            println!(
+                "{}",
+                serde_json::to_string(&sandsurf_host::qualification::requirements())?
+            );
         }
         "qualification-config" => {
             #[cfg(target_os = "linux")]
@@ -184,6 +265,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&record)?);
         }
         "guardian" => {
+            #[cfg(target_os = "macos")]
+            if native_worker.is_none_or(|(kind, _)| {
+                kind != sandsurf_native::resource_broker::WorkerKind::Guardian
+            }) {
+                return Err("guardian requires its owned resource-broker entry".into());
+            }
             let machine: MachineId = argument(&values, "--machine")?
                 .into_os_string()
                 .into_string()
@@ -192,7 +279,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             serve_machine_guardian(&directory, machine)?;
         }
         "bridge" => run_bridge(&directory)?,
-        "event-stream" => {
+        "event-stream" | "console-stream" => {
             let machine: MachineId = argument(&values, "--machine")?
                 .into_os_string()
                 .into_string()
@@ -206,28 +293,89 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let maximum = argument(&values, "--maximum")?
                 .to_str()
                 .ok_or("invalid event page size")?
-                .parse::<u16>()?;
+                .parse::<u32>()?;
             let endpoint = match host_call(
                 &directory,
-                HostRequest::OpenEventStream {
+                HostRequest::OpenObservationStream {
                     machine_id: machine.clone(),
                 },
             )? {
-                HostResponse::EventStream { endpoint } => endpoint,
+                HostResponse::ObservationStream { endpoint } => endpoint,
                 HostResponse::Rejected { category, message } => {
-                    return Err(format!("event stream rejected ({category}): {message}").into());
+                    return Err(
+                        format!("observation stream rejected ({category}): {message}").into(),
+                    );
                 }
-                _ => return Err("host returned an invalid event stream endpoint".into()),
+                _ => return Err("host returned an invalid observation stream endpoint".into()),
+            };
+            let subscription = if mode == "console-stream" {
+                sandsurf_protocol::GuardianRequest::SubscribeConsole {
+                    machine_id: machine,
+                    generation: text_argument(&values, "--generation")?
+                        .parse::<u64>()?
+                        .try_into()?,
+                    after,
+                    maximum,
+                }
+            } else {
+                sandsurf_protocol::GuardianRequest::SubscribeEvents {
+                    machine_id: machine,
+                    after,
+                    maximum: maximum.try_into()?,
+                }
             };
             let mut stream =
-                sandsurf_host::guardian::EventStream::open(&endpoint, machine, after, maximum)?;
-            event_bridge_loop(&mut io::stdin(), &mut io::stdout(), &mut || {
+                sandsurf_host::guardian::ObservationStream::open(&endpoint, subscription)?;
+            observation_bridge_loop(&mut io::stdin(), &mut io::stdout(), &mut || {
                 stream.read_page()
             })?;
         }
         _ => return Err("invalid Sandsurf host mode".into()),
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_pool(
+    pool: sandsurf_native::service_pool::ServicePool,
+) -> io::Result<sandsurf_native::process_budget::windows::JobEnvelope> {
+    sandsurf_native::process_budget::windows::JobEnvelope::install_factory_current(
+        pool.worker_kind(),
+        pool.process_budget(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn managed_pool(
+    directory: &Path,
+    pool: sandsurf_native::service_pool::ServicePool,
+    worker: Option<(
+        sandsurf_native::resource_broker::WorkerKind,
+        sandsurf_native::process_budget::ProcessBudget,
+    )>,
+) -> io::Result<bool> {
+    if let Some((kind, budget)) = worker {
+        if kind != pool.worker_kind()
+            || budget != sandsurf_native::resource_broker::worker_budget(pool.process_budget())?
+        {
+            return Err(io::Error::other(
+                "native service pool budget differs from host admission",
+            ));
+        }
+        return Ok(true);
+    }
+    sandsurf_native::local::ensure_private_directory(directory)?;
+    let root = sandsurf_native::local::canonical_private_directory(directory)?;
+    let owned = sandsurf_native::resource_broker::macos::launch(
+        pool.worker_kind(),
+        pool.process_budget(),
+        &["--directory".into(), root.into_os_string()],
+        std::process::Stdio::null(),
+        std::process::Stdio::inherit(),
+        std::process::Stdio::inherit(),
+    )?;
+    drop(owned);
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -269,23 +417,27 @@ fn run_bridge(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     bridge_loop(directory, &mut input, &mut output)
 }
 
-fn event_bridge_loop(
+fn observation_bridge_loop(
     input: &mut impl Read,
     output: &mut impl Write,
-    next: &mut impl FnMut() -> sandsurf_host::guardian::Result<sandsurf_protocol::RuntimeEventPage>,
+    next: &mut impl FnMut() -> sandsurf_host::guardian::Result<sandsurf_protocol::RuntimeResponse>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let page = next()?;
-        let cursor = page.cursor;
-        let bytes = bridge_payload(
-            1,
-            &HostResponse::Runtime {
-                response: sandsurf_protocol::RuntimeResponse::Events { page },
-            },
-            &[],
-        );
+        let response = next()?;
+        let cursor = match &response {
+            sandsurf_protocol::RuntimeResponse::Events { page } => page.cursor,
+            sandsurf_protocol::RuntimeResponse::Console { page } => page.cursor,
+            _ => return Err("invalid observation bridge response".into()),
+        };
+        let (response, binary) = HostResponse::Runtime { response }.into_wire_parts()?;
+        let data = binary
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let bytes = bridge_payload(1, &response, &data);
         if bytes.len() > MAX_BRIDGE_BYTES {
-            return Err("event page exceeds bridge bound".into());
+            return Err("observation page exceeds bridge bound".into());
         }
         output.write_all(&u32::try_from(bytes.len())?.to_le_bytes())?;
         output.write_all(&bytes)?;
@@ -298,7 +450,7 @@ fn event_bridge_loop(
         }
         input.read_exact(&mut credit[1..])?;
         if u64::from_le_bytes(credit) != cursor.get() {
-            return Err("event bridge credit differs from delivered cursor".into());
+            return Err("observation bridge credit differs from delivered cursor".into());
         }
     }
 }
@@ -581,6 +733,18 @@ mod windows_service {
         report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
         let directory = DIRECTORY.get().expect("service directory");
         let executable = EXECUTABLE.get().expect("service executable").clone();
+        let pool = match ROLE.get().expect("service role") {
+            Role::Host => sandsurf_native::service_pool::ServicePool::Api,
+            Role::Supervisor => sandsurf_native::service_pool::ServicePool::Supervisor,
+        };
+        let _job = match super::windows_pool(pool) {
+            Ok(job) => job,
+            Err(error) => {
+                eprintln!("sandsurf service resource envelope: {error}");
+                report(SERVICE_STOPPED, 0, 0);
+                return;
+            }
+        };
         let result = match ROLE.get().expect("service role") {
             Role::Host => serve_host(directory, executable),
             Role::Supervisor => {
@@ -655,12 +819,14 @@ mod tests {
         let mut credits = 1_u64.to_le_bytes().as_slice().to_vec();
         let mut output = Vec::new();
         let mut reads = 0;
-        event_bridge_loop(&mut credits.as_slice(), &mut output, &mut || {
+        observation_bridge_loop(&mut credits.as_slice(), &mut output, &mut || {
             reads += 1;
-            Ok(sandsurf_protocol::RuntimeEventPage {
-                cursor: sandsurf_protocol::Counter::ONE,
-                available: sandsurf_protocol::Counter::ONE,
-                events: Vec::new(),
+            Ok(sandsurf_protocol::RuntimeResponse::Events {
+                page: sandsurf_protocol::RuntimeEventPage {
+                    cursor: sandsurf_protocol::Counter::ONE,
+                    available: sandsurf_protocol::Counter::ONE,
+                    events: Vec::new(),
+                },
             })
         })
         .unwrap();
@@ -686,18 +852,53 @@ mod tests {
             reads = 0;
             credits = bad;
             assert!(
-                event_bridge_loop(&mut credits.as_slice(), &mut Vec::new(), &mut || {
+                observation_bridge_loop(&mut credits.as_slice(), &mut Vec::new(), &mut || {
                     reads += 1;
-                    Ok(sandsurf_protocol::RuntimeEventPage {
-                        cursor: sandsurf_protocol::Counter::ONE,
-                        available: sandsurf_protocol::Counter::ONE,
-                        events: Vec::new(),
+                    Ok(sandsurf_protocol::RuntimeResponse::Events {
+                        page: sandsurf_protocol::RuntimeEventPage {
+                            cursor: sandsurf_protocol::Counter::ONE,
+                            available: sandsurf_protocol::Counter::ONE,
+                            events: Vec::new(),
+                        },
                     })
                 })
                 .is_err()
             );
             assert_eq!(reads, 1, "invalid credit cannot request another page");
         }
+    }
+
+    #[test]
+    fn console_bridge_keeps_binary_bytes_and_eof_never_requests_another_page() {
+        let mut output = Vec::new();
+        let mut reads = 0;
+        observation_bridge_loop(&mut [].as_slice(), &mut output, &mut || {
+            reads += 1;
+            Ok(sandsurf_protocol::RuntimeResponse::Console {
+                page: sandsurf_protocol::ConsolePage {
+                    generation: sandsurf_protocol::Counter::ONE,
+                    after: sandsurf_protocol::Counter::ZERO,
+                    cursor: 3.try_into().unwrap(),
+                    available: 3.try_into().unwrap(),
+                    bytes: vec![0, 128, 255],
+                    loss: None,
+                    open: true,
+                    capture_failed: false,
+                },
+            })
+        })
+        .unwrap();
+        assert_eq!(reads, 1);
+        let length = u32::from_le_bytes(output[..4].try_into().unwrap()) as usize;
+        assert_eq!(length, output.len() - 4);
+        let (_, _, response, binary) = decode_response(&output[4..]);
+        assert_eq!(binary, [0, 128, 255]);
+        assert!(matches!(
+            response,
+            HostResponse::Runtime {
+                response: sandsurf_protocol::RuntimeResponse::ConsoleMetadata { .. }
+            }
+        ));
     }
 
     fn decode_response(bytes: &[u8]) -> (u64, u16, HostResponse, &[u8]) {

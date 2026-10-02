@@ -9,3 +9,9 @@ respawn_delay=1
 depend() {
     need localmount sandsurf-clone-identity
 }
+
+start_pre() {
+    # Firecracker uses vsock; hardware-accelerated QEMU uses virtio-serial.
+    # Both are ordinary Linux device drivers, independent of machine power.
+    modprobe virtio_console || return 1
+}

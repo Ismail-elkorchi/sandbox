@@ -3,6 +3,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 import { verifyDiskTransport } from "./image-sources.ts";
+import { verifyQemuRuntime } from "./qemu-runtime.ts";
+import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependencies.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await verifyManifest(resolve(repository, "native/manifest.json"), resolve(repository, "native"));
@@ -55,24 +57,24 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
     throw new Error(`${architecture} VM initramfs is malformed`);
   }
   await verifyFile(resolve(imageRoot, initramfs.path), initramfs.sha256, `${architecture} VM initramfs`);
-  if (!isRecord(imageManifest.platformArtifacts)) throw new Error(`${architecture} platform artifacts are malformed`);
-  if (architecture === "x64") {
-    const windows = imageManifest.platformArtifacts.windowsX64;
-    if (!isRecord(windows)) throw new Error("x64 image has no Windows VM-native artifacts");
-    for (const [label, entry] of Object.entries(windows)) {
-      if (!isRecord(entry) || typeof entry.path !== "string" || !/^[A-Za-z0-9._-]+$/u.test(entry.path)) {
-        throw new Error(`x64 Windows ${label} artifact is malformed`);
-      }
-      await verifyFile(resolve(imageRoot, entry.path), entry.sha256, `x64 Windows ${label}`);
-      if (label === "system") await verifyDiskTransport(resolve(imageRoot, `${entry.path}.gz`), entry.sha256 as string);
-    }
-  }
+
 }
 if (required.size !== 0) throw new Error(`required VM images are absent: ${[...required].join(", ")}`);
 
 async function verifyManifest(manifestPath: string, base: string): Promise<void> {
   const manifest: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
   if (!isRecord(manifest) || !isRecord(manifest.files)) throw new Error(`${manifestPath} has an invalid shape`);
+  for (const entry of await readdir(base, { withFileTypes: true })) {
+    if (entry.isDirectory() && /^(?:macos-(?:x64|arm64)|windows-x64)$/u.test(entry.name)) {
+      const inputs = await verifyQemuRuntime(resolve(base, entry.name), entry.name);
+      for (const path of dependencySourceFiles(await verifyDependencySources(resolve(base, entry.name), inputs))) {
+        if (manifest.files[`${entry.name}/${path}`] === undefined) throw new Error("native dependency source is not in the package index");
+      }
+      for (const [path, digest] of Object.entries(inputs)) {
+        if (manifest.files[`${entry.name}/${path}`] !== digest) throw new Error("QEMU runtime and native package identities differ");
+      }
+    }
+  }
   for (const [relativePath, expected] of Object.entries(manifest.files)) {
     if (relativePath.startsWith("/") || relativePath.split("/").includes("..")) {
       throw new Error(`${relativePath} is not a safe manifest path`);

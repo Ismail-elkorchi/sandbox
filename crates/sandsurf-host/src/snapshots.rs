@@ -68,7 +68,6 @@ struct SnapshotManifest {
     image_digest: Digest,
     source_generation: sandsurf_protocol::Counter,
     source_revision: sandsurf_protocol::Counter,
-    disk_container: DiskContainer,
     system_disk_digest: Digest,
     system_disk_bytes: sandsurf_protocol::Counter,
     consistency: SnapshotConsistency,
@@ -78,39 +77,10 @@ struct SnapshotManifest {
     boot: sandsurf_image::boot::FrozenBoot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum DiskContainer {
-    RawExt4,
-    Vhdx,
-}
-
-impl DiskContainer {
-    fn system_name(self) -> &'static str {
-        match self {
-            Self::RawExt4 => "system.ext4",
-            Self::Vhdx => "system.vhdx",
-        }
-    }
-
-    fn storage_format(self) -> Result<crate::storage::DiskFormat> {
-        match self {
-            Self::RawExt4 => Ok(crate::storage::DiskFormat::Raw),
-            #[cfg(target_os = "windows")]
-            Self::Vhdx => Ok(crate::storage::DiskFormat::Vhdx),
-            #[cfg(not(target_os = "windows"))]
-            Self::Vhdx => Err(SnapshotError::Invalid(
-                "VHDX storage requires the Windows host driver",
-            )),
-        }
-    }
-}
-
 pub struct CaptureResult {
     pub disk_digest: Digest,
     pub manifest_digest: Digest,
     pub full: Option<FullSnapshotMetadata>,
-    container: DiskContainer,
 }
 
 pub fn published_filesystem(root: &Path, snapshot: &Snapshot) -> Result<Option<CaptureResult>> {
@@ -145,15 +115,8 @@ pub fn capture_filesystem(
         object_name(snapshot.request.operation_id.as_str())
     ));
     private_directory(&stage)?;
-    let source_container = disk_container(source_disk)?;
-    let container = DiskContainer::RawExt4;
-    let disk = stage.join(container.system_name());
-    let disk_digest = capture_disk(
-        source_disk,
-        &disk,
-        snapshot.system_disk_bytes.get(),
-        source_container,
-    )?;
+    let disk = stage.join("system.ext4");
+    let disk_digest = copy_and_verify(source_disk, &disk, snapshot.system_disk_bytes.get(), None)?;
     let manifest = SnapshotManifest {
         format_version: 1,
         snapshot_id: snapshot.request.id.clone(),
@@ -161,7 +124,6 @@ pub fn capture_filesystem(
         image_digest: snapshot.image_digest.clone(),
         source_generation: snapshot.request.expected_generation,
         source_revision: snapshot.request.expected_revision,
-        disk_container: container,
         system_disk_digest: disk_digest.clone(),
         system_disk_bytes: snapshot.system_disk_bytes,
         consistency: SnapshotConsistency::Crash,
@@ -185,7 +147,6 @@ pub fn capture_filesystem(
         disk_digest,
         manifest_digest,
         full: None,
-        container,
     })
 }
 
@@ -225,8 +186,6 @@ pub fn capture_full(
         }
     }
     private_directory(root)?;
-    let source_container = disk_container(system_disk)?;
-    let container = DiskContainer::RawExt4;
     let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
         return verify_published(&final_directory, snapshot);
@@ -237,11 +196,11 @@ pub fn capture_full(
         object_name(snapshot.request.operation_id.as_str())
     ));
     private_directory(&stage)?;
-    let disk_digest = capture_disk(
+    let disk_digest = copy_and_verify(
         system_disk,
-        &stage.join(container.system_name()),
+        &stage.join("system.ext4"),
         snapshot.system_disk_bytes.get(),
-        source_container,
+        None,
     )?;
     let memory_bound = snapshot
         .resources
@@ -305,7 +264,6 @@ pub fn capture_full(
         image_digest: snapshot.image_digest.clone(),
         source_generation: snapshot.request.expected_generation,
         source_revision: snapshot.request.expected_revision,
-        disk_container: container,
         system_disk_digest: disk_digest.clone(),
         system_disk_bytes: snapshot.system_disk_bytes,
         consistency: SnapshotConsistency::Machine,
@@ -329,7 +287,6 @@ pub fn capture_full(
         disk_digest,
         manifest_digest,
         full: Some(full),
-        container,
     })
 }
 
@@ -344,13 +301,10 @@ pub fn materialize_fork(
         .as_ref()
         .ok_or(SnapshotError::Invalid("snapshot has no defaults disk"))?;
     let source = snapshot_disk(root, snapshot)?;
-    let source_container = published_container(root, snapshot)?;
-    let destination_container = disk_container(destination)?;
     let parent = destination
         .parent()
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
-    let format = destination_container.storage_format()?;
     #[derive(Serialize, Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct ForkReceipt {
@@ -359,51 +313,34 @@ pub fn materialize_fork(
         customized: Digest,
     }
     let receipt_path = destination.with_extension("fork.json");
-    crate::storage::publish_disk(
-        destination,
-        snapshot.system_disk_bytes.get(),
-        format,
-        |staged| {
-            materialize_disk(
-                &source,
-                staged,
-                snapshot.system_disk_bytes.get(),
-                expected,
-                source_container,
-                destination_container,
-            )
-            .map_err(io::Error::other)?;
-            if *profile != sandsurf_image::identity::CloneProfile::Preserve {
-                if destination_container != DiskContainer::RawExt4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "managed VHDX cloning requires an isolated helper",
-                    ));
-                }
-                sandsurf_image::identity::customize(staged, profile)?;
-            }
-            let customized = materialized_digest(
-                staged,
-                snapshot.system_disk_bytes.get(),
-                destination_container,
-            )
-            .map_err(io::Error::other)?;
-            let receipt = ForkReceipt {
-                source: expected.clone(),
-                profile: *profile,
-                customized,
-            };
-            let staged_receipt = receipt_path.with_extension("fork-building");
-            if staged_receipt.exists() {
-                fs::remove_file(&staged_receipt)?;
-            }
-            let mut file = sandsurf_native::local::create_private_file(&staged_receipt)?;
-            file.write_all(&serde_json::to_vec(&receipt).map_err(io::Error::other)?)?;
-            file.sync_all()?;
-            drop(file);
-            sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
-        },
-    )?;
+    crate::storage::publish_disk(destination, snapshot.system_disk_bytes.get(), |staged| {
+        copy_and_verify(
+            &source,
+            staged,
+            snapshot.system_disk_bytes.get(),
+            Some(expected),
+        )
+        .map_err(io::Error::other)?;
+        if *profile != sandsurf_image::identity::CloneProfile::Preserve {
+            sandsurf_image::identity::customize(staged, profile)?;
+        }
+        let customized =
+            file_digest(staged, snapshot.system_disk_bytes.get()).map_err(io::Error::other)?;
+        let receipt = ForkReceipt {
+            source: expected.clone(),
+            profile: *profile,
+            customized,
+        };
+        let staged_receipt = receipt_path.with_extension("fork-building");
+        if staged_receipt.exists() {
+            fs::remove_file(&staged_receipt)?;
+        }
+        let mut file = sandsurf_native::local::create_private_file(&staged_receipt)?;
+        file.write_all(&serde_json::to_vec(&receipt).map_err(io::Error::other)?)?;
+        file.sync_all()?;
+        drop(file);
+        sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
+    })?;
     let mut receipt_bytes = Vec::new();
     sandsurf_native::local::open_private_file(
         &receipt_path,
@@ -420,12 +357,7 @@ pub fn materialize_fork(
             "fork customization contract changed",
         ));
     }
-    if materialized_digest(
-        destination,
-        snapshot.system_disk_bytes.get(),
-        destination_container,
-    )? != receipt.customized
-    {
+    if file_digest(destination, snapshot.system_disk_bytes.get())? != receipt.customized {
         return Err(SnapshotError::Invalid(
             "fork destination contains different state",
         ));
@@ -446,13 +378,6 @@ pub fn materialize_image_template(
         .as_ref()
         .ok_or(SnapshotError::Invalid("snapshot has no defaults disk"))?;
     let source = snapshot_disk(root, snapshot)?;
-    if disk_container(destination)? != DiskContainer::RawExt4
-        || published_container(root, snapshot)? != DiskContainer::RawExt4
-    {
-        return Err(SnapshotError::Invalid(
-            "derived image requires a raw ext4 snapshot",
-        ));
-    }
     copy_and_verify(
         &source,
         destination,
@@ -473,8 +398,6 @@ pub fn rollback(
         .as_ref()
         .ok_or(SnapshotError::Invalid("snapshot has no defaults disk"))?;
     let source = snapshot_disk(root, snapshot)?;
-    let source_container = published_container(root, snapshot)?;
-    let target_container = disk_container(target)?;
     let parent = target
         .parent()
         .ok_or(SnapshotError::Invalid("rollback target has no parent"))?;
@@ -483,26 +406,20 @@ pub fn rollback(
         target,
         operation,
         snapshot.system_disk_bytes.get(),
-        target_container.storage_format()?,
         |staged| {
-            materialize_disk(
+            copy_and_verify(
                 &source,
                 staged,
                 snapshot.system_disk_bytes.get(),
-                expected,
-                source_container,
-                target_container,
+                Some(expected),
             )
+            .map(|_| ())
             .map_err(io::Error::other)
         },
         |candidate| {
-            materialized_digest(
-                candidate,
-                snapshot.system_disk_bytes.get(),
-                target_container,
-            )
-            .map(|actual| actual == *expected)
-            .map_err(io::Error::other)
+            file_digest(candidate, snapshot.system_disk_bytes.get())
+                .map(|actual| actual == *expected)
+                .map_err(io::Error::other)
         },
     )?;
     rollback_evidence(snapshot, operation)
@@ -518,15 +435,7 @@ fn snapshot_disk(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
             "published snapshot disagrees with its catalog record",
         ));
     }
-    Ok(directory.join(verified.container.system_name()))
-}
-
-fn published_container(root: &Path, snapshot: &Snapshot) -> Result<DiskContainer> {
-    Ok(verify_published(
-        &root.join(object_name(snapshot.request.id.as_str())),
-        snapshot,
-    )?
-    .container)
+    Ok(directory.join("system.ext4"))
 }
 
 fn capture_boot(
@@ -578,7 +487,7 @@ fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResu
         ));
     }
     let actual = file_digest(
-        &directory.join(manifest.disk_container.system_name()),
+        &directory.join("system.ext4"),
         manifest.system_disk_bytes.get(),
     )?;
     if actual != manifest.system_disk_digest {
@@ -613,7 +522,6 @@ fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResu
         disk_digest: actual,
         manifest_digest: digest(Domain::Snapshot, &manifest)?,
         full: manifest.full,
-        container: manifest.disk_container,
     })
 }
 
@@ -627,113 +535,6 @@ fn rollback_evidence(snapshot: &Snapshot, operation: &OperationId) -> Result<Dig
             operation,
         ),
     )?)
-}
-
-fn capture_disk(
-    source: &Path,
-    destination: &Path,
-    bytes: u64,
-    source_container: DiskContainer,
-) -> Result<Digest> {
-    match source_container {
-        DiskContainer::RawExt4 => copy_and_verify(source, destination, bytes, None),
-        DiskContainer::Vhdx => {
-            #[cfg(target_os = "windows")]
-            {
-                sandsurf_native::virtual_disk::export_raw(source, destination, bytes)?;
-                file_digest(destination, bytes)
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = (source, destination, bytes);
-                Err(SnapshotError::Invalid(
-                    "VHDX capture requires the Windows host driver",
-                ))
-            }
-        }
-    }
-}
-
-fn materialize_disk(
-    source: &Path,
-    destination: &Path,
-    bytes: u64,
-    expected: &Digest,
-    source_container: DiskContainer,
-    destination_container: DiskContainer,
-) -> Result<()> {
-    match (source_container, destination_container) {
-        (DiskContainer::RawExt4, DiskContainer::RawExt4) => {
-            copy_and_verify(source, destination, bytes, Some(expected))?;
-        }
-        (DiskContainer::RawExt4, DiskContainer::Vhdx) => {
-            #[cfg(target_os = "windows")]
-            {
-                if file_digest(source, bytes)? != *expected {
-                    return Err(SnapshotError::Invalid(
-                        "snapshot source does not match its committed digest",
-                    ));
-                }
-                sandsurf_native::virtual_disk::import_raw(source, destination, bytes)?;
-                if materialized_digest(destination, bytes, DiskContainer::Vhdx)? != *expected {
-                    return Err(SnapshotError::Invalid(
-                        "converted VHDX does not match the snapshot",
-                    ));
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = (source, destination, bytes, expected);
-                return Err(SnapshotError::Invalid(
-                    "VHDX materialization requires the Windows host driver",
-                ));
-            }
-        }
-        _ => {
-            return Err(SnapshotError::Invalid(
-                "snapshot container conversion is unsupported",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn materialized_digest(path: &Path, bytes: u64, container: DiskContainer) -> Result<Digest> {
-    match container {
-        DiskContainer::RawExt4 => file_digest(path, bytes),
-        DiskContainer::Vhdx => {
-            #[cfg(target_os = "windows")]
-            {
-                let parent = path.parent().ok_or(SnapshotError::Invalid(
-                    "VHDX verification path has no parent",
-                ))?;
-                let verification = parent.join(format!(
-                    ".{}.verification.ext4",
-                    path.file_name()
-                        .and_then(|value| value.to_str())
-                        .ok_or(SnapshotError::Invalid("VHDX name is invalid"))?
-                ));
-                let exported = (|| {
-                    sandsurf_native::virtual_disk::export_raw(path, &verification, bytes)?;
-                    file_digest(&verification, bytes)
-                })();
-                let cleanup = remove_file_if_present(&verification);
-                exported.and_then(|digest| cleanup.map(|()| digest))
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = (path, bytes);
-                Err(SnapshotError::Invalid(
-                    "VHDX verification requires the Windows host driver",
-                ))
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn current_disk_digest(path: &Path, bytes: u64) -> Result<Digest> {
-    materialized_digest(path, bytes, disk_container(path)?)
 }
 
 pub(crate) fn copy_and_verify(
@@ -827,16 +628,6 @@ fn open_write(path: &Path) -> io::Result<File> {
     }
 }
 
-fn disk_container(path: &Path) -> Result<DiskContainer> {
-    match path.extension().and_then(|value| value.to_str()) {
-        Some("ext4") | Some("raw") => Ok(DiskContainer::RawExt4),
-        Some("vhdx") => Ok(DiskContainer::Vhdx),
-        _ => Err(SnapshotError::Invalid(
-            "snapshot disk container is unsupported",
-        )),
-    }
-}
-
 fn remove_stage(stage: &Path) -> Result<()> {
     if stage.join("boot").exists() {
         fs::remove_dir_all(stage.join("boot"))?;
@@ -844,7 +635,6 @@ fn remove_stage(stage: &Path) -> Result<()> {
     for name in [
         "manifest.json",
         "system.ext4",
-        "system.vhdx",
         "snapshot.vmstate",
         "memory",
         "reconnect.json",
@@ -971,7 +761,7 @@ mod tests {
             "system": { "rootfs": { "path": "system.ext4", "sha256": bytes_digest(b"seed"), "format": "ext4" },
                 "cloneProfile": { "kind": "preserve" }, "defaults": { "environment": {}, "user": null, "workingDirectory": null },
                 "provenance": { "kind": "source-built", "sourceDigest": "a".repeat(64), "materials": { "fixture": "b".repeat(64) } } },
-            "platformArtifacts": { "windowsX64": null }, "signature": null
+            "signature": null
         });
         (serde_json::to_vec(&manifest).unwrap(), kernel)
     }
@@ -1239,7 +1029,7 @@ mod tests {
         let target_directory = temp.0.join("target");
         private_directory(&target_directory).unwrap();
         let target = target_directory.join("system.ext4");
-        crate::storage::publish_disk(&target, 4096, crate::storage::DiskFormat::Raw, |staged| {
+        crate::storage::publish_disk(&target, 4096, |staged| {
             open_write(staged)?.write_all(&vec![9_u8; 4096])
         })
         .unwrap();

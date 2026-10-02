@@ -54,7 +54,11 @@ fn n(value: u64) -> Counter {
     value.try_into().unwrap()
 }
 
-fn exercise(measured: MachineState, reset: bool) -> (MachineObservation, usize) {
+fn exercise(
+    prior: MachineState,
+    measured: MachineState,
+    reset: bool,
+) -> (MachineObservation, usize) {
     let root = std::env::temp_dir().join(format!(
         "sandsurf-native-power-{}-{}",
         std::process::id(),
@@ -72,7 +76,11 @@ fn exercise(measured: MachineState, reset: bool) -> (MachineObservation, usize) 
             operations: n(32),
             usage_records: n(32),
             image_bytes: n(1024 * 1024),
-            resources: RuntimeConfiguration::default().resources,
+            cpu_quota_micros: RuntimeConfiguration::default().resources.cpu_quota_micros,
+            host_memory_bytes: RuntimeConfiguration::default()
+                .resources
+                .host_memory_bytes()
+                .unwrap(),
         },
     )
     .unwrap();
@@ -112,6 +120,19 @@ fn exercise(measured: MachineState, reset: bool) -> (MachineObservation, usize) 
             ..initial
         })
         .unwrap();
+    if prior == MachineState::Paused {
+        journal
+            .observe(MachineObservation {
+                machine_id: machine_id.clone(),
+                generation: Counter::ONE,
+                sequence: n(3),
+                state: prior,
+                applied_revision: Counter::ONE,
+                cause: ObservationCause::Native {},
+                evidence_digest: bytes_digest(b"fixture-paused"),
+            })
+            .unwrap();
+    }
     let recovered = Arc::new(AtomicUsize::new(0));
     let mut guardian = Guardian::new(
         journal,
@@ -137,7 +158,7 @@ fn exercise(measured: MachineState, reset: bool) -> (MachineObservation, usize) 
             bytes: vec![b'x'],
         },
     });
-    if reset && measured == MachineState::Stopped {
+    if reset && measured == MachineState::Stopped && prior == MachineState::Running {
         assert!(
             matches!(stale, GuardianResponse::Rejected { category, .. } if category == "stale-generation")
         );
@@ -151,7 +172,7 @@ fn exercise(measured: MachineState, reset: bool) -> (MachineObservation, usize) 
 
 #[test]
 fn distinct_native_reset_advances_generation_and_fences_old_console_input() {
-    let (observation, count) = exercise(MachineState::Stopped, true);
+    let (observation, count) = exercise(MachineState::Running, MachineState::Stopped, true);
     assert_eq!(count, 1);
     assert_eq!(observation.generation.get(), 2);
     assert_eq!(observation.state, MachineState::Running);
@@ -165,16 +186,24 @@ fn native_exit_and_management_loss_never_authorize_reboot() {
         MachineState::Stopped,
         MachineState::Failed,
     ] {
-        let (observation, count) = exercise(state, false);
+        let (observation, count) = exercise(MachineState::Running, state, false);
         assert_eq!(count, 0);
         assert_eq!(observation.generation, Counter::ONE);
         assert_eq!(observation.state, state);
     }
-    let (observation, count) = exercise(MachineState::Failed, true);
+    let (observation, count) = exercise(MachineState::Running, MachineState::Failed, true);
     assert_eq!(
         count, 0,
         "a crash cannot be recovered even with a reset witness"
     );
     assert_eq!(observation.state, MachineState::Failed);
+    assert_eq!(observation.generation, Counter::ONE);
+}
+
+#[test]
+fn reset_racing_with_host_pause_cannot_authorize_running() {
+    let (observation, count) = exercise(MachineState::Paused, MachineState::Stopped, true);
+    assert_eq!(count, 0);
+    assert_eq!(observation.state, MachineState::Stopped);
     assert_eq!(observation.generation, Counter::ONE);
 }

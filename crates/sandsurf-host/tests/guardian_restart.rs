@@ -52,6 +52,30 @@ impl Drop for ChildGuard {
     }
 }
 
+fn open_events(
+    endpoint: &Path,
+    machine_id: MachineId,
+    after: Counter,
+    maximum: u16,
+) -> sandsurf_host::guardian::Result<ObservationStream> {
+    ObservationStream::open(
+        endpoint,
+        GuardianRequest::SubscribeEvents {
+            machine_id,
+            after,
+            maximum,
+        },
+    )
+}
+fn read_events(
+    stream: &mut ObservationStream,
+) -> sandsurf_host::guardian::Result<RuntimeEventPage> {
+    match stream.read_page()? {
+        RuntimeResponse::Events { page } => Ok(page),
+        _ => panic!("expected event observation"),
+    }
+}
+
 fn n(value: u64) -> Counter {
     value.try_into().unwrap()
 }
@@ -68,8 +92,8 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(64),
         usage_records: n(64),
         image_bytes: n(400_000),
-        resources: Resources::from_geometry(n(8), n(8192), n(400_000), n(4000), n(32))
-            .expect("static resource envelope"),
+        cpu_quota_micros: n(800_000),
+        host_memory_bytes: n(9 * 1024 * 1024 * 1024),
     }
 }
 fn runtime_limits() -> RuntimeLimits {
@@ -962,24 +986,21 @@ fn journal_stream_resumes_after_owner_restart_and_never_blocks_control() {
     let mut child = spawn();
     drop(wait_for_guardian(&endpoint));
     let client = GuardianClient::new(endpoint.clone());
-    let mut stream =
-        EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
-    let first = stream.read_page().unwrap();
+    let mut stream = open_events(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+    let first = read_events(&mut stream).unwrap();
     assert_eq!(first.cursor, Counter::ONE);
     assert_eq!(first.events.len(), 1);
     // No next credit: a stalled observer cannot hold the journal or VM owner.
     client.inspect(fixture.machine.clone(), None).unwrap();
     drop(stream);
-    let mut resumed =
-        EventStream::open(&endpoint, fixture.machine.clone(), first.cursor, 256).unwrap();
-    let history = resumed.read_page().unwrap();
+    let mut resumed = open_events(&endpoint, fixture.machine.clone(), first.cursor, 256).unwrap();
+    let history = read_events(&mut resumed).unwrap();
     assert_eq!(history.events.first().unwrap().cursor, n(2));
     assert_eq!(history.cursor, history.available);
     drop(resumed);
 
-    let mut idle =
-        EventStream::open(&endpoint, fixture.machine.clone(), history.available, 256).unwrap();
-    idle.read_page().unwrap();
+    let mut idle = open_events(&endpoint, fixture.machine.clone(), history.available, 256).unwrap();
+    read_events(&mut idle).unwrap();
     // The management poll can append independent observations concurrently.
     fs::write(
         fixture.root.0.join("native-power"),
@@ -988,7 +1009,7 @@ fn journal_stream_resumes_after_owner_restart_and_never_blocks_control() {
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     let (measured, cursor) = loop {
-        let page = idle.read_page().unwrap();
+        let page = read_events(&mut idle).unwrap();
         let cursor = page.cursor;
         if let Some(event) = page.events.into_iter().find(|event| matches!(
             &event.value, RuntimeEventValue::Machine { observation }
@@ -1004,19 +1025,18 @@ fn journal_stream_resumes_after_owner_restart_and_never_blocks_control() {
     child.0.wait().unwrap();
     let _restarted = spawn();
     drop(wait_for_guardian(&endpoint));
-    let mut replay =
-        EventStream::open(&endpoint, fixture.machine.clone(), measured.cursor, 256).unwrap();
-    let after = replay.read_page().unwrap();
+    let mut replay = open_events(&endpoint, fixture.machine.clone(), measured.cursor, 256).unwrap();
+    let after = read_events(&mut replay).unwrap();
     assert!(after.cursor >= cursor);
     drop(replay);
-    let mut replay = EventStream::open(
+    let mut replay = open_events(
         &endpoint,
         fixture.machine.clone(),
         n(measured.cursor.get() - 1),
         1,
     )
     .unwrap();
-    assert_eq!(replay.read_page().unwrap().events, vec![measured]);
+    assert_eq!(read_events(&mut replay).unwrap().events, vec![measured]);
 }
 
 #[test]
@@ -1038,15 +1058,14 @@ fn journal_stream_capacity_preserves_non_streaming_control_connections() {
     let streams = (0..8)
         .map(|_| {
             let mut stream =
-                EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
-            stream.read_page().unwrap();
+                open_events(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+            read_events(&mut stream).unwrap();
             stream
         })
         .collect::<Vec<_>>();
-    let mut denied =
-        EventStream::open(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
+    let mut denied = open_events(&endpoint, fixture.machine.clone(), Counter::ZERO, 1).unwrap();
     assert!(
-        matches!(denied.read_page(), Err(sandsurf_host::guardian::Error::Rejected { category, .. }) if category == "capacity")
+        matches!(read_events(&mut denied), Err(sandsurf_host::guardian::Error::Rejected { category, .. }) if category == "capacity")
     );
     GuardianClient::new(endpoint)
         .inspect(fixture.machine.clone(), None)

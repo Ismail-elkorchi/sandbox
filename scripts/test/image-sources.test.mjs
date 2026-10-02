@@ -14,19 +14,18 @@ async function fixture(context) {
   const roots = { images: join(root, "images"), sources: join(root, "sources") };
   const directory = join(roots.images, "development-x64");
   await mkdir(directory, { recursive: true });
-  const disks = { "system.ext4": Buffer.from("raw disk"), "system.vhdx": Buffer.from("Windows disk") };
+  const disks = { "system.ext4": Buffer.from("raw disk") };
   for (const [name, bytes] of Object.entries(disks)) await writeFile(join(directory, name), bytes);
   const manifest = {
     formatVersion: 1, architecture: "x64", bootBundle: {},
     system: { rootfs: { path: "system.ext4", sha256: digest(disks["system.ext4"]) } },
-    platformArtifacts: { windowsX64: { system: { path: "system.vhdx", sha256: digest(disks["system.vhdx"]) } } },
   };
   await writeFile(join(directory, "manifest.json"), JSON.stringify(manifest));
   await writeImageIndex(roots.images, ["x64"]);
   return { roots, directory, disks, manifest };
 }
 
-test("ext4 and VHDX sources hydrate to complete digest-verified readonly bytes", async (context) => {
+test("Machine disk sources hydrate to complete digest-verified readonly bytes", async (context) => {
   const f = await fixture(context);
   await packImageSources("x64", f.roots);
   for (const name of Object.keys(f.disks)) {
@@ -83,30 +82,29 @@ test("hydration rejects a changed manifest before interpreting disk paths", asyn
   await assert.rejects(hydrateImageSources(f.roots), /differs from the image index/u);
 });
 
-test("image compression rejects platform disk traversal and mislabeled formats", async (context) => {
+test("image compression rejects machine disk traversal and mislabeled formats", async (context) => {
   const f = await fixture(context);
-  for (const path of ["../system.vhdx", "system.ext4"]) {
-    f.manifest.platformArtifacts.windowsX64.system.path = path;
+  for (const path of ["../system.ext4", "system.img"]) {
+    f.manifest.system.rootfs.path = path;
     await writeFile(join(f.directory, "manifest.json"), JSON.stringify(f.manifest));
-    await assert.rejects(packImageSources("x64", f.roots), /invalid vhdx artifact identity/u);
+    await assert.rejects(packImageSources("x64", f.roots), /invalid ext4 artifact identity/u);
   }
 });
 
-test("corrupt compressed VHDX never publishes unverified bytes", async (context) => {
+test("corrupt compressed machine disk never publishes unverified bytes", async (context) => {
   const f = await fixture(context);
   await packImageSources("x64", f.roots);
-  await rm(join(f.directory, "system.vhdx"));
-  await writeFile(join(f.roots.sources, "development-x64/system.vhdx.gz"), "not gzip");
+  await rm(join(f.directory, "system.ext4"));
+  await writeFile(join(f.roots.sources, "development-x64/system.ext4.gz"), "not gzip");
   await assert.rejects(hydrateImageSources(f.roots));
-  await assert.rejects(stat(join(f.directory, "system.vhdx")), { code: "ENOENT" });
-  assert.deepEqual(await readFile(join(f.directory, "system.ext4")), f.disks["system.ext4"]);
+  await assert.rejects(stat(join(f.directory, "system.ext4")), { code: "ENOENT" });
 });
 
 test("hydration refuses corrupt existing disk data rather than replacing it", async (context) => {
   const f = await fixture(context);
   await packImageSources("x64", f.roots);
-  await chmod(join(f.directory, "system.vhdx"), 0o600);
-  await writeFile(join(f.directory, "system.vhdx"), "changed");
+  await chmod(join(f.directory, "system.ext4"), 0o600);
+  await writeFile(join(f.directory, "system.ext4"), "changed");
   await assert.rejects(hydrateImageSources(f.roots), /differs from its image manifest/u);
-  assert.equal(await readFile(join(f.directory, "system.vhdx"), "utf8"), "changed");
+  assert.equal(await readFile(join(f.directory, "system.ext4"), "utf8"), "changed");
 });

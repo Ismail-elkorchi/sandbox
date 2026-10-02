@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use sandsurf_protocol::{Counter, Resources};
+use sandsurf_protocol::Counter;
 use sandsurf_state::{CatalogLimits, HostCatalog};
 use std::fs;
 
@@ -17,8 +17,8 @@ fn windows_private_state_is_owner_only_reopenable_and_writer_exclusive() {
             operations: one,
             usage_records: one,
             image_bytes: one,
-            resources: Resources::from_geometry(one, one, one, one, one)
-                .expect("static resource envelope"),
+            cpu_quota_micros: one,
+            host_memory_bytes: one,
         },
     )
     .unwrap();

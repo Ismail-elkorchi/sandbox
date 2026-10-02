@@ -1,5 +1,6 @@
 //! Durable native serial capture, independent of guest management. The host
 //! reserves a bounded prefix and explicitly reports every observed excess byte.
+use crate::guardian::observation_stream::ObservationSignal;
 use crate::guardian::{Error, Result};
 use sandsurf_machine::NativeConsole;
 use sandsurf_protocol::{
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Independent of execution output: at most 32 MiB plus 64 small manifests.
@@ -28,6 +30,7 @@ struct Attachment {
     input: Box<dyn Write + Send>,
 }
 pub(crate) struct ConsoleStore {
+    pub(crate) notifications: Arc<ObservationSignal>,
     root: PathBuf,
     attachment: Option<Attachment>,
     input_budget: Budget,
@@ -52,9 +55,10 @@ impl Budget {
             self.remaining = self.capacity;
         }
         if bytes > self.remaining {
-            return Err(Error::Unsupported(
-                "native console host stream budget exhausted",
-            ));
+            return Err(Error::Rejected {
+                category: "capacity".into(),
+                message: "native console host stream budget exhausted".into(),
+            });
         }
         self.remaining -= bytes;
         Ok(())
@@ -63,6 +67,7 @@ impl Budget {
 impl ConsoleStore {
     pub fn new(root: &Path) -> Self {
         Self {
+            notifications: Arc::new(ObservationSignal::new(Counter::ZERO)),
             root: root.join("console"),
             attachment: None,
             input_budget: Budget::new(32 * 1024),
@@ -77,10 +82,11 @@ impl ConsoleStore {
         let reservation = self.reserve(generation);
         match reservation {
             Ok((base, data, boundary)) => {
+                let notifications = Arc::clone(&self.notifications);
                 std::thread::Builder::new()
                     .name("sandsurf-native-console".into())
                     .spawn(move || {
-                        capture(output, data, base, boundary);
+                        capture(output, data, base, boundary, &notifications);
                     })?;
                 Ok(())
             }
@@ -127,6 +133,7 @@ impl ConsoleStore {
     }
     pub fn detach(&mut self) {
         self.attachment = None;
+        self.notifications.notify();
     }
     pub fn write(&mut self, generation: Counter, bytes: &[u8]) -> Result<u32> {
         if bytes.is_empty() || bytes.len() > MAX_CONSOLE_INPUT_BYTES {
@@ -240,7 +247,13 @@ fn publish(base: &Path, boundary: &Boundary) -> Result<()> {
     sandsurf_native::storage::replace_journal_file(&temporary, &base.with_extension("json"))?;
     Ok(())
 }
-fn capture(mut input: Box<dyn Read + Send>, mut data: File, base: PathBuf, mut boundary: Boundary) {
+fn capture(
+    mut input: Box<dyn Read + Send>,
+    mut data: File,
+    base: PathBuf,
+    mut boundary: Boundary,
+    notifications: &ObservationSignal,
+) {
     let mut buffer = [0; 16 * 1024];
     let mut published = Instant::now();
     let result = (|| -> Result<()> {
@@ -267,16 +280,20 @@ fn capture(mut input: Box<dyn Read + Send>, mut data: File, base: PathBuf, mut b
             // A full prefix admits only one durable loss update per second.
             if retained != 0 || published.elapsed() >= Duration::from_secs(1) {
                 publish(&base, &boundary)?;
+                notifications.notify();
                 published = Instant::now();
             }
         }
-        publish(&base, &boundary)
+        publish(&base, &boundary)?;
+        notifications.notify();
+        Ok(())
     })();
     if result.is_err() {
         boundary.capture_failed = true;
         boundary.open = false;
         let _ = fs::remove_file(base.with_extension("pending"));
         let _ = publish(&base, &boundary);
+        notifications.notify();
         // Archive failure never blocks native control behind serial output.
         let _ = std::io::copy(&mut input, &mut std::io::sink());
     }
@@ -311,6 +328,7 @@ mod tests {
                 open: true,
                 capture_failed: false,
             },
+            &ObservationSignal::new(Counter::ZERO),
         );
         let mut store = ConsoleStore::new(root.parent().unwrap());
         store.root = root.clone();

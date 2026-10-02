@@ -11,7 +11,7 @@ import { Operation } from "./operations.js";
 import { MachineResources } from "./resources.js";
 import { sandsurfDigest } from "./sandsurf-protocol.js";
 import type { Sandsurf } from "./sandsurf.js";
-import { authorize, digest, dispatchGuest, identity, observe, observed, protocol, queryGuest, subscribe, transport, validateIdentity } from "./sdk-internal.js";
+import { authorize, digest, dispatchGuest, identity, observe, observed, protocol, queryGuest, subscribe, subscribeConsole, transport, validateIdentity } from "./sdk-internal.js";
 import { MachineSecrets } from "./secrets.js";
 
 export class SnapshotCollection {
@@ -141,6 +141,7 @@ export class Machine {
   }
   async [transport](request: Readonly<Record<string, unknown>>): Promise<Record<string, unknown>> { return this.#host[transport](request); }
   [subscribe](after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { return this.#host[subscribe](this.id, after, maximum, signal); }
+  [subscribeConsole](generation: number, after: number, maximum: number, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>, void> { return this.#host[subscribeConsole](this.id, generation, after, maximum, signal); }
   async [authorize](change: AuthorityChange): Promise<string> { return this.#host[authorize](change); }
   async #lifecycle(desired: DesiredMachineState, options: MachineLifecycleOptions): Promise<MachineInspection> {
     const operationId = validateIdentity(options.operationId ?? identity(desired)); const expectedRevision = await resolveRevisionPrecondition(this, options.expectedRevision); const approvalId = await this.#host[authorize]({ kind: "lifecycle", machineId: this.id, operationId, request: { desired, expectedRevision } });
@@ -167,16 +168,20 @@ export class NativeConsole {
   readonly generation: number;
   readonly #machine: Machine;
   #detached = false;
+  readonly #detach = new AbortController();
   constructor(machine: Machine, generation: number) {
     this.#machine = machine; this.generation = expectedCounter(generation, "console generation")!;
   }
   /** Detach only this SDK handle. The VM and guardian capture continue. */
-  detach(): void { this.#detached = true; }
+  detach(): void { this.#detached = true; this.#detach.abort(new SandsurfHostError("detached", "Native console handle is detached")); }
   async read(options: { readonly after?: number; readonly maximum?: number } = {}): Promise<ConsolePage> {
     this.#attached();
     const after = integer(options.after ?? 0); const maximum = integer(options.maximum ?? 64 * 1024);
     if (maximum < 1 || maximum > 64 * 1024) throw new RangeError("console page must be 1..65536 bytes");
     const response = runtimeResponse(await this.#machine[transport]({ kind: "read-console", machineId: this.#machine.id, generation: this.generation, after, maximum }));
+    return this.#page(response, after, maximum);
+  }
+  #page(response: Readonly<Record<string, unknown>>, after: number, maximum: number): ConsolePage {
     if (response.kind !== "console" || !record(response.page)) throw protocol("native console response");
     const page = response.page;
     const cursor = integer(page.cursor); const available = integer(page.available);
@@ -199,17 +204,20 @@ export class NativeConsole {
     if (accepted > bytes.byteLength) throw protocol("native console accepted prefix");
     return accepted;
   }
-  /** Poll bounded durable pages. Each generation reserves a 512 KiB prefix;
+  /** Follow credit-driven durable pages. Each generation reserves a 512 KiB prefix;
    * excess output advances the cursor with explicit loss. The guardian admits
    * 64 archived generations, 1 MiB/s of reads and 32 KiB/s of input per computer. */
   async *follow(options: { readonly after?: number; readonly maximum?: number; readonly signal?: AbortSignal } = {}): AsyncGenerator<ConsolePage, void> {
+    this.#attached();
     let after = integer(options.after ?? 0);
-    while (!this.#detached && !options.signal?.aborted) {
-      const page = await this.read({ after, ...(options.maximum === undefined ? {} : { maximum: options.maximum }) });
+    const maximum = integer(options.maximum ?? 64 * 1024);
+    if (maximum < 1 || maximum > 64 * 1024) throw new RangeError("console page must be 1..65536 bytes");
+    const signal = options.signal === undefined ? this.#detach.signal : AbortSignal.any([options.signal, this.#detach.signal]);
+    for await (const response of this.#machine[subscribeConsole](this.generation, after, maximum, signal)) {
+      const page = this.#page(runtimeResponse(response), after, maximum);
       if (page.bytes.byteLength !== 0 || page.loss !== null || !page.open || page.captureFailed) yield page;
       after = page.cursor;
-      if (!page.open || page.captureFailed) return;
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      if ((!page.open || page.captureFailed) && after === page.available) return;
     }
   }
   #attached(): void { if (this.#detached) throw new SandsurfHostError("detached", "Native console handle is detached"); }

@@ -20,7 +20,10 @@ pub struct ResourceCapabilities {
     pub complete_enforcement: sandsurf_protocol::Capability,
 }
 
-pub fn capabilities(root: &std::path::Path) -> ResourceCapabilities {
+pub fn capabilities(
+    root: &std::path::Path,
+    network_egress: &sandsurf_protocol::Capability,
+) -> ResourceCapabilities {
     use sandsurf_protocol::{Capability, Qualification};
     let implemented = || {
         Capability::Supported { qualification: Qualification::Unqualified {
@@ -39,16 +42,12 @@ pub fn capabilities(root: &std::path::Path) -> ResourceCapabilities {
     };
     ResourceCapabilities {
         native_topology: implemented(),
-        cpu_time: linux("no external CPU scheduling implementation for this adapter"),
-        aggregate_host_memory: linux(
-            "no aggregate guardian/VMM/worker memory implementation for this adapter",
-        ),
+        cpu_time: implemented(),
+        aggregate_host_memory: implemented(),
         managed_admission: implemented(),
         output_retention: implemented(),
         storage_reservations: implemented(),
-        network_envelope: linux(
-            "native network resource enforcement is unavailable for this adapter",
-        ),
+        network_envelope: implemented(),
         aggregate_physical_storage: match sandsurf_native::volume::inspect(root) {
             Ok(_) => implemented(),
             Err(error) => unsupported(&error.to_string()),
@@ -58,11 +57,12 @@ pub fn capabilities(root: &std::path::Path) -> ResourceCapabilities {
         ),
         complete_enforcement: if cfg!(target_os = "linux")
             && sandsurf_native::volume::inspect(root).is_ok()
+            && matches!(network_egress, Capability::Supported { .. })
         {
             implemented()
         } else {
             unsupported(
-                "complete enforcement requires operator-provisioned bounded host and machine volumes and Linux native resource mechanisms",
+                "complete enforcement requires bounded host/machine volumes, Linux native resource mechanisms, and the installed kernel socket boundary",
             )
         },
     }
@@ -87,17 +87,6 @@ pub fn require_machine_storage(
         ));
     }
     Ok(())
-}
-
-pub fn require_external_support(adapter: &str) -> std::io::Result<()> {
-    if adapter == "linux" {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "complete external CPU and host-overhead enforcement is unavailable for this adapter; refusing an unenforced resource envelope",
-        ))
-    }
 }
 
 /// The native gateway currently has fixed, stricter bounds. Requested envelopes
@@ -134,12 +123,6 @@ pub fn assess(
     }
     if let Err(error) = require_network_capacity(requested) {
         return result(ResourceChangeMode::Unsupported, &error.to_string());
-    }
-    if !cfg!(target_os = "linux") {
-        return result(
-            ResourceChangeMode::Unsupported,
-            "this adapter has no complete external CPU/host-memory resource mechanism",
-        );
     }
     if requested.disk_bytes != applied.disk_bytes {
         return result(

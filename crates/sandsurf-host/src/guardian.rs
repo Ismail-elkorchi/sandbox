@@ -10,10 +10,10 @@
 use sandsurf_protocol::*;
 use sandsurf_state::{DispatchDecision, HostCatalog, RuntimeJournal};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[path = "event_stream.rs"]
-mod event_stream;
+#[path = "observation_stream.rs"]
+pub(crate) mod observation_stream;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub use event_stream::EventStream;
+pub use observation_stream::ObservationStream;
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -190,6 +190,49 @@ pub trait GuestDriver: Send {
     }
     fn query(&mut self, _request: GuestServiceRequest) -> Result<GuestServiceResponse> {
         Err(Error::Unsupported("guest query is not implemented"))
+    }
+}
+
+/// Restart only within the already applied envelope and the durably committed
+/// reset generation. Guest reset cannot acquire new host lifecycle authority.
+pub(crate) fn restart_after_native_reset<E: GuardianEffect>(
+    effect: &mut E,
+    current: &MachineObservation,
+    configuration: sandsurf_protocol::RuntimeConfiguration,
+) -> Result<Digest> {
+    if current.state != MachineState::Starting || current.generation.get() < 2 {
+        return Err(Error::Protocol(
+            "native reset has no committed generation fence",
+        ));
+    }
+    let command = LifecycleCommand {
+        machine_id: current.machine_id.clone(),
+        operation_id: OperationId::try_from(format!("native-reset-{}", current.generation.get()))
+            .map_err(|_| Error::Protocol("reset identity overflow"))?,
+        desired: sandsurf_protocol::DesiredState::Running,
+        revision: current.applied_revision,
+        request_digest: current.evidence_digest.clone(),
+        configuration,
+    };
+    let previous = MachineObservation {
+        generation: Counter::try_from(current.generation.get() - 1)
+            .map_err(|_| Error::Protocol("reset generation invalid"))?,
+        state: MachineState::Stopped,
+        ..current.clone()
+    };
+    match effect.transition(&command, Some(&previous)) {
+        LifecycleEffect::Observed(values)
+            if values.last().is_some_and(|value| {
+                value.generation == current.generation && value.state == MachineState::Running
+            }) =>
+        {
+            Ok(values
+                .last()
+                .expect("checked reset observation")
+                .evidence_digest
+                .clone())
+        }
+        _ => Err(Error::Protocol("native guest reset recovery failed")),
     }
 }
 
@@ -657,7 +700,7 @@ impl<E: GuardianEffect> Guardian<E> {
             }
         }
         if measured.state == MachineState::Stopped
-            && matches!(current.state, MachineState::Running | MachineState::Paused)
+            && current.state == MachineState::Running
             && let Some(evidence) = reset
         {
             let stopped = self
@@ -1176,9 +1219,11 @@ impl<E: GuardianEffect> Guardian<E> {
                 };
                 Ok(GuardianResponse::Runtime { response })
             }
-            GuardianRequest::SubscribeEvents { .. } => Err(Error::Protocol(
-                "event subscriptions require a streaming connection",
-            )),
+            GuardianRequest::SubscribeEvents { .. } | GuardianRequest::SubscribeConsole { .. } => {
+                Err(Error::Protocol(
+                    "event subscriptions require a streaming connection",
+                ))
+            }
         }
     }
 
@@ -1675,9 +1720,8 @@ pub fn serve_guardian<E: GuardianEffect>(
                 value.channels.get().min(MAX_GUARDIAN_CONNECTIONS as u64) as usize
             }),
     ));
-    let events = Arc::new(event_stream::EventSignal::new(
-        guardian.journal.event_cursor()?,
-    ));
+    let events = Arc::clone(&guardian.console.notifications);
+    events.publish(guardian.journal.event_cursor()?);
     let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
     let (guest_jobs, guest_queue) = mpsc::sync_channel::<GuestWorkItem>(16);
     let completion_sender = sender.clone();
@@ -1767,19 +1811,16 @@ pub fn serve_guardian<E: GuardianEffect>(
                             wire.assemble(data)
                                 .map_err(|_| Error::Protocol("invalid request bytes"))
                         });
-                        if let Ok(GuardianRequest::SubscribeEvents {
-                            machine_id,
-                            after,
-                            maximum,
-                        }) = &parsed
+                        if let Ok(
+                            subscription @ (GuardianRequest::SubscribeEvents { .. }
+                            | GuardianRequest::SubscribeConsole { .. }),
+                        ) = &parsed
                         {
-                            let _ = event_stream::serve(
+                            let _ = observation_stream::serve(
                                 &mut connection,
                                 &sender,
                                 &events,
-                                machine_id.clone(),
-                                *after,
-                                *maximum,
+                                subscription.clone(),
                             );
                             return;
                         }

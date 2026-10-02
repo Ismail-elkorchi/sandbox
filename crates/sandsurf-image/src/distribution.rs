@@ -42,10 +42,6 @@ pub fn install(
             artifacts.push((&initramfs.path, false));
         }
         artifacts.push((&manifest.system.rootfs.path, true));
-        if let Some(windows) = &manifest.platform_artifacts.windows_x64 {
-            artifacts.push((&windows.kernel.path, false));
-            artifacts.push((&windows.system.path, true));
-        }
         for (relative, compressed) in artifacts {
             let target = stage.join(relative);
             let mut directory = stage.clone();

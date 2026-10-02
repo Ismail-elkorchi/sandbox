@@ -518,7 +518,7 @@
     },
     {
       "type": "application",
-      "name": "firecracker",
+      "name": "firecracker (x64)",
       "version": "1.17.0",
       "purl": "pkg:generic/firecracker@1.17.0?arch=x64",
       "licenses": [

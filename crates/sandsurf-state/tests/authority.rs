@@ -45,8 +45,8 @@ fn catalog_limits() -> CatalogLimits {
         operations: n(100),
         usage_records: n(100),
         image_bytes: n(400_000),
-        resources: Resources::from_geometry(n(8), n(16384), n(400_000), n(4000), n(32))
-            .expect("static resource envelope"),
+        cpu_quota_micros: n(800_000),
+        host_memory_bytes: n(17 * 1024 * 1024 * 1024),
     }
 }
 
@@ -1202,6 +1202,7 @@ fn native_counter_identity_is_independent_of_execution_generation() {
         channels_current: None,
         inflight_requests_current: None,
         cpu_micros: Some(n(cpu)),
+        cpu_ledgers: None,
         memory_current: Some(n(10)),
         memory_peak: Some(n(peak)),
         disk_logical_bytes: n(100),
@@ -1247,6 +1248,52 @@ fn native_counter_identity_is_independent_of_execution_generation() {
         .observe_usage(&fixture.machine, n(3), sample("guardian-two", 2, 4, 12))
         .unwrap();
     assert_eq!(duplicate, restarted_owner);
+}
+
+#[test]
+fn native_cpu_ledgers_keep_their_epoch_and_do_not_invent_an_additive_total() {
+    let mut fixture = Fixture::new();
+    let sample = |epoch: &str, native, partition| {
+        let mut usage = ResourceUsage::host_observation("host-job-and-partition", n(1));
+        usage.host_counter_epoch = Some(hash(epoch));
+        usage.cpu_ledgers = Some(sandsurf_protocol::CpuLedgers {
+            native_micros: Some(n(native)),
+            native_source: sandsurf_protocol::MeasurementSource::HostJob,
+            partition_micros: Some(n(partition)),
+            partition_hypervisor_micros: Some(n(partition / 10)),
+            partition_source: sandsurf_protocol::MeasurementSource::HostPartition,
+        });
+        usage
+    };
+    for (generation, epoch, native, partition) in [
+        (1, "one", 10, 100),
+        (1, "one", 11, 110),
+        (2, "one", 12, 120),
+        (3, "two", 1, 10),
+    ] {
+        let raw = sample(epoch, native, partition);
+        let observed = fixture
+            .host
+            .observe_usage(&fixture.machine, n(generation), raw.clone())
+            .unwrap();
+        assert_eq!(observed.cpu_micros, None);
+        assert_eq!(observed.cpu_ledgers, raw.cpu_ledgers);
+        assert_eq!(observed.host_counter_epoch, raw.host_counter_epoch);
+    }
+    assert!(
+        fixture
+            .host
+            .observe_usage(&fixture.machine, n(3), sample("two", 1, 9))
+            .is_err()
+    );
+    let mut absent = sample("two", 1, 10);
+    absent.cpu_ledgers = None;
+    let observed = fixture
+        .host
+        .observe_usage(&fixture.machine, n(3), absent)
+        .unwrap();
+    assert_eq!(observed.cpu_ledgers, None);
+    assert_eq!(observed.cpu_micros, None);
 }
 
 fn rebind_command(value: &GuestCommand, identity: &str) -> GuestCommand {
@@ -2278,12 +2325,59 @@ fn unknown_dispatch_is_not_replayed_on_reconnect() {
 }
 
 #[test]
+fn machine_storage_is_not_reserved_against_the_shared_host_pool() {
+    let mut f = Fixture::new();
+    let id: MachineId = "independent-volume".try_into().unwrap();
+    let operation: OperationId = "admit-independent-volume".try_into().unwrap();
+    let image = hash("image");
+    let resources =
+        Resources::from_geometry(n(1), n(128), n(1024_u64.pow(4)), n(1024 * 1024), n(8)).unwrap();
+    let defaults = ExecutionDefaults::default();
+    let lifetime = MachineLifetime::default();
+    let request_digest = digest(
+        Domain::Machine,
+        &(&id, &image, &resources, &defaults, &lifetime, &operation),
+    )
+    .unwrap();
+    // The native owner separately verifies the exclusive physical volume. The
+    // catalog may reserve compute, but cannot charge this independent device
+    // to a fictitious aggregate of per-machine disk/output/network allowances.
+    f.host
+        .create_machine(
+            MachineAdmission {
+                id: id.clone(),
+                image,
+                resources: resources.clone(),
+                defaults,
+                image_defaults: ExecutionDefaults::default(),
+                lifetime,
+                operation,
+            },
+            Approval {
+                id: "approve-independent-volume".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        f.host
+            .machine(&id)
+            .unwrap()
+            .unwrap()
+            .runtime_configuration
+            .resources,
+        resources
+    );
+}
+
+#[test]
 fn admission_reservations_are_transactional_and_no_eviction_occurs() {
     let mut f = Fixture::new();
     let machine: MachineId = "over-budget".try_into().unwrap();
     let operation: OperationId = "over-budget".try_into().unwrap();
     let mut resources = resources();
     resources.vcpus = n(8);
+    resources.cpu_quota_micros = n(800_000);
     let image = hash("image");
     let defaults = ExecutionDefaults::default();
     let request_digest = digest(

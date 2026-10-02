@@ -50,7 +50,7 @@ pub enum QualificationScope {
 }
 
 impl QualificationScope {
-    fn required_checks(self) -> &'static [&'static str] {
+    pub fn required_checks(self) -> &'static [&'static str] {
         match self {
             Self::Lifecycle => &[
                 "administrator-root",
@@ -94,6 +94,8 @@ impl QualificationScope {
             ],
             Self::NativeNetwork => &[
                 "network-cap",
+                "local-destination-route-change",
+                "native-socket-owner-restart",
                 "management-disabled",
                 "policy-revocation",
                 "malformed-packet-bounds",
@@ -119,6 +121,26 @@ impl QualificationScope {
             Self::Distribution => &["installed-package", "service-restart", "logout-lifetime"],
         }
     }
+}
+
+pub fn requirements() -> std::collections::BTreeMap<&'static str, &'static [&'static str]> {
+    use QualificationScope::*;
+    [
+        ("lifecycle", Lifecycle),
+        ("resources", Resources),
+        ("cpu-time", CpuTime),
+        ("host-memory", HostMemory),
+        ("storage-budgets", StorageBudgets),
+        ("managed-channels", ManagedChannels),
+        ("native-network", NativeNetwork),
+        ("disk-snapshots", DiskSnapshots),
+        ("full-state", FullState),
+        ("images", Images),
+        ("distribution", Distribution),
+    ]
+    .into_iter()
+    .map(|(name, scope)| (name, scope.required_checks()))
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,7 +241,8 @@ fn validate_run(root: &Path, run: &HardwareRun) -> io::Result<()> {
         .map_err(io::Error::other)?;
     if run.scope == QualificationScope::Resources
         && matches!(
-            crate::resources::capabilities(root).complete_enforcement,
+            crate::resources::capabilities(root, &sandsurf_network::egress_capability())
+                .complete_enforcement,
             sandsurf_protocol::Capability::Unsupported { .. }
         )
     {

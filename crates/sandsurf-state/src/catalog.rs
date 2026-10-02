@@ -31,7 +31,11 @@ pub struct CatalogLimits {
     pub operations: Counter,
     pub usage_records: Counter,
     pub image_bytes: Counter,
-    pub resources: Resources,
+    /// Shared scheduling and RAM capacity only. Machine disks, snapshots,
+    /// output and network queues belong to independently enforced machine
+    /// envelopes, not to the host image/catalog volume.
+    pub cpu_quota_micros: Counter,
+    pub host_memory_bytes: Counter,
 }
 
 /// Trusted host-side authorization decision. Not accepted as a guest API message.
@@ -236,12 +240,13 @@ pub struct HostCatalog {
 
 impl HostCatalog {
     pub fn create(path: &Path, host: HostId, limits: CatalogLimits) -> Result<Self> {
-        limits.resources.validate()?;
         if [
             limits.identities,
             limits.operations,
             limits.usage_records,
             limits.image_bytes,
+            limits.cpu_quota_micros,
+            limits.host_memory_bytes,
         ]
         .contains(&Counter::ZERO)
         {
@@ -1520,10 +1525,7 @@ impl HostCatalog {
             return Err(Error::Conflict("machine image is retired"));
         }
         let sensitive = image_record.sensitive;
-        let total = resources.checked_add(&catalog_resources_held(&tx, None)?)?;
-        if !total.within(&self.limits.resources) {
-            return Err(Error::Capacity("host resource reservations exhausted"));
-        }
+        reserve_compute(&tx, None, &resources, &self.limits)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let runtime_configuration = initial_runtime_configuration(&resources)?;
         let activity = current_unix_millis()?;
@@ -1598,10 +1600,7 @@ impl HostCatalog {
         }
         capacity(&tx, "machines", self.limits.identities)?;
         capacity(&tx, "intents", self.limits.operations)?;
-        let total = resources.checked_add(&catalog_resources_held(&tx, None)?)?;
-        if !total.within(&self.limits.resources) {
-            return Err(Error::Capacity("host resource reservations exhausted"));
-        }
+        reserve_compute(&tx, None, &resources, &self.limits)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let configuration = initial_runtime_configuration(&resources)?;
         let source_defaults: String = tx.query_row(
@@ -1966,10 +1965,7 @@ impl HostCatalog {
         let tx = self.db.connection.transaction()?;
         host_operation_identity_available(&tx, operation)?;
         require_revision(&tx, machine, expected)?;
-        let total = resources.checked_add(&catalog_resources_held(&tx, Some(machine))?)?;
-        if !total.within(&self.limits.resources) {
-            return Err(Error::Capacity("host resource reservations exhausted"));
-        }
+        reserve_compute(&tx, Some(machine), &resources, &self.limits)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let encoded: String = tx.query_row(
             "SELECT configuration FROM machines WHERE id=?1",
@@ -2232,6 +2228,26 @@ impl HostCatalog {
                 && raw.host_counter_epoch == old_raw.host_counter_epoch;
             let same_counter = same_host_counter
                 || (raw.host_counter_epoch.is_none() && generation == old_generation);
+            if same_host_counter
+                && let (Some(current), Some(previous)) = (&raw.cpu_ledgers, &old_raw.cpu_ledgers)
+                && [
+                    (current.native_micros, previous.native_micros),
+                    (current.partition_micros, previous.partition_micros),
+                    (
+                        current.partition_hypervisor_micros,
+                        previous.partition_hypervisor_micros,
+                    ),
+                ]
+                .iter()
+                .any(|(current, previous)| {
+                    matches!((current, previous),
+                    (Some(current), Some(previous)) if current < previous)
+                })
+            {
+                return Err(Error::Conflict(
+                    "native CPU ledger rewound within one owner epoch",
+                ));
+            }
             if same_counter
                 && [
                     (raw.network_rx_bytes, old_raw.network_rx_bytes),
@@ -2307,6 +2323,9 @@ impl HostCatalog {
                 },
             )?;
             value.memory_current = raw.memory_current;
+            // These disjointly labelled observations retain their native
+            // epoch. They are not another total or an additive consumption.
+            value.cpu_ledgers = raw.cpu_ledgers.clone();
             value.memory_peak = value.memory_peak.max(raw.memory_peak);
             value.disk_logical_bytes = raw.disk_logical_bytes;
             value.disk_allocated_bytes = raw.disk_allocated_bytes;
@@ -2495,11 +2514,14 @@ fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<
     .transpose()
 }
 
-fn catalog_resources_held(
+fn reserve_compute(
     db: &rusqlite::Connection,
     excluding: Option<&MachineId>,
-) -> Result<Resources> {
-    let mut total = Resources::zero();
+    requested: &Resources,
+    limits: &CatalogLimits,
+) -> Result<()> {
+    let mut cpu = requested.cpu_quota_micros;
+    let mut memory = requested.host_memory_bytes()?;
     let mut statement =
         db.prepare("SELECT id,configuration,released FROM machines WHERE id<>?1")?;
     for row in statement.query_map([excluding.map_or("", MachineId::as_str)], |row| {
@@ -2510,25 +2532,19 @@ fn catalog_resources_held(
         ))
     })? {
         let (_id, configuration, released) = row?;
-        let resources = decode::<RuntimeConfiguration>(&configuration)?.resources;
-        let held = if released {
-            // Native destruction frees compute and attached disks. Archives,
-            // snapshots and image references remain independently retained.
-            // Conservatively retain their original reservations until their
-            // respective byte owners support verified archive reclamation.
-            let mut held = Resources::zero();
-            held.output_bytes = resources.output_bytes;
-            held.snapshot_bytes = resources.snapshot_bytes;
-            // The mounted volume remains exclusively owned even after native
-            // destruction. Retained metadata/evidence prevents slot recycling.
-            held.physical_storage_bytes = resources.physical_storage_bytes;
-            held
-        } else {
-            resources
-        };
-        total = total.checked_add(&held)?;
+        if !released {
+            let resources = decode::<RuntimeConfiguration>(&configuration)?.resources;
+            cpu = cpu.checked_add(resources.cpu_quota_micros.get())?;
+            memory = memory.checked_add(resources.host_memory_bytes()?.get())?;
+        }
     }
-    Ok(total)
+    if cpu > limits.cpu_quota_micros || memory > limits.host_memory_bytes {
+        return Err(Error::Capacity("host compute reservations exhausted"));
+    }
+    // Destruction releases compute only. The mounted machine volume remains
+    // exclusive and independently retains its archives and snapshot bytes;
+    // this admission decision neither reclaims it nor spends host-volume bytes.
+    Ok(())
 }
 
 fn snapshot_charge(resources: &Resources, kind: SnapshotKind) -> Result<u64> {

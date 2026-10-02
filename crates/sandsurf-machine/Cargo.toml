@@ -5,28 +5,18 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[features]
-apple-source-check = []
-
 [dependencies]
 sandsurf-protocol = { path = "../sandsurf-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+sandsurf-native = { path = "../sandsurf-native" }
+sandsurf-network = { path = "../sandsurf-network" }
+sha2.workspace = true
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-sandsurf-network = { path = "../sandsurf-network" }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security",
-  "Win32_System_HostComputeSystem",
-  "Win32_System_Memory",
-  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
 ] }
-
-[target.'cfg(unix)'.dependencies]
-sandsurf-native = { path = "../sandsurf-native" }
-sandsurf-network = { path = "../sandsurf-network" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
-sha2.workspace = true

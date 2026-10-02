@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 export const transport = Symbol("host transport");
 
 export const subscribe = Symbol("event subscription");
+export const subscribeConsole = Symbol("console subscription");
 
 export const authorize = Symbol("host approval");
 

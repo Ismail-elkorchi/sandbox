@@ -27,16 +27,18 @@ jobs:
       - run: test -r /dev/kvm && test -w /dev/kvm
       - run: test -x /usr/bin/busybox && test -x /usr/sbin/mkfs.ext4 && command -v qemu-img
       - run: SANDSURF_LOCAL_IMAGE=1 npm run build:guest-image
-      - run: npm run fetch:firecracker
       - run: npm run build:native
       - run: npm run build:ts
       - run: npm run verify:native
       - run: cargo test --locked -p sandsurf-guest -p sandsurf-state -p sandsurf-host
       - name: Installed services require an independent user service manager
         run: systemctl --user show-environment > /dev/null
-      - run: npm run qualify:linux -- linux-hardware-prerequisites.json
+      - run: npm run qualify:linux -- "$RUNNER_TEMP/linux-hardware-prerequisites.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: linux-hardware-prerequisites
-          path: linux-hardware-prerequisites.json
+          path: |
+            ${{ runner.temp }}/linux-hardware-prerequisites.json
+            ${{ runner.temp }}/linux-hardware-prerequisites.json.result.json
+            ${{ runner.temp }}/linux-hardware-prerequisites.json.evidence

@@ -1,5 +1,6 @@
-//! Ignored real TAP test with remote TCP/UDP servers in a second private netns.
-//! No host interface, firewall, NAT, sudo, or Internet dependency is involved.
+//! Real TAP and marked-socket egress with peers in a second private netns.
+//! Requires root in fresh network AND mount namespaces. Rules, operator paths
+//! and interfaces are installed only there, never in the initial host namespace.
 #![cfg(target_os = "linux")]
 use sandsurf_network::{
     GATEWAY_IPV4, GATEWAY_IPV6, GATEWAY_MAC, GUEST_IPV4, GUEST_IPV6, LinkIdentity, MAX_FRAME,
@@ -18,7 +19,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const REMOTE_V4: &str = "198.51.100.2";
@@ -47,6 +48,94 @@ fn wait_file(root: &Path, name: &str) {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+fn socket_owner() -> Peer {
+    let mut child = Peer(
+        Command::new("/usr/local/libexec/sandsurf/sandsurf-host")
+            .arg("--linux-network-sockets")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(child.0.try_wait().unwrap().is_none(), "socket owner exited");
+        if sandsurf_native::network_sockets::probe().is_ok() {
+            return child;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "socket owner did not admit sockets"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn install_isolated_boundary() -> Peer {
+    // Never hide operator paths or install test rules on the actual host.
+    // SAFETY: scalar effective credential query.
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    for namespace in ["net", "mnt"] {
+        assert_ne!(
+            std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap(),
+            std::fs::read_link(format!("/proc/1/ns/{namespace}")).unwrap(),
+            "test requires a separate {namespace} namespace",
+        );
+    }
+    let source = std::env::var_os("SANDSURF_NETWORK_TEST_HOST")
+        .expect("provide the source-built host executable");
+    let source = Path::new(&source);
+    assert!(source.is_absolute() && source.is_file());
+    // The source must remain accessible after /usr/local and /run are hidden.
+    let source = std::fs::read(source).unwrap();
+    assert!(!source.is_empty() && source.len() <= 256 * 1024 * 1024);
+    let mount =
+        sandsurf_native::filesystem::protected_tool(&["/usr/bin/mount", "/bin/mount"]).unwrap();
+    assert!(
+        Command::new(&mount)
+            .args(["--make-rprivate", "/"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for directory in ["/usr/local", "/run"] {
+        assert!(
+            Command::new(&mount)
+                .args([
+                    "-t",
+                    "tmpfs",
+                    "-o",
+                    "mode=0755,nosuid,nodev,size=300M",
+                    "tmpfs",
+                    directory
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let directory = Path::new("/usr/local/libexec/sandsurf");
+    std::fs::create_dir_all(directory).unwrap();
+    let executable = directory.join("sandsurf-host");
+    std::fs::write(&executable, source).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let nft = sandsurf_native::filesystem::protected_tool(&["/usr/sbin/nft", "/sbin/nft"]).unwrap();
+    let mut rules = Peer(
+        Command::new(nft)
+            .args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    rules
+        .0
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(sandsurf_native::network_sockets::NFT_RULES.as_bytes())
+        .unwrap();
+    assert!(rules.0.wait().unwrap().success());
+    ip(&["link", "set", "lo", "up"]);
+    socket_owner()
 }
 fn servers(root: &Path) {
     std::fs::write(root.join("namespace-ready"), b"ready").unwrap();
@@ -196,7 +285,7 @@ fn open_nic() -> Nic {
     );
     Nic(file)
 }
-fn tcp_echo(nic: &mut Nic, gateway: &NativeNetworkGateway) {
+fn tcp_echo(nic: &mut Nic, gateway: &NativeNetworkGateway, restart: impl FnOnce()) {
     let mut interface = Interface::new(
         Config::new(HardwareAddress::Ethernet(EthernetAddress(GUEST_MAC))),
         nic,
@@ -236,10 +325,11 @@ fn tcp_echo(nic: &mut Nic, gateway: &NativeNetworkGateway) {
             .unwrap();
         handles.push(sockets.add(socket));
     }
-    let mut sent = [false; 2];
+    let mut sent = [0; 2];
     let mut responses = [Vec::new(), Vec::new()];
+    let mut restart = Some(restart);
     let start = Instant::now();
-    while responses.iter().any(|r| r.len() < PAYLOAD.len()) {
+    while responses.iter().any(|r| r.len() < 2 * PAYLOAD.len()) {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "native TCP/v4/v6 failed: {:?}",
@@ -252,9 +342,9 @@ fn tcp_echo(nic: &mut Nic, gateway: &NativeNetworkGateway) {
         );
         for (index, handle) in handles.iter().enumerate() {
             let socket = sockets.get_mut::<Socket>(*handle);
-            if socket.can_send() && !sent[index] {
+            if socket.can_send() && (sent[index] == 0 || (restart.is_none() && sent[index] == 1)) {
                 assert_eq!(socket.send_slice(PAYLOAD).unwrap(), PAYLOAD.len());
-                sent[index] = true;
+                sent[index] += 1;
             }
             if socket.can_recv() {
                 socket
@@ -265,10 +355,15 @@ fn tcp_echo(nic: &mut Nic, gateway: &NativeNetworkGateway) {
                     .unwrap();
             }
         }
+        if responses.iter().all(|r| r.len() >= PAYLOAD.len())
+            && let Some(restart) = restart.take()
+        {
+            restart();
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
     for response in responses {
-        assert_eq!(response, PAYLOAD);
+        assert_eq!(response, PAYLOAD.repeat(2));
     }
     // Drop only the simulated stack. No FIN/RST is emitted: native sockets
     // must remain established until the guardian's policy revision closes them.
@@ -305,55 +400,13 @@ fn udp_echo(nic: &mut Nic, guest: IpAddr, remote: IpAddr) {
 }
 
 #[test]
-#[ignore = "requires iproute2, /dev/net/tun, bubblewrap, and user/network namespaces"]
+#[ignore = "requires root, nftables, /dev/net/tun and fresh mount/network namespaces; no VM required"]
 fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
     if let Some(root) = std::env::var_os("SANDSURF_EGRESS_PEER") {
         servers(Path::new(&root));
         return;
     }
-    if std::env::var_os("SANDSURF_EGRESS_NAMESPACE").is_none() {
-        let result = Command::new("/usr/bin/bwrap")
-            .args([
-                "--unshare-user",
-                "--unshare-net",
-                "--uid",
-                "0",
-                "--gid",
-                "0",
-                "--cap-drop",
-                "ALL",
-                "--cap-add",
-                "CAP_NET_ADMIN",
-                "--cap-add",
-                "CAP_NET_RAW",
-                "--ro-bind",
-                "/",
-                "/",
-                "--bind",
-                "/tmp",
-                "/tmp",
-                "--dev-bind",
-                "/dev",
-                "/dev",
-                "--proc",
-                "/proc",
-                "--setenv",
-                "SANDSURF_EGRESS_NAMESPACE",
-                "1",
-                "--",
-            ])
-            .arg(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "native_tcp_udp_ipv4_ipv6_and_established_flow_revocation",
-                "--nocapture",
-            ])
-            .status()
-            .unwrap();
-        assert!(result.success());
-        return;
-    }
+    let mut owner = install_isolated_boundary();
     let root = std::env::temp_dir().join(format!("sandsurf-native-egress-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let mut peer = Command::new(std::env::current_exe().unwrap());
@@ -364,7 +417,7 @@ fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
         "--nocapture",
     ]);
     // SAFETY: the child executes only the namespace syscall before exec. Its
-    // CAP_NET_ADMIN is scoped to the bubblewrap-created user namespace.
+    // CAP_NET_ADMIN is used only in the isolated test network namespaces.
     unsafe {
         peer.pre_exec(|| {
             if libc::unshare(libc::CLONE_NEWNET) == 0 {
@@ -431,7 +484,13 @@ fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
             .collect(),
     };
     gateway.configure(&policy, &[]).unwrap();
-    tcp_echo(&mut nic, &gateway);
+    tcp_echo(&mut nic, &gateway, || {
+        // Actual transferred sockets must survive death of their original
+        // factory. Recovery uses its exclusive lease, not process-ID adoption.
+        owner.0.kill().unwrap();
+        owner.0.wait().unwrap();
+        owner = socket_owner();
+    });
     udp_echo(&mut nic, GUEST_IPV4.into(), REMOTE_V4.parse().unwrap());
     udp_echo(&mut nic, GUEST_IPV6.into(), REMOTE_V6.parse().unwrap());
     for (guest, remote) in [

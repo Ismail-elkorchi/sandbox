@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { lookup } from "node:dns/promises";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { qualificationDirectory } from "./qualification-storage.mjs";
+import { qualificationDirectory, recordChecks } from "./qualification-storage.mjs";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -26,6 +26,7 @@ test("installed Linux computer runs package scripts, builds, databases and conta
       outputBytes: 16 * 1024 ** 2, managedExecutions: 64,
     } });
     await ready(machine);
+    await recordChecks(directory, machine, ["installed-image-boot"], { image });
     // Public repository addresses are authorized, not a blanket private-host
     // grant. Pin the repository name so the test does not rely on host-local DNS.
     const addresses = await lookup("dl-cdn.alpinelinux.org", { all: true, family: 4 });
@@ -40,6 +41,7 @@ test("installed Linux computer runs package scripts, builds, databases and conta
     context.diagnostic("normal guest package installation, including maintainer scripts");
     await run(machine, "sudo -n apk add --no-cache build-base python3 sqlite docker docker-openrc openssh", 240_000);
     assert.match(await run(machine, "getent passwd sshd; test -d /var/lib/docker; apk info --installed python3 sqlite docker"), /sshd[\s\S]*python3/u);
+    await recordChecks(directory, machine, ["package-install"], { packages: ["build-base", "python3", "sqlite", "docker", "docker-openrc", "openssh"] });
     context.diagnostic("normal kernel package lifecycle updates direct-boot selection");
     await run(machine, "sudo -n apk fix linux-virt", 240_000);
     const bootSelection = JSON.parse(Buffer.from(await machine.fs.readFile("/boot/sandsurf.json")).toString());
@@ -69,6 +71,8 @@ test("installed Linux computer runs package scripts, builds, databases and conta
     assert.ok(machine.generation > generation);
     assert.equal(await run(machine, "/home/agent/project/main; sqlite3 /home/agent/database 'pragma integrity_check; select value from durable;'"), "real-build\nok\nretained\n");
     assert.match(await run(machine, "sudo -n docker info --format '{{.ServerVersion}}'; rc-status default"), /docker/u);
+    await recordChecks(directory, machine, ["persistent-system-files", "kernel-selection"], { generation: machine.generation, bootSelection,
+      databaseIntegrity: "ok", installedBuild: "real-build", persistentService: "docker" });
     context.diagnostic("database recovery after forced native power loss");
     await run(machine, "sqlite3 /home/agent/database \"pragma journal_mode=WAL; insert into durable values('power-loss');\"");
     await machine.powerOff();

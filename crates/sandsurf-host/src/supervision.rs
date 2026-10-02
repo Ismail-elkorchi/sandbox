@@ -5,11 +5,14 @@
 use crate::guardian::GuardianClient;
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_native::storage::object_name;
-use sandsurf_protocol::{Counter, Frame, FrameKind, MachineId};
+use sandsurf_protocol::{Counter, Frame, FrameKind, MachineId, OperationId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -18,9 +21,34 @@ const MAX_CHILDREN: usize = 4096;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct OwnedGuardian {
-    child: Child,
+    child: GuardianChild,
     #[cfg(target_os = "linux")]
     native_unit: bool,
+}
+
+#[cfg(target_os = "linux")]
+type GuardianChild = Child;
+#[cfg(target_os = "macos")]
+type GuardianChild = sandsurf_native::resource_broker::macos::OwnedWorker;
+#[cfg(windows)]
+type GuardianChild = sandsurf_native::owned_windows::OwnedWorker;
+
+impl OwnedGuardian {
+    fn contain(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            if self.child.try_wait()?.is_none()
+                && let Err(error) = self.child.kill()
+                && self.child.try_wait()?.is_none()
+            {
+                return Err(error);
+            }
+            self.child.wait()?;
+            Ok(())
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        self.child.terminate()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +57,8 @@ pub enum Request {
     Inspect,
     Ensure { machine: MachineId },
     Check { machine: MachineId },
+    EnsureImage { operation: OperationId },
+    CheckImage { operation: OperationId },
     Shutdown,
 }
 
@@ -81,7 +111,18 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
     sandsurf_native::local::ensure_private_directory(&root.join("supervision"))?;
     let listener = LocalListener::bind(&root.join("supervision"))?;
     let mut children = BTreeMap::<MachineId, OwnedGuardian>::new();
+    #[cfg(any(target_os = "macos", windows))]
+    let mut image = None::<OwnedImage>;
     loop {
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some(worker) = &mut image {
+            if worker.owner.child.try_wait()?.is_some() {
+                image = None;
+            } else if worker.started.elapsed() >= Duration::from_secs(300) {
+                worker.owner.contain()?;
+                image = None;
+            }
+        }
         let mut reaped = Vec::new();
         for (machine, owner) in &mut children {
             if owner.child.try_wait()?.is_some() {
@@ -120,7 +161,47 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
                     .map_err(io::Error::other)
                 }
             }
+            Request::EnsureImage { operation } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = operation;
+                    Err(io::Error::other(
+                        "Linux image workers are owned by their service unit",
+                    ))
+                }
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    ensure_image(&root, &executable, operation, &mut image)
+                }
+            }
+            Request::CheckImage { operation } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = operation;
+                    Err(io::Error::other(
+                        "Linux image workers are owned by their service unit",
+                    ))
+                }
+                #[cfg(any(target_os = "macos", windows))]
+                {
+                    if image.as_mut().is_some_and(|worker| {
+                        worker.operation == operation
+                            && matches!(worker.owner.child.try_wait(), Ok(None))
+                    }) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "no retained original image worker for this operation",
+                        ))
+                    }
+                }
+            }
             Request::Shutdown => {
+                #[cfg(any(target_os = "macos", windows))]
+                if let Some(worker) = &mut image {
+                    worker.owner.contain()?;
+                }
                 // Explicit host-account/service-manager containment, never SDK
                 // disconnection or host API shutdown. Journals/disks are kept.
                 #[cfg(target_os = "linux")]
@@ -138,13 +219,7 @@ pub fn serve(root: &Path, executable: PathBuf) -> io::Result<()> {
                     }
                 }
                 for owner in children.values_mut() {
-                    if owner.child.try_wait()?.is_none()
-                        && let Err(error) = owner.child.kill()
-                        && owner.child.try_wait()?.is_none()
-                    {
-                        return Err(error);
-                    }
-                    owner.child.wait()?;
+                    owner.contain()?;
                 }
                 children.clear();
                 Ok(())
@@ -280,8 +355,7 @@ fn ensure(
         // the bounded supervisor pool, not a resurrected VM-sized reservation.
         Command::new(executable)
     };
-    #[cfg(not(target_os = "linux"))]
-    let mut command = Command::new(executable);
+    #[cfg(target_os = "linux")]
     let child = command
         .args(["guardian", "--directory"])
         .arg(root)
@@ -291,6 +365,48 @@ fn ensure(
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()?;
+    #[cfg(any(target_os = "macos", windows))]
+    let child = {
+        let config = crate::qemu::read_config(&machine_root.join("guardian/config.json"), &machine)
+            .map_err(io::Error::other)?;
+        let budget = sandsurf_machine::qemu_driver::QemuBudgets::derive(
+            config.resources(),
+            crate::qemu::accelerator(),
+        )?
+        .guardian;
+        let arguments = [
+            "--directory".into(),
+            root.as_os_str().to_owned(),
+            "--machine".into(),
+            machine.as_str().into(),
+        ];
+        #[cfg(target_os = "macos")]
+        {
+            if executable != std::env::current_exe()? {
+                return Err(io::Error::other(
+                    "guardian executable differs from installed host",
+                ));
+            }
+            sandsurf_native::resource_broker::macos::launch(
+                sandsurf_native::resource_broker::WorkerKind::Guardian,
+                budget,
+                &arguments,
+                Stdio::null(),
+                Stdio::null(),
+                Stdio::from(log),
+            )?
+        }
+        #[cfg(windows)]
+        {
+            drop(log);
+            sandsurf_native::owned_windows::OwnedWorker::launch_host(
+                sandsurf_native::resource_broker::WorkerKind::Guardian,
+                executable,
+                &arguments,
+                budget,
+            )?
+        }
+    };
     children.insert(
         machine,
         OwnedGuardian {
@@ -299,6 +415,64 @@ fn ensure(
             native_unit,
         },
     );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+struct OwnedImage {
+    operation: OperationId,
+    owner: OwnedGuardian,
+    started: std::time::Instant,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn ensure_image(
+    root: &Path,
+    executable: &Path,
+    operation: OperationId,
+    slot: &mut Option<OwnedImage>,
+) -> io::Result<()> {
+    if let Some(worker) = slot {
+        if worker.operation == operation && worker.owner.child.try_wait()?.is_none() {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "image pool already has an original owner",
+        ));
+    }
+    sandsurf_native::volume::inspect(root)?;
+    sandsurf_native::local::canonical_private_directory(&root.join("image-workers"))?;
+    crate::image_worker::admitted(root, &operation).map_err(io::Error::other)?;
+    // Acquire before fork. On macOS the durable broker retains this exact
+    // description after supervisor restart; Windows keeps it in the original
+    // Job-owned worker. Neither path can create a second storage owner.
+    let lease = std::sync::Arc::new(sandsurf_native::storage::disk_lease(
+        &root.join("image-workers/.lease"),
+    )?);
+    let arguments = [
+        "--directory".into(),
+        root.as_os_str().to_owned(),
+        "--operation".into(),
+        operation.as_str().into(),
+    ];
+    #[cfg(target_os = "macos")]
+    let child = {
+        if executable != std::env::current_exe()? {
+            return Err(io::Error::other(
+                "image executable differs from installed host",
+            ));
+        }
+        sandsurf_native::resource_broker::macos::launch_images(&arguments, lease)?
+    };
+    #[cfg(windows)]
+    let child =
+        sandsurf_native::owned_windows::OwnedWorker::launch_images(executable, &arguments, lease)?;
+    *slot = Some(OwnedImage {
+        operation,
+        owner: OwnedGuardian { child },
+        started: std::time::Instant::now(),
+    });
     Ok(())
 }
 
@@ -312,9 +486,16 @@ mod tests {
             r#"{"kind":"ensure","machine":"box","executable":"/bin/sh"}"#,
             r#"{"kind":"ensure","machine":"../outside"}"#,
             r#"{"kind":"ensure","machine":"box","directory":"/outside"}"#,
+            r#"{"kind":"ensure-image","operation":"../outside"}"#,
+            r#"{"kind":"ensure-image","operation":"build","executable":"/bin/sh"}"#,
+            r#"{"kind":"ensure-image","operation":"build","directory":"/outside"}"#,
         ] {
             assert!(serde_json::from_str::<Request>(payload).is_err());
         }
         assert!(serde_json::from_str::<Request>(r#"{"kind":"ensure","machine":"box"}"#).is_ok());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"kind":"ensure-image","operation":"build"}"#)
+                .is_ok()
+        );
     }
 }

@@ -17,7 +17,7 @@ use sandsurf_machine::{MachineDriver, MachineOutcome, apply_lifecycle};
 use sandsurf_native::UnixVsockChannel;
 use sandsurf_native::storage::object_name;
 use sandsurf_network::NativeNetworkGateway;
-use sandsurf_protocol::{AUTHENTICATION_MAGIC, GUEST_CONTROL_PORT};
+use sandsurf_protocol::{BootCapability, BootIdentity, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
     Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
     GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
@@ -972,36 +972,7 @@ impl GuardianEffect for LinuxGuardianEffect {
         if let Ok(mut active) = self.guest_binding.lock() {
             *active = None;
         }
-        let command = LifecycleCommand {
-            machine_id: current.machine_id.clone(),
-            operation_id: sandsurf_protocol::OperationId::try_from(format!(
-                "native-reset-{}",
-                current.generation.get()
-            ))
-            .map_err(|_| ControlError::Protocol("reset identity overflow"))?,
-            desired: sandsurf_protocol::DesiredState::Running,
-            revision: current.applied_revision,
-            request_digest: current.evidence_digest.clone(),
-            configuration,
-        };
-        // Driver start advances from the contained prior generation. The
-        // guardian has already committed the target Starting fence.
-        let previous = MachineObservation {
-            generation: Counter::try_from(current.generation.get() - 1)
-                .map_err(|_| ControlError::Protocol("reset generation invalid"))?,
-            state: MachineState::Stopped,
-            ..current.clone()
-        };
-        match self.transition(&command, Some(&previous)) {
-            MachineOutcome::Observed(values)
-                if values.last().is_some_and(|value| {
-                    value.generation == current.generation && value.state == MachineState::Running
-                }) =>
-            {
-                Ok(values.last().unwrap().evidence_digest.clone())
-            }
-            _ => Err(ControlError::Protocol("native guest reset recovery failed")),
-        }
+        crate::guardian::restart_after_native_reset(self, current, configuration)
     }
 }
 
@@ -1893,13 +1864,9 @@ fn ensure_mutable_disk(
     requested_bytes: u64,
     clone_profile: &sandsurf_image::identity::CloneProfile,
 ) -> Result<(), LinuxError> {
-    crate::storage::materialize(
-        source,
-        destination,
-        requested_bytes,
-        crate::storage::DiskFormat::Raw,
-        |staged| sandsurf_image::identity::customize(staged, clone_profile),
-    )?;
+    crate::storage::materialize(source, destination, requested_bytes, |staged| {
+        sandsurf_image::identity::customize(staged, clone_profile)
+    })?;
     Ok(())
 }
 
@@ -1910,38 +1877,22 @@ fn write_authentication(
     boot_identity: &Digest,
     capability: &[u8; 32],
 ) -> Result<(), LinuxError> {
-    let identity = machine_id.as_str().as_bytes();
-    let size = u16::try_from(identity.len())
-        .map_err(|_| LinuxError::Invalid("machine identity is too long".into()))?;
-    let digest = decode_hex(boot_identity.as_str())?;
-    let mut bytes = Vec::with_capacity(512);
-    bytes.extend_from_slice(AUTHENTICATION_MAGIC);
-    bytes.extend_from_slice(&size.to_be_bytes());
-    bytes.extend_from_slice(identity);
-    bytes.extend_from_slice(&generation.get().to_be_bytes());
-    bytes.extend_from_slice(&digest);
-    bytes.extend_from_slice(capability);
-    bytes.resize(512, 0);
+    let bytes = BootIdentity {
+        machine_id: machine_id.clone(),
+        generation,
+        boot_digest: boot_identity.clone(),
+        capability: BootCapability::from_bytes(*capability),
+    }
+    .encode()
+    .map_err(|error| LinuxError::Invalid(error.to_string()))?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(&bytes)?;
+    file.write_all(&bytes[..])?;
     file.sync_all()?;
     Ok(())
-}
-
-fn decode_hex(value: &str) -> Result<[u8; 32], LinuxError> {
-    if value.len() != 64 {
-        return Err(LinuxError::Invalid("digest is malformed".into()));
-    }
-    let mut bytes = [0; 32];
-    for (index, output) in bytes.iter_mut().enumerate() {
-        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| LinuxError::Invalid("digest is malformed".into()))?;
-    }
-    Ok(bytes)
 }
 
 fn random_bytes() -> Result<[u8; 32], LinuxError> {
@@ -2056,7 +2007,7 @@ mod storage_tests {
             sandsurf_native::local::create_private_directory(&root.join(name)).unwrap();
         }
         let disk = root.join("disks/system.ext4");
-        crate::storage::publish_disk(&disk, 4096, crate::storage::DiskFormat::Raw, |stage| {
+        crate::storage::publish_disk(&disk, 4096, |stage| {
             // Not a filesystem at all: any disk interpretation is a bug here.
             sandsurf_native::local::create_private_file(stage)?.write_all(&[7; 4096])
         })
@@ -2066,6 +2017,7 @@ mod storage_tests {
         bytes[0x202..0x206].copy_from_slice(b"HdrS");
         bytes[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
         bytes[0x236] = 1;
+        bytes[0x206..0x208].copy_from_slice(&0x020c_u16.to_le_bytes());
         sandsurf_native::local::create_private_file(&kernel)
             .unwrap()
             .write_all(&bytes)
@@ -2276,7 +2228,7 @@ mod storage_tests {
         )
         .unwrap();
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
-        crate::storage::retire(&destination, 8192, crate::storage::DiskFormat::Raw).unwrap();
+        crate::storage::retire(&destination, 8192).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

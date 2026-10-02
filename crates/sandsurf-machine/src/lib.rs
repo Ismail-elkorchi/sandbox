@@ -17,10 +17,14 @@ pub mod firecracker;
 pub mod launcher;
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(any(target_os = "macos", feature = "apple-source-check"))]
-pub mod macos;
-#[cfg(target_os = "windows")]
-pub mod windows;
+pub mod qemu;
+pub mod qemu_driver;
+mod qemu_launch;
+#[cfg(any(target_os = "macos", windows))]
+pub mod qemu_owner;
+pub mod qemu_runtime;
+#[cfg(any(target_os = "macos", windows))]
+mod qemu_worker;
 
 /// Native adapters supply only virtual-hardware-specific device names. The
 /// Linux OS policy is shared: root may administer its mounted block devices,
@@ -32,7 +36,8 @@ pub fn linux_boot_arguments(console: &str, root_device: &str) -> String {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GuestArchitecture {
     Amd64,
     Arm64,
@@ -82,7 +87,11 @@ pub fn guest_power_capabilities() -> GuestPowerCapabilities {
     };
     GuestPowerCapabilities {
         shutdown,
-        reboot: if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        reboot: if cfg!(any(target_os = "macos", target_os = "windows")) {
+            Capability::Supported { qualification: Qualification::Unqualified {
+                reasons: vec!["QEMU guest RESET events plus confirmed original-child exit permit generation-fenced recovery; real-hardware qualification is missing".into()],
+            } }
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             Capability::Supported { qualification: Qualification::Unqualified {
                 reasons: vec!["Firecracker 1.17 i8042 reset metrics plus clean contained exit permit generation-fenced recovery; real-hardware qualification is missing".into()],
             } }
@@ -101,7 +110,7 @@ pub struct DriverQualification {
     pub engine: VmEngine,
     pub guest_architecture: GuestArchitecture,
     pub lifecycle: Qualification,
-    pub full_state: Qualification,
+    pub full_state: Capability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +319,11 @@ mod tests {
     #[test]
     fn power_support_reports_native_reset_recovery_without_hardware_qualification() {
         let capabilities = super::guest_power_capabilities();
-        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "windows",
+            all(target_os = "linux", target_arch = "x86_64")
+        )) {
             assert!(matches!(
                 capabilities.reboot,
                 super::Capability::Supported {
@@ -363,7 +376,9 @@ mod tests {
                 lifecycle: Qualification::Qualified {
                     evidence: hash("lifecycle"),
                 },
-                full_state: Qualification::Unqualified { reasons: vec![] },
+                full_state: Capability::Supported {
+                    qualification: Qualification::Unqualified { reasons: vec![] },
+                },
             }
         }
         fn configure(

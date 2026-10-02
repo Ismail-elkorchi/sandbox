@@ -13,6 +13,7 @@ name = "sandsurf-guest"
 path = "src/main.rs"
 
 [dependencies]
+zeroize.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }

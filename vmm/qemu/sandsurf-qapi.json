@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Native owner observation only; absent management/control is not VM death.
+##
+# @SandsurfPartitionCounters:
+#
+# Counters from the original WHP partition, over at most 32 VPs.
+#
+# @total-runtime-micros: Total VP runtime, converted from the kernel's
+#     100ns units after summing.
+#
+# @hypervisor-runtime-micros: Independent hypervisor runtime.
+#     Do not add it to Job CPU to invent an aggregate total.
+#
+# @virtual-processors: Number of original virtual processors queried.
+#
+# Since: 11.1
+##
+{ 'struct': 'SandsurfPartitionCounters',
+  'data': { 'total-runtime-micros': 'uint64',
+            'hypervisor-runtime-micros': 'uint64',
+            'virtual-processors': 'uint32' },
+  'if': 'CONFIG_WHPX' }
+##
+# @query-sandsurf-partition-counters:
+#
+# Query the retained partition, without caller-supplied handles/PIDs.
+# Missing support, size mismatch, or overflow is an error.
+# It does not establish that the Linux computer stopped.
+#
+# Returns: Native partition counters.
+#
+# Since: 11.1
+##
+{ 'command': 'query-sandsurf-partition-counters',
+  'returns': 'SandsurfPartitionCounters',
+  'if': 'CONFIG_WHPX' }

@@ -1,6 +1,6 @@
-#![cfg(unix)]
 use sandsurf_network::{
-    GATEWAY_IPV4, GUEST_IPV4, LinkIdentity, MAX_FRAME, NativeNetworkGateway, PacketTransport,
+    GATEWAY_IPV4, GUEST_IPV4, LinkIdentity, MAX_FRAME, NativeNetworkGateway, PacketStream,
+    PacketTransport,
 };
 use sandsurf_protocol::{Counter, Exposure, ExposureSpec, NetworkPolicy};
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -10,16 +10,15 @@ use smoltcp::time::Instant as StackTime;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixDatagram;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
-struct Nic(UnixDatagram);
+struct Nic(PacketStream);
 struct Rx(Vec<u8>);
-struct Tx<'a>(&'a UnixDatagram);
+struct Tx<'a>(&'a mut PacketStream);
 impl RxToken for Rx {
     fn consume<R, F>(self, f: F) -> R
     where
@@ -43,12 +42,11 @@ impl Device for Nic {
     type RxToken<'a> = Rx;
     type TxToken<'a> = Tx<'a>;
     fn receive(&mut self, _: StackTime) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut frame = [0; MAX_FRAME];
-        let n = self.0.recv(&mut frame).ok()?;
-        Some((Rx(frame[..n].to_vec()), Tx(&self.0)))
+        let frame = self.0.receive().ok()?;
+        Some((Rx(frame), Tx(&mut self.0)))
     }
     fn transmit(&mut self, _: StackTime) -> Option<Self::TxToken<'_>> {
-        Some(Tx(&self.0))
+        Some(Tx(&mut self.0))
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut c = DeviceCapabilities::default();
@@ -77,8 +75,7 @@ fn exposure() -> Exposure {
         bound_port: Some(port),
     }
 }
-fn echo_guest(socket: UnixDatagram, stop: Arc<AtomicBool>, link: LinkIdentity) {
-    socket.set_nonblocking(true).unwrap();
+fn echo_guest(socket: PacketStream, stop: Arc<AtomicBool>, link: LinkIdentity) {
     let mut nic = Nic(socket);
     let mut interface = Interface::new(
         Config::new(HardwareAddress::Ethernet(EthernetAddress(link.guest_mac))),
@@ -118,9 +115,10 @@ fn echo_guest(socket: UnixDatagram, stop: Arc<AtomicBool>, link: LinkIdentity) {
 
 #[test]
 fn inbound_targets_native_nic_and_revocation_closes_existing_client_before_success() {
-    let (host, guest) = UnixDatagram::pair().unwrap();
+    let (host, guest) = packet_pair();
     let link = LinkIdentity::for_machine(&"machine-fixture".try_into().unwrap());
-    let gateway = NativeNetworkGateway::start(PacketTransport::Datagram(host), link).unwrap();
+    let gateway =
+        NativeNetworkGateway::start(PacketTransport::Stream(Box::new(host)), link).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let guest_stop = Arc::clone(&stop);
     let worker = std::thread::spawn(move || echo_guest(guest, guest_stop, link));
@@ -157,8 +155,9 @@ fn inbound_targets_native_nic_and_revocation_closes_existing_client_before_succe
 
 #[test]
 fn failed_installation_leaves_deny_and_closes_previous_inbound_authority() {
-    let (host, _guest) = UnixDatagram::pair().unwrap();
-    let gateway = NativeNetworkGateway::start(PacketTransport::Datagram(host), TEST_LINK).unwrap();
+    let (host, _guest) = packet_pair();
+    let gateway =
+        NativeNetworkGateway::start(PacketTransport::Stream(Box::new(host)), TEST_LINK).unwrap();
     let good = exposure();
     gateway
         .configure(&NetworkPolicy::default(), std::slice::from_ref(&good))
@@ -176,9 +175,9 @@ fn failed_installation_leaves_deny_and_closes_previous_inbound_authority() {
 
 #[test]
 fn malformed_flood_cannot_grow_violation_retention_or_block_revocation() {
-    let (host, guest) = UnixDatagram::pair().unwrap();
-    let gateway = NativeNetworkGateway::start(PacketTransport::Datagram(host), TEST_LINK).unwrap();
-    guest.set_nonblocking(true).unwrap();
+    let (host, mut guest) = packet_pair();
+    let gateway =
+        NativeNetworkGateway::start(PacketTransport::Stream(Box::new(host)), TEST_LINK).unwrap();
     for _ in 0..2048 {
         let _ = guest.send(&[255; MAX_FRAME]);
     }
@@ -192,3 +191,13 @@ fn malformed_flood_cannot_grow_violation_retention_or_block_revocation() {
 const TEST_LINK: LinkIdentity = LinkIdentity {
     guest_mac: [2, 0, 0, 0, 0, 2],
 };
+
+fn packet_pair() -> (PacketStream, PacketStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let guest = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (host, _) = listener.accept().unwrap();
+    (
+        PacketStream::new(host.into()).unwrap(),
+        PacketStream::new(guest.into()).unwrap(),
+    )
+}

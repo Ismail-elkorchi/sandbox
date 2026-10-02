@@ -1,4 +1,5 @@
-import type { ArtifactInspection, Capability, ChangeSet, ConfigurationDeliveryObservation, DesiredMachineState, ExecutionObservation, ExecutionStatus, Exposure, ExposureSpec, ImageDefaults, ImageImportOptions, ImageInspection, MachineCreateOptions, MachineEvent, MachineEventValue, MachineGenerationPrecondition, MachineInspection, MachineLifecycleIntent, MachineLifetimePolicy, MachineObservation, MachineRevisionPrecondition, MachineState, ManagementObservation, ManagementReport, MeasurementSource, NativeMachineObservation, NetworkDestination, NetworkPolicy, NetworkRule, ObservationCause, ObservationReference, OperationDelivery, OperationInspection, OperationObservation, OutputChunk, OutputPage, OutputSegmentInspection, Qualification, ReleaseStatus, ResourceCapabilities, ResourceChangeAssessment, ResourceEnvelope, ResourceProvenance, ResourceUsage, RetainedQualification, RuntimeConfiguration, SecretRevocation, SecretVersion, SnapshotConsistency, SnapshotInspection, SnapshotKind, StorageInspection, StoragePayload, TreeChange, TreeEntry, TreeManifest } from "./contracts.js";
+import type { ArtifactInspection, Capability, CpuLedgers, ChangeSet, ConfigurationDeliveryObservation, DesiredMachineState, ExecutionObservation, ExecutionStatus, Exposure, ExposureSpec, ImageDefaults, ImageImportOptions, ImageInspection, MachineCreateOptions, MachineEvent, MachineEventValue, MachineGenerationPrecondition, MachineInspection, MachineLifecycleIntent, MachineLifetimePolicy, MachineObservation, MachineRevisionPrecondition, MachineState, ManagementObservation, ManagementReport, NativeMachineObservation, NetworkDestination, NetworkPolicy, NetworkRule, ObservationCause, ObservationReference, OperationDelivery, OperationInspection, OperationObservation, OutputChunk, OutputPage, OutputSegmentInspection, Qualification, ReleaseStatus, ResourceCapabilities, ResourceChangeAssessment, ResourceEnvelope, ResourceProvenance, ResourceUsage, RetainedQualification, RuntimeConfiguration, SecretRevocation, SecretVersion, SnapshotConsistency, SnapshotInspection, SnapshotKind, StorageInspection, StoragePayload, TreeChange, TreeEntry, TreeManifest } from "./contracts.js";
+import { validateProtocol } from "./protocol-validation.js";
 import { parseExecutionInspection, parseExecutionLineage } from "./execution.js";
 import type { Machine } from "./machines.js";
 import { integer, record, SandsurfHostError, text } from "./native-host.js";
@@ -123,7 +124,7 @@ export function normalizeResources(value: ResourceEnvelope): Required<ResourceEn
   const networkQueueBytes = value.networkQueueBytes ?? value.vcpus * 16 * 1024 * 1024;
   const result = { vcpus: value.vcpus, memoryMiB: value.memoryMiB, diskBytes: value.diskBytes, outputBytes, managedExecutions, cpuQuotaMicros, hostOverheadBytes, snapshotBytes, physicalStorageBytes, channels, inflightRequests, networkConnections, networkBytesPerSecond, networkQueueBytes };
   for (const item of Object.values(result)) if (!Number.isSafeInteger(item) || item <= 0) throw new TypeError("resource values must be positive safe integers");
-  if (cpuQuotaMicros < 1000 || cpuQuotaMicros > value.vcpus * 100_000) throw new TypeError("CPU time quota must be at least 1000µs and cannot exceed vCPU scheduling capacity");
+  if (cpuQuotaMicros % 10 !== 0 || cpuQuotaMicros < 1000 || cpuQuotaMicros > value.vcpus * 100_000) throw new TypeError("CPU time quota requires 10µs granularity, at least 1000µs, within vCPU scheduling capacity");
   const storage = 2 * value.diskBytes + outputBytes + snapshotBytes;
   const memory = value.memoryMiB * 1024 * 1024 + hostOverheadBytes;
   if (!Number.isSafeInteger(storage) || physicalStorageBytes < storage || !Number.isSafeInteger(memory) || memory % 4096 !== 0) throw new TypeError("physical storage or total host memory envelope is invalid");
@@ -215,14 +216,14 @@ function parseLifecycleIntent(value: unknown, machineId: string): MachineLifecyc
 function parseStorageInspection(value: unknown): StorageInspection {
   if (!record(value)) throw protocol("machine storage observation");
   if (value.kind === "unavailable" && ["ownership-missing", "ownership-invalid", "access-unavailable"].includes(text(value.reason)) && Object.keys(value).every((key) => ["kind", "reason"].includes(key))) return { kind: "unavailable", reason: value.reason as "ownership-missing" | "ownership-invalid" | "access-unavailable" };
-  if (value.kind !== "current" || !["preparing", "published", "attached", "replacing", "retiring", "retired"].includes(text(value.phase)) || !["raw", "vhdx"].includes(text(value.format)) || !record(value.payload)) throw protocol("machine storage observation");
+  if (value.kind !== "current" || !["preparing", "published", "replacing", "retiring", "retired"].includes(text(value.phase)) || !record(value.payload)) throw protocol("machine storage observation");
   const capacityBytes = integer(value.capacityBytes);
-  if (capacityBytes < 4096 || capacityBytes > 128 * 1024 ** 3 || capacityBytes % 4096 !== 0 || Object.keys(value).some((key) => !["kind", "phase", "format", "capacityBytes", "operationId", "payload"].includes(key))) throw protocol("machine storage geometry");
+  if (capacityBytes < 4096 || capacityBytes > 128 * 1024 ** 3 || capacityBytes % 4096 !== 0 || Object.keys(value).some((key) => !["kind", "phase", "capacityBytes", "operationId", "payload"].includes(key))) throw protocol("machine storage geometry");
   let payload: StoragePayload;
   if ((value.payload.kind === "present" || value.payload.kind === "capacity-mismatch") && Object.keys(value.payload).every((key) => ["kind", "fileBytes"].includes(key))) payload = { kind: value.payload.kind, fileBytes: integer(value.payload.fileBytes) };
   else if ((value.payload.kind === "missing" || value.payload.kind === "unavailable") && Object.keys(value.payload).length === 1) payload = { kind: value.payload.kind };
   else throw protocol("machine storage payload");
-  return { kind: "current", phase: value.phase as Extract<StorageInspection, { kind: "current" }>["phase"], format: value.format as "raw" | "vhdx", capacityBytes, operationId: value.operationId === null ? null : validateIdentity(text(value.operationId)), payload };
+  return { kind: "current", phase: value.phase as Extract<StorageInspection, { kind: "current" }>["phase"], capacityBytes, operationId: value.operationId === null ? null : validateIdentity(text(value.operationId)), payload };
 }
 
 export function currentMachine(view: MachineInspection): { readonly generation: number } { if (view.machine.kind !== "current" || !record(view.machine.value)) throw new SandsurfHostError("unavailable", "Machine machine observation is unavailable"); return { generation: integer(view.machine.value.generation) }; }
@@ -504,7 +505,13 @@ export function parseSecretRevocation(value: Record<string, unknown>): SecretRev
 
 function identityList(value: unknown): readonly string[] { if (!Array.isArray(value) || value.length > 1024) throw protocol("identity list"); return value.map((item) => validateIdentity(text(item))); }
 
-export function parseUsage(value: Record<string, unknown>): ResourceUsage { if (!record(value.provenance)) throw protocol("resource measurement provenance"); const nullable = (item: unknown): number | null => item === null ? null : integer(item); return { provenance: parseResourceProvenance(value.provenance), hostCounterEpoch: value.hostCounterEpoch === null ? null : digest(text(value.hostCounterEpoch)), channelsCurrent: nullable(value.channelsCurrent), inflightRequestsCurrent: nullable(value.inflightRequestsCurrent), cpuMicros: value.cpuMicros === null ? null : integer(value.cpuMicros), memoryCurrent: value.memoryCurrent === null ? null : integer(value.memoryCurrent), memoryPeak: value.memoryPeak === null ? null : integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: value.ioReadBytes === null ? null : integer(value.ioReadBytes), ioWriteBytes: value.ioWriteBytes === null ? null : integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), executionsCurrent: integer(value.executionsCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
+function parseCpuLedgers(value: unknown): CpuLedgers | null {
+  if (value === null) return null;
+  validateProtocol("CpuLedgers", value);
+  return value;
+}
+
+export function parseUsage(value: Record<string, unknown>): ResourceUsage { if (!record(value.provenance)) throw protocol("resource measurement provenance"); const nullable = (item: unknown): number | null => item === null ? null : integer(item); return { provenance: parseResourceProvenance(value.provenance), hostCounterEpoch: value.hostCounterEpoch === null ? null : digest(text(value.hostCounterEpoch)), channelsCurrent: nullable(value.channelsCurrent), inflightRequestsCurrent: nullable(value.inflightRequestsCurrent), cpuMicros: value.cpuMicros === null ? null : integer(value.cpuMicros), cpuLedgers: parseCpuLedgers(value.cpuLedgers), memoryCurrent: value.memoryCurrent === null ? null : integer(value.memoryCurrent), memoryPeak: value.memoryPeak === null ? null : integer(value.memoryPeak), diskLogicalBytes: integer(value.diskLogicalBytes), diskAllocatedBytes: integer(value.diskAllocatedBytes), ioReadBytes: value.ioReadBytes === null ? null : integer(value.ioReadBytes), ioWriteBytes: value.ioWriteBytes === null ? null : integer(value.ioWriteBytes), outputRetainedBytes: integer(value.outputRetainedBytes), networkRxBytes: integer(value.networkRxBytes), networkTxBytes: integer(value.networkTxBytes), networkConnections: integer(value.networkConnections), executionsCurrent: integer(value.executionsCurrent), complete: value.complete === true, source: text(value.source), observedUnixMillis: integer(value.observedUnixMillis) }; }
 
 export function parseResourceCapabilities(value: Record<string, unknown>): ResourceCapabilities {
   return { nativeTopology: parseCapability(value.nativeTopology), cpuTime: parseCapability(value.cpuTime), aggregateHostMemory: parseCapability(value.aggregateHostMemory), managedAdmission: parseCapability(value.managedAdmission), outputRetention: parseCapability(value.outputRetention), storageReservations: parseCapability(value.storageReservations), networkEnvelope: parseCapability(value.networkEnvelope), aggregatePhysicalStorage: parseCapability(value.aggregatePhysicalStorage), sharedHostWorkers: parseCapability(value.sharedHostWorkers), completeEnforcement: parseCapability(value.completeEnforcement) };
@@ -518,12 +525,8 @@ export function parseResourceAssessment(value: Record<string, unknown>): Resourc
 }
 
 function parseResourceProvenance(value: Record<string, unknown>): ResourceProvenance {
-  const source = (key: string): MeasurementSource => {
-    const item = text(value[key]);
-    if (item !== "unavailable" && item !== "host-cgroup" && item !== "host-filesystem" && item !== "host-retention" && item !== "host-admission" && item !== "host-network" && item !== "guest-reported") throw protocol("measurement source");
-    return item;
-  };
-  return { cpu: source("cpu"), memory: source("memory"), io: source("io"), storage: source("storage"), output: source("output"), executions: source("executions"), channels: source("channels"), network: source("network") };
+  validateProtocol("ResourceProvenance", value);
+  return value;
 }
 
 export function parseRetainedQualification(value: unknown): RetainedQualification {
@@ -531,7 +534,7 @@ export function parseRetainedQualification(value: unknown): RetainedQualificatio
   const run = value.run; const config = value.run.configuration;
   const scope = text(run.scope); const engine = text(config.engine);
   if (scope !== "lifecycle" && scope !== "resources" && scope !== "cpu-time" && scope !== "host-memory" && scope !== "storage-budgets" && scope !== "managed-channels" && scope !== "native-network" && scope !== "disk-snapshots" && scope !== "full-state" && scope !== "images" && scope !== "distribution") throw protocol("qualification scope");
-  if (engine !== "firecracker" && engine !== "apple-virtualization" && engine !== "hyper-v") throw protocol("qualification engine");
+  if (engine !== "firecracker" && engine !== "qemu-hvf" && engine !== "qemu-whpx") throw protocol("qualification engine");
   if (!Array.isArray(run.passedChecks) || run.passedChecks.length > 64) throw protocol("hardware checks");
   return { run: { configuration: { buildDigest: digest(text(config.buildDigest)), platform: text(config.platform), architecture: text(config.architecture), hardwareDigest: digest(text(config.hardwareDigest)), engine, engineDigest: digest(text(config.engineDigest)), imageDigest: digest(text(config.imageDigest)), kernelDigest: digest(text(config.kernelDigest)), initramfsDigest: config.initramfsDigest === null ? null : digest(text(config.initramfsDigest)), nicConfigurationDigest: digest(text(config.nicConfigurationDigest)), storageConfigurationDigest: digest(text(config.storageConfigurationDigest)), resources: parseResources(value.run.configuration.resources) }, scope, observedUnixMillis: integer(run.observedUnixMillis), passedChecks: run.passedChecks.map(text), evidenceDigest: digest(text(run.evidenceDigest)) }, acceptedBy: text(value.acceptedBy), acceptedUnixMillis: integer(value.acceptedUnixMillis), recordDigest: digest(text(value.recordDigest)) };
 }

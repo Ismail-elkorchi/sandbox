@@ -406,10 +406,12 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
                 self.qualification.lifecycle.clone(),
                 "Firecracker lifecycle contract has not passed on this host/configuration",
             ),
-            full_state: qualification(
-                self.qualification.full_state.clone(),
-                "Firecracker full-state contract has not passed on this host/configuration",
-            ),
+            full_state: sandsurf_protocol::Capability::Supported {
+                qualification: qualification(
+                    self.qualification.full_state.clone(),
+                    "Firecracker full-state contract has not passed on this host/configuration",
+                ),
+            },
         }
     }
 

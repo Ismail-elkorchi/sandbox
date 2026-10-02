@@ -57,33 +57,20 @@ async function entries(architecture: "x64" | "arm64", roots: ImageRoots): Promis
     throw new Error(`${directory} image manifest is malformed`);
   }
   if (manifest.formatVersion !== 1) throw new Error(`${directory} is not a machine image`);
-  const artifacts: { artifact: unknown; extension: "ext4" | "vhdx" }[] = [
-    { artifact: manifest.system.rootfs, extension: "ext4" },
-  ];
-  if (manifest.platformArtifacts !== undefined) {
-    if (!record(manifest.platformArtifacts)) throw new Error(`${directory} has invalid platform artifacts`);
-    if (manifest.platformArtifacts.windowsX64 !== undefined) {
-      if (!record(manifest.platformArtifacts.windowsX64) || architecture !== "x64") {
-        throw new Error(`${directory} has invalid Windows artifacts`);
-      }
-      artifacts.push({ artifact: manifest.platformArtifacts.windowsX64.system, extension: "vhdx" });
-    }
+  if (Object.keys(manifest).some((key) => !["formatVersion", "id", "version", "architecture", "bootBundle", "system", "signature"].includes(key))) {
+    throw new Error(`${directory} has unknown machine image fields`);
   }
-  const paths = new Set<string>();
-  return artifacts.map(({ artifact, extension }) => {
-    if (!record(artifact) || typeof artifact.path !== "string" ||
-        !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.(?:ext4|vhdx)$/u.test(artifact.path) ||
-        !artifact.path.endsWith(`.${extension}`) || paths.has(artifact.path) ||
-        typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.sha256)) {
-      throw new Error(`${directory} has an invalid ${extension} artifact identity`);
-    }
-    paths.add(artifact.path);
-    return {
-      raw: resolve(roots.images, directory, artifact.path),
-      compressed: resolve(roots.sources, directory, `${artifact.path}.gz`),
-      sha256: artifact.sha256,
-    };
-  });
+  const artifact = manifest.system.rootfs;
+  if (!record(artifact) || typeof artifact.path !== "string" ||
+      !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.ext4$/u.test(artifact.path) ||
+      typeof artifact.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(artifact.sha256)) {
+    throw new Error(`${directory} has an invalid ext4 artifact identity`);
+  }
+  return [{
+    raw: resolve(roots.images, directory, artifact.path),
+    compressed: resolve(roots.sources, directory, `${artifact.path}.gz`),
+    sha256: artifact.sha256,
+  }];
 }
 
 async function digestFile(path: string): Promise<string> {

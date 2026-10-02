@@ -404,7 +404,10 @@ pub struct ResourceUsage {
     pub host_counter_epoch: Option<crate::Digest>,
     pub channels_current: Option<Counter>,
     pub inflight_requests_current: Option<Counter>,
+    /// A complete externally observed aggregate only where the native
+    /// mechanism establishes one. Separate ledgers below are not its sum.
     pub cpu_micros: Option<Counter>,
+    pub cpu_ledgers: Option<CpuLedgers>,
     pub memory_current: Option<Counter>,
     pub memory_peak: Option<Counter>,
     /// Regular-file lengths in the host-owned machine tree, not guest free
@@ -438,6 +441,7 @@ impl ResourceUsage {
             channels_current: None,
             inflight_requests_current: None,
             cpu_micros: None,
+            cpu_ledgers: None,
             memory_current: None,
             memory_peak: None,
             io_read_bytes: None,
@@ -462,11 +466,28 @@ pub enum MeasurementSource {
     #[default]
     Unavailable,
     HostCgroup,
+    HostDarwinTask,
+    HostJob,
+    HostPartition,
     HostFilesystem,
     HostRetention,
     HostAdmission,
     HostNetwork,
     GuestReported,
+}
+
+/// Worker-lifetime observations fenced by host_counter_epoch, not cumulative
+/// machine-lifetime totals. WHP reports total VP runtime and hypervisor runtime
+/// separately; overlap with Job CPU has not been established. Neither ledger
+/// is guest-reported, and adding them cannot prove unique total CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CpuLedgers {
+    pub native_micros: Option<Counter>,
+    pub native_source: MeasurementSource,
+    pub partition_micros: Option<Counter>,
+    pub partition_hypervisor_micros: Option<Counter>,
+    pub partition_source: MeasurementSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -184,6 +184,13 @@ fn run_kernel_probe() -> KernelProbeResult {
     let network = namespace::probe(true);
     mechanisms.insert("namespace-launcher".into(), namespace);
     mechanisms.insert("network-namespace".into(), network);
+    mechanisms.insert(
+        "native-socket-boundary".into(),
+        probe_outcome(
+            "root-authenticated SO_MARK socket factory with verified nftables INPUT boundary",
+            sandsurf_native::network_sockets::probe(),
+        ),
+    );
     match probe_landlock_enforcement() {
         Ok(abi) => {
             landlock_version = abi;

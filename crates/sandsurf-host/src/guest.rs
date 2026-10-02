@@ -134,22 +134,6 @@ impl GuestConnection for DeadlineConnection {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn deliver_bootstrap(
-    mut channel: impl GuestChannel,
-    bytes: &[u8],
-) -> Result<(), GuestClientError> {
-    if bytes.len() > 4096 {
-        return Err(GuestClientError::Protocol(
-            "guest bootstrap exceeds its bound",
-        ));
-    }
-    let mut connection = DeadlineConnection::new(channel.connect()?, IO_TIMEOUT);
-    connection.write_all(bytes)?;
-    connection.flush()?;
-    Ok(())
-}
-
 impl<C: GuestChannel> GuestClient<C> {
     pub fn new(
         channel: C,

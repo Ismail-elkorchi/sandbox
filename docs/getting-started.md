@@ -84,8 +84,10 @@ Machine creation and OCI boot recipes require an admitted image. They do not
 implicitly install package images or create a second image-publication path.
 Provenance carries known sensitivity; a missing sensitivity declaration is not
 proof that a complete disk contains no secrets, and imports do not scrub disks.
-An image must match the native guest architecture; Windows boot additionally
-requires its verified native kernel and VHDX artifacts.
+An image must match the native guest architecture. All adapters use the same
+raw system-disk contract. QEMU x64 boot requires a supported 64-bit Linux boot
+image or an ELF kernel with a validated physical PVH entry; boot artifacts are
+verified before native launch.
 
 OCI conversion accepts a complete Linux OS filesystem with an executable
 `/sbin/init` and an explicit boot-image recipe:
@@ -122,6 +124,12 @@ Resource reads use the guardian journal's generation fence, not a native power
 query. An unavailable native control channel does not by itself make independent
 host storage, retained-output or gateway measurements unavailable.
 
+On Windows, `cpuLedgers` exposes the owned Jobs' CPU and the original WHP
+partition's VP/hypervisor counters separately. These are worker-lifetime
+observations fenced by `hostCounterEpoch`, not additive machine-lifetime totals.
+`cpuMicros` remains absent when a unique whole-computer total is not established;
+missing native counters are not reported as zero and do not imply power-off.
+
 `(await machine.resources.usage()).executionsCurrent` counts host-owned managed
 admission slots, not Linux PIDs or guest-reported running commands. Admissions
 count before the first guest report and remain reserved through management
@@ -146,7 +154,7 @@ The default guest account obtains root through ordinary `sudo`. Root can change 
 
 `host.inspect().guestPower` distinguishes unsupported guest shutdown/reboot mechanisms from implemented but unqualified ones. Firecracker x86 lacks ACPI poweroff: Linux can halt while the native VM remains running. Ordinary guest reboot recovery requires a native i8042 reset metric, a clean native exit, and confirmed containment. The guardian commits a new execution generation before booting the same persistent disk under the applied configuration. Arbitrary exits and management loss do not trigger recovery. Kernel panic has no automatic reboot timeout. Other native adapters report reboot unsupported until they provide distinct reset evidence and generation fencing.
 
-`const console = await machine.console.attach()` binds a native serial handle to the current generation independently of guest management. `console.read({ after, maximum })` returns binary bytes, durable cursors, explicit retention loss, and capture status; `console.follow()` polls bounded pages. Each computer reserves 64 generations with a 512 KiB retained prefix per generation, 1 MiB/s of reads, and 32 KiB/s of input. `console.write(bytes)` accepts at most 4096 bytes and reports the accepted prefix without automatic retry. Reboot fences old input handles; historical output remains readable. `console.detach()` releases the SDK handle while guardian capture continues. `host.inspect().console` reports native attachment support separately from hardware qualification.
+`const console = await machine.console.attach()` binds a native serial handle to the current generation independently of guest management. `console.read({ after, maximum })` returns binary bytes, durable cursors, explicit retention loss, and capture status; `console.follow()` uses a bounded credit-driven stream shared with event observation, waking on durable capture rather than polling. Each computer reserves 64 generations with a 512 KiB retained prefix per generation, 1 MiB/s of reads, and 32 KiB/s of input. `console.write(bytes)` accepts at most 4096 bytes and reports the accepted prefix without automatic retry. Reboot fences old input handles; historical output remains readable. `console.detach()` releases the SDK handle while guardian capture continues. `host.inspect().console` reports native attachment support separately from hardware qualification.
 
 Use `machine.fs` for guest paths. Artifact import, capture, comparison and host application operate on explicitly selected content. Host publication requires approval of immutable retained content and its destination. Snapshots, forks, rollback, networking, secrets and publication are independent capabilities, not a prescribed workflow.
 
