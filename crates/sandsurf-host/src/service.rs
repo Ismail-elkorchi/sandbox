@@ -204,7 +204,7 @@ struct HostService {
     catalog: HostCatalog,
     executable: PathBuf,
     artifacts: Arc<crate::artifacts::ArtifactStore>,
-    secrets: crate::secrets::SecretAuthority,
+    secrets: Arc<crate::secrets::SecretAuthority>,
 }
 
 impl HostService {
@@ -226,7 +226,9 @@ impl HostService {
         let artifacts = Arc::new(crate::artifacts::ArtifactStore::open(
             &root.join("transfers"),
         )?);
-        let secrets = crate::secrets::SecretAuthority::open(&root.join("secrets"))?;
+        let secrets = Arc::new(crate::secrets::SecretAuthority::open(
+            &root.join("secrets"),
+        )?);
         let service = Self {
             root: root.to_path_buf(),
             catalog,
@@ -257,6 +259,7 @@ impl HostService {
 
     fn route(&mut self, request: HostRequest) -> HostDispatch {
         let result = match request {
+            request @ HostRequest::PutSecret { .. } => self.prepare_secret_put(request),
             HostRequest::Inspect => Ok(HostDispatch::Inspection {
                 root: self.root.clone(),
                 host_id: self.catalog.host_id().as_str().into(),
@@ -1369,46 +1372,9 @@ impl HostService {
             HostRequest::SetNetworkPolicy { .. } | HostRequest::SetExposure { .. } => Err(
                 HostError::Invalid("configuration changes require deferred native effects"),
             ),
-            HostRequest::PutSecret {
-                secret_id,
-                version,
-                bytes,
-                operation_id,
-                approval_id,
-            } => {
-                let commitment = self.secrets.commitment(&secret_id, &version, &bytes)?;
-                let secret = SecretVersion {
-                    id: secret_id.clone(),
-                    version: version.clone(),
-                    bytes: counter(bytes.len() as u64),
-                };
-                let request_digest = digest(
-                    Domain::Secret,
-                    &(
-                        "sandsurf-put-secret-v1",
-                        &secret_id,
-                        &version,
-                        &commitment,
-                        bytes.len(),
-                        &operation_id,
-                    ),
-                )?;
-                let operation = self.catalog.admit_secret_put(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    secret.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if !operation.applied {
-                    let stored = self.secrets.put(secret_id, version, &bytes)?;
-                    self.catalog
-                        .complete_secret_put(&operation_id, &request_digest, &stored)?;
-                }
-                Ok(HostResponse::Secret { secret })
-            }
+            HostRequest::PutSecret { .. } => Err(HostError::Invalid(
+                "secret storage publication requires deferred effects",
+            )),
             HostRequest::DeliverSecret { .. } | HostRequest::RevokeSecret { .. } => Err(
                 HostError::Invalid("secret authority operations require host task admission"),
             ),
@@ -1746,6 +1712,56 @@ impl HostService {
         })
     }
 
+    fn prepare_secret_put(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        match request {
+            HostRequest::PutSecret {
+                secret_id,
+                version,
+                bytes,
+                operation_id,
+                approval_id,
+            } => {
+                let commitment = self.secrets.commitment(&secret_id, &version, &bytes)?;
+                let secret = SecretVersion {
+                    id: secret_id.clone(),
+                    version: version.clone(),
+                    bytes: counter(bytes.len() as u64),
+                };
+                let request_digest = digest(
+                    Domain::Secret,
+                    &(
+                        "sandsurf-put-secret-v1",
+                        &secret_id,
+                        &version,
+                        &commitment,
+                        bytes.len(),
+                        &operation_id,
+                    ),
+                )?;
+                let operation = self.catalog.admit_secret_put(
+                    operation_id.clone(),
+                    request_digest.clone(),
+                    secret.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if operation.applied {
+                    return Ok(HostDispatch::Ready(Box::new(HostResponse::Secret {
+                        secret,
+                    })));
+                }
+                Ok(HostDispatch::Task(Box::new(HostTask::SecretPut {
+                    store: Arc::clone(&self.secrets),
+                    record: operation,
+                    bytes: Zeroizing::new(bytes),
+                })))
+            }
+            _ => Err(HostError::Invalid("not a secret storage request")),
+        }
+    }
+
     fn prepare_secret_delivery(
         &mut self,
         machine_id: MachineId,
@@ -1785,16 +1801,10 @@ impl HostService {
                 HostResponse::SecretDelivery { delivery: record },
             )));
         }
-        let bytes = self
-            .secrets
-            .read(&delivery.secret.id, &delivery.secret.version)?;
-        if bytes.len() as u64 != delivery.secret.bytes.get() {
-            return Err(HostError::Invalid("approved secret version length changed"));
-        }
         Ok(HostDispatch::Task(Box::new(HostTask::SecretPrepare {
             provision: self.prepare_guardian_inner(&machine_id)?,
             record,
-            bytes: Zeroizing::new(bytes),
+            store: Arc::clone(&self.secrets),
         })))
     }
 
@@ -2000,10 +2010,9 @@ impl HostService {
             HostTaskCompletion::SecretPrepare {
                 provision,
                 record,
-                bytes,
                 result,
             } => {
-                result?;
+                let bytes = result?;
                 // The sole catalog owner fences revocation and duplicate
                 // preparations before disclosing bytes to any guest channel.
                 let record = self
@@ -2265,6 +2274,15 @@ impl HostService {
 
     fn complete_task_response(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
         match completion {
+            HostTaskCompletion::SecretPut { record, result } => {
+                let secret = result?;
+                self.catalog.complete_secret_put(
+                    &record.operation_id,
+                    &record.request_digest,
+                    &secret,
+                )?;
+                Ok(HostResponse::Secret { secret })
+            }
             HostTaskCompletion::ImageCleanup {
                 record,
                 reply,
@@ -3562,10 +3580,15 @@ enum HostTask {
         change_set: crate::api::HostChangeSet,
         approval_id: CommitmentId,
     },
+    SecretPut {
+        store: Arc<crate::secrets::SecretAuthority>,
+        record: sandsurf_state::SecretPutRecord,
+        bytes: Zeroizing<Vec<u8>>,
+    },
     SecretPrepare {
         provision: GuardianProvision,
         record: sandsurf_state::SecretDeliveryRecord,
-        bytes: Zeroizing<Vec<u8>>,
+        store: Arc<crate::secrets::SecretAuthority>,
     },
     SecretDelivery {
         endpoint: PathBuf,
@@ -3663,11 +3686,14 @@ enum HostTaskCompletion {
         operation: sandsurf_state::HostTransferOperation,
         result: Result<Box<HostResponse>>,
     },
+    SecretPut {
+        record: sandsurf_state::SecretPutRecord,
+        result: Result<SecretVersion>,
+    },
     SecretPrepare {
         provision: GuardianProvision,
         record: sandsurf_state::SecretDeliveryRecord,
-        bytes: Zeroizing<Vec<u8>>,
-        result: Result<()>,
+        result: Result<Zeroizing<Vec<u8>>>,
     },
     SecretDelivery {
         record: sandsurf_state::SecretDeliveryRecord,
@@ -4067,16 +4093,38 @@ impl HostTask {
                     .map_err(HostError::from);
                 HostTaskCompletion::ArtifactTransfer { operation, result }
             }
-            Self::SecretPrepare {
-                provision,
+            Self::SecretPut {
+                store,
                 record,
                 bytes,
             } => {
-                let result = provision.execute();
+                let result = store
+                    .put(
+                        record.secret.id.clone(),
+                        record.secret.version.clone(),
+                        &bytes,
+                    )
+                    .map_err(HostError::from);
+                HostTaskCompletion::SecretPut { record, result }
+            }
+            Self::SecretPrepare {
+                provision,
+                record,
+                store,
+            } => {
+                let result = (|| {
+                    let bytes = Zeroizing::new(
+                        store.read(&record.delivery.secret.id, &record.delivery.secret.version)?,
+                    );
+                    if bytes.len() as u64 != record.delivery.secret.bytes.get() {
+                        return Err(HostError::Invalid("approved secret version length changed"));
+                    }
+                    provision.execute()?;
+                    Ok(bytes)
+                })();
                 HostTaskCompletion::SecretPrepare {
                     provision,
                     record,
-                    bytes,
                     result,
                 }
             }
@@ -4852,6 +4900,45 @@ mod tests {
     }
 
     #[test]
+    fn secret_publication_changes_store_then_completes_only_on_catalog_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "sssecret-store-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        let mut service = intent_service(&root);
+        let id: SecretId = "credential".try_into().unwrap();
+        let version: SecretVersionId = "version".try_into().unwrap();
+        let operation: OperationId = "put".try_into().unwrap();
+        let request = HostRequest::PutSecret {
+            secret_id: id.clone(),
+            version: version.clone(),
+            bytes: b"protected".to_vec(),
+            operation_id: operation.clone(),
+            approval_id: "approve-put".try_into().unwrap(),
+        };
+        let HostDispatch::Task(task) = service.route(request.clone()) else {
+            panic!("secret publication ran on the catalog writer");
+        };
+        assert!(service.secrets.read(&id, &version).is_err());
+        assert!(matches!(service.catalog.operation(&operation).unwrap(),
+            Some(sandsurf_state::HostOperationRecord::SecretPut(record)) if !record.applied));
+        let completion = task.execute();
+        assert_eq!(service.secrets.read(&id, &version).unwrap(), b"protected");
+        assert!(matches!(service.catalog.operation(&operation).unwrap(),
+            Some(sandsurf_state::HostOperationRecord::SecretPut(record)) if !record.applied));
+        service.complete_task(completion).unwrap();
+        assert!(matches!(service.catalog.operation(&operation).unwrap(),
+            Some(sandsurf_state::HostOperationRecord::SecretPut(record)) if record.applied));
+        assert!(
+            matches!(service.route(request), HostDispatch::Ready(response)
+            if matches!(response.as_ref(), HostResponse::Secret { secret } if secret.id == id && secret.version == version))
+        );
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn secret_preparation_does_not_disclose_and_catalog_completion_fences_duplicate_or_revoked_delivery()
      {
         let root = std::env::temp_dir().join(format!(
@@ -4900,14 +4987,13 @@ mod tests {
                 )
                 .unwrap();
         }
-        let completion = |record, result| HostTaskCompletion::SecretPrepare {
+        let completion = |record, result: Result<()>| HostTaskCompletion::SecretPrepare {
             provision: GuardianProvision {
                 host_root: root.clone(),
                 machine: machine.clone(),
             },
             record,
-            bytes: Zeroizing::new(b"secret".to_vec()),
-            result,
+            result: result.map(|()| Zeroizing::new(b"secret".to_vec())),
         };
         assert!(
             service

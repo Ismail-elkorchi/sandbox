@@ -112,32 +112,64 @@ impl SecretAuthority {
         validate_bytes(bytes)?;
         let directory = self.root.join(object_name(id.as_str()));
         sandsurf_native::local::ensure_private_directory(&directory)?;
-        let path = directory.join(object_name(version.as_str()));
+        let name = object_name(version.as_str());
+        let path = directory.join(&name);
+        // One physical writer owns this version and its unpublished stage.
+        // A crash releases the lease; an exact retry reclaims interrupted bytes
+        // without scanning or deleting another version's active preparation.
+        let _custody =
+            sandsurf_native::storage::disk_lease(&directory.join(format!(".{name}.lock")))?;
+        let temporary = directory.join(format!(".{name}.pending"));
+        match fs::remove_file(&temporary) {
+            Ok(()) => sync_directory(&directory)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let exists = match fs::symlink_metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
         if exists {
-            if self.read(&id, &version)?.as_slice() != bytes {
+            if Zeroizing::new(self.read(&id, &version)?).as_slice() != bytes {
                 return Err(SecretError::Conflict(
                     "opaque secret version already has different bytes",
                 ));
             }
         } else {
-            let nonce = random_nonce()?;
-            let temporary = directory.join(format!(".{nonce}.pending"));
-            let mut file = sandsurf_native::local::create_private_file(&temporary)?;
-            file.write_all(MAGIC)?;
-            file.write_all(&self.mac(&id, &version, bytes).finalize().into_bytes())?;
-            file.write_all(&(bytes.len() as u64).to_be_bytes())?;
-            file.write_all(bytes)?;
-            sandsurf_native::storage::sync_file(&file)?;
-            drop(file);
-            // The exclusively owned host catalog admits the version before publication.
-            fs::rename(&temporary, &path)?;
-            sync_directory(&directory)?;
+            let result = (|| {
+                let mut file = sandsurf_native::local::create_private_file(&temporary)?;
+                file.write_all(MAGIC)?;
+                file.write_all(&self.mac(&id, &version, bytes).finalize().into_bytes())?;
+                file.write_all(&(bytes.len() as u64).to_be_bytes())?;
+                file.write_all(bytes)?;
+                sandsurf_native::storage::sync_file(&file)?;
+                drop(file);
+                // Catalog admission is not a filesystem writer lease. Concurrent
+                // admitted effects must never replace an immutable version.
+                match sandsurf_native::storage::publish_new_file(&temporary, &path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        if Zeroizing::new(self.read(&id, &version)?).as_slice() != bytes {
+                            return Err(SecretError::Conflict(
+                                "opaque secret version already has different bytes",
+                            ));
+                        }
+                        Ok(())
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })();
+            match fs::remove_file(&temporary) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            result?;
         }
+        // A racing identical publication can observe the name before its
+        // original publisher's directory fsync. This caller commits it too.
+        sync_directory(&directory)?;
         Ok(SecretVersion {
             id,
             version,
@@ -166,12 +198,12 @@ impl SecretAuthority {
         if &header[..8] != MAGIC || declared.checked_add(HEADER_BYTES as u64) != Some(length) {
             return Err(SecretError::Invalid("secret object header is malformed"));
         }
-        let mut bytes = vec![0; declared as usize];
+        let mut bytes = Zeroizing::new(vec![0; declared as usize]);
         file.read_exact(&mut bytes)?;
         self.mac(id, version, &bytes)
             .verify_slice(&header[8..40])
             .map_err(|_| SecretError::Conflict("private secret integrity check failed"))?;
-        Ok(bytes)
+        Ok(std::mem::take(&mut *bytes))
     }
 }
 
@@ -233,6 +265,130 @@ mod tests {
                 );
             }
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_publication_never_replaces_an_opaque_version_or_leaves_stages() {
+        use std::sync::{Arc, Barrier};
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-concurrent-secrets-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let authority = Arc::new(SecretAuthority::open(&root).unwrap());
+        let version: SecretVersionId = "immutable-version".try_into().unwrap();
+        for identical in [false, true] {
+            let id: SecretId = format!("secret-{identical}").try_into().unwrap();
+            let barrier = Arc::new(Barrier::new(8));
+            let results = std::thread::scope(|scope| {
+                let workers = (0..8)
+                    .map(|index| {
+                        let authority = Arc::clone(&authority);
+                        let barrier = Arc::clone(&barrier);
+                        let id = id.clone();
+                        let version = version.clone();
+                        scope.spawn(move || {
+                            let marker = if identical { 9 } else { index };
+                            let bytes = Zeroizing::new(vec![marker; MAX_SECRET_BYTES]);
+                            barrier.wait();
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            loop {
+                                match authority.put(id.clone(), version.clone(), &bytes) {
+                                    Err(SecretError::Io(error))
+                                        if error.kind() == io::ErrorKind::WouldBlock =>
+                                    {
+                                        assert!(
+                                            std::time::Instant::now() < deadline,
+                                            "writer custody did not release"
+                                        );
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
+                                    result => break (marker, result),
+                                }
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let successes = results.iter().filter(|(_, result)| result.is_ok()).count();
+            assert_eq!(successes, if identical { 8 } else { 1 });
+            let actual = Zeroizing::new(authority.read(&id, &version).unwrap());
+            assert_eq!(actual.len(), MAX_SECRET_BYTES);
+            for (marker, result) in results {
+                match result {
+                    Ok(_) => assert!(
+                        actual.iter().all(|byte| *byte == marker),
+                        "a successful publisher's immutable bytes were replaced"
+                    ),
+                    Err(SecretError::Conflict(_)) => assert!(!identical),
+                    Err(error) => panic!("unexpected publication failure: {error}"),
+                }
+            }
+            let directory = root.join(object_name(id.as_str()));
+            let entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 2);
+            assert!(entries.contains(&std::ffi::OsString::from(object_name(version.as_str()))));
+            assert!(
+                entries.contains(&std::ffi::OsString::from(format!(
+                    ".{}.lock",
+                    object_name(version.as_str())
+                ))),
+                "a competing publication left secret-bearing pending bytes behind"
+            );
+        }
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_secret_stage_is_reclaimed_only_under_its_version_custody() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-interrupted-secret-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        ));
+        let authority = SecretAuthority::open(&root).unwrap();
+        let id: SecretId = "credential".try_into().unwrap();
+        let version: SecretVersionId = "version".try_into().unwrap();
+        let directory = root.join(object_name(id.as_str()));
+        sandsurf_native::local::ensure_private_directory(&directory).unwrap();
+        let name = object_name(version.as_str());
+        let stage = directory.join(format!(".{name}.pending"));
+        let unrelated = directory.join(".another-version.pending");
+        fs::write(&stage, b"interrupted plaintext").unwrap();
+        fs::write(&unrelated, b"other preparation").unwrap();
+        let custody =
+            sandsurf_native::storage::disk_lease(&directory.join(format!(".{name}.lock"))).unwrap();
+        assert!(
+            matches!(authority.put(id.clone(), version.clone(), b"published"),
+            Err(SecretError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"interrupted plaintext");
+        drop(custody);
+        drop(authority);
+        let authority = SecretAuthority::open(&root).unwrap();
+        authority
+            .put(id.clone(), version.clone(), b"published")
+            .unwrap();
+        assert!(!stage.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"other preparation");
+        assert_eq!(authority.read(&id, &version).unwrap(), b"published");
+        assert!(
+            authority
+                .put(id.clone(), version.clone(), b"different")
+                .is_err()
+        );
+        assert_eq!(authority.read(&id, &version).unwrap(), b"published");
+        drop(authority);
         fs::remove_dir_all(root).unwrap();
     }
 
