@@ -6,6 +6,7 @@ mod capture;
 mod console;
 pub mod guardian;
 pub mod guest;
+mod guest_transport;
 mod guest_worker;
 mod image_records;
 pub mod image_worker;

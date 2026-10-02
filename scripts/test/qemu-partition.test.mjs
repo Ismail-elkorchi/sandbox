@@ -75,7 +75,8 @@ int main(int argc, char **argv) {
       assert.equal(result.status, 0, `counter scenario ${scenario}: ${result.stderr}`);
     }
     const qapi = await readFile("vmm/qemu/sandsurf-qapi.json", "utf8");
-    assert.match(qapi, /'if': 'CONFIG_WHPX'/u);
+    assert.match(qapi, /'if': 'CONFIG_WIN32'/u);
+    assert.doesNotMatch(qapi, /'if': 'CONFIG_WHPX'/u);
     assert.match(qapi, /'query-sandsurf-partition-counters'/u);
     assert.doesNotMatch(qapi, /'pid'|'handle'|'partition-id'/u);
   } finally { await rm(root, { recursive: true, force: true }); }

@@ -63,6 +63,34 @@ pub(crate) struct CaptureBoundary {
 }
 
 impl CaptureBoundary {
+    /// Only a positively observed native transition can retire an interrupted
+    /// pause. Running alone cannot clear its owner; management health is absent
+    /// from this decision. Both native adapters use this same recovery rule.
+    pub fn reconcile_transition(
+        root: &Path,
+        outcome: &sandsurf_machine::MachineOutcome,
+    ) -> Result<bool> {
+        let sandsurf_machine::MachineOutcome::Observed(values) = outcome else {
+            return Ok(false);
+        };
+        let Some(last) = values.last() else {
+            return Ok(false);
+        };
+        if matches!(
+            last.state,
+            MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed
+        ) {
+            Self::clear(root)?;
+        }
+        Ok(matches!(
+            last.state,
+            MachineState::Running
+                | MachineState::Suspended
+                | MachineState::Stopped
+                | MachineState::Destroyed
+        ) && Self::read(root)?.is_none())
+    }
+
     /// A lost native resume response is not permission to resume twice, and a
     /// failed preparation is not proof that the computer was ever paused.
     pub fn needs_resume(&self, observed: MachineState) -> Result<bool> {
@@ -178,6 +206,49 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn uncertain_or_running_power_never_retires_an_interrupted_capture() {
+        let root = Temp::new();
+        CaptureBoundary::begin(
+            &root.0,
+            "capture".try_into().unwrap(),
+            Counter::ONE,
+            MachineState::Running,
+        )
+        .unwrap();
+        assert!(
+            !CaptureBoundary::reconcile_transition(
+                &root.0,
+                &sandsurf_machine::MachineOutcome::Unknown
+            )
+            .unwrap()
+        );
+        let observed = |state| {
+            sandsurf_machine::MachineOutcome::Observed(vec![sandsurf_machine::MachineTransition {
+                generation: Counter::ONE,
+                state,
+                evidence_digest: sandsurf_protocol::bytes_digest(b"native transition"),
+            }])
+        };
+        for state in [
+            MachineState::Running,
+            MachineState::Paused,
+            MachineState::Failed,
+        ] {
+            assert!(!CaptureBoundary::reconcile_transition(&root.0, &observed(state)).unwrap());
+            assert!(CaptureBoundary::read(&root.0).unwrap().is_some());
+        }
+        assert!(
+            CaptureBoundary::reconcile_transition(&root.0, &observed(MachineState::Stopped))
+                .unwrap()
+        );
+        assert!(CaptureBoundary::read(&root.0).unwrap().is_none());
+        assert!(
+            CaptureBoundary::reconcile_transition(&root.0, &observed(MachineState::Running))
+                .unwrap()
+        );
+    }
 
     struct Temp(PathBuf);
     impl Temp {

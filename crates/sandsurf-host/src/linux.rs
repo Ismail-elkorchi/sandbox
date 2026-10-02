@@ -7,6 +7,7 @@ use crate::guardian::{
     EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
+use crate::guest_transport::GuestTransport;
 use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::firecracker::{FirecrackerConfig, FirecrackerProcess, FirecrackerRestore};
 use sandsurf_machine::linux::{
@@ -19,10 +20,10 @@ use sandsurf_native::storage::object_name;
 use sandsurf_network::NativeNetworkGateway;
 use sandsurf_protocol::{BootCapability, BootIdentity, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
-    Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
-    GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
-    NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources,
-    RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
+    Counter, Digest, Domain, ExecutionDefaults, GuestServiceRequest, LifecycleCommand, MachineId,
+    MachineObservation, MachineState, NativeFullCapture, NativeSnapshotRequest,
+    NativeSnapshotResponse, NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact,
+    VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -346,7 +346,7 @@ pub struct LinuxGuardianEffect {
     config: LinuxGuardianConfig,
     machine: FirecrackerDriver<LinuxGenerationFactory>,
     guest_binding: Arc<Mutex<Option<ActiveGuest>>>,
-    guest_transport: Arc<LinuxGuestTransport>,
+    guest_transport: Arc<GuestTransport<ActiveGuest, UnixVsockChannel>>,
     network: Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
     network_usage: NetworkUsage,
     installed_runtime: Option<InstalledRuntime>,
@@ -461,7 +461,7 @@ impl LinuxGuardianEffect {
             config,
             machine,
             guest_binding: active,
-            guest_transport: Arc::new(LinuxGuestTransport::new(
+            guest_transport: Arc::new(GuestTransport::new(
                 crate::capture::CaptureBoundary::read(machine_root)
                     .map_err(|error| LinuxError::Invalid(error.to_string()))?
                     .is_some(),
@@ -583,17 +583,15 @@ impl GuardianEffect for LinuxGuardianEffect {
         assessment
     }
     fn guest_io_admissible(&self) -> bool {
-        !self.guest_transport.capture_blocked.load(Ordering::Acquire)
+        self.guest_transport.admissible()
     }
     fn capture_owner(&self) -> ControlResult<Option<sandsurf_protocol::OperationId>> {
         Ok(crate::capture::CaptureBoundary::read(&self.machine_root)?
             .map(|capture| capture.operation_id))
     }
     fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
-        Box::new(LinuxGuest {
-            active: Arc::clone(&self.guest_binding),
-            remote: Arc::clone(&self.guest_transport),
-        })
+        self.guest_transport
+            .driver(Arc::clone(&self.guest_binding), managed_guest)
     }
 
     fn transition(
@@ -689,23 +687,11 @@ impl GuardianEffect for LinuxGuardianEffect {
             // private duplicate is safe and lets later recovery retry cleanup.
             eprintln!("sandsurf retained suspend staging after cleanup failure: {error}");
         }
-        if matches!(
-            &outcome,
-            MachineOutcome::Observed(values)
-                if values.last().is_some_and(|value| matches!(value.state, MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed))
-        ) && let Err(error) = crate::capture::CaptureBoundary::clear(&self.machine_root)
+        if let Err(error) = self
+            .guest_transport
+            .reconcile_capture(&self.machine_root, &outcome)
         {
-            eprintln!("sandsurf capture cleanup deferred: {error}");
-        }
-        if matches!(
-            &outcome,
-            MachineOutcome::Observed(values)
-                if values.last().is_some_and(|value| matches!(value.state, MachineState::Running | MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed))
-        ) && matches!(
-            crate::capture::CaptureBoundary::read(&self.machine_root),
-            Ok(None)
-        ) {
-            let _ = self.guest_transport.release_capture();
+            eprintln!("sandsurf capture transport recovery deferred: {error}");
         }
         outcome
     }
@@ -1714,123 +1700,6 @@ impl LinuxGenerationFactory {
     }
 }
 
-struct LinuxGuest {
-    active: Arc<Mutex<Option<ActiveGuest>>>,
-    remote: Arc<LinuxGuestTransport>,
-}
-
-/// Only I/O coordination, not a second capture or lifecycle authority. The
-/// persisted CaptureBoundary owns admission and recovery. Keep this gate closed
-/// until that boundary has been retired after native resume or confirmed stop.
-struct LinuxGuestTransport {
-    capture_blocked: AtomicBool,
-    session: Mutex<Option<(ActiveGuest, ManagedGuestClient<UnixVsockChannel>)>>,
-}
-
-impl LinuxGuestTransport {
-    fn new(capture_blocked: bool) -> Self {
-        Self {
-            capture_blocked: AtomicBool::new(capture_blocked),
-            session: Mutex::new(None),
-        }
-    }
-
-    fn quiesce(&self) -> ControlResult<()> {
-        self.quiesce_with_timeout(Duration::from_secs(10))
-    }
-
-    fn quiesce_with_timeout(&self, timeout: Duration) -> ControlResult<()> {
-        self.capture_blocked.store(true, Ordering::Release);
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match self.session.try_lock() {
-                Ok(mut session) => {
-                    *session = None;
-                    return Ok(());
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(ControlError::Protocol("guest transport lock poisoned"));
-                }
-                Err(std::sync::TryLockError::WouldBlock)
-                    if std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    return Err(ControlError::Unsupported(
-                        "guest I/O has not quiesced; capture remains pending",
-                    ));
-                }
-            }
-        }
-    }
-
-    fn release_capture(&self) -> ControlResult<()> {
-        self.quiesce()?;
-        self.capture_blocked.store(false, Ordering::Release);
-        Ok(())
-    }
-}
-
-fn with_cached_guest<T>(
-    active: &ActiveGuest,
-    transport: &LinuxGuestTransport,
-    operation: impl FnOnce(&mut ManagedGuestClient<UnixVsockChannel>) -> T,
-) -> Option<T> {
-    let mut cache = transport.session.lock().ok()?;
-    if transport.capture_blocked.load(Ordering::Acquire) {
-        return None;
-    }
-    if cache.as_ref().is_none_or(|(cached, _)| cached != active) {
-        *cache = Some((active.clone(), managed_guest(active)));
-    }
-    Some(operation(&mut cache.as_mut()?.1))
-}
-
-impl LinuxGuest {
-    fn endpoint(&self) -> Option<ActiveGuest> {
-        self.active.lock().ok()?.clone()
-    }
-
-    fn with_driver<T>(
-        &self,
-        operation: impl FnOnce(&mut ManagedGuestClient<UnixVsockChannel>) -> T,
-    ) -> Option<T> {
-        let active = self.endpoint();
-        let Some(active) = active else {
-            if let Ok(mut remote) = self.remote.session.lock() {
-                *remote = None;
-            }
-            return None;
-        };
-        with_cached_guest(&active, &self.remote, operation)
-    }
-}
-
-impl GuestDriver for LinuxGuest {
-    fn dispatch(&mut self, command: &GuestCommand) -> EffectOutcome {
-        self.with_driver(|driver| driver.dispatch(command))
-            .unwrap_or_else(|| {
-                EffectOutcome::NotApplied(bytes_digest(b"guest-management-not-dispatched"))
-            })
-    }
-
-    fn poll(
-        &mut self,
-        hints: &crate::guest_worker::ExecutionHints,
-    ) -> ControlResult<crate::guest_worker::GuestPoll> {
-        self.with_driver(|driver| driver.poll(hints))
-            .ok_or(ControlError::Unsupported("guest management unavailable"))?
-    }
-
-    fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        self.with_driver(|driver| driver.query(request))
-            .ok_or(ControlError::Unsupported(
-                "guest management transport is unavailable",
-            ))?
-    }
-}
-
 fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<UnixVsockChannel> {
     let pending = active.rebind.as_ref().map(|binding| {
         let source = ActiveGuest {
@@ -2114,88 +1983,6 @@ mod storage_tests {
         drop(configuration);
         drop(factory);
         fs::remove_dir_all(root).unwrap();
-    }
-
-    fn endpoint() -> ActiveGuest {
-        ActiveGuest {
-            rebind: None,
-            socket: PathBuf::from("/not-connected"),
-            machine_id: "capture-transport".try_into().unwrap(),
-            generation: Counter::ONE,
-            boot_identity: bytes_digest(b"boot"),
-            capability: [1; 32],
-            boot_directory: PathBuf::from("/not-connected/boot"),
-        }
-    }
-
-    #[test]
-    fn capture_drains_active_rpc_and_excludes_queued_sends() {
-        use std::sync::mpsc;
-        let transport = Arc::new(LinuxGuestTransport::new(false));
-        let (entered, entry) = mpsc::channel();
-        let (finish, finished) = mpsc::channel();
-        let worker_transport = Arc::clone(&transport);
-        let worker = std::thread::spawn(move || {
-            with_cached_guest(&endpoint(), &worker_transport, |_| {
-                entered.send(()).unwrap();
-                finished.recv_timeout(Duration::from_secs(5)).unwrap();
-            })
-        });
-        entry.recv_timeout(Duration::from_secs(5)).unwrap();
-        let capture_transport = Arc::clone(&transport);
-        let (quiesced, quiescence) = mpsc::channel();
-        let capture = std::thread::spawn(move || {
-            capture_transport.quiesce().unwrap();
-            quiesced.send(()).unwrap();
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !transport.capture_blocked.load(Ordering::Acquire) {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        assert!(
-            quiescence.try_recv().is_err(),
-            "capture must await the active RPC"
-        );
-        finish.send(()).unwrap();
-        assert!(worker.join().unwrap().is_some());
-        quiescence.recv_timeout(Duration::from_secs(5)).unwrap();
-        capture.join().unwrap();
-        assert!(transport.session.lock().unwrap().is_none());
-        assert!(
-            with_cached_guest(&endpoint(), &transport, |_| panic!("sent while paused")).is_none()
-        );
-        transport.release_capture().unwrap();
-        assert_eq!(with_cached_guest(&endpoint(), &transport, |_| 42), Some(42));
-        assert!(transport.session.lock().unwrap().is_some());
-        transport.quiesce().unwrap();
-        assert!(transport.session.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn interrupted_capture_transport_starts_closed_until_recovery() {
-        let transport = LinuxGuestTransport::new(true);
-        assert!(
-            with_cached_guest(&endpoint(), &transport, |_| panic!("sent before recovery"))
-                .is_none()
-        );
-        transport.release_capture().unwrap();
-        assert_eq!(with_cached_guest(&endpoint(), &transport, |_| 7), Some(7));
-    }
-
-    #[test]
-    fn slow_guest_cannot_indefinitely_block_native_capture_control() {
-        let transport = LinuxGuestTransport::new(false);
-        let session = transport.session.lock().unwrap();
-        assert!(
-            transport
-                .quiesce_with_timeout(Duration::from_millis(2))
-                .is_err()
-        );
-        assert!(transport.capture_blocked.load(Ordering::Acquire));
-        drop(session);
-        transport.release_capture().unwrap();
-        assert!(!transport.capture_blocked.load(Ordering::Acquire));
     }
 
     #[test]

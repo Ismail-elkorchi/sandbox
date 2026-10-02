@@ -13,6 +13,8 @@ test("the pinned QEMU hooks cannot accept drift, duplicate owners or omit partit
   const main = '#include "qemu-main.h"\n    qemu_init(argc, argv);';
   const whpx = "    hr = whp_dispatch.WHvSetupPartition(whpx->partition);";
   const schema = readFileSync("vmm/qemu/sandsurf-qapi.json", "utf8");
+  assert.equal((schema.match(/'if': 'CONFIG_WIN32'/gu) ?? []).length, 2);
+  assert.doesNotMatch(schema, /'if': 'CONFIG_WHPX'/u);
   const hooked = ownerHooks(main, whpx, "# pinned misc schema", schema);
   assert.match(hooked.main, /sandsurf_qemu_enter\(argc, &argv\);\n    qemu_init/u);
   assert.ok(hooked.whpx.indexOf("WHvSetPartitionProperty") < hooked.whpx.indexOf("WHvSetupPartition"));

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Native owner observation only; absent management/control is not VM death.
+# This schema is compiled into host-wide QAPI objects. CONFIG_WHPX is a
+# target-only feature (and deliberately poisoned there); use the Windows
+# host condition. The sealed Windows product has exactly one accelerator,
+# WHPX, so the corresponding command is implemented on every Windows build.
 ##
 # @SandsurfPartitionCounters:
 #
@@ -19,7 +23,7 @@
   'data': { 'total-runtime-micros': 'uint64',
             'hypervisor-runtime-micros': 'uint64',
             'virtual-processors': 'uint32' },
-  'if': 'CONFIG_WHPX' }
+  'if': 'CONFIG_WIN32' }
 ##
 # @query-sandsurf-partition-counters:
 #
@@ -33,4 +37,4 @@
 ##
 { 'command': 'query-sandsurf-partition-counters',
   'returns': 'SandsurfPartitionCounters',
-  'if': 'CONFIG_WHPX' }
+  'if': 'CONFIG_WIN32' }

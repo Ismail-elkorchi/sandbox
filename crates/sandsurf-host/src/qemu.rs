@@ -7,6 +7,7 @@ use crate::guardian::{
     EffectOutcome, Error as ControlError, GuardianEffect, GuestDriver, Result as ControlResult,
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
+use crate::guest_transport::GuestTransport;
 use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::qemu::{Accelerator, LaunchConfig};
 use sandsurf_machine::qemu_driver::{
@@ -18,10 +19,9 @@ use sandsurf_native::storage::object_name;
 use sandsurf_network::NativeNetworkGateway;
 use sandsurf_protocol::{BootCapability, BootIdentity};
 use sandsurf_protocol::{
-    Counter, Digest, Domain, ExecutionDefaults, GuestCommand, GuestServiceRequest,
-    GuestServiceResponse, LifecycleCommand, MachineId, MachineObservation, MachineState,
-    NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources, RuntimeConfiguration,
-    SnapshotArtifact, bytes_digest, digest,
+    Counter, Digest, Domain, ExecutionDefaults, GuestServiceRequest, LifecycleCommand, MachineId,
+    MachineObservation, MachineState, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy,
+    Resources, RuntimeConfiguration, SnapshotArtifact, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -243,6 +243,7 @@ pub struct QemuGuardianEffect {
     config: QemuGuardianConfig,
     machine: QemuDriver,
     guest_binding: Arc<Mutex<Option<ActiveGuest>>>,
+    guest_transport: Arc<GuestTransport<ActiveGuest, SerialChannel>>,
     pending: Option<ActiveGuest>,
     network: Arc<Mutex<Option<Arc<NativeNetworkGateway>>>>,
     network_usage: NetworkUsage,
@@ -259,11 +260,6 @@ struct ActiveGuest {
     boot_identity: Digest,
     capability: [u8; 32],
     boot_directory: PathBuf,
-}
-
-struct QemuGuest {
-    active: Arc<Mutex<Option<ActiveGuest>>>,
-    remote: Option<(ActiveGuest, ManagedGuestClient<SerialChannel>)>,
 }
 
 struct InstalledRuntime {
@@ -352,6 +348,11 @@ impl QemuGuardianEffect {
             machine: QemuDriver::new(qemu)
                 .map_err(|error| QemuError::Invalid(format!("invalid Qemu VM: {error:?}")))?,
             guest_binding: active,
+            guest_transport: Arc::new(GuestTransport::new(
+                crate::capture::CaptureBoundary::read(machine_root)
+                    .map_err(|error| QemuError::Invalid(error.to_string()))?
+                    .is_some(),
+            )),
             pending: None,
             network: Arc::new(Mutex::new(None)),
             network_usage,
@@ -518,6 +519,7 @@ impl QemuGuardianEffect {
             observation.value().generation,
             observation.value().state,
         )?;
+        self.guest_transport.quiesce()?;
         let result = if boundary.preserve_pause {
             self.machine.adopt_pause_for_capture()
         } else {
@@ -530,6 +532,7 @@ impl QemuGuardianEffect {
         let Some(boundary) = crate::capture::CaptureBoundary::read(&self.machine_root)? else {
             return Ok(());
         };
+        self.guest_transport.quiesce()?;
         let power = self
             .machine
             .observe_power()
@@ -546,7 +549,8 @@ impl QemuGuardianEffect {
             self.machine.finish_capture_without_resume()
         };
         result.map_err(|_| ControlError::Unsupported("native capture completion failed"))?;
-        crate::capture::CaptureBoundary::clear(&self.machine_root)
+        crate::capture::CaptureBoundary::clear(&self.machine_root)?;
+        self.guest_transport.release_capture()
     }
 
     fn prepare_full_capture(
@@ -879,54 +883,10 @@ enum RuntimeInstallation {
     Unknown,
 }
 
-impl QemuGuest {
-    fn endpoint(&self) -> Option<ActiveGuest> {
-        self.active.lock().ok()?.clone()
-    }
-
-    fn driver(&mut self) -> Option<&mut ManagedGuestClient<SerialChannel>> {
-        let active = self.endpoint();
-        let Some(active) = active else {
-            self.remote = None;
-            return None;
-        };
-        if self
-            .remote
-            .as_ref()
-            .is_none_or(|(cached, _)| cached != &active)
-        {
-            self.remote = Some((active.clone(), managed_guest(&active)));
-        }
-        self.remote.as_mut().map(|(_, driver)| driver)
-    }
-}
-
-impl GuestDriver for QemuGuest {
-    fn dispatch(&mut self, command: &GuestCommand) -> EffectOutcome {
-        let Some(driver) = self.driver() else {
-            return EffectOutcome::NotApplied(bytes_digest(b"qemu-guest-not-running"));
-        };
-        driver.dispatch(command)
-    }
-
-    fn poll(
-        &mut self,
-        hints: &crate::guest_worker::ExecutionHints,
-    ) -> ControlResult<crate::guest_worker::GuestPoll> {
-        self.driver()
-            .ok_or(ControlError::Unsupported("guest management unavailable"))?
-            .poll(hints)
-    }
-
-    fn query(&mut self, request: GuestServiceRequest) -> ControlResult<GuestServiceResponse> {
-        let driver = self.driver().ok_or(ControlError::Unsupported(
-            "guest is unavailable because the Qemu VM has no live owner",
-        ))?;
-        driver.query(request)
-    }
-}
-
 impl GuardianEffect for QemuGuardianEffect {
+    fn guest_io_admissible(&self) -> bool {
+        self.guest_transport.admissible()
+    }
     fn resource_envelope(&self) -> Option<Resources> {
         Some(self.config.resources.clone())
     }
@@ -962,10 +922,8 @@ impl GuardianEffect for QemuGuardianEffect {
             .map(|capture| capture.operation_id))
     }
     fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
-        Box::new(QemuGuest {
-            active: Arc::clone(&self.guest_binding),
-            remote: None,
-        })
+        self.guest_transport
+            .driver(Arc::clone(&self.guest_binding), managed_guest)
     }
 
     fn transition(
@@ -1076,13 +1034,11 @@ impl GuardianEffect for QemuGuardianEffect {
         {
             eprintln!("sandsurf retained Qemu suspend staging after cleanup failure: {error}");
         }
-        if matches!(
-            &outcome,
-            MachineOutcome::Observed(values)
-                if values.last().is_some_and(|value| matches!(value.state, MachineState::Suspended | MachineState::Stopped | MachineState::Destroyed))
-        ) && let Err(error) = crate::capture::CaptureBoundary::clear(&self.machine_root)
+        if let Err(error) = self
+            .guest_transport
+            .reconcile_capture(&self.machine_root, &outcome)
         {
-            eprintln!("sandsurf capture cleanup deferred: {error}");
+            eprintln!("sandsurf capture transport recovery deferred: {error}");
         }
         outcome
     }
