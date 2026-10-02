@@ -31,13 +31,6 @@ pub fn capabilities(
     let unsupported = |reason: &str| Capability::Unsupported {
         reasons: vec![reason.into()],
     };
-    let linux = |reason: &str| {
-        if cfg!(target_os = "linux") {
-            implemented()
-        } else {
-            unsupported(reason)
-        }
-    };
     ResourceCapabilities {
         native_topology: implemented(),
         cpu_time: implemented(),
@@ -50,17 +43,16 @@ pub fn capabilities(
             Ok(_) => implemented(),
             Err(error) => unsupported(&error.to_string()),
         },
-        shared_host_workers: linux(
-            "no external API/artifact and image-worker process pools for this adapter",
-        ),
-        complete_enforcement: if cfg!(target_os = "linux")
-            && sandsurf_native::volume::inspect(root).is_ok()
+        // All native adapters own the same three pools. Darwin's broker and
+        // Windows' original Job owners replace systemd, not the pool model.
+        shared_host_workers: implemented(),
+        complete_enforcement: if sandsurf_native::volume::inspect(root).is_ok()
             && matches!(network_egress, Capability::Supported { .. })
         {
             implemented()
         } else {
             unsupported(
-                "complete enforcement requires bounded host/machine volumes, Linux native resource mechanisms, and the installed kernel socket boundary",
+                "complete enforcement requires bounded host/machine volumes, native resource mechanisms, and the installed kernel socket boundary",
             )
         },
     }
@@ -147,6 +139,32 @@ pub fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_shared_pools_do_not_qualify_the_missing_external_network_boundary() {
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-resource-capabilities-{}",
+            sandsurf_protocol::bytes_digest(&nonce).as_str()
+        ));
+        sandsurf_native::local::create_private_directory(&root).unwrap();
+        let network = sandsurf_protocol::Capability::Unsupported {
+            reasons: vec!["socket boundary absent".into()],
+        };
+        let values = capabilities(&root, &network);
+        assert!(matches!(
+            values.shared_host_workers,
+            sandsurf_protocol::Capability::Supported {
+                qualification: sandsurf_protocol::Qualification::Unqualified { .. }
+            }
+        ));
+        assert!(matches!(
+            values.complete_enforcement,
+            sandsurf_protocol::Capability::Unsupported { .. }
+        ));
+        std::fs::remove_dir(&root).unwrap();
+    }
 
     #[test]
     fn assessment_uses_the_actual_native_engine() {
