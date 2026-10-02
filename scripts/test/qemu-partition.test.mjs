@@ -21,8 +21,9 @@ typedef uint32_t UINT32;
 typedef void *PVOID;
 typedef void *HMODULE;
 typedef void *WHV_PARTITION_HANDLE;
-typedef int WHV_VIRTUAL_PROCESSOR_COUNTER_SET;
-#define WHvVirtualProcessorCounterSetRuntime 0
+typedef int WHV_PROCESSOR_COUNTER_SET;
+#define WHvProcessorCounterSetRuntime 0
+HRESULT WINAPI WHvGetVirtualProcessorCounters(WHV_PARTITION_HANDLE, UINT32, WHV_PROCESSOR_COUNTER_SET, PVOID, UINT32, UINT32 *);
 #define FAILED(value) ((value) < 0)
 typedef struct { uint64_t TotalRuntime100ns, HypervisorRuntime100ns; } WHV_PROCESSOR_RUNTIME_COUNTERS;
 typedef struct { uint64_t total_runtime_micros, hypervisor_runtime_micros; uint32_t virtual_processors; } SandsurfPartitionCounters;
@@ -38,7 +39,7 @@ static bool whpx_enabled(void) { return scenario != 1; }
 #define g_new0(type, number) ((type *)calloc(number, sizeof(type)))
 static void error_setg(Error **error, const char *message) { (void)message; (*error)->failed = true; }
 static HMODULE GetModuleHandleW(const void *name) { (void)name; return scenario == 2 ? NULL : (HMODULE)1; }
-static HRESULT mock_query(WHV_PARTITION_HANDLE owner, UINT32 cpu, WHV_VIRTUAL_PROCESSOR_COUNTER_SET kind, PVOID bytes, UINT32 size, UINT32 *written) {
+static HRESULT mock_query(WHV_PARTITION_HANDLE owner, UINT32 cpu, WHV_PROCESSOR_COUNTER_SET kind, PVOID bytes, UINT32 size, UINT32 *written) {
     if (owner != (WHV_PARTITION_HANDLE)1 || kind != 0 || size != sizeof(WHV_PROCESSOR_RUNTIME_COUNTERS) || cpu >= 32) abort();
     WHV_PROCESSOR_RUNTIME_COUNTERS *value = bytes;
     value->TotalRuntime100ns = scenario == 6 ? (cpu == 0 ? UINT64_MAX : 1) : 11;

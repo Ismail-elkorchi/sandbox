@@ -31,9 +31,9 @@ export function ownerHooks(main: string, whpx: string, misc: string, schema: str
   };
   main = replace(main, '#include "qemu-main.h"', '#include "qemu-main.h"\n#include "../sandsurf-entry.c"');
   main = replace(main, "    qemu_init(argc, argv);", "    argc = sandsurf_qemu_enter(argc, &argv);\n    qemu_init(argc, argv);");
+  whpx = replace(whpx, '#include "qemu/osdep.h"', '#include "qemu/osdep.h"\n#include "../../../sandsurf-entry.h"');
   const setup = "    hr = whp_dispatch.WHvSetupPartition(whpx->partition);";
   const limits = `    /* Sandsurf's host process Job does not account for hypervisor scheduling. */
-    extern uint32_t sandsurf_qemu_cpu_cap(void);
     UINT32 sandsurf_cap = sandsurf_qemu_cpu_cap();
     WHV_PARTITION_PROPERTY sandsurf_requested = {0}, sandsurf_observed = {0};
     UINT32 sandsurf_written = 0;

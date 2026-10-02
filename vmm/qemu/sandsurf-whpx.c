@@ -6,8 +6,10 @@
 
 SandsurfPartitionCounters *qmp_query_sandsurf_partition_counters(Error **errp)
 {
-    typedef HRESULT (WINAPI *RuntimeQuery)(WHV_PARTITION_HANDLE, UINT32,
-        WHV_VIRTUAL_PROCESSOR_COUNTER_SET, PVOID, UINT32, UINT32 *);
+    /* Use the SDK's calling convention and complete prototype, not a second
+     * handwritten ABI that a portable arithmetic fixture could accidentally
+     * validate against itself. Lookup remains optional observation support. */
+    typedef __typeof__(&WHvGetVirtualProcessorCounters) RuntimeQuery;
     HMODULE module = GetModuleHandleW(L"WinHvPlatform.dll");
     RuntimeQuery query = module ? (RuntimeQuery)GetProcAddress(module,
         "WHvGetVirtualProcessorCounters") : NULL;
@@ -27,7 +29,7 @@ SandsurfPartitionCounters *qmp_query_sandsurf_partition_counters(Error **errp)
             return NULL;
         }
         HRESULT status = query(owner->partition, cpu->cpu_index,
-            WHvVirtualProcessorCounterSetRuntime, &observed,
+            WHvProcessorCounterSetRuntime, &observed,
             sizeof(observed), &written);
         if (FAILED(status) || written != sizeof(observed) ||
             UINT64_MAX - runtime < observed.TotalRuntime100ns ||

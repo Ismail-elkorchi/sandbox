@@ -11,7 +11,7 @@ test("the pinned QEMU hooks cannot accept drift, duplicate owners or omit partit
   assert.equal(QEMU_SOURCE.sha256.length, 64);
   assert.equal(QEMU_SOURCE.bytes, 141815216);
   const main = '#include "qemu-main.h"\n    qemu_init(argc, argv);';
-  const whpx = "    hr = whp_dispatch.WHvSetupPartition(whpx->partition);";
+  const whpx = '#include "qemu/osdep.h"\n    hr = whp_dispatch.WHvSetupPartition(whpx->partition);';
   const schema = readFileSync("vmm/qemu/sandsurf-qapi.json", "utf8");
   assert.equal((schema.match(/'if': 'CONFIG_WIN32'/gu) ?? []).length, 2);
   assert.doesNotMatch(schema, /'if': 'CONFIG_WHPX'/u);
@@ -21,6 +21,8 @@ test("the pinned QEMU hooks cannot accept drift, duplicate owners or omit partit
   assert.ok(hooked.whpx.indexOf("WHvGetPartitionProperty") < hooked.whpx.indexOf("WHvSetupPartition"));
   assert.match(hooked.whpx, /sandsurf_observed.CpuCap != sandsurf_cap/u);
   assert.match(hooked.whpx, /sandsurf-whpx\.c/u);
+  assert.match(hooked.whpx, /#include "\.\.\/\.\.\/\.\.\/sandsurf-entry\.h"/u);
+  assert.doesNotMatch(hooked.whpx, /extern uint32_t sandsurf_qemu_cpu_cap/u);
   assert.match(hooked.misc, /query-sandsurf-partition-counters/u);
   assert.ok(hooked.misc.endsWith(schema));
   assert.throws(() => ownerHooks(main, whpx, hooked.misc, schema));
