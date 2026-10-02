@@ -407,6 +407,27 @@ fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
         return;
     }
     let mut owner = install_isolated_boundary();
+    let boundary = sandsurf_native::network_sockets::observe_boundary().unwrap();
+    // Replace only the private namespace's installation path. The running
+    // factory must disclose its original ELF, not hash this new pathname.
+    let executable = Path::new("/usr/local/libexec/sandsurf/sandsurf-host");
+    let original_bytes = std::fs::read(executable).unwrap();
+    assert_eq!(
+        boundary.owner_executable_digest,
+        sandsurf_protocol::bytes_digest(&original_bytes)
+    );
+    let replacement = executable.with_extension("next");
+    let mut replaced_bytes = original_bytes;
+    replaced_bytes.extend_from_slice(b"Sandsurf private fixture identity");
+    std::fs::write(&replacement, &replaced_bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::fs::rename(&replacement, executable).unwrap();
+    assert_eq!(
+        sandsurf_native::network_sockets::observe_boundary().unwrap(),
+        boundary
+    );
+    let replacement_digest = sandsurf_protocol::bytes_digest(&replaced_bytes);
     let root = std::env::temp_dir().join(format!("sandsurf-native-egress-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let mut peer = Command::new(std::env::current_exe().unwrap());
@@ -490,6 +511,12 @@ fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
         owner.0.kill().unwrap();
         owner.0.wait().unwrap();
         owner = socket_owner();
+        let restarted = sandsurf_native::network_sockets::observe_boundary().unwrap();
+        assert_eq!(restarted.owner_executable_digest, replacement_digest);
+        assert_eq!(
+            restarted.local_delivery_expression_digest,
+            boundary.local_delivery_expression_digest
+        );
     });
     udp_echo(&mut nic, GUEST_IPV4.into(), REMOTE_V4.parse().unwrap());
     udp_echo(&mut nic, GUEST_IPV6.into(), REMOTE_V6.parse().unwrap());

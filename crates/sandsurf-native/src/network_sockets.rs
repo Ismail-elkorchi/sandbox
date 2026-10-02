@@ -1,21 +1,27 @@
 //! Linux socket factory for the external packet gateway. The privileged owner
-//! only makes ordinary TCP/UDP sockets bearing a fixed restrictive packet mark.
+//! makes ordinary TCP/UDP sockets bearing a fixed restrictive packet mark and
+//! exposes bounded observations of its original ELF and verified kernel rule.
 //! It accepts no destination, pathname, PID, executable, or application grant.
 //! A separately operator-installed nftables INPUT rule rejects marked packets
 //! at actual local delivery, including after address/route/NAT changes. Guest
 //! packets never become host raw sockets. Host-owned allow policy remains in
 //! sandsurf-network; this module is not a second authorization database.
 use crate::unix_io::{DeadlineIo, wait_ready};
+use sandsurf_protocol::{Digest, bytes_digest};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -25,6 +31,161 @@ const ENDPOINT: &str = "/run/sandsurf-network/sockets.sock";
 pub const MARK: u32 = 0x53534601;
 const DEADLINE: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 32;
+const OBSERVE: [u8; 8] = *b"SSNO\x01\0\0\0";
+
+/// Facts about the running, kernel-authenticated host boundary. Neither the
+/// installed executable's pathname nor a service's assertion of its own hash
+/// identifies the executable that is actually providing socket custody.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BoundaryObservation {
+    pub owner_executable_digest: Digest,
+    pub local_delivery_expression_digest: Digest,
+}
+
+/// A control-plane observation, never a per-packet or per-flow operation. The
+/// peer pidfd fences the observation against owner exit and PID reuse. The
+/// root owner transfers a read-only handle to its running executable and
+/// rechecks its actual kernel expression, rather than reporting an install
+/// filename or its startup cache. Failure is unavailable evidence, not VM death.
+pub fn observe_boundary() -> io::Result<BoundaryObservation> {
+    protected_endpoint()?;
+    let deadline = Instant::now() + DEADLINE;
+    let stream = crate::unix_io::connect_socket(Path::new(ENDPOINT), deadline)?;
+    let credentials = peer(&stream)?;
+    if credentials.uid != 0 {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    observe_connection(stream, credentials.uid, deadline)
+}
+fn observe_connection(
+    mut stream: UnixStream,
+    uid: u32,
+    deadline: Instant,
+) -> io::Result<BoundaryObservation> {
+    let original = peer_process(&stream)?;
+    DeadlineIo {
+        stream: &mut stream,
+        deadline: Some(deadline),
+    }
+    .write_all(&OBSERVE)?;
+    let (header, executable) = receive(&stream, deadline)?;
+    if header != OBSERVE {
+        return Err(invalid("invalid native boundary observation"));
+    }
+    let owner_executable_digest = executable_digest(&File::from(executable), uid, deadline)?;
+    let mut io = DeadlineIo {
+        stream: &mut stream,
+        deadline: Some(deadline),
+    };
+    let mut receipt = [0; 64];
+    io.read_exact(&mut receipt)?;
+    if io.read(&mut [0])? != 0 {
+        return Err(invalid("invalid native boundary observation"));
+    }
+    process_alive(&original)?;
+    let local_delivery_expression_digest = std::str::from_utf8(&receipt)
+        .ok()
+        .and_then(|value| value.to_owned().try_into().ok())
+        .ok_or_else(|| invalid("invalid native boundary expression identity"))?;
+    Ok(BoundaryObservation {
+        owner_executable_digest,
+        local_delivery_expression_digest,
+    })
+}
+
+fn peer_process(stream: &UnixStream) -> io::Result<OwnedFd> {
+    let mut descriptor = -1;
+    let mut length = std::mem::size_of_val(&descriptor) as libc::socklen_t;
+    // SAFETY: retained connected stream and exact initialized scalar output.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&raw mut descriptor).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if descriptor < 0 {
+        return Err(invalid("missing native peer process handle"));
+    }
+    // SAFETY: successful SO_PEERPIDFD transfers a new original process handle.
+    let original = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    // SAFETY: scalar flags query on this retained, newly allocated descriptor.
+    let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+    if length as usize != std::mem::size_of_val(&descriptor)
+        || flags < 0
+        || flags & libc::FD_CLOEXEC == 0
+    {
+        return Err(invalid("invalid native peer process handle"));
+    }
+    process_alive(&original)?;
+    Ok(original)
+}
+fn process_alive(original: &OwnedFd) -> io::Result<()> {
+    let mut event = libc::pollfd {
+        fd: original.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: initialized single pollfd for the original retained process.
+    let ready = unsafe { libc::poll(&mut event, 1, 0) };
+    if ready < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ready != 0 {
+        return Err(invalid("native boundary owner exited during observation"));
+    }
+    Ok(())
+}
+fn executable_digest(
+    executable: &File,
+    expected_uid: u32,
+    deadline: Instant,
+) -> io::Result<Digest> {
+    let metadata = executable.metadata()?;
+    // SAFETY: scalar access-mode query on the retained original file handle.
+    let flags = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() == 0
+        || metadata.len() > 512 * 1024 * 1024
+    {
+        return Err(invalid(
+            "native boundary executable is not protected and bounded",
+        ));
+    }
+    let mut hash = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0; 65536];
+    loop {
+        crate::unix_io::require_time(Some(deadline))?;
+        // SCM_RIGHTS shares an open-file description. Positional reads neither
+        // depend on nor mutate another observer's cursor on this immutable ELF.
+        let count = executable.read_at(&mut buffer, bytes)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > metadata.len() {
+            return Err(invalid("native boundary executable changed length"));
+        }
+        hash.update(&buffer[..count]);
+    }
+    if bytes != metadata.len() {
+        return Err(invalid("native boundary executable changed length"));
+    }
+    format!("{:x}", hash.finalize())
+        .try_into()
+        .map_err(|_| invalid("invalid native boundary executable digest"))
+}
 
 /// Install explicitly, as an operator. The batch replaces only this dedicated
 /// table atomically. Do not flush the host ruleset or remove it on broker exit:
@@ -152,6 +313,9 @@ impl SocketAdmission {
 /// Probe admission with one shared absolute deadline. This is a control-plane
 /// prerequisite check, never a synchronous request for each guest packet.
 pub fn probe() -> io::Result<()> {
+    // The still-running factory may predate an operator's rule or executable
+    // replacement. Verify its live boundary, not only four marked descriptors.
+    observe_boundary()?;
     let deadline = Instant::now() + DEADLINE;
     let mut pending = [(false, false), (false, true), (true, false), (true, true)]
         .into_iter()
@@ -285,7 +449,12 @@ fn marked_socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
     Ok(socket)
 }
 
-fn send(stream: &UnixStream, payload: &[u8], fd: &Socket, deadline: Instant) -> io::Result<()> {
+fn send(
+    stream: &UnixStream,
+    payload: &[u8],
+    fd: &impl AsRawFd,
+    deadline: Instant,
+) -> io::Result<()> {
     if payload.is_empty() || payload.len() > 8 {
         return Err(invalid("native socket receipt exceeds bound"));
     }
@@ -422,7 +591,6 @@ impl Receipt {
     }
 }
 
-#[cfg(test)]
 fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<([u8; 8], OwnedFd)> {
     let mut receipt = Receipt::default();
     loop {
@@ -435,7 +603,7 @@ fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<([u8; 8], Owned
 
 /// Verify the actual immutable enforcement expression, not merely a table name
 /// or a successful policy command. Kernel-assigned handles are observations.
-fn verify_rules(bytes: &[u8]) -> io::Result<()> {
+fn verify_rules(bytes: &[u8]) -> io::Result<Digest> {
     use serde_json::json;
     if bytes.len() > 16384 {
         return Err(invalid("network rule observation exceeds bound"));
@@ -470,7 +638,9 @@ fn verify_rules(bytes: &[u8]) -> io::Result<()> {
     if observed != expected {
         return Err(invalid("installed local-delivery enforcement differs"));
     }
-    Ok(())
+    Ok(bytes_digest(
+        &serde_json::to_vec(&observed).map_err(io::Error::other)?,
+    ))
 }
 
 struct RuleQuery(Child);
@@ -480,7 +650,10 @@ impl Drop for RuleQuery {
         let _ = self.0.wait();
     }
 }
-fn inspect_rules() -> io::Result<()> {
+fn inspect_rules() -> io::Result<Digest> {
+    inspect_rules_until(Instant::now() + Duration::from_secs(5))
+}
+fn inspect_rules_until(deadline: Instant) -> io::Result<Digest> {
     let nft = crate::filesystem::protected_tool(&["/usr/sbin/nft", "/sbin/nft"])?;
     let mut child = RuleQuery(
         Command::new(nft)
@@ -500,7 +673,6 @@ fn inspect_rules() -> io::Result<()> {
     if unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut bytes = Vec::with_capacity(4096);
     let mut buffer = [0; 4096];
     loop {
@@ -601,7 +773,13 @@ pub fn serve() -> io::Result<()> {
     }
     let (listener, _lease) = own_endpoint()?;
     inspect_rules()?;
+    // Open this process's running ELF, not a mutable installation pathname.
+    // The only observation capability disclosed is this read-only file handle.
+    let executable = Arc::new(File::open("/proc/self/exe")?);
     let connections = Arc::new(AtomicUsize::new(0));
+    // At most one rule-query subprocess in addition to the bounded admission
+    // threads. Socket production never waits on observation or a rules query.
+    let observations = Arc::new(Mutex::new(()));
     for stream in listener.incoming() {
         let mut stream = stream?;
         if connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
@@ -615,6 +793,8 @@ pub fn serve() -> io::Result<()> {
             }
         }
         let admission = Admission(Arc::clone(&connections));
+        let observations = Arc::clone(&observations);
+        let executable = Arc::clone(&executable);
         std::thread::Builder::new()
             .name("network-socket".into())
             .spawn(move || {
@@ -629,6 +809,18 @@ pub fn serve() -> io::Result<()> {
                         deadline: Some(deadline),
                     }
                     .read_exact(&mut value)?;
+                    if value == OBSERVE {
+                        let _query = observations
+                            .try_lock()
+                            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+                        let expression = inspect_rules_until(deadline)?;
+                        send(&stream, &OBSERVE, executable.as_ref(), deadline)?;
+                        let mut io = DeadlineIo {
+                            stream: &mut stream,
+                            deadline: Some(deadline),
+                        };
+                        return io.write_all(expression.as_str().as_bytes());
+                    }
                     let (ipv6, udp) = decode(&value)?;
                     let socket = marked_socket(ipv6, udp)?;
                     send(&stream, &value, &socket, deadline)
@@ -641,6 +833,92 @@ pub fn serve() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn boundary_observation_hashes_retained_bytes_without_sharing_a_file_cursor() {
+        use std::io::Seek;
+        let directory =
+            std::env::temp_dir().join(format!("sandsurf-boundary-cursor-{}", std::process::id()));
+        crate::local::create_private_directory(&directory).unwrap();
+        let path = directory.join("executable");
+        crate::local::create_private_file(&path)
+            .unwrap()
+            .write_all(b"original executable bytes held independently of its pathname")
+            .unwrap();
+        let executable = File::open(&path).unwrap();
+        let mut shared = executable.try_clone().unwrap();
+        shared.seek(io::SeekFrom::Start(17)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let expected =
+            executable_digest(&executable, executable.metadata().unwrap().uid(), deadline).unwrap();
+        assert_eq!(shared.stream_position().unwrap(), 17);
+        let replacement = directory.join("replacement");
+        crate::local::create_private_file(&replacement)
+            .unwrap()
+            .write_all(b"new installation bytes")
+            .unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let (mut factory, client) = UnixStream::pair().unwrap();
+        factory.set_nonblocking(true).unwrap();
+        client.set_nonblocking(true).unwrap();
+        let expression = bytes_digest(b"observed kernel expression");
+        let observed_expression = expression.clone();
+        let uid = executable.metadata().unwrap().uid();
+        let worker = std::thread::spawn(move || {
+            let mut request = [0; 8];
+            DeadlineIo {
+                stream: &mut factory,
+                deadline: Some(deadline),
+            }
+            .read_exact(&mut request)
+            .unwrap();
+            assert_eq!(request, OBSERVE);
+            send(&factory, &request[..3], &executable, deadline).unwrap();
+            let mut io = DeadlineIo {
+                stream: &mut factory,
+                deadline: Some(deadline),
+            };
+            io.write_all(&request[3..]).unwrap();
+            for fragment in observed_expression.as_str().as_bytes().chunks(7) {
+                io.write_all(fragment).unwrap();
+            }
+        });
+        let observed = observe_connection(client, uid, deadline).unwrap();
+        worker.join().unwrap();
+        assert_eq!(observed.owner_executable_digest, expected);
+        assert_eq!(observed.local_delivery_expression_digest, expression);
+        assert_eq!(shared.stream_position().unwrap(), 17);
+        drop(shared);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn boundary_observation_refuses_unbounded_or_writable_file_capabilities() {
+        let directory = std::env::temp_dir().join(format!(
+            "sandsurf-boundary-observation-{}",
+            std::process::id()
+        ));
+        crate::local::create_private_directory(&directory).unwrap();
+        let path = directory.join("executable");
+        let mut file = crate::local::create_private_file(&path).unwrap();
+        file.write_all(b"immutable executable bytes").unwrap();
+        let uid = file.metadata().unwrap().uid();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(
+            executable_digest(&file, uid, deadline).is_err(),
+            "writable capability accepted"
+        );
+        let read_only = File::open(&path).unwrap();
+        assert!(executable_digest(&read_only, uid, Instant::now()).is_err());
+        assert!(executable_digest(&read_only, uid + 1, deadline).is_err());
+        assert_eq!(
+            executable_digest(&read_only, uid, deadline).unwrap(),
+            bytes_digest(b"immutable executable bytes")
+        );
+        file.set_len(513 * 1024 * 1024).unwrap();
+        assert!(executable_digest(&read_only, uid, deadline).is_err());
+        drop(file);
+        drop(read_only);
+        fs::remove_dir_all(directory).unwrap();
+    }
     #[test]
     fn admission_poll_is_nonblocking_and_partial_receipts_keep_one_absolute_deadline() {
         let (writer, control) = UnixStream::pair().unwrap();
@@ -939,7 +1217,15 @@ mod tests {
             {"chain":{"family":"inet","table":"sandsurf_boundary","name":"local_delivery","handle":2,"type":"filter","hook":"input","prio":-300,"policy":"accept"}},
             {"rule":{"family":"inet","table":"sandsurf_boundary","chain":"local_delivery","handle":3,"expr":[{"match":{"op":"==","left":{"meta":{"key":"mark"}},"right":MARK}},{"drop":null}]}}
         ]});
-        verify_rules(&serde_json::to_vec(&base).unwrap()).unwrap();
+        let expression = verify_rules(&serde_json::to_vec(&base).unwrap()).unwrap();
+        let mut different_handles = base.clone();
+        different_handles["nftables"][1]["table"]["handle"] = serde_json::json!(900);
+        different_handles["nftables"][2]["chain"]["handle"] = serde_json::json!(901);
+        different_handles["nftables"][3]["rule"]["handle"] = serde_json::json!(902);
+        assert_eq!(
+            expression,
+            verify_rules(&serde_json::to_vec(&different_handles).unwrap()).unwrap()
+        );
         for (index, field, value) in [
             (1, "flags", serde_json::json!(["dormant"])),
             (2, "hook", serde_json::json!("output")),

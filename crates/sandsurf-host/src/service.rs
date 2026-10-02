@@ -3626,6 +3626,28 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    fn intent_service(root: &Path) -> HostService {
+        // These tests admit catalog intents, never real VM workers. Their
+        // capacity is an explicit fixture input, not a measurement of whatever
+        // RAM/CPU remains on a concurrently building native CI runner.
+        prepare_directory(root).unwrap();
+        let limits = CatalogLimits {
+            identities: counter(32),
+            operations: counter(128),
+            usage_records: counter(128),
+            image_bytes: counter(64 * 1024 * 1024),
+            cpu_quota_micros: counter(400000),
+            host_memory_bytes: counter(4 * 1024 * 1024 * 1024),
+        };
+        HostCatalog::create(
+            &root.join("catalog"),
+            "intent-fixture".try_into().unwrap(),
+            limits,
+        )
+        .unwrap();
+        HostService::open(root, root.join("absent-executable")).unwrap()
+    }
+
     #[test]
     fn mechanism_refusal_is_not_transport_failure() {
         let unsupported =
@@ -3735,7 +3757,7 @@ mod tests {
             std::process::id(),
             unix_millis().unwrap().get()
         ));
-        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let mut service = intent_service(&root);
         let machine = admit_machine(&mut service, "box", MachineLifetime::default());
 
         let request = GuestRequest::WriteInput {
@@ -3785,7 +3807,7 @@ mod tests {
             std::process::id(),
             unix_millis().unwrap().get()
         ));
-        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let mut service = intent_service(&root);
         let broken = admit_machine(&mut service, "a-broken", MachineLifetime::default());
         let expired = admit_machine(
             &mut service,
@@ -3833,7 +3855,7 @@ mod tests {
             std::process::id(),
             unix_millis().unwrap().get()
         ));
-        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let mut service = intent_service(&root);
         let machine = admit_machine(
             &mut service,
             "expiring",

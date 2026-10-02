@@ -108,13 +108,15 @@ pub fn qualification_configuration(
             "native boot observation belongs to another machine".into(),
         ));
     }
-    qualification_for_boot(config, &observation.boot, machine_root)
+    let boundary = sandsurf_native::network_sockets::observe_boundary()?;
+    qualification_for_boot(config, &observation.boot, machine_root, &boundary)
 }
 
 fn qualification_for_boot(
     config: &LinuxGuardianConfig,
     boot: &sandsurf_image::boot::FrozenBoot,
     machine_root: &Path,
+    boundary: &sandsurf_native::network_sockets::BoundaryObservation,
 ) -> Result<crate::qualification::NativeConfiguration, LinuxError> {
     let machine_volume = sandsurf_native::volume::require(
         machine_root,
@@ -157,6 +159,7 @@ fn qualification_for_boot(
                 sandsurf_network::MTU,
                 sandsurf_network::GUEST_IPV4.to_string(),
                 sandsurf_network::GUEST_IPV6.to_string(),
+                boundary,
             ),
         )
         .map_err(|error| LinuxError::Invalid(error.to_string()))?,
@@ -400,7 +403,20 @@ impl LinuxGuardianEffect {
             return Ok(());
         };
         let boot = crate::storage::read_boot(&active.boot_directory)?;
-        let exact = qualification_for_boot(&configuration, &boot, &self.machine_root)?;
+        let boundary = match sandsurf_native::network_sockets::observe_boundary() {
+            Ok(boundary) => boundary,
+            Err(_) => {
+                // Unavailable qualification evidence cannot authorize full-state
+                // restoration, but it is not evidence that the VM stopped or
+                // permission to contain an otherwise running computer.
+                self.machine.set_qualification(FirecrackerQualification {
+                    lifecycle: None,
+                    full_state: None,
+                });
+                return Ok(());
+            }
+        };
+        let exact = qualification_for_boot(&configuration, &boot, &self.machine_root, &boundary)?;
         let root = self
             .machine_root
             .parent()
