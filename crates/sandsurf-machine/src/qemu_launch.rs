@@ -2,7 +2,7 @@
 //! QEMU options, host mounts, monitor shell, SLIRP, TAP bridge or TCG fallback.
 use crate::GuestArchitecture;
 use sandsurf_network::LinkIdentity;
-use sandsurf_protocol::{GUEST_SERIAL_CONNECTIONS, GUEST_SERIAL_PREFIX, MachineId};
+use sandsurf_protocol::{GUEST_SERIAL_CONNECTIONS, GUEST_SERIAL_PREFIX, MachineId, VmEngine};
 use serde_json::json;
 use std::ffi::OsString;
 use std::io;
@@ -15,6 +15,13 @@ pub enum Accelerator {
 }
 
 impl Accelerator {
+    pub fn engine(self) -> VmEngine {
+        match self {
+            Self::Hvf => VmEngine::QemuHvf,
+            Self::Whpx => VmEngine::QemuWhpx,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Hvf => "hvf",
@@ -53,12 +60,13 @@ impl LaunchConfig {
         if let Some(path) = &self.initramfs {
             path_text(path)?;
         }
-        if self.system_disk == self.authentication_disk
-            || self.vcpus == 0
-            || self.vcpus > 32
-            || !(256..=65536).contains(&self.memory_mib)
-        {
-            return Err(invalid("invalid QEMU hardware or disk envelope"));
+        crate::validate_hardware(
+            &self.accelerator.engine(),
+            self.vcpus.into(),
+            self.memory_mib.into(),
+        )?;
+        if self.system_disk == self.authentication_disk {
+            return Err(invalid("QEMU disks must have separate identities"));
         }
         for name in ["qmp.sock", "nic.sock", "console.sock", "control-7.sock"] {
             if self

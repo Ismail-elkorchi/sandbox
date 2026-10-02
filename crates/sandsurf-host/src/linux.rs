@@ -189,6 +189,11 @@ pub fn prepare_config(
     resources
         .validate()
         .map_err(|error| LinuxError::Invalid(error.to_string()))?;
+    sandsurf_machine::validate_hardware(
+        &VmEngine::Firecracker,
+        resources.vcpus.get(),
+        resources.memory_mib.get(),
+    )?;
     crate::resources::require_network_capacity(resources)?;
     crate::resources::require_machine_storage(host_root, machine_id, resources)?;
     let existing_path = host_root
@@ -564,9 +569,10 @@ impl GuardianEffect for LinuxGuardianEffect {
     fn assess_resources(
         &self,
         resources: &Resources,
-        current: &MachineObservation,
+        _current: &MachineObservation,
     ) -> sandsurf_protocol::ResourceChangeAssessment {
-        let mut assessment = crate::resources::assess(resources, &self.config.resources, current);
+        let mut assessment =
+            crate::resources::assess(resources, &self.config.resources, &VmEngine::Firecracker);
         if let Err(error) = sandsurf_native::volume::require(
             &self.machine_root,
             resources.physical_storage_bytes.get(),

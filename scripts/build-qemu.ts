@@ -54,15 +54,26 @@ export async function buildQemu(destination: string): Promise<void> {
     const build = resolve(scratch, "build"); await mkdir(build);
     const windows = process.platform === "win32";
     const architecture = process.arch === "arm64" ? "aarch64" : "x86_64";
+    const deviceTree: string[] = [];
+    if (architecture === "aarch64") {
+      // The virt hardware model needs libfdt even when optional features are
+      // disabled. Select the installed source-bound library, not an implicit
+      // subproject download or another architecture's include/library paths.
+      const prefix = (await run("brew", ["--prefix", "dtc"], scratch, true)).trim();
+      if (!/^\/(?:opt\/homebrew|usr\/local)\/[A-Za-z0-9_./+-]+$/u.test(prefix)) throw new Error("invalid native libfdt prefix");
+      deviceTree.push("--enable-fdt=system", `--extra-cflags=-I${prefix}/include`, `--extra-ldflags=-L${prefix}/lib`);
+    }
     await run(windows ? "bash" : "/bin/sh", [shellPath(resolve(source, "configure")),
       `--target-list=${architecture}-softmmu`, "--without-default-features", "--disable-tcg",
       windows ? "--enable-whpx" : "--enable-hvf", "--disable-tools", "--disable-docs",
+      ...deviceTree,
       "--disable-plugins", "--disable-slirp", "--disable-guest-agent", "--disable-werror", "--disable-download"], build);
     // One compiler at a time, including in CI. No unbounded host RAM spike.
-    await run("ninja", ["-j", "1", `qemu-system-${architecture}`], build);
+    const builtExecutable = `qemu-system-${architecture}${windows ? ".exe" : ""}`;
+    await run("ninja", ["-j", "1", builtExecutable], build);
     await mkdir(destination, { recursive: true });
     const executable = resolve(destination, `sandsurf-qemu-${process.arch}${windows ? ".exe" : ""}`);
-    await copyFile(resolve(build, `qemu-system-${architecture}${windows ? ".exe" : ""}`), executable);
+    await copyFile(resolve(build, builtExecutable), executable);
     await chmod(executable, 0o755);
     const libraries = windows ? await windowsLibraries(executable, destination)
       : await darwinLibraries(executable, destination);

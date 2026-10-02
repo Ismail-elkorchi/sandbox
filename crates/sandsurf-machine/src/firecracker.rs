@@ -1024,12 +1024,14 @@ pub fn read_api_response(
 }
 
 fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
+    crate::validate_hardware(
+        &sandsurf_protocol::VmEngine::Firecracker,
+        config.vcpu_count.into(),
+        config.memory_mib.into(),
+    )
+    .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
     if config.guest_cid < 3
         || config.guest_port < 1024
-        || config.vcpu_count == 0
-        || config.vcpu_count > 32
-        || config.memory_mib < 128
-        || config.memory_mib > 65_536
         || config.owner_token.len() != 64
         || !config
             .owner_token

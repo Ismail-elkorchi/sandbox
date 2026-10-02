@@ -13,10 +13,12 @@ use sandsurf_protocol::{
 
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+mod hardware;
 #[cfg(target_os = "linux")]
 pub mod launcher;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub use hardware::validate_hardware;
 pub mod qemu;
 pub mod qemu_driver;
 mod qemu_launch;

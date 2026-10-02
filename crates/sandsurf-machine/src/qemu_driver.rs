@@ -18,6 +18,11 @@ pub struct QemuBudgets {
 impl QemuBudgets {
     pub fn derive(resources: &Resources, accelerator: Accelerator) -> io::Result<Self> {
         resources.validate().map_err(io::Error::other)?;
+        crate::validate_hardware(
+            &accelerator.engine(),
+            resources.vcpus.get(),
+            resources.memory_mib.get(),
+        )?;
         let total_memory = resources
             .host_memory_bytes()
             .map_err(io::Error::other)?
@@ -121,9 +126,9 @@ mod native {
 
     pub fn native_engine() -> VmEngine {
         if cfg!(target_os = "macos") {
-            VmEngine::QemuHvf
+            Accelerator::Hvf.engine()
         } else {
-            VmEngine::QemuWhpx
+            Accelerator::Whpx.engine()
         }
     }
 

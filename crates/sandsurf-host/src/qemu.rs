@@ -146,14 +146,11 @@ pub fn prepare_config(
         &runtime_digest,
         crate::service::native_guest_architecture(),
     )?;
-    if resources.vcpus.get() > 32
-        || resources.memory_mib.get() < 256
-        || resources.memory_mib.get() > 65_536
-    {
-        return Err(QemuError::Invalid(
-            "requested VM shape is outside the Qemu envelope".into(),
-        ));
-    }
+    sandsurf_machine::validate_hardware(
+        &native_engine(),
+        resources.vcpus.get(),
+        resources.memory_mib.get(),
+    )?;
     let socket_identity =
         bytes_digest(format!("{}:{}", host_root.display(), machine_id.as_str()).as_bytes());
     let socket_root = std::env::temp_dir().join(format!("sq-{}", &socket_identity.as_str()[..16]));
@@ -937,10 +934,11 @@ impl GuardianEffect for QemuGuardianEffect {
     fn assess_resources(
         &self,
         resources: &Resources,
-        current: &MachineObservation,
+        _current: &MachineObservation,
     ) -> sandsurf_protocol::ResourceChangeAssessment {
         use sandsurf_protocol::ResourceChangeMode;
-        let mut assessment = crate::resources::assess(resources, &self.config.resources, current);
+        let mut assessment =
+            crate::resources::assess(resources, &self.config.resources, &native_engine());
         if let Err(error) = QemuBudgets::derive(resources, accelerator()).and_then(|_| {
             sandsurf_native::volume::require(
                 &self.machine_root,

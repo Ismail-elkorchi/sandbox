@@ -1,8 +1,6 @@
 //! Resource change semantics shared by native adapters. Guest cgroups and
 //! guest filesystem free-space reports never influence host admission.
-use sandsurf_protocol::{
-    MachineObservation, ResourceChangeAssessment, ResourceChangeMode, Resources,
-};
+use sandsurf_protocol::{ResourceChangeAssessment, ResourceChangeMode, Resources, VmEngine};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +106,7 @@ pub fn require_network_capacity(resources: &Resources) -> std::io::Result<()> {
 pub fn assess(
     requested: &Resources,
     applied: &Resources,
-    _current: &MachineObservation,
+    engine: &VmEngine,
 ) -> ResourceChangeAssessment {
     let result = |mode, reason: &str| ResourceChangeAssessment {
         mode,
@@ -130,14 +128,12 @@ pub fn assess(
             "virtual disk resizing requires owned storage replacement; Linux filesystem resizing is separate",
         );
     }
-    if requested.vcpus.get() > 32
-        || requested.memory_mib.get() < 128
-        || requested.memory_mib.get() > 65_536
-    {
-        return result(
-            ResourceChangeMode::Unsupported,
-            "requested hardware topology exceeds the native Firecracker envelope",
-        );
+    if let Err(error) = sandsurf_machine::validate_hardware(
+        engine,
+        requested.vcpus.get(),
+        requested.memory_mib.get(),
+    ) {
+        return result(ResourceChangeMode::Unsupported, &error.to_string());
     }
     if requested.vcpus != applied.vcpus || requested.memory_mib != applied.memory_mib {
         return result(
@@ -146,4 +142,33 @@ pub fn assess(
         );
     }
     result(ResourceChangeMode::Live, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assessment_uses_the_actual_native_engine() {
+        let mut applied = sandsurf_protocol::RuntimeConfiguration::default().resources;
+        applied.memory_mib = 512.try_into().unwrap();
+        let mut requested = applied.clone();
+        requested.memory_mib = 128.try_into().unwrap();
+        assert_eq!(
+            assess(&requested, &applied, &VmEngine::Firecracker).mode,
+            ResourceChangeMode::RequiresReboot
+        );
+        for engine in [VmEngine::QemuHvf, VmEngine::QemuWhpx] {
+            assert_eq!(
+                assess(&requested, &applied, &engine).mode,
+                ResourceChangeMode::Unsupported
+            );
+            requested.memory_mib = 256.try_into().unwrap();
+            assert_eq!(
+                assess(&requested, &applied, &engine).mode,
+                ResourceChangeMode::RequiresReboot
+            );
+            requested.memory_mib = 128.try_into().unwrap();
+        }
+    }
 }

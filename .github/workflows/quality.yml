@@ -136,7 +136,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
-      - run: brew install glib pixman ninja pkgconf meson python python-setuptools
+      - run: brew install glib pixman ninja pkgconf meson python python-setuptools dtc
       - name: Compile and entitle the owned HVF runtime (not VM qualification)
         run: |
           npm run build:native
