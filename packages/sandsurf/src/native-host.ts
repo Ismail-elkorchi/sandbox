@@ -234,7 +234,7 @@ export class NativeHostClient {
 }
 
 // The SDK caller bootstraps this owner, never the host API process. Installed
-// service definitions use two independent native services for the same roles.
+// registrations bootstrap the same two native owners; they never own a VM.
 async function ensureSupervisor(binary: string, directory: string): Promise<void> {
   const status = await supervisorCommand(binary, "supervisor-status", directory);
   if (status === 0) return;

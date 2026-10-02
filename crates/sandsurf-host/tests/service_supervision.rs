@@ -55,6 +55,16 @@ fn supervisor_owner(root: &Path) -> u32 {
     assert_ne!(pid, 0, "supervisor unit has no running native owner");
     pid
 }
+#[cfg(not(target_os = "linux"))]
+fn supervisor_owner(root: &Path) -> u32 {
+    sandsurf_native::local::LocalConnection::connect(
+        &root.join("supervision"),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    .peer_process()
+    .unwrap()
+}
 fn ready(mut operation: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !operation() {
@@ -94,10 +104,17 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
         )
         .is_ok()
     });
-    #[cfg(target_os = "linux")]
     let owner = supervisor_owner(&root);
-    #[cfg(not(target_os = "linux"))]
-    let owner = supervisor.0.id();
+    #[cfg(target_os = "macos")]
+    {
+        assert!(supervisor.0.wait().unwrap().success());
+        assert!(host.0.wait().unwrap().success());
+        assert_ne!(
+            owner,
+            supervisor.0.id(),
+            "launcher is not the durable service owner"
+        );
+    }
     assert!(
         call(
             &root,
@@ -122,7 +139,7 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
     #[cfg(target_os = "linux")]
     ready(|| pool_stopped(&root, sandsurf_native::service_pool::ServicePool::Api));
     call(&root, Request::Inspect).unwrap();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
     assert!(supervisor.0.try_wait().unwrap().is_none());
     let mut replacement = process("serve", &root);
     ready(|| {
@@ -135,10 +152,9 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
         )
         .is_ok()
     });
-    #[cfg(target_os = "linux")]
     assert_eq!(supervisor_owner(&root), owner);
-    #[cfg(not(target_os = "linux"))]
-    assert_eq!(supervisor.0.id(), owner);
+    #[cfg(target_os = "macos")]
+    assert!(replacement.0.wait().unwrap().success());
     call(&root, Request::Inspect).unwrap();
     host_call(&root, HostRequest::StopService).unwrap();
     assert!(replacement.0.wait().unwrap().success());
@@ -152,6 +168,14 @@ fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitt
             &root,
             sandsurf_native::service_pool::ServicePool::Supervisor,
         )
+    });
+    #[cfg(target_os = "macos")]
+    ready(|| {
+        sandsurf_native::local::LocalConnection::connect(
+            &root.join("supervision"),
+            Duration::from_secs(2),
+        )
+        .is_err()
     });
     drop((supervisor, host, replacement, duplicate));
     // Exact fixture directory only, after every process released its handles.

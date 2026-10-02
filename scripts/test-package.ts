@@ -4,7 +4,7 @@ import { captureCommand as capture } from "./capture-command.ts";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { packageArchive } from "./package-archive.ts";
+import { assertPayloadClosure, packageArchive } from "./package-archive.ts";
 import { QEMU_CORRESPONDING_FILES } from "./qemu-source.ts";
 import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependencies.ts";
 import { verifyQemuRuntime } from "./qemu-runtime.ts";
@@ -25,13 +25,8 @@ try {
     if (!paths.includes("package/package.json") || !paths.includes("package/dist/index.js") || !paths.includes("package/README.md") || !paths.includes("package/LICENSE")) {
       throw new Error(`${tarball} is missing package entry points`);
     }
-    for (const payloadPath of [...expectedImages, ...expectedNative]) {
-      if (!paths.includes(payloadPath)) throw new Error(`${tarball} is missing ${payloadPath}`);
-    }
-    if (paths.some((path) => /(?:minimal-|trusted-bootstrap|development-workload|empty-workspace)/u.test(path))) {
-      throw new Error(`${tarball} contains a retired guest image artifact`);
-    }
-    if (paths.some((path) => /\.ext4$/u.test(path))) throw new Error("package contains unpacked machine disks");
+    assertPayloadClosure(paths, "package/images/", expectedImages);
+    assertPayloadClosure(paths, "package/native/", expectedNative);
   }
   const consumer = resolve(temporary, "consumer");
   await mkdir(consumer);

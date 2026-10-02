@@ -17,7 +17,8 @@ export interface SandsurfServiceDefinitionOptions {
   readonly platform?: SandsurfServicePlatform;
 }
 
-/** Render independent host API and guardian supervision services. No install. */
+/** Render service-manager registration. macOS registers startup commands;
+ * the native broker, not those transient commands, owns service lifetime. */
 export async function sandsurfServiceDefinition(options: SandsurfServiceDefinitionOptions): Promise<SandsurfServiceDefinition> {
   return renderSandsurfServiceDefinition({
     directory: resolve(options.directory),
@@ -51,12 +52,12 @@ export function renderSandsurfServiceDefinition(options: {
       });
     }
     case "macos": {
-      const agent = (role: string, mode: string): Readonly<{ name: string; contents: string }> => {
+      const bootstrap = (role: string, mode: string): Readonly<{ name: string; contents: string }> => {
         const label = `dev.sandsurf.${role}.${suffix}`;
-        return file(`${label}.plist`, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array><string>${xml(options.binary)}</string><string>${mode}</string><string>--directory</string><string>${xml(options.directory)}</string></array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n</dict></plist>\n`);
+        return file(`${label}.plist`, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array><string>${xml(options.binary)}</string><string>${mode}</string><string>--directory</string><string>${xml(options.directory)}</string></array>\n<key>RunAtLoad</key><true/>\n<key>ProcessType</key><string>Interactive</string>\n</dict></plist>\n`);
       };
-      return Object.freeze({ platform: "macos", format: "launchd-agent", files: Object.freeze([agent("supervisor", "supervise"), agent("host", "serve")]),
-        installHint: "First provision the root-owned Sandsurf host, resource broker, and complete signed HVF runtime at /usr/local/libexec/sandsurf. Write both plists to ~/Library/LaunchAgents/ and bootstrap each with launchctl in the account's GUI domain. A GUI LaunchAgent does not promise survival of account logout. Native build validation and real-hardware qualification are separate.",
+      return Object.freeze({ platform: "macos", format: "launchd-agent", files: Object.freeze([bootstrap("supervisor", "supervise"), bootstrap("host", "serve")]),
+        installHint: "First provision the root-owned Sandsurf host, resource broker, and complete signed HVF runtime at /usr/local/libexec/sandsurf. Write both plists to ~/Library/LaunchAgents/ and bootstrap each with launchctl in the account's GUI domain. These are startup-only registrations: the launcher exits after its original native worker acquires the service endpoint. The bounded native broker owns the durable service. Removing a registration does not stop that service; use Sandsurf's explicit stop-service and stop-supervisor commands. Automatic service-crash restart and survival of GUI-domain logout are not promised. Native build validation and real-hardware qualification are separate.",
       });
     }
     case "windows": {

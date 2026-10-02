@@ -366,16 +366,82 @@ fn managed_pool(
     }
     sandsurf_native::local::ensure_private_directory(directory)?;
     let root = sandsurf_native::local::canonical_private_directory(directory)?;
-    let owned = sandsurf_native::resource_broker::macos::launch(
+    let endpoint = root.join(match pool {
+        sandsurf_native::service_pool::ServicePool::Api => "api",
+        sandsurf_native::service_pool::ServicePool::Supervisor => "supervision",
+        sandsurf_native::service_pool::ServicePool::Images => {
+            return Err(io::Error::other(
+                "image workers do not publish service endpoints",
+            ));
+        }
+    });
+    let mut owned = sandsurf_native::resource_broker::macos::launch(
         pool.worker_kind(),
         pool.process_budget(),
-        &["--directory".into(), root.into_os_string()],
+        &["--directory".into(), root.clone().into_os_string()],
         std::process::Stdio::null(),
         std::process::Stdio::inherit(),
         std::process::Stdio::inherit(),
     )?;
+    // The broker receipt proves native resource admission, not that this
+    // worker acquired the exclusive service endpoint. Never accept an older
+    // endpoint owner's response as readiness of a newly launched worker.
+    if let Err(error) = wait_service_owner(&endpoint, owned.process_id(), || {
+        owned.try_wait().map(|exit| exit.is_none())
+    }) {
+        owned.terminate()?;
+        return Err(error);
+    }
     drop(owned);
     Ok(false)
+}
+
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn wait_service_owner(
+    endpoint: &Path,
+    original: u32,
+    mut running: impl FnMut() -> io::Result<bool>,
+) -> io::Result<()> {
+    use sandsurf_native::local::LocalConnection;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if !running()? {
+            return Err(io::Error::other(
+                "native service exited before endpoint admission",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native service did not acquire its endpoint",
+            ));
+        }
+        match LocalConnection::connect(endpoint, remaining.min(Duration::from_millis(200))) {
+            Ok(connection) => {
+                if connection.peer_process()? != original {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "service endpoint belongs to another owner",
+                    ));
+                }
+                if !running()? {
+                    return Err(io::Error::other(
+                        "native service exited during endpoint admission",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_millis(10).min(remaining));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -813,6 +879,50 @@ fn argument(values: &[std::ffi::OsString], name: &str) -> Result<PathBuf, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn service_admission_requires_the_retained_original_endpoint_owner() {
+        use sandsurf_native::local::{LocalListener, create_private_directory};
+        let root = std::env::temp_dir().join(format!(
+            "ss-startup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        create_private_directory(&root).unwrap();
+        let listener = LocalListener::bind(&root).unwrap();
+        std::thread::scope(|scope| {
+            let accept = scope.spawn(|| {
+                for _ in 0..3 {
+                    let _connection = listener.accept(std::time::Duration::from_secs(2)).unwrap();
+                }
+            });
+            wait_service_owner(&root, std::process::id(), || Ok(true)).unwrap();
+            assert_eq!(
+                wait_service_owner(&root, std::process::id() + 1, || Ok(true))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists,
+                "an older service is not admission of a new worker"
+            );
+            let mut checks = 0;
+            assert!(
+                wait_service_owner(&root, std::process::id(), || {
+                    checks += 1;
+                    Ok(checks == 1)
+                })
+                .is_err(),
+                "exit during publication must not report success"
+            );
+            accept.join().unwrap();
+        });
+        assert!(wait_service_owner(&root, std::process::id(), || Ok(false)).is_err());
+        listener.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn event_bridge_is_credit_driven_and_eof_only_detaches() {

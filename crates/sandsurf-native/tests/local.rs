@@ -211,6 +211,8 @@ fn private_endpoint_authenticates_both_peers_and_preserves_binary_frames() {
     let mut server = listener.accept(WAIT).unwrap();
     assert_eq!(client.peer().uid, current_uid());
     assert_eq!(server.peer().uid, current_uid());
+    assert_eq!(client.peer_process().unwrap(), std::process::id());
+    assert_eq!(server.peer_process().unwrap(), std::process::id());
     client.write_frame(&frame(), WAIT).unwrap();
     assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
     server.write_frame(&frame(), WAIT).unwrap();
@@ -332,6 +334,9 @@ fn crashed_endpoint_owner_is_recovered_without_pid_guessing() {
     });
     receive.recv_timeout(Duration::from_secs(5)).unwrap();
     handshake.join().unwrap();
+    let connection = LocalConnection::connect(&root.0, WAIT).unwrap();
+    assert_eq!(connection.peer_process().unwrap(), child.0.id());
+    drop(connection);
     assert_eq!(
         LocalListener::bind(&root.0).err().unwrap().kind(),
         io::ErrorKind::WouldBlock

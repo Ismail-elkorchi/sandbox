@@ -798,6 +798,12 @@ impl LocalConnection {
         self.peer
     }
 
+    /// Kernel observation of this connection's peer, never process adoption.
+    pub fn peer_process(&self) -> io::Result<u32> {
+        self.check()?;
+        Ok(self.peer.process_id)
+    }
+
     pub fn read_frame(&mut self, timeout: Duration) -> io::Result<Option<Frame>> {
         let deadline = Deadline::new(timeout)?;
         self.check()?;

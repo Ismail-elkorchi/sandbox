@@ -443,6 +443,14 @@ impl LocalConnection {
     pub fn peer(&self) -> PeerIdentity {
         self.peer
     }
+    /// Kernel observation of this connection's peer, not permission to adopt
+    /// that process. A launcher must compare it with its retained original.
+    pub fn peer_process(&self) -> io::Result<u32> {
+        self.check()?;
+        crate::socket_io::peer_process(&socket2::Socket::from(std::os::fd::OwnedFd::from(
+            self.stream.try_clone()?,
+        )))
+    }
     pub fn read_frame(&mut self, timeout: Duration) -> io::Result<Option<Frame>> {
         let deadline = Deadline::new(timeout)?;
         self.check()?;

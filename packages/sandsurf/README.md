@@ -30,7 +30,7 @@ const completion = await execution.waitCapture();
 await host.close(); // The Machine and its services remain owned by the native host.
 ```
 
-Sandsurf uses one unscoped npm package and a native host service. Linux uses Firecracker/KVM, macOS uses Virtualization.framework, and Windows uses Hyper-V/HCS. `inspect()` reports qualification honestly; no host-process or cloud fallback is selected when hardware virtualization is unavailable.
+Sandsurf uses one unscoped npm package and a native host service. Linux uses Firecracker/KVM; macOS and Windows use Sandsurf-owned QEMU processes with HVF and WHPX respectively. `inspect()` reports unsupported mechanisms and missing hardware qualification explicitly; no software-emulation, host-process, or cloud fallback is selected when hardware virtualization is unavailable.
 
 Installed operation uses independent native services: the host API owns authority; the guardian supervisor launches fixed per-machine owners. Linux API, supervisor, image workers and machine owners have separate externally bounded systemd groups. `sandsurf setup --directory /absolute/state --json` renders the installed service files. Restarting the API does not stop a machine. Account logout and host reboot do not promise RAM/process survival.
 

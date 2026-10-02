@@ -8,10 +8,23 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import test from "node:test";
-import { packageArchive } from "../package-archive.ts";
+import { assertPayloadClosure, packageArchive } from "../package-archive.ts";
 
 const exec = promisify(execFile);
 const npmCli = process.env.npm_execpath;
+
+test("packaged payloads exactly match their authoritative manifest closure", () => {
+  const prefix = "package/images/";
+  const expected = [prefix + "manifest.json", prefix + "development-x64/system.ext4.gz"];
+  assert.doesNotThrow(() => assertPayloadClosure(["package/README.md", prefix, ...expected], prefix, expected));
+  for (const extra of ["retired-disk.gz", "undeclared-kernel", "undeclared.json", "system.ext4"]) {
+    assert.throws(() => assertPayloadClosure([...expected, prefix + extra], prefix, expected), /undeclared/u);
+  }
+  assert.throws(() => assertPayloadClosure(expected.slice(1), prefix, expected), /missing/u);
+  assert.throws(() => assertPayloadClosure([...expected, expected[0]], prefix, expected), /duplicate/u);
+  assert.throws(() => assertPayloadClosure(expected, prefix, [...expected, expected[0]]), /inventory/u);
+  assert.throws(() => assertPayloadClosure(expected, prefix, ["package/native/foreign"]), /inventory/u);
+});
 
 async function fixture(context, manifest = {}) {
   const root = await mkdtemp(join(tmpdir(), "sandsurf-archive-test-"));

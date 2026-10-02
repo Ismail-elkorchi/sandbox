@@ -31,6 +31,12 @@ test('host API and guardian supervision have independent native service owners',
   assert.match(macos.files[0].contents, /<string>supervise<\/string>/u);
   assert.match(macos.files[1].contents, /<string>serve<\/string>/u);
   assert.notEqual(macos.files[0].name, macos.files[1].name);
+  for (const file of macos.files) {
+    assert.match(file.contents, /<key>RunAtLoad<\/key><true\/>/u);
+    assert.doesNotMatch(file.contents, /KeepAlive/u, 'a completed bootstrap must not become a restart loop');
+  }
+  assert.match(macos.installHint, /startup-only/u);
+  assert.match(macos.installHint, /Removing a registration does not stop/u);
 
   const windows = renderSandsurfServiceDefinition({ directory: 'C:\\Sandsurf State', binary: 'C:\\Program Files\\Sandsurf\\sandsurf-host.exe', platform: 'windows' });
   assert.equal(windows.format, 'windows-scm-powershell');
