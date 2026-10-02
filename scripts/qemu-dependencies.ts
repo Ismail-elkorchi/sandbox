@@ -13,8 +13,9 @@ export interface DependencyComponent {
   materials: Record<string, string>;
 }
 export interface DependencyManifest { formatVersion: 1; components: DependencyComponent[] }
+export interface CommandLimits { timeoutMs: number; maximumOutputBytes: number }
 export type BuildRunner = (command: string, arguments_: readonly string[], cwd: string, capture?: boolean,
-  environment?: Readonly<Record<string, string>>) => Promise<string>;
+  environment?: Readonly<Record<string, string>>, limits?: Readonly<CommandLimits>) => Promise<string>;
 
 const maximumBytes = 512 * 1024 ** 2;
 const safeName = /^[A-Za-z0-9_.+-]+$/u;
@@ -148,9 +149,7 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
 export async function verifyMsysSource(source: string, signature: string, scratch: string,
   run: BuildRunner): Promise<{ source: string; signature: string }> {
   await regular(source, maximumBytes); await regular(signature, 65536);
-  if ((await readFile(signature)).includes(Buffer.from("BEGIN PGP SIGNATURE"))) {
-    throw new Error("MSYS2 package signatures must be binary detached signatures");
-  }
+  requireDetachedSignature(await readFile(signature));
   const verified = { source: await runtimeDigest(source), signature: await runtimeDigest(signature) };
   const keyring = (await run("pacman-conf", ["GPGDir"], scratch, true)).trim();
   if (!keyring.startsWith("/") || keyring.length > 4096 || /[\0\r\n]/u.test(keyring)) {
@@ -161,7 +160,7 @@ export async function verifyMsysSource(source: string, signature: string, scratc
   const status = await run("gpg", ["--no-options", "--homedir", keyring, "--batch", "--no-tty",
     "--no-autostart", "--lock-never", "--no-auto-check-trustdb", "--no-auto-key-retrieve",
     "--auto-key-locate", "clear", "--trust-model", "pgp", "--status-fd", "1",
-    "--verify", unixSignature, unixSource], scratch, true);
+    "--verify", unixSignature, unixSource], scratch, true, {}, { timeoutMs: 30000, maximumOutputBytes: 65536 });
   requireTrustedSignature(status);
   if (await runtimeDigest(source) !== verified.source || await runtimeDigest(signature) !== verified.signature) {
     throw new Error("MSYS2 source changed during verification");
@@ -169,12 +168,36 @@ export async function verifyMsysSource(source: string, signature: string, scratc
   return verified;
 }
 
+/** Admit one finite signature packet, not a compressed/literal/encrypted
+ * OpenPGP message which could expand before the verifier's output cap applies.
+ * Packet headers are upstream OpenPGP encodings, not Sandsurf format versions.
+ * Cryptographic validity and distribution trust still belong to GPG.
+ * https://www.rfc-editor.org/rfc/rfc9580.html#section-4.2 */
+export function requireDetachedSignature(bytes: Buffer): void {
+  if (bytes.length < 3 || bytes.length > 65536) throw new Error("detached signature packet exceeds its bound");
+  const first = bytes[0]!;
+  let start: number, length: number;
+  if (first === 0xc2) {
+    const kind = bytes[1]!;
+    if (kind < 192) { start = 2; length = kind; }
+    else if (kind < 224 && bytes.length >= 3) { start = 3; length = (kind - 192) * 256 + bytes[2]! + 192; }
+    else if (kind === 255 && bytes.length >= 6) { start = 6; length = bytes.readUInt32BE(2); }
+    else throw new Error("detached signatures cannot have partial packet lengths");
+  } else if (first >= 0x88 && first <= 0x8a) {
+    start = 2 + (first === 0x89 ? 1 : first === 0x8a ? 3 : 0);
+    if (bytes.length < start) throw new Error("truncated detached signature header");
+    length = bytes.readUIntBE(1, start - 1);
+  } else throw new Error("MSYS2 source requires one binary detached signature packet");
+  if (length === 0 || start + length !== bytes.length) throw new Error("detached signature packet is truncated or has trailing packets");
+}
+
 /** Status-fd is a protocol, not localized diagnostics or an exit-code-only
  * success indication. A valid signature from an unknown key is insufficient.
  * Reject extra signatures and every failure/unknown status, even after trust.
  * https://raw.githubusercontent.com/gpg/gnupg/master/doc/DETAILS */
 export function requireTrustedSignature(status: string): void {
-  if (Buffer.byteLength(status) > 65536 || /[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/u.test(status)) throw new Error("invalid signature status bounds");
+  if (!status.endsWith("\n") || Buffer.byteLength(status) > 65536
+    || /[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/u.test(status)) throw new Error("invalid signature status bounds");
   const lines = status.replaceAll("\r\n", "\n").split("\n");
   if (lines.at(-1) === "") lines.pop();
   if (lines.length === 0 || lines.length > 64) throw new Error("invalid signature status count");

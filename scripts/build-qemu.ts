@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { ownerHooks, QEMU_CORRESPONDING_FILES, QEMU_SOURCE } from "./qemu-source.ts";
 import { qemuRequiredInputs, runtimeDigest, verifyQemuRuntime } from "./qemu-runtime.ts";
 import { collectDependencySources, verifyDependencySources } from "./qemu-dependencies.ts";
-import type { LibraryInput } from "./qemu-dependencies.ts";
+import type { CommandLimits, LibraryInput } from "./qemu-dependencies.ts";
 import { peImports } from "./pe-imports.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -191,18 +191,35 @@ async function digest(path: string): Promise<string> {
   for await (const bytes of createReadStream(path, { highWaterMark: 65536 })) hash.update(bytes);
   return hash.digest("hex");
 }
-function run(command: string, args: readonly string[], cwd: string, capture = false,
-  environment: Readonly<Record<string, string>> = {}): Promise<string> {
+export function run(command: string, args: readonly string[], cwd: string, capture = false,
+  environment: Readonly<Record<string, string>> = {}, limits?: Readonly<CommandLimits>): Promise<string> {
+  if (limits !== undefined && (!capture || !Number.isSafeInteger(limits.timeoutMs) || limits.timeoutMs < 1
+    || limits.timeoutMs > 300000 || !Number.isSafeInteger(limits.maximumOutputBytes)
+    || limits.maximumOutputBytes < 1 || limits.maximumOutputBytes > 1024 * 1024)) {
+    return Promise.reject(new Error("invalid bounded build-command limits"));
+  }
   return new Promise((resolveRun, rejectRun) => {
-    let output = "", tooLarge = false;
+    let output = "", outputBytes = 0, tooLarge = false, expired = false;
+    const maximum = limits?.maximumOutputBytes ?? 1024 * 1024;
     const child = spawn(command, args, { cwd, env: { ...process.env, ...environment }, stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit" });
+    // Bounded verifier calls cannot start daemons or subprocesses (--no-autostart).
+    // A compiler's whole build tree has a different owner/budget; don't pretend
+    // that killing one arbitrary process would contain all its descendants.
+    const timer = limits === undefined ? undefined : setTimeout(() => {
+      expired = true; child.kill("SIGKILL");
+    }, limits.timeoutMs);
     child.stdout?.on("data", (bytes: Buffer) => {
-      if (output.length + bytes.length > 1024 * 1024) { tooLarge = true; child.kill(); }
+      if (tooLarge || expired) return;
+      outputBytes += bytes.length;
+      if (outputBytes > maximum) { tooLarge = true; child.kill("SIGKILL"); }
       else output += bytes.toString("utf8");
     });
-    child.once("error", rejectRun);
-    child.once("close", (code, signal) => code === 0 && !tooLarge ? resolveRun(output)
-      : rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`)));
+    child.once("error", error => { clearTimeout(timer); rejectRun(error); });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0 && !tooLarge && !expired) resolveRun(output);
+      else rejectRun(new Error(`${command} failed (${expired ? "deadline" : tooLarge ? "output bound" : code ?? signal ?? "unknown"})`));
+    });
   });
 }
 
