@@ -62,7 +62,9 @@ test("real GPG verifies a read-only trusted keyring and rejects an untrusted sig
     const execute = promisify(execFile);
     try { await execute("gpg", ["--version"], { timeout: 5000, maxBuffer: 65536 }); }
     catch (error) { if (error.code === "ENOENT") { context.skip("GPG is not installed"); return; } throw error; }
-    const root = await realpath(await mkdtemp(resolve(tmpdir(), "sandsurf-gpg-test-")));
+    // GPG creates native Unix sockets below its homedir. Darwin's per-user
+    // TMPDIR can exhaust sun_path before the agent has even started.
+    const root = await realpath(await mkdtemp(resolve(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "ss-gpg-")));
     const keyring = resolve(root, "keyring"), untrusted = resolve(root, "untrusted");
     await mkdir(keyring, { mode: 0o700 }); await mkdir(untrusted, { mode: 0o700 });
     context.after(async () => {
