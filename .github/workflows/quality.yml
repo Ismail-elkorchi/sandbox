@@ -188,6 +188,8 @@ jobs:
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
       - run: cargo build --locked -p sandsurf-host
+      - name: Windows pending I/O ownership contracts (no VM hardware required)
+        run: cargo test --locked -p sandsurf-native --lib local::deadline_tests -- --test-threads=1
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64

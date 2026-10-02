@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+    ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
     ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -945,6 +945,7 @@ fn create_pipe(name: &[u16], first: bool) -> io::Result<Handle> {
 }
 
 fn connect_pipe(pipe: &Handle, deadline: &Deadline) -> io::Result<()> {
+    deadline.remaining()?;
     let event = create_event()?;
     // SAFETY: OVERLAPPED accepts zero initialization and a live event handle.
     let mut overlapped: OVERLAPPED = unsafe { zeroed() };
@@ -975,6 +976,7 @@ where
     if requested == 0 {
         return Ok(0);
     }
+    deadline.remaining()?;
     let count = u32::try_from(requested).map_err(|_| invalid("local I/O request is too large"))?;
     let event = create_event()?;
     // SAFETY: OVERLAPPED accepts zero initialization and a live event handle.
@@ -1006,30 +1008,53 @@ fn wait_overlapped(
     event: &Handle,
     deadline: &Deadline,
 ) -> io::Result<u32> {
+    // The deadline can expire after submission, before the first wait. Every
+    // exit must collect the exact IRP before its buffer, event or OVERLAPPED
+    // goes out of scope. Timeout is not evidence that Windows stopped using it.
+    let mut pending = PendingIo {
+        pipe,
+        overlapped,
+        complete: false,
+    };
+    let timeout = deadline.millis()?;
     // SAFETY: event is a live event handle and timeout is bounded.
-    let wait = unsafe { WaitForSingleObject(event.0, deadline.millis()?) };
+    let wait = unsafe { WaitForSingleObject(event.0, timeout) };
     if wait == WAIT_TIMEOUT {
-        drain_cancelled(pipe, overlapped);
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "local transport deadline elapsed",
         ));
     }
     if wait == WAIT_FAILED {
-        let error = io::Error::last_os_error();
-        drain_cancelled(pipe, overlapped);
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
     if wait != WAIT_OBJECT_0 {
-        drain_cancelled(pipe, overlapped);
         return Err(io::Error::other("unexpected local transport wait result"));
     }
     let mut transferred = 0_u32;
     // SAFETY: the event signalled completion of this exact operation.
-    if unsafe { GetOverlappedResult(pipe.0, overlapped, &mut transferred, 0) } == 0 {
-        return pipe_error().map(|count| count as u32);
+    if unsafe { GetOverlappedResult(pipe.0, pending.overlapped, &mut transferred, 0) } == 0 {
+        let error = io::Error::last_os_error();
+        pending.complete = error.raw_os_error() != Some(ERROR_IO_INCOMPLETE as i32);
+        return map_pipe_error(error).map(|count| count as u32);
     }
+    pending.complete = true;
     Ok(transferred)
+}
+
+/// One owner of an outstanding operation. The caller retains the buffer and
+/// event until this borrow ends; even early errors must drain kernel access.
+struct PendingIo<'a> {
+    pipe: &'a Handle,
+    overlapped: &'a mut OVERLAPPED,
+    complete: bool,
+}
+impl Drop for PendingIo<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            drain_cancelled(self.pipe, self.overlapped);
+        }
+    }
 }
 
 fn drain_cancelled(pipe: &Handle, overlapped: &mut OVERLAPPED) {
@@ -1288,4 +1313,140 @@ fn wide_os(path: &Path) -> io::Result<Vec<u16>> {
     }
     value.push(0);
     Ok(value)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use sandsurf_protocol::{AUTHENTICATION_BYTES, Counter, FrameKind};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const WAIT: Duration = Duration::from_secs(2);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    struct Root(PathBuf);
+    impl Root {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "ss-pending-{}-{nonce:x}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            create_private_directory(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn expired() -> Deadline {
+        Deadline(Instant::now() - Duration::from_millis(1))
+    }
+
+    fn frame() -> Frame {
+        Frame {
+            kind: FrameKind::Data,
+            stream: 7,
+            sequence: Counter::ONE,
+            authentication: [0; AUTHENTICATION_BYTES],
+            payload: vec![0, 255, 10, 128],
+        }
+    }
+
+    fn assert_cancelled(pipe: &Handle, overlapped: &mut OVERLAPPED) {
+        let mut transferred = 0;
+        // SAFETY: the pipe, event, buffer and completion record remain live.
+        let result = unsafe { GetOverlappedResult(pipe.0, overlapped, &mut transferred, 0) };
+        let error = io::Error::last_os_error().raw_os_error();
+        // Also drain on a test failure, so a regression never releases memory
+        // still owned by the kernel while unwinding the failing assertion.
+        if result == 0 && error == Some(ERROR_IO_INCOMPLETE as i32) {
+            drain_cancelled(pipe, overlapped);
+        }
+        assert_eq!(result, 0);
+        assert_eq!(error, Some(ERROR_OPERATION_ABORTED as i32));
+    }
+
+    #[test]
+    fn expired_wait_drains_pending_read_before_releasing_its_buffer() {
+        let root = Root::new();
+        let listener = LocalListener::bind(&root.0).unwrap();
+        let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();
+        let mut server = listener.accept(WAIT).unwrap();
+        let event = create_event().unwrap();
+        // SAFETY: zero initialization is valid for this completion record.
+        let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+        overlapped.hEvent = event.0;
+        let mut byte = [0_u8; 1];
+        // SAFETY: all borrowed storage stays live through cancellation/drain.
+        let submitted = unsafe {
+            ReadFile(
+                server.pipe.0,
+                byte.as_mut_ptr(),
+                1,
+                null_mut(),
+                &mut overlapped,
+            )
+        };
+        let submit_error = io::Error::last_os_error().raw_os_error();
+        let result = wait_overlapped(&server.pipe, &mut overlapped, &event, &expired());
+        assert_cancelled(&server.pipe, &mut overlapped);
+        assert_eq!(submitted, 0);
+        assert_eq!(submit_error, Some(ERROR_IO_PENDING as i32));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        client.write_frame(&frame(), WAIT).unwrap();
+        assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
+    }
+
+    #[test]
+    fn expired_wait_drains_pending_connect_and_preserves_listener_availability() {
+        let root = Root::new();
+        let listener = LocalListener::bind(&root.0).unwrap();
+        {
+            let state = listener.state.lock().unwrap();
+            let pipe = state.pending.as_ref().unwrap();
+            let event = create_event().unwrap();
+            // SAFETY: zero initialization is valid for this completion record.
+            let mut overlapped: OVERLAPPED = unsafe { zeroed() };
+            overlapped.hEvent = event.0;
+            // SAFETY: pipe and completion storage remain live through drain.
+            let submitted = unsafe { ConnectNamedPipe(pipe.0, &mut overlapped) };
+            let submit_error = io::Error::last_os_error().raw_os_error();
+            let result = wait_overlapped(pipe, &mut overlapped, &event, &expired());
+            assert_cancelled(pipe, &mut overlapped);
+            assert_eq!(submitted, 0);
+            assert_eq!(submit_error, Some(ERROR_IO_PENDING as i32));
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        let mut client = LocalConnection::connect(&root.0, WAIT).unwrap();
+        let mut server = listener.accept(WAIT).unwrap();
+        client.write_frame(&frame(), WAIT).unwrap();
+        assert_eq!(server.read_frame(WAIT).unwrap(), Some(frame()));
+    }
+
+    #[test]
+    fn expired_deadline_never_submits_new_io() {
+        let root = Root::new();
+        let listener = LocalListener::bind(&root.0).unwrap();
+        let state = listener.state.lock().unwrap();
+        let pipe = state.pending.as_ref().unwrap();
+        let mut submitted = false;
+        let result = overlapped_io(pipe, 1, &expired(), |_, _| {
+            submitted = true;
+            1
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(!submitted);
+        assert_eq!(
+            connect_pipe(pipe, &expired()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 }
