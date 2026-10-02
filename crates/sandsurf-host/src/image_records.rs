@@ -1,4 +1,4 @@
-//! Immutable image-operation records. Jobs and terminal results use one
+//! Immutable host records. Native configurations, jobs and terminal results use one
 //! bounded, no-replace publication mechanism; partial writes are never results.
 use sandsurf_native::local::{create_private_file, open_private_file};
 use sandsurf_native::storage::{publish_new_file, sync_file};

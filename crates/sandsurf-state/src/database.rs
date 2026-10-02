@@ -42,8 +42,14 @@ impl Database {
         let mut connection = connect(&database_path)?;
         configure_durability(&connection)?;
         let tx = connection.transaction()?;
-        tx.execute_batch("PRAGMA application_id = 1396919601; PRAGMA user_version = 1; CREATE TABLE identity(role TEXT NOT NULL) STRICT;")?;
-        tx.execute("INSERT INTO identity VALUES (?1)", [role])?;
+        tx.execute_batch("PRAGMA application_id = 1396919601; PRAGMA user_version = 1; CREATE TABLE identity(role TEXT NOT NULL, schema_digest TEXT NOT NULL) STRICT;")?;
+        tx.execute(
+            "INSERT INTO identity VALUES (?1,?2)",
+            [
+                role,
+                sandsurf_protocol::bytes_digest(schema.as_bytes()).as_str(),
+            ],
+        )?;
         tx.execute_batch(schema)?;
         tx.commit()?;
         sync_directory(&root)?;
@@ -57,7 +63,7 @@ impl Database {
         })
     }
 
-    pub fn open(root: &Path, role: &str) -> Result<Self> {
+    pub fn open(root: &Path, role: &str, schema: &str) -> Result<Self> {
         let root = canonical_directory(root)?;
         let lease = private_file(&root.join("writer.lock"), false)?;
         lock(&lease)?;
@@ -71,9 +77,18 @@ impl Database {
                 "incompatible authority catalog; preserved intact",
             ));
         }
-        let actual: String = connection.query_row("SELECT role FROM identity", [], |r| r.get(0))?;
+        let (actual, fingerprint): (String, String) = connection
+            .query_row("SELECT role,schema_digest FROM identity", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|_| Error::Corrupt("incompatible authority schema; preserved intact"))?;
         if actual != role {
             return Err(Error::Conflict("authority writer role mismatch"));
+        }
+        if fingerprint != sandsurf_protocol::bytes_digest(schema.as_bytes()).as_str() {
+            return Err(Error::Corrupt(
+                "incompatible authority schema; preserved intact",
+            ));
         }
         configure_durability(&connection)?;
         Ok(Self {

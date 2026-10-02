@@ -172,6 +172,25 @@ fn earlier_version_one_catalog_family_is_rejected_without_migration() {
 }
 
 #[test]
+fn mismatched_schema_identity_is_rejected_untouched_at_version_one() {
+    let root = TempRoot::new();
+    let path = root.0.join("wrong-schema");
+    drop(HostCatalog::create(&path, "schema-test".try_into().unwrap(), catalog_limits()).unwrap());
+    let database = path.join("authority.sqlite");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE identity SET schema_digest=?1",
+            [hash("different-schema").as_str()],
+        )
+        .unwrap();
+    drop(connection);
+    let original = fs::read(&database).unwrap();
+    assert!(matches!(HostCatalog::open(&path), Err(Error::Corrupt(_))));
+    assert_eq!(fs::read(&database).unwrap(), original);
+}
+
+#[test]
 fn machine_execution_defaults_is_host_owned_and_durable() {
     let root = TempRoot::new();
     let path = root.0.join("defaults-configuration-host");
@@ -1131,10 +1150,10 @@ fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
             &snapshot_id,
             resources(),
             MachineLifetime::default(),
-            fork_operation,
+            fork_operation.clone(),
             Approval {
                 id: "approve-fork".try_into().unwrap(),
-                request_digest: fork_digest,
+                request_digest: fork_digest.clone(),
             },
         )
         .unwrap();
@@ -1150,6 +1169,49 @@ fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     let fork = fixture.host.machine(&fork_id).unwrap().unwrap();
     assert!(fork.runtime_configuration.network.rules.is_empty());
     assert!(fork.runtime_configuration.exposures.is_empty());
+    let pending = fixture.host.fork(&fork_id).unwrap().unwrap();
+    assert_eq!(pending.snapshot_id, snapshot_id);
+    assert!(pending.materialized_disk.is_none());
+    assert!(
+        fixture.host.authorize_lifecycle(&fork_operation).is_err(),
+        "reconciliation must not boot an uncustomized fork"
+    );
+    assert!(
+        fixture
+            .host
+            .complete_fork_materialization(
+                &fork_id,
+                &fork_operation,
+                &hash("wrong-request"),
+                hash("customized"),
+            )
+            .is_err()
+    );
+    let customized = hash("customized");
+    let completed = fixture
+        .host
+        .complete_fork_materialization(&fork_id, &fork_operation, &fork_digest, customized.clone())
+        .unwrap();
+    assert_eq!(completed.materialized_disk, Some(customized.clone()));
+    fixture.host.authorize_lifecycle(&fork_operation).unwrap();
+    assert_eq!(
+        fixture
+            .host
+            .complete_fork_materialization(&fork_id, &fork_operation, &fork_digest, customized,)
+            .unwrap(),
+        completed
+    );
+    assert!(
+        fixture
+            .host
+            .complete_fork_materialization(
+                &fork_id,
+                &fork_operation,
+                &fork_digest,
+                hash("re-customized"),
+            )
+            .is_err()
+    );
 
     let rollback_operation: OperationId = "rollback-snapshot".try_into().unwrap();
     let rollback_digest = digest(
@@ -1191,6 +1253,17 @@ fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
             .configuration_revision,
         n(2)
     );
+    let Fixture {
+        host,
+        runtime,
+        root,
+        ..
+    } = fixture;
+    drop(host);
+    drop(runtime);
+    let reopened = HostCatalog::open(&root.0.join("host")).unwrap();
+    assert_eq!(reopened.fork(&fork_id).unwrap(), Some(completed));
+    reopened.authorize_lifecycle(&fork_operation).unwrap();
 }
 
 #[test]

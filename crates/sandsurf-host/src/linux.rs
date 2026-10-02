@@ -20,10 +20,9 @@ use sandsurf_native::storage::object_name;
 use sandsurf_network::NativeNetworkGateway;
 use sandsurf_protocol::{BootCapability, BootIdentity, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
-    Counter, Digest, Domain, ExecutionDefaults, GuestServiceRequest, LifecycleCommand, MachineId,
-    MachineObservation, MachineState, NativeFullCapture, NativeSnapshotRequest,
-    NativeSnapshotResponse, NetworkPolicy, Resources, RuntimeConfiguration, SnapshotArtifact,
-    VmEngine, bytes_digest, digest,
+    Counter, Digest, Domain, GuestServiceRequest, LifecycleCommand, MachineId, MachineObservation,
+    MachineState, NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy,
+    Resources, RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -271,28 +270,19 @@ pub fn prepare_config(
 }
 
 pub fn write_config(path: &Path, config: &LinuxGuardianConfig) -> Result<(), LinuxError> {
-    if path.exists() {
-        let existing = read_json::<LinuxGuardianConfig>(path, 1024 * 1024)?;
-        return if existing == *config {
-            Ok(())
-        } else {
-            Err(LinuxError::Invalid(
-                "guardian configuration is already bound to different inputs".into(),
-            ))
-        };
+    match crate::image_records::publish(path, config) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if crate::image_records::read::<LinuxGuardianConfig>(path)? == *config {
+                Ok(())
+            } else {
+                Err(LinuxError::Invalid(
+                    "guardian configuration is already bound to different inputs".into(),
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
     }
-    let bytes = serde_json::to_vec(config)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
 }
 
 pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<LinuxGuardianConfig, LinuxError> {
@@ -317,30 +307,6 @@ pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<LinuxGuardianC
         ));
     }
     Ok(value)
-}
-
-pub fn execution_defaults(
-    host_root: &Path,
-    image_digest: &Digest,
-) -> Result<ExecutionDefaults, LinuxError> {
-    let image = verify_image(
-        &host_root
-            .join("images")
-            .join(image_digest.as_str())
-            .join("manifest.json"),
-        ImageTrust::ExplicitLocal,
-    )?;
-    if image.manifest_digest != image_digest.as_str() {
-        return Err(LinuxError::Invalid(
-            "installed image identity changed".into(),
-        ));
-    }
-    let defaults = image.manifest.system.defaults;
-    Ok(ExecutionDefaults {
-        environment: defaults.environment,
-        user: defaults.user,
-        working_directory: defaults.working_directory,
-    })
 }
 
 pub struct LinuxGuardianEffect {
@@ -1945,6 +1911,20 @@ mod storage_tests {
             system_seed_sha256: "b".repeat(64),
             guest_cid: 17,
         };
+        let config_path = root.join("guardian/config.json");
+        let interrupted = root.join("guardian/interrupted.pending");
+        sandsurf_native::local::create_private_file(&interrupted)
+            .unwrap()
+            .write_all(b"{\"incomplete\":")
+            .unwrap();
+        write_config(&config_path, &config).unwrap();
+        let published = fs::read(&config_path).unwrap();
+        write_config(&config_path, &config).unwrap();
+        let mut conflicting = config.clone();
+        conflicting.guest_cid = 18;
+        assert!(write_config(&config_path, &conflicting).is_err());
+        assert_eq!(fs::read(&config_path).unwrap(), published);
+        assert_eq!(fs::read(&interrupted).unwrap(), b"{\"incomplete\":");
         let mut factory = LinuxGenerationFactory {
             network: Arc::new(Mutex::new(None)),
             network_usage: Arc::new(Mutex::new(NetworkUsageValue::default())),

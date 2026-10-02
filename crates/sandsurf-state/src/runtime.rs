@@ -197,12 +197,7 @@ impl RuntimeJournal {
         })
     }
     pub fn open(path: &Path, machine: &MachineId) -> Result<Self> {
-        let db = Database::open(path, "guardian")?;
-        // Reject a prior execution layout before any output-write recovery.
-        // There is one active schema, with no migration or rebind reader.
-        db.connection.prepare(
-            "SELECT p.admission,p.lineage,r.request_digest FROM processes p LEFT JOIN restore_admissions r ON r.generation=p.generation LIMIT 0",
-        ).map_err(|_| Error::Corrupt("incompatible execution journal; preserved intact"))?;
+        let db = Database::open(path, "guardian", SCHEMA)?;
         let (identity, limits, binding): (String, String, String) = db.connection.query_row(
             "SELECT machine,limits,authority FROM configuration WHERE id=1",
             [],

@@ -22,6 +22,7 @@ CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, mach
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
 CREATE TABLE suspensions(machine TEXT PRIMARY KEY REFERENCES machines(id), value TEXT NOT NULL) STRICT;
+CREATE TABLE forks(machine TEXT PRIMARY KEY REFERENCES machines(id), operation TEXT UNIQUE NOT NULL REFERENCES intents(id), snapshot TEXT NOT NULL REFERENCES snapshots(id), value TEXT NOT NULL) STRICT;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +91,18 @@ pub struct ImageRecord {
     pub storage_bytes: Counter,
     pub provenance_digest: Digest,
     pub sensitive: bool,
+}
+
+/// Host-owned creation intent. Storage publication and clone customization
+/// must complete before any Running authorization is issued for this machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForkRecord {
+    pub machine_id: MachineId,
+    pub operation_id: OperationId,
+    pub snapshot_id: SnapshotId,
+    pub request_digest: Digest,
+    pub materialized_disk: Option<Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,7 +283,7 @@ impl HostCatalog {
         })
     }
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::open(path, "host")?;
+        let db = Database::open(path, "host", SCHEMA)?;
         let orphaned: bool = db.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM machines m LEFT JOIN images i ON m.image=i.digest WHERE m.released=0 AND (i.digest IS NULL OR i.retired<>0))",
             [], |row| row.get(0),
@@ -1621,6 +1634,13 @@ impl HostCatalog {
                 snapshot.sensitive
             ],
         )?;
+        let fork = ForkRecord {
+            machine_id: id.clone(),
+            operation_id: operation.clone(),
+            snapshot_id: snapshot_id.clone(),
+            request_digest: request.clone(),
+            materialized_disk: None,
+        };
         let value = LifecycleIntent {
             machine_id: id,
             operation_id: operation,
@@ -1630,8 +1650,53 @@ impl HostCatalog {
             completion: None,
         };
         save_intent(&tx, &value)?;
+        tx.execute(
+            "INSERT INTO forks VALUES (?1,?2,?3,?4)",
+            params![
+                fork.machine_id.as_str(),
+                fork.operation_id.as_str(),
+                fork.snapshot_id.as_str(),
+                encode(&fork)?,
+            ],
+        )?;
         tx.commit()?;
         Ok(value)
+    }
+
+    pub fn fork(&self, machine: &MachineId) -> Result<Option<ForkRecord>> {
+        fork_record(&self.db.connection, machine)
+    }
+
+    /// Actual verified disk bytes, not worker receipt presence, establish
+    /// materialization. This record persists after Linux modifies those bytes;
+    /// reopening a machine must never reapply its creation customization.
+    pub fn complete_fork_materialization(
+        &mut self,
+        machine: &MachineId,
+        operation: &OperationId,
+        request_digest: &Digest,
+        disk: Digest,
+    ) -> Result<ForkRecord> {
+        let tx = self.db.connection.transaction()?;
+        let mut fork = fork_record(&tx, machine)?
+            .ok_or(Error::Missing("machine fork admission is missing"))?;
+        if fork.operation_id != *operation || fork.request_digest != *request_digest {
+            return Err(Error::Conflict("fork materialization admission changed"));
+        }
+        if let Some(old) = &fork.materialized_disk {
+            return if old == &disk {
+                Ok(fork)
+            } else {
+                Err(Error::Conflict("fork materialization completion changed"))
+            };
+        }
+        fork.materialized_disk = Some(disk);
+        tx.execute(
+            "UPDATE forks SET value=?2 WHERE machine=?1",
+            params![machine.as_str(), encode(&fork)?],
+        )?;
+        tx.commit()?;
+        Ok(fork)
     }
 
     pub fn admit_rollback(
@@ -1802,6 +1867,15 @@ impl HostCatalog {
             .ok_or(Error::Missing("lifecycle intent is missing"))?;
         let machine = machine_record(&self.db.connection, &intent.machine_id)?
             .ok_or(Error::Missing("lifecycle machine is missing"))?;
+        if intent.desired == DesiredState::Running
+            && self
+                .fork(&intent.machine_id)?
+                .is_some_and(|fork| fork.materialized_disk.is_none())
+        {
+            return Err(Error::Conflict(
+                "fork disk materialization has not completed",
+            ));
+        }
         if machine.configuration_revision != intent.revision {
             return Err(Error::Conflict(
                 "lifecycle intent is no longer the current configuration revision",
@@ -2487,6 +2561,17 @@ fn machine_record(db: &rusqlite::Connection, machine: &MachineId) -> Result<Opti
         known_sensitive,
         latest_intent: decode(&latest)?,
     }))
+}
+
+fn fork_record(db: &rusqlite::Connection, machine: &MachineId) -> Result<Option<ForkRecord>> {
+    db.query_row(
+        "SELECT value FROM forks WHERE machine=?1",
+        [machine.as_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|value| decode(&value))
+    .transpose()
 }
 
 fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<Snapshot>> {

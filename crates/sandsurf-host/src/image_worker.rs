@@ -81,7 +81,9 @@ enum Outcome {
     Boot {
         boot: sandsurf_image::boot::FrozenBoot,
     },
-    Fork,
+    Fork {
+        customized: Digest,
+    },
     DiskSnapshot {
         capture: crate::snapshots::CaptureResult,
     },
@@ -122,8 +124,9 @@ fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
         if record.request_digest != job.request_digest {
             return Err(HostError::Invalid("fork worker completion binding changed"));
         }
-        crate::snapshots::verify_fork(snapshot, &fork_disk(root, machine_id), profile)?;
-        return Ok(Some(Outcome::Fork));
+        let customized =
+            crate::snapshots::verify_fork(snapshot, &fork_disk(root, machine_id), profile)?;
+        return Ok(Some(Outcome::Fork { customized }));
     }
     if matches!(job.build, Build::Boot { .. }) {
         let record: BootResult = match read(&directory(root, &job.operation).join("result.json")) {
@@ -178,7 +181,7 @@ pub fn execute(root: &Path, executable: &Path, job: Job) -> Result<ImageRecord> 
     }
     match dispatch(root, executable, job)? {
         Outcome::Image { image } => Ok(image),
-        Outcome::Boot { .. } | Outcome::Fork | Outcome::DiskSnapshot { .. } => Err(
+        Outcome::Boot { .. } | Outcome::Fork { .. } | Outcome::DiskSnapshot { .. } => Err(
             HostError::Invalid("image worker returned a machine preparation result"),
         ),
     }
@@ -267,7 +270,7 @@ pub(crate) fn materialize_fork(
     machine_id: &MachineId,
     profile: sandsurf_image::identity::CloneProfile,
     operation: &OperationId,
-) -> Result<()> {
+) -> Result<Digest> {
     let build = Build::Fork {
         snapshot: Box::new(snapshot.clone()),
         machine_id: machine_id.clone(),
@@ -283,7 +286,7 @@ pub(crate) fn materialize_fork(
         build,
     };
     match dispatch(root, executable, job)? {
-        Outcome::Fork => Ok(()),
+        Outcome::Fork { customized } => Ok(customized),
         _ => Err(HostError::Invalid(
             "fork worker returned a different result kind",
         )),

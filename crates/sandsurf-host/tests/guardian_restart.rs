@@ -1262,7 +1262,18 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     )
     .unwrap();
     assert_eq!(host.intent(&pause).unwrap().unwrap().completion, None);
-    let result = apply_lifecycle(&mut host, endpoint.clone(), &pause).unwrap();
+    let plan = LifecyclePlan::admit(&host, &pause).unwrap();
+    let effects_endpoint = endpoint.clone();
+    let effects = std::thread::spawn(move || plan.execute(effects_endpoint));
+    // Transport and native effects own no SQLite writer or signing key.
+    assert!(host.machine(&fixture.machine).unwrap().is_some());
+    let evidence = effects.join().unwrap().unwrap();
+    assert_eq!(
+        host.intent(&pause).unwrap().unwrap().completion,
+        None,
+        "native application is not host intent completion"
+    );
+    let result = evidence.complete(&mut host).unwrap();
     let lifecycle = result.guardian_operation;
     assert_eq!(lifecycle.delivery, Delivery::Applied);
     assert!(result.completed_intent.unwrap().completion.is_some());
@@ -1298,10 +1309,20 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
         },
     )
     .unwrap();
-    let resumed = apply_lifecycle(&mut host, endpoint.clone(), &resume).unwrap();
+    let resumed = LifecyclePlan::admit(&host, &resume)
+        .unwrap()
+        .execute(endpoint.clone())
+        .unwrap()
+        .complete(&mut host)
+        .unwrap();
     assert_eq!(resumed.guardian_operation.delivery, Delivery::Applied);
 
-    let replayed = apply_lifecycle(&mut host, endpoint.clone(), &pause).unwrap();
+    let replayed = LifecyclePlan::admit(&host, &pause)
+        .unwrap()
+        .execute(endpoint.clone())
+        .unwrap()
+        .complete(&mut host)
+        .unwrap();
     assert_eq!(replayed.guardian_operation, lifecycle);
     assert_eq!(replayed.completed_intent, host.intent(&pause).unwrap());
     let current = GuardianClient::new(endpoint)
@@ -1373,7 +1394,12 @@ fn blocked_guest_io_cannot_block_native_observation_or_power_off() {
             },
         )
         .unwrap();
-    let result = apply_lifecycle(&mut fixture.host, endpoint, &operation).unwrap();
+    let result = LifecyclePlan::admit(&fixture.host, &operation)
+        .unwrap()
+        .execute(endpoint)
+        .unwrap()
+        .complete(&mut fixture.host)
+        .unwrap();
     assert_eq!(result.guardian_operation.delivery, Delivery::Applied);
     // Assert the dependency, not filesystem throughput on a shared runner:
     // native completion must precede either release or timeout of guest I/O.
@@ -1439,7 +1465,12 @@ fn durable_capture_ownership_fences_native_delivery_and_never_blocks_forced_cont
                     },
                 )
                 .unwrap();
-            let outcome = apply_lifecycle(&mut fixture.host, endpoint.clone(), &operation).unwrap();
+            let outcome = LifecyclePlan::admit(&fixture.host, &operation)
+                .unwrap()
+                .execute(endpoint.clone())
+                .unwrap()
+                .complete(&mut fixture.host)
+                .unwrap();
             assert_eq!(outcome.guardian_operation.delivery, expected);
         }
         let inspection = GuardianClient::new(endpoint)

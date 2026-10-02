@@ -1383,68 +1383,132 @@ pub struct HostLifecycleResult {
     pub completed_intent: Option<LifecycleIntent>,
 }
 
-/// Route one already-authorized host intent, then commit only guardian evidence
-/// that establishes its postcondition. Ambiguous/not-applied delivery leaves the
-/// host intent pending and returns the guardian operation unchanged.
-pub fn apply_lifecycle(
-    catalog: &mut HostCatalog,
-    endpoint: PathBuf,
-    operation_id: &OperationId,
-) -> Result<HostLifecycleResult> {
-    let client = GuardianClient::new(endpoint);
-    if let Some(intent) = catalog.intent(operation_id)?
-        && let Some(completion) = intent.completion.as_ref()
-    {
-        let inspection = client.inspect(intent.machine_id.clone(), Some(operation_id.clone()))?;
-        let operation = inspection.lifecycle_operation.ok_or(Error::Protocol(
-            "guardian no longer retains a completed lifecycle operation",
-        ))?;
-        if operation.command.machine_id != intent.machine_id
-            || operation.command.operation_id != intent.operation_id
-            || operation.command.desired != intent.desired
-            || operation.command.revision != intent.revision
-            || operation.command.request_digest != intent.request_digest
-            || operation.delivery != Delivery::Applied
-            || operation.evidence_digest.is_none()
-            || operation.observation.as_ref() != Some(completion)
-        {
-            return Err(Error::Protocol(
-                "guardian lifecycle history conflicts with completed host intent",
-            ));
-        }
-        return Ok(HostLifecycleResult {
-            guardian_operation: operation,
-            completed_intent: Some(intent),
-        });
+/// Immutable admission from the sole host authority. It contains no catalog,
+/// signing key or authority to choose a different operation/configuration.
+pub struct LifecyclePlan {
+    intent: LifecycleIntent,
+    authorization: Option<AuthorizedLifecycle>,
+}
+
+/// Evidence returned by an independently owned guardian. Only catalog-owner
+/// completion turns it into a completed host intent.
+pub struct LifecycleEvidence {
+    intent: LifecycleIntent,
+    operation: LifecycleOperation,
+    observation: Option<MachineObservation>,
+}
+
+impl LifecyclePlan {
+    pub fn admit(catalog: &HostCatalog, operation_id: &OperationId) -> Result<Self> {
+        let intent = catalog
+            .intent(operation_id)?
+            .ok_or(Error::Protocol("lifecycle intent is missing"))?;
+        let authorization = if intent.completion.is_some() {
+            None
+        } else {
+            Some(catalog.authorize_lifecycle(operation_id)?)
+        };
+        Ok(Self {
+            intent,
+            authorization,
+        })
     }
-    let authorization = catalog.authorize_lifecycle(operation_id)?;
-    let operation = client.transition(authorization)?;
-    let completed_intent = if operation.delivery == Delivery::Applied {
-        let inspection = client.inspect(
-            operation.command.machine_id.clone(),
-            Some(operation.command.operation_id.clone()),
-        )?;
-        let observation = match inspection.observation {
-            Observation::Current { value } => value,
-            Observation::Unavailable { .. } => {
+
+    /// Native effects and transport waits never borrow the catalog writer.
+    pub fn execute(self, endpoint: PathBuf) -> Result<LifecycleEvidence> {
+        let client = GuardianClient::new(endpoint);
+        let intent = self.intent;
+        if let Some(completion) = intent.completion.as_ref() {
+            let inspection =
+                client.inspect(intent.machine_id.clone(), Some(intent.operation_id.clone()))?;
+            let operation = inspection.lifecycle_operation.ok_or(Error::Protocol(
+                "guardian no longer retains a completed lifecycle operation",
+            ))?;
+            if operation.command.machine_id != intent.machine_id
+                || operation.command.operation_id != intent.operation_id
+                || operation.command.desired != intent.desired
+                || operation.command.revision != intent.revision
+                || operation.command.request_digest != intent.request_digest
+                || operation.delivery != Delivery::Applied
+                || operation.evidence_digest.is_none()
+                || operation.observation.as_ref() != Some(completion)
+            {
                 return Err(Error::Protocol(
-                    "applied lifecycle observation is unavailable",
+                    "guardian lifecycle history conflicts with completed host intent",
                 ));
             }
+            return Ok(LifecycleEvidence {
+                intent,
+                operation,
+                observation: None,
+            });
+        }
+        let operation = client.transition(self.authorization.ok_or(Error::Protocol(
+            "pending lifecycle plan has no host authorization",
+        ))?)?;
+        let observation = if operation.delivery == Delivery::Applied {
+            let inspection = client.inspect(
+                operation.command.machine_id.clone(),
+                Some(operation.command.operation_id.clone()),
+            )?;
+            let observation = match inspection.observation {
+                Observation::Current { value } => value,
+                Observation::Unavailable { .. } => {
+                    return Err(Error::Protocol(
+                        "applied lifecycle observation is unavailable",
+                    ));
+                }
+            };
+            if inspection.lifecycle_operation.as_ref() != Some(&operation) {
+                return Err(Error::Protocol(
+                    "guardian lifecycle inspection changed during completion",
+                ));
+            }
+            Some(observation)
+        } else {
+            None
         };
-        if inspection.lifecycle_operation.as_ref() != Some(&operation) {
+        Ok(LifecycleEvidence {
+            intent,
+            operation,
+            observation,
+        })
+    }
+}
+
+impl LifecycleEvidence {
+    pub fn complete(self, catalog: &mut HostCatalog) -> Result<HostLifecycleResult> {
+        let intent = catalog
+            .intent(&self.intent.operation_id)?
+            .ok_or(Error::Protocol(
+                "lifecycle intent disappeared before completion",
+            ))?;
+        if intent.machine_id != self.intent.machine_id
+            || intent.operation_id != self.operation.command.operation_id
+            || intent.machine_id != self.operation.command.machine_id
+            || intent.desired != self.operation.command.desired
+            || intent.revision != self.operation.command.revision
+            || intent.request_digest != self.operation.command.request_digest
+        {
             return Err(Error::Protocol(
-                "guardian lifecycle inspection changed during completion",
+                "lifecycle evidence conflicts with host admission",
             ));
         }
-        Some(catalog.complete_lifecycle_operation(&operation, &observation)?)
-    } else {
-        None
-    };
-    Ok(HostLifecycleResult {
-        guardian_operation: operation,
-        completed_intent,
-    })
+        let completed_intent = if let Some(observation) = self.observation {
+            Some(catalog.complete_lifecycle_operation(&self.operation, &observation)?)
+        } else if self.intent.completion.is_some() {
+            if intent.completion != self.intent.completion {
+                return Err(Error::Protocol("completed lifecycle history changed"));
+            }
+            Some(intent)
+        } else {
+            None
+        };
+        Ok(HostLifecycleResult {
+            guardian_operation: self.operation,
+            completed_intent,
+        })
+    }
 }
 
 impl GuardianClient {

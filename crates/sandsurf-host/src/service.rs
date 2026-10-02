@@ -1,9 +1,7 @@
 use crate::api::{
     HOST_API_VERSION, HostInspection, HostRequest, HostResponse, MachineView, ReservationView,
 };
-use crate::guardian::{
-    Guardian, GuardianClient, HostLifecycleResult, apply_lifecycle, serve_guardian,
-};
+use crate::guardian::{Guardian, GuardianClient, LifecycleEvidence, LifecyclePlan, serve_guardian};
 use sandsurf_machine::GuestArchitecture;
 use sandsurf_native::local::{LocalConnection, LocalListener};
 use sandsurf_native::storage::object_name;
@@ -12,7 +10,6 @@ use sandsurf_state::{
     Approval, CatalogLimits, HostCatalog, MachineRecord, ReservationState, RuntimeJournal,
     RuntimeLimits,
 };
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -31,6 +28,41 @@ use zeroize::Zeroizing;
 // converting a still-running, identity-bound command into a client timeout.
 const API_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_HOST_CONNECTIONS: usize = 64;
+
+#[cfg(target_os = "linux")]
+type NativeGuardianConfig = crate::linux::LinuxGuardianConfig;
+#[cfg(any(target_os = "macos", windows))]
+type NativeGuardianConfig = crate::qemu::QemuGuardianConfig;
+
+fn verify_machine_inputs(
+    root: &Path,
+    executable: &Path,
+    machine: &MachineId,
+    image: &Digest,
+    resources: &Resources,
+) -> Result<MachineInputs> {
+    #[cfg(target_os = "linux")]
+    let configuration = crate::linux::prepare_config(root, executable, machine, image, resources)?;
+    #[cfg(any(target_os = "macos", windows))]
+    let configuration = crate::qemu::prepare_config(root, executable, machine, image, resources)?;
+    let verified = crate::images::resolve_native_image(root, image)?;
+    let defaults = verified.manifest.system.defaults;
+    Ok(MachineInputs {
+        configuration,
+        defaults: ExecutionDefaults {
+            environment: defaults.environment,
+            user: defaults.user,
+            working_directory: defaults.working_directory,
+        },
+        clone_profile: verified.manifest.system.clone_profile,
+    })
+}
+
+struct MachineInputs {
+    configuration: NativeGuardianConfig,
+    defaults: ExecutionDefaults,
+    clone_profile: sandsurf_image::identity::CloneProfile,
+}
 
 #[derive(Debug)]
 pub enum HostError {
@@ -137,18 +169,16 @@ impl From<crate::qemu::QemuError> for HostError {
 
 pub type Result<T> = std::result::Result<T, HostError>;
 
-pub struct HostService {
+struct HostService {
     root: PathBuf,
     catalog: HostCatalog,
     executable: PathBuf,
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    verified_guardians: BTreeSet<MachineId>,
     artifacts: Arc<crate::artifacts::ArtifactStore>,
     secrets: crate::secrets::SecretAuthority,
 }
 
 impl HostService {
-    pub fn open(root: &Path, executable: PathBuf) -> Result<Self> {
+    fn open(root: &Path, executable: PathBuf) -> Result<Self> {
         prepare_directory(root)?;
         let catalog_path = root.join("catalog");
         let catalog = if catalog_path.exists() {
@@ -171,24 +201,28 @@ impl HostService {
             root: root.to_path_buf(),
             catalog,
             executable,
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            verified_guardians: BTreeSet::new(),
             artifacts,
             secrets,
         };
-        service.recover_snapshot_barriers();
         service.recover_image_releases();
         Ok(service)
     }
 
-    pub fn endpoint(&self) -> PathBuf {
+    fn endpoint(&self) -> PathBuf {
         self.root.join("api")
     }
 
-    pub fn handle(&mut self, request: HostRequest) -> HostResponse {
-        match self.route(request) {
-            HostDispatch::Task(task) => self.complete_task(task.execute()).unwrap_or_else(rejected),
-            response => response.finish(),
+    #[cfg(test)]
+    fn handle(&mut self, request: HostRequest) -> HostResponse {
+        let mut dispatch = self.route(request);
+        loop {
+            dispatch = match dispatch {
+                HostDispatch::Task(task) => match self.complete_task(task.execute()) {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => return rejected(error),
+                },
+                response => return response.finish(),
+            };
         }
     }
 
@@ -198,6 +232,38 @@ impl HostService {
                 request,
                 approval_id,
             } => self.prepare_snapshot(request, approval_id),
+            request @ (HostRequest::CreateMachine { .. } | HostRequest::ForkMachine { .. }) => {
+                self.prepare_machine_inputs(request)
+            }
+            request @ HostRequest::Lifecycle { .. } => self.prepare_lifecycle_request(request),
+            HostRequest::GetMachine { machine_id } => self
+                .catalog
+                .machine(&machine_id)
+                .map_err(HostError::from)
+                .and_then(|record| {
+                    let record = record.ok_or(HostError::Invalid("machine does not exist"))?;
+                    Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
+                        root: self.root.clone(),
+                        record,
+                        operation: None,
+                    })))
+                }),
+            HostRequest::ListMachines { after, maximum } => self
+                .catalog
+                .machines(after.as_ref(), maximum)
+                .map_err(HostError::from)
+                .map(|records| {
+                    HostDispatch::MachineViews(Box::new(DeferredMachineViews {
+                        root: self.root.clone(),
+                        records,
+                    }))
+                }),
+            HostRequest::OpenObservationStream { machine_id } => self
+                .prepare_guardian_inner(&machine_id)
+                .map(|provision| HostDispatch::ObservationEndpoint(Box::new(provision))),
+            HostRequest::GetUsage { machine_id } => self
+                .prepare_guardian_inner(&machine_id)
+                .map(|provision| HostDispatch::Task(Box::new(HostTask::Usage { provision }))),
             request @ (HostRequest::ImportOci { .. }
             | HostRequest::ImportNativeImage { .. }
             | HostRequest::PublishSnapshotImage { .. }) => self.prepare_image(request),
@@ -346,6 +412,157 @@ impl HostService {
             executable: self.executable.clone(),
             endpoint: self.guardian_endpoint(&request.machine_id),
             capturing: Box::new(capturing),
+        })))
+    }
+
+    fn prepare_machine_inputs(&self, request: HostRequest) -> Result<HostDispatch> {
+        let image = match &request {
+            HostRequest::CreateMachine { image_digest, .. } => image_digest.clone(),
+            HostRequest::ForkMachine { snapshot_id, .. } => {
+                let snapshot = self
+                    .catalog
+                    .snapshot(snapshot_id)?
+                    .ok_or(HostError::Invalid("fork snapshot does not exist"))?;
+                if snapshot.phase != SnapshotPhase::Ready {
+                    return Err(HostError::Invalid("fork snapshot is not ready"));
+                }
+                snapshot.image_digest
+            }
+            _ => return Err(HostError::Invalid("invalid machine input request")),
+        };
+        self.catalog
+            .image(&image)?
+            .ok_or(HostError::Invalid("machine image has not been admitted"))?;
+        Ok(HostDispatch::Task(Box::new(HostTask::MachineInputs {
+            root: self.root.clone(),
+            executable: self.executable.clone(),
+            image,
+            request: Box::new(request),
+        })))
+    }
+
+    fn admit_machine_inputs(
+        &mut self,
+        request: HostRequest,
+        inputs: MachineInputs,
+    ) -> Result<HostDispatch> {
+        if let HostRequest::CreateMachine {
+            machine_id,
+            image_digest,
+            resources,
+            execution_defaults,
+            lifetime,
+            operation_id,
+            approval_id,
+        } = request
+        {
+            self.catalog
+                .image(&image_digest)?
+                .ok_or(HostError::Invalid("machine image is no longer admitted"))?;
+            let request_digest = digest(
+                Domain::Machine,
+                &(
+                    &machine_id,
+                    &image_digest,
+                    &resources,
+                    &execution_defaults,
+                    &lifetime,
+                    &operation_id,
+                ),
+            )?;
+            self.catalog.create_machine(
+                sandsurf_state::MachineAdmission {
+                    id: machine_id.clone(),
+                    image: image_digest,
+                    resources,
+                    defaults: execution_defaults,
+                    image_defaults: inputs.defaults,
+                    lifetime,
+                    operation: operation_id.clone(),
+                },
+                Approval {
+                    id: approval_id,
+                    request_digest,
+                },
+            )?;
+            let provision =
+                self.prepare_guardian_with_config(&machine_id, &inputs.configuration)?;
+            return Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                machine_id,
+                provision,
+                effect: LifecycleEffect::ordinary(LifecyclePlan::admit(
+                    &self.catalog,
+                    &operation_id,
+                )?),
+            })));
+        }
+        self.admit_fork(request, inputs)
+    }
+
+    fn admit_fork(&mut self, request: HostRequest, inputs: MachineInputs) -> Result<HostDispatch> {
+        let HostRequest::ForkMachine {
+            machine_id,
+            snapshot_id,
+            resources,
+            lifetime,
+            operation_id,
+            approval_id,
+        } = request
+        else {
+            return Err(HostError::Invalid("invalid fork admission request"));
+        };
+        let snapshot = self
+            .catalog
+            .snapshot(&snapshot_id)?
+            .ok_or(HostError::Invalid("fork snapshot does not exist"))?;
+        if snapshot.phase != SnapshotPhase::Ready {
+            return Err(HostError::Invalid("fork snapshot is not ready"));
+        }
+        let request_digest = digest(
+            Domain::Snapshot,
+            &(
+                "sandsurf-filesystem-fork-v1",
+                &snapshot_id,
+                &machine_id,
+                &resources,
+                &lifetime,
+                &operation_id,
+            ),
+        )?;
+        self.catalog.create_machine_from_snapshot(
+            machine_id.clone(),
+            &snapshot_id,
+            resources,
+            lifetime,
+            operation_id.clone(),
+            Approval {
+                id: approval_id,
+                request_digest,
+            },
+        )?;
+        let provision = self.prepare_guardian_with_config(&machine_id, &inputs.configuration)?;
+        let fork = self
+            .catalog
+            .fork(&machine_id)?
+            .ok_or(HostError::Invalid("fork admission disappeared"))?;
+        if fork.materialized_disk.is_some() {
+            return Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                machine_id,
+                provision,
+                effect: LifecycleEffect::ordinary(LifecyclePlan::admit(
+                    &self.catalog,
+                    &operation_id,
+                )?),
+            })));
+        }
+        Ok(HostDispatch::Task(Box::new(HostTask::Fork {
+            root: self.root.clone(),
+            executable: self.executable.clone(),
+            snapshot: Box::new(snapshot),
+            record: fork,
+            clone_profile: Some(inputs.clone_profile),
+            provision,
+            continuation: operation_id,
         })))
     }
 
@@ -645,11 +862,12 @@ impl HostService {
             ),
             _ => return Ok(None),
         };
-        self.provision_guardian(&machine_id)?;
+        let provision = self.prepare_guardian_inner(&machine_id)?;
         Ok(Some(DeferredRuntimeRead {
             endpoint: self.guardian_endpoint(&machine_id),
             machine_id,
             query,
+            provision,
         }))
     }
 
@@ -659,29 +877,11 @@ impl HostService {
                 value: self.inspect(),
             }),
             HostRequest::StopService => Ok(HostResponse::Complete),
-            HostRequest::OpenObservationStream { machine_id } => {
-                self.provision_guardian(&machine_id)?;
-                Ok(HostResponse::ObservationStream {
-                    endpoint: self.guardian_endpoint(&machine_id),
-                })
-            }
-            HostRequest::ListMachines { after, maximum } => {
-                let records = self.catalog.machines(after.as_ref(), maximum)?;
-                let mut values = Vec::with_capacity(records.len());
-                for record in records {
-                    values.push(self.view(record)?);
-                }
-                Ok(HostResponse::Machines { values })
-            }
-            HostRequest::GetMachine { machine_id } => {
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine does not exist"))?;
-                Ok(HostResponse::Machine {
-                    value: self.view(record)?,
-                })
-            }
+            HostRequest::OpenObservationStream { .. }
+            | HostRequest::ListMachines { .. }
+            | HostRequest::GetMachine { .. } => Err(HostError::Invalid(
+                "native observations run outside the catalog owner",
+            )),
             HostRequest::GetHostOperation { operation_id } => {
                 self.recover_image_import(&operation_id)?;
                 Ok(HostResponse::HostOperation {
@@ -760,212 +960,10 @@ impl HostService {
             HostRequest::ApplyArtifactToHost { .. } => Err(HostError::Invalid(
                 "artifact publication runs outside the catalog owner",
             )),
-            HostRequest::CreateMachine {
-                machine_id,
-                image_digest,
-                resources,
-                execution_defaults,
-                lifetime,
-                operation_id,
-                approval_id,
-            } => {
-                self.catalog
-                    .image(&image_digest)?
-                    .ok_or(HostError::Invalid("machine image has not been admitted"))?;
-                #[cfg(target_os = "linux")]
-                let native_config = crate::linux::prepare_config(
-                    &self.root,
-                    &self.executable,
-                    &machine_id,
-                    &image_digest,
-                    &resources,
-                )?;
-                #[cfg(any(target_os = "macos", windows))]
-                let native_config = crate::qemu::prepare_config(
-                    &self.root,
-                    &self.executable,
-                    &machine_id,
-                    &image_digest,
-                    &resources,
-                )?;
-                #[cfg(target_os = "linux")]
-                let image_defaults = crate::linux::execution_defaults(&self.root, &image_digest)?;
-                #[cfg(any(target_os = "macos", windows))]
-                let image_defaults = crate::qemu::execution_defaults(&self.root, &image_digest)?;
-                let approval = Approval {
-                    id: approval_id,
-                    request_digest: digest(
-                        Domain::Machine,
-                        &(
-                            &machine_id,
-                            &image_digest,
-                            &resources,
-                            &execution_defaults,
-                            &lifetime,
-                            &operation_id,
-                        ),
-                    )?,
-                };
-                self.catalog.create_machine(
-                    sandsurf_state::MachineAdmission {
-                        id: machine_id.clone(),
-                        image: image_digest,
-                        resources,
-                        defaults: execution_defaults,
-                        image_defaults,
-                        lifetime,
-                        operation: operation_id.clone(),
-                    },
-                    approval,
-                )?;
-                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                self.provision_guardian_with_config(&machine_id, Some(&native_config))?;
-                let endpoint = self.guardian_endpoint(&machine_id);
-                let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &operation_id)?;
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid(
-                        "created machine disappeared from catalog",
-                    ))?;
-                Ok(HostResponse::Lifecycle {
-                    operation: lifecycle.guardian_operation,
-                    machine: Box::new(self.view(record)?),
-                })
-            }
-            HostRequest::ForkMachine {
-                machine_id,
-                snapshot_id,
-                resources,
-                lifetime,
-                operation_id,
-                approval_id,
-            } => {
-                let snapshot = self
-                    .catalog
-                    .snapshot(&snapshot_id)?
-                    .ok_or(HostError::Invalid("fork snapshot does not exist"))?;
-                if snapshot.phase != SnapshotPhase::Ready {
-                    return Err(HostError::Invalid("fork snapshot is not ready"));
-                }
-                #[cfg(target_os = "linux")]
-                let native_config = crate::linux::prepare_config(
-                    &self.root,
-                    &self.executable,
-                    &machine_id,
-                    &snapshot.image_digest,
-                    &resources,
-                )?;
-                #[cfg(any(target_os = "macos", windows))]
-                let native_config = crate::qemu::prepare_config(
-                    &self.root,
-                    &self.executable,
-                    &machine_id,
-                    &snapshot.image_digest,
-                    &resources,
-                )?;
-                let request_digest = digest(
-                    Domain::Snapshot,
-                    &(
-                        "sandsurf-filesystem-fork-v1",
-                        &snapshot_id,
-                        &machine_id,
-                        &resources,
-                        &lifetime,
-                        &operation_id,
-                    ),
-                )?;
-                let previously_admitted = self.catalog.operation(&operation_id)?.is_some();
-                let fork_image = sandsurf_image::verify_image(
-                    &self
-                        .root
-                        .join("images")
-                        .join(snapshot.image_digest.as_str())
-                        .join("manifest.json"),
-                    sandsurf_image::ImageTrust::Pinned {
-                        manifest_digest: snapshot.image_digest.as_str(),
-                    },
-                )
-                .map_err(crate::images::ImageBuildError::from)?;
-                let clone_profile = fork_image.manifest.system.clone_profile;
-                let intent = self.catalog.create_machine_from_snapshot(
-                    machine_id.clone(),
-                    &snapshot_id,
-                    resources,
-                    lifetime,
-                    operation_id.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest,
-                    },
-                )?;
-                let machine_root = self.machine_root(&machine_id);
-                prepare_directory(&machine_root)?;
-                let disks = machine_root.join("disks");
-                prepare_directory(&disks)?;
-                let system_disk = disks.join(system_disk_name());
-                // The guardian creates a blank mutable disk when none exists.
-                // A new fork must install its captured disk before the guardian
-                // is allowed to open that VM. An interrupted pre-launch copy is
-                // verified and resumed by the same exact snapshot identity.
-                let materialized_before_owner = !system_disk.exists();
-                if materialized_before_owner {
-                    crate::image_worker::materialize_fork(
-                        &self.root,
-                        &self.executable,
-                        &snapshot,
-                        &machine_id,
-                        clone_profile,
-                        &operation_id,
-                    )?;
-                }
-                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-                self.provision_guardian_with_config(&machine_id, Some(&native_config))?;
-                let endpoint = self.guardian_endpoint(&machine_id);
-                let mut lifecycle = if previously_admitted {
-                    Some(apply_lifecycle(
-                        &mut self.catalog,
-                        endpoint.clone(),
-                        &operation_id,
-                    )?)
-                } else {
-                    None
-                };
-                // Never overwrite a fork disk while an earlier launch has an
-                // ambiguous outcome. A completed retry returns its immutable
-                // history; only a fresh operation or positive NotApplied
-                // evidence permits materialization.
-                if lifecycle.as_ref().is_none_or(|value| {
-                    value.completed_intent.is_none()
-                        && value.guardian_operation.delivery == Delivery::NotApplied
-                }) {
-                    if !materialized_before_owner {
-                        crate::image_worker::materialize_fork(
-                            &self.root,
-                            &self.executable,
-                            &snapshot,
-                            &machine_id,
-                            clone_profile,
-                            &operation_id,
-                        )?;
-                    }
-                    lifecycle = Some(apply_lifecycle(
-                        &mut self.catalog,
-                        endpoint,
-                        &intent.operation_id,
-                    )?);
-                }
-                let lifecycle = lifecycle.ok_or(HostError::Invalid(
-                    "fork lifecycle recovery produced no operation",
-                ))?;
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("forked machine disappeared"))?;
-                Ok(HostResponse::Lifecycle {
-                    operation: lifecycle.guardian_operation,
-                    machine: Box::new(self.view(record)?),
-                })
+            HostRequest::CreateMachine { .. } | HostRequest::ForkMachine { .. } => {
+                Err(HostError::Invalid(
+                    "machine creation requires catalog admission and deferred native effects",
+                ))
             }
             HostRequest::RollbackFilesystem {
                 machine_id,
@@ -1038,50 +1036,9 @@ impl HostService {
                     )?,
                 })
             }
-            HostRequest::Lifecycle {
-                machine_id,
-                operation_id,
-                expected_revision,
-                desired,
-                approval_id,
-            } => {
-                self.require_revision_for_new_host_operation(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                )?;
-                let approval = Approval {
-                    id: approval_id,
-                    request_digest: digest(
-                        Domain::Operation,
-                        &(&machine_id, &operation_id, expected_revision, desired),
-                    )?,
-                };
-                let intent = self.catalog.request_lifecycle(
-                    &machine_id,
-                    operation_id.clone(),
-                    expected_revision,
-                    desired,
-                    approval,
-                )?;
-                self.provision_guardian(&machine_id)?;
-                let endpoint = self.guardian_endpoint(&machine_id);
-                let lifecycle = self.apply_lifecycle_intent(&intent, endpoint)?;
-                if desired == DesiredState::Running && lifecycle.completed_intent.is_some() {
-                    self.catalog.observe_activity(&machine_id, unix_millis()?)?;
-                }
-                if desired == DesiredState::Destroyed && lifecycle.completed_intent.is_some() {
-                    self.retire_machine_storage(&machine_id)?;
-                }
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
-                Ok(HostResponse::Lifecycle {
-                    operation: lifecycle.guardian_operation,
-                    machine: Box::new(self.view(record)?),
-                })
-            }
+            HostRequest::Lifecycle { .. } => Err(HostError::Invalid(
+                "lifecycle requires deferred native effects",
+            )),
             HostRequest::SetNetworkPolicy {
                 machine_id,
                 operation_id,
@@ -1340,28 +1297,9 @@ impl HostService {
                 };
                 Ok(HostResponse::ResourceAssessment { assessment })
             }
-            HostRequest::GetUsage { machine_id } => {
-                self.provision_guardian(&machine_id)?;
-                let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                let response = client.runtime(machine_id.clone(), RuntimeRequest::Usage)?;
-                let RuntimeResponse::Usage {
-                    generation,
-                    mut usage,
-                } = response
-                else {
-                    return Err(HostError::Invalid(
-                        "native resource accounting is unavailable",
-                    ));
-                };
-                let storage =
-                    sandsurf_native::storage_usage::tree_usage(&self.machine_root(&machine_id))?;
-                usage.disk_logical_bytes = Counter::try_from(storage.logical_bytes)?;
-                usage.disk_allocated_bytes = Counter::try_from(storage.allocated_bytes)?;
-                usage.provenance.storage = sandsurf_protocol::MeasurementSource::HostFilesystem;
-                Ok(HostResponse::Usage {
-                    usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
-                })
-            }
+            HostRequest::GetUsage { .. } => Err(HostError::Invalid(
+                "resource sampling requires deferred observation",
+            )),
             HostRequest::ReadConsole { .. } | HostRequest::WriteConsole { .. } => Err(
                 HostError::Invalid("native console I/O requires deferred guardian routing"),
             ),
@@ -1629,253 +1567,224 @@ impl HostService {
         }
     }
 
-    fn apply_lifecycle_intent(
-        &mut self,
-        intent: &LifecycleIntent,
-        endpoint: PathBuf,
-    ) -> Result<HostLifecycleResult> {
-        if intent.completion.is_some() {
-            return Ok(apply_lifecycle(
-                &mut self.catalog,
-                endpoint,
-                &intent.operation_id,
-            )?);
+    fn prepare_lifecycle_request(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        let HostRequest::Lifecycle {
+            machine_id,
+            operation_id,
+            expected_revision,
+            desired,
+            approval_id,
+        } = request
+        else {
+            return Err(HostError::Invalid("invalid lifecycle admission"));
+        };
+        self.require_revision_for_new_host_operation(
+            &machine_id,
+            &operation_id,
+            expected_revision,
+        )?;
+        let request_digest = digest(
+            Domain::Operation,
+            &(&machine_id, &operation_id, expected_revision, desired),
+        )?;
+        let intent = self.catalog.request_lifecycle(
+            &machine_id,
+            operation_id,
+            expected_revision,
+            desired,
+            Approval {
+                id: approval_id,
+                request_digest,
+            },
+        )?;
+        self.prepare_lifecycle_intent(intent)
+    }
+
+    fn prepare_lifecycle_intent(&mut self, intent: LifecycleIntent) -> Result<HostDispatch> {
+        let intent = self
+            .catalog
+            .intent(&intent.operation_id)?
+            .ok_or(HostError::Invalid("lifecycle admission disappeared"))?;
+        if intent.completion.is_none() && intent.desired == DesiredState::Running {
+            let config = self
+                .machine_root(&intent.machine_id)
+                .join("guardian/config.json");
+            if !config.exists() {
+                let record = self
+                    .catalog
+                    .machine(&intent.machine_id)?
+                    .ok_or(HostError::Invalid("machine bootstrap is missing"))?;
+                return Ok(HostDispatch::Task(Box::new(HostTask::MachineBootstrap {
+                    root: self.root.clone(),
+                    executable: self.executable.clone(),
+                    record: Box::new(record),
+                    intent,
+                })));
+            }
+            if let Some(fork) = self.catalog.fork(&intent.machine_id)?
+                && fork.materialized_disk.is_none()
+            {
+                let snapshot = self
+                    .catalog
+                    .snapshot(&fork.snapshot_id)?
+                    .ok_or(HostError::Invalid("fork recovery snapshot is missing"))?;
+                let provision = self.prepare_guardian_inner(&intent.machine_id)?;
+                return Ok(HostDispatch::Task(Box::new(HostTask::Fork {
+                    root: self.root.clone(),
+                    executable: self.executable.clone(),
+                    snapshot: Box::new(snapshot),
+                    record: fork,
+                    clone_profile: None,
+                    provision,
+                    continuation: intent.operation_id,
+                })));
+            }
         }
-        let client = GuardianClient::new(endpoint.clone());
-        let inspection = client.inspect(intent.machine_id.clone(), None)?;
+        let provision = self.prepare_guardian_inner(&intent.machine_id)?;
+        if intent.completion.is_none()
+            && matches!(
+                intent.desired,
+                DesiredState::Running | DesiredState::Suspended
+            )
+        {
+            return Ok(HostDispatch::Task(Box::new(HostTask::LifecycleInspect {
+                intent,
+                provision,
+            })));
+        }
+        let plan = LifecyclePlan::admit(&self.catalog, &intent.operation_id)?;
+        Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+            machine_id: intent.machine_id,
+            provision,
+            effect: LifecycleEffect::ordinary(plan),
+        })))
+    }
+
+    fn prepare_lifecycle_effect(
+        &mut self,
+        intent: LifecycleIntent,
+        provision: GuardianProvision,
+        inspection: GuardianInspection,
+    ) -> Result<HostDispatch> {
+        let intent = self
+            .catalog
+            .intent(&intent.operation_id)?
+            .ok_or(HostError::Invalid("lifecycle admission disappeared"))?;
+        let plan = LifecyclePlan::admit(&self.catalog, &intent.operation_id)?;
+        if intent.completion.is_some() {
+            return Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                machine_id: intent.machine_id,
+                provision,
+                effect: LifecycleEffect::ordinary(plan),
+            })));
+        }
         let current = match inspection.observation {
             Observation::Current { value } => Some(value),
             Observation::Unavailable { .. } => None,
         };
-        match (intent.desired, current.as_ref().map(|value| value.state)) {
-            (DesiredState::Suspended, Some(_)) => {
-                self.suspend_with_full_snapshot(intent, endpoint, current.as_ref().unwrap())
-            }
-            (DesiredState::Running, Some(MachineState::Suspended)) => {
-                self.restore_suspended_snapshot(intent, endpoint, current.as_ref().unwrap())
-            }
-            _ => Ok(apply_lifecycle(
-                &mut self.catalog,
-                endpoint,
-                &intent.operation_id,
-            )?),
-        }
-    }
-
-    fn suspend_with_full_snapshot(
-        &mut self,
-        intent: &LifecycleIntent,
-        endpoint: PathBuf,
-        current: &MachineObservation,
-    ) -> Result<HostLifecycleResult> {
-        let (snapshot_id, capture_operation_id) = suspension_identities(intent)?;
-        if current.state == MachineState::Suspended {
-            let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
-            if lifecycle.completed_intent.is_some() {
+        if intent.desired == DesiredState::Suspended {
+            let current =
+                current.ok_or(HostError::Invalid("suspend requires a native observation"))?;
+            let (snapshot_id, operation_id) = suspension_identities(&intent)?;
+            if current.state == MachineState::Suspended {
                 let snapshot = self
                     .catalog
                     .snapshot(&snapshot_id)?
                     .ok_or(HostError::Invalid(
                         "suspended machine has no lifecycle snapshot",
                     ))?;
-                let manifest = snapshot.manifest_digest.as_ref().ok_or(HostError::Invalid(
-                    "suspension snapshot has no committed manifest",
-                ))?;
-                self.catalog.record_suspension(
-                    &intent.machine_id,
-                    &intent.operation_id,
-                    &snapshot_id,
-                    manifest,
-                )?;
-            }
-            return Ok(lifecycle);
-        }
-        if !matches!(current.state, MachineState::Running | MachineState::Paused)
-            || current.applied_revision.next()? != intent.revision
-        {
-            return Err(HostError::Invalid(
-                "suspend requires the current running or paused revision",
-            ));
-        }
-        let request = SnapshotRequest {
-            id: snapshot_id.clone(),
-            operation_id: capture_operation_id.clone(),
-            machine_id: intent.machine_id.clone(),
-            expected_generation: current.generation,
-            expected_revision: current.applied_revision,
-            kind: SnapshotKind::Full,
-            parent: None,
-        };
-        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request))?;
-        let admitted = self
-            .catalog
-            .admit_suspension_snapshot(request.clone(), &intent.operation_id)?;
-        let snapshot = if admitted.phase == SnapshotPhase::Ready {
-            admitted
-        } else {
-            let capturing = self.catalog.begin_snapshot(&snapshot_id, &request_digest)?;
-            if let Some(captured) = crate::snapshots::published_filesystem(
-                &crate::snapshots::root(&self.root, &capturing),
-                &capturing,
-            )? {
-                complete_snapshot_capture(
-                    &mut self.catalog,
-                    &snapshot_id,
-                    &request_digest,
-                    captured,
-                )?
-            } else {
-                let client = GuardianClient::new(endpoint.clone());
-                let prepared = client.native_snapshot(
-                    intent.machine_id.clone(),
-                    NativeSnapshotRequest::PrepareFull {
-                        snapshot_id: snapshot_id.clone(),
-                        operation_id: capture_operation_id.clone(),
-                        expected_generation: capturing.request.expected_generation,
-                        expected_revision: capturing.request.expected_revision,
-                    },
-                )?;
-                let NativeSnapshotResponse::Prepared { capture } = prepared else {
-                    return Err(HostError::Invalid(
-                        "guardian did not establish the suspension capture boundary",
-                    ));
-                };
-                let machine_root = self.machine_root(&intent.machine_id);
-                let captured = crate::snapshots::capture_full(
-                    &crate::snapshots::root(&self.root, &capturing),
-                    &capturing,
-                    &machine_root.join("disks").join(system_disk_name()),
-                    &machine_root
-                        .join("guardian/full-captures")
-                        .join(object_name(capture_operation_id.as_str())),
-                    capture,
-                )?;
-                complete_snapshot_capture(
-                    &mut self.catalog,
-                    &snapshot_id,
-                    &request_digest,
-                    captured,
-                )?
-            }
-        };
-        let manifest_digest = snapshot.manifest_digest.clone().ok_or(HostError::Invalid(
-            "suspension snapshot has no committed manifest",
-        ))?;
-        if !matches!(
-            GuardianClient::new(endpoint.clone()).native_snapshot(
-                intent.machine_id.clone(),
-                NativeSnapshotRequest::CommitSuspend {
-                    operation_id: capture_operation_id,
-                    manifest_digest: manifest_digest.clone(),
-                },
-            )?,
-            NativeSnapshotResponse::Complete { .. }
-        ) {
-            return Err(HostError::Invalid(
-                "guardian did not commit the suspension snapshot",
-            ));
-        }
-        let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
-        if lifecycle.completed_intent.is_some() {
-            self.catalog.record_suspension(
-                &intent.machine_id,
-                &intent.operation_id,
-                &snapshot_id,
-                &manifest_digest,
-            )?;
-        }
-        Ok(lifecycle)
-    }
-
-    fn restore_suspended_snapshot(
-        &mut self,
-        intent: &LifecycleIntent,
-        endpoint: PathBuf,
-        current: &MachineObservation,
-    ) -> Result<HostLifecycleResult> {
-        let suspension = self
-            .catalog
-            .suspension(&intent.machine_id)?
-            .ok_or(HostError::Invalid(
-                "suspended machine has no committed restore snapshot",
-            ))?;
-        let snapshot = self
-            .catalog
-            .snapshot(&suspension.snapshot_id)?
-            .ok_or(HostError::Invalid("restore snapshot does not exist"))?;
-        let full = snapshot
-            .full
-            .clone()
-            .ok_or(HostError::Invalid("restore snapshot has no machine state"))?;
-        let system_disk = SnapshotArtifact {
-            digest: snapshot
-                .system_disk_digest
-                .clone()
-                .ok_or(HostError::Invalid("restore snapshot has no defaults disk"))?,
-            bytes: snapshot.system_disk_bytes,
-        };
-        if current.applied_revision.next()? != intent.revision {
-            return Err(HostError::Invalid(
-                "restore does not follow the suspended configuration revision",
-            ));
-        }
-        if !matches!(
-            GuardianClient::new(endpoint.clone()).native_snapshot(
-                intent.machine_id.clone(),
-                NativeSnapshotRequest::StageRestore {
-                    snapshot_id: suspension.snapshot_id.clone(),
-                    manifest_digest: suspension.manifest_digest.clone(),
-                    system_disk,
-                    expected: Box::new(full),
-                },
-            )?,
-            NativeSnapshotResponse::Complete { .. }
-        ) {
-            return Err(HostError::Invalid(
-                "guardian did not stage the suspended machine restore",
-            ));
-        }
-        let lifecycle = apply_lifecycle(&mut self.catalog, endpoint, &intent.operation_id)?;
-        if lifecycle.completed_intent.is_some() {
-            self.catalog
-                .clear_suspension(&intent.machine_id, &suspension.snapshot_id)?;
-        }
-        Ok(lifecycle)
-    }
-
-    fn recover_snapshot_barriers(&mut self) {
-        let mut after = None;
-        loop {
-            let Ok(values) = self.catalog.snapshots(
-                after.as_ref(),
-                Counter::try_from(256).expect("constant is positive"),
-            ) else {
-                return;
-            };
-            if values.is_empty() {
-                return;
-            }
-            for snapshot in &values {
-                if snapshot.phase != SnapshotPhase::Capturing
-                    || snapshot.request.kind != SnapshotKind::Disk
-                {
-                    continue;
-                }
-                let machine = snapshot.request.machine_id.clone();
-                if self.provision_guardian(&machine).is_ok() {
-                    let _ = GuardianClient::new(self.guardian_endpoint(&machine)).native_snapshot(
-                        machine,
-                        NativeSnapshotRequest::FinishDisk {
-                            operation_id: snapshot.request.operation_id.clone(),
+                let manifest_digest = snapshot
+                    .manifest_digest
+                    .ok_or(HostError::Invalid("suspension manifest is missing"))?;
+                return Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                    machine_id: intent.machine_id,
+                    provision,
+                    effect: Box::new(LifecycleEffect {
+                        plan,
+                        prepare: None,
+                        custody: None,
+                        post: LifecyclePost::Suspend {
+                            snapshot_id,
+                            manifest_digest,
                         },
-                    );
-                }
+                    }),
+                })));
             }
-            if values.len() < 256 {
-                return;
+            if !matches!(current.state, MachineState::Running | MachineState::Paused)
+                || current.applied_revision.next()? != intent.revision
+            {
+                return Err(HostError::Invalid(
+                    "suspend requires the current running or paused revision",
+                ));
             }
-            after = values.last().map(|value| value.request.id.clone());
+            let request = SnapshotRequest {
+                id: snapshot_id.clone(),
+                operation_id,
+                machine_id: intent.machine_id.clone(),
+                expected_generation: current.generation,
+                expected_revision: current.applied_revision,
+                kind: SnapshotKind::Full,
+                parent: None,
+            };
+            let admitted = self
+                .catalog
+                .admit_suspension_snapshot(request, &intent.operation_id)?;
+            let capturing = if admitted.phase == SnapshotPhase::Ready {
+                admitted
+            } else {
+                self.catalog
+                    .begin_snapshot(&snapshot_id, &admitted.request_digest)?
+            };
+            return Ok(HostDispatch::Task(Box::new(HostTask::SuspendCapture {
+                root: self.root.clone(),
+                intent,
+                provision,
+                capturing: Box::new(capturing),
+            })));
         }
+        let mut effect = LifecycleEffect::ordinary(plan);
+        if intent.desired == DesiredState::Running
+            && let Some(current) = current
+            && current.state == MachineState::Suspended
+        {
+            if current.applied_revision.next()? != intent.revision {
+                return Err(HostError::Invalid(
+                    "restore does not follow the suspended revision",
+                ));
+            }
+            let suspension =
+                self.catalog
+                    .suspension(&intent.machine_id)?
+                    .ok_or(HostError::Invalid(
+                        "suspended machine has no committed restore snapshot",
+                    ))?;
+            let snapshot = self
+                .catalog
+                .snapshot(&suspension.snapshot_id)?
+                .ok_or(HostError::Invalid("restore snapshot is missing"))?;
+            let full = snapshot
+                .full
+                .ok_or(HostError::Invalid("restore snapshot has no machine state"))?;
+            effect.prepare = Some(NativeSnapshotRequest::StageRestore {
+                snapshot_id: suspension.snapshot_id.clone(),
+                manifest_digest: suspension.manifest_digest,
+                system_disk: SnapshotArtifact {
+                    digest: snapshot
+                        .system_disk_digest
+                        .ok_or(HostError::Invalid("restore snapshot has no system disk"))?,
+                    bytes: snapshot.system_disk_bytes,
+                },
+                expected: Box::new(full),
+            });
+            effect.post = LifecyclePost::Restore {
+                snapshot_id: suspension.snapshot_id,
+            };
+        }
+        Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+            machine_id: intent.machine_id,
+            provision,
+            effect,
+        })))
     }
 
     fn recover_image_releases(&mut self) {
@@ -2155,8 +2064,147 @@ impl HostService {
         Ok(())
     }
 
-    fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
+    fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostDispatch> {
         match completion {
+            HostTaskCompletion::MachineInputs { request, result } => {
+                self.admit_machine_inputs(*request, result?)
+            }
+            HostTaskCompletion::MachineBootstrap { intent, result } => {
+                let inputs = result?;
+                self.prepare_guardian_with_config(&intent.machine_id, &inputs.configuration)?;
+                self.prepare_lifecycle_intent(intent)
+            }
+            HostTaskCompletion::LifecycleInspect {
+                intent,
+                provision,
+                result,
+            } => self.prepare_lifecycle_effect(intent, provision, (*result)?),
+            HostTaskCompletion::SuspendCapture {
+                intent,
+                provision,
+                capturing,
+                result,
+            } => {
+                let (captured, custody) = result?;
+                let snapshot = complete_snapshot_capture(
+                    &mut self.catalog,
+                    &capturing.request.id,
+                    &capturing.request_digest,
+                    captured,
+                )?;
+                let manifest_digest = snapshot.manifest_digest.ok_or(HostError::Invalid(
+                    "suspension snapshot has no committed manifest",
+                ))?;
+                let effect = LifecycleEffect {
+                    plan: LifecyclePlan::admit(&self.catalog, &intent.operation_id)?,
+                    prepare: Some(NativeSnapshotRequest::CommitSuspend {
+                        operation_id: capturing.request.operation_id,
+                        manifest_digest: manifest_digest.clone(),
+                    }),
+                    post: LifecyclePost::Suspend {
+                        snapshot_id: snapshot.request.id,
+                        manifest_digest,
+                    },
+                    custody: Some(custody),
+                };
+                Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                    machine_id: intent.machine_id,
+                    provision,
+                    effect: Box::new(effect),
+                })))
+            }
+            HostTaskCompletion::Lifecycle {
+                machine_id,
+                result,
+                post,
+                custody: _custody,
+            } => {
+                let lifecycle = result?.complete(&mut self.catalog)?;
+                if let Some(intent) = &lifecycle.completed_intent {
+                    match post {
+                        LifecyclePost::None => {}
+                        LifecyclePost::Suspend {
+                            snapshot_id,
+                            manifest_digest,
+                        } => {
+                            self.catalog.record_suspension(
+                                &machine_id,
+                                &intent.operation_id,
+                                &snapshot_id,
+                                &manifest_digest,
+                            )?;
+                        }
+                        LifecyclePost::Restore { snapshot_id } => {
+                            if self.catalog.suspension(&machine_id)?.is_some() {
+                                self.catalog.clear_suspension(&machine_id, &snapshot_id)?;
+                            }
+                        }
+                    }
+                    if intent.desired == DesiredState::Running {
+                        self.catalog.observe_activity(&machine_id, unix_millis()?)?;
+                    }
+                    if intent.desired == DesiredState::Destroyed {
+                        self.retire_machine_storage(&machine_id)?;
+                    }
+                }
+                let record = self
+                    .catalog
+                    .machine(&machine_id)?
+                    .ok_or(HostError::Invalid("machine disappeared before completion"))?;
+                Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
+                    root: self.root.clone(),
+                    record,
+                    operation: Some(lifecycle.guardian_operation),
+                })))
+            }
+            HostTaskCompletion::Fork {
+                record,
+                provision,
+                result,
+                continuation,
+            } => {
+                self.catalog.complete_fork_materialization(
+                    &record.machine_id,
+                    &record.operation_id,
+                    &record.request_digest,
+                    result?,
+                )?;
+                Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
+                    machine_id: record.machine_id,
+                    provision,
+                    effect: LifecycleEffect::ordinary(LifecyclePlan::admit(
+                        &self.catalog,
+                        &continuation,
+                    )?),
+                })))
+            }
+            completion => self
+                .complete_task_response(completion)
+                .map(|response| HostDispatch::Ready(Box::new(response))),
+        }
+    }
+
+    fn complete_task_response(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
+        match completion {
+            HostTaskCompletion::Usage { machine_id, result } => {
+                let (generation, usage) = result?;
+                Ok(HostResponse::Usage {
+                    usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
+                })
+            }
+            HostTaskCompletion::Configuration { result }
+            | HostTaskCompletion::CaptureRecovery { result } => {
+                result?;
+                Ok(HostResponse::Complete)
+            }
+            HostTaskCompletion::MachineInputs { .. }
+            | HostTaskCompletion::MachineBootstrap { .. }
+            | HostTaskCompletion::LifecycleInspect { .. }
+            | HostTaskCompletion::SuspendCapture { .. }
+            | HostTaskCompletion::Lifecycle { .. }
+            | HostTaskCompletion::Fork { .. } => Err(HostError::Invalid(
+                "machine effects require staged completion",
+            )),
             HostTaskCompletion::Snapshot {
                 snapshot_id,
                 request_digest,
@@ -2225,61 +2273,26 @@ impl HostService {
     }
 
     fn provision_guardian(&mut self, machine: &MachineId) -> Result<()> {
-        if self.catalog.machine(machine)?.is_some_and(|record| {
-            record.latest_intent.desired == DesiredState::Destroyed
-                && record.latest_intent.completion.is_some()
-        }) {
-            return self.provision_guardian_inner(machine);
-        }
+        self.prepare_guardian_inner(machine)?.execute()
+    }
+
+    fn prepare_guardian_with_config(
+        &self,
+        machine: &MachineId,
+        config: &NativeGuardianConfig,
+    ) -> Result<GuardianProvision> {
+        let root = self.machine_root(machine);
+        prepare_directory(&root)?;
+        prepare_directory(&root.join("guardian"))?;
+        let path = root.join("guardian/config.json");
         #[cfg(target_os = "linux")]
-        return self.provision_guardian_with_config(machine, None);
-        #[cfg(target_os = "macos")]
-        return self.provision_guardian_with_config(machine, None);
-        #[cfg(target_os = "windows")]
-        return self.provision_guardian_with_config(machine, None);
+        crate::linux::write_config(&path, config)?;
+        #[cfg(any(target_os = "macos", windows))]
+        crate::qemu::write_config(&path, config)?;
+        self.prepare_guardian_inner(machine)
     }
 
-    #[cfg(target_os = "linux")]
-    fn provision_guardian_with_config(
-        &mut self,
-        machine: &MachineId,
-        config: Option<&crate::linux::LinuxGuardianConfig>,
-    ) -> Result<()> {
-        let root = self.machine_root(machine);
-        prepare_directory(&root)?;
-        prepare_directory(&root.join("guardian"))?;
-        let config_path = root.join("guardian/config.json");
-        if let Some(config) = config {
-            crate::linux::write_config(&config_path, config)?;
-            self.verified_guardians.insert(machine.clone());
-        } else if !self.verified_guardians.contains(machine) {
-            crate::linux::read_config(&config_path, machine)?;
-            self.verified_guardians.insert(machine.clone());
-        }
-        self.provision_guardian_inner(machine)
-    }
-
-    #[cfg(any(target_os = "macos", windows))]
-    fn provision_guardian_with_config(
-        &mut self,
-        machine: &MachineId,
-        config: Option<&crate::qemu::QemuGuardianConfig>,
-    ) -> Result<()> {
-        let root = self.machine_root(machine);
-        prepare_directory(&root)?;
-        prepare_directory(&root.join("guardian"))?;
-        let config_path = root.join("guardian/config.json");
-        if let Some(config) = config {
-            crate::qemu::write_config(&config_path, config)?;
-            self.verified_guardians.insert(machine.clone());
-        } else if !self.verified_guardians.contains(machine) {
-            crate::qemu::read_config(&config_path, machine)?;
-            self.verified_guardians.insert(machine.clone());
-        }
-        self.provision_guardian_inner(machine)
-    }
-
-    fn provision_guardian_inner(&self, machine: &MachineId) -> Result<()> {
+    fn prepare_guardian_inner(&self, machine: &MachineId) -> Result<GuardianProvision> {
         let root = self.machine_root(machine);
         #[cfg(target_os = "linux")]
         crate::resources::require_machine_storage(
@@ -2311,104 +2324,20 @@ impl HostService {
                 self.catalog.authority_binding().clone(),
             )?;
         }
-        let endpoint = self.guardian_endpoint(machine);
-        match GuardianClient::new(endpoint.clone()).owner_identity(machine.clone()) {
-            Ok(_) => return Ok(()),
-            Err(crate::guardian::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) => {}
-            Err(error) => {
-                return Err(HostError::GuardianStartup(format!(
-                    "an existing guardian endpoint is incompatible or unhealthy; refusing a second owner: {error}"
-                )));
-            }
-        }
-        crate::supervision::call(
-            &self.root,
-            crate::supervision::Request::Ensure {
-                machine: machine.clone(),
-            },
-        )
-        .map_err(|error| {
-            HostError::GuardianStartup(format!(
-                "independent guardian supervisor is unavailable: {error}"
-            ))
-        })?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            if GuardianClient::new(endpoint.clone())
-                .owner_identity(machine.clone())
-                .is_ok()
-            {
-                return Ok(());
-            }
-            crate::supervision::call(
-                &self.root,
-                crate::supervision::Request::Check {
-                    machine: machine.clone(),
-                },
-            )
-            .map_err(|error| {
-                HostError::GuardianStartup(format!(
-                    "guardian launch failed: {error}; inspect {}",
-                    root.join("guardian/guardian.log").display()
-                ))
-            })?;
-            if std::time::Instant::now() >= deadline {
-                return Err(HostError::GuardianStartup(format!(
-                    "guardian did not become reachable; inspect {}",
-                    root.join("guardian/guardian.log").display()
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn view(&mut self, record: MachineRecord) -> Result<MachineView> {
-        let storage =
-            crate::storage::inspect(&self.machine_root(&record.id).join("disks/system.ext4"));
-        let (machine, management) = match GuardianClient::new(self.guardian_endpoint(&record.id))
-            .inspect(record.id.clone(), None)
-        {
-            Ok(value) => (value.observation, value.management),
-            Err(_) => (
-                Observation::Unavailable { last_known: None },
-                Observation::Unavailable { last_known: None },
-            ),
-        };
-        Ok(MachineView {
-            known_sensitive: record.known_sensitive,
-            execution_defaults: record.execution_defaults,
-            lifetime: record.lifetime,
-            last_activity_unix_millis: record.last_activity_unix_millis,
-            id: record.id,
-            image_digest: record.image_digest,
-            runtime_configuration: record.runtime_configuration,
-            configuration_revision: record.configuration_revision,
-            reservation: match record.reservation {
-                ReservationState::Held => ReservationView::Held,
-                ReservationState::Released => ReservationView::Released,
-            },
-            lifecycle_intent: record.latest_intent,
-            machine,
-            management,
-            storage,
+        Ok(GuardianProvision {
+            host_root: self.root.clone(),
+            machine: machine.clone(),
         })
     }
 
+    fn view(&mut self, record: MachineRecord) -> Result<MachineView> {
+        observe_machine(&self.root, record)
+    }
+
     fn apply_configuration(&mut self, machine: &MachineId, revision: Counter) -> Result<()> {
-        self.provision_guardian(machine)?;
+        let provision = self.prepare_guardian_inner(machine)?;
         let authorization = self.catalog.authorize_configuration(machine, revision)?;
-        let operation =
-            GuardianClient::new(self.guardian_endpoint(machine)).configure(authorization)?;
-        if operation.delivery != Delivery::Applied || operation.command.revision != revision {
-            return Err(HostError::Invalid(
-                "guardian did not apply the host configuration revision",
-            ));
-        }
-        Ok(())
+        perform_configuration(&provision, authorization)
     }
 
     fn require_revision_for_new_host_operation(
@@ -2444,30 +2373,50 @@ impl HostService {
         Ok(())
     }
 
-    fn reconcile_configuration(&mut self, record: &MachineRecord) -> Result<()> {
-        self.provision_guardian(&record.id)?;
-        let inspection = GuardianClient::new(self.guardian_endpoint(&record.id))
-            .inspect(record.id.clone(), None)?;
-        let Observation::Current { value } = inspection.observation else {
-            return Ok(());
-        };
-        if value.applied_revision > record.configuration_revision {
-            return Err(HostError::Invalid(
-                "guardian configuration is ahead of host authority",
-            ));
-        }
-        if value.applied_revision == record.configuration_revision {
-            return Ok(());
-        }
-        self.apply_configuration(&record.id, record.configuration_revision)
-    }
-
-    /// Reconcile unfinished lifecycle work and enforce only policies that were
-    /// admitted with Machine creation/fork. Policy decisions update host
-    /// lifecycle intent; the guardian still exclusively records whether the
-    /// machine transition occurred.
-    fn reconcile_lifetime_policies(&mut self) -> Result<()> {
+    /// Admit host policy changes on the sole writer; native reconciliation
+    /// uses the same detached tasks as SDK requests.
+    fn reconcile_lifetime_policies(&mut self) -> Result<Vec<(MachineId, HostDispatch)>> {
         let now = unix_millis()?;
+        let mut work = Vec::new();
+        let mut after_snapshot = None;
+        loop {
+            let snapshots = self
+                .catalog
+                .snapshots(after_snapshot.as_ref(), counter(256))?;
+            if snapshots.is_empty() {
+                break;
+            }
+            after_snapshot = snapshots.last().map(|snapshot| snapshot.request.id.clone());
+            for snapshot in snapshots {
+                if snapshot.phase != SnapshotPhase::Capturing
+                    || snapshot.request.kind != SnapshotKind::Disk
+                {
+                    continue;
+                }
+                let machine = &snapshot.request.machine_id;
+                let prepare = (|| -> Result<Option<GuardianProvision>> {
+                    if crate::capture::CaptureBoundary::read(&self.machine_root(machine))?
+                        .is_some_and(|boundary| {
+                            boundary.operation_id == snapshot.request.operation_id
+                        })
+                    {
+                        return self.prepare_guardian_inner(machine).map(Some);
+                    }
+                    Ok(None)
+                })();
+                match prepare {
+                    Ok(Some(provision)) => work.push((
+                        machine.clone(),
+                        HostDispatch::Task(Box::new(HostTask::CaptureRecovery {
+                            provision,
+                            snapshot: Box::new(snapshot),
+                        })),
+                    )),
+                    Ok(None) => {}
+                    Err(error) => eprintln!("sandsurf capture recovery deferred: {error}"),
+                }
+            }
+        }
         let mut after = None;
         loop {
             let records = self.catalog.machines(after.as_ref(), counter(256))?;
@@ -2477,32 +2426,33 @@ impl HostService {
             after = records.last().map(|record| record.id.clone());
             for record in records {
                 let id = record.id.clone();
-                if let Err(error) = self.reconcile_machine(record, now) {
-                    // A machine's native failure or interrupted operation is
-                    // not permission to starve other machines' host decisions.
-                    eprintln!(
+                match self.reconcile_machine(record, now) {
+                    Ok(Some(dispatch)) => work.push((id, dispatch)),
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
                         "sandsurf machine {} reconciliation deferred: {error}",
                         id.as_str()
-                    );
+                    ),
                 }
             }
-            if after.is_none() {
-                break;
-            }
         }
-        Ok(())
+        Ok(work)
     }
 
-    fn reconcile_machine(&mut self, mut record: MachineRecord, now: Counter) -> Result<()> {
+    fn reconcile_machine(
+        &mut self,
+        record: MachineRecord,
+        now: Counter,
+    ) -> Result<Option<HostDispatch>> {
+        if record.reservation == ReservationState::Released {
+            return Ok(None);
+        }
         if record.latest_intent.desired == DesiredState::Destroyed
             && record.latest_intent.completion.is_some()
         {
-            return self.retire_machine_storage(&record.id);
+            self.retire_machine_storage(&record.id)?;
+            return Ok(None);
         }
-        if record.reservation == ReservationState::Released {
-            return Ok(());
-        }
-        // Host intent changes without claiming that native delivery succeeded.
         if let Some(expires) = record.lifetime.expires_at_unix_millis
             && now >= expires
         {
@@ -2513,40 +2463,37 @@ impl HostService {
             if record.latest_intent.desired != desired
                 && record.latest_intent.desired != DesiredState::Destroyed
             {
-                return self.apply_policy_lifecycle(record, desired, "expiration");
+                return self
+                    .prepare_policy_lifecycle(record, desired, "expiration")
+                    .map(Some);
             }
-            if record.latest_intent.completion.is_none()
-                && record.latest_intent.revision == record.configuration_revision
-            {
-                self.provision_guardian(&record.id)?;
-                self.apply_lifecycle_intent(
-                    &record.latest_intent,
-                    self.guardian_endpoint(&record.id),
-                )?;
-            }
-            return Ok(());
         }
         if record.latest_intent.completion.is_none()
             && record.latest_intent.revision == record.configuration_revision
         {
-            self.provision_guardian(&record.id)?;
-            self.apply_lifecycle_intent(&record.latest_intent, self.guardian_endpoint(&record.id))?;
-            record = self.catalog.machine(&record.id)?.ok_or(HostError::Invalid(
-                "machine disappeared during reconciliation",
-            ))?;
-            if record.latest_intent.completion.is_none() {
-                return Ok(());
-            }
+            return self
+                .prepare_lifecycle_intent(record.latest_intent)
+                .map(Some);
         }
-        self.reconcile_configuration(&record)
+        if record.latest_intent.desired == DesiredState::Destroyed {
+            return Ok(None);
+        }
+        Ok(Some(HostDispatch::Task(Box::new(
+            HostTask::Configuration {
+                provision: self.prepare_guardian_inner(&record.id)?,
+                authorization: self
+                    .catalog
+                    .authorize_configuration(&record.id, record.configuration_revision)?,
+            },
+        ))))
     }
 
-    fn apply_policy_lifecycle(
+    fn prepare_policy_lifecycle(
         &mut self,
         record: MachineRecord,
         desired: DesiredState,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<HostDispatch> {
         let identity = digest(
             Domain::Operation,
             &(
@@ -2583,10 +2530,7 @@ impl HostService {
                 request_digest,
             },
         )?;
-        self.provision_guardian(&record.id)?;
-        let endpoint = self.guardian_endpoint(&record.id);
-        self.apply_lifecycle_intent(&intent, endpoint)?;
-        Ok(())
+        self.prepare_lifecycle_intent(intent)
     }
 
     fn machine_root(&self, machine: &MachineId) -> PathBuf {
@@ -2623,6 +2567,160 @@ impl HostService {
     }
 }
 
+fn perform_configuration(
+    provision: &GuardianProvision,
+    authorization: AuthorizedConfiguration,
+) -> Result<()> {
+    provision.execute()?;
+    let command = authorization.statement.command.clone();
+    let operation = GuardianClient::new(provision.endpoint()).configure(authorization)?;
+    if operation.delivery != Delivery::Applied || operation.command != command {
+        return Err(HostError::Invalid(
+            "guardian did not apply the host configuration revision",
+        ));
+    }
+    Ok(())
+}
+
+enum LifecyclePost {
+    None,
+    Suspend {
+        snapshot_id: SnapshotId,
+        manifest_digest: Digest,
+    },
+    Restore {
+        snapshot_id: SnapshotId,
+    },
+}
+
+struct LifecycleEffect {
+    plan: LifecyclePlan,
+    prepare: Option<NativeSnapshotRequest>,
+    post: LifecyclePost,
+    // The native capture task remains exclusively owned across catalog
+    // completion and CommitSuspend. It is never replaced by a record reference.
+    custody: Option<fs::File>,
+}
+
+impl LifecycleEffect {
+    fn ordinary(plan: LifecyclePlan) -> Box<Self> {
+        Box::new(Self {
+            plan,
+            prepare: None,
+            post: LifecyclePost::None,
+            custody: None,
+        })
+    }
+}
+
+struct GuardianProvision {
+    host_root: PathBuf,
+    machine: MachineId,
+}
+
+impl GuardianProvision {
+    fn endpoint(&self) -> PathBuf {
+        self.host_root
+            .join("machines")
+            .join(object_name(self.machine.as_str()))
+            .join("guardian")
+    }
+
+    fn execute(&self) -> Result<()> {
+        let machine = &self.machine;
+        let root = self
+            .host_root
+            .join("machines")
+            .join(object_name(machine.as_str()));
+        let endpoint = root.join("guardian");
+        match GuardianClient::new(endpoint.clone()).owner_identity(machine.clone()) {
+            Ok(_) => return Ok(()),
+            Err(crate::guardian::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => {
+                return Err(HostError::GuardianStartup(format!(
+                    "an existing guardian endpoint is incompatible or unhealthy; refusing a second owner: {error}"
+                )));
+            }
+        }
+        crate::supervision::call(
+            &self.host_root,
+            crate::supervision::Request::Ensure {
+                machine: machine.clone(),
+            },
+        )
+        .map_err(|error| {
+            HostError::GuardianStartup(format!(
+                "independent guardian supervisor is unavailable: {error}"
+            ))
+        })?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if GuardianClient::new(endpoint.clone())
+                .owner_identity(machine.clone())
+                .is_ok()
+            {
+                return Ok(());
+            }
+            crate::supervision::call(
+                &self.host_root,
+                crate::supervision::Request::Check {
+                    machine: machine.clone(),
+                },
+            )
+            .map_err(|error| {
+                HostError::GuardianStartup(format!(
+                    "guardian launch failed: {error}; inspect {}",
+                    root.join("guardian/guardian.log").display()
+                ))
+            })?;
+            if std::time::Instant::now() >= deadline {
+                return Err(HostError::GuardianStartup(format!(
+                    "guardian did not become reachable; inspect {}",
+                    root.join("guardian/guardian.log").display()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn observe_machine(host_root: &Path, record: MachineRecord) -> Result<MachineView> {
+    let machine_root = host_root
+        .join("machines")
+        .join(object_name(record.id.as_str()));
+    let storage = crate::storage::inspect(&machine_root.join("disks/system.ext4"));
+    let (machine, management) =
+        match GuardianClient::new(machine_root.join("guardian")).inspect(record.id.clone(), None) {
+            Ok(value) => (value.observation, value.management),
+            Err(_) => (
+                Observation::Unavailable { last_known: None },
+                Observation::Unavailable { last_known: None },
+            ),
+        };
+    Ok(MachineView {
+        known_sensitive: record.known_sensitive,
+        execution_defaults: record.execution_defaults,
+        lifetime: record.lifetime,
+        last_activity_unix_millis: record.last_activity_unix_millis,
+        id: record.id,
+        image_digest: record.image_digest,
+        runtime_configuration: record.runtime_configuration,
+        configuration_revision: record.configuration_revision,
+        reservation: match record.reservation {
+            ReservationState::Held => ReservationView::Held,
+            ReservationState::Released => ReservationView::Released,
+        },
+        lifecycle_intent: record.latest_intent,
+        machine,
+        management,
+        storage,
+    })
+}
+
 pub fn serve_host(root: &Path, executable: PathBuf) -> Result<()> {
     let service = HostService::open(root, executable)?;
     let listener = LocalListener::bind(&service.endpoint())?;
@@ -2634,6 +2732,7 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
     let active = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = mpsc::sync_channel::<HostIngress>(MAX_HOST_CONNECTIONS);
     std::thread::scope(|scope| {
+        let reconciliation_sender = sender.clone();
         let stopped_accept = Arc::clone(&stopped);
         let active_accept = Arc::clone(&active);
         let accept_worker = scope.spawn(move || {
@@ -2692,26 +2791,10 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
                         if let Ok(dispatch) = response.recv() {
                             // A lost response never reverses an admitted operation.
                             let written = {
-                                let response = match dispatch {
-                                    HostDispatch::Task(task) => {
-                                        let completion = task.execute();
-                                        let (reply, committed) = mpsc::channel();
-                                        if sender
-                                            .send(HostIngress::TaskComplete {
-                                                completion: Box::new(completion),
-                                                reply,
-                                            })
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                        let Ok(response) = committed.recv() else {
-                                            return;
-                                        };
-                                        response
-                                    }
-                                    dispatch => dispatch.finish(),
+                                let Some(dispatch) = execute_host_tasks(dispatch, &sender) else {
+                                    return;
                                 };
+                                let response = dispatch.finish();
                                 write_host_response(&mut connection, sequence, response).is_ok()
                             };
                             drop(connection);
@@ -2727,10 +2810,35 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
             }
         });
         let mut next_reconciliation = std::time::Instant::now() + Duration::from_secs(1);
+        // Scheduling only: no cached observations, grants or lifecycle facts.
+        // Crash recovery derives the work again from the catalog.
+        let mut reconciliations = BTreeSet::new();
         let result = loop {
             if std::time::Instant::now() >= next_reconciliation {
-                if let Err(error) = service.reconcile_lifetime_policies() {
-                    eprintln!("sandsurf host reconciliation deferred: {error}");
+                match service.reconcile_lifetime_policies() {
+                    Ok(work) => {
+                        for (machine, dispatch) in work {
+                            if reconciliations.len() >= MAX_HOST_CONNECTIONS / 2
+                                || reconciliations.contains(&machine)
+                            {
+                                continue;
+                            }
+                            let sender = reconciliation_sender.clone();
+                            let identity = machine.clone();
+                            match std::thread::Builder::new().name("sandsurf-host-reconcile".into()).spawn(move || {
+                            if let Some(HostDispatch::Ready(response)) = execute_host_tasks(dispatch, &sender)
+                                && let HostResponse::Rejected { message, .. } = *response
+                            {
+                                eprintln!("sandsurf machine {} reconciliation deferred: {message}", identity.as_str());
+                            }
+                            let _ = sender.send(HostIngress::Reconciled(identity));
+                        }) {
+                            Ok(_) => { reconciliations.insert(machine); }
+                            Err(error) => eprintln!("sandsurf reconciliation worker unavailable: {error}"),
+                        }
+                        }
+                    }
+                    Err(error) => eprintln!("sandsurf host reconciliation deferred: {error}"),
                 }
                 next_reconciliation = std::time::Instant::now() + Duration::from_secs(1);
             }
@@ -2752,7 +2860,13 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
                     let _ = reply.send(response);
                 }
                 Ok(HostIngress::TaskComplete { completion, reply }) => {
-                    let _ = reply.send(service.complete_task(*completion).unwrap_or_else(rejected));
+                    let _ =
+                        reply.send(service.complete_task(*completion).unwrap_or_else(|error| {
+                            HostDispatch::Ready(Box::new(rejected(error)))
+                        }));
+                }
+                Ok(HostIngress::Reconciled(machine)) => {
+                    reconciliations.remove(&machine);
                 }
                 Ok(HostIngress::Failed(error)) => break Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2780,7 +2894,32 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
     })
 }
 
+/// Both API clients and recovery workers execute the same admitted task chain.
+/// They return every durable completion to the one catalog owner.
+fn execute_host_tasks(
+    mut dispatch: HostDispatch,
+    sender: &mpsc::SyncSender<HostIngress>,
+) -> Option<HostDispatch> {
+    loop {
+        dispatch = match dispatch {
+            HostDispatch::Task(task) => {
+                let completion = task.execute();
+                let (reply, committed) = mpsc::channel();
+                sender
+                    .send(HostIngress::TaskComplete {
+                        completion: Box::new(completion),
+                        reply,
+                    })
+                    .ok()?;
+                committed.recv().ok()?
+            }
+            dispatch => return Some(dispatch),
+        };
+    }
+}
+
 enum HostIngress {
+    Reconciled(MachineId),
     Request {
         parsed: Box<Result<HostRequest>>,
         reply: mpsc::Sender<HostDispatch>,
@@ -2788,7 +2927,7 @@ enum HostIngress {
     },
     TaskComplete {
         completion: Box<HostTaskCompletion>,
-        reply: mpsc::Sender<HostResponse>,
+        reply: mpsc::Sender<HostDispatch>,
     },
     Failed(io::Error),
 }
@@ -2799,6 +2938,45 @@ enum HostDispatch {
     Runtime(Box<DeferredRuntimeRead>),
     Guest(Box<DeferredGuest>),
     Task(Box<HostTask>),
+    MachineView(Box<DeferredMachineView>),
+    MachineViews(Box<DeferredMachineViews>),
+    ObservationEndpoint(Box<GuardianProvision>),
+}
+
+struct DeferredMachineViews {
+    root: PathBuf,
+    records: Vec<MachineRecord>,
+}
+
+impl DeferredMachineViews {
+    fn execute(self) -> Result<HostResponse> {
+        Ok(HostResponse::Machines {
+            values: self
+                .records
+                .into_iter()
+                .map(|record| observe_machine(&self.root, record))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+struct DeferredMachineView {
+    root: PathBuf,
+    record: MachineRecord,
+    operation: Option<LifecycleOperation>,
+}
+
+impl DeferredMachineView {
+    fn execute(self) -> Result<HostResponse> {
+        let value = observe_machine(&self.root, self.record)?;
+        Ok(match self.operation {
+            Some(operation) => HostResponse::Lifecycle {
+                operation,
+                machine: Box::new(value),
+            },
+            None => HostResponse::Machine { value },
+        })
+    }
 }
 
 impl HostDispatch {
@@ -2808,6 +2986,14 @@ impl HostDispatch {
             Self::ArtifactRead(read) => read.execute().unwrap_or_else(rejected),
             Self::Runtime(read) => (*read).execute().unwrap_or_else(rejected),
             Self::Guest(guest) => (*guest).execute().unwrap_or_else(rejected),
+            Self::MachineView(view) => view.execute().unwrap_or_else(rejected),
+            Self::MachineViews(views) => views.execute().unwrap_or_else(rejected),
+            Self::ObservationEndpoint(provision) => provision
+                .execute()
+                .map(|()| HostResponse::ObservationStream {
+                    endpoint: provision.endpoint(),
+                })
+                .unwrap_or_else(rejected),
             Self::Task(_) => rejected(HostError::Invalid(
                 "host task completion requires its catalog owner",
             )),
@@ -2905,29 +3091,7 @@ fn capture_snapshot(
             (Ok(captured), Ok(true))
         }
         SnapshotKind::Full => {
-            let prepared = client.native_snapshot(
-                request.machine_id.clone(),
-                NativeSnapshotRequest::PrepareFull {
-                    snapshot_id: request.id.clone(),
-                    operation_id: request.operation_id.clone(),
-                    expected_generation: request.expected_generation,
-                    expected_revision: request.expected_revision,
-                },
-            )?;
-            let NativeSnapshotResponse::Prepared { capture } = prepared else {
-                return Err(HostError::Invalid(
-                    "guardian did not establish a full capture boundary",
-                ));
-            };
-            let captured = crate::snapshots::capture_full(
-                &capture_root,
-                capturing,
-                &machine_root.join("disks").join(system_disk_name()),
-                &machine_root
-                    .join("guardian/full-captures")
-                    .join(object_name(request.operation_id.as_str())),
-                capture,
-            );
+            let captured = capture_full_state(root, endpoint, capturing);
             let finished = client
                 .native_snapshot(
                     request.machine_id.clone(),
@@ -2948,7 +3112,89 @@ fn capture_snapshot(
     Ok(captured)
 }
 
+fn capture_full_state(
+    root: &Path,
+    endpoint: &Path,
+    capturing: &Snapshot,
+) -> Result<crate::snapshots::CaptureResult> {
+    let request = &capturing.request;
+    let client = GuardianClient::new(endpoint.to_path_buf());
+    let prepared = client.native_snapshot(
+        request.machine_id.clone(),
+        NativeSnapshotRequest::PrepareFull {
+            snapshot_id: request.id.clone(),
+            operation_id: request.operation_id.clone(),
+            expected_generation: request.expected_generation,
+            expected_revision: request.expected_revision,
+        },
+    )?;
+    let NativeSnapshotResponse::Prepared { capture } = prepared else {
+        return Err(HostError::Invalid(
+            "guardian did not establish a full capture boundary",
+        ));
+    };
+    let machine_root = root
+        .join("machines")
+        .join(object_name(request.machine_id.as_str()));
+    Ok(crate::snapshots::capture_full(
+        &crate::snapshots::root(root, capturing),
+        capturing,
+        &machine_root.join("disks").join(system_disk_name()),
+        &machine_root
+            .join("guardian/full-captures")
+            .join(object_name(request.operation_id.as_str())),
+        capture,
+    )?)
+}
+
 enum HostTask {
+    CaptureRecovery {
+        provision: GuardianProvision,
+        snapshot: Box<Snapshot>,
+    },
+    Usage {
+        provision: GuardianProvision,
+    },
+    Configuration {
+        provision: GuardianProvision,
+        authorization: AuthorizedConfiguration,
+    },
+    MachineBootstrap {
+        root: PathBuf,
+        executable: PathBuf,
+        record: Box<MachineRecord>,
+        intent: LifecycleIntent,
+    },
+    LifecycleInspect {
+        intent: LifecycleIntent,
+        provision: GuardianProvision,
+    },
+    SuspendCapture {
+        root: PathBuf,
+        intent: LifecycleIntent,
+        provision: GuardianProvision,
+        capturing: Box<Snapshot>,
+    },
+    MachineInputs {
+        root: PathBuf,
+        executable: PathBuf,
+        image: Digest,
+        request: Box<HostRequest>,
+    },
+    Lifecycle {
+        machine_id: MachineId,
+        provision: GuardianProvision,
+        effect: Box<LifecycleEffect>,
+    },
+    Fork {
+        root: PathBuf,
+        executable: PathBuf,
+        snapshot: Box<Snapshot>,
+        record: sandsurf_state::ForkRecord,
+        clone_profile: Option<sandsurf_image::identity::CloneProfile>,
+        provision: GuardianProvision,
+        continuation: OperationId,
+    },
     Snapshot {
         root: PathBuf,
         executable: PathBuf,
@@ -2984,6 +3230,47 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    CaptureRecovery {
+        result: Result<()>,
+    },
+    Usage {
+        machine_id: MachineId,
+        result: Result<(Counter, ResourceUsage)>,
+    },
+    Configuration {
+        result: Result<()>,
+    },
+    MachineBootstrap {
+        intent: LifecycleIntent,
+        result: Result<MachineInputs>,
+    },
+    LifecycleInspect {
+        intent: LifecycleIntent,
+        provision: GuardianProvision,
+        result: Box<Result<GuardianInspection>>,
+    },
+    SuspendCapture {
+        intent: LifecycleIntent,
+        provision: GuardianProvision,
+        capturing: Box<Snapshot>,
+        result: Result<(crate::snapshots::CaptureResult, fs::File)>,
+    },
+    Fork {
+        record: sandsurf_state::ForkRecord,
+        provision: GuardianProvision,
+        result: Result<Digest>,
+        continuation: OperationId,
+    },
+    MachineInputs {
+        request: Box<HostRequest>,
+        result: Result<MachineInputs>,
+    },
+    Lifecycle {
+        machine_id: MachineId,
+        result: Result<LifecycleEvidence>,
+        post: LifecyclePost,
+        custody: Option<fs::File>,
+    },
     Snapshot {
         snapshot_id: sandsurf_protocol::SnapshotId,
         request_digest: Digest,
@@ -3010,6 +3297,225 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::CaptureRecovery {
+                provision,
+                snapshot,
+            } => {
+                let result = (|| {
+                    let capture_root = crate::snapshots::root(&provision.host_root, &snapshot);
+                    crate::snapshots::private_directory(&capture_root)?;
+                    let _custody =
+                        sandsurf_native::storage::disk_lease(&capture_root.join(format!(
+                            ".{}.task.lock",
+                            object_name(snapshot.request.operation_id.as_str()),
+                        )))?;
+                    provision.execute()?;
+                    let response = GuardianClient::new(provision.endpoint()).native_snapshot(
+                        snapshot.request.machine_id,
+                        NativeSnapshotRequest::FinishDisk {
+                            operation_id: snapshot.request.operation_id,
+                        },
+                    )?;
+                    if !matches!(response, NativeSnapshotResponse::Complete { .. }) {
+                        return Err(HostError::Invalid(
+                            "guardian did not release interrupted disk capture",
+                        ));
+                    }
+                    Ok(())
+                })();
+                HostTaskCompletion::CaptureRecovery { result }
+            }
+            Self::Usage { provision } => {
+                let result = (|| {
+                    provision.execute()?;
+                    let response = GuardianClient::new(provision.endpoint())
+                        .runtime(provision.machine.clone(), RuntimeRequest::Usage)?;
+                    let RuntimeResponse::Usage {
+                        generation,
+                        mut usage,
+                    } = response
+                    else {
+                        return Err(HostError::Invalid(
+                            "native resource accounting is unavailable",
+                        ));
+                    };
+                    let storage = sandsurf_native::storage_usage::tree_usage(
+                        &provision
+                            .host_root
+                            .join("machines")
+                            .join(object_name(provision.machine.as_str())),
+                    )?;
+                    usage.disk_logical_bytes = Counter::try_from(storage.logical_bytes)?;
+                    usage.disk_allocated_bytes = Counter::try_from(storage.allocated_bytes)?;
+                    usage.provenance.storage = MeasurementSource::HostFilesystem;
+                    Ok((generation, usage))
+                })();
+                HostTaskCompletion::Usage {
+                    machine_id: provision.machine,
+                    result,
+                }
+            }
+            Self::Configuration {
+                provision,
+                authorization,
+            } => HostTaskCompletion::Configuration {
+                result: perform_configuration(&provision, authorization),
+            },
+            Self::MachineBootstrap {
+                root,
+                executable,
+                record,
+                intent,
+            } => {
+                let result = verify_machine_inputs(
+                    &root,
+                    &executable,
+                    &record.id,
+                    &record.image_digest,
+                    &record.runtime_configuration.resources,
+                );
+                HostTaskCompletion::MachineBootstrap { intent, result }
+            }
+            Self::LifecycleInspect { intent, provision } => {
+                let result = provision.execute().and_then(|()| {
+                    GuardianClient::new(provision.endpoint())
+                        .inspect(intent.machine_id.clone(), None)
+                        .map_err(HostError::from)
+                });
+                HostTaskCompletion::LifecycleInspect {
+                    intent,
+                    provision,
+                    result: Box::new(result),
+                }
+            }
+            Self::SuspendCapture {
+                root,
+                intent,
+                provision,
+                capturing,
+            } => {
+                let result = (|| {
+                    let capture_root = crate::snapshots::root(&root, &capturing);
+                    crate::snapshots::private_directory(&capture_root)?;
+                    let custody =
+                        sandsurf_native::storage::disk_lease(&capture_root.join(format!(
+                            ".{}.task.lock",
+                            object_name(capturing.request.operation_id.as_str()),
+                        )))?;
+                    let captured =
+                        match crate::snapshots::published_filesystem(&capture_root, &capturing)? {
+                            Some(captured) => captured,
+                            None => capture_full_state(&root, &provision.endpoint(), &capturing)?,
+                        };
+                    Ok((captured, custody))
+                })();
+                HostTaskCompletion::SuspendCapture {
+                    intent,
+                    provision,
+                    capturing,
+                    result,
+                }
+            }
+            Self::MachineInputs {
+                root,
+                executable,
+                image,
+                request,
+            } => {
+                let result = (|| {
+                    let (machine, resources) = match &*request {
+                        HostRequest::CreateMachine {
+                            machine_id,
+                            resources,
+                            ..
+                        }
+                        | HostRequest::ForkMachine {
+                            machine_id,
+                            resources,
+                            ..
+                        } => (machine_id, resources),
+                        _ => return Err(HostError::Invalid("invalid machine inputs")),
+                    };
+                    verify_machine_inputs(&root, &executable, machine, &image, resources)
+                })();
+                HostTaskCompletion::MachineInputs { request, result }
+            }
+            Self::Lifecycle {
+                machine_id,
+                provision,
+                effect,
+            } => {
+                let LifecycleEffect {
+                    plan,
+                    prepare,
+                    post,
+                    custody,
+                } = *effect;
+                let result = (|| {
+                    provision.execute()?;
+                    if let Some(request) = prepare
+                        && !matches!(
+                            GuardianClient::new(provision.endpoint())
+                                .native_snapshot(machine_id.clone(), request,)?,
+                            NativeSnapshotResponse::Complete { .. }
+                        )
+                    {
+                        return Err(HostError::Invalid(
+                            "guardian did not complete lifecycle preparation",
+                        ));
+                    }
+                    Ok(plan.execute(provision.endpoint())?)
+                })();
+                HostTaskCompletion::Lifecycle {
+                    machine_id,
+                    result,
+                    post,
+                    custody,
+                }
+            }
+            Self::Fork {
+                root,
+                executable,
+                snapshot,
+                record,
+                clone_profile,
+                provision,
+                continuation,
+            } => {
+                let result = (|| {
+                    let machine_root = root
+                        .join("machines")
+                        .join(object_name(record.machine_id.as_str()));
+                    let _custody =
+                        sandsurf_native::storage::disk_lease(&machine_root.join(format!(
+                            ".{}.initialization.lock",
+                            object_name(record.operation_id.as_str())
+                        )))?;
+                    let clone_profile = match clone_profile {
+                        Some(profile) => profile,
+                        None => {
+                            crate::images::resolve_native_image(&root, &snapshot.image_digest)?
+                                .manifest
+                                .system
+                                .clone_profile
+                        }
+                    };
+                    crate::image_worker::materialize_fork(
+                        &root,
+                        &executable,
+                        &snapshot,
+                        &record.machine_id,
+                        clone_profile,
+                        &record.operation_id,
+                    )
+                })();
+                HostTaskCompletion::Fork {
+                    record,
+                    provision,
+                    result,
+                    continuation,
+                }
+            }
             Self::Snapshot {
                 root,
                 executable,
@@ -3306,10 +3812,12 @@ struct DeferredRuntimeRead {
     endpoint: PathBuf,
     machine_id: MachineId,
     query: RuntimeRequest,
+    provision: GuardianProvision,
 }
 
 impl DeferredRuntimeRead {
     fn execute(self) -> Result<HostResponse> {
+        self.provision.execute()?;
         Ok(HostResponse::Runtime {
             response: GuardianClient::new(self.endpoint).runtime(self.machine_id, self.query)?,
         })
@@ -3869,7 +4377,7 @@ mod tests {
             root: root.clone(),
             executable: service.executable.clone(),
             endpoint: root.join("absent-native-owner"),
-            capturing: Box::new(capturing),
+            capturing: Box::new(capturing.clone()),
         };
         let completion = task.execute();
         assert!(
@@ -3877,6 +4385,20 @@ mod tests {
             "custody must be acquired before recovery can send FinishDisk to the native owner"
         );
         assert!(service.complete_task(completion).is_err());
+        let recovery = HostTask::CaptureRecovery {
+            provision: GuardianProvision {
+                host_root: root.clone(),
+                machine: machine.clone(),
+            },
+            snapshot: Box::new(capturing),
+        }
+        .execute();
+        assert!(
+            matches!(recovery, HostTaskCompletion::CaptureRecovery {
+            result: Err(HostError::Io(error)),
+        } if error.kind() == io::ErrorKind::WouldBlock),
+            "background recovery must not release a live capture worker's native pause"
+        );
         assert_eq!(
             service
                 .catalog
@@ -3895,6 +4417,134 @@ mod tests {
         ));
         drop(custody);
         drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn machine_input_verification_is_detached_and_cannot_admit_partial_authority() {
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!("ssmi-{:x}", u64::from_le_bytes(nonce)));
+        let mut service = intent_service(&root);
+        let existing = admit_machine(&mut service, "seed-owner", MachineLifetime::default());
+        let seed = service.catalog.machine(&existing).unwrap().unwrap();
+        let new_machine: MachineId = "new-machine".try_into().unwrap();
+        let operation: OperationId = "create-new-machine".try_into().unwrap();
+        let HostDispatch::Task(task) = service.route(HostRequest::CreateMachine {
+            machine_id: new_machine.clone(),
+            image_digest: seed.image_digest,
+            resources: seed.runtime_configuration.resources,
+            execution_defaults: ExecutionDefaults::default(),
+            lifetime: MachineLifetime::default(),
+            operation_id: operation.clone(),
+            approval_id: "approve-new-machine".try_into().unwrap(),
+        }) else {
+            panic!("native input verification ran on the catalog owner");
+        };
+        let worker = thread::spawn(move || task.execute());
+        assert!(matches!(
+            service.handle(HostRequest::ListImages {
+                after: None,
+                maximum: counter(16)
+            }),
+            HostResponse::Images { .. }
+        ));
+        assert!(service.catalog.machine(&new_machine).unwrap().is_none());
+        assert!(service.catalog.operation(&operation).unwrap().is_none());
+        // This fixture deliberately has no usable native seed/volume/toolchain.
+        assert!(service.complete_task(worker.join().unwrap()).is_err());
+        assert!(service.catalog.machine(&new_machine).unwrap().is_none());
+        assert!(service.catalog.operation(&operation).unwrap().is_none());
+        assert!(
+            !service
+                .machine_root(&new_machine)
+                .join("guardian/config.json")
+                .exists()
+        );
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_native_inspection_leaves_the_catalog_and_other_clients_available() {
+        let parent = if cfg!(target_os = "macos") {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = parent.join(format!("ssv-{:x}", u64::from_le_bytes(nonce)));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "observed", MachineLifetime::default());
+        prepare_directory(&service.machine_root(&machine)).unwrap();
+        let endpoint = service.guardian_endpoint(&machine);
+        prepare_directory(&endpoint).unwrap();
+        let listener = LocalListener::bind(&endpoint).unwrap();
+        let (entered, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let native = thread::spawn(move || {
+            let mut connection = listener.accept(Duration::from_secs(10)).unwrap();
+            assert!(
+                connection
+                    .read_frame(Duration::from_secs(5))
+                    .unwrap()
+                    .is_some()
+            );
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+            // Response loss must yield unavailable observation, not a new owner.
+            drop(connection);
+        });
+        drop(service);
+        let serving = root.clone();
+        let host = thread::spawn(move || serve_host(&serving, serving.join("absent-executable")));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if host_call(
+                &root,
+                HostRequest::ListImages {
+                    after: None,
+                    maximum: counter(16),
+                },
+            )
+            .is_ok()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let reading = root.clone();
+        let identity = machine.clone();
+        let reader = thread::spawn(move || {
+            host_call(
+                &reading,
+                HostRequest::GetMachine {
+                    machine_id: identity,
+                },
+            )
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            host_call(
+                &root,
+                HostRequest::ListImages {
+                    after: None,
+                    maximum: counter(16)
+                }
+            )
+            .unwrap(),
+            HostResponse::Images { .. }
+        ));
+        release.send(()).unwrap();
+        native.join().unwrap();
+        assert!(
+            matches!(reader.join().unwrap().unwrap(), HostResponse::Machine { value }
+            if value.id == machine && matches!(value.machine, Observation::Unavailable { .. }))
+        );
+        host_call(&root, HostRequest::StopService).unwrap();
+        host.join().unwrap().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
