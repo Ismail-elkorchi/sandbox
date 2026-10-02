@@ -49,7 +49,9 @@ fn reparse_volume(bytes: &[u8]) -> io::Result<String> {
     let end = start + field(10);
     let name = String::from_utf16(
         &bytes[start..end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>(),
     )

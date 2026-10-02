@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { artifactFiles, publishNativePlatform, publishNativeTree } from "../nati
 import { QEMU_CORRESPONDING_FILES } from "../qemu-source.ts";
 
 async function fixture() {
-  const root = await mkdtemp(resolve(tmpdir(), "sandsurf-native-artifacts-"));
+  const root = await realpath(await mkdtemp(resolve(tmpdir(), "sandsurf-native-artifacts-")));
   const native = resolve(root, "native");
   await mkdir(native);
   const write = async (base, path, bytes) => {

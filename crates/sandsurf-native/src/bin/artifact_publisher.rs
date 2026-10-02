@@ -207,25 +207,52 @@ fn canonical(path: &Path) -> io::Result<bool> {
     }
     #[cfg(windows)]
     {
-        let real = real
-            .to_str()
-            .ok_or_else(|| invalid("invalid canonical path"))?;
-        let path = path
-            .to_str()
-            .ok_or_else(|| invalid("invalid native path"))?;
-        Ok(real
-            .strip_prefix("\\\\?\\")
-            .unwrap_or(real)
-            .eq_ignore_ascii_case(path.strip_prefix("\\\\?\\").unwrap_or(path)))
+        Ok(windows_components(&real)? == windows_components(path)?)
     }
+}
+
+#[cfg(windows)]
+fn windows_components(path: &Path) -> io::Result<Vec<String>> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| invalid("invalid native path"))?;
+    // Windows canonicalization supplies a verbatim namespace prefix. Compare
+    // native path components, not display strings: separators and a trailing
+    // separator are spelling, whereas a reparse target is a different owner.
+    let normalized = if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+        std::borrow::Cow::Owned(format!("\\\\{rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(text.strip_prefix("\\\\?\\").unwrap_or(text))
+    };
+    Path::new(normalized.as_ref())
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| invalid("invalid native path component"))
+        })
+        .collect()
 }
 
 fn directory(path: &Path) -> io::Result<()> {
     if !path.is_absolute() || path.to_str().is_none() {
         return Err(invalid("native directory must be absolute UTF-8"));
     }
-    if !canonical(path)? || !fs::symlink_metadata(path)?.is_dir() {
+    let metadata = fs::symlink_metadata(path)?;
+    if !canonical(path)? || !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("native artifact directory is an alias"));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(invalid("native artifact directory is a reparse alias"));
+        }
     }
     Ok(())
 }
@@ -662,5 +689,30 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("sandsurf-artifact-publisher: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_path_spellings_do_not_create_multiple_publication_owners() {
+        let plain = windows_components(Path::new("D:\\build\\native")).unwrap();
+        for spelling in ["d:/build/native/", "\\\\?\\D:\\build\\native\\"] {
+            assert_eq!(windows_components(Path::new(spelling)).unwrap(), plain);
+        }
+        assert_eq!(
+            windows_components(Path::new("\\\\?\\UNC\\server\\share\\native\\")).unwrap(),
+            windows_components(Path::new("\\\\server\\share\\native")).unwrap(),
+        );
+        assert_ne!(
+            windows_components(Path::new("D:\\elsewhere\\native")).unwrap(),
+            plain
+        );
+        assert_ne!(
+            windows_components(Path::new("D:\\build\\..\\native")).unwrap(),
+            plain
+        );
     }
 }

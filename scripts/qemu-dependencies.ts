@@ -1,5 +1,5 @@
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
-import { relative, resolve } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import { runtimeDigest } from "./qemu-runtime.ts";
 
 export interface LibraryInput { path: string; sha256: string }
@@ -60,7 +60,7 @@ interface Origin {
 }
 
 async function homebrewOrigin(library: string, cellar: string, scratch: string, run: BuildRunner): Promise<Origin> {
-  const actual = await realpath(library), path = relative(cellar, actual).split("/");
+  const actual = await realpath(library), path = relative(cellar, actual).split(sep);
   const name = path[0], version = path[1];
   if (name === undefined || version === undefined || path.length < 3 || !safeName.test(name) || !safeName.test(version)) {
     throw new Error("bundled dylib must belong to an exact installed Homebrew keg");

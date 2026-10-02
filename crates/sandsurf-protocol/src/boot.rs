@@ -34,7 +34,9 @@ impl BootIdentity {
             .boot_digest
             .as_str()
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
         {
             // Digest's constructor already guarantees lowercase hexadecimal.

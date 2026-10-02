@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -79,7 +79,7 @@ test("an empty loader closure has exactly an empty source inventory", async (con
 
 for (const platform of ["darwin", "win32"]) {
   test(`${platform} collection selects installed recipes and ships actual source bytes`, async (context) => {
-    const root = await mkdtemp(resolve(tmpdir(), "sandsurf-source-collector-"));
+    const root = await realpath(await mkdtemp(resolve(tmpdir(), "sandsurf-source-collector-")));
     context.after(() => rm(root, { recursive: true, force: true }));
     const original = Object.getOwnPropertyDescriptor(process, "platform");
     const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");

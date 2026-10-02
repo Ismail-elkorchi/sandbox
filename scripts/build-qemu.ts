@@ -32,7 +32,9 @@ export async function buildQemu(destination: string): Promise<void> {
       || await digest(archive) !== QEMU_SOURCE.sha256) throw new Error("QEMU source differs from the reviewed release");
     // Host tar sees only the pinned trusted tool source, never guest disk data
     // or an OCI layer. Do not execute guest image scripts in this build path.
-    await run("tar", ["-xJf", archive, "-C", scratch], scratch);
+    // The extractor already runs in this owned directory. Give it the local
+    // archive name: GNU tar interprets a Windows drive colon as remote syntax.
+    await run("tar", ["-xJf", basename(archive)], scratch);
     const source = resolve(scratch, `qemu-${QEMU_SOURCE.version}`);
     const main = resolve(source, "system/main.c");
     const whpx = resolve(source, "target/i386/whpx/whpx-all.c");
