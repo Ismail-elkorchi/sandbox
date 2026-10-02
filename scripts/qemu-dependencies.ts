@@ -118,7 +118,7 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
   if (!safeName.test(name) || !/^(?:[0-9]+:)?[A-Za-z0-9_.+~-]+-[0-9]+$/u.test(version)) throw new Error("invalid MSYS2 source package identity");
   const licenses = selected.fields.get("LICENSE");
   if (licenses === undefined || licenses.length === 0) throw new Error("MSYS2 source package license missing");
-  const license = licenses.map(licenseExpression).join(" AND ");
+  const license = msysLicenseExpression(licenses);
   const description = selected.path;
   const filename = `${name}-${version.replace(/^[0-9]+:/u, "")}.src.tar.zst`;
   return { manager: "msys2", name, version, license, async capture(output, materials) {
@@ -167,6 +167,18 @@ export function licenseExpression(value: unknown, depth = 0): string {
     }
   }
   throw new Error("native library has no distributable license expression");
+}
+
+/** MSYS2's installed metadata uses spdx: expressions. Separate array entries
+ * are alternatives, not cumulative obligations. Mixed/custom legacy labels
+ * have undefined semantics and cannot authorize this closed distribution.
+ * https://www.msys2.org/dev/package-licensing/#the-license-array-field */
+export function msysLicenseExpression(values: readonly string[]): string {
+  if (values.length === 0 || values.length > 16 || values.some((value) => !value.startsWith("spdx:"))) {
+    throw new Error("installed MSYS2 package requires explicit SPDX license expressions");
+  }
+  const expressions = values.map((value) => licenseExpression(value.slice(5)));
+  return expressions.length === 1 ? expressions[0]! : `(${expressions.map((value) => `(${value})`).join(" OR ")})`;
 }
 
 async function material(source: string, output: string, name: string, materials: Record<string, string>): Promise<string> {

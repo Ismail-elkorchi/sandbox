@@ -54,7 +54,9 @@ fn private(metadata: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
-struct Directory {
+/// Retained private directory identity. It is not an endpoint writer lease,
+/// machine owner, or authorization decision.
+pub struct Directory {
     path: PathBuf,
     held: File,
 }
@@ -161,7 +163,7 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 impl Directory {
-    fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         let original = fs::symlink_metadata(path)?;
         private(&original)?;
         if !original.is_dir() || original.file_type().is_symlink() {
@@ -183,7 +185,7 @@ impl Directory {
         root.check()?;
         Ok(root)
     }
-    fn check(&self) -> io::Result<()> {
+    pub fn check(&self) -> io::Result<()> {
         crate::filesystem::require_protected_ancestors(&self.path)?;
         #[cfg(target_os = "macos")]
         crate::macos::require_private_file_acl(&self.held)?;
@@ -193,6 +195,9 @@ impl Directory {
             return Err(denied("endpoint root identity changed"));
         }
         Ok(())
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
     }
     fn socket(&self) -> io::Result<Metadata> {
         self.socket_named(SOCKET)

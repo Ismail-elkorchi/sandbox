@@ -4,7 +4,7 @@ import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { collectDependencySources, dependencySourceFiles, licenseExpression, pacmanDescription, verifyDependencySources } from "../qemu-dependencies.ts";
+import { collectDependencySources, dependencySourceFiles, licenseExpression, msysLicenseExpression, pacmanDescription, verifyDependencySources } from "../qemu-dependencies.ts";
 
 test("installed package fields remain exact and reject duplicate or oversized metadata", () => {
   const description = "%NAME%\nmingw-w64-ucrt-x86_64-glib2\n\n%BASE%\nmingw-w64-glib2\n\n%VERSION%\n1:2.90.0-1\n\n%LICENSE%\nLGPL-2.1-or-later\n";
@@ -12,6 +12,15 @@ test("installed package fields remain exact and reject duplicate or oversized me
   for (const text of ["%NAME%\nx\n\n%NAME%\ny", "NAME\nx", "%NAME%\nx\0", "x".repeat(65537)]) assert.throws(() => pacmanDescription(text));
   assert.equal(licenseExpression({ all_of: ["LGPL-2.1-or-later", { any_of: ["MIT", "BSD-3-Clause"] }] }), "(LGPL-2.1-or-later AND (MIT OR BSD-3-Clause))");
   for (const value of [null, "UNKNOWN", "custom:foo", { any_of: ["MIT"] }, { all_of: ["MIT", "UNKNOWN"] }, { all_of: ["MIT", "ISC"], more: true }]) assert.throws(() => licenseExpression(value));
+});
+
+test("MSYS2 SPDX metadata preserves expressions and alternative licensing without legacy guesses", () => {
+  assert.equal(msysLicenseExpression(["spdx:MIT AND BSD-3-Clause-Clear"]), "MIT AND BSD-3-Clause-Clear");
+  assert.equal(msysLicenseExpression(["spdx:LGPL-2.1-only", "spdx:MPL-1.1"]), "((LGPL-2.1-only) OR (MPL-1.1))");
+  assert.equal(msysLicenseExpression(["spdx:MIT OR BSD-2-Clause", "spdx:ISC AND Zlib"]), "((MIT OR BSD-2-Clause) OR (ISC AND Zlib))");
+  for (const values of [[], ["MIT"], ["custom:MIT"], ["spdx:MIT", "BSD"], ["spdx:"], ["spdx:UNKNOWN"], Array(17).fill("spdx:MIT")]) {
+    assert.throws(() => msysLicenseExpression(values));
+  }
 });
 
 async function fixture(context, manager = "homebrew") {
@@ -96,7 +105,7 @@ for (const platform of ["darwin", "win32"]) {
     const database = resolve(root, "database"), owner = "mingw-w64-ucrt-x86_64-glib2";
     await mkdir(resolve(database, "local", `${owner}-2.90.0-1`), { recursive: true });
     await writeFile(resolve(database, "local", `${owner}-2.90.0-1`, "desc"),
-      `%NAME%\n${owner}\n\n%BASE%\nmingw-w64-glib2\n\n%VERSION%\n2.90.0-1\n\n%LICENSE%\nLGPL-2.1-or-later\n`);
+      `%NAME%\n${owner}\n\n%BASE%\nmingw-w64-glib2\n\n%VERSION%\n2.90.0-1\n\n%LICENSE%\nspdx:LGPL-2.1-or-later\n`);
     const calls = [];
     async function run(command, args, cwd, capture, environment) {
       calls.push({ command, args, cwd, capture, environment });

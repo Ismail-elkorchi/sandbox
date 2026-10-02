@@ -275,8 +275,14 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     #[test]
     fn private_endpoint_verifies_kernel_pid_and_rejects_an_alias_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "sandsurf-peer-{}-{}",
+        // Darwin's per-user TMPDIR plus the fixture nonce can exceed sun_path.
+        // Exercise the same bounded private endpoint model as native owners.
+        #[cfg(target_os = "macos")]
+        let parent = std::path::PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let parent = std::env::temp_dir();
+        let root = parent.join(format!(
+            "ss-peer-{}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

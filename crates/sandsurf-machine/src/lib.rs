@@ -21,6 +21,7 @@ pub mod linux;
 pub use hardware::validate_hardware;
 pub mod qemu;
 pub mod qemu_driver;
+mod qemu_endpoints;
 mod qemu_launch;
 #[cfg(any(target_os = "macos", windows))]
 pub mod qemu_owner;

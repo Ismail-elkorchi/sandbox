@@ -2,6 +2,7 @@
 //! enforced NIC. Guest management is a separate optional serial attachment.
 //! This owner observes native state; it owns no grants or lifecycle intention.
 use crate::qemu::LaunchConfig;
+use crate::qemu_endpoints::{CONSOLE, NIC};
 use crate::qemu_worker::QemuWorker;
 use crate::{NativeConsole, NativePowerObservation};
 use sandsurf_native::GuestConnection;
@@ -47,12 +48,12 @@ impl QemuOwner {
         )?;
         let process = worker.process_id();
         let timeout = std::time::Duration::from_secs(15);
-        let serial = SerialOwner::new(&config.endpoints, process, timeout)?;
-        let output = worker.attach("console.sock")?;
+        let serial = SerialOwner::new(worker.endpoints(), process, timeout)?;
+        let output = worker.attach(CONSOLE)?;
         let input = output.try_clone()?;
         output.set_io_timeout(None)?;
         input.set_io_timeout(Some(std::time::Duration::from_secs(1)))?;
-        let socket = worker.attach("nic.sock")?;
+        let socket = worker.attach(NIC)?;
         let network = Arc::new(NativeNetworkGateway::start(
             PacketTransport::Stream(Box::new(PacketStream::new(socket.into_socket())?)),
             LinkIdentity::for_machine(&config.machine_id),

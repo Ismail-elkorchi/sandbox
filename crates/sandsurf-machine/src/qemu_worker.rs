@@ -2,12 +2,13 @@
 //! No guest management, network policy, lifecycle intent, or catalog ownership.
 use crate::GuestArchitecture;
 use crate::qemu::{Accelerator, LaunchConfig, QemuControl};
+use crate::qemu_endpoints::{CONSOLE, Endpoints, NIC, QMP};
 use sandsurf_native::process_budget::ProcessBudget;
 use sandsurf_native::socket_io::SocketConnection;
 use sandsurf_protocol::{Digest, bytes_digest};
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
@@ -17,7 +18,7 @@ type NativeWorker = sandsurf_native::owned_windows::OwnedWorker;
 pub(crate) struct QemuWorker {
     pub(crate) child: NativeWorker,
     pub(crate) control: QemuControl,
-    endpoints: PathBuf,
+    endpoints: Endpoints,
     startup_deadline: Instant,
     _custody: Arc<File>,
     _runtime: crate::qemu_runtime::Runtime,
@@ -49,17 +50,13 @@ impl QemuWorker {
                 "hardware accelerator and guest architecture must match this native host",
             ));
         }
-        if sandsurf_native::local::canonical_private_directory(&config.endpoints)?
-            != config.endpoints
-        {
-            return Err(invalid("native endpoint directory is an alias"));
-        }
         let runtime = crate::qemu_runtime::verify(runtime_manifest, runtime_digest, architecture)?;
         if config.firmware_directory != runtime.firmware_directory {
             return Err(invalid("native firmware differs from verified runtime"));
         }
         let executable = runtime.executable.as_path();
-        let mut arguments = config.arguments()?;
+        let mut endpoints = Endpoints::create()?;
+        let mut arguments = config.arguments(endpoints.path())?;
         if restoring {
             arguments.extend(["-incoming".into(), "defer".into()]);
         }
@@ -101,22 +98,37 @@ impl QemuWorker {
         // Resource-gate acknowledgement is not device readiness. Wait for
         // this retained child's sockets without treating an absent endpoint
         // as permission to create a replacement native computer.
-        let qmp = connect_device(&config.endpoints.join("qmp.sock"), &mut child, deadline)?;
-        let control = QemuControl::open(
-            qmp,
-            deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "native control startup deadline exceeded",
-                    )
-                })?,
-        )?;
+        let control = (|| {
+            let qmp = connect_device(&endpoints.path().join(QMP), &mut child, deadline)?;
+            QemuControl::open(
+                qmp,
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "native control startup deadline exceeded",
+                        )
+                    })?,
+            )
+        })();
+        let control = match control {
+            Ok(control) => control,
+            Err(error) => {
+                // Failed attachment is not native exit. Only this retained
+                // child's confirmed containment permits socket reclamation.
+                if child.terminate().is_ok()
+                    && let Err(cleanup) = endpoints.remove_after_exit()
+                {
+                    eprintln!("sandsurf native endpoint cleanup unavailable: {cleanup}");
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             child,
             control,
-            endpoints: config.endpoints.clone(),
+            endpoints,
             startup_deadline: deadline,
             _custody: custody,
             _runtime: runtime,
@@ -125,12 +137,15 @@ impl QemuWorker {
     pub(crate) fn process_id(&self) -> u32 {
         self.child.process_id()
     }
+    pub(crate) fn endpoints(&self) -> &Path {
+        self.endpoints.path()
+    }
     pub(crate) fn attach(&mut self, name: &str) -> io::Result<SocketConnection> {
-        if !matches!(name, "console.sock" | "nic.sock") {
+        if !matches!(name, CONSOLE | NIC) {
             return Err(invalid("unknown native device attachment"));
         }
         connect_device(
-            &self.endpoints.join(name),
+            &self.endpoints.path().join(name),
             &mut self.child,
             self.startup_deadline,
         )
@@ -157,6 +172,17 @@ impl QemuWorker {
                     )
                 })
             })
+        }
+    }
+}
+impl Drop for QemuWorker {
+    fn drop(&mut self) {
+        // A failed native receipt leaves the namespace intact. Destructor
+        // cleanup is not a journal claim of power or operation completion.
+        if self.child.terminate().is_ok()
+            && let Err(error) = self.endpoints.remove_after_exit()
+        {
+            eprintln!("sandsurf native endpoint cleanup unavailable: {error}");
         }
     }
 }

@@ -290,7 +290,9 @@ struct FileIdentity {
     file: u64,
 }
 
-struct Directory {
+/// Retained private directory identity. It is not an endpoint writer lease,
+/// machine owner, or authorization decision.
+pub struct Directory {
     path: PathBuf,
     held: File,
     identity: FileIdentity,
@@ -335,7 +337,7 @@ fn mount_identity(file: &File) -> io::Result<FileIdentity> {
 }
 
 impl Directory {
-    fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(invalid("local endpoint root must be absolute"));
         }
@@ -372,7 +374,7 @@ impl Directory {
         Ok(directory)
     }
 
-    fn check(&self) -> io::Result<()> {
+    pub fn check(&self) -> io::Result<()> {
         if let Some(mount) = &self.mount {
             mount.check()?;
         }
@@ -383,6 +385,10 @@ impl Directory {
             return Err(denied("local endpoint root identity changed"));
         }
         Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn pipe_name(&self) -> Vec<u16> {

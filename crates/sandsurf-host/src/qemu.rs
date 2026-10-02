@@ -89,7 +89,6 @@ pub struct QemuGuardianConfig {
     image_manifest: PathBuf,
     system_seed: PathBuf,
     system_seed_sha256: String,
-    endpoint_root: PathBuf,
 }
 
 impl QemuGuardianConfig {
@@ -151,10 +150,6 @@ pub fn prepare_config(
         resources.vcpus.get(),
         resources.memory_mib.get(),
     )?;
-    let socket_identity =
-        bytes_digest(format!("{}:{}", host_root.display(), machine_id.as_str()).as_bytes());
-    let socket_root = std::env::temp_dir().join(format!("sq-{}", &socket_identity.as_str()[..16]));
-    ensure_private_directory(&socket_root)?;
     Ok(QemuGuardianConfig {
         format_version: CONFIG_VERSION,
         machine_id: machine_id.clone(),
@@ -165,7 +160,6 @@ pub fn prepare_config(
         image_manifest: verified.manifest_path,
         system_seed_sha256: sha256_file(&template, 128 * 1024 * 1024 * 1024)?,
         system_seed: template,
-        endpoint_root: sandsurf_native::local::canonical_private_directory(&socket_root)?,
     })
 }
 
@@ -210,7 +204,6 @@ pub fn read_config(path: &Path, machine_id: &MachineId) -> Result<QemuGuardianCo
             "guardian configuration artifact identity changed".into(),
         ));
     }
-    ensure_private_directory(&value.endpoint_root)?;
     Ok(value)
 }
 
@@ -334,7 +327,6 @@ impl QemuGuardianEffect {
                 system_disk,
                 authentication_disk,
                 firmware_directory: runtime.firmware_directory,
-                endpoints: config.endpoint_root.clone(),
                 memory_mib: u32::try_from(config.resources.memory_mib.get())
                     .map_err(io::Error::other)?,
                 vcpus: u32::try_from(config.resources.vcpus.get()).map_err(io::Error::other)?,
@@ -417,14 +409,9 @@ impl QemuGuardianEffect {
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
             .and_then(|format| format.require_qemu())
             .map_err(|_| bytes_digest(b"qemu-kernel-loader-contract-invalid"))?;
-        let nonce = random_bytes().map_err(|_| bytes_digest(b"qemu-endpoint-entropy"))?;
-        let name: String = nonce[..8].iter().map(|b| format!("{b:02x}")).collect();
-        let endpoints = self.config.endpoint_root.join(name);
-        ensure_private_directory(&endpoints)
-            .map_err(|_| bytes_digest(b"qemu-endpoints-not-private"))?;
         let authentication_disk = boot_directory.join("auth.img");
         self.machine
-            .stage_boot_artifacts(kernel, initramfs, authentication_disk.clone(), endpoints)
+            .stage_boot_artifacts(kernel, initramfs, authentication_disk.clone())
             .map_err(|_| bytes_digest(b"qemu-boot-staging-failed"))?;
         let capability = random_bytes().map_err(|_| bytes_digest(b"qemu-boot-entropy"))?;
         let boot_identity = digest(

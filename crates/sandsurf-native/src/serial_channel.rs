@@ -9,6 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The host-side name for one fixed guest serial slot. This address is not a
+/// guest filesystem path, machine identity, or permission to open a new owner.
+pub fn socket_name(slot: usize) -> io::Result<String> {
+    if slot >= GUEST_SERIAL_CONNECTIONS {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(format!("control-{slot}.sock"))
+}
+
 struct Slots {
     held: [bool; GUEST_SERIAL_CONNECTIONS],
     closed: bool,
@@ -49,7 +58,9 @@ impl SerialOwner {
         }
         Ok(Self {
             pool: Arc::new(Pool {
-                paths: std::array::from_fn(|slot| directory.join(format!("control-{slot}.sock"))),
+                paths: std::array::from_fn(|slot| {
+                    directory.join(socket_name(slot).expect("fixed serial slot"))
+                }),
                 process_id,
                 timeout,
                 slots: Mutex::new(Slots {
@@ -168,6 +179,20 @@ impl GuestChannel for SerialChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn socket_names_match_only_fixed_serial_slots() {
+        let names: std::collections::BTreeSet<_> = (0..GUEST_SERIAL_CONNECTIONS)
+            .map(|slot| socket_name(slot).unwrap())
+            .collect();
+        assert_eq!(names.len(), GUEST_SERIAL_CONNECTIONS);
+        assert_eq!(socket_name(0).unwrap(), "control-0.sock");
+        for slot in [GUEST_SERIAL_CONNECTIONS, usize::MAX] {
+            assert_eq!(
+                socket_name(slot).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
     fn pool() -> Arc<Pool> {
         Arc::new(Pool {
             paths: std::array::from_fn(|slot| PathBuf::from(format!("/control-{slot}"))),

@@ -164,7 +164,6 @@ mod native {
             kernel: PathBuf,
             initramfs: Option<PathBuf>,
             authentication: PathBuf,
-            endpoints: PathBuf,
         ) -> io::Result<()> {
             if self.owner.is_some() {
                 return Err(invalid("boot staging requires confirmed native detach"));
@@ -172,7 +171,6 @@ mod native {
             self.config.launch.kernel = kernel;
             self.config.launch.initramfs = initramfs;
             self.config.launch.authentication_disk = authentication;
-            self.config.launch.endpoints = endpoints;
             self.config.launch.validate()
         }
         pub fn stage_storage_custody(&mut self, custody: Arc<File>) -> io::Result<()> {

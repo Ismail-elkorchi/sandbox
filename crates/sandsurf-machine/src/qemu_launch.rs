@@ -1,6 +1,7 @@
 //! One explicit hardware-only device model for owned QEMU workers. No user
 //! QEMU options, host mounts, monitor shell, SLIRP, TAP bridge or TCG fallback.
 use crate::GuestArchitecture;
+use crate::qemu_endpoints::{CONSOLE, NIC, QMP};
 use sandsurf_network::LinkIdentity;
 use sandsurf_protocol::{GUEST_SERIAL_CONNECTIONS, GUEST_SERIAL_PREFIX, MachineId, VmEngine};
 use serde_json::json;
@@ -40,8 +41,6 @@ pub struct LaunchConfig {
     pub authentication_disk: PathBuf,
     /// Verified, bundled firmware only; never QEMU's host-wide search path.
     pub firmware_directory: PathBuf,
-    /// A new private directory per native owner, never reused by another boot.
-    pub endpoints: PathBuf,
     pub memory_mib: u32,
     pub vcpus: u32,
 }
@@ -53,7 +52,6 @@ impl LaunchConfig {
             &self.system_disk,
             &self.authentication_disk,
             &self.firmware_directory,
-            &self.endpoints,
         ] {
             path_text(path)?;
         }
@@ -68,27 +66,15 @@ impl LaunchConfig {
         if self.system_disk == self.authentication_disk {
             return Err(invalid("QEMU disks must have separate identities"));
         }
-        for name in ["qmp.sock", "nic.sock", "console.sock", "control-7.sock"] {
-            if self
-                .endpoints
-                .join(name)
-                .as_os_str()
-                .as_encoded_bytes()
-                .len()
-                > 103
-            {
-                return Err(invalid(
-                    "private QEMU endpoint exceeds native Unix socket path bound",
-                ));
-            }
-        }
         Ok(())
     }
 
     /// Arguments only. The native owner must verify executable identity,
     /// storage custody and applied process/partition limits before spawning.
-    pub fn arguments(&self) -> io::Result<Vec<OsString>> {
+    pub fn arguments(&self, endpoints: &Path) -> io::Result<Vec<OsString>> {
         self.validate()?;
+        path_text(endpoints)?;
+        crate::qemu_endpoints::validate(endpoints)?;
         let mut args: Vec<OsString> = [
             "-no-user-config",
             "-nodefaults",
@@ -172,13 +158,10 @@ impl LaunchConfig {
             "-qmp",
             format!(
                 "unix:{},server=on,wait=off",
-                escaped_path(&self.endpoints.join("qmp.sock"))?
+                escaped_path(&endpoints.join(QMP))?
             ),
         );
-        pair(
-            "-chardev",
-            socket("console", &self.endpoints.join("console.sock"))?,
-        );
+        pair("-chardev", socket("console", &endpoints.join(CONSOLE))?);
         pair("-serial", "chardev:console".into());
         pair(
             "-device",
@@ -189,7 +172,7 @@ impl LaunchConfig {
                 "-chardev",
                 socket(
                     &format!("control{slot}"),
-                    &self.endpoints.join(format!("control-{slot}.sock")),
+                    &endpoints.join(sandsurf_native::serial_channel::socket_name(slot)?),
                 )?,
             );
             pair(
@@ -204,7 +187,7 @@ impl LaunchConfig {
             "-netdev",
             format!(
                 "stream,id=external,server=on,addr.type=unix,addr.path={}",
-                escaped_path(&self.endpoints.join("nic.sock"))?
+                escaped_path(&endpoints.join(NIC))?
             ),
         );
         pair(
@@ -255,7 +238,6 @@ mod tests {
             system_disk: root.join("system,disk.raw"),
             authentication_disk: root.join("auth.raw"),
             firmware_directory: root.join("firmware"),
-            endpoints: root.join("sq"),
             memory_mib: 512,
             vcpus: 2,
         }
@@ -264,7 +246,10 @@ mod tests {
     fn both_native_accelerators_have_one_enforced_packet_path_and_no_fallback() {
         for accelerator in [Accelerator::Hvf, Accelerator::Whpx] {
             for architecture in [GuestArchitecture::Amd64, GuestArchitecture::Arm64] {
-                let args = config(accelerator, architecture).arguments().unwrap();
+                let endpoints = crate::qemu_endpoints::Endpoints::create().unwrap();
+                let args = config(accelerator, architecture)
+                    .arguments(endpoints.path())
+                    .unwrap();
                 let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
                 assert_eq!(args.iter().filter(|arg| **arg == "-accel").count(), 1);
                 assert!(
@@ -319,13 +304,16 @@ mod tests {
     #[test]
     fn launch_rejects_alias_disks_unbounded_sockets_and_control_injection() {
         let mut config = config(Accelerator::Hvf, GuestArchitecture::Arm64);
+        let endpoints = crate::qemu_endpoints::Endpoints::create().unwrap();
         config.authentication_disk = config.system_disk.clone();
-        assert!(config.arguments().is_err());
+        assert!(config.arguments(endpoints.path()).is_err());
         config.authentication_disk = std::env::temp_dir().join("auth.raw");
-        config.endpoints = std::env::temp_dir().join("x".repeat(104));
-        assert!(config.arguments().is_err());
-        config.endpoints = std::env::temp_dir().join("sq");
+        assert!(
+            config
+                .arguments(&std::env::temp_dir().join("x".repeat(104)))
+                .is_err()
+        );
         config.kernel = std::env::temp_dir().join("kernel\n-accel tcg");
-        assert!(config.arguments().is_err());
+        assert!(config.arguments(endpoints.path()).is_err());
     }
 }
