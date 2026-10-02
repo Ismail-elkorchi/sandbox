@@ -1,6 +1,10 @@
 // Empty hardware handle probe only; no guest, memory or disks are attached.
 // This is not qualification of Sandsurf's QEMU owner or containment.
+#if defined(__aarch64__)
+#include <Hypervisor/Hypervisor.h>
+#else
 #include <Hypervisor/hv.h>
+#endif
 #include <stdio.h>
 
 int main(void)
