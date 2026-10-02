@@ -1,4 +1,5 @@
 import { captureCommand as capture } from "./capture-command.ts";
+import { evaluateLicense } from "./license-expression.ts";
 
 const allowed = new Set([
   "Apache-2.0",
@@ -37,48 +38,5 @@ function approvedExpression(expression: string): boolean {
   const normalized = expression
     .replaceAll("MIT/Apache-2.0", "MIT OR Apache-2.0")
     .replaceAll("Unlicense/MIT", "Unlicense OR MIT");
-  const tokens = normalized.match(/\(|\)|AND|OR|WITH|[A-Za-z0-9][A-Za-z0-9.+-]*/gu) ?? [];
-  if (tokens.join(" ").replaceAll("( ", "(").replaceAll(" )", ")") === "") return false;
-  let index = 0;
-  const factor = (): boolean => {
-    if (tokens[index] === "(") {
-      index += 1;
-      const value = alternatives();
-      if (tokens[index] !== ")") throw new Error(`invalid SPDX expression: ${expression}`);
-      index += 1;
-      return value;
-    }
-    const license = tokens[index++];
-    if (license === undefined || ["AND", "OR", "WITH", ")"].includes(license)) {
-      throw new Error(`invalid SPDX expression: ${expression}`);
-    }
-    let value = allowed.has(license);
-    if (tokens[index] === "WITH") {
-      index += 1;
-      const exception = tokens[index++];
-      value = value && exception !== undefined && allowed.has(exception);
-    }
-    return value;
-  };
-  const conjunction = (): boolean => {
-    let value = factor();
-    while (tokens[index] === "AND") {
-      index += 1;
-      const next = factor();
-      value = value && next;
-    }
-    return value;
-  };
-  const alternatives = (): boolean => {
-    let value = conjunction();
-    while (tokens[index] === "OR") {
-      index += 1;
-      const next = conjunction();
-      value = value || next;
-    }
-    return value;
-  };
-  const result = alternatives();
-  if (index !== tokens.length) throw new Error(`invalid SPDX expression: ${expression}`);
-  return result;
+  return evaluateLicense(normalized, (id) => allowed.has(id), (id) => allowed.has(id));
 }

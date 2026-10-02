@@ -37,7 +37,7 @@ const LAYER_MEDIA: [&str; 5] = [
     "application/vnd.docker.image.rootfs.diff.tar",
     "application/vnd.docker.image.rootfs.diff.tar.gzip",
 ];
-const USER_AGENT: &str = "sandsurf/0.1 OCI-distribution";
+const USER_AGENT: &str = concat!("sandsurf/", env!("CARGO_PKG_VERSION"), " OCI-distribution");
 const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 import { copyFile, lstat, mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { runtimeDigest } from "./qemu-runtime.ts";
+import { evaluateLicense } from "./license-expression.ts";
 
 export interface LibraryInput { path: string; sha256: string }
 export interface DependencyComponent {
@@ -159,11 +160,18 @@ function single(fields: ReadonlyMap<string, readonly string[]>, key: string): st
 
 export function licenseExpression(value: unknown, depth = 0): string {
   if (depth > 8) throw new Error("license expression nesting exceeds its bound");
-  if (typeof value === "string" && /^[A-Za-z0-9().+ -]{1,256}$/u.test(value) && !/unknown|custom|proprietary/iu.test(value)) return value;
+  if (typeof value === "string") {
+    const named = (id: string) => {
+      if (/unknown|custom|proprietary|LicenseRef/iu.test(id)) throw new Error("native library license requires unresolved terms");
+      return true;
+    };
+    if (value.length <= 256 && evaluateLicense(value, named, named)) return value;
+    throw new Error("native library lacks an explicit supported license expression");
+  }
   if (record(value) && Object.keys(value).length === 1) {
     for (const [key, items] of Object.entries(value)) {
       if (!['all_of', 'any_of'].includes(key) || !Array.isArray(items) || items.length < 2 || items.length > 16) break;
-      return `(${items.map((item) => licenseExpression(item, depth + 1)).join(key === "all_of" ? " AND " : " OR ")})`;
+      return licenseExpression(`(${items.map((item) => licenseExpression(item, depth + 1)).join(key === "all_of" ? " AND " : " OR ")})`, depth);
     }
   }
   throw new Error("native library has no distributable license expression");
@@ -178,7 +186,7 @@ export function msysLicenseExpression(values: readonly string[]): string {
     throw new Error("installed MSYS2 package requires explicit SPDX license expressions");
   }
   const expressions = values.map((value) => licenseExpression(value.slice(5)));
-  return expressions.length === 1 ? expressions[0]! : `(${expressions.map((value) => `(${value})`).join(" OR ")})`;
+  return licenseExpression(expressions.length === 1 ? expressions[0]! : `(${expressions.map((value) => `(${value})`).join(" OR ")})`);
 }
 
 async function material(source: string, output: string, name: string, materials: Record<string, string>): Promise<string> {

@@ -11,7 +11,7 @@ test("installed package fields remain exact and reject duplicate or oversized me
   assert.deepEqual(pacmanDescription(description).get("VERSION"), ["1:2.90.0-1"]);
   for (const text of ["%NAME%\nx\n\n%NAME%\ny", "NAME\nx", "%NAME%\nx\0", "x".repeat(65537)]) assert.throws(() => pacmanDescription(text));
   assert.equal(licenseExpression({ all_of: ["LGPL-2.1-or-later", { any_of: ["MIT", "BSD-3-Clause"] }] }), "(LGPL-2.1-or-later AND (MIT OR BSD-3-Clause))");
-  for (const value of [null, "UNKNOWN", "custom:foo", { any_of: ["MIT"] }, { all_of: ["MIT", "UNKNOWN"] }, { all_of: ["MIT", "ISC"], more: true }]) assert.throws(() => licenseExpression(value));
+  for (const value of [null, "UNKNOWN", "MIT OR UNKNOWN", "MIT OR LicenseRef-special", "MIT AND", "MIT .", "custom:foo", { any_of: ["MIT"] }, { all_of: ["MIT", "UNKNOWN"] }, { all_of: ["MIT", "ISC"], more: true }]) assert.throws(() => licenseExpression(value));
 });
 
 test("MSYS2 SPDX metadata preserves expressions and alternative licensing without legacy guesses", () => {
