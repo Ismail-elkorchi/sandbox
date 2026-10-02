@@ -60,6 +60,39 @@ test("bridge closure with an incomplete reply is a protocol failure", async (t) 
   await failed; await client.close();
 });
 
+test("bridge accepts highly fragmented metadata and coalesced out-of-order replies", async (t) => {
+  const { child, client } = bridgeFixture(t);
+  const pending = [client.request({ kind: "inspect" }), client.request({ kind: "inspect" }), client.request({ kind: "inspect" })];
+  const large = { kind: "complete", padding: "x".repeat(200_000) };
+  const fragmented = replyFrame(2, large);
+  for (let offset = 0; offset < fragmented.length; offset += 7) child.stdout.write(fragmented.subarray(offset, offset + 7));
+  child.stdout.write(Buffer.concat([replyFrame(3, { kind: "complete" }), replyFrame(1, { kind: "complete" })]));
+  child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+  assert.deepEqual(await Promise.all(pending), [{ kind: "complete" }, large, { kind: "complete" }]);
+  await client.close();
+});
+
+for (const length of [0, 1024 * 1024 + 256 * 1024 + 5]) {
+  test(`bridge rejects frame length ${length} before accepting subsequent bytes`, async (t) => {
+    const { child, client } = bridgeFixture(t);
+    const failed = assert.rejects(client.request({ kind: "inspect" }), (error) =>
+      error instanceof SandsurfHostError && error.category === "protocol");
+    const header = Buffer.alloc(4); header.writeUInt32LE(length);
+    child.stdout.write(header); child.stdout.write(replyFrame(1, { kind: "complete" }));
+    child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+    await failed; await client.close();
+  });
+}
+
+test("bridge rejects invalid UTF-8 rather than changing response bytes", async (t) => {
+  const { child, client } = bridgeFixture(t);
+  const failed = assert.rejects(client.request({ kind: "inspect" }), (error) =>
+    error instanceof SandsurfHostError && error.category === "protocol");
+  const frame = replyFrame(1, { kind: "complete" }); frame[frame.indexOf("complete")] = 0xff;
+  child.stdout.write(frame); child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+  await failed; await client.close();
+});
+
 test("native bridge correlates concurrent host responses and bounds admission", async () => {
   const root = await mkdtemp(join(tmpdir(), "sandsurf-bridge-"));
   let client;
