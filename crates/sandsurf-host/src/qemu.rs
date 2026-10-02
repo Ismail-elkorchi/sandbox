@@ -419,14 +419,9 @@ impl QemuGuardianEffect {
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
             .and_then(|format| format.require_qemu())
             .map_err(|_| bytes_digest(b"qemu-kernel-loader-contract-invalid"))?;
-        let endpoints = self.config.endpoint_root.join(format!(
-            "{}",
-            &random_bytes()
-                .map_err(|_| bytes_digest(b"qemu-endpoint-entropy"))?
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()[..16]
-        ));
+        let nonce = random_bytes().map_err(|_| bytes_digest(b"qemu-endpoint-entropy"))?;
+        let name: String = nonce[..8].iter().map(|b| format!("{b:02x}")).collect();
+        let endpoints = self.config.endpoint_root.join(name);
         ensure_private_directory(&endpoints)
             .map_err(|_| bytes_digest(b"qemu-endpoints-not-private"))?;
         let authentication_disk = boot_directory.join("auth.img");

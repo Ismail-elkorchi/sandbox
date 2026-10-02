@@ -669,6 +669,13 @@ mod tests {
         assert!(admission.poll().unwrap().is_none());
         assert_eq!(admission.receipt.offset, 3);
         let fd = admission.receipt.descriptor.as_ref().unwrap().as_raw_fd();
+        // Keep the source socket live so its inode cannot be recycled. Other
+        // parallel tests may reuse the descriptor number after cancellation;
+        // numbers alone cannot establish whether the received reference closed.
+        // SAFETY: stat has an all-zero valid initialization for fstat output.
+        let mut before: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the receipt still owns fd and the output has the native ABI.
+        assert_eq!(unsafe { libc::fstat(fd, &mut before) }, 0);
         admission.deadline = Instant::now();
         assert_eq!(
             admission.poll().unwrap_err().kind(),
@@ -676,8 +683,15 @@ mod tests {
         );
         assert!(admission.finished);
         assert!(admission.receipt.descriptor.is_none());
-        // SAFETY: scalar validity query, not adoption of the already closed FD.
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // SAFETY: stat has an all-zero valid initialization for fstat output.
+        let mut after: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: bounded identity observation only; never adopt a descriptor
+        // number that a parallel test may have reused after the owner closed it.
+        if unsafe { libc::fstat(fd, &mut after) } == 0 {
+            assert_ne!((after.st_dev, after.st_ino), (before.st_dev, before.st_ino));
+        } else {
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
         assert!(admission.poll().is_err());
     }
 

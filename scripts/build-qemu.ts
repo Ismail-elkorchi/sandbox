@@ -34,7 +34,11 @@ export async function buildQemu(destination: string): Promise<void> {
     // or an OCI layer. Do not execute guest image scripts in this build path.
     // The extractor already runs in this owned directory. Give it the local
     // archive name: GNU tar interprets a Windows drive colon as remote syntax.
-    await run("tar", ["-xJf", basename(archive)], scratch);
+    // MSYS's default link emulation copies the link target, losing POSIX
+    // source semantics and failing for targets appearing later in the archive.
+    // The native build requires real links, never copy/cookie fallbacks.
+    await run("tar", ["-xJf", basename(archive)], scratch, false,
+      process.platform === "win32" ? { MSYS: "winsymlinks:nativestrict" } : {});
     const source = resolve(scratch, `qemu-${QEMU_SOURCE.version}`);
     const main = resolve(source, "system/main.c");
     const whpx = resolve(source, "target/i386/whpx/whpx-all.c");
