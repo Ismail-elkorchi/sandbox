@@ -427,6 +427,7 @@ impl LinuxGuardianEffect {
             active: Arc::clone(&active),
             pending: None,
             pending_restore: None,
+            prepared_boot: None,
         };
         let machine = FirecrackerDriver::new(
             config.machine_id.clone(),
@@ -545,6 +546,29 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for LinuxGuardianEffect {
+    fn boot_preparation(
+        &self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> ControlResult<Option<crate::boot_preparation::BootPreparation>> {
+        crate::boot_preparation::BootPreparation::cold(
+            &self.machine_root,
+            &self.config.image_digest,
+            command,
+            current,
+        )
+    }
+    fn install_prepared_boot(
+        &mut self,
+        prepared: crate::boot_preparation::PreparedBoot,
+    ) -> ControlResult<()> {
+        let slot = &mut self.machine.generation_factory_mut().prepared_boot;
+        if slot.is_some() {
+            return Err(ControlError::Protocol("prepared boot is already staged"));
+        }
+        *slot = Some(prepared);
+        Ok(())
+    }
     fn resource_envelope(&self) -> Option<Resources> {
         Some(self.config.resources.clone())
     }
@@ -581,6 +605,7 @@ impl GuardianEffect for LinuxGuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> MachineOutcome {
+        let prepared = self.machine.generation_factory_mut().prepared_boot.take();
         // Current signed authority is installed outside the guest before any
         // start/resume transition can execute guest code.
         if (command.desired == sandsurf_protocol::DesiredState::Running
@@ -603,7 +628,9 @@ impl GuardianEffect for LinuxGuardianEffect {
             && current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Failed)
             });
+        self.machine.generation_factory_mut().prepared_boot = prepared;
         let mut outcome = apply_lifecycle(&mut self.machine, command, current);
+        self.machine.generation_factory_mut().prepared_boot = None;
         let running = matches!(
             &outcome,
             MachineOutcome::Observed(values)
@@ -948,6 +975,14 @@ impl GuardianEffect for LinuxGuardianEffect {
             *active = None;
         }
         crate::guardian::restart_after_native_reset(self, current, configuration)
+    }
+    fn guest_reset_configuration(&self) -> ControlResult<RuntimeConfiguration> {
+        self.installed_runtime
+            .as_ref()
+            .map(|runtime| runtime.configuration.clone())
+            .ok_or(ControlError::Protocol(
+                "guest reset has no applied native envelope",
+            ))
     }
 }
 
@@ -1368,6 +1403,7 @@ struct LinuxGenerationFactory {
     active: Arc<Mutex<Option<ActiveGuest>>>,
     pending: Option<PendingGuest>,
     pending_restore: Option<PendingRestore>,
+    prepared_boot: Option<crate::boot_preparation::PreparedBoot>,
 }
 
 fn bind_network_owner(
@@ -1412,17 +1448,17 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             return Err(bytes_digest(b"linux-generation-factory-identity-conflict"));
         }
         self.config.resources = resources.clone();
-        let (boot_directory, boot) = crate::image_worker::prepare_boot(
+        let prepared = self
+            .prepared_boot
+            .take()
+            .ok_or_else(|| bytes_digest(b"linux-prepared-boot-missing"))?;
+        let (boot_directory, boot) = prepared.consume(
             &self.machine_root,
             machine_id,
             generation,
             &self.config.image_digest,
             resources.disk_bytes.get(),
-        )
-        .map_err(|error| {
-            eprintln!("sandsurf offline boot preparation failed: {error}");
-            bytes_digest(b"linux-boot-preparation-failed")
-        })?;
+        )?;
         let storage_lease = crate::storage::attach(&self.system_disk).map_err(|error| {
             eprintln!("sandsurf disk attachment refused: {error}");
             bytes_digest(b"linux-system-disk-attachment-failed")
@@ -1934,6 +1970,7 @@ mod storage_tests {
             active: Arc::new(Mutex::new(None)),
             pending: None,
             pending_restore: None,
+            prepared_boot: None,
         };
         let source = FirecrackerRestoreSource {
             snapshot_id,

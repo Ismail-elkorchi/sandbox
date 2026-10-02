@@ -93,7 +93,26 @@ pub use sandsurf_machine::{MachineOutcome as LifecycleEffect, MachineTransition}
 use crate::guest_worker::{ExecutionHint, GuestJob, GuestJobResult};
 pub use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 
+pub use crate::boot_preparation::{BootPreparation, PreparedBoot};
+
 pub trait GuardianEffect {
+    fn boot_preparation(
+        &self,
+        _command: &LifecycleCommand,
+        _current: Option<&MachineObservation>,
+    ) -> Result<Option<BootPreparation>> {
+        Ok(None)
+    }
+    fn install_prepared_boot(&mut self, _prepared: PreparedBoot) -> Result<()> {
+        Err(Error::Unsupported(
+            "native owner does not consume prepared boot artifacts",
+        ))
+    }
+    fn guest_reset_configuration(&self) -> Result<RuntimeConfiguration> {
+        Err(Error::Unsupported(
+            "native guest reset configuration is unavailable",
+        ))
+    }
     fn take_console(&mut self) -> Option<sandsurf_machine::NativeConsole> {
         None
     }
@@ -205,21 +224,8 @@ pub(crate) fn restart_after_native_reset<E: GuardianEffect>(
             "native reset has no committed generation fence",
         ));
     }
-    let command = LifecycleCommand {
-        machine_id: current.machine_id.clone(),
-        operation_id: OperationId::try_from(format!("native-reset-{}", current.generation.get()))
-            .map_err(|_| Error::Protocol("reset identity overflow"))?,
-        desired: sandsurf_protocol::DesiredState::Running,
-        revision: current.applied_revision,
-        request_digest: current.evidence_digest.clone(),
-        configuration,
-    };
-    let previous = MachineObservation {
-        generation: Counter::try_from(current.generation.get() - 1)
-            .map_err(|_| Error::Protocol("reset generation invalid"))?,
-        state: MachineState::Stopped,
-        ..current.clone()
-    };
+    let command = reset_command(current, configuration)?;
+    let previous = reset_previous(current)?;
     match effect.transition(&command, Some(&previous)) {
         LifecycleEffect::Observed(values)
             if values.last().is_some_and(|value| {
@@ -236,6 +242,40 @@ pub(crate) fn restart_after_native_reset<E: GuardianEffect>(
     }
 }
 
+fn reset_command(
+    starting: &MachineObservation,
+    configuration: RuntimeConfiguration,
+) -> Result<LifecycleCommand> {
+    Ok(LifecycleCommand {
+        machine_id: starting.machine_id.clone(),
+        operation_id: OperationId::try_from(format!("native-reset-{}", starting.generation.get()))
+            .map_err(|_| Error::Protocol("reset identity overflow"))?,
+        desired: DesiredState::Running,
+        revision: starting.applied_revision,
+        request_digest: starting.evidence_digest.clone(),
+        configuration,
+    })
+}
+
+fn reset_previous(starting: &MachineObservation) -> Result<MachineObservation> {
+    Ok(MachineObservation {
+        generation: Counter::try_from(
+            starting
+                .generation
+                .get()
+                .checked_sub(1)
+                .ok_or(Error::Protocol("reset generation invalid"))?,
+        )
+        .map_err(|_| Error::Protocol("reset generation invalid"))?,
+        state: MachineState::Stopped,
+        ..starting.clone()
+    })
+}
+
+#[cfg(test)]
+#[path = "boot_preparation_tests.rs"]
+mod boot_preparation_tests;
+
 pub struct Guardian<E> {
     journal: RuntimeJournal,
     // Native ownership ends at confirmed destruction. The durable ledger can
@@ -244,6 +284,23 @@ pub struct Guardian<E> {
     management_seen: Option<std::time::Instant>,
     execution_seen: std::collections::BTreeMap<ExecutionId, std::time::Instant>,
     console: crate::console::ConsoleStore,
+    // Scheduling only. Durable operation admission and the authority fence
+    // decide whether a completed offline job can ever start virtual hardware.
+    boot_in_flight: bool,
+    reset_pending: Option<MachineObservation>,
+}
+
+enum BootAdmission {
+    Ready(GuardianResponse),
+    Queued {
+        input: BootPreparation,
+        pending: BootPending,
+    },
+}
+
+enum BootPending {
+    Lifecycle(Box<AuthorizedLifecycle>),
+    Reset(MachineObservation),
 }
 
 enum GuestAdmission {
@@ -283,6 +340,8 @@ impl<E: GuardianEffect> Guardian<E> {
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
             console,
+            boot_in_flight: false,
+            reset_pending: None,
         }
     }
 
@@ -302,6 +361,8 @@ impl<E: GuardianEffect> Guardian<E> {
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
             console,
+            boot_in_flight: false,
+            reset_pending: None,
         })
     }
 
@@ -625,10 +686,12 @@ impl<E: GuardianEffect> Guardian<E> {
     /// A destroyed VM no longer needs a resident owner. Its journal remains
     /// durable and can be reopened if the host later reads historical evidence.
     pub fn can_retire(&mut self) -> Result<bool> {
-        Ok(self
-            .journal
-            .last_observation()?
-            .is_some_and(|value| value.value().state == MachineState::Destroyed)
+        Ok(!self.boot_in_flight
+            && self.reset_pending.is_none()
+            && self
+                .journal
+                .last_observation()?
+                .is_some_and(|value| value.value().state == MachineState::Destroyed)
             && match self.effect.as_mut() {
                 None => true,
                 Some(effect) => matches!(effect.observe_power(), Ok(None)),
@@ -680,6 +743,12 @@ impl<E: GuardianEffect> Guardian<E> {
             // Capture owns this temporary pause; it is not public pause intent.
             return Ok(false);
         }
+        if measured.state == MachineState::Stopped
+            && current.state == MachineState::Starting
+            && self.reset_pending.as_ref() == Some(&current)
+        {
+            return Ok(false);
+        }
         if measured.state != current.state {
             self.journal.observe(MachineObservation {
                 machine_id: current.machine_id.clone(),
@@ -725,26 +794,325 @@ impl<E: GuardianEffect> Guardian<E> {
             };
             // Commit the fence before any replacement attachment can run.
             self.journal.observe(starting.clone())?;
-            let outcome = effect.recover_guest_reset(&starting);
-            let (state, evidence_digest) = match outcome {
-                Ok(evidence) => (MachineState::Running, evidence),
-                Err(error) => (
-                    MachineState::Failed,
-                    bytes_digest(error.to_string().as_bytes()),
-                ),
-            };
-            self.journal.observe(MachineObservation {
-                sequence: starting
-                    .sequence
-                    .next()
-                    .map_err(|_| Error::Protocol("reset sequence overflow"))?,
-                state,
-                evidence_digest,
-                ..starting
-            })?;
+            // A reset advances the durable generation immediately, but offline
+            // disk interpretation must never occupy the native control owner.
+            self.reset_pending = Some(starting.clone());
+            let command = reset_command(&starting, effect.guest_reset_configuration()?)?;
+            let previous = reset_previous(&starting)?;
+            if effect
+                .boot_preparation(&command, Some(&previous))?
+                .is_none()
+            {
+                self.complete_reset(starting, None)?;
+            }
         }
         self.attach_native_console();
         Ok(true)
+    }
+
+    fn begin_boot(&mut self, authorization: AuthorizedLifecycle) -> Result<BootAdmission> {
+        self.refresh_native_observation()?;
+        let operation = self.journal.admit_lifecycle(authorization.clone())?;
+        if !matches!(
+            operation.delivery,
+            Delivery::Admitted | Delivery::NotApplied
+        ) {
+            return Ok(BootAdmission::Ready(self.transition(authorization, None)?));
+        }
+        if let Err(error) = self.journal.validate_lifecycle_preparation(&authorization) {
+            return Ok(BootAdmission::Ready(
+                self.unprepared_failure(&operation.command, error.into())?,
+            ));
+        }
+        let current = self
+            .journal
+            .last_observation()?
+            .map(|value| value.value().clone());
+        let input = self
+            .effect
+            .as_ref()
+            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
+            .boot_preparation(&operation.command, current.as_ref())?;
+        let Some(input) = input else {
+            return Ok(BootAdmission::Ready(self.transition(authorization, None)?));
+        };
+        if self.boot_in_flight {
+            // An exact retry observes admission; it is not a second worker.
+            // A later host revision is already fenced and may be retried once
+            // the physical disk worker releases its custody.
+            return Ok(BootAdmission::Ready(GuardianResponse::Lifecycle {
+                operation,
+            }));
+        }
+        self.boot_in_flight = true;
+        Ok(BootAdmission::Queued {
+            input,
+            pending: BootPending::Lifecycle(Box::new(authorization)),
+        })
+    }
+
+    fn begin_reset_boot(&mut self) -> Result<Option<(BootPreparation, BootPending)>> {
+        if self.boot_in_flight {
+            return Ok(None);
+        }
+        let Some(starting) = self.reset_pending.clone() else {
+            return Ok(None);
+        };
+        if !self.journal.native_reset_is_current(&starting)? {
+            self.reset_pending = None;
+            return Ok(None);
+        }
+        let native = self
+            .effect
+            .as_ref()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?;
+        let command = reset_command(&starting, native.guest_reset_configuration()?)?;
+        let previous = reset_previous(&starting)?;
+        let Some(input) = native.boot_preparation(&command, Some(&previous))? else {
+            self.complete_reset(starting, None)?;
+            return Ok(None);
+        };
+        self.boot_in_flight = true;
+        Ok(Some((input, BootPending::Reset(starting))))
+    }
+
+    fn finish_boot(
+        &mut self,
+        pending: BootPending,
+        result: Result<PreparedBoot>,
+    ) -> Result<Option<GuardianResponse>> {
+        self.boot_in_flight = false;
+        match pending {
+            BootPending::Lifecycle(authorization) => {
+                let command = authorization.statement.command.clone();
+                let result =
+                    result.and_then(|prepared| self.transition(*authorization, Some(prepared)));
+                match result {
+                    Ok(response) => Ok(Some(response)),
+                    Err(error) => Ok(Some(self.unprepared_failure(&command, error)?)),
+                }
+            }
+            BootPending::Reset(starting) => {
+                if !self.journal.native_reset_is_current(&starting)? {
+                    self.reset_pending = None;
+                    return Ok(None);
+                }
+                match result {
+                    Ok(prepared) => self.complete_reset(starting, Some(prepared))?,
+                    Err(error) => self.record_reset_completion(starting, Err(error))?,
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn unprepared_failure(
+        &mut self,
+        command: &LifecycleCommand,
+        error: Error,
+    ) -> Result<GuardianResponse> {
+        let operation = self
+            .journal
+            .lifecycle_operation(&command.operation_id)?
+            .ok_or(Error::Protocol("prepared lifecycle admission is missing"))?;
+        let operation = if operation.delivery == Delivery::Admitted {
+            self.journal.record_lifecycle_delivery(
+                &command.operation_id,
+                &command.request_digest,
+                Delivery::NotApplied,
+                Some(bytes_digest(error.to_string().as_bytes())),
+                None,
+            )?
+        } else {
+            operation
+        };
+        Ok(GuardianResponse::Lifecycle { operation })
+    }
+
+    fn complete_reset(
+        &mut self,
+        starting: MachineObservation,
+        prepared: Option<PreparedBoot>,
+    ) -> Result<()> {
+        let native = self
+            .effect
+            .as_mut()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?;
+        let outcome = (|| {
+            if let Some(prepared) = prepared {
+                native.install_prepared_boot(prepared)?;
+            }
+            native.recover_guest_reset(&starting)
+        })();
+        self.record_reset_completion(starting, outcome)
+    }
+
+    fn record_reset_completion(
+        &mut self,
+        starting: MachineObservation,
+        outcome: Result<Digest>,
+    ) -> Result<()> {
+        let (state, evidence_digest) = match outcome {
+            Ok(evidence) => (MachineState::Running, evidence),
+            Err(error) => (
+                MachineState::Failed,
+                bytes_digest(error.to_string().as_bytes()),
+            ),
+        };
+        self.journal.observe(MachineObservation {
+            sequence: starting
+                .sequence
+                .next()
+                .map_err(|_| Error::Protocol("reset sequence overflow"))?,
+            state,
+            evidence_digest,
+            ..starting
+        })?;
+        self.reset_pending = None;
+        self.attach_native_console();
+        Ok(())
+    }
+
+    fn transition(
+        &mut self,
+        authorization: AuthorizedLifecycle,
+        prepared: Option<PreparedBoot>,
+    ) -> Result<GuardianResponse> {
+        self.refresh_native_observation()?;
+        let command = authorization.statement.command.clone();
+        let current = self
+            .journal
+            .last_observation()?
+            .map(|value| value.value().clone());
+        self.journal.admit_lifecycle(authorization.clone())?;
+        let operation = match self.journal.begin_lifecycle(authorization)? {
+            sandsurf_state::LifecycleDecision::Reconcile(operation) => {
+                self.reconcile_lifecycle(operation)?
+            }
+            sandsurf_state::LifecycleDecision::Perform(permit) => {
+                let native = self
+                    .effect
+                    .as_mut()
+                    .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
+                let outcome = permit.perform(|actual| {
+                    if matches!(actual.desired, DesiredState::Running | DesiredState::Paused) {
+                        match native.capture_owner() {
+                            Ok(None) => {}
+                            Ok(Some(_)) => {
+                                return LifecycleEffect::NotApplied(bytes_digest(
+                                    b"native-capture-owns-pause-boundary",
+                                ));
+                            }
+                            Err(_) => {
+                                return LifecycleEffect::NotApplied(bytes_digest(
+                                    b"native-capture-ownership-unavailable",
+                                ));
+                            }
+                        }
+                    }
+                    // Forced containment must not depend on a readable
+                    // capture journal; suspension verifies its own
+                    // committed full-state witness in the native owner.
+                    if let Some(prepared) = prepared
+                        && let Err(error) = native.install_prepared_boot(prepared)
+                    {
+                        return LifecycleEffect::NotApplied(bytes_digest(
+                            error.to_string().as_bytes(),
+                        ));
+                    }
+                    native.transition(actual, current.as_ref())
+                });
+                match outcome {
+                    LifecycleEffect::Observed(transitions) => {
+                        if transitions.is_empty() || transitions.len() > 8 {
+                            return Err(Error::Protocol(
+                                "native lifecycle returned an invalid observation count",
+                            ));
+                        }
+                        let restored_generation = if current
+                            .as_ref()
+                            .is_some_and(|value| value.state == MachineState::Suspended)
+                            && transitions
+                                .last()
+                                .is_some_and(|value| value.state == MachineState::Running)
+                        {
+                            let generation = transitions
+                                .last()
+                                .expect("restored transition checked above")
+                                .generation;
+                            Some(generation)
+                        } else {
+                            None
+                        };
+                        let mut references = Vec::with_capacity(transitions.len());
+                        for transition in transitions {
+                            let sequence = match self.journal.last_observation()? {
+                                Some(value) => value.value().sequence.next().map_err(|_| {
+                                    Error::Protocol("guardian observation sequence overflow")
+                                })?,
+                                None => Counter::ONE,
+                            };
+                            let committed = self.journal.observe(MachineObservation {
+                                machine_id: command.machine_id.clone(),
+                                generation: transition.generation,
+                                sequence,
+                                state: transition.state,
+                                applied_revision: command.revision,
+                                cause: sandsurf_protocol::ObservationCause::Lifecycle {
+                                    operation_id: command.operation_id.clone(),
+                                },
+                                evidence_digest: transition.evidence_digest,
+                            })?;
+                            references.push(committed.reference()?);
+                        }
+                        let final_observation = self.journal.last_observation()?.ok_or(
+                            Error::Protocol("native lifecycle produced no committed observation"),
+                        )?;
+                        if !final_observation.value().state.satisfies(command.desired) {
+                            return Err(Error::Protocol(
+                                "native lifecycle did not establish the desired state",
+                            ));
+                        }
+                        let evidence = digest(Domain::Operation, &references)
+                            .map_err(|_| Error::Protocol("lifecycle evidence digest failed"))?;
+                        let operation = self.journal.record_lifecycle_delivery(
+                            &command.operation_id,
+                            &command.request_digest,
+                            Delivery::Applied,
+                            Some(evidence),
+                            Some(final_observation.reference()?),
+                        )?;
+                        // Native facts and lifecycle delivery have their
+                        // own owner. Execution integration cannot rewind
+                        // them or turn an observed running VM into unknown.
+                        if let Some(generation) = restored_generation
+                            && let Err(error) =
+                                native.rebind_restored_runtime(&mut self.journal, generation)
+                        {
+                            eprintln!("sandsurf restored execution integration pending: {error}");
+                        }
+                        operation
+                    }
+                    LifecycleEffect::NotApplied(evidence) => {
+                        self.journal.record_lifecycle_delivery(
+                            &command.operation_id,
+                            &command.request_digest,
+                            Delivery::NotApplied,
+                            Some(evidence),
+                            None,
+                        )?
+                    }
+                    LifecycleEffect::Unknown => self.journal.record_lifecycle_delivery(
+                        &command.operation_id,
+                        &command.request_digest,
+                        Delivery::Unknown,
+                        None,
+                        None,
+                    )?,
+                }
+            }
+        };
+        Ok(GuardianResponse::Lifecycle { operation })
     }
 
     fn attach_native_console(&mut self) {
@@ -811,148 +1179,7 @@ impl<E: GuardianEffect> Guardian<E> {
             | GuardianRequest::Guest { .. } => Err(Error::Protocol(
                 "guest requests require the independent I/O worker",
             )),
-            GuardianRequest::Transition { authorization } => {
-                self.refresh_native_observation()?;
-                let command = authorization.statement.command.clone();
-                let current = self
-                    .journal
-                    .last_observation()?
-                    .map(|value| value.value().clone());
-                self.journal.admit_lifecycle(authorization.clone())?;
-                let operation = match self.journal.begin_lifecycle(authorization)? {
-                    sandsurf_state::LifecycleDecision::Reconcile(operation) => {
-                        self.reconcile_lifecycle(operation)?
-                    }
-                    sandsurf_state::LifecycleDecision::Perform(permit) => {
-                        let native = self
-                            .effect
-                            .as_mut()
-                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
-                        let outcome = permit.perform(|actual| {
-                            if matches!(
-                                actual.desired,
-                                DesiredState::Running | DesiredState::Paused
-                            ) {
-                                match native.capture_owner() {
-                                    Ok(None) => {}
-                                    Ok(Some(_)) => {
-                                        return LifecycleEffect::NotApplied(bytes_digest(
-                                            b"native-capture-owns-pause-boundary",
-                                        ));
-                                    }
-                                    Err(_) => {
-                                        return LifecycleEffect::NotApplied(bytes_digest(
-                                            b"native-capture-ownership-unavailable",
-                                        ));
-                                    }
-                                }
-                            }
-                            // Forced containment must not depend on a readable
-                            // capture journal; suspension verifies its own
-                            // committed full-state witness in the native owner.
-                            native.transition(actual, current.as_ref())
-                        });
-                        match outcome {
-                            LifecycleEffect::Observed(transitions) => {
-                                if transitions.is_empty() || transitions.len() > 8 {
-                                    return Err(Error::Protocol(
-                                        "native lifecycle returned an invalid observation count",
-                                    ));
-                                }
-                                let restored_generation = if current
-                                    .as_ref()
-                                    .is_some_and(|value| value.state == MachineState::Suspended)
-                                    && transitions
-                                        .last()
-                                        .is_some_and(|value| value.state == MachineState::Running)
-                                {
-                                    let generation = transitions
-                                        .last()
-                                        .expect("restored transition checked above")
-                                        .generation;
-                                    Some(generation)
-                                } else {
-                                    None
-                                };
-                                let mut references = Vec::with_capacity(transitions.len());
-                                for transition in transitions {
-                                    let sequence = match self.journal.last_observation()? {
-                                        Some(value) => {
-                                            value.value().sequence.next().map_err(|_| {
-                                                Error::Protocol(
-                                                    "guardian observation sequence overflow",
-                                                )
-                                            })?
-                                        }
-                                        None => Counter::ONE,
-                                    };
-                                    let committed = self.journal.observe(MachineObservation {
-                                        machine_id: command.machine_id.clone(),
-                                        generation: transition.generation,
-                                        sequence,
-                                        state: transition.state,
-                                        applied_revision: command.revision,
-                                        cause: sandsurf_protocol::ObservationCause::Lifecycle {
-                                            operation_id: command.operation_id.clone(),
-                                        },
-                                        evidence_digest: transition.evidence_digest,
-                                    })?;
-                                    references.push(committed.reference()?);
-                                }
-                                let final_observation =
-                                    self.journal.last_observation()?.ok_or(Error::Protocol(
-                                        "native lifecycle produced no committed observation",
-                                    ))?;
-                                if !final_observation.value().state.satisfies(command.desired) {
-                                    return Err(Error::Protocol(
-                                        "native lifecycle did not establish the desired state",
-                                    ));
-                                }
-                                let evidence =
-                                    digest(Domain::Operation, &references).map_err(|_| {
-                                        Error::Protocol("lifecycle evidence digest failed")
-                                    })?;
-                                let operation = self.journal.record_lifecycle_delivery(
-                                    &command.operation_id,
-                                    &command.request_digest,
-                                    Delivery::Applied,
-                                    Some(evidence),
-                                    Some(final_observation.reference()?),
-                                )?;
-                                // Native facts and lifecycle delivery have their
-                                // own owner. Execution integration cannot rewind
-                                // them or turn an observed running VM into unknown.
-                                if let Some(generation) = restored_generation
-                                    && let Err(error) = native
-                                        .rebind_restored_runtime(&mut self.journal, generation)
-                                {
-                                    eprintln!(
-                                        "sandsurf restored execution integration pending: {error}"
-                                    );
-                                }
-                                operation
-                            }
-                            LifecycleEffect::NotApplied(evidence) => {
-                                self.journal.record_lifecycle_delivery(
-                                    &command.operation_id,
-                                    &command.request_digest,
-                                    Delivery::NotApplied,
-                                    Some(evidence),
-                                    None,
-                                )?
-                            }
-                            LifecycleEffect::Unknown => self.journal.record_lifecycle_delivery(
-                                &command.operation_id,
-                                &command.request_digest,
-                                Delivery::Unknown,
-                                None,
-                                None,
-                            )?,
-                        }
-                    }
-                };
-                Ok(GuardianResponse::Lifecycle { operation })
-            }
+            GuardianRequest::Transition { authorization } => self.transition(authorization, None),
             GuardianRequest::Configure { authorization } => {
                 let command = authorization.statement.command.clone();
                 let current = self
@@ -1787,6 +2014,32 @@ pub fn serve_guardian<E: GuardianEffect>(
     let events = Arc::clone(&guardian.console.notifications);
     events.publish(guardian.journal.event_cursor()?);
     let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
+    let (boot_jobs, boot_queue) = mpsc::sync_channel::<BootWorkItem>(1);
+    let boot_completions = sender.clone();
+    let boot_worker = std::thread::Builder::new()
+        .name("sandsurf-offline-boot".into())
+        .spawn(move || {
+            while let Ok(BootWorkItem {
+                input,
+                pending,
+                reply,
+            }) = boot_queue.recv()
+            {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.execute()))
+                        .unwrap_or_else(|_| Err(Error::Protocol("offline boot worker panicked")));
+                if boot_completions
+                    .send(GuardianIngress::BootComplete {
+                        pending,
+                        result,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })?;
     let (guest_jobs, guest_queue) = mpsc::sync_channel::<GuestWorkItem>(16);
     let completion_sender = sender.clone();
     let guest_worker = guardian
@@ -1964,6 +2217,37 @@ pub fn serve_guardian<E: GuardianEffect>(
                 Ok(GuardianIngress::Request { parsed, reply }) => {
                     last_request = std::time::Instant::now();
                     let response = match *parsed {
+                        Ok(GuardianRequest::Transition { authorization }) => {
+                            match guardian.begin_boot(authorization) {
+                                Ok(BootAdmission::Ready(response)) => response,
+                                Ok(BootAdmission::Queued { input, pending }) => {
+                                    if outstanding_guest_jobs >= inflight_limit {
+                                        if let Some(response) = guardian.finish_boot(
+                                            pending,
+                                            Err(Error::Rejected {
+                                                category: "capacity".into(),
+                                                message: "host in-flight resource budget exhausted"
+                                                    .into(),
+                                            }),
+                                        )? {
+                                            let _ = reply.send(response);
+                                        }
+                                        continue;
+                                    }
+                                    queue_boot(
+                                        guardian,
+                                        &boot_jobs,
+                                        BootWorkItem {
+                                            input,
+                                            pending,
+                                            reply: Some(reply),
+                                        },
+                                    )?;
+                                    continue;
+                                }
+                                Err(error) => rejected(error),
+                            }
+                        }
                         Ok(request)
                             if matches!(
                                 request,
@@ -1972,7 +2256,9 @@ pub fn serve_guardian<E: GuardianEffect>(
                                     | GuardianRequest::Guest { .. }
                             ) =>
                         {
-                            if outstanding_guest_jobs >= inflight_limit {
+                            if outstanding_guest_jobs + usize::from(guardian.boot_in_flight)
+                                >= inflight_limit
+                            {
                                 let _ = reply.send(rejected(Error::Rejected {
                                     category: "capacity".into(),
                                     message: "host in-flight resource budget exhausted".into(),
@@ -2027,7 +2313,8 @@ pub fn serve_guardian<E: GuardianEffect>(
                             ..
                         }) if resources.channels.get() < active.load(Ordering::Acquire) as u64
                             || resources.inflight_requests.get()
-                                < outstanding_guest_jobs as u64 =>
+                                < (outstanding_guest_jobs + usize::from(guardian.boot_in_flight))
+                                    as u64 =>
                         {
                             rejected(Error::Rejected {
                                 category: "capacity".into(),
@@ -2048,9 +2335,12 @@ pub fn serve_guardian<E: GuardianEffect>(
                                         })?,
                                 );
                                 usage.inflight_requests_current = Some(
-                                    Counter::try_from(outstanding_guest_jobs as u64).map_err(
-                                        |_| Error::Protocol("request accounting overflow"),
-                                    )?,
+                                    Counter::try_from(
+                                        (outstanding_guest_jobs
+                                            + usize::from(guardian.boot_in_flight))
+                                            as u64,
+                                    )
+                                    .map_err(|_| Error::Protocol("request accounting overflow"))?,
                                 );
                                 usage.provenance.channels =
                                     sandsurf_protocol::MeasurementSource::HostAdmission;
@@ -2089,6 +2379,25 @@ pub fn serve_guardian<E: GuardianEffect>(
                         }
                     }
                 }
+                Ok(GuardianIngress::BootComplete {
+                    pending,
+                    result,
+                    reply,
+                }) => match guardian.finish_boot(pending, result) {
+                    Ok(Some(response)) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(response);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(rejected(error));
+                        } else {
+                            eprintln!("sandsurf native reset completion unavailable: {error}");
+                        }
+                    }
+                },
                 Ok(GuardianIngress::Failed(error)) => break Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if outstanding_guest_jobs == 0
@@ -2102,12 +2411,26 @@ pub fn serve_guardian<E: GuardianEffect>(
                     break Err(Error::Protocol("guardian ingress stopped unexpectedly"));
                 }
             }
+            if outstanding_guest_jobs < inflight_limit
+                && let Some((input, pending)) = guardian.begin_reset_boot()?
+            {
+                queue_boot(
+                    guardian,
+                    &boot_jobs,
+                    BootWorkItem {
+                        input,
+                        pending,
+                        reply: None,
+                    },
+                )?;
+            }
             if last_poll.elapsed() >= Duration::from_secs(1) {
                 last_poll = std::time::Instant::now();
                 guardian.refresh_native_observation()?;
                 guardian.reconcile_execution_integration();
                 if !poll_in_flight
-                    && outstanding_guest_jobs < inflight_limit
+                    && outstanding_guest_jobs + usize::from(guardian.boot_in_flight)
+                        < inflight_limit
                     && let Some(job) = guardian.poll_job()?
                     && guest_jobs
                         .try_send(GuestWorkItem {
@@ -2137,6 +2460,8 @@ pub fn serve_guardian<E: GuardianEffect>(
             .map_err(|_| Error::Protocol("guardian accept worker panicked"))?;
         drop(guest_jobs);
         drop(guest_worker); // No native handles or journal writer are owned by this thread.
+        drop(boot_jobs);
+        drop(boot_worker); // Immutable input only; no journal or native ownership.
         result
     })
 }
@@ -2152,7 +2477,42 @@ enum GuardianIngress {
         result: GuestJobResult,
         reply: Option<mpsc::Sender<GuardianResponse>>,
     },
+    BootComplete {
+        pending: BootPending,
+        result: Result<PreparedBoot>,
+        reply: Option<mpsc::Sender<GuardianResponse>>,
+    },
     Failed(std::io::Error),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct BootWorkItem {
+    input: BootPreparation,
+    pending: BootPending,
+    reply: Option<mpsc::Sender<GuardianResponse>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn queue_boot<E: GuardianEffect>(
+    guardian: &mut Guardian<E>,
+    queue: &mpsc::SyncSender<BootWorkItem>,
+    item: BootWorkItem,
+) -> Result<()> {
+    if let Err(error) = queue.try_send(item) {
+        let item = match error {
+            mpsc::TrySendError::Full(item) | mpsc::TrySendError::Disconnected(item) => item,
+        };
+        let response = guardian.finish_boot(
+            item.pending,
+            Err(Error::Unsupported("offline boot queue is unavailable")),
+        )?;
+        if let Some(reply) = item.reply
+            && let Some(response) = response
+        {
+            let _ = reply.send(response);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

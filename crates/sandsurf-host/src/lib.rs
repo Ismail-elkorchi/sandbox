@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod artifacts;
+mod boot_preparation;
 mod capture;
 mod console;
 pub mod guardian;

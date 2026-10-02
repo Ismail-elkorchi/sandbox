@@ -213,6 +213,7 @@ pub struct QemuGuardianEffect {
     network_usage: NetworkUsage,
     installed_runtime: Option<InstalledRuntime>,
     suspend_capture_operation: Option<sandsurf_protocol::OperationId>,
+    prepared_boot: Option<crate::boot_preparation::PreparedBoot>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -321,6 +322,7 @@ impl QemuGuardianEffect {
             network_usage,
             installed_runtime: None,
             suspend_capture_operation: None,
+            prepared_boot: None,
         })
     }
 
@@ -328,6 +330,7 @@ impl QemuGuardianEffect {
         &mut self,
         command: &LifecycleCommand,
         generation: Counter,
+        prepared: Option<crate::boot_preparation::PreparedBoot>,
     ) -> Result<(), Digest> {
         let restoring = crate::restore::load::<RestoreLineage>(&self.machine_root)
             .map_err(|_| bytes_digest(b"qemu-restore-lineage-invalid"))?;
@@ -353,17 +356,15 @@ impl QemuGuardianEffect {
             }
             (boot_directory, boot)
         } else {
-            crate::image_worker::prepare_boot(
-                &self.machine_root,
-                &command.machine_id,
-                generation,
-                &self.config.image_digest,
-                command.configuration.resources.disk_bytes.get(),
-            )
-            .map_err(|error| {
-                eprintln!("sandsurf offline boot preparation failed: {error}");
-                bytes_digest(b"qemu-boot-preparation-failed")
-            })?
+            prepared
+                .ok_or_else(|| bytes_digest(b"qemu-prepared-boot-missing"))?
+                .consume(
+                    &self.machine_root,
+                    &command.machine_id,
+                    generation,
+                    &self.config.image_digest,
+                    command.configuration.resources.disk_bytes.get(),
+                )?
         };
         let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
             .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?;
@@ -833,6 +834,28 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for QemuGuardianEffect {
+    fn boot_preparation(
+        &self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> ControlResult<Option<crate::boot_preparation::BootPreparation>> {
+        crate::boot_preparation::BootPreparation::cold(
+            &self.machine_root,
+            &self.config.image_digest,
+            command,
+            current,
+        )
+    }
+    fn install_prepared_boot(
+        &mut self,
+        prepared: crate::boot_preparation::PreparedBoot,
+    ) -> ControlResult<()> {
+        if self.prepared_boot.is_some() {
+            return Err(ControlError::Protocol("prepared boot is already staged"));
+        }
+        self.prepared_boot = Some(prepared);
+        Ok(())
+    }
     fn guest_io_admissible(&self) -> bool {
         self.guest_transport.admissible()
     }
@@ -880,6 +903,7 @@ impl GuardianEffect for QemuGuardianEffect {
         command: &LifecycleCommand,
         current: Option<&MachineObservation>,
     ) -> MachineOutcome {
+        let prepared = self.prepared_boot.take();
         let cold_boot = command.desired == sandsurf_protocol::DesiredState::Running
             && current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Failed)
@@ -897,11 +921,12 @@ impl GuardianEffect for QemuGuardianEffect {
                 },
                 None => Counter::ONE,
             };
-            if let Err(evidence) = self.prepare_boot(command, generation) {
+            if let Err(evidence) = self.prepare_boot(command, generation, prepared) {
                 return MachineOutcome::NotApplied(evidence);
             }
         }
         let mut outcome = apply_lifecycle(&mut self.machine, command, current);
+        self.prepared_boot = None;
         self.machine.discard_pending_storage_custody();
         let running = matches!(
             &outcome,
@@ -1346,6 +1371,14 @@ impl GuardianEffect for QemuGuardianEffect {
             *active = None;
         }
         crate::guardian::restart_after_native_reset(self, current, configuration)
+    }
+    fn guest_reset_configuration(&self) -> ControlResult<RuntimeConfiguration> {
+        self.installed_runtime
+            .as_ref()
+            .map(|runtime| runtime.configuration.clone())
+            .ok_or(ControlError::Protocol(
+                "guest reset has no applied native envelope",
+            ))
     }
 }
 

@@ -1,0 +1,602 @@
+use super::*;
+use sandsurf_state::{Approval, CatalogLimits, ImageRecord, MachineAdmission, RuntimeLimits};
+
+struct NoGuest;
+impl GuestDriver for NoGuest {
+    fn dispatch(&mut self, _: &GuestCommand) -> EffectOutcome {
+        EffectOutcome::Unknown
+    }
+}
+
+struct Native {
+    root: PathBuf,
+    measured: Option<MachineState>,
+    reset: bool,
+    installed: usize,
+    started: usize,
+}
+impl GuardianEffect for Native {
+    fn capture_owner(&self) -> Result<Option<OperationId>> {
+        Ok(None)
+    }
+    fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
+        Box::new(NoGuest)
+    }
+    fn boot_preparation(
+        &self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> Result<Option<BootPreparation>> {
+        if command.desired != DesiredState::Running
+            || current.is_some_and(|value| {
+                !matches!(value.state, MachineState::Stopped | MachineState::Failed)
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(BootPreparation {
+            machine_root: self.root.clone(),
+            machine_id: command.machine_id.clone(),
+            generation: current
+                .map_or(Ok(Counter::ONE), |value| value.generation.next())
+                .map_err(|_| Error::Protocol("generation overflow"))?,
+            image_digest: bytes_digest(b"image"),
+            disk_bytes: command.configuration.resources.disk_bytes.get(),
+        }))
+    }
+    fn install_prepared_boot(&mut self, _: PreparedBoot) -> Result<()> {
+        self.installed += 1;
+        Ok(())
+    }
+    fn transition(
+        &mut self,
+        command: &LifecycleCommand,
+        current: Option<&MachineObservation>,
+    ) -> LifecycleEffect {
+        let generation = if command.desired == DesiredState::Running {
+            self.started += 1;
+            current.map_or(Counter::ONE, |value| value.generation.next().unwrap())
+        } else {
+            current.map_or(Counter::ONE, |value| value.generation)
+        };
+        let target = match command.desired {
+            DesiredState::Running => MachineState::Running,
+            DesiredState::Stopped => MachineState::Stopped,
+            DesiredState::Destroyed => MachineState::Destroyed,
+            _ => panic!("unsupported fixture lifecycle"),
+        };
+        let mut states = Vec::new();
+        if current.is_none() {
+            states.push(MachineState::Creating);
+        }
+        if target == MachineState::Running && current.is_some() {
+            states.push(MachineState::Starting);
+        }
+        if target == MachineState::Destroyed {
+            states.push(MachineState::Destroying);
+        }
+        states.push(target);
+        self.measured = (target != MachineState::Destroyed).then_some(target);
+        LifecycleEffect::Observed(
+            states
+                .into_iter()
+                .map(|state| MachineTransition {
+                    generation,
+                    state,
+                    evidence_digest: bytes_digest(b"fixture-native-effect"),
+                })
+                .collect(),
+        )
+    }
+    fn observe_power(&mut self) -> Result<Option<sandsurf_machine::NativePowerObservation>> {
+        Ok(self
+            .measured
+            .map(|state| sandsurf_machine::NativePowerObservation {
+                state,
+                evidence_digest: bytes_digest(b"fixture-native-power"),
+            }))
+    }
+    fn take_guest_reset(&mut self) -> Option<Digest> {
+        std::mem::take(&mut self.reset).then(|| bytes_digest(b"fixture-native-reset"))
+    }
+    fn guest_reset_configuration(&self) -> Result<RuntimeConfiguration> {
+        Ok(RuntimeConfiguration::default())
+    }
+    fn recover_guest_reset(&mut self, current: &MachineObservation) -> Result<Digest> {
+        restart_after_native_reset(self, current, RuntimeConfiguration::default())
+    }
+}
+
+struct Fixture {
+    guardian: Guardian<Native>,
+    host: HostCatalog,
+    root: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "ssf-boot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        sandsurf_native::local::create_private_directory(&root).unwrap();
+        let mut host = HostCatalog::create(
+            &root.join("host"),
+            "host".try_into().unwrap(),
+            CatalogLimits {
+                identities: n(16),
+                operations: n(64),
+                usage_records: n(64),
+                image_bytes: n(1 << 20),
+                cpu_quota_micros: n(800_000),
+                host_memory_bytes: n(16 * 1024 * 1024 * 1024),
+            },
+        )
+        .unwrap();
+        let image = bytes_digest(b"image");
+        let operation: OperationId = "image".try_into().unwrap();
+        let request = bytes_digest(b"import");
+        host.admit_image_import(
+            operation.clone(),
+            request.clone(),
+            Approval {
+                id: "approve-image".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+        host.complete_image_import(
+            &operation,
+            &request,
+            ImageRecord {
+                digest: image.clone(),
+                source_digest: image.clone(),
+                platform: "linux".into(),
+                architecture: "amd64".into(),
+                logical_bytes: n(1),
+                storage_bytes: n(1),
+                provenance_digest: image.clone(),
+                sensitive: false,
+            },
+        )
+        .unwrap();
+        let machine: MachineId = "computer".try_into().unwrap();
+        let operation: OperationId = "create".try_into().unwrap();
+        let resources = RuntimeConfiguration::default().resources;
+        let defaults = ExecutionDefaults::default();
+        let lifetime = MachineLifetime::default();
+        let request_digest = digest(
+            Domain::Machine,
+            &(
+                &machine, &image, &resources, &defaults, &lifetime, &operation,
+            ),
+        )
+        .unwrap();
+        host.create_machine(
+            MachineAdmission {
+                image_defaults: defaults.clone(),
+                id: machine.clone(),
+                image,
+                resources,
+                defaults,
+                lifetime,
+                operation,
+            },
+            Approval {
+                id: "approve-create".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+        let journal = RuntimeJournal::create(
+            &root.join("runtime"),
+            machine,
+            RuntimeLimits {
+                identities: n(16),
+                managed_executions: n(8),
+                operations: n(64),
+                observations: n(64),
+                events: n(256),
+                chunks: n(64),
+                output_segments: n(16),
+                output_bytes: n(4096),
+            },
+            host.authority_binding().clone(),
+        )
+        .unwrap();
+        let guardian = Guardian::new(
+            journal,
+            Native {
+                root: root.clone(),
+                measured: None,
+                reset: false,
+                installed: 0,
+                started: 0,
+            },
+        );
+        Self {
+            guardian,
+            host,
+            root,
+        }
+    }
+    fn create(&self) -> AuthorizedLifecycle {
+        self.host
+            .authorize_lifecycle(&"create".try_into().unwrap())
+            .unwrap()
+    }
+    fn intent(&mut self, name: &str, desired: DesiredState) -> AuthorizedLifecycle {
+        let machine = self.guardian.journal.machine_id().clone();
+        let revision = self
+            .host
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .configuration_revision;
+        let operation: OperationId = name.try_into().unwrap();
+        let request_digest = digest(
+            Domain::Operation,
+            &(&machine, &operation, revision, desired),
+        )
+        .unwrap();
+        self.host
+            .request_lifecycle(
+                &machine,
+                operation.clone(),
+                revision,
+                desired,
+                Approval {
+                    id: format!("approve-{name}").try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        self.host.authorize_lifecycle(&operation).unwrap()
+    }
+    fn start(&mut self) {
+        let BootAdmission::Queued { input, pending } =
+            self.guardian.begin_boot(self.create()).unwrap()
+        else {
+            panic!("cold boot must prepare off-owner");
+        };
+        let response = self
+            .guardian
+            .finish_boot(pending, Ok(prepared(input)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery(response), Delivery::Applied);
+    }
+}
+fn n(value: u64) -> Counter {
+    value.try_into().unwrap()
+}
+fn prepared(input: BootPreparation) -> PreparedBoot {
+    PreparedBoot {
+        directory: input.machine_root.join("frozen"),
+        boot: sandsurf_image::boot::FrozenBoot {
+            architecture: sandsurf_image::Architecture::X64,
+            kernel: sandsurf_image::ImageArtifact {
+                path: "kernel".into(),
+                sha256: "a".repeat(64),
+            },
+            initramfs: None,
+        },
+        input,
+    }
+}
+fn delivery(response: GuardianResponse) -> Delivery {
+    let GuardianResponse::Lifecycle { operation } = response else {
+        panic!("expected lifecycle")
+    };
+    operation.delivery
+}
+fn retire(fixture: Fixture) {
+    let root = fixture.root.clone();
+    drop(fixture);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stop_and_destroy_overtake_offline_boot_without_dispatching_its_completion() {
+    for desired in [DesiredState::Stopped, DesiredState::Destroyed] {
+        let mut f = Fixture::new();
+        let authorization = f.create();
+        let BootAdmission::Queued { input, pending } =
+            f.guardian.begin_boot(authorization.clone()).unwrap()
+        else {
+            panic!("cold boot should be queued");
+        };
+        assert_eq!(
+            f.guardian
+                .journal
+                .lifecycle_operation(&authorization.statement.command.operation_id)
+                .unwrap()
+                .unwrap()
+                .delivery,
+            Delivery::Admitted
+        );
+        assert_eq!(f.guardian.effect.as_ref().unwrap().started, 0);
+        assert!(matches!(
+            f.guardian.begin_boot(authorization.clone()).unwrap(),
+            BootAdmission::Ready(_)
+        ));
+        let containment = f.intent("contain", desired);
+        let BootAdmission::Ready(response) = f.guardian.begin_boot(containment).unwrap() else {
+            panic!("containment must not wait for offline boot");
+        };
+        assert_eq!(delivery(response), Delivery::Applied);
+        let BootAdmission::Ready(response) = f.guardian.begin_boot(authorization).unwrap() else {
+            panic!("superseded authority must not schedule another disk worker");
+        };
+        assert_eq!(delivery(response), Delivery::NotApplied);
+        assert!(
+            !f.guardian.can_retire().unwrap(),
+            "disk worker still holds work custody"
+        );
+        let response = f
+            .guardian
+            .finish_boot(pending, Ok(prepared(input)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery(response), Delivery::NotApplied);
+        let native = f.guardian.effect.as_ref().unwrap();
+        assert_eq!(native.installed, 0);
+        assert_eq!(native.started, 0);
+        assert!(
+            f.guardian
+                .journal
+                .last_observation()
+                .unwrap()
+                .unwrap()
+                .value()
+                .state
+                .satisfies(desired)
+        );
+        retire(f);
+    }
+}
+
+#[test]
+fn failed_preparation_is_not_applied_and_exact_retry_still_has_one_dispatch_gate() {
+    let mut f = Fixture::new();
+    let authorization = f.create();
+    let BootAdmission::Queued { pending, .. } =
+        f.guardian.begin_boot(authorization.clone()).unwrap()
+    else {
+        panic!("expected preparation");
+    };
+    let response = f
+        .guardian
+        .finish_boot(pending, Err(Error::Protocol("offline failure")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery(response), Delivery::NotApplied);
+    assert!(f.guardian.journal.last_observation().unwrap().is_none());
+    assert_eq!(f.guardian.effect.as_ref().unwrap().started, 0);
+    let BootAdmission::Queued { pending, .. } =
+        f.guardian.begin_boot(authorization.clone()).unwrap()
+    else {
+        panic!("exact retry must prepare again");
+    };
+    let response = f
+        .guardian
+        .finish_boot(pending, Err(Error::Protocol("second offline failure")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery(response), Delivery::NotApplied);
+    let BootAdmission::Queued { input, pending } =
+        f.guardian.begin_boot(authorization.clone()).unwrap()
+    else {
+        panic!("exact retry must prepare again");
+    };
+    let response = f
+        .guardian
+        .finish_boot(pending, Ok(prepared(input)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery(response), Delivery::Applied);
+    assert!(matches!(
+        f.guardian.begin_boot(authorization).unwrap(),
+        BootAdmission::Ready(_)
+    ));
+    assert_eq!(f.guardian.effect.as_ref().unwrap().started, 1);
+    assert_eq!(f.guardian.effect.as_ref().unwrap().installed, 1);
+    retire(f);
+}
+
+#[test]
+fn prepared_artifacts_are_bound_to_the_machine_image_geometry_and_generation() {
+    let input = BootPreparation {
+        machine_root: PathBuf::from("/owned/computer"),
+        machine_id: "computer".try_into().unwrap(),
+        generation: Counter::ONE,
+        image_digest: bytes_digest(b"image"),
+        disk_bytes: 4096,
+    };
+    let changes = [
+        BootPreparation {
+            machine_root: PathBuf::from("/other/computer"),
+            ..input.clone()
+        },
+        BootPreparation {
+            machine_id: "other".try_into().unwrap(),
+            ..input.clone()
+        },
+        BootPreparation {
+            generation: n(2),
+            ..input.clone()
+        },
+        BootPreparation {
+            image_digest: bytes_digest(b"other-image"),
+            ..input.clone()
+        },
+        BootPreparation {
+            disk_bytes: 8192,
+            ..input.clone()
+        },
+    ];
+    for expected in changes {
+        assert!(
+            prepared(input.clone())
+                .consume(
+                    &expected.machine_root,
+                    &expected.machine_id,
+                    expected.generation,
+                    &expected.image_digest,
+                    expected.disk_bytes,
+                )
+                .is_err()
+        );
+    }
+    assert!(
+        prepared(input.clone())
+            .consume(
+                &input.machine_root,
+                &input.machine_id,
+                input.generation,
+                &input.image_digest,
+                input.disk_bytes,
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn admitted_boot_recovers_after_owner_restart_without_any_dispatch_evidence() {
+    let mut f = Fixture::new();
+    let authorization = f.create();
+    assert!(matches!(
+        f.guardian.begin_boot(authorization.clone()).unwrap(),
+        BootAdmission::Queued { .. }
+    ));
+    let retained = RuntimeJournal::open(&f.root.join("runtime"), f.guardian.journal.machine_id());
+    assert!(retained.is_err(), "a second journal writer is forbidden");
+    let machine = f.guardian.journal.machine_id().clone();
+    // Replace the owner only after dropping the old writer.
+    let Fixture {
+        guardian,
+        host,
+        root,
+    } = f;
+    drop(guardian);
+    let journal = RuntimeJournal::open(&root.join("runtime"), &machine).unwrap();
+    f = Fixture {
+        host,
+        root: root.clone(),
+        guardian: Guardian::new(
+            journal,
+            Native {
+                root,
+                measured: None,
+                reset: false,
+                installed: 0,
+                started: 0,
+            },
+        ),
+    };
+    let BootAdmission::Queued { input, pending } = f.guardian.begin_boot(authorization).unwrap()
+    else {
+        panic!("admitted operation must rebuild preparation");
+    };
+    let response = f
+        .guardian
+        .finish_boot(pending, Ok(prepared(input)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery(response), Delivery::Applied);
+    assert_eq!(f.guardian.effect.as_ref().unwrap().started, 1);
+    retire(f);
+}
+
+#[test]
+fn reset_preparation_is_fenced_by_new_authority_even_before_native_stop_delivery() {
+    let mut f = Fixture::new();
+    f.start();
+    let native = f.guardian.effect.as_mut().unwrap();
+    native.measured = Some(MachineState::Stopped);
+    native.reset = true;
+    f.guardian.refresh_native_observation().unwrap();
+    let starting = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    assert_eq!(starting.state, MachineState::Starting);
+    assert_eq!(starting.generation, n(2));
+    let (input, pending) = f.guardian.begin_reset_boot().unwrap().unwrap();
+    assert_eq!(input.generation, n(2));
+    assert!(f.guardian.begin_reset_boot().unwrap().is_none());
+    let stop = f.intent("stop-reset", DesiredState::Stopped);
+    f.guardian.journal.admit_lifecycle(stop.clone()).unwrap();
+    assert!(
+        !f.guardian
+            .journal
+            .native_reset_is_current(&starting)
+            .unwrap()
+    );
+    assert!(
+        f.guardian
+            .finish_boot(pending, Ok(prepared(input)))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.guardian.effect.as_ref().unwrap().started, 1);
+    assert_eq!(f.guardian.effect.as_ref().unwrap().installed, 1);
+    let BootAdmission::Ready(response) = f.guardian.begin_boot(stop).unwrap() else {
+        panic!("stop must not prepare");
+    };
+    assert_eq!(delivery(response), Delivery::Applied);
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .generation,
+        n(2)
+    );
+    retire(f);
+}
+
+#[test]
+fn reboot_preparation_and_failure_keep_the_committed_generation_and_native_facts() {
+    for fail in [false, true] {
+        let mut f = Fixture::new();
+        f.start();
+        let native = f.guardian.effect.as_mut().unwrap();
+        native.measured = Some(MachineState::Stopped);
+        native.reset = true;
+        f.guardian.refresh_native_observation().unwrap();
+        let (input, pending) = f.guardian.begin_reset_boot().unwrap().unwrap();
+        let result = if fail {
+            Err(Error::Protocol("offline reset failure"))
+        } else {
+            Ok(prepared(input))
+        };
+        assert!(f.guardian.finish_boot(pending, result).unwrap().is_none());
+        let current = f.guardian.journal.last_observation().unwrap().unwrap();
+        assert_eq!(current.value().generation, n(2));
+        assert_eq!(current.value().applied_revision, Counter::ONE);
+        assert_eq!(current.value().cause, ObservationCause::GuestReset {});
+        assert_eq!(
+            current.value().state,
+            if fail {
+                MachineState::Failed
+            } else {
+                MachineState::Running
+            }
+        );
+        assert_eq!(
+            f.guardian.effect.as_ref().unwrap().started,
+            if fail { 1 } else { 2 }
+        );
+        retire(f);
+    }
+}

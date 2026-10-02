@@ -49,6 +49,9 @@ impl GuardianEffect for Power {
         self.measured = MachineState::Running;
         Ok(bytes_digest(b"fixture-native-recovered"))
     }
+    fn guest_reset_configuration(&self) -> Result<RuntimeConfiguration> {
+        Ok(RuntimeConfiguration::default())
+    }
 }
 fn n(value: u64) -> Counter {
     value.try_into().unwrap()

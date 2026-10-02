@@ -521,6 +521,52 @@ impl RuntimeJournal {
         lifecycle_operation(&self.db.connection, id)
     }
 
+    /// A native reboot cannot resume an older applied envelope after a newer
+    /// signed host decision was admitted, even if that decision has not yet
+    /// changed the observed virtual hardware.
+    pub fn native_reset_is_current(&self, starting: &MachineObservation) -> Result<bool> {
+        if starting.machine_id != self.machine
+            || starting.state != MachineState::Starting
+            || starting.cause != (ObservationCause::GuestReset {})
+            || starting.generation.get() < 2
+        {
+            return Err(Error::Conflict("native reset has no committed generation"));
+        }
+        let accepted: u64 = self.db.connection.query_row(
+            "SELECT accepted_revision FROM configuration WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(accepted == starting.applied_revision.get()
+            && observation(&self.db.connection)?.as_ref() == Some(starting))
+    }
+
+    /// Read-only scheduling check, not an effect permission. Offline preparation
+    /// must not run for superseded authority; begin_lifecycle rechecks the same
+    /// durable fence before any prepared result can create virtual hardware.
+    pub fn validate_lifecycle_preparation(
+        &self,
+        authorization: &AuthorizedLifecycle,
+    ) -> Result<()> {
+        self.authority.verify_lifecycle(authorization)?;
+        let command = &authorization.statement.command;
+        let value = lifecycle_operation(&self.db.connection, &command.operation_id)?
+            .ok_or(Error::Missing("lifecycle operation is not admitted"))?;
+        if value.command != *command
+            || !matches!(value.delivery, Delivery::Admitted | Delivery::NotApplied)
+        {
+            return Err(Error::Conflict(
+                "lifecycle preparation has no pending admission",
+            ));
+        }
+        require_lifecycle_state(
+            &self.machine,
+            observation(&self.db.connection)?.as_ref(),
+            command,
+        )?;
+        require_authority_fence(&self.db.connection, command.revision)
+    }
+
     pub fn configuration_operation(
         &self,
         id: &OperationId,

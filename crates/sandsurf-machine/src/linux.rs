@@ -85,6 +85,11 @@ pub struct FirecrackerDriver<F> {
 }
 
 impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
+    /// The native owner stages immutable configuration inputs; this does not
+    /// create virtual hardware or transfer lifecycle authority to the factory.
+    pub fn generation_factory_mut(&mut self) -> &mut F {
+        &mut self.factory
+    }
     /// Native qualification changes whenever exact host device/resources
     /// configuration changes. A prior hardware run cannot qualify a new shape.
     pub fn set_qualification(&mut self, qualification: FirecrackerQualification) {
