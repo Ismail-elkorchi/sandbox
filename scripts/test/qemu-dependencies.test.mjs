@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -104,6 +104,29 @@ test("real GPG verifies a read-only trusted keyring and rejects an untrusted sig
     await assert.rejects(verifyMsysSource(source, signature, root, run), /not trusted/u);
     selected = keyring; await writeFile(source, "altered source bytes");
     await assert.rejects(verifyMsysSource(source, signature, root, run));
+  });
+
+test("native MSYS2 installed library ships distribution-verified corresponding source",
+  { skip: process.env.SANDSURF_MSYS_SOURCE_TEST !== "1", timeout: 180000 }, async (context) => {
+    assert.equal(process.platform, "win32", "this is a native MSYS2 contract, not a simulated platform");
+    const execute = promisify(execFile);
+    const run = async (command, args, cwd) => (await execute(command, args,
+      { cwd, timeout: 120000, maxBuffer: 1024 * 1024 })).stdout;
+    const root = await mkdtemp(resolve(tmpdir(), "sandsurf-msys-source-contract-"));
+    context.after(() => rm(root, { recursive: true, force: true }));
+    const scratch = resolve(root, "scratch"), output = resolve(root, "output");
+    await mkdir(scratch); await mkdir(output);
+    assert.ok(process.env.MINGW_PREFIX, "the build must select an explicit MSYS2 toolchain");
+    const prefix = (await run("cygpath", ["-w", `${process.env.MINGW_PREFIX}/bin`], scratch)).trim();
+    const name = "libglib-2.0-0.dll", input = resolve(prefix, name);
+    const digest = createHash("sha256").update(await readFile(input)).digest("hex");
+    await copyFile(input, resolve(output, name));
+    await collectDependencySources(output, new Map([[name, { path: input, sha256: digest }]]), scratch, run);
+    const manifest = await verifyDependencySources(output, { [name]: digest });
+    assert.equal(manifest.components.length, 1);
+    assert.equal(manifest.components[0].manager, "msys2");
+    assert.equal(manifest.components[0].name, "mingw-w64-glib2");
+    assert.ok(Object.keys(manifest.components[0].materials).some((file) => file.endsWith(".src.tar.zst")));
   });
 
 test("installed package fields remain exact and reject duplicate or oversized metadata", () => {

@@ -42,6 +42,10 @@ jobs:
             mingw-w64-ucrt-x86_64-python-setuptools
             mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-meson
+      - if: runner.os == 'Windows'
+        name: Verify installed MSYS2 source trust before compiling the VMM
+        shell: msys2 {0}
+        run: SANDSURF_MSYS_SOURCE_TEST=1 node --test --test-concurrency=1 scripts/test/qemu-dependencies.test.mjs
       - run: rustup toolchain install stable --profile minimal
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
@@ -200,6 +204,9 @@ jobs:
             mingw-w64-ucrt-x86_64-python-setuptools
             mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-meson
+      - name: Verify installed MSYS2 source trust before compiling the VMM
+        shell: msys2 {0}
+        run: SANDSURF_MSYS_SOURCE_TEST=1 node --test --test-concurrency=1 scripts/test/qemu-dependencies.test.mjs
       - name: Assemble the source-built native transport
         shell: msys2 {0}
         run: npm run build:native
