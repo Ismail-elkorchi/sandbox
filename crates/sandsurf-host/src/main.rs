@@ -895,10 +895,20 @@ mod tests {
         create_private_directory(&root).unwrap();
         let listener = LocalListener::bind(&root).unwrap();
         std::thread::scope(|scope| {
-            let accept = scope.spawn(|| {
+            let (finished, observations) = std::sync::mpsc::channel();
+            let listening = &listener;
+            let accept = scope.spawn(move || {
+                let mut connections = Vec::new();
                 for _ in 0..3 {
-                    let _connection = listener.accept(std::time::Duration::from_secs(2)).unwrap();
+                    connections.push(listening.accept(std::time::Duration::from_secs(2)).unwrap());
                 }
+                // Darwin correctly refuses LOCAL_PEERPID once the server closes
+                // the connection. Keep the observed owners live, as the actual
+                // service does, until all admission checks have completed.
+                observations
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(connections);
             });
             wait_service_owner(&root, std::process::id(), || Ok(true)).unwrap();
             assert_eq!(
@@ -917,6 +927,7 @@ mod tests {
                 .is_err(),
                 "exit during publication must not report success"
             );
+            finished.send(()).unwrap();
             accept.join().unwrap();
         });
         assert!(wait_service_owner(&root, std::process::id(), || Ok(false)).is_err());

@@ -5,10 +5,11 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFil
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ownerHooks, QEMU_SOURCE } from "./qemu-source.ts";
+import { ownerHooks, QEMU_CORRESPONDING_FILES, QEMU_SOURCE } from "./qemu-source.ts";
 import { qemuRequiredInputs, runtimeDigest, verifyQemuRuntime } from "./qemu-runtime.ts";
 import { collectDependencySources, verifyDependencySources } from "./qemu-dependencies.ts";
 import type { LibraryInput } from "./qemu-dependencies.ts";
+import { peImports } from "./pe-imports.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -87,14 +88,11 @@ export async function buildQemu(destination: string): Promise<void> {
     // Keep one pristine upstream archive and the complete hook recipe. Release
     // assembly can deduplicate identical source rather than shipping it per VM.
     const corresponding = resolve(destination, "qemu-source"); await mkdir(corresponding);
-    await copyFile(archive, resolve(corresponding, basename(archive)));
-    for (const name of ["COPYING", "COPYING.LIB", "LICENSE"]) {
-      await copyFile(resolve(source, name), resolve(corresponding, name));
-    }
-    for (const path of ["vmm/qemu/sandsurf-entry.c", "vmm/qemu/sandsurf-entry.h",
-      "vmm/qemu/hvf.entitlements", "vmm/qemu/sandsurf-whpx.c", "vmm/qemu/sandsurf-qapi.json", "scripts/qemu-source.ts", "scripts/qemu-runtime.ts", "scripts/qemu-dependencies.ts", "scripts/build-qemu.ts"]) {
+    for (const path of QEMU_CORRESPONDING_FILES) {
       await mkdir(dirname(resolve(corresponding, path)), { recursive: true });
-      await copyFile(resolve(repository, path), resolve(corresponding, path));
+      const input = path === basename(archive) ? archive
+        : ["COPYING", "COPYING.LIB", "LICENSE"].includes(path) ? resolve(source, path) : resolve(repository, path);
+      await copyFile(input, resolve(corresponding, path));
     }
     await writeFile(resolve(destination, "qemu-build.json"), `${JSON.stringify({ formatVersion: 1,
       upstream: QEMU_SOURCE, platform: process.platform, architecture: process.arch,
@@ -166,9 +164,7 @@ async function windowsLibraries(executable: string, destination: string): Promis
   const binaryRoot = resolve(await run("cygpath", ["-w", `${prefix}/bin`], destination, true).then((value) => value.trim()));
   const pending = [executable], names = new Set<string>();
   while (pending.length > 0) {
-    for (const match of (await run("objdump", ["-p", pending.shift()!], destination, true)).matchAll(/DLL Name:\s*(\S+)/gu)) {
-      const name = match[1]!;
-      if (!/^[A-Za-z0-9_.+-]+\.dll$/iu.test(name)) throw new Error("invalid QEMU import name");
+    for (const name of await peImports(pending.shift()!)) {
       const key = name.toLowerCase();
       if (names.has(key)) continue;
       names.add(key);

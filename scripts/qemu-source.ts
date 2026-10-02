@@ -14,7 +14,7 @@ export const QEMU_CORRESPONDING_FILES = [
   "vmm/qemu/sandsurf-entry.c", "vmm/qemu/sandsurf-entry.h",
   "vmm/qemu/sandsurf-whpx.c", "vmm/qemu/sandsurf-qapi.json",
   "vmm/qemu/hvf.entitlements", "scripts/build-qemu.ts", "scripts/qemu-source.ts",
-  "scripts/qemu-runtime.ts", "scripts/qemu-dependencies.ts",
+  "scripts/qemu-runtime.ts", "scripts/qemu-dependencies.ts", "scripts/pe-imports.ts",
 ] as const;
 
 /** Mechanical hooks in the pinned GPL QEMU source. Keep the privileged Darwin
