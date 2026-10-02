@@ -236,6 +236,14 @@ impl HostService {
                 self.prepare_machine_inputs(request)
             }
             request @ HostRequest::Lifecycle { .. } => self.prepare_lifecycle_request(request),
+            request @ HostRequest::RollbackFilesystem { .. } => {
+                self.prepare_rollback_request(request)
+            }
+            request @ (HostRequest::SetNetworkPolicy { .. } | HostRequest::SetExposure { .. }) => {
+                self.prepare_configuration_request(request)
+            }
+            request @ (HostRequest::UpdateResources { .. }
+            | HostRequest::AssessResources { .. }) => self.prepare_resource_assessment(request),
             HostRequest::GetMachine { machine_id } => self
                 .catalog
                 .machine(&machine_id)
@@ -245,7 +253,7 @@ impl HostService {
                     Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
                         root: self.root.clone(),
                         record,
-                        operation: None,
+                        reply: MachineViewReply::Machine,
                     })))
                 }),
             HostRequest::ListMachines { after, maximum } => self
@@ -261,6 +269,7 @@ impl HostService {
             HostRequest::OpenObservationStream { machine_id } => self
                 .prepare_guardian_inner(&machine_id)
                 .map(|provision| HostDispatch::ObservationEndpoint(Box::new(provision))),
+            request @ HostRequest::ReleaseEvidence { .. } => self.prepare_evidence_release(request),
             HostRequest::GetUsage { machine_id } => self
                 .prepare_guardian_inner(&machine_id)
                 .map(|provision| HostDispatch::Task(Box::new(HostTask::Usage { provision }))),
@@ -345,7 +354,7 @@ impl HostService {
             } => self
                 .prepare_guest_query(machine_id, generation, request)
                 .map(|request| HostDispatch::Guest(Box::new(request))),
-            request => match self.defer_runtime_read(&request) {
+            request => match self.prepare_runtime_request(&request) {
                 Ok(Some(read)) => Ok(HostDispatch::Runtime(Box::new(read))),
                 Ok(None) => self
                     .handle_inner(request)
@@ -356,33 +365,292 @@ impl HostService {
         result.unwrap_or_else(|error| HostDispatch::Ready(Box::new(rejected(error))))
     }
 
+    fn prepare_rollback_request(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        match request {
+            HostRequest::RollbackFilesystem {
+                machine_id,
+                snapshot_id,
+                operation_id,
+                expected_revision,
+                approval_id,
+            } => {
+                let request_digest = digest(
+                    Domain::Snapshot,
+                    &(
+                        "sandsurf-filesystem-rollback-v1",
+                        &machine_id,
+                        &snapshot_id,
+                        &operation_id,
+                        expected_revision,
+                    ),
+                )?;
+                if self.catalog.operation(&operation_id)?.is_none() {
+                    self.catalog
+                        .require_revision(&machine_id, expected_revision)?;
+                }
+                let admitted = self.catalog.admit_rollback(
+                    &machine_id,
+                    &snapshot_id,
+                    operation_id.clone(),
+                    expected_revision,
+                    Approval {
+                        id: approval_id,
+                        request_digest: request_digest.clone(),
+                    },
+                )?;
+                if admitted.phase == RollbackPhase::Applied {
+                    return Ok(HostDispatch::Ready(Box::new(HostResponse::Rollback {
+                        value: admitted,
+                    })));
+                }
+                self.prepare_rollback_effect(admitted)
+            }
+            _ => Err(HostError::Invalid("not a disk rollback request")),
+        }
+    }
+
+    fn prepare_rollback_effect(&self, record: RollbackRecord) -> Result<HostDispatch> {
+        let snapshot = self
+            .catalog
+            .snapshot(&record.snapshot_id)?
+            .ok_or(HostError::Invalid("rollback snapshot disappeared"))?;
+        Ok(HostDispatch::Task(Box::new(HostTask::Rollback {
+            provision: self.prepare_guardian_inner(&record.machine_id)?,
+            record,
+            snapshot: Box::new(snapshot),
+        })))
+    }
+
+    fn prepare_configuration_request(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        match request {
+            HostRequest::SetNetworkPolicy {
+                machine_id,
+                operation_id,
+                expected_revision,
+                policy,
+                approval_id,
+            } => {
+                policy.validate()?;
+                self.require_revision_for_new_host_operation(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                )?;
+                let request_digest = digest(
+                    Domain::Network,
+                    &(
+                        "sandsurf-network-policy-change-v1",
+                        &machine_id,
+                        &operation_id,
+                        expected_revision,
+                        &policy,
+                    ),
+                )?;
+                let mut configuration = self
+                    .catalog
+                    .machine(&machine_id)?
+                    .ok_or(HostError::Invalid("machine does not exist"))?
+                    .runtime_configuration;
+                configuration.network = policy;
+                let operation = self.catalog.set_runtime_configuration(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                    configuration,
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                self.prepare_configuration_effect(
+                    &machine_id,
+                    operation.revision,
+                    MachineViewReply::Configuration {
+                        revision: operation.revision,
+                    },
+                )
+            }
+            HostRequest::SetExposure {
+                machine_id,
+                operation_id,
+                expected_revision,
+                exposure_id,
+                mut spec,
+                active,
+                approval_id,
+            } => {
+                self.require_revision_for_new_host_operation(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                )?;
+                let requested_spec = spec.clone();
+                let request_digest = digest(
+                    Domain::Exposure,
+                    &(
+                        "sandsurf-port-exposure-v1",
+                        &machine_id,
+                        &operation_id,
+                        expected_revision,
+                        &exposure_id,
+                        &requested_spec,
+                        active,
+                    ),
+                )?;
+                if active && spec.host_port == 0 {
+                    spec.host_port = reserve_ephemeral_port(&spec.host_address)?;
+                }
+                spec.validate()?;
+                let mut configuration = self
+                    .catalog
+                    .machine(&machine_id)?
+                    .ok_or(HostError::Invalid("machine does not exist"))?
+                    .runtime_configuration;
+                let existing = configuration
+                    .exposures
+                    .iter()
+                    .position(|value| value.id == exposure_id);
+                let bound_port = active.then_some(spec.host_port);
+                let exposure = Exposure {
+                    id: exposure_id,
+                    machine_id: machine_id.clone(),
+                    revision: expected_revision.next()?,
+                    spec,
+                    active,
+                    bound_port,
+                };
+                match existing {
+                    Some(index) => configuration.exposures[index] = exposure.clone(),
+                    None if active => configuration.exposures.push(exposure.clone()),
+                    None => {
+                        return Err(HostError::Invalid("cannot revoke a missing port exposure"));
+                    }
+                }
+                configuration
+                    .exposures
+                    .sort_by(|left, right| left.id.cmp(&right.id));
+                let operation = self.catalog.set_runtime_configuration(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                    configuration,
+                    request_digest.clone(),
+                    Approval {
+                        id: approval_id,
+                        request_digest,
+                    },
+                )?;
+                let exposure = operation
+                    .configuration
+                    .exposures
+                    .iter()
+                    .find(|value| value.id == exposure.id)
+                    .cloned()
+                    .ok_or(HostError::Invalid(
+                        "committed exposure is missing from its configuration",
+                    ))?;
+                self.prepare_configuration_effect(
+                    &machine_id,
+                    operation.revision,
+                    MachineViewReply::Exposure { exposure },
+                )
+            }
+            _ => Err(HostError::Invalid("not a configuration request")),
+        }
+    }
+
+    fn prepare_resource_assessment(&self, request: HostRequest) -> Result<HostDispatch> {
+        let (machine_id, resources, update) = match request {
+            HostRequest::AssessResources {
+                machine_id,
+                resources,
+            } => (machine_id, resources, None),
+            HostRequest::UpdateResources {
+                machine_id,
+                operation_id,
+                expected_revision,
+                resources,
+                approval_id,
+            } => {
+                self.require_revision_for_new_host_operation(
+                    &machine_id,
+                    &operation_id,
+                    expected_revision,
+                )?;
+                (
+                    machine_id,
+                    resources,
+                    Some(ResourceUpdateAdmission {
+                        operation_id,
+                        expected_revision,
+                        approval_id,
+                    }),
+                )
+            }
+            _ => return Err(HostError::Invalid("not a resource assessment request")),
+        };
+        resources.validate()?;
+        Ok(HostDispatch::Task(Box::new(HostTask::ResourceAssessment {
+            provision: self.prepare_guardian_inner(&machine_id)?,
+            resources,
+            update,
+        })))
+    }
+
+    fn prepare_configuration_effect(
+        &self,
+        machine: &MachineId,
+        revision: Counter,
+        reply: MachineViewReply,
+    ) -> Result<HostDispatch> {
+        let record = self
+            .catalog
+            .machine(machine)?
+            .ok_or(HostError::Invalid("machine does not exist"))?;
+        if revision > record.configuration_revision {
+            return Err(HostError::Invalid(
+                "configuration operation is ahead of host authority",
+            ));
+        }
+        // Historical observations never reinstall superseded authority.
+        if revision < record.configuration_revision {
+            return Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
+                root: self.root.clone(),
+                record,
+                reply,
+            })));
+        }
+        Ok(HostDispatch::Task(Box::new(HostTask::Configuration {
+            provision: self.prepare_guardian_inner(machine)?,
+            authorization: self.catalog.authorize_configuration(machine, revision)?,
+            reply: Some(Box::new(reply)),
+        })))
+    }
+
     fn prepare_snapshot(
         &mut self,
-        request: sandsurf_protocol::SnapshotRequest,
+        request: SnapshotRequest,
+        approval_id: CommitmentId,
+    ) -> Result<HostDispatch> {
+        if self.catalog.operation(&request.operation_id)?.is_none() {
+            self.catalog
+                .require_revision(&request.machine_id, request.expected_revision)?;
+            return Ok(HostDispatch::Task(Box::new(HostTask::SnapshotInspect {
+                provision: self.prepare_guardian_inner(&request.machine_id)?,
+                request: Box::new(request),
+                approval_id,
+            })));
+        }
+        self.admit_snapshot_request(request, approval_id)
+    }
+
+    fn admit_snapshot_request(
+        &mut self,
+        request: SnapshotRequest,
         approval_id: CommitmentId,
     ) -> Result<HostDispatch> {
         let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request))?;
-        let historical = self.catalog.operation(&request.operation_id)?.is_some();
-        if !historical {
-            self.catalog
-                .require_revision(&request.machine_id, request.expected_revision)?;
-            self.provision_guardian(&request.machine_id)?;
-            let inspection = GuardianClient::new(self.guardian_endpoint(&request.machine_id))
-                .inspect(request.machine_id.clone(), None)?;
-            let Observation::Current { value: machine } = inspection.observation else {
-                return Err(HostError::Invalid(
-                    "snapshot requires a current machine observation",
-                ));
-            };
-            if machine.generation != request.expected_generation
-                || machine.applied_revision != request.expected_revision
-                || !matches!(machine.state, MachineState::Running | MachineState::Paused)
-            {
-                return Err(HostError::Invalid(
-                    "snapshot requires the expected running or paused generation and revision",
-                ));
-            }
-        }
         let admitted = self.catalog.admit_snapshot(
             request.clone(),
             Approval {
@@ -398,20 +666,25 @@ impl HostService {
         // A completed opaque input remains finishable after native destruction.
         // Only a retained native pause owner, or missing capture input, requires
         // a machine attachment. Record presence is not completion evidence.
-        if crate::capture::CaptureBoundary::read(&self.machine_root(&request.machine_id))?.is_some()
-            || !crate::snapshots::has_capture_record(
-                &crate::snapshots::root(&self.root, &admitted),
-                &admitted,
-            )?
-        {
-            self.provision_guardian(&request.machine_id)?;
-        }
+        let provision =
+            if crate::capture::CaptureBoundary::read(&self.machine_root(&request.machine_id))?
+                .is_some()
+                || !crate::snapshots::has_capture_record(
+                    &crate::snapshots::root(&self.root, &admitted),
+                    &admitted,
+                )?
+            {
+                Some(self.prepare_guardian_inner(&request.machine_id)?)
+            } else {
+                None
+            };
         let capturing = self.catalog.begin_snapshot(&request.id, &request_digest)?;
         Ok(HostDispatch::Task(Box::new(HostTask::Snapshot {
             root: self.root.clone(),
             executable: self.executable.clone(),
             endpoint: self.guardian_endpoint(&request.machine_id),
             capturing: Box::new(capturing),
+            provision,
         })))
     }
 
@@ -767,8 +1040,67 @@ impl HostService {
         })
     }
 
-    fn defer_runtime_read(&mut self, request: &HostRequest) -> Result<Option<DeferredRuntimeRead>> {
+    fn prepare_runtime_request(
+        &mut self,
+        request: &HostRequest,
+    ) -> Result<Option<DeferredRuntimeRequest>> {
         let (machine_id, query) = match request {
+            HostRequest::GetOperation {
+                machine_id,
+                operation_id,
+            } => {
+                if self.catalog.operation(operation_id)?.is_some() {
+                    return Ok(None);
+                }
+                (
+                    machine_id.clone(),
+                    RuntimeRequest::Operation {
+                        operation_id: operation_id.clone(),
+                    },
+                )
+            }
+            HostRequest::AcknowledgeReceipt {
+                machine_id,
+                operation_id,
+                execution_id,
+                receipt_digest,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::AcknowledgeReceipt {
+                    operation_id: operation_id.clone(),
+                    execution_id: execution_id.clone(),
+                    receipt_digest: receipt_digest.clone(),
+                },
+            ),
+            HostRequest::SealOutput {
+                machine_id,
+                operation_id,
+                execution_id,
+                generation,
+                expected,
+                segment_id,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::SealOutput {
+                    operation_id: operation_id.clone(),
+                    execution_id: execution_id.clone(),
+                    generation: *generation,
+                    expected: expected.clone(),
+                    segment_id: segment_id.clone(),
+                },
+            ),
+            HostRequest::CleanupReleasedEvidence {
+                machine_id,
+                execution_id,
+                request_digest,
+            } => (
+                machine_id.clone(),
+                RuntimeRequest::CleanupReleased {
+                    execution_id: execution_id.clone(),
+                    request_digest: request_digest.clone(),
+                },
+            ),
+
             HostRequest::ReadConsole {
                 machine_id,
                 generation,
@@ -863,12 +1195,71 @@ impl HostService {
             _ => return Ok(None),
         };
         let provision = self.prepare_guardian_inner(&machine_id)?;
-        Ok(Some(DeferredRuntimeRead {
+        Ok(Some(DeferredRuntimeRequest {
             endpoint: self.guardian_endpoint(&machine_id),
             machine_id,
-            query,
+            request: query,
+            loss: None,
             provision,
         }))
+    }
+
+    fn prepare_evidence_release(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        let HostRequest::ReleaseEvidence {
+            machine_id,
+            execution_id,
+            request,
+            loss_approval_id,
+        } = request
+        else {
+            return Err(HostError::Invalid("not an output release request"));
+        };
+        let loss = match (&request.disposition, loss_approval_id) {
+            (ReleaseDisposition::AuthorizedLoss { authorization }, Some(id))
+                if *authorization == id =>
+            {
+                Some(self.catalog.authorize_output_loss(
+                    &machine_id,
+                    &execution_id,
+                    &request.receipt_digest,
+                    &request.output,
+                    Approval {
+                        id,
+                        request_digest: digest(
+                            Domain::Release,
+                            &(
+                                &machine_id,
+                                &execution_id,
+                                &request.receipt_digest,
+                                &request.output,
+                                "loss",
+                            ),
+                        )?,
+                    },
+                )?)
+            }
+            (ReleaseDisposition::AuthorizedLoss { .. }, _) => {
+                return Err(HostError::Invalid(
+                    "authorized loss requires its exact approval identity",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(HostError::Invalid(
+                    "loss approval is invalid for this release disposition",
+                ));
+            }
+            (_, None) => None,
+        };
+        Ok(HostDispatch::Runtime(Box::new(DeferredRuntimeRequest {
+            endpoint: self.guardian_endpoint(&machine_id),
+            provision: self.prepare_guardian_inner(&machine_id)?,
+            machine_id,
+            request: RuntimeRequest::Release {
+                execution_id,
+                request,
+            },
+            loss,
+        })))
     }
 
     fn handle_inner(&mut self, request: HostRequest) -> Result<HostResponse> {
@@ -965,219 +1356,15 @@ impl HostService {
                     "machine creation requires catalog admission and deferred native effects",
                 ))
             }
-            HostRequest::RollbackFilesystem {
-                machine_id,
-                snapshot_id,
-                operation_id,
-                expected_revision,
-                approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Snapshot,
-                    &(
-                        "sandsurf-filesystem-rollback-v1",
-                        &machine_id,
-                        &snapshot_id,
-                        &operation_id,
-                        expected_revision,
-                    ),
-                )?;
-                if self.catalog.operation(&operation_id)?.is_none() {
-                    self.catalog
-                        .require_revision(&machine_id, expected_revision)?;
-                }
-                let admitted = self.catalog.admit_rollback(
-                    &machine_id,
-                    &snapshot_id,
-                    operation_id.clone(),
-                    expected_revision,
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == RollbackPhase::Applied {
-                    return Ok(HostResponse::Rollback { value: admitted });
-                }
-                self.provision_guardian(&machine_id)?;
-                let inspection = GuardianClient::new(self.guardian_endpoint(&machine_id))
-                    .inspect(machine_id.clone(), None)?;
-                if !matches!(
-                    inspection.observation,
-                    Observation::Current {
-                        value: MachineObservation {
-                            state: MachineState::Stopped,
-                            ..
-                        }
-                    }
-                ) {
-                    return Err(HostError::Invalid(
-                        "filesystem rollback requires a confirmed stopped machine",
-                    ));
-                }
-                let snapshot = self
-                    .catalog
-                    .snapshot(&snapshot_id)?
-                    .ok_or(HostError::Invalid("rollback snapshot disappeared"))?;
-                let evidence = crate::snapshots::rollback(
-                    &crate::snapshots::root(&self.root, &snapshot),
-                    &snapshot,
-                    &self
-                        .machine_root(&machine_id)
-                        .join("disks")
-                        .join(system_disk_name()),
-                    &operation_id,
-                )?;
-                Ok(HostResponse::Rollback {
-                    value: self.catalog.complete_rollback(
-                        &operation_id,
-                        &request_digest,
-                        evidence,
-                    )?,
-                })
-            }
+            HostRequest::RollbackFilesystem { .. } => Err(HostError::Invalid(
+                "disk replacement requires deferred native custody",
+            )),
             HostRequest::Lifecycle { .. } => Err(HostError::Invalid(
                 "lifecycle requires deferred native effects",
             )),
-            HostRequest::SetNetworkPolicy {
-                machine_id,
-                operation_id,
-                expected_revision,
-                policy,
-                approval_id,
-            } => {
-                policy.validate()?;
-                self.require_revision_for_new_host_operation(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                )?;
-                let request_digest = digest(
-                    Domain::Network,
-                    &(
-                        "sandsurf-network-policy-change-v1",
-                        &machine_id,
-                        &operation_id,
-                        expected_revision,
-                        &policy,
-                    ),
-                )?;
-                let mut configuration = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine does not exist"))?
-                    .runtime_configuration;
-                configuration.network = policy;
-                let operation = self.catalog.set_runtime_configuration(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                    configuration,
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest,
-                    },
-                )?;
-                self.apply_configuration_if_current(&machine_id, operation.revision)?;
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
-                Ok(HostResponse::Configuration {
-                    revision: operation.revision,
-                    machine: self.view(record)?,
-                })
-            }
-            HostRequest::SetExposure {
-                machine_id,
-                operation_id,
-                expected_revision,
-                exposure_id,
-                mut spec,
-                active,
-                approval_id,
-            } => {
-                self.require_revision_for_new_host_operation(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                )?;
-                let requested_spec = spec.clone();
-                let request_digest = digest(
-                    Domain::Exposure,
-                    &(
-                        "sandsurf-port-exposure-v1",
-                        &machine_id,
-                        &operation_id,
-                        expected_revision,
-                        &exposure_id,
-                        &requested_spec,
-                        active,
-                    ),
-                )?;
-                if active && spec.host_port == 0 {
-                    spec.host_port = reserve_ephemeral_port(&spec.host_address)?;
-                }
-                spec.validate()?;
-                let mut configuration = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine does not exist"))?
-                    .runtime_configuration;
-                let existing = configuration
-                    .exposures
-                    .iter()
-                    .position(|value| value.id == exposure_id);
-                let bound_port = active.then_some(spec.host_port);
-                let exposure = Exposure {
-                    id: exposure_id,
-                    machine_id: machine_id.clone(),
-                    revision: expected_revision.next()?,
-                    spec,
-                    active,
-                    bound_port,
-                };
-                match existing {
-                    Some(index) => configuration.exposures[index] = exposure.clone(),
-                    None if active => configuration.exposures.push(exposure.clone()),
-                    None => {
-                        return Err(HostError::Invalid("cannot revoke a missing port exposure"));
-                    }
-                }
-                configuration
-                    .exposures
-                    .sort_by(|left, right| left.id.cmp(&right.id));
-                let operation = self.catalog.set_runtime_configuration(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                    configuration,
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest,
-                    },
-                )?;
-                self.apply_configuration_if_current(&machine_id, operation.revision)?;
-                let exposure = operation
-                    .configuration
-                    .exposures
-                    .iter()
-                    .find(|value| value.id == exposure.id)
-                    .cloned()
-                    .ok_or(HostError::Invalid(
-                        "committed exposure is missing from its configuration",
-                    ))?;
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
-                Ok(HostResponse::Exposure {
-                    exposure,
-                    machine: self.view(record)?,
-                })
-            }
+            HostRequest::SetNetworkPolicy { .. } | HostRequest::SetExposure { .. } => Err(
+                HostError::Invalid("configuration changes require deferred native effects"),
+            ),
             HostRequest::PutSecret {
                 secret_id,
                 version,
@@ -1221,82 +1408,9 @@ impl HostService {
             HostRequest::DeliverSecret { .. } | HostRequest::RevokeSecret { .. } => Err(
                 HostError::Invalid("secret authority operations require host task admission"),
             ),
-            HostRequest::UpdateResources {
-                machine_id,
-                operation_id,
-                expected_revision,
-                resources,
-                approval_id,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                let response = GuardianClient::new(self.guardian_endpoint(&machine_id)).runtime(
-                    machine_id.clone(),
-                    RuntimeRequest::AssessResources {
-                        resources: resources.clone(),
-                    },
-                )?;
-                let RuntimeResponse::ResourceAssessment { assessment } = response else {
-                    return Err(HostError::Invalid("native resource assessment unavailable"));
-                };
-                let validated = GuardianClient::new(self.guardian_endpoint(&machine_id)).runtime(
-                    machine_id.clone(),
-                    RuntimeRequest::ValidateResources {
-                        resources: resources.clone(),
-                    },
-                )?;
-                if !matches!(validated, RuntimeResponse::Complete) {
-                    return Err(HostError::Invalid(
-                        "native resource validation returned an unexpected response",
-                    ));
-                }
-                self.require_revision_for_new_host_operation(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                )?;
-                let request_digest = digest(
-                    Domain::Authority,
-                    &(
-                        "sandsurf-machine-resources-v1",
-                        &machine_id,
-                        &operation_id,
-                        expected_revision,
-                        &resources,
-                    ),
-                )?;
-                let operation = self.catalog.update_resources(
-                    &machine_id,
-                    &operation_id,
-                    expected_revision,
-                    resources,
-                    Approval {
-                        id: approval_id,
-                        request_digest,
-                    },
-                )?;
-                self.apply_configuration_if_current(&machine_id, operation.revision)?;
-                let record = self
-                    .catalog
-                    .machine(&machine_id)?
-                    .ok_or(HostError::Invalid("machine disappeared from catalog"))?;
-                Ok(HostResponse::ResourceUpdate {
-                    revision: operation.revision,
-                    machine: self.view(record)?,
-                    assessment,
-                })
-            }
-            HostRequest::AssessResources {
-                machine_id,
-                resources,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                let response = GuardianClient::new(self.guardian_endpoint(&machine_id))
-                    .runtime(machine_id, RuntimeRequest::AssessResources { resources })?;
-                let RuntimeResponse::ResourceAssessment { assessment } = response else {
-                    return Err(HostError::Invalid("native resource assessment unavailable"));
-                };
-                Ok(HostResponse::ResourceAssessment { assessment })
-            }
+            HostRequest::UpdateResources { .. } | HostRequest::AssessResources { .. } => Err(
+                HostError::Invalid("resource assessment requires deferred native observation"),
+            ),
             HostRequest::GetUsage { .. } => Err(HostError::Invalid(
                 "resource sampling requires deferred observation",
             )),
@@ -1318,181 +1432,23 @@ impl HostService {
                     }
                     return Ok(HostResponse::HostOperation { value: Some(value) });
                 }
-                self.provision_guardian(&machine_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&machine_id))
-                        .runtime(machine_id, RuntimeRequest::Operation { operation_id })?,
-                })
+                Err(HostError::Invalid(
+                    "runtime operation lookup requires deferred guardian routing",
+                ))
             }
-            request @ (HostRequest::ListEvents { .. }
+            HostRequest::ListEvents { .. }
             | HostRequest::GetProcess { .. }
             | HostRequest::ListProcesses { .. }
             | HostRequest::GetReceipt { .. }
             | HostRequest::ReadEvidence { .. }
             | HostRequest::GetOutputSegment { .. }
-            | HostRequest::ReadOutputSegment { .. }) => self
-                .defer_runtime_read(&request)?
-                .ok_or(HostError::Invalid("runtime read route is unavailable"))?
-                .execute(),
-            HostRequest::AcknowledgeReceipt {
-                machine_id,
-                operation_id,
-                execution_id,
-                receipt_digest,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                let prior = runtime_operation(&client, &machine_id, &operation_id)?;
-                match prior {
-                    Some(RuntimeOperationRecord::ReceiptAcknowledgement {
-                        operation_id: old_operation,
-                        execution_id: old_process,
-                        receipt_digest: old_receipt,
-                    }) if old_operation == operation_id
-                        && old_process == execution_id
-                        && old_receipt == receipt_digest =>
-                    {
-                        return Ok(HostResponse::Runtime {
-                            response: RuntimeResponse::Complete,
-                        });
-                    }
-                    Some(_) => {
-                        return Err(sandsurf_state::Error::Conflict(
-                            "receipt acknowledgement operation identity conflict",
-                        )
-                        .into());
-                    }
-                    None => {}
-                }
-                Ok(HostResponse::Runtime {
-                    response: client.runtime(
-                        machine_id,
-                        RuntimeRequest::AcknowledgeReceipt {
-                            operation_id,
-                            execution_id,
-                            receipt_digest,
-                        },
-                    )?,
-                })
-            }
-            HostRequest::SealOutput {
-                machine_id,
-                operation_id,
-                execution_id,
-                generation,
-                expected,
-                segment_id,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                Ok(HostResponse::Runtime {
-                    response: client.runtime(
-                        machine_id,
-                        RuntimeRequest::SealOutput {
-                            operation_id,
-                            execution_id,
-                            generation,
-                            expected,
-                            segment_id,
-                        },
-                    )?,
-                })
-            }
-            HostRequest::ReleaseEvidence {
-                machine_id,
-                execution_id,
-                request,
-                loss_approval_id,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                let client = GuardianClient::new(self.guardian_endpoint(&machine_id));
-                let prior = runtime_operation(&client, &machine_id, &request.operation_id)?;
-                match prior {
-                    Some(RuntimeOperationRecord::EvidenceRelease {
-                        execution_id: old_process,
-                        request: old_request,
-                        status,
-                    }) if old_process == execution_id && old_request == request => {
-                        return Ok(HostResponse::Runtime {
-                            response: RuntimeResponse::Release { status },
-                        });
-                    }
-                    Some(_) => {
-                        return Err(sandsurf_state::Error::Conflict(
-                            "evidence release operation identity conflict",
-                        )
-                        .into());
-                    }
-                    None => {}
-                }
-                match (&request.disposition, loss_approval_id) {
-                    (ReleaseDisposition::AuthorizedLoss { authorization }, Some(approval_id))
-                        if *authorization == approval_id =>
-                    {
-                        let authorized = self.catalog.authorize_output_loss(
-                            &machine_id,
-                            &execution_id,
-                            &request.receipt_digest,
-                            &request.output,
-                            Approval {
-                                id: approval_id,
-                                request_digest: digest(
-                                    Domain::Release,
-                                    &(
-                                        &machine_id,
-                                        &execution_id,
-                                        &request.receipt_digest,
-                                        &request.output,
-                                        "loss",
-                                    ),
-                                )?,
-                            },
-                        )?;
-                        client.runtime(
-                            machine_id.clone(),
-                            RuntimeRequest::RecordLoss {
-                                authorization: authorized,
-                            },
-                        )?;
-                    }
-                    (ReleaseDisposition::AuthorizedLoss { .. }, _) => {
-                        return Err(HostError::Invalid(
-                            "authorized loss requires its exact approval identity",
-                        ));
-                    }
-                    (_, Some(_)) => {
-                        return Err(HostError::Invalid(
-                            "loss approval is invalid for this release disposition",
-                        ));
-                    }
-                    (_, None) => {}
-                }
-                Ok(HostResponse::Runtime {
-                    response: client.runtime(
-                        machine_id,
-                        RuntimeRequest::Release {
-                            execution_id,
-                            request,
-                        },
-                    )?,
-                })
-            }
-            HostRequest::CleanupReleasedEvidence {
-                machine_id,
-                execution_id,
-                request_digest,
-            } => {
-                self.provision_guardian(&machine_id)?;
-                Ok(HostResponse::Runtime {
-                    response: GuardianClient::new(self.guardian_endpoint(&machine_id)).runtime(
-                        machine_id,
-                        RuntimeRequest::CleanupReleased {
-                            execution_id,
-                            request_digest,
-                        },
-                    )?,
-                })
-            }
+            | HostRequest::ReadOutputSegment { .. }
+            | HostRequest::AcknowledgeReceipt { .. }
+            | HostRequest::SealOutput { .. }
+            | HostRequest::ReleaseEvidence { .. }
+            | HostRequest::CleanupReleasedEvidence { .. } => Err(HostError::Invalid(
+                "runtime journal requests require deferred guardian routing",
+            )),
         }
     }
 
@@ -1845,12 +1801,8 @@ impl HostService {
         if bytes.len() as u64 != delivery.secret.bytes.get() {
             return Err(HostError::Invalid("approved secret version length changed"));
         }
-        self.provision_guardian(&machine_id)?;
-        let record = self
-            .catalog
-            .begin_secret_disclosure(&operation_id, &request_digest)?;
-        Ok(HostDispatch::Task(Box::new(HostTask::SecretDelivery {
-            endpoint: self.guardian_endpoint(&machine_id),
+        Ok(HostDispatch::Task(Box::new(HostTask::SecretPrepare {
+            provision: self.prepare_guardian_inner(&machine_id)?,
             record,
             bytes: Zeroizing::new(bytes),
         })))
@@ -1893,16 +1845,17 @@ impl HostService {
                 request_digest,
             },
         )?;
-        if record.guest_cleanup_report.is_some()
-            || record.deliveries.is_empty()
-            || self.provision_guardian(&record.machine_id).is_err()
-        {
+        if record.guest_cleanup_report.is_some() || record.deliveries.is_empty() {
             return Ok(HostDispatch::Ready(Box::new(
                 HostResponse::SecretRevocation { revocation: record },
             )));
         }
+        // Host revocation has committed even when native/guest cleanup cannot
+        // run. Provisioning remains a best-effort, detached observation.
+        let provision = self.prepare_guardian_inner(&record.machine_id);
         Ok(HostDispatch::Task(Box::new(HostTask::SecretCleanup {
             endpoint: self.guardian_endpoint(&record.machine_id),
+            provision,
             record,
         })))
     }
@@ -2066,6 +2019,125 @@ impl HostService {
 
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostDispatch> {
         match completion {
+            HostTaskCompletion::SecretPrepare {
+                provision,
+                record,
+                bytes,
+                result,
+            } => {
+                result?;
+                // The sole catalog owner fences revocation and duplicate
+                // preparations before disclosing bytes to any guest channel.
+                let record = self
+                    .catalog
+                    .begin_secret_disclosure(&record.operation_id, &record.request_digest)?;
+                Ok(HostDispatch::Task(Box::new(HostTask::SecretDelivery {
+                    endpoint: provision.endpoint(),
+                    record,
+                    bytes,
+                })))
+            }
+            HostTaskCompletion::SnapshotInspect {
+                request,
+                approval_id,
+                result,
+            } => {
+                if self.catalog.operation(&request.operation_id)?.is_some() {
+                    return self.admit_snapshot_request(*request, approval_id);
+                }
+                let inspection = (*result)?;
+                // The pre-admission inspection is not a catalog revision grant.
+                self.catalog
+                    .require_revision(&request.machine_id, request.expected_revision)?;
+                let Observation::Current { value: machine } = inspection.observation else {
+                    return Err(HostError::Invalid(
+                        "snapshot requires a current machine observation",
+                    ));
+                };
+                if inspection.machine_id != request.machine_id
+                    || machine.machine_id != request.machine_id
+                    || machine.generation != request.expected_generation
+                    || machine.applied_revision != request.expected_revision
+                    || !matches!(machine.state, MachineState::Running | MachineState::Paused)
+                {
+                    return Err(HostError::Invalid(
+                        "snapshot requires the expected running or paused generation and revision",
+                    ));
+                }
+
+                self.admit_snapshot_request(*request, approval_id)
+            }
+            HostTaskCompletion::Configuration {
+                machine_id,
+                reply,
+                result,
+            } => {
+                result?;
+                match reply {
+                    None => Ok(HostDispatch::Ready(Box::new(HostResponse::Complete))),
+                    Some(reply) => {
+                        let record =
+                            self.catalog
+                                .machine(&machine_id)?
+                                .ok_or(HostError::Invalid(
+                                    "machine disappeared before configuration response",
+                                ))?;
+                        Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
+                            root: self.root.clone(),
+                            record,
+                            reply: *reply,
+                        })))
+                    }
+                }
+            }
+            HostTaskCompletion::ResourceAssessment {
+                machine_id,
+                resources,
+                update,
+                result,
+            } => {
+                let assessment = result?;
+                let Some(update) = update else {
+                    return Ok(HostDispatch::Ready(Box::new(
+                        HostResponse::ResourceAssessment { assessment },
+                    )));
+                };
+                // Native validation is an observation, not authority. The catalog
+                // rechecks the revision, approval, identity and total reservation.
+                self.require_revision_for_new_host_operation(
+                    &machine_id,
+                    &update.operation_id,
+                    update.expected_revision,
+                )?;
+                let request_digest = digest(
+                    Domain::Authority,
+                    &(
+                        "sandsurf-machine-resources-v1",
+                        &machine_id,
+                        &update.operation_id,
+                        update.expected_revision,
+                        &resources,
+                    ),
+                )?;
+                let operation = self.catalog.update_resources(
+                    &machine_id,
+                    &update.operation_id,
+                    update.expected_revision,
+                    resources,
+                    Approval {
+                        id: update.approval_id,
+                        request_digest,
+                    },
+                )?;
+                self.prepare_configuration_effect(
+                    &machine_id,
+                    operation.revision,
+                    MachineViewReply::ResourceUpdate {
+                        revision: operation.revision,
+                        assessment,
+                    },
+                )
+            }
             HostTaskCompletion::MachineInputs { request, result } => {
                 self.admit_machine_inputs(*request, result?)
             }
@@ -2154,7 +2226,9 @@ impl HostService {
                 Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
                     root: self.root.clone(),
                     record,
-                    operation: Some(lifecycle.guardian_operation),
+                    reply: MachineViewReply::Lifecycle {
+                        operation: Box::new(lifecycle.guardian_operation),
+                    },
                 })))
             }
             HostTaskCompletion::Fork {
@@ -2186,18 +2260,28 @@ impl HostService {
 
     fn complete_task_response(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
         match completion {
+            HostTaskCompletion::Rollback { record, result } => Ok(HostResponse::Rollback {
+                value: self.catalog.complete_rollback(
+                    &record.operation_id,
+                    &record.request_digest,
+                    result?,
+                )?,
+            }),
             HostTaskCompletion::Usage { machine_id, result } => {
                 let (generation, usage) = result?;
                 Ok(HostResponse::Usage {
                     usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
                 })
             }
-            HostTaskCompletion::Configuration { result }
-            | HostTaskCompletion::CaptureRecovery { result } => {
+            HostTaskCompletion::CaptureRecovery { result } => {
                 result?;
                 Ok(HostResponse::Complete)
             }
-            HostTaskCompletion::MachineInputs { .. }
+            HostTaskCompletion::SecretPrepare { .. }
+            | HostTaskCompletion::SnapshotInspect { .. }
+            | HostTaskCompletion::Configuration { .. }
+            | HostTaskCompletion::ResourceAssessment { .. }
+            | HostTaskCompletion::MachineInputs { .. }
             | HostTaskCompletion::MachineBootstrap { .. }
             | HostTaskCompletion::LifecycleInspect { .. }
             | HostTaskCompletion::SuspendCapture { .. }
@@ -2272,10 +2356,6 @@ impl HostService {
         }
     }
 
-    fn provision_guardian(&mut self, machine: &MachineId) -> Result<()> {
-        self.prepare_guardian_inner(machine)?.execute()
-    }
-
     fn prepare_guardian_with_config(
         &self,
         machine: &MachineId,
@@ -2330,16 +2410,6 @@ impl HostService {
         })
     }
 
-    fn view(&mut self, record: MachineRecord) -> Result<MachineView> {
-        observe_machine(&self.root, record)
-    }
-
-    fn apply_configuration(&mut self, machine: &MachineId, revision: Counter) -> Result<()> {
-        let provision = self.prepare_guardian_inner(machine)?;
-        let authorization = self.catalog.authorize_configuration(machine, revision)?;
-        perform_configuration(&provision, authorization)
-    }
-
     fn require_revision_for_new_host_operation(
         &self,
         machine: &MachineId,
@@ -2348,27 +2418,6 @@ impl HostService {
     ) -> Result<()> {
         if self.catalog.operation(operation)?.is_none() {
             self.catalog.require_revision(machine, expected_revision)?;
-        }
-        Ok(())
-    }
-
-    fn apply_configuration_if_current(
-        &mut self,
-        machine: &MachineId,
-        operation_revision: Counter,
-    ) -> Result<()> {
-        let current = self
-            .catalog
-            .machine(machine)?
-            .ok_or(HostError::Invalid("machine does not exist"))?
-            .configuration_revision;
-        if operation_revision > current {
-            return Err(HostError::Invalid(
-                "configuration operation is ahead of host authority",
-            ));
-        }
-        if operation_revision == current {
-            self.apply_configuration(machine, current)?;
         }
         Ok(())
     }
@@ -2468,6 +2517,11 @@ impl HostService {
                     .map(Some);
             }
         }
+        if record.latest_intent.desired != DesiredState::Destroyed
+            && let Some(rollback) = self.catalog.pending_rollback(&record.id)?
+        {
+            return self.prepare_rollback_effect(rollback).map(Some);
+        }
         if record.latest_intent.completion.is_none()
             && record.latest_intent.revision == record.configuration_revision
         {
@@ -2484,6 +2538,7 @@ impl HostService {
                 authorization: self
                     .catalog
                     .authorize_configuration(&record.id, record.configuration_revision)?,
+                reply: None,
             },
         ))))
     }
@@ -2935,7 +2990,7 @@ enum HostIngress {
 enum HostDispatch {
     ArtifactRead(Box<DeferredArtifactRead>),
     Ready(Box<HostResponse>),
-    Runtime(Box<DeferredRuntimeRead>),
+    Runtime(Box<DeferredRuntimeRequest>),
     Guest(Box<DeferredGuest>),
     Task(Box<HostTask>),
     MachineView(Box<DeferredMachineView>),
@@ -2960,21 +3015,58 @@ impl DeferredMachineViews {
     }
 }
 
+enum MachineViewReply {
+    Machine,
+    Lifecycle {
+        operation: Box<LifecycleOperation>,
+    },
+    Configuration {
+        revision: Counter,
+    },
+    Exposure {
+        exposure: Exposure,
+    },
+    ResourceUpdate {
+        revision: Counter,
+        assessment: ResourceChangeAssessment,
+    },
+}
+struct ResourceUpdateAdmission {
+    operation_id: OperationId,
+    expected_revision: Counter,
+    approval_id: CommitmentId,
+}
 struct DeferredMachineView {
     root: PathBuf,
     record: MachineRecord,
-    operation: Option<LifecycleOperation>,
+    reply: MachineViewReply,
 }
 
 impl DeferredMachineView {
     fn execute(self) -> Result<HostResponse> {
         let value = observe_machine(&self.root, self.record)?;
-        Ok(match self.operation {
-            Some(operation) => HostResponse::Lifecycle {
-                operation,
+        Ok(match self.reply {
+            MachineViewReply::Lifecycle { operation } => HostResponse::Lifecycle {
+                operation: *operation,
                 machine: Box::new(value),
             },
-            None => HostResponse::Machine { value },
+            MachineViewReply::Machine => HostResponse::Machine { value },
+            MachineViewReply::Configuration { revision } => HostResponse::Configuration {
+                revision,
+                machine: value,
+            },
+            MachineViewReply::Exposure { exposure } => HostResponse::Exposure {
+                exposure,
+                machine: value,
+            },
+            MachineViewReply::ResourceUpdate {
+                revision,
+                assessment,
+            } => HostResponse::ResourceUpdate {
+                revision,
+                assessment,
+                machine: value,
+            },
         })
     }
 }
@@ -3008,6 +3100,7 @@ fn capture_snapshot(
     executable: &Path,
     endpoint: &Path,
     capturing: &sandsurf_protocol::Snapshot,
+    provision: Option<&GuardianProvision>,
 ) -> Result<crate::snapshots::CaptureResult> {
     let request = &capturing.request;
     let capture_root = crate::snapshots::root(root, capturing);
@@ -3016,6 +3109,9 @@ fn capture_snapshot(
         ".{}.task.lock",
         object_name(request.operation_id.as_str())
     )))?;
+    if let Some(provision) = provision {
+        provision.execute()?;
+    }
     let machine_root = root
         .join("machines")
         .join(object_name(request.machine_id.as_str()));
@@ -3148,6 +3244,11 @@ fn capture_full_state(
 }
 
 enum HostTask {
+    Rollback {
+        provision: GuardianProvision,
+        record: RollbackRecord,
+        snapshot: Box<Snapshot>,
+    },
     CaptureRecovery {
         provision: GuardianProvision,
         snapshot: Box<Snapshot>,
@@ -3158,6 +3259,12 @@ enum HostTask {
     Configuration {
         provision: GuardianProvision,
         authorization: AuthorizedConfiguration,
+        reply: Option<Box<MachineViewReply>>,
+    },
+    ResourceAssessment {
+        provision: GuardianProvision,
+        resources: Resources,
+        update: Option<ResourceUpdateAdmission>,
     },
     MachineBootstrap {
         root: PathBuf,
@@ -3195,11 +3302,17 @@ enum HostTask {
         provision: GuardianProvision,
         continuation: OperationId,
     },
+    SnapshotInspect {
+        provision: GuardianProvision,
+        request: Box<SnapshotRequest>,
+        approval_id: CommitmentId,
+    },
     Snapshot {
         root: PathBuf,
         executable: PathBuf,
         endpoint: PathBuf,
         capturing: Box<sandsurf_protocol::Snapshot>,
+        provision: Option<GuardianProvision>,
     },
     Image {
         root: PathBuf,
@@ -3219,6 +3332,11 @@ enum HostTask {
         change_set: crate::api::HostChangeSet,
         approval_id: CommitmentId,
     },
+    SecretPrepare {
+        provision: GuardianProvision,
+        record: sandsurf_state::SecretDeliveryRecord,
+        bytes: Zeroizing<Vec<u8>>,
+    },
     SecretDelivery {
         endpoint: PathBuf,
         record: sandsurf_state::SecretDeliveryRecord,
@@ -3226,10 +3344,15 @@ enum HostTask {
     },
     SecretCleanup {
         endpoint: PathBuf,
+        provision: Result<GuardianProvision>,
         record: sandsurf_state::SecretRevocationRecord,
     },
 }
 enum HostTaskCompletion {
+    Rollback {
+        record: RollbackRecord,
+        result: Result<Digest>,
+    },
     CaptureRecovery {
         result: Result<()>,
     },
@@ -3238,7 +3361,15 @@ enum HostTaskCompletion {
         result: Result<(Counter, ResourceUsage)>,
     },
     Configuration {
+        machine_id: MachineId,
+        reply: Option<Box<MachineViewReply>>,
         result: Result<()>,
+    },
+    ResourceAssessment {
+        machine_id: MachineId,
+        resources: Resources,
+        update: Option<ResourceUpdateAdmission>,
+        result: Result<ResourceChangeAssessment>,
     },
     MachineBootstrap {
         intent: LifecycleIntent,
@@ -3271,6 +3402,11 @@ enum HostTaskCompletion {
         post: LifecyclePost,
         custody: Option<fs::File>,
     },
+    SnapshotInspect {
+        request: Box<SnapshotRequest>,
+        approval_id: CommitmentId,
+        result: Box<Result<GuardianInspection>>,
+    },
     Snapshot {
         snapshot_id: sandsurf_protocol::SnapshotId,
         request_digest: Digest,
@@ -3285,6 +3421,12 @@ enum HostTaskCompletion {
         operation: sandsurf_state::HostTransferOperation,
         result: Result<Box<HostResponse>>,
     },
+    SecretPrepare {
+        provision: GuardianProvision,
+        record: sandsurf_state::SecretDeliveryRecord,
+        bytes: Zeroizing<Vec<u8>>,
+        result: Result<()>,
+    },
     SecretDelivery {
         record: sandsurf_state::SecretDeliveryRecord,
         reported_received: bool,
@@ -3297,6 +3439,42 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::Rollback {
+                provision,
+                record,
+                snapshot,
+            } => {
+                let result = (|| {
+                    provision.execute()?;
+                    let inspection = GuardianClient::new(provision.endpoint())
+                        .inspect(record.machine_id.clone(), None)?;
+                    if inspection.machine_id != record.machine_id
+                        || !matches!(
+                            inspection.observation, Observation::Current {
+                                value: MachineObservation { ref machine_id, state: MachineState::Stopped, .. }
+                            } if *machine_id == record.machine_id
+                        )
+                    {
+                        return Err(HostError::Invalid(
+                            "disk rollback requires a confirmed stopped machine",
+                        ));
+                    }
+                    // Observed stop is necessary but insufficient: replacement
+                    // takes the storage owner's exclusive attachment lease too.
+                    Ok(crate::snapshots::rollback(
+                        &crate::snapshots::root(&provision.host_root, &snapshot),
+                        &snapshot,
+                        &provision
+                            .host_root
+                            .join("machines")
+                            .join(object_name(record.machine_id.as_str()))
+                            .join("disks")
+                            .join(system_disk_name()),
+                        &record.operation_id,
+                    )?)
+                })();
+                HostTaskCompletion::Rollback { record, result }
+            }
             Self::CaptureRecovery {
                 provision,
                 snapshot,
@@ -3358,9 +3536,54 @@ impl HostTask {
             Self::Configuration {
                 provision,
                 authorization,
-            } => HostTaskCompletion::Configuration {
-                result: perform_configuration(&provision, authorization),
-            },
+                reply,
+            } => {
+                let result = perform_configuration(&provision, authorization);
+                HostTaskCompletion::Configuration {
+                    machine_id: provision.machine,
+                    reply,
+                    result,
+                }
+            }
+            Self::ResourceAssessment {
+                provision,
+                resources,
+                update,
+            } => {
+                let result = (|| {
+                    provision.execute()?;
+                    let client = GuardianClient::new(provision.endpoint());
+                    let response = client.runtime(
+                        provision.machine.clone(),
+                        RuntimeRequest::AssessResources {
+                            resources: resources.clone(),
+                        },
+                    )?;
+                    let RuntimeResponse::ResourceAssessment { assessment } = response else {
+                        return Err(HostError::Invalid("native resource assessment unavailable"));
+                    };
+                    if update.is_some() {
+                        let response = client.runtime(
+                            provision.machine.clone(),
+                            RuntimeRequest::ValidateResources {
+                                resources: resources.clone(),
+                            },
+                        )?;
+                        if !matches!(response, RuntimeResponse::Complete) {
+                            return Err(HostError::Invalid(
+                                "unexpected native resource validation response",
+                            ));
+                        }
+                    }
+                    Ok(assessment)
+                })();
+                HostTaskCompletion::ResourceAssessment {
+                    machine_id: provision.machine,
+                    resources,
+                    update,
+                    result,
+                }
+            }
             Self::MachineBootstrap {
                 root,
                 executable,
@@ -3516,15 +3739,38 @@ impl HostTask {
                     continuation,
                 }
             }
+            Self::SnapshotInspect {
+                provision,
+                request,
+                approval_id,
+            } => {
+                let result = provision.execute().and_then(|()| {
+                    GuardianClient::new(provision.endpoint())
+                        .inspect(request.machine_id.clone(), None)
+                        .map_err(HostError::from)
+                });
+                HostTaskCompletion::SnapshotInspect {
+                    request,
+                    approval_id,
+                    result: Box::new(result),
+                }
+            }
             Self::Snapshot {
                 root,
                 executable,
                 endpoint,
                 capturing,
+                provision,
             } => HostTaskCompletion::Snapshot {
                 snapshot_id: capturing.request.id.clone(),
                 request_digest: capturing.request_digest.clone(),
-                result: capture_snapshot(&root, &executable, &endpoint, &capturing),
+                result: capture_snapshot(
+                    &root,
+                    &executable,
+                    &endpoint,
+                    &capturing,
+                    provision.as_ref(),
+                ),
             },
             Self::Image {
                 root,
@@ -3566,6 +3812,19 @@ impl HostTask {
                     .map_err(HostError::from);
                 HostTaskCompletion::ArtifactTransfer { operation, result }
             }
+            Self::SecretPrepare {
+                provision,
+                record,
+                bytes,
+            } => {
+                let result = provision.execute();
+                HostTaskCompletion::SecretPrepare {
+                    provision,
+                    record,
+                    bytes,
+                    result,
+                }
+            }
             Self::SecretDelivery {
                 endpoint,
                 record,
@@ -3587,9 +3846,20 @@ impl HostTask {
                     ),
                 }
             }
-            Self::SecretCleanup { endpoint, record } => {
+            Self::SecretCleanup {
+                endpoint,
+                provision,
+                record,
+            } => {
                 let client = GuardianClient::new(endpoint);
-                let report = match client.inspect(record.machine_id.clone(), None) {
+                let inspection = provision
+                    .and_then(|provision| provision.execute())
+                    .and_then(|()| {
+                        client
+                            .inspect(record.machine_id.clone(), None)
+                            .map_err(HostError::from)
+                    });
+                let report = match inspection {
                     Ok(inspection)
                         if matches!(
                             inspection.observation,
@@ -3808,18 +4078,31 @@ impl DeferredGuest {
     }
 }
 
-struct DeferredRuntimeRead {
+struct DeferredRuntimeRequest {
     endpoint: PathBuf,
     machine_id: MachineId,
-    query: RuntimeRequest,
+    request: RuntimeRequest,
+    loss: Option<AuthorizedLoss>,
     provision: GuardianProvision,
 }
 
-impl DeferredRuntimeRead {
+impl DeferredRuntimeRequest {
     fn execute(self) -> Result<HostResponse> {
         self.provision.execute()?;
+        let client = GuardianClient::new(self.endpoint);
+        if let Some(authorization) = self.loss {
+            let response = client.runtime(
+                self.machine_id.clone(),
+                RuntimeRequest::RecordLoss { authorization },
+            )?;
+            if !matches!(response, RuntimeResponse::Complete) {
+                return Err(HostError::Invalid(
+                    "guardian did not acknowledge host loss authority",
+                ));
+            }
+        }
         Ok(HostResponse::Runtime {
-            response: GuardianClient::new(self.endpoint).runtime(self.machine_id, self.query)?,
+            response: client.runtime(self.machine_id, self.request)?,
         })
     }
 }
@@ -4115,24 +4398,6 @@ fn reserve_ephemeral_port(address: &str) -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn runtime_operation(
-    client: &GuardianClient,
-    machine: &MachineId,
-    operation: &OperationId,
-) -> Result<Option<RuntimeOperationRecord>> {
-    match client.runtime(
-        machine.clone(),
-        RuntimeRequest::Operation {
-            operation_id: operation.clone(),
-        },
-    )? {
-        RuntimeResponse::Operation { operation } => Ok(operation),
-        _ => Err(HostError::Invalid(
-            "guardian returned the wrong runtime operation response",
-        )),
-    }
-}
-
 fn random_id(prefix: &str) -> Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|_| HostError::Invalid("host entropy unavailable"))?;
@@ -4332,6 +4597,371 @@ mod tests {
     }
 
     #[test]
+    fn secret_preparation_does_not_disclose_and_catalog_completion_fences_duplicate_or_revoked_delivery()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "sssecret-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let secret = SecretVersion {
+            id: "credential".try_into().unwrap(),
+            version: "opaque-version".try_into().unwrap(),
+            bytes: counter(6),
+        };
+        let delivery = |id: &str| sandsurf_state::SecretDeliveryRecord {
+            operation_id: id.try_into().unwrap(),
+            machine_id: machine.clone(),
+            request_digest: bytes_digest(id.as_bytes()),
+            delivery: SecretDelivery {
+                secret: secret.clone(),
+                destination: SecretDestination::File {
+                    path: "/run/credential".try_into().unwrap(),
+                    mode: 0o600,
+                },
+                lifetime: SecretLifetime::UntilRevoked,
+                execution_id: None,
+            },
+            disclosure: SecretDisclosure::NotSent,
+            revoked: false,
+            revocation_operation: None,
+        };
+        let first = delivery("deliver");
+        let revoked = delivery("deliver-after-revocation");
+        for record in [&first, &revoked] {
+            service
+                .catalog
+                .admit_secret_delivery(
+                    record.clone(),
+                    Counter::ONE,
+                    Approval {
+                        id: format!("approve-{}", record.operation_id.as_str())
+                            .try_into()
+                            .unwrap(),
+                        request_digest: record.request_digest.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let completion = |record, result| HostTaskCompletion::SecretPrepare {
+            provision: GuardianProvision {
+                host_root: root.clone(),
+                machine: machine.clone(),
+            },
+            record,
+            bytes: Zeroizing::new(b"secret".to_vec()),
+            result,
+        };
+        assert!(
+            service
+                .complete_task(completion(
+                    first.clone(),
+                    Err(HostError::Invalid("native unavailable"))
+                ))
+                .is_err()
+        );
+        assert!(
+            service
+                .catalog
+                .secret_deliveries(&machine)
+                .unwrap()
+                .iter()
+                .all(|record| record.disclosure == SecretDisclosure::NotSent)
+        );
+        assert!(
+            !service
+                .catalog
+                .machine(&machine)
+                .unwrap()
+                .unwrap()
+                .known_sensitive
+        );
+        let HostDispatch::Task(task) = service
+            .complete_task(completion(first.clone(), Ok(())))
+            .unwrap()
+        else {
+            panic!("secret disclosure did not return to a detached worker");
+        };
+        assert!(matches!(*task, HostTask::SecretDelivery { .. }));
+        drop(task); // An interrupted dispatch cannot be sent again by a second preparation.
+        assert!(service.complete_task(completion(first, Ok(()))).is_err());
+        assert!(
+            service
+                .catalog
+                .machine(&machine)
+                .unwrap()
+                .unwrap()
+                .known_sensitive
+        );
+        service
+            .catalog
+            .admit_secret_revocation(
+                sandsurf_state::SecretRevocationAdmission {
+                    machine_id: machine.clone(),
+                    operation_id: "revoke".try_into().unwrap(),
+                    expected_revision: Counter::ONE,
+                    secret,
+                    terminate_recipients: false,
+                    request_digest: bytes_digest(b"revoke"),
+                },
+                Approval {
+                    id: "approve-revoke".try_into().unwrap(),
+                    request_digest: bytes_digest(b"revoke"),
+                },
+            )
+            .unwrap();
+        assert!(
+            service
+                .complete_task(completion(revoked.clone(), Ok(())))
+                .is_err()
+        );
+        assert!(
+            service
+                .catalog
+                .secret_deliveries(&machine)
+                .unwrap()
+                .iter()
+                .any(|record| record.operation_id == revoked.operation_id
+                    && record.revoked
+                    && record.disclosure == SecretDisclosure::NotSent)
+        );
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_resource_validation_cannot_admit_a_superseded_host_revision() {
+        let root = std::env::temp_dir().join(format!(
+            "ssresource-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let resources = service
+            .catalog
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .runtime_configuration
+            .resources;
+        let operation: OperationId = "resource-update".try_into().unwrap();
+        // Another host decision wins while the native worker is assessing.
+        service
+            .catalog
+            .request_lifecycle(
+                &machine,
+                "stop".try_into().unwrap(),
+                Counter::ONE,
+                DesiredState::Stopped,
+                Approval {
+                    id: "approve-stop".try_into().unwrap(),
+                    request_digest: digest(
+                        Domain::Operation,
+                        &(
+                            &machine,
+                            OperationId::try_from("stop").unwrap(),
+                            Counter::ONE,
+                            DesiredState::Stopped,
+                        ),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        let completion = HostTaskCompletion::ResourceAssessment {
+            machine_id: machine.clone(),
+            resources,
+            update: Some(ResourceUpdateAdmission {
+                operation_id: operation.clone(),
+                expected_revision: Counter::ONE,
+                approval_id: "approve-resource-update".try_into().unwrap(),
+            }),
+            result: Ok(ResourceChangeAssessment {
+                mode: ResourceChangeMode::Live,
+                reasons: vec![],
+            }),
+        };
+        assert!(service.complete_task(completion).is_err());
+        assert!(service.catalog.operation(&operation).unwrap().is_none());
+        let record = service.catalog.machine(&machine).unwrap().unwrap();
+        assert_eq!(record.configuration_revision, Counter::ONE.next().unwrap());
+        assert_eq!(record.latest_intent.desired, DesiredState::Stopped);
+        assert!(!service.machine_root(&machine).exists());
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn historical_network_retry_does_not_install_old_authority_or_contact_native_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "ssnetwork-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let operation: OperationId = "configure".try_into().unwrap();
+        let policy = NetworkPolicy::default();
+        let request_digest = digest(
+            Domain::Network,
+            &(
+                "sandsurf-network-policy-change-v1",
+                &machine,
+                &operation,
+                Counter::ONE,
+                &policy,
+            ),
+        )
+        .unwrap();
+        let configuration = service
+            .catalog
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .runtime_configuration;
+        let admission = service
+            .catalog
+            .set_runtime_configuration(
+                &machine,
+                &operation,
+                Counter::ONE,
+                configuration,
+                request_digest.clone(),
+                Approval {
+                    id: "approve-configure".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        service
+            .catalog
+            .request_lifecycle(
+                &machine,
+                "stop".try_into().unwrap(),
+                admission.revision,
+                DesiredState::Stopped,
+                Approval {
+                    id: "approve-stop".try_into().unwrap(),
+                    request_digest: digest(
+                        Domain::Operation,
+                        &(
+                            &machine,
+                            OperationId::try_from("stop").unwrap(),
+                            admission.revision,
+                            DesiredState::Stopped,
+                        ),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        let HostDispatch::MachineView(view) = service.route(HostRequest::SetNetworkPolicy {
+            machine_id: machine.clone(),
+            operation_id: operation,
+            expected_revision: Counter::ONE,
+            policy,
+            approval_id: "approve-configure".try_into().unwrap(),
+        }) else {
+            panic!("historical configuration was dispatched to the native owner");
+        };
+        assert_eq!(
+            view.record.configuration_revision,
+            admission.revision.next().unwrap()
+        );
+        assert!(
+            matches!(view.reply, MachineViewReply::Configuration { revision } if revision == admission.revision)
+        );
+        assert!(!service.machine_root(&machine).exists());
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_or_cross_machine_snapshot_inspection_cannot_reserve_capture_authority() {
+        let root = std::env::temp_dir().join(format!(
+            "sssnapshot-inspect-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let request = SnapshotRequest {
+            id: "snapshot".try_into().unwrap(),
+            operation_id: "capture".try_into().unwrap(),
+            machine_id: machine.clone(),
+            expected_generation: Counter::ONE,
+            expected_revision: Counter::ONE,
+            kind: SnapshotKind::Disk,
+            parent: None,
+        };
+        let inspection = |identity: MachineId| GuardianInspection {
+            machine_id: identity.clone(),
+            observation: Observation::Current {
+                value: MachineObservation {
+                    machine_id: identity,
+                    generation: Counter::ONE,
+                    sequence: Counter::ONE,
+                    state: MachineState::Running,
+                    applied_revision: Counter::ONE,
+                    cause: ObservationCause::Native {},
+                    evidence_digest: bytes_digest(b"native"),
+                },
+            },
+            management: Observation::Unavailable { last_known: None },
+            operation: None,
+            lifecycle_operation: None,
+            configuration_operation: None,
+        };
+        let completion = |identity| HostTaskCompletion::SnapshotInspect {
+            request: Box::new(request.clone()),
+            approval_id: "approve-capture".try_into().unwrap(),
+            result: Box::new(Ok(inspection(identity))),
+        };
+        assert!(
+            service
+                .complete_task(completion("other".try_into().unwrap()))
+                .is_err()
+        );
+        assert!(service.catalog.snapshot(&request.id).unwrap().is_none());
+        service
+            .catalog
+            .request_lifecycle(
+                &machine,
+                "stop".try_into().unwrap(),
+                Counter::ONE,
+                DesiredState::Stopped,
+                Approval {
+                    id: "approve-stop".try_into().unwrap(),
+                    request_digest: digest(
+                        Domain::Operation,
+                        &(
+                            &machine,
+                            OperationId::try_from("stop").unwrap(),
+                            Counter::ONE,
+                            DesiredState::Stopped,
+                        ),
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+        assert!(service.complete_task(completion(machine)).is_err());
+        assert!(service.catalog.snapshot(&request.id).unwrap().is_none());
+        assert!(
+            service
+                .catalog
+                .operation(&request.operation_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn duplicate_snapshot_tasks_cannot_release_an_active_capture_boundary() {
         let root = std::env::temp_dir().join(format!(
             "sssnap-{}-{}",
@@ -4378,6 +5008,7 @@ mod tests {
             executable: service.executable.clone(),
             endpoint: root.join("absent-native-owner"),
             capturing: Box::new(capturing.clone()),
+            provision: None,
         };
         let completion = task.execute();
         assert!(
@@ -4634,7 +5265,7 @@ mod tests {
         );
         assert_eq!(expired.reservation, ReservationState::Held);
         assert!(matches!(
-            service.view(expired).unwrap().machine,
+            observe_machine(&service.root, expired).unwrap().machine,
             Observation::Unavailable { last_known: None }
         ));
         drop(service);

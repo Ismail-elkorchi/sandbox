@@ -20,6 +20,7 @@ CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, machine TEXT NOT NUL
 CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
+CREATE UNIQUE INDEX pending_rollback_machine ON rollbacks(machine) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
 CREATE TABLE suspensions(machine TEXT PRIMARY KEY REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE TABLE forks(machine TEXT PRIMARY KEY REFERENCES machines(id), operation TEXT UNIQUE NOT NULL REFERENCES intents(id), snapshot TEXT NOT NULL REFERENCES snapshots(id), value TEXT NOT NULL) STRICT;
@@ -1738,6 +1739,9 @@ impl HostCatalog {
         }
         host_operation_identity_available(&tx, &operation_id)?;
         require_revision(&tx, machine, expected_revision)?;
+        if pending_rollback_record(&tx, machine)?.is_some() {
+            return Err(Error::Conflict("another disk replacement is pending"));
+        }
         let source = snapshot_record(&tx, snapshot_id)?
             .ok_or(Error::Missing("rollback snapshot is missing"))?;
         let target =
@@ -1780,6 +1784,12 @@ impl HostCatalog {
         )?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// The admitted replacement, not a cached storage observation, fences new
+    /// boot authority until its exact verified disk publication is committed.
+    pub fn pending_rollback(&self, machine: &MachineId) -> Result<Option<RollbackRecord>> {
+        pending_rollback_record(&self.db.connection, machine)
     }
 
     pub fn complete_rollback(
@@ -1867,6 +1877,11 @@ impl HostCatalog {
             .ok_or(Error::Missing("lifecycle intent is missing"))?;
         let machine = machine_record(&self.db.connection, &intent.machine_id)?
             .ok_or(Error::Missing("lifecycle machine is missing"))?;
+        if intent.desired == DesiredState::Running
+            && self.pending_rollback(&intent.machine_id)?.is_some()
+        {
+            return Err(Error::Conflict("disk replacement has not completed"));
+        }
         if intent.desired == DesiredState::Running
             && self
                 .fork(&intent.machine_id)?
@@ -2047,6 +2062,13 @@ impl HostCatalog {
             |row| row.get(0),
         )?;
         let mut configuration: RuntimeConfiguration = decode(&encoded)?;
+        if resources.disk_bytes != configuration.resources.disk_bytes
+            && pending_rollback_record(&tx, machine)?.is_some()
+        {
+            return Err(Error::Conflict(
+                "pending disk replacement fixes disk geometry",
+            ));
+        }
         if snapshot_capacity_held(&tx, machine)? > resources.snapshot_bytes.get() {
             return Err(Error::Capacity(
                 "resource reduction excludes retained snapshot reservations",
@@ -2732,6 +2754,33 @@ fn intent(db: &rusqlite::Connection, operation: &OperationId) -> Result<Option<L
     .map(|s| decode(&s))
     .transpose()
 }
+fn pending_rollback_record(
+    db: &rusqlite::Connection,
+    machine: &MachineId,
+) -> Result<Option<RollbackRecord>> {
+    let mut statement = db.prepare(
+        "SELECT value FROM rollbacks WHERE machine=?1 AND json_extract(value,'$.phase') IS NOT 'applied' LIMIT 2",
+    )?;
+    let values = statement
+        .query_map([machine.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => {
+            let record: RollbackRecord = decode(value)?;
+            if record.machine_id != *machine || record.phase != RollbackPhase::Admitted {
+                return Err(Error::Corrupt(
+                    "pending disk replacement binding is invalid",
+                ));
+            }
+            Ok(Some(record))
+        }
+        _ => Err(Error::Corrupt(
+            "machine has competing pending disk replacements",
+        )),
+    }
+}
+
 fn host_operation_identity_available(
     db: &rusqlite::Connection,
     operation: &OperationId,

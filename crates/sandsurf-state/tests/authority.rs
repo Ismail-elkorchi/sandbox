@@ -1088,6 +1088,198 @@ fn dispatch(runtime: &mut RuntimeJournal, command: &GuestCommand) {
 }
 
 #[test]
+fn pending_disk_replacement_has_one_host_owner_and_fences_boot_until_exact_completion() {
+    let mut fixture = Fixture::new();
+    let request = SnapshotRequest {
+        id: "replacement-source".try_into().unwrap(),
+        operation_id: "capture-replacement".try_into().unwrap(),
+        machine_id: fixture.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(2),
+        kind: SnapshotKind::Disk,
+        parent: None,
+    };
+    let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+    fixture
+        .host
+        .admit_snapshot(
+            request.clone(),
+            Approval {
+                id: "approve-capture".try_into().unwrap(),
+                request_digest: request_digest.clone(),
+            },
+        )
+        .unwrap();
+    fixture
+        .host
+        .begin_snapshot(&request.id, &request_digest)
+        .unwrap();
+    fixture
+        .host
+        .complete_snapshot(
+            &request.id,
+            &request_digest,
+            hash("disk"),
+            hash("manifest"),
+            SnapshotConsistency::Crash,
+        )
+        .unwrap();
+    let operation: OperationId = "replace-disk".try_into().unwrap();
+    let rollback_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-rollback-v1",
+            &fixture.machine,
+            &request.id,
+            &operation,
+            n(2),
+        ),
+    )
+    .unwrap();
+    let pending = fixture
+        .host
+        .admit_rollback(
+            &fixture.machine,
+            &request.id,
+            operation.clone(),
+            n(2),
+            Approval {
+                id: "approve-replace".try_into().unwrap(),
+                request_digest: rollback_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fixture.host.pending_rollback(&fixture.machine).unwrap(),
+        Some(pending.clone())
+    );
+    assert_eq!(
+        fixture
+            .host
+            .admit_rollback(
+                &fixture.machine,
+                &request.id,
+                operation.clone(),
+                n(2),
+                Approval {
+                    id: "approve-replace".try_into().unwrap(),
+                    request_digest: rollback_digest.clone(),
+                }
+            )
+            .unwrap(),
+        pending
+    );
+    let competitor: OperationId = "competing-replacement".try_into().unwrap();
+    let competitor_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-rollback-v1",
+            &fixture.machine,
+            &request.id,
+            &competitor,
+            n(2),
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.host.admit_rollback(
+            &fixture.machine,
+            &request.id,
+            competitor.clone(),
+            n(2),
+            Approval {
+                id: "approve-competitor".try_into().unwrap(),
+                request_digest: competitor_digest,
+            }
+        ),
+        Err(Error::Conflict("another disk replacement is pending"))
+    ));
+    assert!(fixture.host.operation(&competitor).unwrap().is_none());
+    let mut larger = resources();
+    larger.disk_bytes = n(larger.disk_bytes.get() + 1000);
+    larger.physical_storage_bytes = n(larger.physical_storage_bytes.get() + 4000);
+    let growth: OperationId = "grow-replacing-disk".try_into().unwrap();
+    let growth_digest = digest(
+        Domain::Authority,
+        &(
+            "sandsurf-machine-resources-v1",
+            &fixture.machine,
+            &growth,
+            n(2),
+            &larger,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture.host.update_resources(
+            &fixture.machine,
+            &growth,
+            n(2),
+            larger,
+            Approval {
+                id: "approve-growth".try_into().unwrap(),
+                request_digest: growth_digest,
+            }
+        ),
+        Err(Error::Conflict(
+            "pending disk replacement fixes disk geometry"
+        ))
+    ));
+    let start: OperationId = "start-after-replacement".try_into().unwrap();
+    let start_digest = digest(
+        Domain::Operation,
+        &(&fixture.machine, &start, n(2), DesiredState::Running),
+    )
+    .unwrap();
+    fixture
+        .host
+        .request_lifecycle(
+            &fixture.machine,
+            start.clone(),
+            n(2),
+            DesiredState::Running,
+            Approval {
+                id: "approve-start".try_into().unwrap(),
+                request_digest: start_digest,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.host.authorize_lifecycle(&start),
+        Err(Error::Conflict("disk replacement has not completed"))
+    ));
+    assert!(
+        fixture
+            .host
+            .complete_rollback(&operation, &hash("wrong-request"), hash("installed"))
+            .is_err()
+    );
+    assert_eq!(
+        fixture.host.pending_rollback(&fixture.machine).unwrap(),
+        Some(pending.clone())
+    );
+    drop(fixture.host);
+    let mut host = HostCatalog::open(&fixture.root.0.join("host")).unwrap();
+    assert_eq!(
+        host.pending_rollback(&fixture.machine).unwrap(),
+        Some(pending)
+    );
+    assert!(host.authorize_lifecycle(&start).is_err());
+    host.complete_rollback(&operation, &rollback_digest, hash("installed"))
+        .unwrap();
+    assert!(host.pending_rollback(&fixture.machine).unwrap().is_none());
+    host.authorize_lifecycle(&start).unwrap();
+    assert!(
+        host.complete_rollback(
+            &operation,
+            &rollback_digest,
+            hash("different-installed-disk")
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn snapshot_fork_and_rollback_keep_authority_and_lineage_host_owned() {
     let mut fixture = Fixture::new();
     let snapshot_id: SnapshotId = "snapshot-one".try_into().unwrap();
