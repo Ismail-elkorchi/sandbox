@@ -3704,6 +3704,18 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     assert_eq!(record.configuration_revision, n(2));
     assert_eq!(record.reservation, ReservationState::Held);
     assert_eq!(record.latest_intent.desired, DesiredState::Running);
+    assert_eq!(
+        f.host.active_machines(None, n(10)).unwrap(),
+        vec![record.clone()]
+    );
+    assert!(
+        f.host
+            .active_machines(Some(&f.machine), n(10))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(f.host.active_machines(None, Counter::ZERO).is_err());
+    assert!(f.host.active_machines(None, n(257)).is_err());
     assert_eq!(f.host.machines(None, n(10)).unwrap(), vec![record]);
     assert!(f.host.machines(None, Counter::ZERO).is_err());
     assert!(f.host.machines(None, n(257)).is_err());
@@ -3756,6 +3768,11 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     let destroyed = f.runtime.observe(observation).unwrap();
     f.host.complete_intent(&destroyed).unwrap();
     assert_eq!(
+        f.host.active_machines(None, n(10)).unwrap().len(),
+        1,
+        "native destruction does not release pending storage cleanup"
+    );
+    assert_eq!(
         f.host.machine(&f.machine).unwrap().unwrap().reservation,
         ReservationState::Held
     );
@@ -3770,6 +3787,154 @@ fn catalog_listing_keeps_intent_separate_and_releases_only_after_destroy_observa
     assert_eq!(retired.reservation, ReservationState::Released);
     assert!(retired.latest_intent.completion.is_some());
     assert!(f.host.revision(&f.machine).is_err());
+    assert!(f.host.active_machines(None, n(10)).unwrap().is_empty());
+    assert_eq!(
+        f.host.machines(None, n(10)).unwrap().len(),
+        1,
+        "released identities and history remain observable"
+    );
+}
+
+#[test]
+fn recovery_queries_visit_indexed_pending_objects_not_retained_history() {
+    let mut f = Fixture::new();
+    // The default snapshot envelope holds one full capture. This fixture also
+    // retains four disk captures, so explicitly admit their additional budget.
+    let mut envelope = f
+        .host
+        .machine(&f.machine)
+        .unwrap()
+        .unwrap()
+        .runtime_configuration
+        .resources;
+    envelope.snapshot_bytes = envelope
+        .snapshot_bytes
+        .checked_add(1024 * 1024 * 1024)
+        .unwrap();
+    envelope.physical_storage_bytes = envelope
+        .physical_storage_bytes
+        .checked_add(1024 * 1024 * 1024)
+        .unwrap();
+    let operation: OperationId = "recovery-budget".try_into().unwrap();
+    let request_digest = digest(
+        Domain::Authority,
+        &(
+            "sandsurf-machine-resources-v1",
+            &f.machine,
+            &operation,
+            n(2),
+            &envelope,
+        ),
+    )
+    .unwrap();
+    let revision = f
+        .host
+        .update_resources(
+            &f.machine,
+            &operation,
+            n(2),
+            envelope,
+            Approval {
+                id: "approve-recovery-budget".try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap()
+        .revision;
+    assert!(
+        f.host
+            .capturing_disk_snapshots(None, Counter::ZERO)
+            .is_err()
+    );
+    assert!(f.host.capturing_disk_snapshots(None, n(257)).is_err());
+    let mut capturing = Vec::new();
+    for (name, kind, begin, complete) in [
+        ("a-ready", SnapshotKind::Disk, true, true),
+        ("b-admitted", SnapshotKind::Disk, false, false),
+        ("c-full", SnapshotKind::Full, true, false),
+        ("d-capturing", SnapshotKind::Disk, true, false),
+        ("e-capturing", SnapshotKind::Disk, true, false),
+    ] {
+        let request = SnapshotRequest {
+            id: name.try_into().unwrap(),
+            operation_id: format!("capture-{name}").try_into().unwrap(),
+            machine_id: f.machine.clone(),
+            expected_generation: n(1),
+            expected_revision: revision,
+            kind,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+        f.host
+            .admit_snapshot(
+                request.clone(),
+                Approval {
+                    id: format!("approve-{name}").try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        if begin {
+            let value = f.host.begin_snapshot(&request.id, &request_digest).unwrap();
+            if !complete && kind == SnapshotKind::Disk {
+                capturing.push(value);
+            }
+        }
+        if complete {
+            f.host
+                .complete_snapshot(
+                    &request.id,
+                    &request_digest,
+                    hash("disk"),
+                    hash("manifest"),
+                    SnapshotConsistency::Crash,
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        f.host.capturing_disk_snapshots(None, n(1)).unwrap(),
+        capturing[..1]
+    );
+    assert_eq!(
+        f.host
+            .capturing_disk_snapshots(Some(&capturing[0].request.id), n(1))
+            .unwrap(),
+        capturing[1..]
+    );
+    assert!(
+        f.host
+            .capturing_disk_snapshots(Some(&capturing[1].request.id), n(1))
+            .unwrap()
+            .is_empty()
+    );
+    drop(f.host);
+    f.host = HostCatalog::open(&f.root.0.join("host")).unwrap();
+    assert_eq!(
+        f.host.capturing_disk_snapshots(None, n(256)).unwrap(),
+        capturing
+    );
+    let connection = rusqlite::Connection::open_with_flags(
+        f.root.0.join("host/authority.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for (query, index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT id FROM machines WHERE released=0 AND id>'' ORDER BY id LIMIT 32",
+            "active_machines",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT value FROM snapshots WHERE id>'' AND json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk' ORDER BY id LIMIT 32",
+            "capturing_disk_snapshots",
+        ),
+    ] {
+        let details: String = connection.query_row(query, [], |row| row.get(3)).unwrap();
+        assert!(
+            details.contains(index),
+            "pending-object query must use {index}: {details}"
+        );
+    }
 }
 
 #[test]

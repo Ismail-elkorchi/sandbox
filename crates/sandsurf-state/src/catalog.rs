@@ -7,6 +7,7 @@ use std::path::Path;
 const SCHEMA: &str = "
 CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NULL, limits TEXT NOT NULL, authority TEXT NOT NULL) STRICT;
 CREATE TABLE machines(id TEXT PRIMARY KEY, image TEXT NOT NULL, configuration TEXT NOT NULL, defaults TEXT NOT NULL, lifetime TEXT NOT NULL, activity INTEGER NOT NULL, revision INTEGER NOT NULL, sensitive INTEGER NOT NULL CHECK(sensitive IN (0,1)), released INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE INDEX active_machines ON machines(id) WHERE released=0;
 CREATE TABLE intents(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
@@ -19,6 +20,7 @@ CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, machine TEXT NOT NULL
 CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
+CREATE INDEX capturing_disk_snapshots ON snapshots(id) WHERE json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk';
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE UNIQUE INDEX pending_rollback_machine ON rollbacks(machine) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
@@ -1214,6 +1216,28 @@ impl HostCatalog {
         Ok(values)
     }
 
+    /// Recovery candidates, not all historical snapshots. The partial index
+    /// bounds work independently of the size of retained immutable history.
+    pub fn capturing_disk_snapshots(
+        &self,
+        after: Option<&SnapshotId>,
+        limit: Counter,
+    ) -> Result<Vec<Snapshot>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("snapshot page limit must be in 1..=256"));
+        }
+        let mut statement = self.db.connection.prepare(
+            "SELECT value FROM snapshots WHERE id>?1 AND json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk' ORDER BY id LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![after.map_or("", SnapshotId::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| decode(&row?))
+            .collect()
+    }
+
     pub fn admit_snapshot(
         &mut self,
         request: SnapshotRequest,
@@ -1482,6 +1506,38 @@ impl HostCatalog {
                 let id: MachineId = id.try_into()?;
                 machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
                     "listed machine disappeared from the host transaction view",
+                ))
+            })
+            .collect()
+    }
+
+    /// Machines whose storage reservation still has an owner. Retirement
+    /// recovery remains eligible until actual deletion is committed; released
+    /// historical identities do not slow lifecycle reconciliation.
+    pub fn active_machines(
+        &self,
+        after: Option<&MachineId>,
+        limit: Counter,
+    ) -> Result<Vec<MachineRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity("machine page limit must be in 1..=256"));
+        }
+        let mut statement = self
+            .db
+            .connection
+            .prepare("SELECT id FROM machines WHERE released=0 AND id>?1 ORDER BY id LIMIT ?2")?;
+        let identities = statement
+            .query_map(
+                params![after.map_or("", MachineId::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        identities
+            .into_iter()
+            .map(|id| {
+                let id: MachineId = id.try_into()?;
+                machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
+                    "active machine disappeared from the host transaction view",
                 ))
             })
             .collect()

@@ -169,6 +169,15 @@ impl From<crate::qemu::QemuError> for HostError {
 
 pub type Result<T> = std::result::Result<T, HostError>;
 
+/// Volatile scheduling position only. Every visit rereads canonical authority;
+/// restarting a host merely restarts the bounded sweep.
+#[derive(Default)]
+struct ReconciliationCursor {
+    after_machine: Option<MachineId>,
+    after_snapshot: Option<SnapshotId>,
+    snapshots_first: bool,
+}
+
 struct HostService {
     root: PathBuf,
     catalog: HostCatalog,
@@ -228,6 +237,10 @@ impl HostService {
 
     fn route(&mut self, request: HostRequest) -> HostDispatch {
         let result = match request {
+            HostRequest::Inspect => Ok(HostDispatch::Inspection {
+                root: self.root.clone(),
+                host_id: self.catalog.host_id().as_str().into(),
+            }),
             HostRequest::CreateSnapshot {
                 request,
                 approval_id,
@@ -1264,9 +1277,9 @@ impl HostService {
 
     fn handle_inner(&mut self, request: HostRequest) -> Result<HostResponse> {
         match request {
-            HostRequest::Inspect => Ok(HostResponse::Inspection {
-                value: self.inspect(),
-            }),
+            HostRequest::Inspect => Err(HostError::Invalid(
+                "host inspection requires detached observation",
+            )),
             HostRequest::StopService => Ok(HostResponse::Complete),
             HostRequest::OpenObservationStream { .. }
             | HostRequest::ListMachines { .. }
@@ -1449,77 +1462,6 @@ impl HostService {
             | HostRequest::CleanupReleasedEvidence { .. } => Err(HostError::Invalid(
                 "runtime journal requests require deferred guardian routing",
             )),
-        }
-    }
-
-    fn inspect(&self) -> HostInspection {
-        let network_egress = sandsurf_network::egress_capability();
-        let (qualification_records, qualification_issues) =
-            match crate::qualification::inspect(&self.root) {
-                Ok(records) => (records, Vec::new()),
-                Err(error) => (
-                    Vec::new(),
-                    vec![format!("retained native evidence unavailable: {error}")],
-                ),
-            };
-        let engine = if cfg!(target_os = "macos") {
-            VmEngine::QemuHvf
-        } else if cfg!(target_os = "windows") {
-            VmEngine::QemuWhpx
-        } else {
-            VmEngine::Firecracker
-        };
-        let reason = if qualification_records.is_empty() {
-            format!(
-                "{} driver has no retained real-hardware qualification for this exact build/configuration",
-                std::env::consts::OS
-            )
-        } else {
-            "qualification is scoped to the exact configurations and mechanisms in qualificationRecords; no blanket platform qualification is implied".into()
-        };
-        HostInspection {
-            host_id: self.catalog.host_id().as_str().into(),
-            platform: std::env::consts::OS.into(),
-            architecture: std::env::consts::ARCH.into(),
-            guest_architecture: match native_guest_architecture() {
-                GuestArchitecture::Amd64 => "amd64",
-                GuestArchitecture::Arm64 => "arm64",
-            }
-            .into(),
-            engine,
-            lifecycle: Qualification::Unqualified {
-                reasons: vec![reason.clone()],
-            },
-            full_state: {
-                #[cfg(any(target_os = "macos", windows))]
-                {
-                    sandsurf_machine::qemu_driver::full_state_capability()
-                }
-                #[cfg(not(any(target_os = "macos", windows)))]
-                {
-                    Capability::Supported {
-                        qualification: Qualification::Unqualified {
-                            reasons: vec![reason],
-                        },
-                    }
-                }
-            },
-            images: { crate::images::qualification() },
-            image_workers: crate::image_worker::capability(&self.root),
-            resources: crate::resources::capabilities(&self.root, &network_egress),
-            network_egress,
-            qualification_records,
-            qualification_issues,
-            guest_power: sandsurf_machine::guest_power_capabilities(),
-            console: sandsurf_machine::native_console_capability(),
-            guest_platform: format!(
-                "linux/{}",
-                match native_guest_architecture() {
-                    GuestArchitecture::Amd64 => "amd64",
-                    GuestArchitecture::Arm64 => "arm64",
-                }
-            ),
-            default_image_digest: crate::images::bundled_image_digest(),
         }
     }
 
@@ -2037,6 +1979,28 @@ impl HostService {
                     bytes,
                 })))
             }
+            HostTaskCompletion::StorageRetire {
+                machine_id,
+                reply,
+                result,
+            } => {
+                result?;
+                self.catalog.release_retired_storage(&machine_id)?;
+                match reply {
+                    None => Ok(HostDispatch::Ready(Box::new(HostResponse::Complete))),
+                    Some(reply) => {
+                        let record = self
+                            .catalog
+                            .machine(&machine_id)?
+                            .ok_or(HostError::Invalid("retired machine disappeared"))?;
+                        Ok(HostDispatch::MachineView(Box::new(DeferredMachineView {
+                            root: self.root.clone(),
+                            record,
+                            reply: *reply,
+                        })))
+                    }
+                }
+            }
             HostTaskCompletion::SnapshotInspect {
                 request,
                 approval_id,
@@ -2216,7 +2180,12 @@ impl HostService {
                         self.catalog.observe_activity(&machine_id, unix_millis()?)?;
                     }
                     if intent.desired == DesiredState::Destroyed {
-                        self.retire_machine_storage(&machine_id)?;
+                        return self.prepare_storage_retirement(
+                            &machine_id,
+                            Some(Box::new(MachineViewReply::Lifecycle {
+                                operation: Box::new(lifecycle.guardian_operation),
+                            })),
+                        );
                     }
                 }
                 let record = self
@@ -2273,11 +2242,8 @@ impl HostService {
                     usage: self.catalog.observe_usage(&machine_id, generation, usage)?,
                 })
             }
-            HostTaskCompletion::CaptureRecovery { result } => {
-                result?;
-                Ok(HostResponse::Complete)
-            }
             HostTaskCompletion::SecretPrepare { .. }
+            | HostTaskCompletion::StorageRetire { .. }
             | HostTaskCompletion::SnapshotInspect { .. }
             | HostTaskCompletion::Configuration { .. }
             | HostTaskCompletion::ResourceAssessment { .. }
@@ -2422,70 +2388,119 @@ impl HostService {
         Ok(())
     }
 
-    /// Admit host policy changes on the sole writer; native reconciliation
-    /// uses the same detached tasks as SDK requests.
-    fn reconcile_lifetime_policies(&mut self) -> Result<Vec<(MachineId, HostDispatch)>> {
+    /// Bounded, rotating authority visits. Neither retained history nor a busy
+    /// early machine may cause every sweep to start over at the first identity.
+    fn reconcile_lifetime_policies(
+        &mut self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<MachineId>,
+        slots: usize,
+    ) -> Result<Vec<(MachineId, HostDispatch)>> {
+        let slots = slots.min(MAX_HOST_CONNECTIONS / 2);
+        if slots == 0 {
+            return Ok(Vec::new());
+        }
         let now = unix_millis()?;
         let mut work = Vec::new();
-        let mut after_snapshot = None;
-        loop {
-            let snapshots = self
-                .catalog
-                .snapshots(after_snapshot.as_ref(), counter(256))?;
-            if snapshots.is_empty() {
-                break;
-            }
-            after_snapshot = snapshots.last().map(|snapshot| snapshot.request.id.clone());
-            for snapshot in snapshots {
-                if snapshot.phase != SnapshotPhase::Capturing
-                    || snapshot.request.kind != SnapshotKind::Disk
-                {
-                    continue;
-                }
-                let machine = &snapshot.request.machine_id;
-                let prepare = (|| -> Result<Option<GuardianProvision>> {
-                    if crate::capture::CaptureBoundary::read(&self.machine_root(machine))?
-                        .is_some_and(|boundary| {
-                            boundary.operation_id == snapshot.request.operation_id
-                        })
-                    {
-                        return self.prepare_guardian_inner(machine).map(Some);
-                    }
-                    Ok(None)
-                })();
-                match prepare {
-                    Ok(Some(provision)) => work.push((
-                        machine.clone(),
-                        HostDispatch::Task(Box::new(HostTask::CaptureRecovery {
-                            provision,
-                            snapshot: Box::new(snapshot),
-                        })),
-                    )),
-                    Ok(None) => {}
-                    Err(error) => eprintln!("sandsurf capture recovery deferred: {error}"),
-                }
-            }
-        }
-        let mut after = None;
-        loop {
-            let records = self.catalog.machines(after.as_ref(), counter(256))?;
-            if records.is_empty() {
-                break;
-            }
-            after = records.last().map(|record| record.id.clone());
-            for record in records {
-                let id = record.id.clone();
-                match self.reconcile_machine(record, now) {
-                    Ok(Some(dispatch)) => work.push((id, dispatch)),
-                    Ok(None) => {}
-                    Err(error) => eprintln!(
-                        "sandsurf machine {} reconciliation deferred: {error}",
-                        id.as_str()
-                    ),
-                }
-            }
+        // Alternate which domain gets the first slot, even at capacity one.
+        cursor.snapshots_first = !cursor.snapshots_first;
+        if cursor.snapshots_first {
+            self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?;
+            self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?;
+        } else {
+            self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?;
+            self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?;
         }
         Ok(work)
+    }
+
+    fn reconcile_machine_page(
+        &mut self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<MachineId>,
+        slots: usize,
+        now: Counter,
+        work: &mut Vec<(MachineId, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let records = self
+            .catalog
+            .active_machines(cursor.after_machine.as_ref(), counter(remaining as u64))?;
+        let at_end = records.len() < remaining;
+        for record in records {
+            let id = record.id.clone();
+            cursor.after_machine = Some(id.clone());
+            if busy.contains(&id) || work.iter().any(|(machine, _)| *machine == id) {
+                continue;
+            }
+            match self.reconcile_machine(record, now) {
+                Ok(Some(dispatch)) => work.push((id, dispatch)),
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "sandsurf machine {} reconciliation deferred: {error}",
+                    id.as_str(),
+                ),
+            }
+        }
+        if at_end {
+            cursor.after_machine = None;
+        }
+        Ok(())
+    }
+
+    fn reconcile_snapshot_page(
+        &self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<MachineId>,
+        slots: usize,
+        work: &mut Vec<(MachineId, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let snapshots = self
+            .catalog
+            .capturing_disk_snapshots(cursor.after_snapshot.as_ref(), counter(remaining as u64))?;
+        let at_end = snapshots.len() < remaining;
+        for snapshot in snapshots {
+            cursor.after_snapshot = Some(snapshot.request.id.clone());
+            let machine = snapshot.request.machine_id.clone();
+            if busy.contains(&machine) || work.iter().any(|(id, _)| *id == machine) {
+                continue;
+            }
+            // Reuse the complete capture transaction, not a separate pause-only
+            // repair path. Its lease prevents releasing an active capture and
+            // its immutable prepared input permits finishing after restart.
+            match self.prepare_snapshot_recovery(snapshot) {
+                Ok(dispatch) => work.push((machine, dispatch)),
+                Err(error) => eprintln!("sandsurf snapshot recovery deferred: {error}"),
+            }
+        }
+        if at_end {
+            cursor.after_snapshot = None;
+        }
+        Ok(())
+    }
+
+    fn prepare_snapshot_recovery(&self, snapshot: Snapshot) -> Result<HostDispatch> {
+        // Admission already binds an existing generation and machine-owned
+        // storage. Re-reading that storage envelope is not a second recovery
+        // authority, and finalizing published bytes needs no live VM owner.
+        let provision = GuardianProvision {
+            host_root: self.root.clone(),
+            machine: snapshot.request.machine_id.clone(),
+        };
+        Ok(HostDispatch::Task(Box::new(HostTask::Snapshot {
+            root: self.root.clone(),
+            executable: self.executable.clone(),
+            endpoint: provision.endpoint(),
+            capturing: Box::new(snapshot),
+            provision: Some(provision),
+        })))
     }
 
     fn reconcile_machine(
@@ -2499,8 +2514,7 @@ impl HostService {
         if record.latest_intent.desired == DesiredState::Destroyed
             && record.latest_intent.completion.is_some()
         {
-            self.retire_machine_storage(&record.id)?;
-            return Ok(None);
+            return self.prepare_storage_retirement(&record.id, None).map(Some);
         }
         if let Some(expires) = record.lifetime.expires_at_unix_millis
             && now >= expires
@@ -2594,7 +2608,11 @@ impl HostService {
             .join(object_name(machine.as_str()))
     }
 
-    fn retire_machine_storage(&mut self, machine: &MachineId) -> Result<()> {
+    fn prepare_storage_retirement(
+        &self,
+        machine: &MachineId,
+        reply: Option<Box<MachineViewReply>>,
+    ) -> Result<HostDispatch> {
         let record = self
             .catalog
             .machine(machine)?
@@ -2606,19 +2624,89 @@ impl HostService {
                 "disk retirement requires confirmed native destruction",
             ));
         }
-        crate::storage::retire(
-            &self
+        Ok(HostDispatch::Task(Box::new(HostTask::StorageRetire {
+            machine_id: machine.clone(),
+            disk: self
                 .machine_root(machine)
                 .join("disks")
                 .join(system_disk_name()),
-            record.runtime_configuration.resources.disk_bytes.get(),
-        )?;
-        self.catalog.release_retired_storage(machine)?;
-        Ok(())
+            disk_bytes: record.runtime_configuration.resources.disk_bytes,
+            reply,
+        })))
     }
 
     fn guardian_endpoint(&self, machine: &MachineId) -> PathBuf {
         self.machine_root(machine).join("guardian")
+    }
+}
+
+fn inspect_host(root: &Path, host_id: String) -> HostInspection {
+    let network_egress = sandsurf_network::egress_capability();
+    let (qualification_records, qualification_issues) = match crate::qualification::inspect(root) {
+        Ok(records) => (records, Vec::new()),
+        Err(error) => (
+            Vec::new(),
+            vec![format!("retained native evidence unavailable: {error}")],
+        ),
+    };
+    let engine = if cfg!(target_os = "macos") {
+        VmEngine::QemuHvf
+    } else if cfg!(target_os = "windows") {
+        VmEngine::QemuWhpx
+    } else {
+        VmEngine::Firecracker
+    };
+    let reason = if qualification_records.is_empty() {
+        format!(
+            "{} driver has no retained real-hardware qualification for this exact build/configuration",
+            std::env::consts::OS
+        )
+    } else {
+        "qualification is scoped to the exact configurations and mechanisms in qualificationRecords; no blanket platform qualification is implied".into()
+    };
+    HostInspection {
+        host_id,
+        platform: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        guest_architecture: match native_guest_architecture() {
+            GuestArchitecture::Amd64 => "amd64",
+            GuestArchitecture::Arm64 => "arm64",
+        }
+        .into(),
+        engine,
+        lifecycle: Qualification::Unqualified {
+            reasons: vec![reason.clone()],
+        },
+        full_state: {
+            #[cfg(any(target_os = "macos", windows))]
+            {
+                sandsurf_machine::qemu_driver::full_state_capability()
+            }
+            #[cfg(not(any(target_os = "macos", windows)))]
+            {
+                Capability::Supported {
+                    qualification: Qualification::Unqualified {
+                        reasons: vec![reason],
+                    },
+                }
+            }
+        },
+        images: { crate::images::qualification() },
+        image_workers: crate::image_worker::capability(root),
+        resources: crate::resources::capabilities(root, &network_egress),
+        network_egress,
+        qualification_records,
+        qualification_issues,
+        guest_power: sandsurf_machine::guest_power_capabilities(),
+        console: sandsurf_machine::native_console_capability(),
+        guest_platform: format!(
+            "linux/{}",
+            match native_guest_architecture() {
+                GuestArchitecture::Amd64 => "amd64",
+                GuestArchitecture::Arm64 => "arm64",
+            }
+        ),
+        default_image_digest: crate::images::bundled_image_digest(),
     }
 }
 
@@ -2868,9 +2956,14 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
         // Scheduling only: no cached observations, grants or lifecycle facts.
         // Crash recovery derives the work again from the catalog.
         let mut reconciliations = BTreeSet::new();
+        let mut reconciliation_cursor = ReconciliationCursor::default();
         let result = loop {
             if std::time::Instant::now() >= next_reconciliation {
-                match service.reconcile_lifetime_policies() {
+                match service.reconcile_lifetime_policies(
+                    &mut reconciliation_cursor,
+                    &reconciliations,
+                    (MAX_HOST_CONNECTIONS / 2).saturating_sub(reconciliations.len()),
+                ) {
                     Ok(work) => {
                         for (machine, dispatch) in work {
                             if reconciliations.len() >= MAX_HOST_CONNECTIONS / 2
@@ -2988,6 +3081,7 @@ enum HostIngress {
 }
 
 enum HostDispatch {
+    Inspection { root: PathBuf, host_id: String },
     ArtifactRead(Box<DeferredArtifactRead>),
     Ready(Box<HostResponse>),
     Runtime(Box<DeferredRuntimeRequest>),
@@ -3074,6 +3168,9 @@ impl DeferredMachineView {
 impl HostDispatch {
     fn finish(self) -> HostResponse {
         match self {
+            Self::Inspection { root, host_id } => HostResponse::Inspection {
+                value: inspect_host(&root, host_id),
+            },
             Self::Ready(response) => *response,
             Self::ArtifactRead(read) => read.execute().unwrap_or_else(rejected),
             Self::Runtime(read) => (*read).execute().unwrap_or_else(rejected),
@@ -3109,13 +3206,13 @@ fn capture_snapshot(
         ".{}.task.lock",
         object_name(request.operation_id.as_str())
     )))?;
-    if let Some(provision) = provision {
-        provision.execute()?;
-    }
     let machine_root = root
         .join("machines")
         .join(object_name(request.machine_id.as_str()));
     if crate::capture::CaptureBoundary::require(&machine_root, &request.operation_id)?.is_some() {
+        if let Some(provision) = provision {
+            provision.execute()?;
+        }
         let client = GuardianClient::new(endpoint.to_path_buf());
         match request.kind {
             SnapshotKind::Disk => {
@@ -3147,6 +3244,9 @@ fn capture_snapshot(
             // pause boundary, never infer an image store from it.
             crate::images::resolve_native_image(root, &capturing.image_digest)?;
             if !crate::snapshots::prepared_filesystem(&capture_root, capturing)? {
+                if let Some(provision) = provision {
+                    provision.execute()?;
+                }
                 let prepared = client.native_snapshot(
                     request.machine_id.clone(),
                     NativeSnapshotRequest::PrepareDisk {
@@ -3187,6 +3287,9 @@ fn capture_snapshot(
             (Ok(captured), Ok(true))
         }
         SnapshotKind::Full => {
+            if let Some(provision) = provision {
+                provision.execute()?;
+            }
             let captured = capture_full_state(root, endpoint, capturing);
             let finished = client
                 .native_snapshot(
@@ -3249,9 +3352,11 @@ enum HostTask {
         record: RollbackRecord,
         snapshot: Box<Snapshot>,
     },
-    CaptureRecovery {
-        provision: GuardianProvision,
-        snapshot: Box<Snapshot>,
+    StorageRetire {
+        machine_id: MachineId,
+        disk: PathBuf,
+        disk_bytes: Counter,
+        reply: Option<Box<MachineViewReply>>,
     },
     Usage {
         provision: GuardianProvision,
@@ -3353,7 +3458,9 @@ enum HostTaskCompletion {
         record: RollbackRecord,
         result: Result<Digest>,
     },
-    CaptureRecovery {
+    StorageRetire {
+        machine_id: MachineId,
+        reply: Option<Box<MachineViewReply>>,
         result: Result<()>,
     },
     Usage {
@@ -3475,33 +3582,19 @@ impl HostTask {
                 })();
                 HostTaskCompletion::Rollback { record, result }
             }
-            Self::CaptureRecovery {
-                provision,
-                snapshot,
+            Self::StorageRetire {
+                machine_id,
+                disk,
+                disk_bytes,
+                reply,
             } => {
-                let result = (|| {
-                    let capture_root = crate::snapshots::root(&provision.host_root, &snapshot);
-                    crate::snapshots::private_directory(&capture_root)?;
-                    let _custody =
-                        sandsurf_native::storage::disk_lease(&capture_root.join(format!(
-                            ".{}.task.lock",
-                            object_name(snapshot.request.operation_id.as_str()),
-                        )))?;
-                    provision.execute()?;
-                    let response = GuardianClient::new(provision.endpoint()).native_snapshot(
-                        snapshot.request.machine_id,
-                        NativeSnapshotRequest::FinishDisk {
-                            operation_id: snapshot.request.operation_id,
-                        },
-                    )?;
-                    if !matches!(response, NativeSnapshotResponse::Complete { .. }) {
-                        return Err(HostError::Invalid(
-                            "guardian did not release interrupted disk capture",
-                        ));
-                    }
-                    Ok(())
-                })();
-                HostTaskCompletion::CaptureRecovery { result }
+                let result =
+                    crate::storage::retire(&disk, disk_bytes.get()).map_err(HostError::from);
+                HostTaskCompletion::StorageRetire {
+                    machine_id,
+                    reply,
+                    result,
+                }
             }
             Self::Usage { provision } => {
                 let result = (|| {
@@ -4564,7 +4657,7 @@ mod tests {
         let resources = Resources::from_geometry(
             Counter::ONE,
             128_u64.try_into().unwrap(),
-            1_000_000_u64.try_into().unwrap(),
+            1_048_576_u64.try_into().unwrap(),
             1_000_000_u64.try_into().unwrap(),
             8_u64.try_into().unwrap(),
         )
@@ -5016,18 +5109,15 @@ mod tests {
             "custody must be acquired before recovery can send FinishDisk to the native owner"
         );
         assert!(service.complete_task(completion).is_err());
-        let recovery = HostTask::CaptureRecovery {
-            provision: GuardianProvision {
-                host_root: root.clone(),
-                machine: machine.clone(),
-            },
-            snapshot: Box::new(capturing),
-        }
-        .execute();
+        let HostDispatch::Task(recovery) = service.prepare_snapshot_recovery(capturing).unwrap()
+        else {
+            panic!("capture recovery must use the canonical capture task");
+        };
+        let recovery = recovery.execute();
         assert!(
-            matches!(recovery, HostTaskCompletion::CaptureRecovery {
-            result: Err(HostError::Io(error)),
-        } if error.kind() == io::ErrorKind::WouldBlock),
+            matches!(recovery, HostTaskCompletion::Snapshot {
+                result: Err(HostError::Io(error)), ..
+            } if error.kind() == io::ErrorKind::WouldBlock),
             "background recovery must not release a live capture worker's native pause"
         );
         assert_eq!(
@@ -5230,6 +5320,257 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reconciliation_visits_later_machines_and_does_not_advance_without_capacity() {
+        let root = std::env::temp_dir().join(format!(
+            "ssfair-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        prepare_directory(&root).unwrap();
+        HostCatalog::create(
+            &root.join("catalog"),
+            "fair-fixture".try_into().unwrap(),
+            CatalogLimits {
+                identities: counter(40),
+                operations: counter(128),
+                usage_records: counter(128),
+                image_bytes: counter(64 * 1024 * 1024),
+                cpu_quota_micros: counter(4_000_000),
+                host_memory_bytes: counter(40 * 1024 * 1024 * 1024),
+            },
+        )
+        .unwrap();
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        for index in 0..33 {
+            admit_machine(
+                &mut service,
+                &format!("box-{index:02}"),
+                MachineLifetime {
+                    expires_at_unix_millis: (index == 32).then_some(Counter::ONE),
+                    expiration_action: ExpirationAction::Stop,
+                },
+            );
+        }
+        let mut cursor = ReconciliationCursor::default();
+        let busy = BTreeSet::new();
+        let first = service
+            .reconcile_lifetime_policies(&mut cursor, &busy, 32)
+            .unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(cursor.after_machine.as_ref().unwrap().as_str(), "box-31");
+        let expired: MachineId = "box-32".try_into().unwrap();
+        assert_eq!(
+            service
+                .catalog
+                .machine(&expired)
+                .unwrap()
+                .unwrap()
+                .latest_intent
+                .desired,
+            DesiredState::Running
+        );
+        let before = cursor.after_machine.clone();
+        assert!(
+            service
+                .reconcile_lifetime_policies(&mut cursor, &busy, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cursor.after_machine, before,
+            "capacity loss skipped unvisited authority"
+        );
+        let busy = first.into_iter().map(|(id, _)| id).collect();
+        let second = service
+            .reconcile_lifetime_policies(&mut cursor, &busy, 1)
+            .unwrap();
+        // This authority-only fixture intentionally has no operator volume:
+        // native task preparation may refuse, but the later expiration must
+        // still be visited and durably admitted rather than starved.
+        assert!(second.len() <= 1);
+        if let Some((identity, _)) = second.first() {
+            assert_eq!(identity, &expired);
+        }
+        let record = service.catalog.machine(&expired).unwrap().unwrap();
+        assert_eq!(record.latest_intent.desired, DesiredState::Stopped);
+        assert!(record.latest_intent.completion.is_none());
+        assert_eq!(record.reservation, ReservationState::Held);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn single_slot_reconciliation_alternates_snapshot_completion_and_machine_policy() {
+        let root = std::env::temp_dir().join(format!(
+            "ssdomains-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let request = SnapshotRequest {
+            id: "snapshot".try_into().unwrap(),
+            operation_id: "capture".try_into().unwrap(),
+            machine_id: machine,
+            expected_generation: Counter::ONE,
+            expected_revision: Counter::ONE,
+            kind: SnapshotKind::Disk,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+        service
+            .catalog
+            .admit_snapshot(
+                request.clone(),
+                Approval {
+                    id: "approve-capture".try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        service
+            .catalog
+            .begin_snapshot(&request.id, &request_digest)
+            .unwrap();
+        let mut cursor = ReconciliationCursor::default();
+        let busy = BTreeSet::new();
+        let first = service
+            .reconcile_lifetime_policies(&mut cursor, &busy, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(&first[0].1, HostDispatch::Task(task) if matches!(
+            &**task, HostTask::Snapshot { capturing, .. } if capturing.request == request
+        )));
+        let second = service
+            .reconcile_lifetime_policies(&mut cursor, &busy, 1)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(matches!(&second[0].1, HostDispatch::Task(task) if matches!(
+            &**task, HostTask::MachineBootstrap { .. }
+        )));
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_destruction_keeps_disk_retirement_detached_and_reservation_until_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "ssretire-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        assert!(service.prepare_storage_retirement(&machine, None).is_err());
+        let operation: OperationId = "destroy".try_into().unwrap();
+        let request_digest = digest(
+            Domain::Operation,
+            &(&machine, &operation, Counter::ONE, DesiredState::Destroyed),
+        )
+        .unwrap();
+        service
+            .catalog
+            .request_lifecycle(
+                &machine,
+                operation.clone(),
+                Counter::ONE,
+                DesiredState::Destroyed,
+                Approval {
+                    id: "approve-destroy".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        let record = service.catalog.machine(&machine).unwrap().unwrap();
+        let mut runtime = sandsurf_state::RuntimeJournal::create(
+            &root.join("observed"),
+            machine.clone(),
+            runtime_limits(&record.runtime_configuration.resources),
+            service.catalog.authority_binding().clone(),
+        )
+        .unwrap();
+        let mut observed = MachineObservation {
+            machine_id: machine.clone(),
+            generation: Counter::ONE,
+            sequence: Counter::ONE,
+            state: MachineState::Creating,
+            applied_revision: Counter::ONE,
+            cause: ObservationCause::Lifecycle {
+                operation_id: "create-box".try_into().unwrap(),
+            },
+            evidence_digest: bytes_digest(b"native-created"),
+        };
+        runtime.observe(observed.clone()).unwrap();
+        observed.sequence = counter(2);
+        observed.state = MachineState::Destroying;
+        observed.applied_revision = counter(2);
+        observed.cause = ObservationCause::Lifecycle {
+            operation_id: operation.clone(),
+        };
+        runtime.observe(observed.clone()).unwrap();
+        observed.sequence = counter(3);
+        observed.state = MachineState::Destroyed;
+        let evidence = runtime.observe(observed).unwrap();
+        service.catalog.complete_intent(&evidence).unwrap();
+        let disk = service
+            .machine_root(&machine)
+            .join("disks")
+            .join(system_disk_name());
+        prepare_directory(&root.join("machines")).unwrap();
+        prepare_directory(&service.machine_root(&machine)).unwrap();
+        prepare_directory(disk.parent().unwrap()).unwrap();
+        let HostDispatch::Task(task) = service.prepare_storage_retirement(&machine, None).unwrap()
+        else {
+            panic!("disk deletion must not run on the catalog writer");
+        };
+        assert!(!disk.with_extension("storage.json").exists());
+        assert_eq!(
+            service
+                .catalog
+                .machine(&machine)
+                .unwrap()
+                .unwrap()
+                .reservation,
+            ReservationState::Held
+        );
+        let completion = task.execute();
+        assert_eq!(
+            service
+                .catalog
+                .machine(&machine)
+                .unwrap()
+                .unwrap()
+                .reservation,
+            ReservationState::Held,
+            "a deletion worker cannot release host authority"
+        );
+        assert!(matches!(
+            service.complete_task(completion).unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        assert_eq!(
+            service
+                .catalog
+                .machine(&machine)
+                .unwrap()
+                .unwrap()
+                .reservation,
+            ReservationState::Released
+        );
+        assert!(
+            service
+                .catalog
+                .active_machines(None, counter(32))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(service.catalog.machine(&machine).unwrap().is_some());
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn broken_native_ownership_cannot_starve_another_machines_expiration_intent() {
         let root = std::env::temp_dir().join(format!(
             "sspolicy-{}-{}",
@@ -5246,7 +5587,9 @@ mod tests {
                 expiration_action: ExpirationAction::Stop,
             },
         );
-        service.reconcile_lifetime_policies().unwrap();
+        service
+            .reconcile_lifetime_policies(&mut ReconciliationCursor::default(), &BTreeSet::new(), 32)
+            .unwrap();
         assert_eq!(
             service
                 .catalog
