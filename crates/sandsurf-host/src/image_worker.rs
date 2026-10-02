@@ -37,9 +37,12 @@ pub enum Build {
         recipe: MachineImageRecipe,
         platform: String,
     },
-    Snapshot {
+    PublishSnapshot {
         snapshot: Box<Snapshot>,
         allow_sensitive: bool,
+    },
+    DiskSnapshot {
+        snapshot: Box<Snapshot>,
     },
     /// Internal native-boot preparation, not image publication or new authority.
     /// All paths are derived from existing host-owned identities.
@@ -49,6 +52,11 @@ pub enum Build {
         image_digest: Digest,
         disk_bytes: u64,
         boot_name: String,
+    },
+    Fork {
+        snapshot: Box<Snapshot>,
+        machine_id: MachineId,
+        profile: sandsurf_image::identity::CloneProfile,
     },
 }
 
@@ -73,6 +81,16 @@ enum Outcome {
     Boot {
         boot: sandsurf_image::boot::FrozenBoot,
     },
+    Fork,
+    DiskSnapshot {
+        capture: crate::snapshots::CaptureResult,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForkResult {
+    request_digest: Digest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +101,30 @@ struct BootResult {
 }
 
 fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
+    if let Build::DiskSnapshot { snapshot } = &job.build {
+        return Ok(crate::snapshots::published_filesystem(
+            &crate::snapshots::root(root, snapshot),
+            snapshot,
+        )?
+        .map(|capture| Outcome::DiskSnapshot { capture }));
+    }
+    if let Build::Fork {
+        snapshot,
+        machine_id,
+        profile,
+    } = &job.build
+    {
+        let record: ForkResult = match read(&directory(root, &job.operation).join("result.json")) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if record.request_digest != job.request_digest {
+            return Err(HostError::Invalid("fork worker completion binding changed"));
+        }
+        crate::snapshots::verify_fork(snapshot, &fork_disk(root, machine_id), profile)?;
+        return Ok(Some(Outcome::Fork));
+    }
     if matches!(job.build, Build::Boot { .. }) {
         let record: BootResult = match read(&directory(root, &job.operation).join("result.json")) {
             Ok(record) => record,
@@ -126,14 +168,19 @@ pub(crate) fn completed(
 /// Submission never forks image processing in the API process. A busy pool
 /// rejects new work for explicit retry; it does not grow a queue of builders.
 pub fn execute(root: &Path, executable: &Path, job: Job) -> Result<ImageRecord> {
-    if matches!(job.build, Build::Boot { .. }) {
+    if !matches!(
+        job.build,
+        Build::Native { .. } | Build::Oci { .. } | Build::PublishSnapshot { .. }
+    ) {
         return Err(HostError::Invalid(
-            "boot preparation is not image publication",
+            "machine disk preparation is not image publication",
         ));
     }
     match dispatch(root, executable, job)? {
         Outcome::Image { image } => Ok(image),
-        Outcome::Boot { .. } => Err(HostError::Invalid("image worker returned a boot result")),
+        Outcome::Boot { .. } | Outcome::Fork | Outcome::DiskSnapshot { .. } => Err(
+            HostError::Invalid("image worker returned a machine preparation result"),
+        ),
     }
 }
 
@@ -205,6 +252,67 @@ fn boot_job(
         request_digest,
         build,
     })
+}
+
+fn fork_disk(root: &Path, machine_id: &MachineId) -> PathBuf {
+    root.join("machines")
+        .join(object_name(machine_id.as_str()))
+        .join("disks/system.ext4")
+}
+
+pub(crate) fn materialize_fork(
+    root: &Path,
+    executable: &Path,
+    snapshot: &Snapshot,
+    machine_id: &MachineId,
+    profile: sandsurf_image::identity::CloneProfile,
+    operation: &OperationId,
+) -> Result<()> {
+    let build = Build::Fork {
+        snapshot: Box::new(snapshot.clone()),
+        machine_id: machine_id.clone(),
+        profile,
+    };
+    let request_digest = digest(
+        Domain::Image,
+        &("sandsurf-fork-preparation-v1", operation, &build),
+    )?;
+    let job = Job {
+        operation: format!("fork-{}", request_digest.as_str()).try_into()?,
+        request_digest,
+        build,
+    };
+    match dispatch(root, executable, job)? {
+        Outcome::Fork => Ok(()),
+        _ => Err(HostError::Invalid(
+            "fork worker returned a different result kind",
+        )),
+    }
+}
+
+pub(crate) fn finish_disk_snapshot(
+    root: &Path,
+    executable: &Path,
+    snapshot: &Snapshot,
+) -> Result<crate::snapshots::CaptureResult> {
+    let build = Build::DiskSnapshot {
+        snapshot: Box::new(snapshot.clone()),
+    };
+    let request_digest = digest(
+        Domain::Image,
+        &("sandsurf-disk-capture-finishing-v1", &build),
+    )?;
+    let job = Job {
+        operation: format!("capture-{}", request_digest.as_str()).try_into()?,
+        request_digest,
+        build,
+    };
+    match dispatch(root, executable, job)? {
+        Outcome::DiskSnapshot { capture } => Ok(capture),
+        _ => Err(HostError::Invalid(
+            "snapshot worker returned a different result kind",
+        )),
+    }
 }
 
 fn dispatch(root: &Path, executable: &Path, job: Job) -> Result<Outcome> {
@@ -374,6 +482,40 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
         return Ok(());
     }
     let image = match &job.build {
+        Build::DiskSnapshot { snapshot } => {
+            let image = crate::images::resolve_native_image(&root, &snapshot.image_digest)?;
+            crate::snapshots::finish_filesystem(
+                &crate::snapshots::root(&root, snapshot),
+                snapshot,
+                &image,
+            )?;
+            return Ok(());
+        }
+        Build::Fork {
+            snapshot,
+            machine_id,
+            profile,
+        } => {
+            let image = crate::images::resolve_native_image(&root, &snapshot.image_digest)?;
+            if image.manifest.system.clone_profile != *profile {
+                return Err(HostError::Invalid(
+                    "fork profile differs from its admitted image",
+                ));
+            }
+            crate::snapshots::materialize_fork(
+                &crate::snapshots::root(&root, snapshot),
+                snapshot,
+                &fork_disk(&root, machine_id),
+                profile,
+            )?;
+            publish(
+                &directory(&root, &operation).join("result.json"),
+                &ForkResult {
+                    request_digest: job.request_digest.clone(),
+                },
+            )?;
+            return Ok(());
+        }
         Build::Boot {
             machine_id,
             generation,
@@ -448,7 +590,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
                 credential.as_ref().map(|v| v.as_slice()),
             )?
         }
-        Build::Snapshot {
+        Build::PublishSnapshot {
             snapshot,
             allow_sensitive,
         } => crate::images::publish_snapshot(

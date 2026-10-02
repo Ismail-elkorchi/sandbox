@@ -1246,7 +1246,7 @@ impl GuardianEffect for QemuGuardianEffect {
         journal: &mut RuntimeJournal,
     ) -> ControlResult<NativeSnapshotResponse> {
         match request {
-            NativeSnapshotRequest::PrepareDisk { operation_id } => {
+            NativeSnapshotRequest::PrepareDisk { operation_id, .. } => {
                 self.prepare_capture_boundary(operation_id, journal)?;
                 Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"native-computer-paused-for-disk-capture-v1"),
@@ -1262,6 +1262,7 @@ impl GuardianEffect for QemuGuardianEffect {
             NativeSnapshotRequest::PrepareFull {
                 snapshot_id,
                 operation_id,
+                ..
             } => {
                 if matches!(
                     sandsurf_machine::qemu_driver::full_state_capability(),

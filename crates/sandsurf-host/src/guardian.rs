@@ -1024,6 +1024,36 @@ impl<E: GuardianEffect> Guardian<E> {
                 if &machine_id != self.journal.machine_id() {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
+                match &request {
+                    NativeSnapshotRequest::PrepareDisk {
+                        expected_generation,
+                        expected_revision,
+                        ..
+                    }
+                    | NativeSnapshotRequest::PrepareFull {
+                        expected_generation,
+                        expected_revision,
+                        ..
+                    } => {
+                        self.refresh_native_observation()?;
+                        let current = self
+                            .journal
+                            .last_observation()?
+                            .ok_or(Error::Protocol("capture has no native machine observation"))?;
+                        if current.value().generation != *expected_generation
+                            || current.value().applied_revision != *expected_revision
+                            || !matches!(
+                                current.value().state,
+                                MachineState::Running | MachineState::Paused
+                            )
+                        {
+                            return Err(Error::Protocol(
+                                "capture generation, revision or native power changed",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
                 let response = self
                     .effect
                     .as_mut()
@@ -1347,14 +1377,6 @@ pub struct GuardianClient {
     endpoint: PathBuf,
 }
 
-/// Trusted host-side routing. Application requests contain identities and
-/// expected revisions; this link creates the signed envelope and sends it
-/// directly to the guardian without returning it to the application.
-pub struct HostGuardianLink<'host> {
-    catalog: &'host HostCatalog,
-    guardian: GuardianClient,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLifecycleResult {
     pub guardian_operation: LifecycleOperation,
@@ -1423,28 +1445,6 @@ pub fn apply_lifecycle(
         guardian_operation: operation,
         completed_intent,
     })
-}
-
-impl<'host> HostGuardianLink<'host> {
-    pub fn new(catalog: &'host HostCatalog, endpoint: PathBuf) -> Self {
-        Self {
-            catalog,
-            guardian: GuardianClient::new(endpoint),
-        }
-    }
-
-    pub fn transition(&self, operation_id: &OperationId) -> Result<LifecycleOperation> {
-        let authorization = self.catalog.authorize_lifecycle(operation_id)?;
-        self.guardian.transition(authorization)
-    }
-
-    pub fn inspect(
-        &self,
-        machine_id: MachineId,
-        operation_id: Option<OperationId>,
-    ) -> Result<GuardianInspection> {
-        self.guardian.inspect(machine_id, operation_id)
-    }
 }
 
 impl GuardianClient {

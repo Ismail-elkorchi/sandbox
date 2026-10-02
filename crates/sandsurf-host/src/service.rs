@@ -194,6 +194,10 @@ impl HostService {
 
     fn route(&mut self, request: HostRequest) -> HostDispatch {
         let result = match request {
+            HostRequest::CreateSnapshot {
+                request,
+                approval_id,
+            } => self.prepare_snapshot(request, approval_id),
             request @ (HostRequest::ImportOci { .. }
             | HostRequest::ImportNativeImage { .. }
             | HostRequest::PublishSnapshotImage { .. }) => self.prepare_image(request),
@@ -284,6 +288,65 @@ impl HostService {
             },
         };
         result.unwrap_or_else(|error| HostDispatch::Ready(Box::new(rejected(error))))
+    }
+
+    fn prepare_snapshot(
+        &mut self,
+        request: sandsurf_protocol::SnapshotRequest,
+        approval_id: CommitmentId,
+    ) -> Result<HostDispatch> {
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request))?;
+        let historical = self.catalog.operation(&request.operation_id)?.is_some();
+        if !historical {
+            self.catalog
+                .require_revision(&request.machine_id, request.expected_revision)?;
+            self.provision_guardian(&request.machine_id)?;
+            let inspection = GuardianClient::new(self.guardian_endpoint(&request.machine_id))
+                .inspect(request.machine_id.clone(), None)?;
+            let Observation::Current { value: machine } = inspection.observation else {
+                return Err(HostError::Invalid(
+                    "snapshot requires a current machine observation",
+                ));
+            };
+            if machine.generation != request.expected_generation
+                || machine.applied_revision != request.expected_revision
+                || !matches!(machine.state, MachineState::Running | MachineState::Paused)
+            {
+                return Err(HostError::Invalid(
+                    "snapshot requires the expected running or paused generation and revision",
+                ));
+            }
+        }
+        let admitted = self.catalog.admit_snapshot(
+            request.clone(),
+            Approval {
+                id: approval_id,
+                request_digest: request_digest.clone(),
+            },
+        )?;
+        if admitted.phase == SnapshotPhase::Ready {
+            return Ok(HostDispatch::Ready(Box::new(HostResponse::Snapshot {
+                value: admitted,
+            })));
+        }
+        // A completed opaque input remains finishable after native destruction.
+        // Only a retained native pause owner, or missing capture input, requires
+        // a machine attachment. Record presence is not completion evidence.
+        if crate::capture::CaptureBoundary::read(&self.machine_root(&request.machine_id))?.is_some()
+            || !crate::snapshots::has_capture_record(
+                &crate::snapshots::root(&self.root, &admitted),
+                &admitted,
+            )?
+        {
+            self.provision_guardian(&request.machine_id)?;
+        }
+        let capturing = self.catalog.begin_snapshot(&request.id, &request_digest)?;
+        Ok(HostDispatch::Task(Box::new(HostTask::Snapshot {
+            root: self.root.clone(),
+            executable: self.executable.clone(),
+            endpoint: self.guardian_endpoint(&request.machine_id),
+            capturing: Box::new(capturing),
+        })))
     }
 
     fn prepare_image(&mut self, request: HostRequest) -> Result<HostDispatch> {
@@ -415,7 +478,7 @@ impl HostService {
                     job: crate::image_worker::Job {
                         operation: operation_id,
                         request_digest,
-                        build: crate::image_worker::Build::Snapshot {
+                        build: crate::image_worker::Build::PublishSnapshot {
                             snapshot: Box::new(snapshot),
                             allow_sensitive,
                         },
@@ -678,168 +741,8 @@ impl HostService {
                     .snapshot(&snapshot_id)?
                     .ok_or(HostError::Invalid("snapshot does not exist"))?,
             }),
-            HostRequest::CreateSnapshot {
-                request,
-                approval_id,
-            } => {
-                let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request))?;
-                let historical = self.catalog.operation(&request.operation_id)?.is_some();
-                if !historical {
-                    self.catalog
-                        .require_revision(&request.machine_id, request.expected_revision)?;
-                    self.provision_guardian(&request.machine_id)?;
-                    let inspection =
-                        GuardianClient::new(self.guardian_endpoint(&request.machine_id))
-                            .inspect(request.machine_id.clone(), None)?;
-                    let Observation::Current { value: machine } = inspection.observation else {
-                        return Err(HostError::Invalid(
-                            "snapshot requires a current machine observation",
-                        ));
-                    };
-                    if machine.generation != request.expected_generation
-                        || machine.applied_revision != request.expected_revision
-                        || !matches!(machine.state, MachineState::Running | MachineState::Paused)
-                    {
-                        return Err(HostError::Invalid(
-                            "snapshot requires the expected running or paused generation and revision",
-                        ));
-                    }
-                }
-                let admitted = self.catalog.admit_snapshot(
-                    request.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == SnapshotPhase::Ready {
-                    return Ok(HostResponse::Snapshot { value: admitted });
-                }
-                self.provision_guardian(&request.machine_id)?;
-                let capture_root = crate::snapshots::root(&self.root, &admitted);
-                if admitted.phase == SnapshotPhase::Capturing {
-                    let client = GuardianClient::new(self.guardian_endpoint(&request.machine_id));
-                    match request.kind {
-                        SnapshotKind::Disk => {
-                            client.native_snapshot(
-                                request.machine_id.clone(),
-                                NativeSnapshotRequest::FinishDisk {
-                                    operation_id: request.operation_id.clone(),
-                                },
-                            )?;
-                        }
-                        SnapshotKind::Full => {
-                            client.native_snapshot(
-                                request.machine_id.clone(),
-                                NativeSnapshotRequest::FinishFull {
-                                    operation_id: request.operation_id.clone(),
-                                },
-                            )?;
-                        }
-                    }
-                }
-                let capturing = self.catalog.begin_snapshot(&request.id, &request_digest)?;
-                if let Some(captured) =
-                    crate::snapshots::published_filesystem(&capture_root, &capturing)?
-                {
-                    return Ok(HostResponse::Snapshot {
-                        value: complete_snapshot_capture(
-                            &mut self.catalog,
-                            &request.id,
-                            &request_digest,
-                            captured,
-                        )?,
-                    });
-                }
-                let client = GuardianClient::new(self.guardian_endpoint(&request.machine_id));
-                let machine_root = self.machine_root(&request.machine_id);
-                let (captured, finished) = match request.kind {
-                    SnapshotKind::Disk => {
-                        // The catalog owns images; snapshot bytes belong to a
-                        // separate machine volume. Verify before acquiring the
-                        // pause boundary, never infer an image store from it.
-                        let image = crate::images::resolve_native_image(
-                            &self.root,
-                            &capturing.image_digest,
-                        )?;
-                        let prepared = client.native_snapshot(
-                            request.machine_id.clone(),
-                            NativeSnapshotRequest::PrepareDisk {
-                                operation_id: request.operation_id.clone(),
-                            },
-                        )?;
-                        if !matches!(prepared, NativeSnapshotResponse::Complete { .. }) {
-                            return Err(HostError::Invalid(
-                                "guardian did not establish the native disk capture boundary",
-                            ));
-                        }
-                        let captured = crate::snapshots::capture_filesystem(
-                            &capture_root,
-                            &capturing,
-                            &machine_root.join("disks").join(system_disk_name()),
-                            &image,
-                        );
-                        let finished = client
-                            .native_snapshot(
-                                request.machine_id.clone(),
-                                NativeSnapshotRequest::FinishDisk {
-                                    operation_id: request.operation_id.clone(),
-                                },
-                            )
-                            .map(|response| {
-                                matches!(response, NativeSnapshotResponse::Complete { .. })
-                            });
-                        (captured, finished)
-                    }
-                    SnapshotKind::Full => {
-                        let prepared = client.native_snapshot(
-                            request.machine_id.clone(),
-                            NativeSnapshotRequest::PrepareFull {
-                                snapshot_id: request.id.clone(),
-                                operation_id: request.operation_id.clone(),
-                            },
-                        )?;
-                        let NativeSnapshotResponse::Prepared { capture } = prepared else {
-                            return Err(HostError::Invalid(
-                                "guardian did not establish a full capture boundary",
-                            ));
-                        };
-                        let captured = crate::snapshots::capture_full(
-                            &capture_root,
-                            &capturing,
-                            &machine_root.join("disks").join(system_disk_name()),
-                            &machine_root
-                                .join("guardian/full-captures")
-                                .join(object_name(request.operation_id.as_str())),
-                            capture,
-                        );
-                        let finished = client
-                            .native_snapshot(
-                                request.machine_id.clone(),
-                                NativeSnapshotRequest::FinishFull {
-                                    operation_id: request.operation_id.clone(),
-                                },
-                            )
-                            .map(|response| {
-                                matches!(response, NativeSnapshotResponse::Complete { .. })
-                            });
-                        (captured, finished)
-                    }
-                };
-                let captured = captured?;
-                if !finished? {
-                    return Err(HostError::Invalid(
-                        "guardian did not release the snapshot capture boundary",
-                    ));
-                }
-                Ok(HostResponse::Snapshot {
-                    value: complete_snapshot_capture(
-                        &mut self.catalog,
-                        &request.id,
-                        &request_digest,
-                        captured,
-                    )?,
-                })
+            HostRequest::CreateSnapshot { .. } => {
+                Err(HostError::Invalid("snapshot requires deferred admission"))
             }
             HostRequest::ImportOci { .. }
             | HostRequest::ImportNativeImage { .. }
@@ -1007,11 +910,13 @@ impl HostService {
                 // verified and resumed by the same exact snapshot identity.
                 let materialized_before_owner = !system_disk.exists();
                 if materialized_before_owner {
-                    crate::snapshots::materialize_fork(
-                        &crate::snapshots::root(&self.root, &snapshot),
+                    crate::image_worker::materialize_fork(
+                        &self.root,
+                        &self.executable,
                         &snapshot,
-                        &system_disk,
-                        &clone_profile,
+                        &machine_id,
+                        clone_profile,
+                        &operation_id,
                     )?;
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1035,11 +940,13 @@ impl HostService {
                         && value.guardian_operation.delivery == Delivery::NotApplied
                 }) {
                     if !materialized_before_owner {
-                        crate::snapshots::materialize_fork(
-                            &crate::snapshots::root(&self.root, &snapshot),
+                        crate::image_worker::materialize_fork(
+                            &self.root,
+                            &self.executable,
                             &snapshot,
-                            &system_disk,
-                            &clone_profile,
+                            &machine_id,
+                            clone_profile,
+                            &operation_id,
                         )?;
                     }
                     lifecycle = Some(apply_lifecycle(
@@ -1824,6 +1731,8 @@ impl HostService {
                     NativeSnapshotRequest::PrepareFull {
                         snapshot_id: snapshot_id.clone(),
                         operation_id: capture_operation_id.clone(),
+                        expected_generation: capturing.request.expected_generation,
+                        expected_revision: capturing.request.expected_revision,
                     },
                 )?;
                 let NativeSnapshotResponse::Prepared { capture } = prepared else {
@@ -2248,6 +2157,18 @@ impl HostService {
 
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
         match completion {
+            HostTaskCompletion::Snapshot {
+                snapshot_id,
+                request_digest,
+                result,
+            } => Ok(HostResponse::Snapshot {
+                value: complete_snapshot_capture(
+                    &mut self.catalog,
+                    &snapshot_id,
+                    &request_digest,
+                    result?,
+                )?,
+            }),
             HostTaskCompletion::Image {
                 operation,
                 request_digest,
@@ -2896,7 +2817,144 @@ impl HostDispatch {
 
 /// Immutable admitted effects run away from the catalog writer. Only owner
 /// completion may change durable host state; workers never receive the catalog.
+fn capture_snapshot(
+    root: &Path,
+    executable: &Path,
+    endpoint: &Path,
+    capturing: &sandsurf_protocol::Snapshot,
+) -> Result<crate::snapshots::CaptureResult> {
+    let request = &capturing.request;
+    let capture_root = crate::snapshots::root(root, capturing);
+    crate::snapshots::private_directory(&capture_root)?;
+    let _custody = sandsurf_native::storage::disk_lease(&capture_root.join(format!(
+        ".{}.task.lock",
+        object_name(request.operation_id.as_str())
+    )))?;
+    let machine_root = root
+        .join("machines")
+        .join(object_name(request.machine_id.as_str()));
+    if crate::capture::CaptureBoundary::require(&machine_root, &request.operation_id)?.is_some() {
+        let client = GuardianClient::new(endpoint.to_path_buf());
+        match request.kind {
+            SnapshotKind::Disk => {
+                client.native_snapshot(
+                    request.machine_id.clone(),
+                    NativeSnapshotRequest::FinishDisk {
+                        operation_id: request.operation_id.clone(),
+                    },
+                )?;
+            }
+            SnapshotKind::Full => {
+                client.native_snapshot(
+                    request.machine_id.clone(),
+                    NativeSnapshotRequest::FinishFull {
+                        operation_id: request.operation_id.clone(),
+                    },
+                )?;
+            }
+        }
+    }
+    if let Some(captured) = crate::snapshots::published_filesystem(&capture_root, capturing)? {
+        return Ok(captured);
+    }
+    let client = GuardianClient::new(endpoint.to_path_buf());
+    let (captured, finished) = match request.kind {
+        SnapshotKind::Disk => {
+            // The catalog owns images; snapshot bytes belong to a
+            // separate machine volume. Verify before acquiring the
+            // pause boundary, never infer an image store from it.
+            crate::images::resolve_native_image(root, &capturing.image_digest)?;
+            if !crate::snapshots::prepared_filesystem(&capture_root, capturing)? {
+                let prepared = client.native_snapshot(
+                    request.machine_id.clone(),
+                    NativeSnapshotRequest::PrepareDisk {
+                        operation_id: request.operation_id.clone(),
+                        expected_generation: request.expected_generation,
+                        expected_revision: request.expected_revision,
+                    },
+                )?;
+                if !matches!(prepared, NativeSnapshotResponse::Complete { .. }) {
+                    return Err(HostError::Invalid(
+                        "guardian did not establish the native disk capture boundary",
+                    ));
+                }
+                let captured = crate::snapshots::prepare_filesystem(
+                    &capture_root,
+                    capturing,
+                    &machine_root.join("disks").join(system_disk_name()),
+                );
+                let finished = client
+                    .native_snapshot(
+                        request.machine_id.clone(),
+                        NativeSnapshotRequest::FinishDisk {
+                            operation_id: request.operation_id.clone(),
+                        },
+                    )
+                    .map(|response| matches!(response, NativeSnapshotResponse::Complete { .. }));
+                // Native pause protects only the opaque disk copy.
+                // Filesystem parsing runs after release, against the
+                // durably published input, in the shared worker pool.
+                captured?;
+                if !finished? {
+                    return Err(HostError::Invalid(
+                        "guardian did not release disk copy boundary",
+                    ));
+                }
+            }
+            let captured = crate::image_worker::finish_disk_snapshot(root, executable, capturing)?;
+            (Ok(captured), Ok(true))
+        }
+        SnapshotKind::Full => {
+            let prepared = client.native_snapshot(
+                request.machine_id.clone(),
+                NativeSnapshotRequest::PrepareFull {
+                    snapshot_id: request.id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    expected_generation: request.expected_generation,
+                    expected_revision: request.expected_revision,
+                },
+            )?;
+            let NativeSnapshotResponse::Prepared { capture } = prepared else {
+                return Err(HostError::Invalid(
+                    "guardian did not establish a full capture boundary",
+                ));
+            };
+            let captured = crate::snapshots::capture_full(
+                &capture_root,
+                capturing,
+                &machine_root.join("disks").join(system_disk_name()),
+                &machine_root
+                    .join("guardian/full-captures")
+                    .join(object_name(request.operation_id.as_str())),
+                capture,
+            );
+            let finished = client
+                .native_snapshot(
+                    request.machine_id.clone(),
+                    NativeSnapshotRequest::FinishFull {
+                        operation_id: request.operation_id.clone(),
+                    },
+                )
+                .map(|response| matches!(response, NativeSnapshotResponse::Complete { .. }));
+            (captured, finished)
+        }
+    };
+    let captured = captured?;
+    if !finished? {
+        return Err(HostError::Invalid(
+            "guardian did not release the snapshot capture boundary",
+        ));
+    }
+    Ok(captured)
+}
+
 enum HostTask {
+    Snapshot {
+        root: PathBuf,
+        executable: PathBuf,
+        endpoint: PathBuf,
+        capturing: Box<sandsurf_protocol::Snapshot>,
+    },
     Image {
         root: PathBuf,
         executable: PathBuf,
@@ -2926,6 +2984,11 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    Snapshot {
+        snapshot_id: sandsurf_protocol::SnapshotId,
+        request_digest: Digest,
+        result: Result<crate::snapshots::CaptureResult>,
+    },
     Image {
         operation: OperationId,
         request_digest: Digest,
@@ -2947,6 +3010,16 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::Snapshot {
+                root,
+                executable,
+                endpoint,
+                capturing,
+            } => HostTaskCompletion::Snapshot {
+                snapshot_id: capturing.request.id.clone(),
+                request_digest: capturing.request_digest.clone(),
+                result: capture_snapshot(&root, &executable, &endpoint, &capturing),
+            },
             Self::Image {
                 root,
                 executable,
@@ -3748,6 +3821,81 @@ mod tests {
             )
             .unwrap();
         machine
+    }
+
+    #[test]
+    fn duplicate_snapshot_tasks_cannot_release_an_active_capture_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "sssnap-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let request = sandsurf_protocol::SnapshotRequest {
+            id: "snapshot".try_into().unwrap(),
+            operation_id: "capture".try_into().unwrap(),
+            machine_id: machine.clone(),
+            expected_generation: Counter::ONE,
+            expected_revision: Counter::ONE,
+            kind: SnapshotKind::Disk,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+        service
+            .catalog
+            .admit_snapshot(
+                request.clone(),
+                Approval {
+                    id: "approve-capture".try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        let capturing = service
+            .catalog
+            .begin_snapshot(&request.id, &request_digest)
+            .unwrap();
+        prepare_directory(&service.root.join("machines")).unwrap();
+        prepare_directory(&service.machine_root(&machine)).unwrap();
+        let capture_root = crate::snapshots::root(&root, &capturing);
+        prepare_directory(&capture_root).unwrap();
+        let custody = sandsurf_native::storage::disk_lease(&capture_root.join(format!(
+            ".{}.task.lock",
+            object_name(request.operation_id.as_str())
+        )))
+        .unwrap();
+        let task = HostTask::Snapshot {
+            root: root.clone(),
+            executable: service.executable.clone(),
+            endpoint: root.join("absent-native-owner"),
+            capturing: Box::new(capturing),
+        };
+        let completion = task.execute();
+        assert!(
+            matches!(&completion, HostTaskCompletion::Snapshot { result: Err(HostError::Io(error)), .. } if error.kind() == io::ErrorKind::WouldBlock),
+            "custody must be acquired before recovery can send FinishDisk to the native owner"
+        );
+        assert!(service.complete_task(completion).is_err());
+        assert_eq!(
+            service
+                .catalog
+                .snapshot(&request.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            SnapshotPhase::Capturing
+        );
+        assert!(matches!(
+            service.handle(HostRequest::ListMachines {
+                after: None,
+                maximum: counter(16)
+            }),
+            HostResponse::Machines { .. }
+        ));
+        drop(custody);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

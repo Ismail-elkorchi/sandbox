@@ -443,6 +443,16 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn native_snapshot(
+        &mut self,
+        _request: NativeSnapshotRequest,
+        _journal: &mut RuntimeJournal,
+    ) -> sandsurf_host::guardian::Result<NativeSnapshotResponse> {
+        fs::write(self.path.parent().unwrap().join("snapshot-delivered"), [])?;
+        Ok(NativeSnapshotResponse::Complete {
+            evidence: hash("native snapshot"),
+        })
+    }
     fn retire_restore_intent(&mut self) -> sandsurf_host::guardian::Result<()> {
         let path = self
             .path
@@ -828,6 +838,84 @@ fn native_measurements_are_durable_independent_facts_and_unavailability_is_not_s
 }
 
 #[test]
+fn capture_generation_and_revision_are_fenced_at_the_native_owner() {
+    let fixture = Fixture::new();
+    let runtime = RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.machine).unwrap();
+    let mut guardian = Guardian::new(
+        runtime,
+        FileEffect {
+            path: fixture.root.0.join("effects.log"),
+        },
+    );
+    let delivered = fixture.root.0.join("snapshot-delivered");
+    for (generation, revision) in [(n(2), n(2)), (n(1), n(3))] {
+        for request in [
+            NativeSnapshotRequest::PrepareDisk {
+                operation_id: "capture".try_into().unwrap(),
+                expected_generation: generation,
+                expected_revision: revision,
+            },
+            NativeSnapshotRequest::PrepareFull {
+                snapshot_id: "snapshot".try_into().unwrap(),
+                operation_id: "capture".try_into().unwrap(),
+                expected_generation: generation,
+                expected_revision: revision,
+            },
+        ] {
+            assert!(
+                matches!(guardian.handle(GuardianRequest::NativeSnapshot { machine_id: fixture.machine.clone(), request }), GuardianResponse::Rejected { message, .. } if message.contains("capture generation, revision or native power changed"))
+            );
+            assert!(
+                !delivered.exists(),
+                "stale requests never reach native capture"
+            );
+        }
+    }
+    assert!(matches!(
+        guardian.handle(GuardianRequest::NativeSnapshot {
+            machine_id: fixture.machine.clone(),
+            request: NativeSnapshotRequest::PrepareDisk {
+                operation_id: "capture".try_into().unwrap(),
+                expected_generation: n(1),
+                expected_revision: n(2)
+            }
+        }),
+        GuardianResponse::NativeSnapshot { .. }
+    ));
+    fs::remove_file(&delivered).unwrap();
+    fs::write(
+        fixture.root.0.join("native-power"),
+        serde_json::to_vec(&MachineState::Stopped).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        guardian.handle(GuardianRequest::NativeSnapshot {
+            machine_id: fixture.machine.clone(),
+            request: NativeSnapshotRequest::PrepareDisk {
+                operation_id: "capture".try_into().unwrap(),
+                expected_generation: n(1),
+                expected_revision: n(2)
+            }
+        }),
+        GuardianResponse::Rejected { .. }
+    ));
+    assert!(
+        !delivered.exists(),
+        "positive native shutdown is sampled before capture"
+    );
+    // Completion releases its own boundary even after the public fence changes.
+    assert!(matches!(
+        guardian.handle(GuardianRequest::NativeSnapshot {
+            machine_id: fixture.machine.clone(),
+            request: NativeSnapshotRequest::FinishDisk {
+                operation_id: "capture".try_into().unwrap()
+            }
+        }),
+        GuardianResponse::NativeSnapshot { .. }
+    ));
+}
+
+#[test]
 fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner() {
     let fixture = Fixture::new();
     let path = fixture.root.0.join("runtime");
@@ -853,7 +941,9 @@ fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner(
         guardian.handle(GuardianRequest::NativeSnapshot {
             machine_id: fixture.machine.clone(),
             request: NativeSnapshotRequest::PrepareDisk {
-                operation_id: "capture-retired".try_into().unwrap()
+                operation_id: "capture-retired".try_into().unwrap(),
+                expected_generation: Counter::ONE,
+                expected_revision: Counter::ONE,
             },
         }),
         GuardianResponse::Rejected { .. }
@@ -1125,7 +1215,6 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let host_path = fixture.root.0.join("host");
     drop(fixture.host);
     let mut host = HostCatalog::open(&host_path).unwrap();
-    let link = HostGuardianLink::new(&host, endpoint.clone());
     let operation = GuardianClient::new(endpoint.clone())
         .dispatch(fixture.command.clone())
         .unwrap();
@@ -1137,7 +1226,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
             .count(),
         1
     );
-    let inspection = link
+    let inspection = GuardianClient::new(endpoint.clone())
         .inspect(
             fixture.machine.clone(),
             Some(fixture.command.operation_id.clone()),
@@ -1154,7 +1243,6 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     ));
     assert_eq!(inspection.operation, Some(operation));
     assert_eq!(inspection.lifecycle_operation, None);
-    drop(link);
 
     let pause: OperationId = "pause-machine".try_into().unwrap();
     let request_digest = digest(
@@ -1178,8 +1266,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let lifecycle = result.guardian_operation;
     assert_eq!(lifecycle.delivery, Delivery::Applied);
     assert!(result.completed_intent.unwrap().completion.is_some());
-    let link = HostGuardianLink::new(&host, endpoint.clone());
-    let inspection = link
+    let inspection = GuardianClient::new(endpoint.clone())
         .inspect(fixture.machine.clone(), Some(pause.clone()))
         .unwrap();
     assert!(matches!(
@@ -1193,7 +1280,6 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     ));
     assert_eq!(inspection.lifecycle_operation, Some(lifecycle.clone()));
     assert!(host.intent(&pause).unwrap().unwrap().completion.is_some());
-    drop(link);
 
     let resume: OperationId = "resume-machine".try_into().unwrap();
     let request_digest = digest(
@@ -1218,7 +1304,7 @@ fn guardian_survives_host_restart_and_never_replays_a_lost_dispatch_response() {
     let replayed = apply_lifecycle(&mut host, endpoint.clone(), &pause).unwrap();
     assert_eq!(replayed.guardian_operation, lifecycle);
     assert_eq!(replayed.completed_intent, host.intent(&pause).unwrap());
-    let current = HostGuardianLink::new(&host, endpoint)
+    let current = GuardianClient::new(endpoint)
         .inspect(fixture.machine.clone(), None)
         .unwrap();
     assert!(matches!(

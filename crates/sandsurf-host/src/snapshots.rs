@@ -77,6 +77,7 @@ struct SnapshotManifest {
     boot: sandsurf_image::boot::FrozenBoot,
 }
 
+#[derive(Debug)]
 pub struct CaptureResult {
     pub disk_digest: Digest,
     pub manifest_digest: Digest,
@@ -91,10 +92,121 @@ pub fn published_filesystem(root: &Path, snapshot: &Snapshot) -> Result<Option<C
     Ok(Some(verify_published(&directory, snapshot)?))
 }
 
-pub fn capture_filesystem(
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiskCaptureInput {
+    request_digest: Digest,
+    image_digest: Digest,
+    bytes: sandsurf_protocol::Counter,
+    disk_digest: Digest,
+}
+
+fn disk_stage(root: &Path, snapshot: &Snapshot) -> PathBuf {
+    root.join(format!(
+        ".{}.{}.capture",
+        object_name(snapshot.request.id.as_str()),
+        object_name(snapshot.request.operation_id.as_str())
+    ))
+}
+
+/// A routing hint only: retained records may let finishing proceed without a
+/// live machine. Neither a record nor this observation establishes completion;
+/// the capture task must verify all corresponding bytes before publication.
+pub(crate) fn has_capture_record(root: &Path, snapshot: &Snapshot) -> Result<bool> {
+    let published = root
+        .join(object_name(snapshot.request.id.as_str()))
+        .join("manifest.json");
+    let input = disk_stage(root, snapshot).join("disk-input.json");
+    for path in std::iter::once(published)
+        .chain((snapshot.request.kind == SnapshotKind::Disk).then_some(input))
+    {
+        match open_read(&path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+fn read_disk_input(stage: &Path, snapshot: &Snapshot) -> Result<Digest> {
+    private_directory(stage)?;
+    let input: DiskCaptureInput = crate::image_records::read(&stage.join("disk-input.json"))?;
+    if input.request_digest != snapshot.request_digest
+        || input.image_digest != snapshot.image_digest
+        || input.bytes != snapshot.system_disk_bytes
+    {
+        return Err(SnapshotError::Invalid("disk capture input binding changed"));
+    }
+    if file_digest(&stage.join("system.ext4"), input.bytes.get())? != input.disk_digest {
+        return Err(SnapshotError::Invalid("disk capture input bytes changed"));
+    }
+    Ok(input.disk_digest)
+}
+
+/// Observe an immutable byte capture, not the current computer or its power.
+/// A resumed/rebooted source cannot alter the bytes this operation finishes.
+pub(crate) fn prepared_filesystem(root: &Path, snapshot: &Snapshot) -> Result<bool> {
+    let stage = disk_stage(root, snapshot);
+    match fs::symlink_metadata(&stage) {
+        Ok(_) => {
+            read_disk_input(&stage, snapshot)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Copies only opaque disk bytes under the guardian's native pause boundary.
+/// Publish the complete input atomically before returning. Finishing can then
+/// outlive the API and its pause without reading a live machine disk again.
+pub(crate) fn prepare_filesystem(
     root: &Path,
     snapshot: &Snapshot,
     source_disk: &Path,
+) -> Result<()> {
+    if snapshot.request.kind != SnapshotKind::Disk {
+        return Err(SnapshotError::Invalid(
+            "disk input requires a disk snapshot",
+        ));
+    }
+    private_directory(root)?;
+    let _custody = sandsurf_native::storage::disk_lease(&root.join(format!(
+        ".{}.capture.lock",
+        object_name(snapshot.request.operation_id.as_str())
+    )))?;
+    let stage = disk_stage(root, snapshot);
+    if stage.exists() {
+        read_disk_input(&stage, snapshot)?;
+        return Ok(());
+    }
+    let pending = stage.with_extension("input-building");
+    remove_stage(&pending)?;
+    private_directory(&pending)?;
+    let disk_digest = copy_and_verify(
+        source_disk,
+        &pending.join("system.ext4"),
+        snapshot.system_disk_bytes.get(),
+        None,
+    )?;
+    write_record(
+        &pending.join("disk-input.json"),
+        &DiskCaptureInput {
+            request_digest: snapshot.request_digest.clone(),
+            image_digest: snapshot.image_digest.clone(),
+            bytes: snapshot.system_disk_bytes,
+            disk_digest,
+        },
+    )?;
+    sync_directory(&pending)?;
+    sandsurf_native::storage::publish_new_directory(&pending, &stage)?;
+    sync_directory(root)
+}
+
+pub(crate) fn finish_filesystem(
+    root: &Path,
+    snapshot: &Snapshot,
     image: &sandsurf_image::VerifiedImage,
 ) -> Result<CaptureResult> {
     if snapshot.request.kind != SnapshotKind::Disk
@@ -105,18 +217,17 @@ pub fn capture_filesystem(
         ));
     }
     private_directory(root)?;
+    let _custody = sandsurf_native::storage::disk_lease(&root.join(format!(
+        ".{}.capture.lock",
+        object_name(snapshot.request.operation_id.as_str())
+    )))?;
     let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
         return verify_published(&final_directory, snapshot);
     }
-    let stage = root.join(format!(
-        ".{}.{}.capture",
-        object_name(snapshot.request.id.as_str()),
-        object_name(snapshot.request.operation_id.as_str())
-    ));
-    private_directory(&stage)?;
+    let stage = disk_stage(root, snapshot);
     let disk = stage.join("system.ext4");
-    let disk_digest = copy_and_verify(source_disk, &disk, snapshot.system_disk_bytes.get(), None)?;
+    let disk_digest = read_disk_input(&stage, snapshot)?;
     let manifest = SnapshotManifest {
         format_version: 1,
         snapshot_id: snapshot.request.id.clone(),
@@ -130,10 +241,23 @@ pub fn capture_filesystem(
         sensitive: snapshot.sensitive,
         kind: SnapshotKind::Disk,
         full: None,
-        boot: capture_boot(image, &disk, &stage)?,
+        boot: crate::storage::freeze_boot(image, &disk, &stage.join("boot"))?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
-    write_manifest(&stage.join("manifest.json"), &manifest)?;
+    // Exact interrupted retries may already have a complete immutable record.
+    let manifest_path = stage.join("manifest.json");
+    if manifest_path.exists() {
+        let previous: SnapshotManifest = crate::image_records::read(&manifest_path)?;
+        if previous != manifest {
+            return Err(SnapshotError::Invalid(
+                "disk capture publication binding changed",
+            ));
+        }
+    } else {
+        let building = stage.join("manifest-building");
+        write_record(&building, &manifest)?;
+        sandsurf_native::storage::publish_new_file(&building, &manifest_path)?;
+    }
     sync_directory(&stage)?;
     match sandsurf_native::storage::publish_new_directory(&stage, &final_directory) {
         Ok(()) => sync_directory(root)?,
@@ -273,7 +397,7 @@ pub fn capture_full(
         boot: crate::storage::copy_boot(&native_directory.join("boot"), &stage.join("boot"))?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
-    write_manifest(&stage.join("manifest.json"), &manifest)?;
+    write_record(&stage.join("manifest.json"), &manifest)?;
     sync_directory(&stage)?;
     match sandsurf_native::storage::publish_new_directory(&stage, &final_directory) {
         Ok(()) => sync_directory(root)?,
@@ -288,6 +412,14 @@ pub fn capture_full(
         manifest_digest,
         full: Some(full),
     })
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForkReceipt {
+    source: Digest,
+    profile: sandsurf_image::identity::CloneProfile,
+    customized: Digest,
 }
 
 pub fn materialize_fork(
@@ -305,13 +437,6 @@ pub fn materialize_fork(
         .parent()
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
-    #[derive(Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase", deny_unknown_fields)]
-    struct ForkReceipt {
-        source: Digest,
-        profile: sandsurf_image::identity::CloneProfile,
-        customized: Digest,
-    }
     let receipt_path = destination.with_extension("fork.json");
     crate::storage::publish_disk(destination, snapshot.system_disk_bytes.get(), |staged| {
         copy_and_verify(
@@ -341,6 +466,23 @@ pub fn materialize_fork(
         drop(file);
         sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
     })?;
+    verify_fork(snapshot, destination, profile)?;
+    sync_directory(parent)
+}
+
+/// The Ready storage owner and complete bytes back a fork completion. This
+/// does not rerun customization or interpret the guest filesystem on retry.
+pub(crate) fn verify_fork(
+    snapshot: &Snapshot,
+    destination: &Path,
+    profile: &sandsurf_image::identity::CloneProfile,
+) -> Result<Digest> {
+    let expected = snapshot
+        .system_disk_digest
+        .as_ref()
+        .ok_or(SnapshotError::Invalid("snapshot has no captured disk"))?;
+    let _custody = crate::storage::attach(destination)?;
+    let receipt_path = destination.with_extension("fork.json");
     let mut receipt_bytes = Vec::new();
     sandsurf_native::local::open_private_file(
         &receipt_path,
@@ -362,7 +504,7 @@ pub fn materialize_fork(
             "fork destination contains different state",
         ));
     }
-    sync_directory(parent)
+    Ok(receipt.customized)
 }
 
 /// Materialize a snapshot as the initial writable-state template of a
@@ -438,35 +580,19 @@ fn snapshot_disk(root: &Path, snapshot: &Snapshot) -> Result<PathBuf> {
     Ok(directory.join("system.ext4"))
 }
 
-fn capture_boot(
-    image: &sandsurf_image::VerifiedImage,
-    disk: &Path,
-    stage: &Path,
-) -> Result<sandsurf_image::boot::FrozenBoot> {
-    // Stages are private and never attachable. Interrupted extraction is
-    // discarded, while published boot artifacts are always digest verified.
-    let directory = stage.join("boot");
-    if directory.exists() {
-        fs::remove_dir_all(&directory)?;
-    }
-    Ok(crate::storage::freeze_boot(image, disk, &directory)?)
-}
-
 pub(crate) fn boot_artifacts(
     root: &Path,
     snapshot: &Snapshot,
 ) -> Result<(PathBuf, sandsurf_image::boot::FrozenBoot)> {
     let directory = root.join(object_name(snapshot.request.id.as_str()));
     verify_published(&directory, snapshot)?;
-    let manifest: SnapshotManifest =
-        serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    let manifest: SnapshotManifest = crate::image_records::read(&directory.join("manifest.json"))?;
     Ok((directory.join("boot"), manifest.boot))
 }
 
 fn verify_published(directory: &Path, snapshot: &Snapshot) -> Result<CaptureResult> {
     private_directory(directory)?;
-    let manifest: SnapshotManifest =
-        serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    let manifest: SnapshotManifest = crate::image_records::read(&directory.join("manifest.json"))?;
     sandsurf_image::boot::verify(&directory.join("boot"), &manifest.boot)?;
     if manifest.format_version != 1
         || manifest.snapshot_id != snapshot.request.id
@@ -602,10 +728,14 @@ pub(crate) fn file_digest(path: &Path, length: u64) -> Result<Digest> {
     Ok(format!("{:x}", hash.finalize()).try_into()?)
 }
 
-fn write_manifest(path: &Path, manifest: &SnapshotManifest) -> Result<()> {
+fn write_record(path: &Path, manifest: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec(manifest)?;
+    if bytes.len() > sandsurf_protocol::MAX_CONTROL_BYTES {
+        return Err(SnapshotError::Invalid("snapshot record exceeds bound"));
+    }
     let mut file = open_write(path)?;
     file.set_len(0)?;
-    serde_json::to_writer(&mut file, manifest)?;
+    file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     sandsurf_native::storage::sync_file(&file)?;
     Ok(())
@@ -629,11 +759,25 @@ fn open_write(path: &Path) -> io::Result<File> {
 }
 
 fn remove_stage(stage: &Path) -> Result<()> {
+    match fs::symlink_metadata(stage) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            private_directory(stage)?
+        }
+        Ok(_) => {
+            return Err(SnapshotError::Invalid(
+                "snapshot stage is not a private directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
     if stage.join("boot").exists() {
         fs::remove_dir_all(stage.join("boot"))?;
     }
     for name in [
         "manifest.json",
+        "manifest-building",
+        "disk-input.json",
         "system.ext4",
         "snapshot.vmstate",
         "memory",
@@ -792,6 +936,84 @@ mod tests {
     }
 
     #[test]
+    fn immutable_disk_input_survives_source_loss_and_interrupted_finishing() {
+        let temp = Temp::new();
+        let disk = temp.0.join("source.raw");
+        open_write(&disk).unwrap().write_all(&[3; 4096]).unwrap();
+        let snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        private_directory(&root).unwrap();
+        let stage = disk_stage(&root, &snapshot);
+        let pending = stage.with_extension("input-building");
+        private_directory(&pending).unwrap();
+        open_write(&pending.join("system.ext4"))
+            .unwrap()
+            .write_all(b"interrupted")
+            .unwrap();
+        prepare_filesystem(&root, &snapshot, &disk).unwrap();
+        assert!(!pending.exists());
+        assert!(prepared_filesystem(&root, &snapshot).unwrap());
+        fs::remove_file(&disk).unwrap();
+        prepare_filesystem(&root, &snapshot, &disk).unwrap();
+        assert_eq!(fs::read(stage.join("system.ext4")).unwrap(), [3; 4096]);
+        let custody = sandsurf_native::storage::disk_lease(&root.join(format!(
+            ".{}.capture.lock",
+            object_name(snapshot.request.operation_id.as_str())
+        )))
+        .unwrap();
+        let image = temp.image(&snapshot);
+        assert!(finish_filesystem(&root, &snapshot, &image).is_err());
+        drop(custody);
+        // A crash while writing the final manifest must not recopy the source
+        // or discard the already complete captured input.
+        open_write(&stage.join("manifest-building"))
+            .unwrap()
+            .write_all(b"partial")
+            .unwrap();
+        let captured = finish_filesystem(&root, &snapshot, &image).unwrap();
+        let retried = finish_filesystem(&root, &snapshot, &image).unwrap();
+        assert_eq!(captured.disk_digest, retried.disk_digest);
+        assert_eq!(captured.manifest_digest, retried.manifest_digest);
+        assert_eq!(
+            fs::read(
+                root.join(object_name(snapshot.request.id.as_str()))
+                    .join("system.ext4")
+            )
+            .unwrap(),
+            [3; 4096]
+        );
+    }
+
+    #[test]
+    fn captured_input_requires_matching_binding_and_actual_bytes() {
+        let temp = Temp::new();
+        let disk = temp.0.join("source.raw");
+        open_write(&disk).unwrap().write_all(&[3; 4096]).unwrap();
+        let snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        prepare_filesystem(&root, &snapshot, &disk).unwrap();
+        let mut changed = snapshot.clone();
+        changed.request_digest = bytes_digest(b"another request");
+        assert!(prepared_filesystem(&root, &changed).is_err());
+        fs::write(disk_stage(&root, &snapshot).join("system.ext4"), [9; 4096]).unwrap();
+        assert!(prepared_filesystem(&root, &snapshot).is_err());
+        assert!(finish_filesystem(&root, &snapshot, &temp.image(&snapshot)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_cleanup_never_follows_a_directory_symlink() {
+        let temp = Temp::new();
+        let outside = temp.0.join("outside");
+        private_directory(&outside).unwrap();
+        fs::write(outside.join("system.ext4"), b"retain").unwrap();
+        let stage = temp.0.join("stage");
+        std::os::unix::fs::symlink(&outside, &stage).unwrap();
+        assert!(remove_stage(&stage).is_err());
+        assert_eq!(fs::read(outside.join("system.ext4")).unwrap(), b"retain");
+    }
+
+    #[test]
     fn snapshot_boot_identity_rejects_changed_kernel_and_never_uses_pristine_seed() {
         let temp = Temp::new();
         let disk = temp.0.join("source.raw");
@@ -801,13 +1023,14 @@ mod tests {
         let image = temp.image(&snapshot);
         let mut foreign = snapshot.clone();
         foreign.image_digest = bytes_digest(b"another image");
-        assert!(capture_filesystem(&root, &foreign, &disk, &image).is_err());
+        assert!(finish_filesystem(&root, &foreign, &image).is_err());
         assert!(
             !root.exists(),
             "reject another image before allocating capture storage"
         );
         assert!(!root.parent().unwrap().join("images").exists());
-        capture_filesystem(&root, &snapshot, &disk, &image).unwrap();
+        prepare_filesystem(&root, &snapshot, &disk).unwrap();
+        finish_filesystem(&root, &snapshot, &image).unwrap();
         let directory = root.join(object_name(snapshot.request.id.as_str()));
         let kernel = directory.join("boot/kernel");
         #[cfg(unix)]
@@ -982,7 +1205,8 @@ mod tests {
         let mut snapshot = snapshot();
         let root = temp.capture_root(&snapshot);
         let image = temp.image(&snapshot);
-        let captured = capture_filesystem(&root, &snapshot, &source, &image).unwrap();
+        prepare_filesystem(&root, &snapshot, &source).unwrap();
+        let captured = finish_filesystem(&root, &snapshot, &image).unwrap();
         snapshot.phase = SnapshotPhase::Ready;
         snapshot.consistency = Some(SnapshotConsistency::Crash);
         snapshot.system_disk_digest = Some(captured.disk_digest.clone());
@@ -1006,6 +1230,34 @@ mod tests {
         .unwrap();
         assert!(!interrupted.exists());
         assert_eq!(file_digest(&fork, 4096).unwrap(), captured.disk_digest);
+        let custody = crate::storage::attach(&fork).unwrap();
+        assert!(
+            verify_fork(
+                &snapshot,
+                &fork,
+                &sandsurf_image::identity::CloneProfile::Preserve
+            )
+            .is_err(),
+            "a completion reference cannot bypass native disk custody"
+        );
+        drop(custody);
+        assert_eq!(
+            verify_fork(
+                &snapshot,
+                &fork,
+                &sandsurf_image::identity::CloneProfile::Preserve
+            )
+            .unwrap(),
+            captured.disk_digest
+        );
+        assert!(
+            verify_fork(
+                &snapshot,
+                &fork,
+                &sandsurf_image::identity::CloneProfile::Alpine
+            )
+            .is_err()
+        );
         fs::write(&fork, vec![8_u8; 4096]).unwrap();
         assert!(
             materialize_fork(

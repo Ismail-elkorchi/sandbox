@@ -866,7 +866,7 @@ impl GuardianEffect for LinuxGuardianEffect {
         journal: &mut RuntimeJournal,
     ) -> ControlResult<NativeSnapshotResponse> {
         match request {
-            NativeSnapshotRequest::PrepareDisk { operation_id } => {
+            NativeSnapshotRequest::PrepareDisk { operation_id, .. } => {
                 self.prepare_capture_boundary(operation_id, journal)?;
                 Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"native-computer-paused-for-disk-capture-v1"),
@@ -882,6 +882,7 @@ impl GuardianEffect for LinuxGuardianEffect {
             NativeSnapshotRequest::PrepareFull {
                 snapshot_id,
                 operation_id,
+                ..
             } => self.prepare_full_capture(snapshot_id, operation_id, journal),
             NativeSnapshotRequest::FinishFull { operation_id } => {
                 crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
