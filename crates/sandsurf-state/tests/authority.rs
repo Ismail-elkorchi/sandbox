@@ -4898,3 +4898,360 @@ fn malformed_output_index_is_unavailable_without_panicking_or_erasing_receipt() 
         assert!(runtime.read_output(&f.process, n(0), 64).is_err());
     }
 }
+
+fn resource_configuration(f: &mut Fixture, name: &str, output: u64) -> AuthorizedConfiguration {
+    let record = f.host.machine(&f.machine).unwrap().unwrap();
+    let mut resources = record.runtime_configuration.resources;
+    resources.output_bytes = n(output);
+    let operation = name.try_into().unwrap();
+    let request = digest(
+        Domain::Authority,
+        &(
+            "sandsurf-machine-resources-v1",
+            &f.machine,
+            &operation,
+            record.configuration_revision,
+            &resources,
+        ),
+    )
+    .unwrap();
+    let admitted = f
+        .host
+        .update_resources(
+            &f.machine,
+            &operation,
+            record.configuration_revision,
+            resources,
+            Approval {
+                id: format!("approve-{name}").try_into().unwrap(),
+                request_digest: request,
+            },
+        )
+        .unwrap();
+    f.host
+        .authorize_configuration(&f.machine, admitted.revision)
+        .unwrap()
+}
+
+fn reserve_resource_output(
+    f: &mut Fixture,
+    name: &str,
+    generation: Counter,
+    bytes: u64,
+) -> Result<()> {
+    let mut request = f.command.request.clone();
+    let GuestRequest::Spawn { request: spawn } = &mut request else {
+        unreachable!()
+    };
+    spawn.generation = generation;
+    spawn.execution_id = name.try_into().unwrap();
+    spawn.operation_id = name.try_into().unwrap();
+    spawn.output_bytes = n(bytes);
+    let execution = spawn.execution_id.clone();
+    let operation = spawn.operation_id.clone();
+    let command =
+        GuestCommand::new(f.machine.clone(), generation, operation.clone(), request).unwrap();
+    f.runtime.admit(command)?;
+    f.runtime
+        .admit_process(execution, &operation, n(bytes), false)
+}
+
+fn resource_lifecycle(f: &mut Fixture, name: &str, desired: DesiredState) -> AuthorizedLifecycle {
+    let revision = f
+        .host
+        .machine(&f.machine)
+        .unwrap()
+        .unwrap()
+        .configuration_revision;
+    let operation: OperationId = name.try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.machine, &operation, revision, desired),
+    )
+    .unwrap();
+    f.host
+        .request_lifecycle(
+            &f.machine,
+            operation.clone(),
+            revision,
+            desired,
+            Approval {
+                id: format!("approve-{name}").try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap();
+    f.host.authorize_lifecycle(&operation).unwrap()
+}
+
+fn resource_configuration_observation(
+    f: &mut Fixture,
+    command: &ConfigurationCommand,
+) -> CommittedObservation {
+    let previous = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    f.runtime
+        .observe(MachineObservation {
+            sequence: previous.sequence.next().unwrap(),
+            applied_revision: command.revision,
+            cause: ObservationCause::Configuration {
+                operation_id: command.operation_id.clone(),
+            },
+            evidence_digest: hash("native-applied-configuration"),
+            ..previous
+        })
+        .unwrap()
+}
+
+#[test]
+fn running_lifecycle_installs_its_actual_limits_and_reopen_preserves_them() {
+    let mut f = Fixture::new();
+    let configuration = resource_configuration(&mut f, "larger-pending-envelope", 2000);
+    // Catalog authority alone has not changed guardian retention admission.
+    assert!(reserve_resource_output(&mut f, "before-running", n(1), 1800).is_err());
+    let previous = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    f.runtime
+        .observe(MachineObservation {
+            state: MachineState::Stopped,
+            sequence: previous.sequence.next().unwrap(),
+            cause: ObservationCause::Native {},
+            evidence_digest: hash("native-stopped"),
+            ..previous
+        })
+        .unwrap();
+    let authorization = resource_lifecycle(&mut f, "run-new-envelope", DesiredState::Running);
+    assert!(authorization.statement.command.revision > configuration.statement.command.revision);
+    let command = authorization.statement.command.clone();
+    f.runtime.admit_lifecycle(authorization.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_lifecycle(authorization).unwrap(),
+        LifecycleDecision::Perform(_)
+    ));
+    let previous = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let starting = f
+        .runtime
+        .observe(MachineObservation {
+            generation: previous.generation.next().unwrap(),
+            sequence: previous.sequence.next().unwrap(),
+            state: MachineState::Starting,
+            applied_revision: command.revision,
+            cause: ObservationCause::Lifecycle {
+                operation_id: command.operation_id.clone(),
+            },
+            evidence_digest: hash("native-starting"),
+            ..previous
+        })
+        .unwrap();
+    let running = f
+        .runtime
+        .observe(MachineObservation {
+            sequence: starting.value().sequence.next().unwrap(),
+            state: MachineState::Running,
+            evidence_digest: hash("native-running"),
+            ..starting.value().clone()
+        })
+        .unwrap();
+    f.runtime
+        .record_lifecycle_delivery(
+            &command.operation_id,
+            &command.request_digest,
+            Delivery::Applied,
+            Some(hash("applied-running")),
+            Some(running.reference().unwrap()),
+        )
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    f.runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    reserve_resource_output(&mut f, "after-running", n(2), 1800).unwrap();
+    assert!(reserve_resource_output(&mut f, "beyond-new-capacity", n(2), 200).is_err());
+}
+
+#[test]
+fn late_historical_configuration_completion_never_reinstalls_its_resource_limits() {
+    let mut f = Fixture::new();
+    let old = resource_configuration(&mut f, "old-envelope", 2000);
+    let old_command = old.statement.command.clone();
+    f.runtime.admit_configuration(old.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_configuration(old).unwrap(),
+        ConfigurationDecision::Perform(_)
+    ));
+    let old_observed = resource_configuration_observation(&mut f, &old_command);
+    f.runtime
+        .record_configuration_delivery(
+            &old_command.operation_id,
+            &old_command.request_digest,
+            Delivery::Unknown,
+            None,
+            None,
+        )
+        .unwrap();
+
+    let latest = resource_configuration(&mut f, "latest-envelope", 4000);
+    let latest_command = latest.statement.command.clone();
+    f.runtime.admit_configuration(latest.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_configuration(latest).unwrap(),
+        ConfigurationDecision::Perform(_)
+    ));
+    let observed = resource_configuration_observation(&mut f, &latest_command);
+    f.runtime
+        .record_configuration_delivery(
+            &latest_command.operation_id,
+            &latest_command.request_digest,
+            Delivery::Applied,
+            Some(hash("latest-applied")),
+            Some(observed.reference().unwrap()),
+        )
+        .unwrap();
+    f.runtime
+        .record_configuration_delivery(
+            &old_command.operation_id,
+            &old_command.request_digest,
+            Delivery::Applied,
+            Some(hash("historical-applied")),
+            Some(old_observed.reference().unwrap()),
+        )
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    f.runtime = RuntimeJournal::open(&path, &f.machine).unwrap();
+    reserve_resource_output(&mut f, "latest-capacity", n(1), 3000).unwrap();
+    assert!(reserve_resource_output(&mut f, "beyond-latest-capacity", n(1), 1000).is_err());
+    assert_eq!(
+        f.runtime
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .applied_revision,
+        latest_command.revision
+    );
+}
+
+#[test]
+fn resource_retry_rechecks_retention_before_dispatch_but_never_blocks_containment() {
+    let mut f = Fixture::new();
+    let authorization = resource_configuration(&mut f, "smaller-envelope", 100);
+    let command = authorization.statement.command.clone();
+    f.runtime
+        .admit_configuration(authorization.clone())
+        .unwrap();
+    assert!(matches!(
+        f.runtime
+            .begin_configuration(authorization.clone())
+            .unwrap(),
+        ConfigurationDecision::Perform(_)
+    ));
+    f.runtime
+        .record_configuration_delivery(
+            &command.operation_id,
+            &command.request_digest,
+            Delivery::NotApplied,
+            Some(hash("not-applied")),
+            None,
+        )
+        .unwrap();
+    reserve_resource_output(&mut f, "intervening-reservation", n(1), 100).unwrap();
+    assert!(matches!(
+        f.runtime.begin_configuration(authorization),
+        Err(Error::Capacity(_))
+    ));
+    assert_eq!(
+        f.runtime
+            .configuration_operation(&command.operation_id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::NotApplied
+    );
+
+    let run = resource_lifecycle(&mut f, "run-smaller-envelope", DesiredState::Running);
+    let run_command = run.statement.command.clone();
+    f.runtime.admit_lifecycle(run.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.validate_lifecycle_preparation(&run),
+        Err(Error::Capacity(_))
+    ));
+    assert!(matches!(
+        f.runtime.begin_lifecycle(run),
+        Err(Error::Capacity(_))
+    ));
+    assert_eq!(
+        f.runtime
+            .lifecycle_operation(&run_command.operation_id)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Admitted
+    );
+    let stop = resource_lifecycle(&mut f, "stop-with-retention", DesiredState::Stopped);
+    let stop_command = stop.statement.command.clone();
+    f.runtime.admit_lifecycle(stop.clone()).unwrap();
+    assert!(matches!(
+        f.runtime.begin_lifecycle(stop).unwrap(),
+        LifecycleDecision::Perform(_)
+    ));
+    let previous = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let observed = f
+        .runtime
+        .observe(MachineObservation {
+            sequence: previous.sequence.next().unwrap(),
+            state: MachineState::Stopped,
+            applied_revision: stop_command.revision,
+            cause: ObservationCause::Lifecycle {
+                operation_id: stop_command.operation_id.clone(),
+            },
+            evidence_digest: hash("contained"),
+            ..previous
+        })
+        .unwrap();
+    f.runtime
+        .record_lifecycle_delivery(
+            &stop_command.operation_id,
+            &stop_command.request_digest,
+            Delivery::Applied,
+            Some(hash("containment-applied")),
+            Some(observed.reference().unwrap()),
+        )
+        .unwrap();
+    let path = f.root.0.join("runtime");
+    drop(f.runtime);
+    let db = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    let limits: String = db
+        .query_row("SELECT limits FROM configuration WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<RuntimeLimits>(&limits)
+            .unwrap()
+            .output_bytes,
+        n(1000),
+        "stop delivery is not evidence of native resource installation or output deletion"
+    );
+}

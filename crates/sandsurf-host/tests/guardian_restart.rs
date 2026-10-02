@@ -83,7 +83,9 @@ fn hash(value: &str) -> Digest {
     bytes_digest(value.as_bytes())
 }
 fn resources() -> Resources {
-    Resources::from_geometry(n(2), n(2048), n(100_000), n(1000), n(8))
+    // The simulated native envelope and journal admission budget describe the
+    // same machine; a resume must not authorize less than its existing capture.
+    Resources::from_geometry(n(2), n(2048), n(100_000), n(4096), n(8))
         .expect("static resource envelope")
 }
 fn catalog_limits() -> CatalogLimits {

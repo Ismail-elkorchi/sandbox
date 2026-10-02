@@ -564,7 +564,11 @@ impl RuntimeJournal {
             observation(&self.db.connection)?.as_ref(),
             command,
         )?;
-        require_authority_fence(&self.db.connection, command.revision)
+        require_authority_fence(&self.db.connection, command.revision)?;
+        if command.desired == DesiredState::Running {
+            validate_resource_envelope(&self.db.connection, &command.configuration.resources)?;
+        }
+        Ok(())
     }
 
     pub fn configuration_operation(
@@ -633,6 +637,9 @@ impl RuntimeJournal {
         }
         require_lifecycle_state(&self.machine, observation(&tx)?.as_ref(), command)?;
         require_authority_fence(&tx, command.revision)?;
+        if command.desired == DesiredState::Running {
+            validate_resource_envelope(&tx, &command.configuration.resources)?;
+        }
         value.delivery = Delivery::Dispatched;
         value.evidence_digest = None;
         value.observation = None;
@@ -732,6 +739,17 @@ impl RuntimeJournal {
             }
             Delivery::Admitted | Delivery::Dispatched => unreachable!(),
         }
+        let applied_limits =
+            if delivery == Delivery::Applied && value.command.desired == DesiredState::Running {
+                install_applied_resource_limits(
+                    &tx,
+                    &self.limits,
+                    &value.command.configuration.resources,
+                    value.command.revision,
+                )?
+            } else {
+                None
+            };
         value.delivery = delivery;
         value.evidence_digest = evidence;
         value.observation = observed;
@@ -748,6 +766,9 @@ impl RuntimeJournal {
             },
         )?;
         tx.commit()?;
+        if let Some(limits) = applied_limits {
+            self.limits = limits;
+        }
         Ok(value)
     }
 
@@ -823,6 +844,7 @@ impl RuntimeJournal {
         }
         require_configuration_state(&self.machine, observation(&tx)?.as_ref(), command)?;
         require_authority_fence(&tx, command.revision)?;
+        validate_resource_envelope(&tx, &command.configuration.resources)?;
         value.delivery = Delivery::Dispatched;
         tx.execute(
             "UPDATE configuration_operations SET value=?2 WHERE id=?1",
@@ -921,17 +943,16 @@ impl RuntimeJournal {
             }
             Delivery::Admitted | Delivery::Dispatched => unreachable!(),
         }
-        let mut applied_limits = None;
-        if delivery == Delivery::Applied {
-            let mut limits = self.limits.clone();
-            limits.output_bytes = value.command.configuration.resources.output_bytes;
-            limits.managed_executions = value.command.configuration.resources.managed_executions;
-            tx.execute(
-                "UPDATE configuration SET limits=?1 WHERE id=1",
-                [encode(&limits)?],
-            )?;
-            applied_limits = Some(limits);
-        }
+        let applied_limits = if delivery == Delivery::Applied {
+            install_applied_resource_limits(
+                &tx,
+                &self.limits,
+                &value.command.configuration.resources,
+                value.command.revision,
+            )?
+        } else {
+            None
+        };
         value.delivery = delivery;
         value.evidence_digest = evidence;
         value.observation = observed;
@@ -965,27 +986,7 @@ impl RuntimeJournal {
 
     /// Management unavailability cannot free either kind of reservation.
     pub fn validate_resource_envelope(&self, resources: &Resources) -> Result<()> {
-        resources.validate()?;
-        let active = managed_execution_slots(&self.db.connection)?;
-        let reserved: u64 = self.db.connection.query_row(
-            "SELECT coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
-            [],
-            |row| row.get(0),
-        )?;
-        let retained: u64 = self.db.connection.query_row(
-            "SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0",
-            [], |row| row.get(0),
-        )?;
-        if active > resources.managed_executions.get()
-            || reserved
-                .checked_add(retained)
-                .is_none_or(|bytes| bytes > resources.output_bytes.get())
-        {
-            return Err(Error::Capacity(
-                "resource reduction excludes retained bytes or active reservations",
-            ));
-        }
-        Ok(())
+        validate_resource_envelope(&self.db.connection, resources)
     }
 
     pub fn admit(&mut self, request: GuestCommand) -> Result<Operation> {
@@ -2524,6 +2525,51 @@ impl RuntimeJournal {
             cleanup_pending: false,
         })
     }
+}
+
+fn install_applied_resource_limits(
+    db: &rusqlite::Connection,
+    current: &RuntimeLimits,
+    resources: &Resources,
+    revision: Counter,
+) -> Result<Option<RuntimeLimits>> {
+    if observation(db)?.is_none_or(|value| value.applied_revision != revision) {
+        // A delayed historical acknowledgement may complete its own operation,
+        // never install a past envelope over newer native facts.
+        return Ok(None);
+    }
+    let mut limits = current.clone();
+    limits.output_bytes = resources.output_bytes;
+    limits.managed_executions = resources.managed_executions;
+    db.execute(
+        "UPDATE configuration SET limits=?1 WHERE id=1",
+        [encode(&limits)?],
+    )?;
+    Ok(Some(limits))
+}
+
+fn validate_resource_envelope(db: &rusqlite::Connection, resources: &Resources) -> Result<()> {
+    resources.validate()?;
+    let active = managed_execution_slots(db)?;
+    let reserved: u64 = db.query_row(
+        "SELECT coalesce(sum(output_limit),0) FROM processes WHERE reservation_active=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let retained: u64 = db.query_row(
+        "SELECT coalesce(sum(c.length),0) FROM chunks c JOIN processes p ON p.id=c.process WHERE p.reservation_active=0",
+        [], |row| row.get(0),
+    )?;
+    if active > resources.managed_executions.get()
+        || reserved
+            .checked_add(retained)
+            .is_none_or(|bytes| bytes > resources.output_bytes.get())
+    {
+        return Err(Error::Capacity(
+            "resource reduction excludes retained bytes or active reservations",
+        ));
+    }
+    Ok(())
 }
 
 fn output_index_capacity(db: &rusqlite::Connection, limit: Counter, additional: u64) -> Result<()> {
