@@ -1,5 +1,6 @@
 import { chmod, copyFile, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { captureCommand } from "./capture-command.ts";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hydrateImageSources } from "./image-sources.ts";
@@ -127,16 +128,8 @@ function run(command: string, args: readonly string[], environment: Readonly<Rec
   });
 }
 
-function assertStaticElf(path: string): Promise<void> {
-  return new Promise<void>((resolveCheck, rejectCheck) => {
-    const output: Buffer[] = [];
-    const child = spawn("readelf", ["--program-headers", path], { stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.once("error", rejectCheck);
-    child.once("exit", (code, signal) => {
-      if (code !== 0 || signal !== null) rejectCheck(new Error(`native ELF inspection failed (${code ?? signal ?? "unknown"})`));
-      else if (Buffer.concat(output).toString("utf8").includes(" INTERP ")) rejectCheck(new Error("the Linux Sandsurf host must be statically linked for confined VMM launch"));
-      else resolveCheck();
-    });
-  });
+async function assertStaticElf(path: string): Promise<void> {
+  if ((await captureCommand("readelf", ["--program-headers", path])).includes(" INTERP ")) {
+    throw new Error("the Linux Sandsurf host must be statically linked for confined VMM launch");
+  }
 }

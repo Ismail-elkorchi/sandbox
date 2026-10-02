@@ -34,11 +34,13 @@ export async function buildQemu(destination: string): Promise<void> {
     // or an OCI layer. Do not execute guest image scripts in this build path.
     // The extractor already runs in this owned directory. Give it the local
     // archive name: GNU tar interprets a Windows drive colon as remote syntax.
-    // MSYS's default link emulation copies the link target, losing POSIX
-    // source semantics and failing for targets appearing later in the archive.
-    // The native build requires real links, never copy/cookie fallbacks.
-    await run("tar", ["-xJf", basename(archive)], scratch, false,
-      process.platform === "win32" ? { MSYS: "winsymlinks:nativestrict" } : {});
+    // MSYS link emulation (even nativestrict) first stats the target, rejecting
+    // forward/dangling source links. Use the native Windows libarchive owner,
+    // which creates actual NTFS links; no copy/cookie or skipped source trees.
+    const systemRoot = process.env.SystemRoot;
+    if (process.platform === "win32" && systemRoot === undefined) throw new Error("native Windows extraction requires SystemRoot");
+    const tar = process.platform === "win32" ? resolve(systemRoot!, "System32/tar.exe") : "tar";
+    await run(tar, ["-xJf", basename(archive)], scratch);
     const source = resolve(scratch, `qemu-${QEMU_SOURCE.version}`);
     const main = resolve(source, "system/main.c");
     const whpx = resolve(source, "target/i386/whpx/whpx-all.c");
@@ -192,7 +194,7 @@ function run(command: string, args: readonly string[], cwd: string, capture = fa
       else output += bytes.toString("utf8");
     });
     child.once("error", rejectRun);
-    child.once("exit", (code, signal) => code === 0 && !tooLarge ? resolveRun(output)
+    child.once("close", (code, signal) => code === 0 && !tooLarge ? resolveRun(output)
       : rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"})`)));
   });
 }

@@ -46,8 +46,13 @@ export class NativeHostClient {
     this.#bridge.stdout.on("error", (error: Error) => this.#fail(new SandsurfHostError("transport", `native bridge output failed: ${error.message}`)));
     this.#bridge.stdout.on("data", (chunk: Buffer) => this.#read(chunk));
     this.#bridge.once("error", (error: Error) => this.#fail(new SandsurfHostError("transport", `native bridge failed: ${error.message}`)));
-    this.#bridge.once("exit", (code, signal) => {
-      this.#fail(new SandsurfHostError("transport", `native bridge exited (${code ?? signal ?? "unknown"}): ${errorText}`));
+    // Process exit precedes stdio closure. Consume complete buffered replies
+    // before rejecting unresolved requests; a spawn failure also emits close
+    // without exit, and must not leave close() waiting forever.
+    this.#bridge.once("close", (code, signal) => {
+      this.#fail(this.#buffer.byteLength === 0
+        ? new SandsurfHostError("transport", `native bridge exited (${code ?? signal ?? "unknown"}): ${errorText}`)
+        : new SandsurfHostError("protocol", "native bridge ended inside a frame"));
       this.#finishExit();
     });
   }

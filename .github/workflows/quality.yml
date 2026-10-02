@@ -39,6 +39,8 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-setuptools
+            mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-meson
       - run: rustup toolchain install stable --profile minimal
       - if: runner.os == 'Linux'
@@ -134,7 +136,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo clippy -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host --all-targets -- -D warnings
       - run: npm run build:ts
-      - run: brew install glib pixman ninja pkgconf meson python
+      - run: brew install glib pixman ninja pkgconf meson python python-setuptools
       - name: Compile and entitle the owned HVF runtime (not VM qualification)
         run: |
           npm run build:native
@@ -195,6 +197,8 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-setuptools
+            mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-meson
       - name: Assemble the source-built native transport
         shell: msys2 {0}

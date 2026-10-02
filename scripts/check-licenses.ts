@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { captureCommand as capture } from "./capture-command.ts";
 
 const allowed = new Set([
   "Apache-2.0",
@@ -81,19 +81,4 @@ function approvedExpression(expression: string): boolean {
   const result = alternatives();
   if (index !== tokens.length) throw new Error(`invalid SPDX expression: ${expression}`);
   return result;
-}
-
-function capture(command: string, arguments_: readonly string[]): Promise<string> {
-  return new Promise((resolveRun, rejectRun) => {
-    const output: Buffer[] = [];
-    const errors: Buffer[] = [];
-    const child = spawn(command, arguments_, { stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
-    child.once("error", rejectRun);
-    child.once("exit", (code, signal) => {
-      if (code === 0) resolveRun(Buffer.concat(output).toString("utf8"));
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
-    });
-  });
 }

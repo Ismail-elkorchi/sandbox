@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { nativeComponents } from "./native-supply-chain.ts";
 import type { Component, ComponentLicense } from "./native-supply-chain.ts";
-import { spawn } from "node:child_process";
+import { captureCommand as capture } from "./capture-command.ts";
 import { resolve } from "node:path";
 
 interface CargoPackage {
@@ -118,19 +118,4 @@ function requiredString(value: unknown, label: string): string {
 function licenseText(license: ComponentLicense | undefined): string {
   if (license === undefined) return "UNKNOWN";
   return "expression" in license ? license.expression : license.license.id;
-}
-
-function capture(command: string, arguments_: readonly string[]): Promise<string> {
-  return new Promise((resolveRun, rejectRun) => {
-    const output: Buffer[] = [];
-    const errors: Buffer[] = [];
-    const child = spawn(command, arguments_, { stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
-    child.once("error", rejectRun);
-    child.once("exit", (code, signal) => {
-      if (code === 0) resolveRun(Buffer.concat(output).toString("utf8"));
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
-    });
-  });
 }

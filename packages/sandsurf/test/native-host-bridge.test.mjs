@@ -1,9 +1,64 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { PassThrough, Writable } from "node:stream";
 import { NativeHostClient, SandsurfHostError } from "../dist/native-host.js";
+
+// Exercise the transport ordering without a public injection API or a second
+// implementation of the bridge. The real native correlation test stays below.
+function bridgeFixture(t) {
+  const child = new EventEmitter();
+  child.stdin = new Writable({ write(_bytes, _encoding, done) { done(); } });
+  child.stdout = new PassThrough(); child.stderr = new PassThrough();
+  child.kill = () => true;
+  t.mock.method(childProcess, "spawn", () => child);
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return { child, client: new NativeHostClient("fixture", "fixture") };
+}
+
+function replyFrame(id, response) {
+  const json = Buffer.from(JSON.stringify([id, 1, response]));
+  const frame = Buffer.alloc(8 + json.length);
+  frame.writeUInt32LE(4 + json.length); frame.writeUInt32LE(json.length, 4);
+  json.copy(frame, 8); return frame;
+}
+
+test("bridge drains replies that arrive after process exit and before stdio close", async (t) => {
+  const { child, client } = bridgeFixture(t);
+  const response = client.request({ kind: "inspect" });
+  child.emit("exit", 0, null);
+  const frame = replyFrame(1, { kind: "complete" });
+  child.stdout.write(frame.subarray(0, 3));
+  child.stdout.write(frame.subarray(3));
+  child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+  assert.deepEqual(await response, { kind: "complete" });
+  await client.close();
+});
+
+test("failed spawn closes the client without requiring an exit event", async (t) => {
+  const { child, client } = bridgeFixture(t);
+  const failed = assert.rejects(client.request({ kind: "inspect" }), (error) =>
+    error instanceof SandsurfHostError && error.category === "transport");
+  child.emit("error", new Error("spawn failed"));
+  child.stdout.end(); child.stderr.end(); child.emit("close", -2, null);
+  await failed; await client.close();
+});
+
+test("bridge closure with an incomplete reply is a protocol failure", async (t) => {
+  const { child, client } = bridgeFixture(t);
+  const failed = assert.rejects(client.request({ kind: "inspect" }), (error) =>
+    error instanceof SandsurfHostError && error.category === "protocol");
+  child.emit("exit", 0, null);
+  child.stdout.write(replyFrame(1, { kind: "complete" }).subarray(0, 9));
+  child.stdout.end(); child.stderr.end(); child.emit("close", 0, null);
+  await failed; await client.close();
+});
 
 test("native bridge correlates concurrent host responses and bounds admission", async () => {
   const root = await mkdtemp(join(tmpdir(), "sandsurf-bridge-"));

@@ -97,7 +97,7 @@ jobs:
       - run: npm run manifest:images
       - run: npm run build:ts
       - if: runner.os == 'macOS'
-        run: brew install glib pixman ninja pkgconf meson python
+        run: brew install glib pixman ninja pkgconf meson python python-setuptools
       - if: runner.os == 'Windows'
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -112,6 +112,8 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-setuptools
+            mingw-w64-ucrt-x86_64-python-wheel
             mingw-w64-ucrt-x86_64-meson
       - if: runner.os != 'Windows'
         run: npm run build:native

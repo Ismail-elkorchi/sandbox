@@ -70,7 +70,7 @@ async function publish(request: object): Promise<string | undefined> {
     // An aborted owner can leave only an unpublished stage or a recoverable
     // previous generated tree; neither is a partially published generation.
     child.stdin.on("error", rejectPublish);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (exceeded || code !== 0 || signal !== null) {
         rejectPublish(new Error(Buffer.concat(errors, errorBytes).toString("utf8").trim() || `native publication failed (${code ?? signal})`)); return;
       }

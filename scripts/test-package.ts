@@ -1,5 +1,6 @@
 import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
+import { captureCommand as capture } from "./capture-command.ts";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -192,24 +193,9 @@ function run(command: string, arguments_: readonly string[], cwd = process.cwd()
     child.stdout.on("data", (chunk: Buffer) => { output = (output + chunk.toString("utf8")).slice(-4096); process.stdout.write(chunk); });
     child.stderr.on("data", (chunk: Buffer) => { errors = (errors + chunk.toString("utf8")).slice(-4096); process.stderr.write(chunk); });
     child.once("error", rejectRun);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       if (code === 0) resolveRun();
       else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${output}\n${errors}`));
-    });
-  });
-}
-
-function capture(command: string, arguments_: readonly string[]): Promise<string> {
-  return new Promise((resolveRun, rejectRun) => {
-    const output: Buffer[] = [];
-    const errors: Buffer[] = [];
-    const child = spawn(command, arguments_, { stdio: ["ignore", "pipe", "pipe"] });
-    child.stdout.on("data", (chunk: Buffer) => output.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
-    child.once("error", rejectRun);
-    child.once("exit", (code, signal) => {
-      if (code === 0) resolveRun(Buffer.concat(output).toString("utf8"));
-      else rejectRun(new Error(`${command} failed (${code ?? signal ?? "unknown"}): ${Buffer.concat(errors).toString("utf8").slice(-4096)}`));
     });
   });
 }

@@ -535,13 +535,23 @@ fn native_tcp_udp_ipv4_ipv6_and_established_flow_revocation() {
         &TEST_LINK,
     )
     .unwrap();
-    let kernel_mac = std::fs::read_to_string("/sys/class/net/sandsurf0/address")
-        .unwrap()
-        .trim()
-        .split(':')
-        .map(|part| u8::from_str_radix(part, 16).unwrap())
-        .collect::<Vec<_>>();
-    kernel_frame[..6].copy_from_slice(&kernel_mac);
+    // The inherited sysfs mount belongs to the original network namespace.
+    // Query through this namespace's socket, not a pathname in that mount.
+    // SAFETY: zeroed ifreq is initialized before the ioctl reads its name.
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (target, byte) in request.ifr_name.iter_mut().zip(b"sandsurf0") {
+        *target = *byte as _;
+    }
+    // SAFETY: live UDP socket and writable, initialized native request.
+    assert_eq!(
+        unsafe { libc::ioctl(kernel.as_raw_fd(), libc::SIOCGIFHWADDR, &mut request) },
+        0
+    );
+    // SAFETY: successful SIOCGIFHWADDR initialized this union member.
+    let address = unsafe { request.ifr_ifru.ifru_hwaddr };
+    for (target, byte) in kernel_frame[..6].iter_mut().zip(address.sa_data.iter()) {
+        *target = *byte as u8;
+    }
     kernel_frame[6..12].copy_from_slice(&GUEST_MAC);
     let mut kernel_bytes = vec![0; 10];
     kernel_bytes.extend_from_slice(&kernel_frame);
