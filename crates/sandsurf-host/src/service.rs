@@ -175,7 +175,28 @@ pub type Result<T> = std::result::Result<T, HostError>;
 struct ReconciliationCursor {
     after_machine: Option<MachineId>,
     after_snapshot: Option<SnapshotId>,
-    snapshots_first: bool,
+    next_domain: usize,
+    after_image: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ReconciliationIdentity {
+    Machine(MachineId),
+    Image(OperationId),
+}
+impl fmt::Display for ReconciliationIdentity {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Machine(id) => write!(output, "machine {}", id.as_str()),
+            Self::Image(id) => write!(output, "image operation {}", id.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImageLookupReply {
+    HostOperation,
+    ImageImport,
 }
 
 struct HostService {
@@ -206,14 +227,13 @@ impl HostService {
             &root.join("transfers"),
         )?);
         let secrets = crate::secrets::SecretAuthority::open(&root.join("secrets"))?;
-        let mut service = Self {
+        let service = Self {
             root: root.to_path_buf(),
             catalog,
             executable,
             artifacts,
             secrets,
         };
-        service.recover_image_releases();
         Ok(service)
     }
 
@@ -241,6 +261,13 @@ impl HostService {
                 root: self.root.clone(),
                 host_id: self.catalog.host_id().as_str().into(),
             }),
+            HostRequest::GetHostOperation { operation_id } => {
+                self.prepare_image_lookup(operation_id, ImageLookupReply::HostOperation)
+            }
+            HostRequest::GetImageImport { operation_id } => {
+                self.prepare_image_lookup(operation_id, ImageLookupReply::ImageImport)
+            }
+            request @ HostRequest::ReleaseImage { .. } => self.prepare_image_release(request),
             HostRequest::CreateSnapshot {
                 request,
                 approval_id,
@@ -1286,12 +1313,11 @@ impl HostService {
             | HostRequest::GetMachine { .. } => Err(HostError::Invalid(
                 "native observations run outside the catalog owner",
             )),
-            HostRequest::GetHostOperation { operation_id } => {
-                self.recover_image_import(&operation_id)?;
-                Ok(HostResponse::HostOperation {
-                    value: self.catalog.operation(&operation_id)?,
-                })
-            }
+            HostRequest::GetHostOperation { .. }
+            | HostRequest::GetImageImport { .. }
+            | HostRequest::ReleaseImage { .. } => Err(HostError::Invalid(
+                "image verification and cleanup require detached effects",
+            )),
             HostRequest::ListImages { after, maximum } => Ok(HostResponse::Images {
                 values: self.catalog.images(after.as_ref(), maximum)?,
             }),
@@ -1301,41 +1327,6 @@ impl HostService {
                     .image(&digest)?
                     .ok_or(HostError::Invalid("image does not exist"))?,
             }),
-            HostRequest::GetImageImport { operation_id } => {
-                self.recover_image_import(&operation_id)?;
-                Ok(HostResponse::ImageImport {
-                    operation: self
-                        .catalog
-                        .image_import(&operation_id)?
-                        .ok_or(HostError::Invalid("image import operation does not exist"))?,
-                })
-            }
-            HostRequest::ReleaseImage {
-                digest: image_digest,
-                operation_id,
-                approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Image,
-                    &("sandsurf-release-image-v1", &operation_id, &image_digest),
-                )?;
-                let release = self.catalog.release_image(
-                    operation_id.clone(),
-                    image_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                let operation = if release.cleanup_pending {
-                    crate::images::cleanup(&self.root, &image_digest)?;
-                    self.catalog
-                        .complete_image_release(&operation_id, &request_digest)?
-                } else {
-                    release
-                };
-                Ok(HostResponse::ImageRelease { operation })
-            }
             HostRequest::ListSnapshots { after, maximum } => Ok(HostResponse::Snapshots {
                 values: self.catalog.snapshots(after.as_ref(), maximum)?,
             }),
@@ -1685,17 +1676,74 @@ impl HostService {
         })))
     }
 
-    fn recover_image_releases(&mut self) {
-        let Ok(releases) = self.catalog.pending_image_releases() else {
-            return;
+    fn prepare_image_release(&mut self, request: HostRequest) -> Result<HostDispatch> {
+        let HostRequest::ReleaseImage {
+            digest: image_digest,
+            operation_id,
+            approval_id,
+        } = request
+        else {
+            return Err(HostError::Invalid("not an image release request"));
         };
-        for release in releases {
-            if crate::images::cleanup(&self.root, &release.image_digest).is_ok() {
-                let _ = self
-                    .catalog
-                    .complete_image_release(&release.operation_id, &release.request_digest);
-            }
+        let request_digest = digest(
+            Domain::Image,
+            &("sandsurf-release-image-v1", &operation_id, &image_digest),
+        )?;
+        let record = self.catalog.release_image(
+            operation_id,
+            image_digest,
+            Approval {
+                id: approval_id,
+                request_digest,
+            },
+        )?;
+        if !record.cleanup_pending {
+            return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageRelease {
+                operation: record,
+            })));
         }
+        Ok(HostDispatch::Task(Box::new(HostTask::ImageCleanup {
+            root: self.root.clone(),
+            record,
+            reply: true,
+        })))
+    }
+
+    fn prepare_image_lookup(
+        &self,
+        operation: OperationId,
+        reply: ImageLookupReply,
+    ) -> Result<HostDispatch> {
+        if let Some(record) = self.catalog.image_import(&operation)?
+            && record.phase == sandsurf_state::ImageImportPhase::Admitted
+        {
+            return Ok(HostDispatch::Task(Box::new(HostTask::ImageInspect {
+                root: self.root.clone(),
+                record,
+                reply,
+            })));
+        }
+        Ok(HostDispatch::Ready(Box::new(
+            self.image_lookup_response(&operation, reply)?,
+        )))
+    }
+
+    fn image_lookup_response(
+        &self,
+        operation: &OperationId,
+        reply: ImageLookupReply,
+    ) -> Result<HostResponse> {
+        Ok(match reply {
+            ImageLookupReply::HostOperation => HostResponse::HostOperation {
+                value: self.catalog.operation(operation)?,
+            },
+            ImageLookupReply::ImageImport => HostResponse::ImageImport {
+                operation: self
+                    .catalog
+                    .image_import(operation)?
+                    .ok_or(HostError::Invalid("image import operation does not exist"))?,
+            },
+        })
     }
 
     fn prepare_secret_delivery(
@@ -1945,18 +1993,6 @@ impl HostService {
             change_set,
             approval_id,
         })))
-    }
-
-    fn recover_image_import(&mut self, operation: &OperationId) -> Result<()> {
-        if let Some(admitted) = self.catalog.image_import(operation)?
-            && admitted.phase == sandsurf_state::ImageImportPhase::Admitted
-            && let Some(image) =
-                crate::image_worker::completed(&self.root, operation, &admitted.request_digest)?
-        {
-            self.catalog
-                .complete_image_import(operation, &admitted.request_digest, image)?;
-        }
-        Ok(())
     }
 
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostDispatch> {
@@ -2229,6 +2265,35 @@ impl HostService {
 
     fn complete_task_response(&mut self, completion: HostTaskCompletion) -> Result<HostResponse> {
         match completion {
+            HostTaskCompletion::ImageCleanup {
+                record,
+                reply,
+                result,
+            } => {
+                result?;
+                let operation = self
+                    .catalog
+                    .complete_image_release(&record.operation_id, &record.request_digest)?;
+                Ok(if reply {
+                    HostResponse::ImageRelease { operation }
+                } else {
+                    HostResponse::Complete
+                })
+            }
+            HostTaskCompletion::ImageInspect {
+                record,
+                reply,
+                result,
+            } => {
+                if let Some(image) = result? {
+                    self.catalog.complete_image_import(
+                        &record.operation_id,
+                        &record.request_digest,
+                        image,
+                    )?;
+                }
+                self.image_lookup_response(&record.operation_id, reply)
+            }
             HostTaskCompletion::Rollback { record, result } => Ok(HostResponse::Rollback {
                 value: self.catalog.complete_rollback(
                     &record.operation_id,
@@ -2393,23 +2458,26 @@ impl HostService {
     fn reconcile_lifetime_policies(
         &mut self,
         cursor: &mut ReconciliationCursor,
-        busy: &BTreeSet<MachineId>,
+        busy: &BTreeSet<ReconciliationIdentity>,
         slots: usize,
-    ) -> Result<Vec<(MachineId, HostDispatch)>> {
+    ) -> Result<Vec<(ReconciliationIdentity, HostDispatch)>> {
         let slots = slots.min(MAX_HOST_CONNECTIONS / 2);
         if slots == 0 {
             return Ok(Vec::new());
         }
         let now = unix_millis()?;
         let mut work = Vec::new();
-        // Alternate which domain gets the first slot, even at capacity one.
-        cursor.snapshots_first = !cursor.snapshots_first;
-        if cursor.snapshots_first {
-            self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?;
-            self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?;
-        } else {
-            self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?;
-            self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?;
+        // Rotate the first domain so a single free slot cannot starve either
+        // snapshot publication, lifecycle policy or independently owned images.
+        let first = cursor.next_domain;
+        cursor.next_domain = (first + 1) % 3;
+        for offset in 0..3 {
+            match (first + offset) % 3 {
+                0 => self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?,
+                1 => self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?,
+                2 => self.reconcile_image_page(cursor, busy, slots, &mut work)?,
+                _ => unreachable!(),
+            }
         }
         Ok(work)
     }
@@ -2417,10 +2485,10 @@ impl HostService {
     fn reconcile_machine_page(
         &mut self,
         cursor: &mut ReconciliationCursor,
-        busy: &BTreeSet<MachineId>,
+        busy: &BTreeSet<ReconciliationIdentity>,
         slots: usize,
         now: Counter,
-        work: &mut Vec<(MachineId, HostDispatch)>,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
     ) -> Result<()> {
         let remaining = slots.saturating_sub(work.len());
         if remaining == 0 {
@@ -2433,11 +2501,12 @@ impl HostService {
         for record in records {
             let id = record.id.clone();
             cursor.after_machine = Some(id.clone());
-            if busy.contains(&id) || work.iter().any(|(machine, _)| *machine == id) {
+            let identity = ReconciliationIdentity::Machine(id.clone());
+            if busy.contains(&identity) || work.iter().any(|(key, _)| *key == identity) {
                 continue;
             }
             match self.reconcile_machine(record, now) {
-                Ok(Some(dispatch)) => work.push((id, dispatch)),
+                Ok(Some(dispatch)) => work.push((identity, dispatch)),
                 Ok(None) => {}
                 Err(error) => eprintln!(
                     "sandsurf machine {} reconciliation deferred: {error}",
@@ -2454,9 +2523,9 @@ impl HostService {
     fn reconcile_snapshot_page(
         &self,
         cursor: &mut ReconciliationCursor,
-        busy: &BTreeSet<MachineId>,
+        busy: &BTreeSet<ReconciliationIdentity>,
         slots: usize,
-        work: &mut Vec<(MachineId, HostDispatch)>,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
     ) -> Result<()> {
         let remaining = slots.saturating_sub(work.len());
         if remaining == 0 {
@@ -2469,19 +2538,56 @@ impl HostService {
         for snapshot in snapshots {
             cursor.after_snapshot = Some(snapshot.request.id.clone());
             let machine = snapshot.request.machine_id.clone();
-            if busy.contains(&machine) || work.iter().any(|(id, _)| *id == machine) {
+            let identity = ReconciliationIdentity::Machine(machine);
+            if busy.contains(&identity) || work.iter().any(|(key, _)| *key == identity) {
                 continue;
             }
             // Reuse the complete capture transaction, not a separate pause-only
             // repair path. Its lease prevents releasing an active capture and
             // its immutable prepared input permits finishing after restart.
             match self.prepare_snapshot_recovery(snapshot) {
-                Ok(dispatch) => work.push((machine, dispatch)),
+                Ok(dispatch) => work.push((identity, dispatch)),
                 Err(error) => eprintln!("sandsurf snapshot recovery deferred: {error}"),
             }
         }
         if at_end {
             cursor.after_snapshot = None;
+        }
+        Ok(())
+    }
+
+    fn reconcile_image_page(
+        &self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<ReconciliationIdentity>,
+        slots: usize,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let releases = self
+            .catalog
+            .pending_image_releases(cursor.after_image.as_ref(), counter(remaining as u64))?;
+        let at_end = releases.len() < remaining;
+        for record in releases {
+            cursor.after_image = Some(record.operation_id.clone());
+            let identity = ReconciliationIdentity::Image(record.operation_id.clone());
+            if busy.contains(&identity) {
+                continue;
+            }
+            work.push((
+                identity,
+                HostDispatch::Task(Box::new(HostTask::ImageCleanup {
+                    root: self.root.clone(),
+                    record,
+                    reply: false,
+                })),
+            ));
+        }
+        if at_end {
+            cursor.after_image = None;
         }
         Ok(())
     }
@@ -2973,17 +3079,26 @@ fn serve_host_owned(mut service: HostService, listener: LocalListener) -> Result
                             }
                             let sender = reconciliation_sender.clone();
                             let identity = machine.clone();
-                            match std::thread::Builder::new().name("sandsurf-host-reconcile".into()).spawn(move || {
-                            if let Some(HostDispatch::Ready(response)) = execute_host_tasks(dispatch, &sender)
-                                && let HostResponse::Rejected { message, .. } = *response
-                            {
-                                eprintln!("sandsurf machine {} reconciliation deferred: {message}", identity.as_str());
+                            match std::thread::Builder::new()
+                                .name("sandsurf-host-reconcile".into())
+                                .spawn(move || {
+                                    if let Some(HostDispatch::Ready(response)) =
+                                        execute_host_tasks(dispatch, &sender)
+                                        && let HostResponse::Rejected { message, .. } = *response
+                                    {
+                                        eprintln!(
+                                            "sandsurf {identity} reconciliation deferred: {message}"
+                                        );
+                                    }
+                                    let _ = sender.send(HostIngress::Reconciled(identity));
+                                }) {
+                                Ok(_) => {
+                                    reconciliations.insert(machine);
+                                }
+                                Err(error) => {
+                                    eprintln!("sandsurf reconciliation worker unavailable: {error}")
+                                }
                             }
-                            let _ = sender.send(HostIngress::Reconciled(identity));
-                        }) {
-                            Ok(_) => { reconciliations.insert(machine); }
-                            Err(error) => eprintln!("sandsurf reconciliation worker unavailable: {error}"),
-                        }
                         }
                     }
                     Err(error) => eprintln!("sandsurf host reconciliation deferred: {error}"),
@@ -3067,7 +3182,7 @@ fn execute_host_tasks(
 }
 
 enum HostIngress {
-    Reconciled(MachineId),
+    Reconciled(ReconciliationIdentity),
     Request {
         parsed: Box<Result<HostRequest>>,
         reply: mpsc::Sender<HostDispatch>,
@@ -3347,6 +3462,16 @@ fn capture_full_state(
 }
 
 enum HostTask {
+    ImageCleanup {
+        root: PathBuf,
+        record: sandsurf_state::ImageReleaseRecord,
+        reply: bool,
+    },
+    ImageInspect {
+        root: PathBuf,
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+    },
     Rollback {
         provision: GuardianProvision,
         record: RollbackRecord,
@@ -3454,6 +3579,16 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    ImageCleanup {
+        record: sandsurf_state::ImageReleaseRecord,
+        reply: bool,
+        result: Result<()>,
+    },
+    ImageInspect {
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+        result: Result<Option<sandsurf_state::ImageRecord>>,
+    },
     Rollback {
         record: RollbackRecord,
         result: Result<Digest>,
@@ -3546,6 +3681,33 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::ImageCleanup {
+                root,
+                record,
+                reply,
+            } => {
+                let result =
+                    crate::images::cleanup(&root, &record.image_digest).map_err(HostError::from);
+                HostTaskCompletion::ImageCleanup {
+                    record,
+                    reply,
+                    result,
+                }
+            }
+            Self::ImageInspect {
+                root,
+                record,
+                reply,
+            } => {
+                let result =
+                    crate::images::completed(&root, &record.operation_id, &record.request_digest)
+                        .map_err(HostError::from);
+                HostTaskCompletion::ImageInspect {
+                    record,
+                    reply,
+                    result,
+                }
+            }
             Self::Rollback {
                 provision,
                 record,
@@ -5320,6 +5482,160 @@ mod tests {
     }
 
     #[test]
+    fn image_lookup_reads_bytes_off_owner_and_absence_never_completes_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "ssimage-query-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        let mut service = intent_service(&root);
+        let operation: OperationId = "import".try_into().unwrap();
+        let request_digest = bytes_digest(b"image input");
+        let admitted = service
+            .catalog
+            .admit_image_import(
+                operation.clone(),
+                request_digest.clone(),
+                Approval {
+                    id: "approve-import".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        for request in [
+            HostRequest::GetHostOperation {
+                operation_id: operation.clone(),
+            },
+            HostRequest::GetImageImport {
+                operation_id: operation.clone(),
+            },
+        ] {
+            let HostDispatch::Task(task) = service.route(request) else {
+                panic!("verification cannot run while the catalog handles a lookup");
+            };
+            assert!(matches!(&*task, HostTask::ImageInspect { record, .. } if *record == admitted));
+            let completion = task.execute();
+            service.complete_task(completion).unwrap();
+            assert_eq!(
+                service.catalog.image_import(&operation).unwrap(),
+                Some(admitted.clone())
+            );
+        }
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_retirement_reopens_without_deleting_and_recovers_through_catalog_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "ssimage-cleanup-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get(),
+        ));
+        let mut service = intent_service(&root);
+        let image = bytes_digest(b"retired image");
+        let import: OperationId = "import".try_into().unwrap();
+        let request_digest = bytes_digest(b"input");
+        service
+            .catalog
+            .admit_image_import(
+                import.clone(),
+                request_digest.clone(),
+                Approval {
+                    id: "approve-import".try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        service
+            .catalog
+            .complete_image_import(
+                &import,
+                &request_digest,
+                sandsurf_state::ImageRecord {
+                    digest: image.clone(),
+                    source_digest: image.clone(),
+                    platform: "linux".into(),
+                    architecture: "amd64".into(),
+                    logical_bytes: Counter::ONE,
+                    storage_bytes: Counter::ONE,
+                    provenance_digest: image.clone(),
+                    sensitive: false,
+                },
+            )
+            .unwrap();
+        let bytes = root.join("images").join(image.as_str());
+        prepare_directory(&bytes).unwrap();
+        fs::write(
+            bytes.join("owned-payload"),
+            b"retain until admitted deletion",
+        )
+        .unwrap();
+        let operation: OperationId = "release".try_into().unwrap();
+        let HostDispatch::Task(task) = service.route(HostRequest::ReleaseImage {
+            digest: image.clone(),
+            operation_id: operation.clone(),
+            approval_id: "approve-release".try_into().unwrap(),
+        }) else {
+            panic!("image deletion must not run on the catalog writer");
+        };
+        assert!(bytes.exists());
+        assert_eq!(
+            service
+                .catalog
+                .pending_image_releases(None, counter(1))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(task); // client/host dies after durable admission, before deletion
+        drop(service);
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        assert!(
+            bytes.exists(),
+            "host startup ran cleanup before serving requests"
+        );
+        let mut cursor = ReconciliationCursor::default();
+        let work = service
+            .reconcile_lifetime_policies(&mut cursor, &BTreeSet::new(), 1)
+            .unwrap();
+        assert_eq!(work.len(), 1);
+        let (identity, HostDispatch::Task(task)) = work.into_iter().next().unwrap() else {
+            panic!("recovery must run the same admitted image cleanup task");
+        };
+        assert_eq!(identity, ReconciliationIdentity::Image(operation.clone()));
+        let completion = task.execute();
+        assert!(!bytes.exists());
+        assert_eq!(
+            service
+                .catalog
+                .pending_image_releases(None, counter(1))
+                .unwrap()
+                .len(),
+            1,
+            "storage effects are not catalog completion"
+        );
+        assert!(matches!(
+            service.complete_task(completion).unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        assert!(
+            service
+                .catalog
+                .pending_image_releases(None, counter(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            matches!(service.handle(HostRequest::GetHostOperation { operation_id: operation }),
+            HostResponse::HostOperation { value: Some(sandsurf_state::HostOperationRecord::ImageRelease(record)) }
+                if !record.cleanup_pending && record.image_digest == image)
+        );
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bounded_reconciliation_visits_later_machines_and_does_not_advance_without_capacity() {
         let root = std::env::temp_dir().join(format!(
             "ssfair-{}-{}",
@@ -5389,7 +5705,7 @@ mod tests {
         // still be visited and durably admitted rather than starved.
         assert!(second.len() <= 1);
         if let Some((identity, _)) = second.first() {
-            assert_eq!(identity, &expired);
+            assert_eq!(identity, &ReconciliationIdentity::Machine(expired.clone()));
         }
         let record = service.catalog.machine(&expired).unwrap().unwrap();
         assert_eq!(record.latest_intent.desired, DesiredState::Stopped);

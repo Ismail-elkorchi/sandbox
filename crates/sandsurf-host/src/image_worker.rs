@@ -155,17 +155,11 @@ fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
         }
         Ok(Some(Outcome::Boot { boot: record.boot }))
     } else {
-        Ok(completed(root, &job.operation, &job.request_digest)?
-            .map(|image| Outcome::Image { image }))
+        Ok(
+            crate::images::completed(root, &job.operation, &job.request_digest)?
+                .map(|image| Outcome::Image { image }),
+        )
     }
-}
-
-pub(crate) fn completed(
-    root: &Path,
-    operation: &OperationId,
-    request_digest: &Digest,
-) -> Result<Option<ImageRecord>> {
-    Ok(crate::images::completed(root, operation, request_digest)?)
 }
 
 /// Submission never forks image processing in the API process. A busy pool
@@ -606,7 +600,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
     };
     // Builders publish the same operation outcome before returning. Do not
     // write a second completion record or acknowledge a reference-only result.
-    if completed(&root, &operation, &job.request_digest)?.as_ref() != Some(&image) {
+    if crate::images::completed(&root, &operation, &job.request_digest)?.as_ref() != Some(&image) {
         return Err(HostError::Invalid(
             "image builder returned without its matching complete outcome",
         ));

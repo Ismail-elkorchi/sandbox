@@ -708,7 +708,7 @@ mod native_import_tests {
         let operation: OperationId = "worker-operation".try_into().unwrap();
         let binding: Digest = "c".repeat(64).try_into().unwrap();
         assert_eq!(
-            crate::image_worker::completed(&fixture.root, &operation, &binding).unwrap(),
+            completed(&fixture.root, &operation, &binding).unwrap(),
             Some(image.clone())
         );
         assert!(
@@ -717,11 +717,11 @@ mod native_import_tests {
         );
         fs::remove_dir_all(fixture.manifest.parent().unwrap()).unwrap();
         assert_eq!(
-            crate::image_worker::completed(&fixture.root, &operation, &binding).unwrap(),
+            completed(&fixture.root, &operation, &binding).unwrap(),
             Some(image)
         );
         assert!(
-            crate::image_worker::completed(
+            completed(
                 &fixture.root,
                 &operation,
                 &"d".repeat(64).try_into().unwrap()

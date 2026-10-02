@@ -660,13 +660,103 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
     assert!(release.cleanup_pending);
     assert!(host.image(&image.digest).unwrap().is_none());
     assert!(host.images(None, n(10)).unwrap().is_empty());
-    assert_eq!(host.pending_image_releases().unwrap(), vec![release]);
+    assert_eq!(
+        host.pending_image_releases(None, n(1)).unwrap(),
+        vec![release]
+    );
+    assert!(
+        host.pending_image_releases(Some(&release_operation), n(1))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(host.pending_image_releases(None, Counter::ZERO).is_err());
+    assert!(host.pending_image_releases(None, n(257)).is_err());
     assert!(
         !host
             .complete_image_release(&release_operation, &release_digest)
             .unwrap()
             .cleanup_pending
     );
+}
+
+#[test]
+fn historical_image_cleanup_completion_cannot_release_new_cleanup_reservation() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut limits = catalog_limits();
+    limits.image_bytes = n(3_000);
+    let mut host = HostCatalog::create(&path, "image-owner".try_into().unwrap(), limits).unwrap();
+    let first = publish_image(&mut host, "import-first", "first", 2_000);
+    let mut releases = Vec::new();
+    for name in ["release-first", "release-again"] {
+        let operation: OperationId = name.try_into().unwrap();
+        let request_digest = digest(
+            Domain::Image,
+            &("sandsurf-release-image-v1", &operation, &first.digest),
+        )
+        .unwrap();
+        let record = host
+            .release_image(
+                operation.clone(),
+                first.digest.clone(),
+                Approval {
+                    id: format!("approve-{name}").try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        assert!(record.cleanup_pending);
+        releases.push((operation.clone(), request_digest.clone()));
+        if name == "release-first" {
+            host.complete_image_release(&operation, &request_digest)
+                .unwrap();
+            assert_eq!(
+                publish_image(&mut host, "reimport-first", "first", 2_000),
+                first
+            );
+        }
+    }
+    drop(host);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert!(
+        !host
+            .complete_image_release(&releases[0].0, &releases[0].1)
+            .unwrap()
+            .cleanup_pending
+    );
+    let pending = host.pending_image_releases(None, n(1)).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].operation_id, releases[1].0);
+    let import: OperationId = "import-second".try_into().unwrap();
+    let request_digest = hash("second-input");
+    host.admit_image_import(
+        import.clone(),
+        request_digest.clone(),
+        Approval {
+            id: "approve-second-input".try_into().unwrap(),
+            request_digest: request_digest.clone(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            host.complete_image_import(&import, &request_digest, image("second", 2_000)),
+            Err(sandsurf_state::Error::Capacity(_))
+        ),
+        "historical completion freed a newer operation's actual storage reservation"
+    );
+    assert!(
+        matches!(
+            host.complete_image_import(&import, &request_digest, first),
+            Err(sandsurf_state::Error::Conflict(_))
+        ),
+        "historical completion permitted re-import while new cleanup still owns the bytes"
+    );
+    host.complete_image_release(&releases[1].0, &releases[1].1)
+        .unwrap();
+    assert!(host.pending_image_releases(None, n(1)).unwrap().is_empty());
+    host.complete_image_import(&import, &request_digest, image("second", 2_000))
+        .unwrap();
 }
 
 #[test]
@@ -735,7 +825,9 @@ fn publish_image(
         operation.clone(),
         request.clone(),
         Approval {
-            id: format!("approve-{label}").try_into().unwrap(),
+            id: format!("approve-{}", operation.as_str())
+                .try_into()
+                .unwrap(),
             request_digest: request.clone(),
         },
     )

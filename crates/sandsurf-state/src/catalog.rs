@@ -14,13 +14,16 @@ CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFE
 CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
-CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0, cleanup_pending INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFERENCES images(digest), request_digest TEXT NOT NULL, cleanup_pending INTEGER NOT NULL) STRICT;
+CREATE INDEX pending_image_releases ON image_releases(operation) WHERE cleanup_pending=1;
+CREATE UNIQUE INDEX pending_image_cleanup ON image_releases(image) WHERE cleanup_pending=1;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE INDEX capturing_disk_snapshots ON snapshots(id) WHERE json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk';
+CREATE INDEX snapshot_image ON snapshots(json_extract(value,'$.imageDigest'));
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE UNIQUE INDEX pending_rollback_machine ON rollbacks(machine) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
@@ -921,12 +924,12 @@ impl HostCatalog {
         }
         if existing.is_some() {
             tx.execute(
-                "UPDATE images SET retired=0,cleanup_pending=0 WHERE digest=?1",
+                "UPDATE images SET retired=0 WHERE digest=?1",
                 [image.digest.as_str()],
             )?;
         } else {
             tx.execute(
-                "INSERT INTO images VALUES (?1,?2,0,0)",
+                "INSERT INTO images VALUES (?1,?2,0)",
                 params![image.digest.as_str(), encode(&image)?],
             )?;
         }
@@ -1008,15 +1011,13 @@ impl HostCatalog {
         if machine_references {
             return Err(Error::Conflict("active machines pin this image"));
         }
-        let mut statement = tx.prepare("SELECT value FROM snapshots")?;
-        let snapshots = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        for snapshot in snapshots {
-            if decode::<Snapshot>(&snapshot)?.image_digest == image_digest {
-                return Err(Error::Conflict("retained snapshots pin this image"));
-            }
+        let snapshot_references: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM snapshots WHERE json_extract(value,'$.imageDigest')=?1)",
+            [image_digest.as_str()],
+            |row| row.get(0),
+        )?;
+        if snapshot_references {
+            return Err(Error::Conflict("retained snapshots pin this image"));
         }
         capacity(&tx, "image_releases", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
@@ -1035,7 +1036,7 @@ impl HostCatalog {
             ],
         )?;
         tx.execute(
-            "UPDATE images SET retired=1,cleanup_pending=1 WHERE digest=?1",
+            "UPDATE images SET retired=1 WHERE digest=?1",
             [value.image_digest.as_str()],
         )?;
         tx.commit()?;
@@ -1057,28 +1058,36 @@ impl HostCatalog {
             "UPDATE image_releases SET cleanup_pending=0 WHERE operation=?1",
             [operation_id.as_str()],
         )?;
-        tx.execute(
-            "UPDATE images SET cleanup_pending=0 WHERE digest=?1",
-            [value.image_digest.as_str()],
-        )?;
         tx.commit()?;
         value.cleanup_pending = false;
         Ok(value)
     }
 
-    pub fn pending_image_releases(&self) -> Result<Vec<ImageReleaseRecord>> {
+    pub fn pending_image_releases(
+        &self,
+        after: Option<&OperationId>,
+        limit: Counter,
+    ) -> Result<Vec<ImageReleaseRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity(
+                "image cleanup page limit must be in 1..=256",
+            ));
+        }
         let mut statement = self.db.connection.prepare(
-            "SELECT operation,image,request_digest,cleanup_pending FROM image_releases WHERE cleanup_pending=1 ORDER BY operation",
+            "SELECT operation,image,request_digest,cleanup_pending FROM image_releases WHERE cleanup_pending=1 AND operation>?1 ORDER BY operation LIMIT ?2",
         )?;
         statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            })?
+            .query_map(
+                params![after.map_or("", OperationId::as_str), limit.get()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )?
             .map(|row| {
                 let (operation, image, request, cleanup_pending) = row?;
                 Ok(ImageReleaseRecord {
@@ -2874,7 +2883,7 @@ fn image_state(
     digest: &Digest,
 ) -> Result<Option<(ImageRecord, bool, bool)>> {
     db.query_row(
-        "SELECT value,retired,cleanup_pending FROM images WHERE digest=?1",
+        "SELECT value,retired,EXISTS(SELECT 1 FROM image_releases r WHERE r.image=images.digest AND r.cleanup_pending=1) FROM images WHERE digest=?1",
         [digest.as_str()],
         |row| {
             Ok((
@@ -2893,7 +2902,7 @@ fn image_storage_bytes(db: &rusqlite::Connection) -> Result<u64> {
     // Retirement gates new attachments immediately, but its storage remains
     // reserved until exact artifact cleanup is durably complete.
     let mut statement =
-        db.prepare("SELECT value FROM images WHERE retired=0 OR cleanup_pending=1")?;
+        db.prepare("SELECT value FROM images WHERE retired=0 OR EXISTS(SELECT 1 FROM image_releases r WHERE r.image=images.digest AND r.cleanup_pending=1)")?;
     let values = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
