@@ -1,10 +1,110 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { collectDependencySources, dependencySourceFiles, licenseExpression, msysLicenseExpression, pacmanDescription, verifyDependencySources } from "../qemu-dependencies.ts";
+import { promisify } from "node:util";
+import { collectDependencySources, dependencySourceFiles, licenseExpression, msysLicenseExpression, pacmanDescription, requireTrustedSignature, verifyDependencySources, verifyMsysSource } from "../qemu-dependencies.ts";
+
+const fingerprint = "A".repeat(40);
+const trustedStatus = `[GNUPG:] NEWSIG\n[GNUPG:] KEY_CONSIDERED ${fingerprint} 0\n[GNUPG:] SIG_ID abcdef123 2026-10-02 1790937600\n[GNUPG:] GOODSIG ${fingerprint.slice(-16)} Distribution signer\n[GNUPG:] VALIDSIG ${fingerprint} 2026-10-02 1790937600 0 4 0 22 8 00 ${fingerprint}\n[GNUPG:] TRUST_FULLY 0 pgp\n`;
+
+test("source trust requires one complete valid signature, not a success substring", () => {
+  requireTrustedSignature(trustedStatus);
+  requireTrustedSignature(trustedStatus.replace("Distribution signer", "Léo — distribution signer"));
+  requireTrustedSignature(trustedStatus.replace("TRUST_FULLY", "TRUST_ULTIMATE").replaceAll("\n", "\r\n"));
+  for (const status of ["", "[GNUPG:] TRUST_FULLY 0 pgp\n", trustedStatus.repeat(2),
+    trustedStatus.replace(/.*GOODSIG.*\n/u, ""), trustedStatus.replace(/.*VALIDSIG.*\n/u, ""),
+    trustedStatus.replace(/.*TRUST_FULLY.*\n/u, ""), trustedStatus.replace("TRUST_FULLY", "TRUST_MARGINAL"),
+    trustedStatus.replace("TRUST_FULLY", "TRUST_UNDEFINED"), trustedStatus.replace("0 pgp", "0 always"),
+    trustedStatus.replace(`GOODSIG ${fingerprint.slice(-16)}`, `GOODSIG ${"B".repeat(16)}`),
+    trustedStatus.replace("8 00", "8 01"), trustedStatus.replace("[GNUPG:]", "not [GNUPG:]"),
+    trustedStatus + "[GNUPG:] BADSIG ABC bad\n", trustedStatus + "[GNUPG:] FAILURE verify 1\n",
+    trustedStatus + "[GNUPG:] EXPKEYSIG ABC expired\n", trustedStatus + "[GNUPG:] REVKEYSIG ABC revoked\n",
+    trustedStatus + "[GNUPG:] TRUST_NEVER 0 pgp\n", trustedStatus + "[GNUPG:] UNKNOWN\n",
+    trustedStatus + "\0", trustedStatus + "\n", "x".repeat(65537),
+    trustedStatus.replace("Distribution signer", "x".repeat(4096)),
+    trustedStatus.replace("[GNUPG:] GOODSIG", `[GNUPG:] KEY_CONSIDERED ${fingerprint} 0\n`.repeat(65) + "[GNUPG:] GOODSIG")]) {
+    assert.throws(() => requireTrustedSignature(status));
+  }
+});
+
+test("source verifier binds the bytes checked and never elevates or updates trust", async (context) => {
+  const root = await mkdtemp(resolve(tmpdir(), "sandsurf-signature-source-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const source = resolve(root, "source.tar.zst"), signature = `${source}.sig`;
+  await writeFile(source, "source archive"); await writeFile(signature, Buffer.from([0x89, 1, 2, 3]));
+  async function run(command, args, _cwd, capture) {
+    assert.equal(capture, true);
+    if (command === "pacman-conf") { assert.deepEqual(args, ["GPGDir"]); return "/etc/pacman.d/gnupg"; }
+    if (command === "cygpath") { assert.equal(args[0], "-u"); return args[1]; }
+    assert.equal(command, "gpg");
+    assert.deepEqual(args, ["--no-options", "--homedir", "/etc/pacman.d/gnupg", "--batch", "--no-tty",
+      "--no-autostart", "--lock-never", "--no-auto-check-trustdb", "--no-auto-key-retrieve",
+      "--auto-key-locate", "clear", "--trust-model", "pgp", "--status-fd", "1", "--verify", signature, source]);
+    return trustedStatus;
+  }
+  const result = await verifyMsysSource(source, signature, root, run);
+  assert.equal(result.source, createHash("sha256").update("source archive").digest("hex"));
+  await assert.rejects(verifyMsysSource(source, signature, root, async (...args) => {
+    const status = await run(...args);
+    if (args[0] === "gpg") await writeFile(source, "replaced archive");
+    return status;
+  }), /changed during verification/u);
+  await writeFile(signature, "-----BEGIN PGP SIGNATURE-----");
+  await assert.rejects(verifyMsysSource(source, signature, root, run), /binary detached/u);
+});
+
+test("real GPG verifies a read-only trusted keyring and rejects an untrusted signer and altered bytes",
+  { skip: process.platform === "win32", timeout: 30000 }, async (context) => {
+    const execute = promisify(execFile);
+    try { await execute("gpg", ["--version"], { timeout: 5000, maxBuffer: 65536 }); }
+    catch (error) { if (error.code === "ENOENT") { context.skip("GPG is not installed"); return; } throw error; }
+    const root = await realpath(await mkdtemp(resolve(tmpdir(), "sandsurf-gpg-test-")));
+    const keyring = resolve(root, "keyring"), untrusted = resolve(root, "untrusted");
+    await mkdir(keyring, { mode: 0o700 }); await mkdir(untrusted, { mode: 0o700 });
+    context.after(async () => {
+      await chmod(keyring, 0o700);
+      await execute("gpgconf", ["--homedir", keyring, "--kill", "gpg-agent"], { timeout: 5000 });
+      await rm(root, { recursive: true, force: true });
+    });
+    const gpg = async (home, args) => (await execute("gpg", ["--no-options", "--homedir", home,
+      "--batch", "--no-tty", ...args], { timeout: 15000, maxBuffer: 65536 })).stdout;
+    await gpg(keyring, ["--pinentry-mode", "loopback", "--passphrase", "", "--quick-generate-key",
+      "Sandsurf isolated source test <source@example.invalid>", "ed25519", "sign", "0"]);
+    await gpg(keyring, ["--check-trustdb"]);
+    const source = resolve(root, "source.tar.zst"), signature = `${source}.sig`;
+    await writeFile(source, "actual signed source bytes");
+    await gpg(keyring, ["--pinentry-mode", "loopback", "--passphrase", "", "--output", signature, "--detach-sign", source]);
+    const publicKey = resolve(root, "signer.gpg");
+    await gpg(keyring, ["--output", publicKey, "--export"]);
+    await gpg(untrusted, ["--import", publicKey]); await gpg(untrusted, ["--check-trustdb"]);
+    // A user's config must not turn an unknown distribution signer into trust.
+    await writeFile(resolve(untrusted, "gpg.conf"), "trust-model always\n");
+    await execute("gpgconf", ["--homedir", keyring, "--kill", "gpg-agent"], { timeout: 5000 });
+    const keyBytes = await readFile(resolve(keyring, "pubring.kbx"));
+    const trustBytes = await readFile(resolve(keyring, "trustdb.gpg"));
+    await chmod(resolve(keyring, "pubring.kbx"), 0o400); await chmod(resolve(keyring, "trustdb.gpg"), 0o400);
+    await chmod(keyring, 0o500);
+    const keyringFiles = await readdir(keyring);
+    let selected = keyring;
+    const run = async (command, args) => {
+      if (command === "pacman-conf") return selected;
+      if (command === "cygpath") return args[1];
+      assert.equal(command, "gpg");
+      return (await execute(command, args, { timeout: 10000, maxBuffer: 65536 })).stdout;
+    };
+    await verifyMsysSource(source, signature, root, run);
+    assert.deepEqual(await readFile(resolve(keyring, "pubring.kbx")), keyBytes);
+    assert.deepEqual(await readFile(resolve(keyring, "trustdb.gpg")), trustBytes);
+    assert.deepEqual(await readdir(keyring), keyringFiles);
+    selected = untrusted;
+    await assert.rejects(verifyMsysSource(source, signature, root, run), /not trusted/u);
+    selected = keyring; await writeFile(source, "altered source bytes");
+    await assert.rejects(verifyMsysSource(source, signature, root, run));
+  });
 
 test("installed package fields remain exact and reject duplicate or oversized metadata", () => {
   const description = "%NAME%\nmingw-w64-ucrt-x86_64-glib2\n\n%BASE%\nmingw-w64-glib2\n\n%VERSION%\n1:2.90.0-1\n\n%LICENSE%\nLGPL-2.1-or-later\n";
@@ -124,12 +224,11 @@ for (const platform of ["darwin", "win32"]) {
       }
       if (command === "cygpath") return args[1];
       if (command === "pacman") return owner;
-      if (command === "pacman-conf") return database;
+      if (command === "pacman-conf") return args[0] === "DBPath" ? database : "/etc/pacman.d/gnupg";
       if (command === "curl") { await writeFile(args[args.indexOf("--output") + 1], "signed package source"); return ""; }
-      if (command === "bash") {
-        assert.equal(args[1], 'exec pacman-key --verify "$@"');
-        assert.ok(args[3].endsWith("mingw-w64-glib2-2.90.0-1.src.tar.zst.sig"));
-        assert.equal(args[4], args[3].slice(0, -4)); return "";
+      if (command === "gpg") {
+        assert.ok(args.at(-2).endsWith("mingw-w64-glib2-2.90.0-1.src.tar.zst.sig"));
+        assert.equal(args.at(-1), args.at(-2).slice(0, -4)); return trustedStatus;
       }
       throw new Error(`unexpected native source command ${command}`);
     }
@@ -140,7 +239,7 @@ for (const platform of ["darwin", "win32"]) {
       assert.equal(manifest.components.length, 1);
       assert.deepEqual(manifest.components[0].binaries[binary], {
         inputSha256: digest("installed bytes"), sha256: digest("relocated and signed bytes") });
-      if (platform === "win32") assert.ok(calls.some((call) => call.command === "bash"));
+      if (platform === "win32") assert.ok(calls.some((call) => call.command === "gpg"));
       else assert.equal(Object.keys(manifest.components[0].materials).length, 4);
     } finally { Object.defineProperty(process, "platform", original); }
   });

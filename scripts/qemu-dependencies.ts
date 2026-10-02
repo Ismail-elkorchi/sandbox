@@ -130,16 +130,76 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
       await run("curl", ["--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
         "--max-time", "600", "--max-filesize", String(limit), "--output", destination, address], scratch);
     }
-    // Source-only archives are signed by the distribution. Never extract or
-    // run a downloaded PKGBUILD on the host to establish its trust.
-    const unixSignature = (await run("cygpath", ["-u", signature], scratch, true)).trim();
-    const unixSource = (await run("cygpath", ["-u", source], scratch, true)).trim();
-    // pacman-key is a shell script, not a Windows PE executable. Arguments
-    // cross the MSYS boundary separately; paths are never shell source.
-    await run("bash", ["-c", 'exec pacman-key --verify "$@"', "sandsurf-source", unixSignature, unixSource], scratch);
-    await material(source, output, filename, materials);
-    await material(signature, output, `${filename}.sig`, materials);
+    // Never extract or run a downloaded PKGBUILD to establish its trust.
+    const verified = await verifyMsysSource(source, signature, scratch, run);
+    if (await material(source, output, filename, materials) !== verified.source
+      || await material(signature, output, `${filename}.sig`, materials) !== verified.signature) {
+      throw new Error("verified MSYS2 source changed during capture");
+    }
   } };
+}
+
+/** Verify against the installed distribution trust database without modifying
+ * it, importing keys, or using the user's GnuPG configuration. pacman-key's
+ * administrative wrapper checks writable-keyring configuration even for
+ * verification. Its underlying trust requirement is retained here, alongside
+ * successful exit and one complete, cryptographically valid signature.
+ * https://raw.githubusercontent.com/msys2/msys2-pacman/master/scripts/pacman-key.sh.in */
+export async function verifyMsysSource(source: string, signature: string, scratch: string,
+  run: BuildRunner): Promise<{ source: string; signature: string }> {
+  await regular(source, maximumBytes); await regular(signature, 65536);
+  if ((await readFile(signature)).includes(Buffer.from("BEGIN PGP SIGNATURE"))) {
+    throw new Error("MSYS2 package signatures must be binary detached signatures");
+  }
+  const verified = { source: await runtimeDigest(source), signature: await runtimeDigest(signature) };
+  const keyring = (await run("pacman-conf", ["GPGDir"], scratch, true)).trim();
+  if (!keyring.startsWith("/") || keyring.length > 4096 || /[\0\r\n]/u.test(keyring)) {
+    throw new Error("installed distribution keyring path is invalid");
+  }
+  const unixSignature = (await run("cygpath", ["-u", signature], scratch, true)).trim();
+  const unixSource = (await run("cygpath", ["-u", source], scratch, true)).trim();
+  const status = await run("gpg", ["--no-options", "--homedir", keyring, "--batch", "--no-tty",
+    "--no-autostart", "--lock-never", "--no-auto-check-trustdb", "--no-auto-key-retrieve",
+    "--auto-key-locate", "clear", "--trust-model", "pgp", "--status-fd", "1",
+    "--verify", unixSignature, unixSource], scratch, true);
+  requireTrustedSignature(status);
+  if (await runtimeDigest(source) !== verified.source || await runtimeDigest(signature) !== verified.signature) {
+    throw new Error("MSYS2 source changed during verification");
+  }
+  return verified;
+}
+
+/** Status-fd is a protocol, not localized diagnostics or an exit-code-only
+ * success indication. A valid signature from an unknown key is insufficient.
+ * Reject extra signatures and every failure/unknown status, even after trust.
+ * https://raw.githubusercontent.com/gpg/gnupg/master/doc/DETAILS */
+export function requireTrustedSignature(status: string): void {
+  if (Buffer.byteLength(status) > 65536 || /[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]/u.test(status)) throw new Error("invalid signature status bounds");
+  const lines = status.replaceAll("\r\n", "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  if (lines.length === 0 || lines.length > 64) throw new Error("invalid signature status count");
+  let started = false, good: string | undefined, valid: string | undefined, trusted = false;
+  for (const line of lines) {
+    const fields = /^\[GNUPG:\] ([A-Z_]+)(?: (.*))?$/u.exec(line);
+    if (fields === null || Buffer.byteLength(line) > 4096) throw new Error("invalid signature status record");
+    const tag = fields[1], args = fields[2] ?? "";
+    if (tag === "NEWSIG" && !started) { started = true; continue; }
+    if (!started) throw new Error("signature status has no signature boundary");
+    if (tag === "KEY_CONSIDERED" && /^(?:[A-F0-9]{40}|[A-F0-9]{64}) [0-9]+$/u.test(args)
+      || tag === "SIG_ID" && /^[A-Za-z0-9+/=]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]+$/u.test(args)) continue;
+    if (tag === "GOODSIG" && good === undefined && valid === undefined && !trusted) {
+      const signer = /^([A-F0-9]{16}|[A-F0-9]{40}|[A-F0-9]{64}) .+$/u.exec(args)?.[1];
+      if (signer !== undefined) { good = signer; continue; }
+    }
+    if (tag === "VALIDSIG" && good !== undefined && valid === undefined && !trusted) {
+      const fingerprint = /^((?:[A-F0-9]{40}|[A-F0-9]{64})) [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]+ [0-9]+ [0-9]+ 0 [0-9]+ [0-9]+ 00(?: (?:[A-F0-9]{40}|[A-F0-9]{64}))?$/u.exec(args)?.[1];
+      if (fingerprint !== undefined && (fingerprint === good || fingerprint.endsWith(good))) { valid = fingerprint; continue; }
+    }
+    if ((tag === "TRUST_FULLY" || tag === "TRUST_ULTIMATE") && valid !== undefined && !trusted
+      && /^0 pgp(?: [^ ]+)?$/u.test(args)) { trusted = true; continue; }
+    throw new Error(`source signature status is not trusted: ${tag}`);
+  }
+  if (valid === undefined || !trusted) throw new Error("source signature lacks cryptographic validity and distribution trust");
 }
 
 export function pacmanDescription(text: string): Map<string, string[]> {
