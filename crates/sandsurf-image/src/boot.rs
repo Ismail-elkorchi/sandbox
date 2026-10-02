@@ -122,9 +122,12 @@ pub fn extract(
     .flatten()
     {
         fs::File::open(&path)?.sync_all()?;
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(path, permissions)?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions)?;
+        }
     }
     Ok(frozen)
 }

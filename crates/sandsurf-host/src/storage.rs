@@ -155,34 +155,58 @@ pub(crate) fn freeze_boot(
     directory: &Path,
 ) -> io::Result<sandsurf_image::boot::FrozenBoot> {
     use sandsurf_image::boot::{self, BootProfile};
-    if image.manifest.boot_bundle.profile == BootProfile::Pinned {
-        let boot = pin_boot(
-            &image.kernel_path,
-            image.initramfs_path.as_deref(),
-            image.manifest.architecture,
-            directory,
-        )?;
-        if boot.kernel.sha256 != image.manifest.boot_bundle.kernel.sha256
-            || boot.initramfs.as_ref().map(|v| &v.sha256)
-                != image
-                    .manifest
-                    .boot_bundle
-                    .initramfs
-                    .as_ref()
-                    .map(|v| &v.sha256)
-        {
-            return Err(invalid("pinned boot inputs changed"));
-        }
-        return Ok(boot);
+    if object_exists(directory)? {
+        return read_boot(directory);
     }
-    sandsurf_native::local::create_private_directory(directory)?;
-    let boot = boot::extract(disk, directory, image.manifest.architecture)?;
-    boot::verify(directory, &boot)?;
-    let mut record = create_private_file(&directory.join("boot.json"))?;
-    record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
-    sync_file(&record)?;
-    sync_directory(directory)?;
-    Ok(boot)
+    let parent = directory
+        .parent()
+        .ok_or_else(|| invalid("boot object has no owner"))?;
+    let mut nonce = [0; 16];
+    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
+    let stage = parent.join(format!(
+        ".boot-{}.stage",
+        sandsurf_protocol::bytes_digest(&nonce).as_str()
+    ));
+    // Publication, including its record, is atomic. An interrupted extraction
+    // cannot turn a partly populated public directory into a frozen boot.
+    let result = (|| {
+        let boot = if image.manifest.boot_bundle.profile == BootProfile::Pinned {
+            let boot = pin_boot(
+                &image.kernel_path,
+                image.initramfs_path.as_deref(),
+                image.manifest.architecture,
+                &stage,
+            )?;
+            if boot.kernel.sha256 != image.manifest.boot_bundle.kernel.sha256
+                || boot.initramfs.as_ref().map(|v| &v.sha256)
+                    != image
+                        .manifest
+                        .boot_bundle
+                        .initramfs
+                        .as_ref()
+                        .map(|v| &v.sha256)
+            {
+                return Err(invalid("pinned boot inputs changed"));
+            }
+            boot
+        } else {
+            sandsurf_native::local::create_private_directory(&stage)?;
+            let boot = boot::extract(disk, &stage, image.manifest.architecture)?;
+            boot::verify(&stage, &boot)?;
+            let mut record = create_private_file(&stage.join("boot.json"))?;
+            record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
+            sync_file(&record)?;
+            sync_directory(&stage)?;
+            boot
+        };
+        sandsurf_native::storage::publish_new_directory(&stage, directory)?;
+        sync_directory(parent)?;
+        Ok(boot)
+    })();
+    if stage.exists() {
+        fs::remove_dir_all(&stage)?;
+    }
+    result
 }
 
 /// Never acquire a mutation/attachment lease, repair a slot, open a filesystem,
@@ -669,6 +693,66 @@ mod tests {
     use std::io::Write;
 
     struct Fixture(std::path::PathBuf);
+
+    fn pinned_image(root: &Path, kernel: &Path) -> sandsurf_image::VerifiedImage {
+        let mut manifest: sandsurf_image::ImageManifest = serde_json::from_str(include_str!(
+            "../../../packages/sandsurf/images/development-x64/manifest.json"
+        ))
+        .unwrap();
+        manifest.boot_bundle.profile = sandsurf_image::boot::BootProfile::Pinned;
+        manifest.boot_bundle.initramfs = None;
+        manifest.boot_bundle.kernel =
+            sandsurf_image::boot::artifact(kernel, "kernel", 8192).unwrap();
+        sandsurf_image::VerifiedImage {
+            manifest,
+            manifest_path: root.join("manifest.json"),
+            manifest_digest: "unused".into(),
+            kernel_path: kernel.into(),
+            initramfs_path: None,
+            system_path: root.join("unused-disk"),
+        }
+    }
+
+    #[test]
+    fn offline_boot_publication_is_atomic_retries_complete_bytes_and_never_adopts_partial_records()
+    {
+        let fixture = Fixture::new();
+        let kernel = fixture.0.join("kernel-input");
+        create_private_file(&kernel)
+            .unwrap()
+            .write_all(b"invalid kernel")
+            .unwrap();
+        let target = fixture.0.join("frozen-boot");
+        let image = pinned_image(&fixture.0, &kernel);
+        assert!(freeze_boot(&image, &image.system_path, &target).is_err());
+        assert!(!target.exists());
+        assert!(
+            !fs::read_dir(&fixture.0).unwrap().any(|v| v
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".stage"))
+        );
+        let mut bytes = vec![0; 4096];
+        bytes[0x202..0x206].copy_from_slice(b"HdrS");
+        bytes[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        bytes[0x236] = 1;
+        bytes[0x206..0x208].copy_from_slice(&0x020c_u16.to_le_bytes());
+        fs::write(&kernel, &bytes).unwrap();
+        let image = pinned_image(&fixture.0, &kernel);
+        let boot = freeze_boot(&image, &image.system_path, &target).unwrap();
+        fs::remove_file(&kernel).unwrap();
+        assert_eq!(
+            freeze_boot(&image, &image.system_path, &target).unwrap(),
+            boot
+        );
+        assert_eq!(fs::read(target.join("kernel")).unwrap(), bytes);
+        let partial = fixture.0.join("partial-boot");
+        create_private_directory(&partial).unwrap();
+        fs::write(partial.join("kernel"), b"partial").unwrap();
+        assert!(freeze_boot(&image, &image.system_path, &partial).is_err());
+        assert_eq!(fs::read(partial.join("kernel")).unwrap(), b"partial");
+    }
 
     #[test]
     fn running_boot_publication_preserves_bytes_and_rejects_reference_only_or_changed_sources() {

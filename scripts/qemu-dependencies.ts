@@ -120,7 +120,11 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
   if (!safeName.test(name) || !/^(?:[0-9]+:)?[A-Za-z0-9_.+~-]+-[0-9]+$/u.test(version)) throw new Error("invalid MSYS2 source package identity");
   const licenses = selected.fields.get("LICENSE");
   if (licenses === undefined || licenses.length === 0) throw new Error("MSYS2 source package license missing");
-  const license = msysLicenseExpression(licenses);
+  let license: string;
+  try { license = msysLicenseExpression(licenses); }
+  catch (cause) {
+    throw new Error(`MSYS2 ${owner} ${version} has unresolved installed license metadata: ${JSON.stringify(licenses)}`, { cause });
+  }
   const description = selected.path;
   const filename = `${name}-${version.replace(/^[0-9]+:/u, "")}.src.tar.zst`;
   return { manager: "msys2", name, version, license, async capture(output, materials) {

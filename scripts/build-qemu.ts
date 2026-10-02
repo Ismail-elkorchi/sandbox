@@ -157,7 +157,7 @@ async function darwinLibraries(executable: string, destination: string): Promise
   return origins;
 }
 
-async function windowsLibraries(executable: string, destination: string): Promise<Map<string, LibraryInput>> {
+export async function windowsLibraries(executable: string, destination: string): Promise<Map<string, LibraryInput>> {
   const origins = new Map<string, LibraryInput>();
   const prefix = process.env.MINGW_PREFIX, system = process.env.SystemRoot;
   if (prefix === undefined || system === undefined) throw new Error("QEMU build requires a native MSYS2 UCRT toolchain");

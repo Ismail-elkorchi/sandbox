@@ -8,7 +8,7 @@ use crate::service::{HostError, Result};
 use sandsurf_native::local::ensure_private_directory;
 use sandsurf_native::service_pool::ServicePool;
 use sandsurf_native::storage::object_name;
-use sandsurf_protocol::{Digest, OperationId, Snapshot};
+use sandsurf_protocol::{Counter, Digest, Domain, MachineId, OperationId, Snapshot, digest};
 use sandsurf_state::ImageRecord;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -41,6 +41,15 @@ pub enum Build {
         snapshot: Box<Snapshot>,
         allow_sensitive: bool,
     },
+    /// Internal native-boot preparation, not image publication or new authority.
+    /// All paths are derived from existing host-owned identities.
+    Boot {
+        machine_id: MachineId,
+        generation: Counter,
+        image_digest: Digest,
+        disk_bytes: u64,
+        boot_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +65,54 @@ fn directory(root: &Path, operation: &OperationId) -> PathBuf {
         .join(object_name(operation.as_str()))
 }
 
-fn result(root: &Path, job: &Job) -> Result<Option<ImageRecord>> {
-    completed(root, &job.operation, &job.request_digest)
+#[derive(Debug)]
+enum Outcome {
+    Image {
+        image: ImageRecord,
+    },
+    Boot {
+        boot: sandsurf_image::boot::FrozenBoot,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootResult {
+    request_digest: Digest,
+    boot: sandsurf_image::boot::FrozenBoot,
+}
+
+fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
+    if matches!(job.build, Build::Boot { .. }) {
+        let record: BootResult = match read(&directory(root, &job.operation).join("result.json")) {
+            Ok(record) => record,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if record.request_digest != job.request_digest {
+            return Err(HostError::Invalid("boot worker completion binding changed"));
+        }
+        let Build::Boot {
+            machine_id,
+            generation,
+            boot_name,
+            ..
+        } = &job.build
+        else {
+            unreachable!()
+        };
+        if crate::storage::read_boot(&boot_directory(root, machine_id, *generation, boot_name)?)?
+            != record.boot
+        {
+            return Err(HostError::Invalid(
+                "boot worker completion has no matching retained bytes",
+            ));
+        }
+        Ok(Some(Outcome::Boot { boot: record.boot }))
+    } else {
+        Ok(completed(root, &job.operation, &job.request_digest)?
+            .map(|image| Outcome::Image { image }))
+    }
 }
 
 pub(crate) fn completed(
@@ -71,6 +126,88 @@ pub(crate) fn completed(
 /// Submission never forks image processing in the API process. A busy pool
 /// rejects new work for explicit retry; it does not grow a queue of builders.
 pub fn execute(root: &Path, executable: &Path, job: Job) -> Result<ImageRecord> {
+    if matches!(job.build, Build::Boot { .. }) {
+        return Err(HostError::Invalid(
+            "boot preparation is not image publication",
+        ));
+    }
+    match dispatch(root, executable, job)? {
+        Outcome::Image { image } => Ok(image),
+        Outcome::Boot { .. } => Err(HostError::Invalid("image worker returned a boot result")),
+    }
+}
+
+/// Offline preparation belongs to the shared worker envelope, never the small
+/// per-machine guardian. The guardian reacquires native attachment custody
+/// after publication; a result or observed stopped state is not that lease.
+pub(crate) fn prepare_boot(
+    machine_root: &Path,
+    machine_id: &MachineId,
+    generation: Counter,
+    image_digest: &Digest,
+    disk_bytes: u64,
+) -> Result<(PathBuf, sandsurf_image::boot::FrozenBoot)> {
+    let root = machine_root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(HostError::Invalid("machine storage has no host owner"))?;
+    let expected = root.join("machines").join(object_name(machine_id.as_str()));
+    if machine_root != expected {
+        return Err(HostError::Invalid("boot preparation machine path changed"));
+    }
+    let job = boot_job(machine_id, generation, image_digest, disk_bytes)?;
+    let Build::Boot { boot_name, .. } = &job.build else {
+        unreachable!()
+    };
+    let destination = boot_directory(root, machine_id, generation, boot_name)?;
+    let outcome = dispatch(root, &std::env::current_exe()?, job)?;
+    let Outcome::Boot { boot } = outcome else {
+        return Err(HostError::Invalid("boot worker returned an image result"));
+    };
+    if crate::storage::read_boot(&destination)? != boot {
+        return Err(HostError::Invalid(
+            "boot worker returned unbacked artifacts",
+        ));
+    }
+    Ok((destination, boot))
+}
+
+fn boot_job(
+    machine_id: &MachineId,
+    generation: Counter,
+    image_digest: &Digest,
+    disk_bytes: u64,
+) -> Result<Job> {
+    // A response loss reuses the exact operation and frozen bytes. A fresh
+    // native boot has a new host generation, not a new random retry identity.
+    let identity = digest(
+        Domain::Image,
+        &(
+            "sandsurf-boot-object-v1",
+            machine_id,
+            generation,
+            image_digest,
+            disk_bytes,
+        ),
+    )?;
+    let boot_name = format!("boot-{}-{}", generation.get(), identity.as_str());
+    let build = Build::Boot {
+        machine_id: machine_id.clone(),
+        generation,
+        image_digest: image_digest.clone(),
+        disk_bytes,
+        boot_name,
+    };
+    let request_digest = digest(Domain::Image, &("sandsurf-boot-preparation-v1", &build))?;
+    let operation = format!("boot-{}", request_digest.as_str()).try_into()?;
+    Ok(Job {
+        operation,
+        request_digest,
+        build,
+    })
+}
+
+fn dispatch(root: &Path, executable: &Path, job: Job) -> Result<Outcome> {
     let root = sandsurf_native::local::canonical_private_directory(root)?;
     sandsurf_native::volume::inspect(&root)?;
     ensure_private_directory(&root.join("image-workers"))?;
@@ -237,6 +374,37 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
         return Ok(());
     }
     let image = match &job.build {
+        Build::Boot {
+            machine_id,
+            generation,
+            image_digest,
+            disk_bytes,
+            boot_name,
+        } => {
+            prepare_machine(
+                &root,
+                machine_id,
+                *generation,
+                image_digest,
+                *disk_bytes,
+                boot_name,
+            )?;
+            let boot = crate::storage::read_boot(
+                &root
+                    .join("machines")
+                    .join(object_name(machine_id.as_str()))
+                    .join("guardian")
+                    .join(boot_name),
+            )?;
+            publish(
+                &directory(&root, &operation).join("result.json"),
+                &BootResult {
+                    request_digest: job.request_digest.clone(),
+                    boot,
+                },
+            )?;
+            return Ok(());
+        }
         Build::Native {
             manifest_path,
             manifest_digest,
@@ -301,9 +469,164 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
     Ok(())
 }
 
+fn boot_directory(
+    root: &Path,
+    machine: &MachineId,
+    generation: Counter,
+    boot_name: &str,
+) -> Result<PathBuf> {
+    let prefix = format!("boot-{}-", generation.get());
+    if boot_name.strip_prefix(&prefix).is_none_or(|nonce| {
+        nonce.len() != 64
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) {
+        return Err(HostError::Invalid("invalid boot preparation object name"));
+    }
+    Ok(root
+        .join("machines")
+        .join(object_name(machine.as_str()))
+        .join("guardian")
+        .join(boot_name))
+}
+
+fn prepare_machine(
+    root: &Path,
+    machine: &MachineId,
+    generation: Counter,
+    image_digest: &Digest,
+    disk_bytes: u64,
+    boot_name: &str,
+) -> Result<()> {
+    let boot_directory = boot_directory(root, machine, generation, boot_name)?;
+    let machine_root = root.join("machines").join(object_name(machine.as_str()));
+    sandsurf_native::local::canonical_private_directory(&machine_root)?;
+    let image = crate::images::resolve_native_image(root, image_digest)?;
+    let disk = machine_root.join("disks/system.ext4");
+    crate::storage::materialize(&image.system_path, &disk, disk_bytes, |staged| {
+        sandsurf_image::identity::customize(staged, &image.manifest.system.clone_profile)
+    })?;
+    let _custody = crate::storage::attach(&disk)?;
+    crate::storage::freeze_boot(&image, &disk, &boot_directory)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn boot_jobs_bind_every_input_and_cannot_address_arbitrary_host_paths() {
+        let root = Path::new("/host-owner");
+        let machine: MachineId = "computer".try_into().unwrap();
+        let generation: Counter = 7.try_into().unwrap();
+        let image = sandsurf_protocol::bytes_digest(b"image");
+        assert_eq!(
+            serde_json::to_vec(&boot_job(&machine, generation, &image, 8192).unwrap()).unwrap(),
+            serde_json::to_vec(&boot_job(&machine, generation, &image, 8192).unwrap()).unwrap()
+        );
+        assert_ne!(
+            boot_job(&machine, generation, &image, 8192)
+                .unwrap()
+                .operation,
+            boot_job(&machine, generation.next().unwrap(), &image, 8192)
+                .unwrap()
+                .operation
+        );
+        let name = format!("boot-7-{}", "a".repeat(64));
+        assert_eq!(
+            boot_directory(root, &machine, generation, &name).unwrap(),
+            root.join("machines")
+                .join(object_name(machine.as_str()))
+                .join("guardian")
+                .join(&name)
+        );
+        for name in [
+            "../outside",
+            "/host/kernel",
+            "boot-8-aaaa",
+            "boot-7-aaa",
+            &format!("boot-7-{}", "A".repeat(64)),
+        ] {
+            assert!(boot_directory(root, &machine, generation, name).is_err());
+        }
+        let build = Build::Boot {
+            machine_id: machine,
+            generation,
+            image_digest: sandsurf_protocol::bytes_digest(b"image"),
+            disk_bytes: 8192,
+            boot_name: name,
+        };
+        let encoded = serde_json::to_value(&build).unwrap();
+        let identity = digest(Domain::Image, &("sandsurf-boot-preparation-v1", &build)).unwrap();
+        for (key, value) in [
+            ("machineId", serde_json::json!("other-computer")),
+            ("generation", serde_json::json!(8)),
+            (
+                "imageDigest",
+                serde_json::json!(sandsurf_protocol::bytes_digest(b"other-image")),
+            ),
+            ("diskBytes", serde_json::json!(16384)),
+            (
+                "bootName",
+                serde_json::json!(format!("boot-7-{}", "b".repeat(64))),
+            ),
+        ] {
+            let mut changed = encoded.clone();
+            changed[key] = value;
+            let changed: Build = serde_json::from_value(changed).unwrap();
+            assert_ne!(
+                digest(Domain::Image, &("sandsurf-boot-preparation-v1", &changed)).unwrap(),
+                identity
+            );
+        }
+        let mut invalid = encoded;
+        invalid["diskPath"] = serde_json::json!("/arbitrary/host/data");
+        assert!(serde_json::from_value::<Build>(invalid).is_err());
+    }
+
+    #[test]
+    fn boot_completion_reference_alone_is_not_a_completed_preparation() {
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-boot-result-{}",
+            sandsurf_protocol::bytes_digest(&nonce).as_str()
+        ));
+        ensure_private_directory(&root).unwrap();
+        ensure_private_directory(&root.join("image-workers")).unwrap();
+        let job = Job {
+            operation: "boot-operation".try_into().unwrap(),
+            request_digest: sandsurf_protocol::bytes_digest(b"job"),
+            build: Build::Boot {
+                machine_id: "computer".try_into().unwrap(),
+                generation: 7.try_into().unwrap(),
+                image_digest: sandsurf_protocol::bytes_digest(b"image"),
+                disk_bytes: 8192,
+                boot_name: format!("boot-7-{}", "a".repeat(64)),
+            },
+        };
+        ensure_private_directory(&directory(&root, &job.operation)).unwrap();
+        assert!(result(&root, &job).unwrap().is_none());
+        let boot = sandsurf_image::boot::FrozenBoot {
+            architecture: sandsurf_image::Architecture::X64,
+            kernel: sandsurf_image::ImageArtifact {
+                path: "kernel".into(),
+                sha256: "a".repeat(64),
+            },
+            initramfs: None,
+        };
+        publish(
+            &directory(&root, &job.operation).join("result.json"),
+            &BootResult {
+                request_digest: job.request_digest.clone(),
+                boot,
+            },
+        )
+        .unwrap();
+        assert!(result(&root, &job).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     #[cfg(target_os = "linux")]
     fn shared_workers_have_a_complete_separate_process_envelope() {

@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { collectDependencySources, dependencySourceFiles, licenseExpression, msysLicenseExpression, pacmanDescription, requireDetachedSignature, requireTrustedSignature, verifyDependencySources, verifyMsysSource } from "../qemu-dependencies.ts";
+import { windowsLibraries } from "../build-qemu.ts";
 
 const fingerprint = "A".repeat(40);
 const trustedStatus = `[GNUPG:] NEWSIG\n[GNUPG:] KEY_CONSIDERED ${fingerprint} 0\n[GNUPG:] SIG_ID abcdef123 2026-10-02 1790937600\n[GNUPG:] GOODSIG ${fingerprint.slice(-16)} Distribution signer\n[GNUPG:] VALIDSIG ${fingerprint} 2026-10-02 1790937600 0 4 0 22 8 00 ${fingerprint}\n[GNUPG:] TRUST_FULLY 0 pgp\n`;
@@ -123,7 +124,7 @@ test("real GPG verifies a read-only trusted keyring and rejects an untrusted sig
   });
 
 test("native MSYS2 installed library ships distribution-verified corresponding source",
-  { skip: process.env.SANDSURF_MSYS_SOURCE_TEST !== "1", timeout: 180000 }, async (context) => {
+  { skip: process.env.SANDSURF_MSYS_SOURCE_TEST !== "1", timeout: 300000 }, async (context) => {
     assert.equal(process.platform, "win32", "this is a native MSYS2 contract, not a simulated platform");
     const execute = promisify(execFile);
     const run = async (command, args, cwd, _capture, _environment, limits) => (await execute(command, args,
@@ -137,12 +138,18 @@ test("native MSYS2 installed library ships distribution-verified corresponding s
     const name = "libglib-2.0-0.dll", input = resolve(prefix, name);
     const digest = createHash("sha256").update(await readFile(input)).digest("hex");
     await copyFile(input, resolve(output, name));
-    await collectDependencySources(output, new Map([[name, { path: input, sha256: digest }]]), scratch, run);
-    const manifest = await verifyDependencySources(output, { [name]: digest });
-    assert.equal(manifest.components.length, 1);
-    assert.equal(manifest.components[0].manager, "msys2");
-    assert.equal(manifest.components[0].name, "mingw-w64-glib2");
-    assert.ok(Object.keys(manifest.components[0].materials).some((file) => file.endsWith(".src.tar.zst")));
+    const libraries = await windowsLibraries(input, output);
+    libraries.set(name, { path: input, sha256: digest });
+    await collectDependencySources(output, libraries, scratch, run);
+    const runtime = Object.fromEntries(await Promise.all([...libraries.keys()].map(async (file) =>
+      [file, createHash("sha256").update(await readFile(resolve(output, file))).digest("hex")])));
+    const manifest = await verifyDependencySources(output, runtime);
+    assert.ok(manifest.components.length > 1, "the installed transitive DLL closure, not just GLib, must ship source");
+    assert.ok(manifest.components.some((component) => component.name === "mingw-w64-glib2"));
+    for (const component of manifest.components) {
+      assert.equal(component.manager, "msys2");
+      assert.ok(Object.keys(component.materials).some((file) => file.endsWith(".src.tar.zst")));
+    }
   });
 
 test("installed package fields remain exact and reject duplicate or oversized metadata", () => {

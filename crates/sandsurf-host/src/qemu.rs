@@ -358,34 +358,18 @@ impl QemuGuardianEffect {
         command: &LifecycleCommand,
         generation: Counter,
     ) -> Result<(), Digest> {
-        let image = verify_image(&self.config.image_manifest, ImageTrust::ExplicitLocal)
-            .map_err(|_| bytes_digest(b"qemu-boot-image-invalid"))?;
         let restoring = crate::restore::load::<RestoreLineage>(&self.machine_root)
             .map_err(|_| bytes_digest(b"qemu-restore-lineage-invalid"))?;
-        if restoring.is_none() {
-            ensure_mutable_disk(
-                &self.config.system_seed,
-                &self.machine_root.join("disks/system.ext4"),
-                command.configuration.resources.disk_bytes.get(),
-                &image.manifest.system.clone_profile,
-            )
-            .map_err(|error| {
-                eprintln!("sandsurf disk preparation failed: {error}");
-                bytes_digest(b"qemu-system-disk-preparation-failed")
-            })?;
-        }
-        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
-            .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?;
-        let boot_directory = self.machine_root.join("guardian").join(format!(
-            "boot-{}-{}",
-            generation.get(),
-            random_bytes()
-                .map_err(|_| bytes_digest(b"qemu-boot-entropy"))?
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        ));
-        let boot = if let Some(lineage) = &restoring {
+        let (boot_directory, boot) = if let Some(lineage) = &restoring {
+            let boot_directory = self.machine_root.join("guardian").join(format!(
+                "boot-{}-{}",
+                generation.get(),
+                random_bytes()
+                    .map_err(|_| bytes_digest(b"qemu-boot-entropy"))?
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
             let source = self
                 .machine_root
                 .join("snapshots")
@@ -396,15 +380,22 @@ impl QemuGuardianEffect {
             if boot != lineage.source.boot {
                 return Err(bytes_digest(b"qemu-restore-boot-identity-mismatch"));
             }
-            boot
+            (boot_directory, boot)
         } else {
-            crate::storage::freeze_boot(
-                &image,
-                &self.machine_root.join("disks/system.ext4"),
-                &boot_directory,
+            crate::image_worker::prepare_boot(
+                &self.machine_root,
+                &command.machine_id,
+                generation,
+                &self.config.image_digest,
+                command.configuration.resources.disk_bytes.get(),
             )
-            .map_err(|_| bytes_digest(b"qemu-boot-artifacts-invalid"))?
+            .map_err(|error| {
+                eprintln!("sandsurf offline boot preparation failed: {error}");
+                bytes_digest(b"qemu-boot-preparation-failed")
+            })?
         };
+        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
+            .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?;
         let (kernel, initramfs) = sandsurf_image::boot::paths(&boot_directory, &boot);
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
             .and_then(|format| format.require_qemu())
@@ -1461,18 +1452,6 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<SerialChannel> {
         active.boot_identity.clone(),
         active.capability,
     )
-}
-
-fn ensure_mutable_disk(
-    source: &Path,
-    destination: &Path,
-    bytes: u64,
-    profile: &sandsurf_image::identity::CloneProfile,
-) -> Result<(), QemuError> {
-    crate::storage::materialize(source, destination, bytes, |staged| {
-        sandsurf_image::identity::customize(staged, profile)
-    })?;
-    Ok(())
 }
 
 fn write_authentication(

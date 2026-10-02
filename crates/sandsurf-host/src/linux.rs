@@ -1445,32 +1445,21 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             return Err(bytes_digest(b"linux-generation-factory-identity-conflict"));
         }
         self.config.resources = resources.clone();
-        let image = verify_image(&self.config.image_manifest, ImageTrust::ExplicitLocal)
-            .map_err(|_| bytes_digest(b"linux-boot-image-invalid"))?;
-        ensure_mutable_disk(
-            &self.config.system_seed,
-            &self.system_disk,
+        let (boot_directory, boot) = crate::image_worker::prepare_boot(
+            &self.machine_root,
+            machine_id,
+            generation,
+            &self.config.image_digest,
             resources.disk_bytes.get(),
-            &image.manifest.system.clone_profile,
         )
         .map_err(|error| {
-            eprintln!("sandsurf disk preparation failed: {error}");
-            bytes_digest(b"linux-system-disk-preparation-failed")
+            eprintln!("sandsurf offline boot preparation failed: {error}");
+            bytes_digest(b"linux-boot-preparation-failed")
         })?;
         let storage_lease = crate::storage::attach(&self.system_disk).map_err(|error| {
             eprintln!("sandsurf disk attachment refused: {error}");
             bytes_digest(b"linux-system-disk-attachment-failed")
         })?;
-        let boot_directory = self.machine_root.join("guardian").join(format!(
-            "boot-{}-{}",
-            generation.get(),
-            hex(&random_bytes().map_err(|_| bytes_digest(b"linux-boot-entropy"))?)
-        ));
-        let boot = crate::storage::freeze_boot(&image, &self.system_disk, &boot_directory)
-            .map_err(|error| {
-                eprintln!("sandsurf boot selection failed: {error}");
-                bytes_digest(b"linux-boot-artifacts-invalid")
-            })?;
         self.configuration_from_boot(
             machine_id,
             generation,
@@ -1749,18 +1738,6 @@ fn guest_client(active: &ActiveGuest) -> GuestClient<UnixVsockChannel> {
     )
 }
 
-fn ensure_mutable_disk(
-    source: &Path,
-    destination: &Path,
-    requested_bytes: u64,
-    clone_profile: &sandsurf_image::identity::CloneProfile,
-) -> Result<(), LinuxError> {
-    crate::storage::materialize(source, destination, requested_bytes, |staged| {
-        sandsurf_image::identity::customize(staged, clone_profile)
-    })?;
-    Ok(())
-}
-
 fn write_authentication(
     path: &Path,
     machine_id: &MachineId,
@@ -2019,22 +1996,13 @@ mod storage_tests {
             .unwrap()
             .write_all(contents)
             .unwrap();
-        ensure_mutable_disk(
-            &source,
-            &destination,
-            8192,
-            &sandsurf_image::identity::CloneProfile::Preserve,
-        )
-        .unwrap();
+        crate::storage::materialize(&source, &destination, 8192, |_| Ok(())).unwrap();
         assert_eq!(fs::metadata(&destination).unwrap().len(), 8192);
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         fs::remove_file(source).unwrap();
-        ensure_mutable_disk(
-            &root.join("missing-seed"),
-            &destination,
-            8192,
-            &sandsurf_image::identity::CloneProfile::Preserve,
-        )
+        crate::storage::materialize(&root.join("missing-seed"), &destination, 8192, |_| {
+            panic!("published storage must not be prepared again")
+        })
         .unwrap();
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         crate::storage::retire(&destination, 8192).unwrap();
