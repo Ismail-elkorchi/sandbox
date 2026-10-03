@@ -5,6 +5,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0A00
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <sddl.h>
 #include <userenv.h>
@@ -86,11 +87,11 @@ static void child(DWORD recipient, const char *moniker) {
                               &primary) && create_token != NULL &&
                 create_token(primary, &security, &restricted), "fixed socket token");
     CloseHandle(primary);
-    WSAPROTOCOL_INFOW receipts[2] = {0};
-    for (int slot = 0; slot < 2; ++slot) {
+    WSAPROTOCOL_INFOW receipts[3] = {0};
+    for (int slot = 0; slot < 3; ++slot) {
         require(ImpersonateLoggedOnUser(restricted), "socket creation identity");
-        int type = slot == 0 ? SOCK_STREAM : SOCK_DGRAM;
-        int protocol = slot == 0 ? IPPROTO_TCP : IPPROTO_UDP;
+        int type = slot == 1 ? SOCK_DGRAM : SOCK_STREAM;
+        int protocol = slot == 1 ? IPPROTO_UDP : IPPROTO_TCP;
         SOCKET socket = WSASocketW(AF_INET, type, protocol, NULL, 0,
                                   WSA_FLAG_OVERLAPPED);
         require(socket != INVALID_SOCKET, "restricted socket allocation");
@@ -127,20 +128,9 @@ static int experiment(const wchar_t *binary) {
     PSID sid = NULL;
     require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(name, &sid)),
             "fresh AppContainer identity");
-    /* Registration gives the native object namespace an identity. Deliberately
-     * do not create a writable AppContainer profile outside the bounded scope. */
-    typedef HRESULT (WINAPI *RegisterSid)(PSID, LPCWSTR, LPCWSTR);
-    typedef HRESULT (WINAPI *UnregisterSid)(PSID);
-    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
-    FARPROC address_register = GetProcAddress(kernelbase, "AppContainerRegisterSid");
-    FARPROC address_unregister = GetProcAddress(kernelbase, "AppContainerUnregisterSid");
-    RegisterSid register_sid = NULL;
-    UnregisterSid unregister_sid = NULL;
-    _Static_assert(sizeof(register_sid) == sizeof(address_register), "native function ABI");
-    memcpy(&register_sid, &address_register, sizeof(register_sid));
-    memcpy(&unregister_sid, &address_unregister, sizeof(unregister_sid));
-    require(register_sid != NULL && unregister_sid != NULL &&
-                SUCCEEDED(register_sid(sid, name, name)), "native identity registration");
+    /* Tokens/socket identities need no writable profile or persistent native
+     * registration. This experiment must prove useful external delivery too,
+     * not infer isolation from a token which merely denies every network. */
     LPWSTR sid_text = NULL;
     require(ConvertSidToStringSidW(sid, &sid_text), "AppContainer SID text");
     wchar_t temporary[MAX_PATH], executable[MAX_PATH];
@@ -207,7 +197,7 @@ static int experiment(const wchar_t *binary) {
                 &startup.StartupInfo, &process), "restricted native socket owner");
     CloseHandle(write_pipe);
     CloseHandle(diagnostic);
-    WSAPROTOCOL_INFOW receipts[2] = {0};
+    WSAPROTOCOL_INFOW receipts[3] = {0};
     DWORD offset = 0;
     while (offset < sizeof(receipts)) {
         DWORD count = 0;
@@ -216,8 +206,8 @@ static int experiment(const wchar_t *binary) {
                 "transferred original socket receipt");
         offset += count;
     }
-    SOCKET sockets[2];
-    for (int slot = 0; slot < 2; ++slot) {
+    SOCKET sockets[3];
+    for (int slot = 0; slot < 3; ++slot) {
         sockets[slot] = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
             FROM_PROTOCOL_INFO, &receipts[slot], 0, WSA_FLAG_OVERLAPPED);
         require(sockets[slot] != INVALID_SOCKET, "adopt original socket");
@@ -232,9 +222,26 @@ static int experiment(const wchar_t *binary) {
     CloseHandle(read_pipe);
     DeleteProcThreadAttributeList(attributes);
     free(attributes);
-    require(SUCCEEDED(unregister_sid(sid)), "native identity retirement");
     FreeSid(sid);
     require(DeleteFileW(executable), "fixture binary cleanup");
+
+    struct addrinfo hints = {0}, *external = NULL;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    require(getaddrinfo("github.com", "443", &hints, &external) == 0 &&
+                external != NULL, "ordinary public destination resolution");
+    unsigned long nonblocking = 1;
+    require(ioctlsocket(sockets[2], FIONBIO, &nonblocking) == 0, "bounded external connect");
+    int initiated = connect(sockets[2], external->ai_addr, (int)external->ai_addrlen);
+    require(initiated == 0 || WSAGetLastError() == WSAEWOULDBLOCK, "external connect admission");
+    fd_set writable; FD_ZERO(&writable); FD_SET(sockets[2], &writable);
+    struct timeval deadline = {10, 0};
+    require(select(0, NULL, &writable, NULL, &deadline) == 1, "external connect deadline");
+    int connected_error = 0, error_bytes = sizeof(connected_error);
+    require(getsockopt(sockets[2], SOL_SOCKET, SO_ERROR, (char *)&connected_error,
+                &error_bytes) == 0 && connected_error == 0, "unregistered original identity admits public TCP");
+    puts("Transferred unregistered socket admits public TCP after original owner exit");
+    freeaddrinfo(external);
+    closesocket(sockets[2]);
 
     unsigned short port = 0;
     SOCKET receiver = udp_listener("127.0.0.1", &port);
