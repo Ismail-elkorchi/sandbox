@@ -326,10 +326,18 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
-        let alias = root
-            .join("..")
-            .join(root.file_name().unwrap())
-            .join("peer.sock");
+        // PathBuf::push normalizes a verbatim Windows path, eliminating '..'
+        // before connect sees it. Construct the actual unnormalized input.
+        let mut alias = root.as_os_str().to_owned();
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        alias.push(&separator);
+        alias.push("..");
+        alias.push(&separator);
+        alias.push(root.file_name().unwrap());
+        alias.push(&separator);
+        alias.push("peer.sock");
+        let alias = std::path::PathBuf::from(alias);
+        assert!(alias.components().any(|part| part.as_os_str() == ".."));
         assert!(
             SocketConnection::connect(&alias, std::process::id(), Duration::from_secs(1)).is_err()
         );
