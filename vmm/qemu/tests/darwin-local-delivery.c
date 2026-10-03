@@ -15,8 +15,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define FACTORY_UID 65530
 #define DEADLINE_MS 300
+int sandsurf_darwin_network_socket(int family, int type, int protocol);
 
 static void require(int condition, const char *message)
 {
@@ -34,8 +34,8 @@ static int restricted_socket(int family, int type)
     require(child >= 0, "factory fork");
     if (child == 0) {
         close(channel[0]);
-        require(setgid(FACTORY_UID) == 0 && setuid(FACTORY_UID) == 0, "factory credential");
-        int descriptor = socket(family, type, 0);
+        int descriptor = sandsurf_darwin_network_socket(family, type,
+            type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
         require(descriptor >= 0, "factory native socket");
         uint8_t payload = 1;
         struct iovec iov = {.iov_base = &payload, .iov_len = 1};

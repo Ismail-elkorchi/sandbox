@@ -4,6 +4,9 @@ on:
     branches: [main]
     paths:
       - vmm/qemu/tests/windows-local-delivery.c
+      - vmm/qemu/tests/darwin-local-delivery.c
+      - vmm/qemu/tests/darwin-network-native.c
+      - crates/sandsurf-native/src/darwin_socket.c
       - .github/workflows/native-network-proof.yml
   workflow_dispatch:
 permissions:
@@ -18,11 +21,17 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_ENVIRONMENT" != github-hosted ]; then exit 1; fi
-          trap 'sudo pfctl -d; sudo pfctl -f /etc/pf.conf' EXIT
+          clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-network-native.c crates/sandsurf-native/src/darwin_socket.c -o darwin-network-native
+          clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-local-delivery.c crates/sandsurf-native/src/darwin_socket.c -o darwin-local-delivery
+          sudo chown root:wheel darwin-network-native
+          sudo chmod go-w darwin-network-native
+          sudo ./darwin-network-native
+          trap 'sudo ifconfig lo0 -alias 198.18.0.9 2>/dev/null || true; sudo pfctl -d; sudo pfctl -f /etc/pf.conf' EXIT
           sudo pfctl -f vmm/qemu/tests/darwin-local-delivery.conf
           sudo pfctl -e
           sudo pfctl -sa -vv
           sudo pfctl -s Interfaces -v
+          sudo ./darwin-local-delivery
   windows-network:
     runs-on: windows-2025
     timeout-minutes: 10

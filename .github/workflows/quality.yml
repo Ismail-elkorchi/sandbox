@@ -187,7 +187,7 @@ jobs:
       - name: Kernel local-delivery and original socket-owner contract (no VM hardware required)
         run: |
           test "$RUNNER_ENVIRONMENT" = github-hosted
-          clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-local-delivery.c -o target/debug/darwin-local-delivery
+          clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-local-delivery.c crates/sandsurf-native/src/darwin_socket.c -o target/debug/darwin-local-delivery
           sudo pfctl -nf vmm/qemu/tests/darwin-local-delivery.conf
           # Only disposable CI may replace its root policy. Never run this on
           # an operator's host or infer VM qualification from this contract.
