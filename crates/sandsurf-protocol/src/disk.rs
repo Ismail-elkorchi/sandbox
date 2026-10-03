@@ -27,9 +27,6 @@ pub enum DiskOperation {
         bytes: u64,
         compression: DiskCompression,
     },
-    Execute {
-        argv: Vec<String>,
-    },
     Sync,
     Unmount,
     CheckExt4,
@@ -44,10 +41,6 @@ pub enum DiskOperation {
         path: String,
         mode: u32,
     },
-    Mkdir {
-        path: String,
-    },
-    ZeroFreeSpace,
     Realpath {
         path: String,
     },
@@ -59,18 +52,6 @@ pub enum DiskOperation {
         offset: u64,
         bytes: u64,
     },
-    Cat {
-        path: String,
-    },
-    Stat {
-        path: String,
-    },
-    Readlink {
-        path: String,
-    },
-    Exists {
-        path: String,
-    },
 }
 
 impl DiskOperation {
@@ -80,12 +61,9 @@ impl DiskOperation {
             Self::Mount { writable: true }
                 | Self::MakeExt4
                 | Self::ImportTar { .. }
-                | Self::Execute { .. }
                 | Self::Remove { .. }
                 | Self::Write { .. }
                 | Self::Chmod { .. }
-                | Self::Mkdir { .. }
-                | Self::ZeroFreeSpace
         )
     }
 
@@ -97,14 +75,9 @@ impl DiskOperation {
             Self::Remove { path }
             | Self::Write { path, .. }
             | Self::Chmod { path, .. }
-            | Self::Mkdir { path }
             | Self::Realpath { path }
             | Self::FileSize { path }
-            | Self::Download { path, .. }
-            | Self::Cat { path }
-            | Self::Stat { path }
-            | Self::Readlink { path }
-            | Self::Exists { path } => Some(path),
+            | Self::Download { path, .. } => Some(path),
             _ => None,
         };
         if path.is_some_and(|path| {
@@ -124,16 +97,6 @@ impl DiskOperation {
             Self::Download { offset, bytes, .. } if offset.checked_add(*bytes).is_none() => {
                 Err(invalid("disk range overflow"))
             }
-            Self::Execute { argv }
-                if argv.is_empty()
-                    || argv.len() > 64
-                    || argv[0].is_empty()
-                    || argv
-                        .iter()
-                        .any(|arg| arg.len() > 4096 || arg.contains('\0')) =>
-            {
-                Err(invalid("invalid disk program argv"))
-            }
             Self::Write { bytes, .. } if bytes.len() > 16384 => {
                 Err(invalid("disk metadata write exceeds bound"))
             }
@@ -147,35 +110,18 @@ impl DiskOperation {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DiskReply {
     Complete,
-    Text {
-        value: String,
-    },
-    Size {
-        bytes: u64,
-    },
-    Exists {
-        value: bool,
-    },
-    Stat {
-        uid: u32,
-        gid: u32,
-        mode: u32,
-        bytes: u64,
-    },
-    Failed {
-        message: String,
-    },
+    Text { value: String },
+    Size { bytes: u64 },
+    Failed { message: String },
 }
 
 impl DiskReply {
     pub fn validate_for(&self, operation: &DiskOperation) -> io::Result<()> {
         let valid = match (operation, self) {
             (_, Self::Failed { message }) => message.len() <= 4096,
-            (DiskOperation::Cat { .. }, Self::Text { value }) => value.len() <= 16384,
-            (
-                DiskOperation::Realpath { .. } | DiskOperation::Readlink { .. },
-                Self::Text { value },
-            ) => value.len() <= 4096 && !value.contains('\0'),
+            (DiskOperation::Realpath { .. }, Self::Text { value }) => {
+                value.len() <= 4096 && !value.contains('\0')
+            }
             (DiskOperation::FileSize { .. }, Self::Size { bytes }) => *bytes <= MAX_DISK_TRANSFER,
             (
                 DiskOperation::Download {
@@ -183,23 +129,16 @@ impl DiskReply {
                 },
                 Self::Size { bytes },
             ) => expected == bytes,
-            (DiskOperation::Stat { .. }, Self::Stat { mode, bytes, .. }) => {
-                *mode <= 0o177777 && *bytes <= MAX_DISK_TRANSFER
-            }
-            (DiskOperation::Exists { .. }, Self::Exists { .. }) => true,
             (
                 DiskOperation::Mount { .. }
                 | DiskOperation::MakeExt4
                 | DiskOperation::ImportTar { .. }
-                | DiskOperation::Execute { .. }
                 | DiskOperation::Sync
                 | DiskOperation::Unmount
                 | DiskOperation::CheckExt4
                 | DiskOperation::Remove { .. }
                 | DiskOperation::Write { .. }
-                | DiskOperation::Chmod { .. }
-                | DiskOperation::Mkdir { .. }
-                | DiskOperation::ZeroFreeSpace,
+                | DiskOperation::Chmod { .. },
                 Self::Complete,
             ) => true,
             _ => false,
@@ -258,6 +197,7 @@ impl<T: Read + Write> DiskChannel<T> {
         self.checked(result)
     }
     pub fn send_data(&mut self, input: &mut impl Read, bytes: u64) -> io::Result<()> {
+        self.ready()?;
         if bytes == 0 || bytes > MAX_DISK_TRANSFER {
             return Err(invalid("invalid disk transfer credit"));
         }
@@ -273,6 +213,7 @@ impl<T: Read + Write> DiskChannel<T> {
         Ok(())
     }
     pub fn data(&mut self, output: &mut impl Write, bytes: u64) -> io::Result<()> {
+        self.ready()?;
         if bytes == 0 || bytes > MAX_DISK_TRANSFER {
             return Err(invalid("invalid disk receive credit"));
         }
@@ -488,13 +429,42 @@ mod tests {
         );
         assert!(
             DiskReply::Text {
-                value: "x".repeat(16385)
+                value: "x".repeat(4097)
             }
-            .validate_for(&DiskOperation::Cat {
+            .validate_for(&DiskOperation::Realpath {
                 path: "/text".into()
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn failed_channel_does_not_consume_new_input() {
+        let mut channel = DiskChannel::new(Cursor::new(Vec::<u8>::new()));
+        assert!(channel.metadata::<DiskReply>().is_err());
+        let mut input = Cursor::new(b"untouched");
+        assert!(channel.send_data(&mut input, 9).is_err());
+        assert_eq!(input.position(), 0);
+    }
+
+    #[test]
+    fn closed_protocol_rejects_unused_operations_and_replies() {
+        for kind in [
+            "execute",
+            "mkdir",
+            "zero-free-space",
+            "cat",
+            "stat",
+            "readlink",
+            "exists",
+        ] {
+            let value = format!("{{\"kind\":\"{kind}\"}}");
+            assert!(serde_json::from_str::<DiskOperation>(&value).is_err());
+        }
+        for kind in ["stat", "exists"] {
+            let value = format!("{{\"kind\":\"{kind}\"}}");
+            assert!(serde_json::from_str::<DiskReply>(&value).is_err());
+        }
     }
 
     #[test]

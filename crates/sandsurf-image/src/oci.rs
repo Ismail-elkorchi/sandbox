@@ -6,11 +6,13 @@ use flate2::read::MultiGzDecoder;
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 const OCI_INDEX_MEDIA: &str = "application/vnd.oci.image.index.v1+json";
 const OCI_MANIFEST_MEDIA: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -194,13 +196,13 @@ pub fn unpack_layout_archive(
             return Err(OciError::Limit("OCI archive entry count"));
         }
         let relative = normalize_layer_path(item.path(), limits.path_bytes)?;
-        if relative.as_os_str().is_empty() {
+        if relative.is_empty() {
             continue;
         }
         if !is_layout_archive_path(&relative) {
             return Err(OciError::Invalid(format!(
                 "OCI archive contains an unexpected path {}",
-                relative.display()
+                relative
             )));
         }
         let kind = item.header().entry_type();
@@ -262,7 +264,7 @@ pub fn write_filesystem_tar(
     archive.mode(tar::HeaderMode::Deterministic);
     for entry in ordered {
         let relative = normalize_layer_path(Path::new(&entry.path), 4096)?;
-        if relative.as_os_str().is_empty() {
+        if relative.is_empty() {
             continue;
         }
         let mut header = tar::Header::new_gnu();
@@ -274,11 +276,15 @@ pub fn write_filesystem_tar(
             TreeEntryKind::Directory => {
                 header.set_entry_type(tar::EntryType::Directory);
                 header.set_size(0);
-                header.set_cksum();
-                archive.append_data(&mut header, &relative, io::empty())?;
+                guest_header(&mut archive, &mut header, &relative, None)?;
+                archive.append(&header, io::empty())?;
             }
             TreeEntryKind::Regular => {
-                let source = tree_root.join(&relative);
+                let digest = entry.digest.as_deref().ok_or_else(|| {
+                    OciError::Invalid("regular inode has no content identity".into())
+                })?;
+                parse_digest(&format!("sha256:{digest}"))?;
+                let source = tree_root.join(digest);
                 let metadata = fs::symlink_metadata(&source)?;
                 if !metadata.is_file()
                     || metadata.file_type().is_symlink()
@@ -290,8 +296,12 @@ pub fn write_filesystem_tar(
                 }
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_size(entry.size);
-                header.set_cksum();
-                archive.append_data(&mut header, &relative, File::open(source)?)?;
+                guest_header(&mut archive, &mut header, &relative, None)?;
+                let mut input = HashingReader::new(File::open(source)?, entry.size);
+                archive.append(&header, &mut input)?;
+                if input.bytes != entry.size || format!("{:x}", input.hasher.finalize()) != digest {
+                    return Err(OciError::DigestMismatch(digest.into()));
+                }
             }
             TreeEntryKind::Symlink | TreeEntryKind::Hardlink => {
                 let target = entry
@@ -304,13 +314,51 @@ pub fn write_filesystem_tar(
                     tar::EntryType::Link
                 });
                 header.set_size(0);
-                archive.append_link(&mut header, &relative, target)?;
+                guest_header(&mut archive, &mut header, &relative, Some(target))?;
+                archive.append(&header, io::empty())?;
             }
         }
     }
     archive.finish()?;
     let output = archive.into_inner()?;
     output.sync_all()?;
+    Ok(())
+}
+
+/// Guest Linux names never pass through a host Path interpretation. In
+/// particular Windows drive prefixes, backslashes and reserved device names
+/// remain literal tar bytes, never host filenames. GNU extensions carry the
+/// complete bounded UTF-8 name rather than a host-normalized alias.
+fn guest_header<W: Write>(
+    archive: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    path: &str,
+    link: Option<&str>,
+) -> io::Result<()> {
+    for (text, kind, offset) in [
+        (Some(path), tar::EntryType::GNULongName, 0),
+        (link, tar::EntryType::GNULongLink, 157),
+    ] {
+        let Some(text) = text else { continue };
+        if text.len() > 4096 || text.contains('\0') {
+            return Err(io::Error::other("invalid guest tar name"));
+        }
+        if text.len() > 100 {
+            let mut extension = tar::Header::new_gnu();
+            extension.set_entry_type(kind);
+            extension.set_size(text.len() as u64 + 1);
+            extension.set_mode(0o644);
+            let name = b"././@LongLink\0";
+            extension.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            extension.set_cksum();
+            archive.append(&extension, text.as_bytes().chain(&b"\0"[..]))?;
+        }
+        let bytes = &mut header.as_mut_bytes()[offset..offset + 100];
+        bytes.fill(0);
+        let count = text.len().min(100);
+        bytes[..count].copy_from_slice(&text.as_bytes()[..count]);
+    }
+    header.set_cksum();
     Ok(())
 }
 
@@ -370,33 +418,12 @@ fn filesystem_archive_order(entries: &[TreeEntry]) -> Result<Vec<&TreeEntry>, Oc
     Ok(ordered)
 }
 
-fn is_layout_archive_path(path: &Path) -> bool {
-    if matches!(
-        path.to_str(),
-        Some("oci-layout" | "index.json" | "blobs" | "blobs/sha256")
-    ) {
+fn is_layout_archive_path(path: &str) -> bool {
+    if matches!(path, "oci-layout" | "index.json" | "blobs" | "blobs/sha256") {
         return true;
     }
-    let mut components = path.components();
-    let (
-        Some(Component::Normal(blobs)),
-        Some(Component::Normal(algorithm)),
-        Some(Component::Normal(digest)),
-        None,
-    ) = (
-        components.next(),
-        components.next(),
-        components.next(),
-        components.next(),
-    )
-    else {
-        return false;
-    };
-    blobs == "blobs"
-        && algorithm == "sha256"
-        && digest
-            .to_str()
-            .is_some_and(|value| parse_digest(&format!("sha256:{value}")).is_ok())
+    path.strip_prefix("blobs/sha256/")
+        .is_some_and(|value| parse_digest(&format!("sha256:{value}")).is_ok())
 }
 
 impl OciLayout {
@@ -520,11 +547,6 @@ impl OciLayout {
         source: ResolvedOciImage,
         destination: &Path,
     ) -> Result<ConvertedTree, OciError> {
-        if !cfg!(unix) {
-            return Err(OciError::Unsupported(
-                "OCI conversion requires the Linux builder appliance".into(),
-            ));
-        }
         let current = self.resolve(&GuestPlatform {
             architecture: source.architecture.clone(),
             os: source.os.clone(),
@@ -538,7 +560,7 @@ impl OciLayout {
         let manifest_descriptor = self.find_manifest_descriptor(&source.manifest_digest)?;
         let manifest: Manifest = self.read_descriptor_json(&manifest_descriptor)?;
         prepare_empty_destination(destination)?;
-        let mut metadata = BTreeMap::new();
+        let mut metadata = VirtualTree::default();
         let mut total_entries = 0usize;
         let mut total_expanded = 0u64;
         for (index, descriptor) in manifest.layers.iter().enumerate() {
@@ -553,7 +575,7 @@ impl OciLayout {
                 return Err(OciError::DigestMismatch(source.diff_ids[index].clone()));
             }
         }
-        let entries = collect_tree(destination, &metadata, self.limits.entries)?;
+        let entries = collect_tree(&metadata);
         let manifest_bytes = serde_json::to_vec(&("sandsurf-oci-tree-v1", &source, &entries))?;
         let manifest_digest = sha256_hex(&manifest_bytes);
         Ok(ConvertedTree {
@@ -586,20 +608,19 @@ impl OciLayout {
         &self,
         descriptor: &Descriptor,
         root: &Path,
-        metadata: &mut BTreeMap<String, EntryMetadata>,
+        metadata: &mut VirtualTree,
         total_entries: &mut usize,
         total_expanded: &mut u64,
     ) -> Result<String, OciError> {
         self.validate_descriptor(descriptor)?;
         let file = File::open(self.blob_path(&descriptor.digest)?)?;
         let remaining_expanded = self.limits.expanded_bytes.saturating_sub(*total_expanded);
-        let decoder: Box<dyn Read> = match descriptor.media_type.as_str() {
-            OCI_LAYER_TAR | DOCKER_LAYER_TAR => Box::new(file),
-            OCI_LAYER_GZIP | DOCKER_LAYER_GZIP => Box::new(MultiGzDecoder::new(file)),
-            OCI_LAYER_ZSTD => Box::new(ZstdReader::new(file, remaining_expanded)?),
-            value => return Err(OciError::Unsupported(format!("layer media type {value}"))),
-        };
+        let decoder = layer_decoder(file, &descriptor.media_type, remaining_expanded)?;
         let mut hashing = HashingReader::new(decoder, remaining_expanded);
+        // OCI whiteouts delete lower-layer entries regardless of archive
+        // ordering. Validate/hash a bounded first pass, applying only deletes;
+        // then replay this exact layer's additions, never guest commands.
+        let initial_headers = *total_entries;
         {
             let mut archive = sandsurf_format::archive::Archive::new(
                 &mut hashing,
@@ -611,7 +632,15 @@ impl OciLayout {
                 },
             );
             while let Some(entry) = archive.next_entry()? {
-                apply_entry(entry, root, metadata, &self.limits)?;
+                let path = normalize_layer_path(entry.path(), self.limits.path_bytes)?;
+                if whiteout(&path)?.is_some() {
+                    if !entry.header().entry_type().is_file() || entry.size() != 0 {
+                        return Err(OciError::Invalid(
+                            "OCI whiteout must be an empty regular entry".into(),
+                        ));
+                    }
+                    apply_whiteout(&path, metadata)?;
+                }
             }
             *total_entries += archive.headers_read();
         }
@@ -621,7 +650,32 @@ impl OciLayout {
         if *total_expanded > self.limits.expanded_bytes {
             return Err(OciError::Limit("expanded byte count"));
         }
-        Ok(format!("sha256:{:x}", hashing.hasher.finalize()))
+        let first = format!("sha256:{:x}", hashing.hasher.finalize());
+        let decoder = layer_decoder(
+            File::open(self.blob_path(&descriptor.digest)?)?,
+            &descriptor.media_type,
+            remaining_expanded,
+        )?;
+        let mut hashing = HashingReader::new(decoder, remaining_expanded);
+        {
+            let mut archive = sandsurf_format::archive::Archive::new(
+                &mut hashing,
+                sandsurf_format::archive::Limits {
+                    headers: self.limits.entries.saturating_sub(initial_headers),
+                    bytes: remaining_expanded,
+                    file_bytes: self.limits.file_bytes,
+                    path_bytes: self.limits.path_bytes,
+                },
+            );
+            while let Some(entry) = archive.next_entry()? {
+                apply_entry(entry, root, metadata, &self.limits)?;
+            }
+        }
+        let second = format!("sha256:{:x}", hashing.hasher.finalize());
+        if first != second {
+            return Err(OciError::DigestMismatch(first));
+        }
+        Ok(second)
     }
 
     fn read_descriptor_json<T: for<'de> Deserialize<'de>>(
@@ -794,13 +848,36 @@ struct Rootfs {
     diff_ids: Vec<String>,
 }
 
+#[derive(Default)]
+struct VirtualTree {
+    entries: BTreeMap<String, EntryMetadata>,
+    next_inode: usize,
+}
+
 #[derive(Debug, Clone)]
-struct EntryMetadata {
-    kind: TreeEntryKind,
+enum EntryMetadata {
+    Directory {
+        mode: u32,
+        uid: u64,
+        gid: u64,
+    },
+    Symlink {
+        mode: u32,
+        uid: u64,
+        gid: u64,
+        target: String,
+    },
+    File(Rc<RefCell<FileInode>>),
+}
+
+#[derive(Debug)]
+struct FileInode {
+    identity: usize,
+    digest: String,
+    size: u64,
     mode: u32,
     uid: u64,
     gid: u64,
-    link_target: Option<String>,
 }
 
 struct HashingReader<R> {
@@ -808,6 +885,15 @@ struct HashingReader<R> {
     hasher: Sha256,
     bytes: u64,
     maximum: u64,
+}
+
+fn layer_decoder(file: File, media: &str, maximum: u64) -> Result<Box<dyn Read>, OciError> {
+    match media {
+        OCI_LAYER_TAR | DOCKER_LAYER_TAR => Ok(Box::new(file)),
+        OCI_LAYER_GZIP | DOCKER_LAYER_GZIP => Ok(Box::new(MultiGzDecoder::new(file))),
+        OCI_LAYER_ZSTD => Ok(Box::new(ZstdReader::new(file, maximum)?)),
+        value => Err(OciError::Unsupported(format!("layer media type {value}"))),
+    }
 }
 
 /// Every compressed frame contributes to the OCI diff ID. Never silently
@@ -975,291 +1061,278 @@ fn validate_defaults(value: &OciDefaults) -> Result<(), OciError> {
     Ok(())
 }
 
+/// Linux inode identity is metadata; only opaque digest-named content reaches
+/// the host filesystem. Replacing an inode never changes surviving aliases.
 fn apply_entry<R: Read>(
     mut entry: sandsurf_format::archive::Entry<'_, R>,
     root: &Path,
-    metadata: &mut BTreeMap<String, EntryMetadata>,
+    tree: &mut VirtualTree,
     limits: &ConversionLimits,
 ) -> Result<(), OciError> {
     let path = normalize_layer_path(entry.path(), limits.path_bytes)?;
-    if path.as_os_str().is_empty() {
-        return Ok(());
-    }
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| OciError::Invalid("layer path has no UTF-8 basename".into()))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    register_implicit_directories(parent, metadata);
-    if name == ".wh..wh..opq" {
-        let directory = resolve_directory(root, parent, true)?;
-        for child in fs::read_dir(&directory)? {
-            remove_path(&child?.path())?;
-        }
-        let prefix = path_key(parent);
-        if prefix.is_empty() {
-            metadata.clear();
-        } else {
-            metadata.retain(|candidate, _| !is_descendant(candidate, &prefix));
+    if path.is_empty() {
+        // The canonical filesystem profile leaves the mkfs-owned root inode
+        // intact. Admit only its exact semantics, never silently discard an
+        // attempted root replacement or different administration metadata.
+        if !entry.header().entry_type().is_dir()
+            || entry.size() != 0
+            || entry.header().mode()? != 0o755
+            || entry.header().uid()? != 0
+            || entry.header().gid()? != 0
+        {
+            return Err(OciError::Unsupported(
+                "OCI root must be an empty root-owned 0755 directory".into(),
+            ));
         }
         return Ok(());
     }
-    if let Some(target) = name.strip_prefix(".wh.") {
-        if target.is_empty() {
-            return Err(OciError::Invalid("empty OCI whiteout target".into()));
-        }
-        let directory = resolve_directory(root, parent, true)?;
-        remove_path(&directory.join(target))?;
-        let target_path = parent.join(target);
-        let key = path_key(&target_path);
-        metadata.retain(|candidate, _| candidate != &key && !is_descendant(candidate, &key));
+    if whiteout(&path)?.is_some() {
         return Ok(());
     }
-
-    let parent_path = resolve_directory(root, parent, true)?;
-    let destination = parent_path.join(name);
-    let mode = entry.header().mode().map_err(OciError::Io)? & 0o7777;
-    let uid = entry.header().uid().map_err(OciError::Io)?;
-    let gid = entry.header().gid().map_err(OciError::Io)?;
+    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    register_implicit_directories(parent, tree, limits.entries)?;
+    let mode = entry.header().mode()?;
+    let uid = entry.header().uid()?;
+    let gid = entry.header().gid()?;
     let kind = entry.header().entry_type();
-    let key = path_key(&path);
-    if kind.is_dir() {
-        if destination.exists() {
-            let current = fs::symlink_metadata(&destination)?;
-            if !current.is_dir() || current.file_type().is_symlink() {
-                remove_path(&destination)?;
-                fs::create_dir(&destination)?;
-            }
-        } else {
-            fs::create_dir(&destination)?;
+    if mode > 0o7777 || uid > u32::MAX as u64 || gid > u32::MAX as u64 {
+        return Err(OciError::Unsupported(
+            "inode metadata exceeds the guest Linux profile".into(),
+        ));
+    }
+    if !kind.is_file() && entry.size() != 0 {
+        return Err(OciError::Invalid(
+            "non-file layer member carries payload".into(),
+        ));
+    }
+    let value = if kind.is_dir() {
+        if !matches!(
+            tree.entries.get(&path),
+            Some(EntryMetadata::Directory { .. })
+        ) {
+            remove_metadata_subtree(tree, &path);
         }
-        set_mode(&destination, mode)?;
-        metadata.insert(
-            key,
-            EntryMetadata {
-                kind: TreeEntryKind::Directory,
-                mode,
-                uid,
-                gid,
-                link_target: None,
-            },
-        );
+        EntryMetadata::Directory { mode, uid, gid }
     } else if kind.is_file() {
-        remove_metadata_subtree(metadata, &key);
         let declared = entry.size();
         if declared > limits.file_bytes {
             return Err(OciError::Limit("individual file size"));
         }
-        remove_path(&destination)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)?;
-        let copied = io::copy(&mut entry.by_ref().take(limits.file_bytes + 1), &mut output)?;
-        if copied != declared || copied > limits.file_bytes {
+        let identity = tree.next_inode;
+        tree.next_inode = identity
+            .checked_add(1)
+            .ok_or(OciError::Limit("inode identity count"))?;
+        let temporary = root.join(format!(".content-{identity}"));
+        let mut output = sandsurf_native::local::create_private_file(&temporary)?;
+        let mut reader = HashingReader::new(&mut entry, declared);
+        if io::copy(&mut reader, &mut output)? != declared {
             return Err(OciError::Invalid(
-                "layer file size differs from header or exceeds bound".into(),
+                "layer file size differs from header".into(),
             ));
         }
-        output.flush()?;
-        set_mode(&destination, mode)?;
-        metadata.insert(
-            key,
-            EntryMetadata {
-                kind: TreeEntryKind::Regular,
-                mode,
-                uid,
-                gid,
-                link_target: None,
-            },
-        );
+        output.sync_all()?;
+        drop(output);
+        let digest = format!("{:x}", reader.hasher.finalize());
+        let content = root.join(&digest);
+        match fs::symlink_metadata(&content) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == declared =>
+            {
+                if sha256_reader(&mut File::open(&content)?)? != digest {
+                    return Err(OciError::DigestMismatch(digest));
+                }
+                fs::remove_file(temporary)?;
+            }
+            Ok(_) => {
+                return Err(OciError::Invalid(
+                    "opaque content identity is not a regular blob".into(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::rename(temporary, content)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+        remove_metadata_subtree(tree, &path);
+        EntryMetadata::File(Rc::new(RefCell::new(FileInode {
+            identity,
+            digest,
+            size: declared,
+            mode,
+            uid,
+            gid,
+        })))
     } else if kind.is_symlink() {
-        remove_metadata_subtree(metadata, &key);
         let target = normalized_link(&entry, limits.path_bytes)?;
-        remove_path(&destination)?;
-        create_symlink(&target, &destination)?;
-        metadata.insert(
-            key,
-            EntryMetadata {
-                kind: TreeEntryKind::Symlink,
-                mode,
-                uid,
-                gid,
-                link_target: Some(target),
-            },
-        );
+        remove_metadata_subtree(tree, &path);
+        EntryMetadata::Symlink {
+            mode,
+            uid,
+            gid,
+            target,
+        }
     } else if kind.is_hard_link() {
-        remove_metadata_subtree(metadata, &key);
-        let target = entry
-            .link_name()
-            .ok_or_else(|| OciError::Invalid("hardlink target is absent".into()))?;
-        let target = normalize_layer_path(target, limits.path_bytes)?;
-        let target_path = resolve_existing_regular(root, &target)?;
-        remove_path(&destination)?;
-        fs::hard_link(target_path, &destination)?;
-        metadata.insert(
-            key,
-            EntryMetadata {
-                kind: TreeEntryKind::Hardlink,
-                mode,
-                uid,
-                gid,
-                link_target: Some(path_key(&target)),
-            },
-        );
+        let target = normalize_layer_path(
+            entry
+                .link_name()
+                .ok_or_else(|| OciError::Invalid("hardlink target is absent".into()))?,
+            limits.path_bytes,
+        )?;
+        if path == target {
+            return Err(OciError::Invalid(
+                "hardlink cannot replace its own target".into(),
+            ));
+        }
+        let Some(EntryMetadata::File(inode)) = tree.entries.get(&target) else {
+            return Err(OciError::Invalid(
+                "hardlink target is not an existing regular inode".into(),
+            ));
+        };
+        let inode = Rc::clone(inode);
+        // Tar metadata applies to the inode, not one directory-entry alias.
+        {
+            let mut value = inode.borrow_mut();
+            value.mode = mode;
+            value.uid = uid;
+            value.gid = gid;
+        }
+        remove_metadata_subtree(tree, &path);
+        EntryMetadata::File(inode)
     } else {
         return Err(OciError::Unsupported(format!(
             "tar entry type {:?}",
             kind.as_byte()
         )));
+    };
+    tree.entries.insert(path, value);
+    if tree.entries.len() > limits.entries {
+        return Err(OciError::Limit("final tree entry count"));
     }
     Ok(())
 }
 
-fn normalize_layer_path(path: &Path, maximum: usize) -> Result<PathBuf, OciError> {
+/// Interpret '/' only. Host drive, case-folding and backslash semantics are
+/// irrelevant because no guest pathname will ever be opened on the host.
+fn normalize_layer_path(path: &Path, maximum: usize) -> Result<String, OciError> {
     let text = path
         .to_str()
         .ok_or_else(|| OciError::Unsupported("non-UTF-8 layer path".into()))?;
     if text.len() > maximum || text.contains('\0') {
         return Err(OciError::Limit("layer path length"));
     }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(value) => normalized.push(value),
-            Component::CurDir => {}
-            _ => return Err(OciError::Invalid("layer path escapes root".into())),
-        }
+    if text.starts_with('/') || text.split('/').any(|part| part == "..") {
+        return Err(OciError::Invalid("layer path escapes root".into()));
     }
-    Ok(normalized)
-}
-
-fn resolve_directory(root: &Path, relative: &Path, create: bool) -> Result<PathBuf, OciError> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(OciError::Invalid("directory path is not normalized".into()));
-        };
-        current.push(name);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(OciError::Invalid(
-                    "layer path traverses a non-directory or symlink".into(),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                fs::create_dir(&current)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(current)
-}
-
-fn resolve_existing_regular(root: &Path, relative: &Path) -> Result<PathBuf, OciError> {
-    let parent = resolve_directory(
-        root,
-        relative.parent().unwrap_or_else(|| Path::new("")),
-        false,
-    )?;
-    let path = parent.join(
-        relative
-            .file_name()
-            .ok_or_else(|| OciError::Invalid("hardlink target has no basename".into()))?,
-    );
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(OciError::Invalid(
-            "hardlink target is not an existing regular file".into(),
-        ));
-    }
-    Ok(path)
+    Ok(text
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 fn normalized_link<R: Read>(
     entry: &sandsurf_format::archive::Entry<'_, R>,
     maximum: usize,
 ) -> Result<String, OciError> {
-    let target = entry
+    let value = entry
         .link_name()
-        .ok_or_else(|| OciError::Invalid("symlink target is absent".into()))?;
-    let value = target
-        .to_str()
-        .ok_or_else(|| OciError::Unsupported("non-UTF-8 symlink target".into()))?;
+        .and_then(Path::to_str)
+        .ok_or_else(|| OciError::Unsupported("missing or non-UTF-8 symlink target".into()))?;
     if value.is_empty() || value.len() > maximum || value.contains('\0') {
         return Err(OciError::Limit("symlink target length"));
     }
-    Ok(value.to_owned())
+    Ok(value.into())
 }
 
-fn remove_path(path: &Path) -> Result<(), OciError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir_all(path)?
-        }
-        Ok(_) => fs::remove_file(path)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+fn whiteout(path: &str) -> Result<Option<(&str, bool)>, OciError> {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if name == ".wh..wh..opq" {
+        return Ok(Some((parent, true)));
     }
-    Ok(())
+    if let Some(target) = name.strip_prefix(".wh.") {
+        if target.is_empty() || matches!(target, "." | "..") {
+            return Err(OciError::Invalid("invalid OCI whiteout target".into()));
+        }
+        // The caller constructs the normalized target under this parent.
+        return Ok(Some((target, false)));
+    }
+    Ok(None)
 }
 
-fn collect_tree(
-    root: &Path,
-    metadata: &BTreeMap<String, EntryMetadata>,
-    maximum: usize,
-) -> Result<Vec<TreeEntry>, OciError> {
-    let mut paths = Vec::new();
-    collect_paths(root, Path::new(""), &mut paths, maximum)?;
-    paths.sort();
-    let mut entries = Vec::with_capacity(paths.len());
-    for relative in paths {
-        let key = path_key(&relative);
-        let value = metadata.get(&key).ok_or_else(|| {
-            OciError::Invalid(format!("tree metadata missing for implicit path {key}"))
-        })?;
-        let path = root.join(&relative);
-        let filesystem = fs::symlink_metadata(&path)?;
-        let (size, digest) = if filesystem.is_file() && !filesystem.file_type().is_symlink() {
-            let mut file = File::open(&path)?;
-            (filesystem.len(), Some(sha256_reader(&mut file)?))
+fn apply_whiteout(path: &str, tree: &mut VirtualTree) -> Result<(), OciError> {
+    if let Some((target, opaque)) = whiteout(path)? {
+        if opaque {
+            tree.entries
+                .retain(|candidate, _| !target.is_empty() && !is_descendant(candidate, target));
         } else {
-            (0, None)
-        };
-        entries.push(TreeEntry {
-            path: key,
-            kind: value.kind,
-            mode: value.mode,
-            uid: value.uid,
-            gid: value.gid,
-            size,
-            digest,
-            link_target: value.link_target.clone(),
-        });
-    }
-    Ok(entries)
-}
-
-fn collect_paths(
-    root: &Path,
-    relative: &Path,
-    paths: &mut Vec<PathBuf>,
-    maximum: usize,
-) -> Result<(), OciError> {
-    for item in fs::read_dir(root.join(relative))? {
-        let item = item?;
-        let child = relative.join(item.file_name());
-        paths.push(child.clone());
-        if paths.len() > maximum {
-            return Err(OciError::Limit("final tree entry count"));
-        }
-        let metadata = fs::symlink_metadata(item.path())?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            collect_paths(root, &child, paths, maximum)?;
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let target = if parent.is_empty() {
+                target.to_owned()
+            } else {
+                format!("{parent}/{target}")
+            };
+            remove_metadata_subtree(tree, &target);
         }
     }
     Ok(())
+}
+
+fn collect_tree(tree: &VirtualTree) -> Vec<TreeEntry> {
+    let mut representatives = BTreeMap::<usize, &str>::new();
+    tree.entries
+        .iter()
+        .map(|(path, value)| {
+            let (kind, mode, uid, gid, size, digest, link_target) = match value {
+                EntryMetadata::Directory { mode, uid, gid } => {
+                    (TreeEntryKind::Directory, *mode, *uid, *gid, 0, None, None)
+                }
+                EntryMetadata::Symlink {
+                    mode,
+                    uid,
+                    gid,
+                    target,
+                } => (
+                    TreeEntryKind::Symlink,
+                    *mode,
+                    *uid,
+                    *gid,
+                    0,
+                    None,
+                    Some(target.clone()),
+                ),
+                EntryMetadata::File(value) => {
+                    let inode = value.borrow();
+                    let representative = representatives.entry(inode.identity).or_insert(path);
+                    let kind = if *representative == path {
+                        TreeEntryKind::Regular
+                    } else {
+                        TreeEntryKind::Hardlink
+                    };
+                    (
+                        kind,
+                        inode.mode,
+                        inode.uid,
+                        inode.gid,
+                        inode.size,
+                        Some(inode.digest.clone()),
+                        (kind == TreeEntryKind::Hardlink).then(|| (*representative).to_owned()),
+                    )
+                }
+            };
+            TreeEntry {
+                path: path.clone(),
+                kind,
+                mode,
+                uid,
+                gid,
+                size,
+                digest,
+                link_target,
+            }
+        })
+        .collect()
 }
 
 fn prepare_empty_destination(path: &Path) -> Result<(), OciError> {
@@ -1274,13 +1347,14 @@ fn prepare_empty_destination(path: &Path) -> Result<(), OciError> {
                 && !metadata.file_type().is_symlink()
                 && fs::read_dir(path)?.next().is_none() =>
         {
+            sandsurf_native::local::canonical_private_directory(path)?;
             Ok(())
         }
         Ok(_) => Err(OciError::Invalid(
             "conversion destination must be a new empty directory".into(),
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
+            sandsurf_native::local::create_private_directory(path)?;
             Ok(())
         }
         Err(error) => Err(error.into()),
@@ -1341,16 +1415,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn path_key(path: &Path) -> String {
-    path.components()
-        .filter_map(|value| match value {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn is_descendant(candidate: &str, parent: &str) -> bool {
     !parent.is_empty()
         && candidate
@@ -1358,55 +1422,49 @@ fn is_descendant(candidate: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn register_implicit_directories(path: &Path, metadata: &mut BTreeMap<String, EntryMetadata>) {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        if let Component::Normal(value) = component {
-            current.push(value);
-            metadata.entry(path_key(&current)).or_insert(EntryMetadata {
-                kind: TreeEntryKind::Directory,
-                mode: 0o755,
-                uid: 0,
-                gid: 0,
-                link_target: None,
-            });
+fn register_implicit_directories(
+    path: &str,
+    tree: &mut VirtualTree,
+    maximum: usize,
+) -> Result<(), OciError> {
+    let mut current = String::new();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(component);
+        match tree.entries.get(&current) {
+            Some(EntryMetadata::Directory { .. }) => {}
+            Some(_) => {
+                return Err(OciError::Invalid(
+                    "layer path traverses a non-directory or symlink".into(),
+                ));
+            }
+            None => {
+                if tree.entries.len() >= maximum {
+                    return Err(OciError::Limit("implicit directory count"));
+                }
+                tree.entries.insert(
+                    current.clone(),
+                    EntryMetadata::Directory {
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                    },
+                );
+            }
         }
     }
+    Ok(())
 }
 
-fn remove_metadata_subtree(metadata: &mut BTreeMap<String, EntryMetadata>, path: &str) {
-    metadata.retain(|candidate, _| candidate != path && !is_descendant(candidate, path));
+fn remove_metadata_subtree(tree: &mut VirtualTree, path: &str) {
+    tree.entries
+        .retain(|candidate, _| candidate != path && !is_descendant(candidate, path));
 }
 
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &str, destination: &Path) -> Result<(), OciError> {
-    std::os::unix::fs::symlink(target, destination)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &str, _destination: &Path) -> Result<(), OciError> {
-    Err(OciError::Unsupported(
-        "OCI conversion requires the Linux builder appliance".into(),
-    ))
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> Result<(), OciError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
-    Err(OciError::Unsupported(
-        "Linux inode permissions require the Linux builder appliance".into(),
-    ))
 }
 
 #[cfg(test)]
@@ -1417,6 +1475,52 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn root_members_cannot_silently_replace_the_filesystem_root() {
+        let temp = Temp::new();
+        for (kind, mode, uid, size, accepted) in [
+            (tar::EntryType::Directory, 0o755, 0, 0, true),
+            (tar::EntryType::Directory, 0o777, 0, 0, false),
+            (tar::EntryType::Directory, 0o755, 42, 0, false),
+            (tar::EntryType::Regular, 0o755, 0, 0, false),
+            (tar::EntryType::Directory, 0o755, 0, 1, false),
+        ] {
+            let mut writer = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(uid);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_size(size);
+            writer
+                .append_data(&mut header, ".", &b"x"[..size as usize])
+                .unwrap();
+            let bytes = writer.into_inner().unwrap();
+            let mut archive = sandsurf_format::archive::Archive::new(
+                &bytes[..],
+                sandsurf_format::archive::Limits {
+                    headers: 1,
+                    bytes: 4096,
+                    file_bytes: 1,
+                    path_bytes: 4096,
+                },
+            );
+            let result = archive
+                .next_entry()
+                .map_err(OciError::from)
+                .and_then(|entry| {
+                    apply_entry(
+                        entry.unwrap(),
+                        &temp.0,
+                        &mut VirtualTree::default(),
+                        &ConversionLimits::default(),
+                    )
+                });
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -1425,7 +1529,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path).unwrap();
+            sandsurf_native::local::create_private_directory(&path).unwrap();
             Self(path)
         }
     }
@@ -1489,17 +1593,23 @@ mod tests {
         }
         assert_eq!(
             normalize_layer_path(Path::new("./usr/bin/tool"), 4096).unwrap(),
-            PathBuf::from("usr/bin/tool")
+            "usr/bin/tool"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn parent_symlinks_are_never_followed() {
-        let root = Temp::new();
-        let outside = Temp::new();
-        std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
-        assert!(resolve_directory(&root.0, Path::new("link/child"), true).is_err());
+        let mut tree = VirtualTree::default();
+        tree.entries.insert(
+            "link".into(),
+            EntryMetadata::Symlink {
+                mode: 0o777,
+                uid: 0,
+                gid: 0,
+                target: "/outside".into(),
+            },
+        );
+        assert!(register_implicit_directories("link/child", &mut tree, 32).is_err());
     }
 
     #[test]
@@ -1523,6 +1633,248 @@ mod tests {
         let root = Temp::new();
         fs::write(root.0.join("existing"), b"x").unwrap();
         assert!(prepare_empty_destination(&root.0).is_err());
+    }
+
+    fn apply_test_layer(
+        layout: &Temp,
+        tree: &mut VirtualTree,
+        bytes: &[u8],
+        entries: &mut usize,
+        expanded: &mut u64,
+    ) {
+        fs::create_dir_all(layout.0.join("blobs/sha256")).unwrap();
+        let descriptor: Descriptor =
+            serde_json::from_value(write_blob(&layout.0, bytes, OCI_LAYER_TAR)).unwrap();
+        let blobs = layout.0.join("content");
+        if !blobs.exists() {
+            sandsurf_native::local::create_private_directory(&blobs).unwrap();
+        }
+        let owner = OciLayout {
+            root: layout.0.clone(),
+            limits: ConversionLimits::default(),
+        };
+        assert_eq!(
+            owner
+                .apply_layer(&descriptor, &blobs, tree, entries, expanded)
+                .unwrap(),
+            format!("sha256:{}", sha256_hex(bytes))
+        );
+    }
+
+    #[test]
+    fn opaque_content_preserves_linux_names_and_distinct_equal_inodes_on_every_host() {
+        let layout = Temp::new();
+        let mut tree = VirtualTree::default();
+        let mut archive = tar::Builder::new(Vec::new());
+        let long = format!("{}λ", "very-long".repeat(30));
+        let names = [
+            "CON",
+            "con",
+            "C:drive\\tool",
+            "a:b",
+            "trailing.",
+            "back\\slash",
+            long.as_str(),
+        ];
+        for path in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o4755);
+            header.set_uid(42);
+            header.set_gid(43);
+            guest_header(&mut archive, &mut header, path, None).unwrap();
+            archive.append(&header, &b"same"[..]).unwrap();
+        }
+        archive.finish().unwrap();
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &archive.into_inner().unwrap(),
+            &mut 0,
+            &mut 0,
+        );
+        let entries = collect_tree(&tree);
+        assert_eq!(entries.len(), names.len());
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kind == TreeEntryKind::Regular
+                    && entry.mode == 0o4755
+                    && entry.uid == 42
+                    && entry.gid == 43)
+        );
+        assert_eq!(fs::read_dir(layout.0.join("content")).unwrap().count(), 1);
+        let source = ResolvedOciImage {
+            source_index_digest: "unused".into(),
+            manifest_digest: "unused".into(),
+            config_digest: "unused".into(),
+            layer_digests: vec![],
+            diff_ids: vec![],
+            defaults: ImageDefaults {
+                environment: vec![],
+                user: None,
+                working_directory: None,
+                entrypoint: vec![],
+                command: vec![],
+            },
+            architecture: "amd64".into(),
+            os: "linux".into(),
+            variant: None,
+        };
+        let converted = ConvertedTree {
+            source,
+            entries,
+            manifest_digest: "unused".into(),
+        };
+        let output = layout.0.join("filesystem.tar");
+        write_filesystem_tar(&layout.0.join("content"), &converted, &output).unwrap();
+        let mut archive = sandsurf_format::archive::CanonicalArchive::new(
+            File::open(output).unwrap(),
+            sandsurf_format::archive::Limits {
+                headers: 32,
+                bytes: 65536,
+                file_bytes: 16,
+                path_bytes: 4096,
+            },
+            names.len() as u64 * 4,
+        );
+        let mut actual = BTreeSet::new();
+        while let Some(mut entry) = archive.next_entry().unwrap() {
+            actual.insert(entry.path().to_str().unwrap().to_owned());
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"same");
+        }
+        assert_eq!(actual, names.into_iter().map(str::to_owned).collect());
+        fs::write(layout.0.join("content").join(sha256_hex(b"same")), b"evil").unwrap();
+        assert!(
+            write_filesystem_tar(
+                &layout.0.join("content"),
+                &converted,
+                &layout.0.join("tampered.tar")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn replacement_and_whiteouts_preserve_surviving_hardlink_inodes_not_target_names() {
+        let layout = Temp::new();
+        let mut tree = VirtualTree::default();
+        let mut entries = 0;
+        let mut expanded = 0;
+        let mut first = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_gnu();
+        file.set_size(3);
+        file.set_mode(0o755);
+        file.set_uid(0);
+        file.set_gid(0);
+        guest_header(&mut first, &mut file, "z-source", None).unwrap();
+        first.append(&file, &b"old"[..]).unwrap();
+        for path in ["a-alias", "b-alias"] {
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Link);
+            link.set_size(0);
+            link.set_mode(0o4755);
+            link.set_uid(42);
+            link.set_gid(43);
+            guest_header(&mut first, &mut link, path, Some("z-source")).unwrap();
+            first.append(&link, io::empty()).unwrap();
+        }
+        first.finish().unwrap();
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &first.into_inner().unwrap(),
+            &mut entries,
+            &mut expanded,
+        );
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &tar_layer(&[("z-source", b"new")]),
+            &mut entries,
+            &mut expanded,
+        );
+        let current = collect_tree(&tree);
+        let a = current
+            .iter()
+            .find(|entry| entry.path == "a-alias")
+            .unwrap();
+        assert_eq!(a.kind, TreeEntryKind::Regular);
+        assert_eq!(a.mode, 0o4755);
+        assert_eq!((a.uid, a.gid), (42, 43));
+        assert_eq!(a.digest, Some(sha256_hex(b"old")));
+        let b = current
+            .iter()
+            .find(|entry| entry.path == "b-alias")
+            .unwrap();
+        assert_eq!(b.kind, TreeEntryKind::Hardlink);
+        assert_eq!(b.link_target.as_deref(), Some("a-alias"));
+        assert_eq!(
+            current
+                .iter()
+                .find(|entry| entry.path == "z-source")
+                .unwrap()
+                .digest,
+            Some(sha256_hex(b"new"))
+        );
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &tar_layer(&[(".wh.a-alias", b"")]),
+            &mut entries,
+            &mut expanded,
+        );
+        let current = collect_tree(&tree);
+        assert!(!current.iter().any(|entry| entry.path == "a-alias"));
+        assert_eq!(
+            current
+                .iter()
+                .find(|entry| entry.path == "b-alias")
+                .unwrap()
+                .kind,
+            TreeEntryKind::Regular
+        );
+    }
+
+    #[test]
+    fn whiteouts_are_lower_layer_deletions_even_when_tar_members_follow_additions() {
+        let layout = Temp::new();
+        let mut tree = VirtualTree::default();
+        let mut entries = 0;
+        let mut expanded = 0;
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &tar_layer(&[("dir/old", b"old"), ("replace", b"old")]),
+            &mut entries,
+            &mut expanded,
+        );
+        apply_test_layer(
+            &layout,
+            &mut tree,
+            &tar_layer(&[
+                ("dir/new", b"new"),
+                ("replace", b"new"),
+                ("dir/.wh..wh..opq", b""),
+                (".wh.replace", b""),
+            ]),
+            &mut entries,
+            &mut expanded,
+        );
+        let current = collect_tree(&tree);
+        assert!(current.iter().any(|entry| entry.path == "dir/new"));
+        assert!(!current.iter().any(|entry| entry.path == "dir/old"));
+        assert_eq!(
+            current
+                .iter()
+                .find(|entry| entry.path == "replace")
+                .unwrap()
+                .digest,
+            Some(sha256_hex(b"new"))
+        );
+        assert!(current.iter().all(|entry| !entry.path.contains(".wh.")));
     }
 
     #[test]
@@ -1599,54 +1951,52 @@ mod tests {
         let conversion = OciLayout::open(&layout.0, ConversionLimits::default())
             .unwrap()
             .convert(source.clone(), &destination);
-        #[cfg(not(unix))]
-        {
-            assert!(
-                matches!(conversion, Err(OciError::Unsupported(_))),
-                "a host without Linux inode semantics must report the required builder, not silently discard metadata"
-            );
-            assert!(
-                !destination.exists(),
-                "unsupported conversion must not stage a partial tree"
-            );
-        }
-        #[cfg(unix)]
-        {
-            let converted = conversion.unwrap();
-            assert_eq!(fs::read(destination.join("usr/bin/tool")).unwrap(), b"v2");
-            assert!(!destination.join("usr/bin/old").exists());
-            assert!(
-                converted
-                    .entries
-                    .iter()
-                    .any(|entry| { entry.path == "usr" && entry.kind == TreeEntryKind::Directory })
-            );
-            assert!(converted.entries.iter().any(|entry| {
-                entry.path == "usr/bin/tool" && entry.kind == TreeEntryKind::Regular
-            }));
-            let filesystem_tar = layout.0.join("filesystem.tar");
-            write_filesystem_tar(&destination, &converted, &filesystem_tar).unwrap();
-            let mut archive = tar::Archive::new(File::open(&filesystem_tar).unwrap());
-            let tool = archive
-                .entries()
+        let converted = conversion.unwrap();
+        let tool_entry = converted
+            .entries
+            .iter()
+            .find(|entry| entry.path == "usr/bin/tool")
+            .unwrap();
+        assert_eq!(
+            fs::read(destination.join(tool_entry.digest.as_ref().unwrap())).unwrap(),
+            b"v2"
+        );
+        assert!(
+            !converted
+                .entries
+                .iter()
+                .any(|entry| entry.path == "usr/bin/old")
+        );
+        assert!(
+            !destination.join("usr").exists(),
+            "Linux paths never become host paths"
+        );
+        assert!(
+            converted
+                .entries
+                .iter()
+                .any(|entry| entry.path == "usr" && entry.kind == TreeEntryKind::Directory)
+        );
+        let filesystem_tar = layout.0.join("filesystem.tar");
+        write_filesystem_tar(&destination, &converted, &filesystem_tar).unwrap();
+        let mut archive = tar::Archive::new(File::open(&filesystem_tar).unwrap());
+        let tool = archive
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().unwrap() == Path::new("usr/bin/tool"))
+            .unwrap();
+        assert_eq!(tool.header().uid().unwrap(), 0);
+        assert_eq!(tool.header().gid().unwrap(), 0);
+        assert_eq!(tool.header().mode().unwrap(), 0o755);
+        let mut forged = source;
+        forged.config_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(
+            OciLayout::open(&layout.0, ConversionLimits::default())
                 .unwrap()
-                .map(Result::unwrap)
-                .find(|entry| entry.path().unwrap() == Path::new("usr/bin/tool"))
-                .unwrap();
-            assert_eq!(tool.header().uid().unwrap(), 0);
-            assert_eq!(tool.header().gid().unwrap(), 0);
-            assert_eq!(tool.header().mode().unwrap(), 0o755);
-
-            let mut forged = source;
-            forged.config_digest = format!("sha256:{}", "0".repeat(64));
-            let other = layout.0.join("forged");
-            assert!(
-                OciLayout::open(&layout.0, ConversionLimits::default())
-                    .unwrap()
-                    .convert(forged, &other)
-                    .is_err()
-            );
-        }
+                .convert(forged, &layout.0.join("forged"))
+                .is_err()
+        );
     }
 
     #[test]

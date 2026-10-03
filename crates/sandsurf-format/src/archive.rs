@@ -3,7 +3,7 @@
 //! No filesystem extraction, guest execution, sparse decoding, or unbounded
 //! extension buffering occurs in this reader.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +26,108 @@ pub struct Archive<R> {
     remaining: u64,
     padding: usize,
     ended: bool,
+}
+
+/// The one complete-filesystem profile consumed by the offline guest and
+/// verified by the host. Framing remains owned by Archive; this validator owns
+/// only member order, canonical Linux paths and representable inode metadata.
+/// Paths are '/'-separated guest bytes, never host filesystem components.
+pub struct CanonicalArchive<R> {
+    archive: Archive<R>,
+    entries: BTreeMap<String, u8>,
+    payload: u64,
+    capacity: u64,
+    maximum_entries: usize,
+    failed: bool,
+}
+
+impl<R: Read> CanonicalArchive<R> {
+    pub fn new(reader: R, limits: Limits, capacity: u64) -> Self {
+        Self {
+            archive: Archive::new(reader, limits),
+            entries: BTreeMap::new(),
+            payload: 0,
+            capacity,
+            maximum_entries: limits.headers,
+            failed: false,
+        }
+    }
+
+    pub fn next_entry(&mut self) -> io::Result<Option<Entry<'_, R>>> {
+        if self.failed {
+            return Err(invalid("canonical archive previously failed"));
+        }
+        self.failed = true;
+        let Some(entry) = self.archive.next_entry()? else {
+            self.failed = false;
+            return Ok(None);
+        };
+        let path = canonical_path(entry.path())?;
+        let kind = entry.header().entry_type();
+        if self.entries.len() >= self.maximum_entries
+            || self.entries.contains_key(path)
+            || !(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link())
+            || entry.header().mode()? > 0o7777
+            || entry.header().uid()? > u32::MAX as u64
+            || entry.header().gid()? > u32::MAX as u64
+            || entry.header().mtime()? > i64::MAX as u64
+        {
+            return Err(invalid("unsupported canonical filesystem archive metadata"));
+        }
+        let mut parent = path;
+        while let Some((value, _)) = parent.rsplit_once('/') {
+            if self.entries.get(value) != Some(&b'5') {
+                return Err(invalid("archive parent is not a preceding directory"));
+            }
+            parent = value;
+        }
+        if kind.is_hard_link() {
+            let target = canonical_path(
+                entry
+                    .link_name()
+                    .ok_or_else(|| invalid("archive link has no target"))?,
+            )?;
+            if !self
+                .entries
+                .get(target)
+                .is_some_and(|kind| *kind == b'0' || *kind == b'1')
+            {
+                return Err(invalid("archive hardlink is not a preceding inode"));
+            }
+        } else if kind.is_symlink() && entry.link_name().is_none() {
+            return Err(invalid("archive symlink has no target"));
+        }
+        if kind.is_file() {
+            self.payload = self
+                .payload
+                .checked_add(entry.size())
+                .filter(|value| *value <= self.capacity)
+                .ok_or_else(|| invalid("filesystem payload exceeds disk capacity"))?;
+        } else if entry.size() != 0 {
+            return Err(invalid("non-file archive member carries payload"));
+        }
+        self.entries.insert(
+            path.to_owned(),
+            if kind.is_file() { b'0' } else { kind.as_byte() },
+        );
+        self.failed = false;
+        Ok(Some(entry))
+    }
+}
+
+fn canonical_path(path: &Path) -> io::Result<&str> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| unsupported("non-UTF-8 canonical guest path"))?;
+    if text.len() > 4096
+        || text.contains('\0')
+        || text
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err(invalid("noncanonical filesystem archive path"));
+    }
+    Ok(text)
 }
 
 #[derive(Default)]
@@ -408,6 +510,7 @@ mod tests {
         header.set_mode(0o644);
         header.set_uid(0);
         header.set_gid(0);
+        header.set_mtime(0);
         header.set_cksum();
         header
     }
@@ -428,6 +531,135 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(payload);
         bytes.resize(bytes.len().next_multiple_of(BLOCK), 0);
+    }
+
+    #[test]
+    fn canonical_paths_have_linux_not_host_filesystem_semantics() {
+        for value in [
+            "CON",
+            "con",
+            "C:drive\\file",
+            "a:b",
+            "back\\slash",
+            "trailing.",
+        ] {
+            assert_eq!(canonical_path(Path::new(value)).unwrap(), value);
+        }
+        for value in ["", "/a", "a//b", "a/", "./a", "a/../b", "a/./b"] {
+            assert!(canonical_path(Path::new(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_profile_preserves_regular_variants_and_prior_links_under_one_envelope() {
+        let mut data = Vec::new();
+        member(&mut data, header(tar::EntryType::Directory, "dir", 0), b"");
+        let mut file = header(tar::EntryType::new(0), "dir/file", 3);
+        file.set_uid(123);
+        file.set_gid(456);
+        file.set_mode(0o4755);
+        file.set_cksum();
+        member(&mut data, file, b"abc");
+        let mut link = header(tar::EntryType::Link, "dir/alias", 0);
+        link.set_link_name("dir/file").unwrap();
+        link.set_cksum();
+        member(&mut data, link, b"");
+        let mut link = header(tar::EntryType::Symlink, "outside", 0);
+        link.set_link_name("/outside").unwrap();
+        link.set_cksum();
+        member(&mut data, link, b"");
+        data.resize(data.len() + BLOCK * 2, 0);
+        let mut archive = CanonicalArchive::new(&data[..], limits(), 3);
+        assert!(
+            archive
+                .next_entry()
+                .unwrap()
+                .unwrap()
+                .header()
+                .entry_type()
+                .is_dir()
+        );
+        let file = archive.next_entry().unwrap().unwrap();
+        assert_eq!(
+            (
+                file.header().uid().unwrap(),
+                file.header().gid().unwrap(),
+                file.header().mode().unwrap()
+            ),
+            (123, 456, 0o4755)
+        );
+        drop(file);
+        assert!(
+            archive
+                .next_entry()
+                .unwrap()
+                .unwrap()
+                .header()
+                .entry_type()
+                .is_hard_link()
+        );
+        assert!(
+            archive
+                .next_entry()
+                .unwrap()
+                .unwrap()
+                .header()
+                .entry_type()
+                .is_symlink()
+        );
+        assert!(archive.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn canonical_profile_rejects_metadata_parent_alias_and_capacity_violations_permanently() {
+        let regular = || header(tar::EntryType::Regular, "file", 0);
+        let mut mode = regular();
+        mode.set_mode(0o177777);
+        mode.set_cksum();
+        let mut uid = regular();
+        uid.set_uid(u32::MAX as u64 + 1);
+        uid.set_cksum();
+        let mut time = regular();
+        time.set_mtime(i64::MAX as u64 + 1);
+        time.set_cksum();
+        let mut forward = header(tar::EntryType::Link, "alias", 0);
+        forward.set_link_name("future").unwrap();
+        forward.set_cksum();
+        for members in [
+            vec![mode],
+            vec![uid],
+            vec![time],
+            vec![forward],
+            vec![header(tar::EntryType::Regular, "missing/file", 0)],
+            vec![regular(), regular()],
+            vec![header(tar::EntryType::Symlink, "no-target", 0)],
+            vec![header(tar::EntryType::Directory, "payload", 1)],
+            vec![header(tar::EntryType::Regular, "file", 4)],
+        ] {
+            let mut data = Vec::new();
+            for header in members {
+                let size = header.size().unwrap();
+                member(&mut data, header, &vec![0; size as usize]);
+            }
+            data.resize(data.len() + BLOCK * 2, 0);
+            let mut archive = CanonicalArchive::new(&data[..], limits(), 3);
+            let mut rejected = false;
+            loop {
+                match archive.next_entry() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {
+                        rejected = true;
+                        break;
+                    }
+                }
+            }
+            assert!(rejected);
+            assert!(
+                archive.next_entry().is_err(),
+                "failed canonical validation cannot resume"
+            );
+        }
     }
 
     #[test]

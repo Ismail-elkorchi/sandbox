@@ -1,4 +1,5 @@
-//! Linux-only OCI machine construction in the externally bounded image worker.
+//! Portable OCI metadata/content conversion; Linux filesystem construction
+//! runs in the native offline hardware VM, never on the host filesystem.
 use super::*;
 use sandsurf_image::ext4::materialize_tar;
 use sandsurf_image::oci::{
@@ -227,34 +228,34 @@ fn require_os_init(tree: &ConvertedTree) -> Result<(), ImageBuildError> {
                     .link_target
                     .as_ref()
                     .ok_or_else(|| ImageBuildError::Invalid("OS init link has no target".into()))?;
+                // Linux path resolution must not inherit Windows drive,
+                // backslash or case-folding rules from the host.
                 let joined = if target.starts_with('/') || entry.kind == TreeEntryKind::Hardlink {
-                    PathBuf::from(target.trim_start_matches('/'))
+                    target.trim_start_matches('/').to_owned()
                 } else {
-                    Path::new(&path)
-                        .parent()
-                        .unwrap_or(Path::new(""))
-                        .join(target)
+                    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    if parent.is_empty() {
+                        target.clone()
+                    } else {
+                        format!("{parent}/{target}")
+                    }
                 };
                 let mut components = Vec::new();
-                for component in joined.components() {
+                for component in joined.split('/') {
                     match component {
-                        std::path::Component::Normal(value) => components.push(value.to_owned()),
-                        std::path::Component::CurDir => {}
-                        std::path::Component::ParentDir if !components.is_empty() => {
+                        "" | "." => {}
+                        ".." if !components.is_empty() => {
                             components.pop();
                         }
-                        _ => {
+                        ".." => {
                             return Err(ImageBuildError::Invalid(
                                 "OS init link escapes the machine root".into(),
                             ));
                         }
+                        value => components.push(value),
                     }
                 }
-                path = components
-                    .into_iter()
-                    .collect::<PathBuf>()
-                    .to_string_lossy()
-                    .into_owned();
+                path = components.join("/");
             }
             _ => {
                 return Err(ImageBuildError::Invalid(
@@ -299,4 +300,73 @@ fn rootfs_size(tree: &ConvertedTree) -> Result<u64, ImageBuildError> {
 
 fn short_digest(value: &str) -> Result<&str, ImageBuildError> {
     Ok(&bare_digest(value)?[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sandsurf_image::oci::{ImageDefaults, ResolvedOciImage, TreeEntry};
+
+    fn tree(target: &str, executable: &str) -> ConvertedTree {
+        ConvertedTree {
+            source: ResolvedOciImage {
+                source_index_digest: "unused".into(),
+                manifest_digest: "unused".into(),
+                config_digest: "unused".into(),
+                layer_digests: vec![],
+                diff_ids: vec![],
+                defaults: ImageDefaults {
+                    environment: vec![],
+                    user: None,
+                    working_directory: None,
+                    entrypoint: vec![],
+                    command: vec![],
+                },
+                architecture: "amd64".into(),
+                os: "linux".into(),
+                variant: None,
+            },
+            manifest_digest: "unused".into(),
+            entries: vec![
+                TreeEntry {
+                    path: "sbin/init".into(),
+                    kind: TreeEntryKind::Symlink,
+                    mode: 0o777,
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    digest: None,
+                    link_target: Some(target.into()),
+                },
+                TreeEntry {
+                    path: executable.into(),
+                    kind: TreeEntryKind::Regular,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    size: 1,
+                    digest: Some("unused".into()),
+                    link_target: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn os_init_resolution_uses_linux_identity_and_never_host_path_rules() {
+        for (target, executable) in [
+            ("../bin/init", "bin/init"),
+            ("/bin/init", "bin/init"),
+            ("C:drive\\init", "sbin/C:drive\\init"),
+            ("../CON", "CON"),
+        ] {
+            assert!(require_os_init(&tree(target, executable)).is_ok());
+        }
+        assert!(require_os_init(&tree("../../outside", "outside")).is_err());
+        assert!(require_os_init(&tree("../CON", "con")).is_err());
+        assert!(require_os_init(&tree("init", "other")).is_err());
+        let mut value = tree("/bin/init", "bin/init");
+        value.entries[1].mode = 0o644;
+        assert!(require_os_init(&value).is_err());
+    }
 }

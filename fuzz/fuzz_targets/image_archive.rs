@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sandsurf_format::archive::{Archive, Limits};
+use sandsurf_format::archive::{Archive, CanonicalArchive, Limits};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 1024 * 1024 {
@@ -25,6 +25,7 @@ fuzz_target!(|data: &[u8]| {
     header.set_mode(0o644);
     header.set_uid(0);
     header.set_gid(0);
+    header.set_mtime(0);
     header.set_size(if data.first().is_some_and(|byte| byte & 0x80 != 0) && data.len() >= 9 {
         u64::from_le_bytes(data[1..9].try_into().unwrap())
     } else {
@@ -51,5 +52,11 @@ fn exercise(data: &[u8]) {
         if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
             break;
         }
+    }
+    let mut archive = CanonicalArchive::new(data, Limits {
+        headers: 1024, bytes: 1024 * 1024, file_bytes: 1024 * 1024, path_bytes: 4096,
+    }, 1024 * 1024);
+    while let Ok(Some(mut entry)) = archive.next_entry() {
+        if std::io::copy(&mut entry, &mut std::io::sink()).is_err() { break; }
     }
 }

@@ -4,10 +4,10 @@
 use sandsurf_protocol::disk::{
     DiskChannel, DiskCompression, DiskOperation, DiskReply, MAX_DISK_OPERATIONS, MAX_DISK_TRANSFER,
 };
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 
@@ -204,13 +204,6 @@ fn execute_rooted(
             }
             DiskReply::Complete
         }
-        DiskOperation::Execute { argv } => {
-            tool(
-                &argv[0],
-                &argv[1..].iter().map(String::as_str).collect::<Vec<_>>(),
-            )?;
-            DiskReply::Complete
-        }
         DiskOperation::Remove { path } => {
             match fs::remove_file(path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -226,28 +219,6 @@ fn execute_rooted(
         }
         DiskOperation::Chmod { path, mode } => {
             fs::set_permissions(path, fs::Permissions::from_mode(*mode))?;
-            DiskReply::Complete
-        }
-        DiskOperation::Mkdir { path } => {
-            fs::create_dir_all(path)?;
-            DiskReply::Complete
-        }
-        DiskOperation::ZeroFreeSpace => {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open("/sandsurf-zero")?;
-            let buffer = [0; 65536];
-            loop {
-                match file.write_all(&buffer) {
-                    Ok(()) => {}
-                    Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => break,
-                    Err(error) => return Err(error),
-                }
-            }
-            file.sync_all()?;
-            drop(file);
-            fs::remove_file("/sandsurf-zero")?;
             DiskReply::Complete
         }
         DiskOperation::Realpath { path } => DiskReply::Text {
@@ -276,48 +247,15 @@ fn execute_rooted(
             channel.send_metadata(&DiskReply::Size { bytes: *bytes })?;
             return channel.send_data(&mut file, *bytes);
         }
-        DiskOperation::Cat { path } => {
-            let mut bytes = Vec::new();
-            File::open(path)?.take(16385).read_to_end(&mut bytes)?;
-            if bytes.len() > 16384 {
-                return Err(invalid("guest text exceeds bound"));
-            }
-            DiskReply::Text {
-                value: String::from_utf8(bytes).map_err(|_| invalid("guest text is not UTF-8"))?,
-            }
-        }
-        DiskOperation::Stat { path } => {
-            let stat = fs::symlink_metadata(path)?;
-            DiskReply::Stat {
-                uid: stat.uid(),
-                gid: stat.gid(),
-                mode: stat.mode(),
-                bytes: stat.len(),
-            }
-        }
-        DiskOperation::Readlink { path } => DiskReply::Text {
-            value: fs::read_link(path)?
-                .into_os_string()
-                .into_string()
-                .map_err(|_| invalid("guest link is not UTF-8"))?,
-        },
-        DiskOperation::Exists { path } => DiskReply::Exists {
-            value: match fs::symlink_metadata(path) {
-                Ok(_) => true,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error),
-            },
-        },
         _ => return Err(invalid("operation is not a rooted disk operation")),
     };
     channel.send_metadata(&reply)
 }
 
 fn extract(input: impl Read) -> io::Result<()> {
-    use sandsurf_format::archive::{Archive, Limits};
+    use sandsurf_format::archive::{CanonicalArchive, Limits};
     use std::collections::BTreeMap;
-    use std::path::Component;
-    let mut archive = Archive::new(
+    let mut archive = CanonicalArchive::new(
         input,
         Limits {
             headers: 100000,
@@ -325,36 +263,14 @@ fn extract(input: impl Read) -> io::Result<()> {
             file_bytes: MAX_DISK_TRANSFER,
             path_bytes: 4096,
         },
+        MAX_DISK_TRANSFER,
     );
-    let mut entries = BTreeMap::new();
     let mut directory_times = BTreeMap::new();
     while let Some(mut entry) = archive.next_entry()? {
         let path = entry.path().to_owned();
         let kind = entry.header().entry_type();
         let mtime = i64::try_from(entry.header().mtime()?)
             .map_err(|_| invalid("archive timestamp exceeds the guest time ABI"))?;
-        if path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|part| !matches!(part, Component::Normal(_)))
-            || entries.contains_key(&path)
-            || entries.len() >= 100000
-            || !(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link())
-            || entry.header().mode()? > 0o7777
-            || entry.header().uid()? > u32::MAX as u64
-            || entry.header().gid()? > u32::MAX as u64
-        {
-            return Err(invalid("unsupported canonical filesystem archive member"));
-        }
-        for parent in path
-            .ancestors()
-            .skip(1)
-            .filter(|path| !path.as_os_str().is_empty())
-        {
-            if entries.get(parent).is_none_or(|kind: &u8| *kind != b'5') {
-                return Err(invalid("archive parent is not a preceding directory"));
-            }
-        }
         if kind.is_dir() {
             fs::create_dir_all(&path)?;
         } else if kind.is_file() {
@@ -369,15 +285,6 @@ fn extract(input: impl Read) -> io::Result<()> {
             if kind.is_symlink() {
                 std::os::unix::fs::symlink(target, &path)?;
             } else {
-                if target
-                    .components()
-                    .any(|part| !matches!(part, Component::Normal(_)))
-                    || !entries
-                        .get(target)
-                        .is_some_and(|kind| *kind == b'0' || *kind == b'1')
-                {
-                    return Err(invalid("archive hardlink is not a preceding file"));
-                }
                 fs::hard_link(target, &path)?;
             }
         }
@@ -403,8 +310,6 @@ fn extract(input: impl Read) -> io::Result<()> {
         } else {
             set_mtime(&path, mtime)?;
         }
-        // GNU regular entries can use either NUL or '0'; they are one kind.
-        entries.insert(path, if kind.is_file() { b'0' } else { kind.as_byte() });
     }
     // Creating children updates directory mtimes. Restore them leaf-first only
     // after the complete bounded archive has been consumed successfully.

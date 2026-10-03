@@ -37,6 +37,7 @@ impl Executor {
 
     fn load(&mut self) -> io::Result<&Loaded> {
         if self.loaded.is_none() {
+            sandsurf_native::volume::inspect(&self.root)?;
             let digest = crate::images::bundled_image_digest().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -140,13 +141,13 @@ impl DiskExecutor for Executor {
         writable: bool,
         mut custody: Vec<Arc<File>>,
     ) -> io::Result<Appliance> {
+        sandsurf_native::volume::inspect_object(&self.root, disk)?;
         custody.extend(self.custody.iter().cloned());
         let loaded = self.load()?;
         custody.push(loaded.custody.clone());
         let parent = disk
             .parent()
             .ok_or_else(|| invalid("offline disk has no storage owner"))?;
-        sandsurf_native::volume::inspect(parent)?;
         let state = parent.join(".offline");
         // Entry is allowed only under the admitted pool's original exclusive
         // lease. Every earlier VMM inherited that same open description; an

@@ -1040,9 +1040,19 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
-    #[ignore = "native Firecracker offline-worker image qualification; run explicitly with --ignored"]
+    #[ignore = "requires reviewed-image-bound native build, packaged Firecracker and SANDSURF_OFFLINE_TEST_DIRECTORY on an operator-bounded volume"]
     fn converted_machine_seed_has_a_verified_internal_journal() {
-        let root = Path::new("/var/tmp").join(format!(
+        let parent = PathBuf::from(
+            std::env::var_os("SANDSURF_OFFLINE_TEST_DIRECTORY")
+                .expect("provide an operator-bounded offline qualification directory"),
+        );
+        assert!(parent.is_absolute());
+        sandsurf_native::volume::inspect(&parent).unwrap();
+        assert!(
+            bundled_image_digest().is_some(),
+            "compile against the reviewed image identity"
+        );
+        let root = parent.join(format!(
             "sandsurf-oci-journal-{}-{}",
             std::process::id(),
             short_nonce().unwrap()
@@ -1076,12 +1086,18 @@ mod tests {
         let image = root.join("system.ext4");
         materialize_tar(
             &mut crate::offline::Executor::new(
-                &root,
+                &parent,
                 vec![std::sync::Arc::new(
                     sandsurf_native::storage::disk_lease(&root.join(".executor")).unwrap(),
                 )],
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../packages/sandsurf/native/linux-x64/sandsurf-host-linux-x64"),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+                    "../../packages/sandsurf/native/linux-{0}/sandsurf-host-linux-{0}",
+                    if cfg!(target_arch = "aarch64") {
+                        "arm64"
+                    } else {
+                        "x64"
+                    }
+                )),
             ),
             vec![],
             &archive_path,
@@ -1101,10 +1117,10 @@ mod tests {
             u32::from_le_bytes(superblock[224..228].try_into().unwrap()),
             8
         );
-        fs::remove_file(image).unwrap();
-        fs::remove_file(archive_path).unwrap();
-        fs::remove_dir_all(root.join(".offline")).unwrap();
-        fs::remove_file(root.join(".executor")).unwrap();
-        fs::remove_dir(root).unwrap();
+        drop(file);
+        // This test created the exact private child; all native custody has
+        // drained before reclaiming its disks and scratch. The reviewed TCB
+        // cache stays on the shared qualification volume for later sessions.
+        fs::remove_dir_all(root).unwrap();
     }
 }

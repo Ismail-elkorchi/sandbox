@@ -102,8 +102,10 @@ const image = await host.images.importOCI({
 The recipe selects verified native kernel artifacts. OCI `ENTRYPOINT` and
 `CMD` do not become PID 1. The source filesystem must supply its own guest
 management integration if guest APIs are needed. Conversion does not run
-package scripts on the host. Journaled OCI conversion currently requires a
-Linux builder; other hosts report that limitation explicitly.
+package scripts on the host. OCI conversion uses portable inode metadata and
+opaque content files; journaled Linux filesystem construction runs in a reviewed,
+NIC-less Firecracker/HVF/WHPX VM under the native host envelope. The reviewed
+executor image and native containment prerequisites must be available.
 Archive metadata and decompression are bounded before allocation. The current
 filesystem profile preserves numeric ownership, modes, files and links;
 unsupported xattrs, ACLs and sparse encodings are rejected, not silently lost.

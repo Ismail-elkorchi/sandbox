@@ -19,6 +19,51 @@ pub fn inspect(root: &Path) -> io::Result<BoundedVolume> {
     inspect_owned(root, true)
 }
 
+/// Verify the physical owner of a host-selected object, not its containing
+/// subdirectory as though every directory were a separately mounted volume.
+/// Host shared bytes and machine bytes have the existing two closed storage
+/// namespaces. No ancestor search, mount adoption, or caller-defined submount.
+pub fn inspect_object(root: &Path, object: &Path) -> io::Result<BoundedVolume> {
+    let (owner, shared) = object_owner(root, object)?;
+    inspect_owned(&owner, shared)
+}
+
+fn object_owner(root: &Path, object: &Path) -> io::Result<(std::path::PathBuf, bool)> {
+    use std::path::Component;
+    let relative = object
+        .strip_prefix(root)
+        .map_err(|_| unsupported("storage object escapes its host owner"))?;
+    if !root.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(unsupported("storage object path is not canonical"));
+    }
+    let mut parts = relative.components();
+    if parts.next() == Some(Component::Normal(std::ffi::OsStr::new("machines"))) {
+        let slot = parts
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .filter(|slot| {
+                slot.strip_prefix("id-").is_some_and(|id| {
+                    id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            })
+            .ok_or_else(|| unsupported("machine storage object has no exact host-owned slot"))?;
+        if parts.next().is_none() {
+            return Err(unsupported("machine volume is not an object"));
+        }
+        Ok((root.join("machines").join(slot), false))
+    } else {
+        Ok((root.to_owned(), true))
+    }
+}
+
 fn inspect_owned(root: &Path, shared: bool) -> io::Result<BoundedVolume> {
     #[cfg(target_os = "linux")]
     {
@@ -334,6 +379,24 @@ fn mount_device(mounts: &str, target: &str, shared: bool) -> io::Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn object_storage_resolves_only_existing_closed_volume_namespaces() {
+        let root = std::env::temp_dir().join("sandsurf-volume-owner");
+        let slot = format!("id-{}", "a".repeat(64));
+        let machine = root.join("machines").join(&slot);
+        assert_eq!(
+            object_owner(&root, &machine.join("disks/system.building")).unwrap(),
+            (machine.clone(), false)
+        );
+        assert_eq!(
+            object_owner(&root, &root.join("images/imports/candidate/system.ext4")).unwrap(),
+            (root.clone(), true)
+        );
+        assert!(object_owner(&root, &root.join("machines/foreign/disk")).is_err());
+        assert!(object_owner(&root, &machine).is_err());
+        assert!(object_owner(&root, &root.join("images/../foreign")).is_err());
+        assert!(object_owner(&root, &root.with_extension("foreign").join("disk")).is_err());
+    }
     #[test]
     fn darwin_volume_proof_rejects_shared_containers_aliases_and_submounts() {
         let make = |path: &str, source: &str| MountRecord {
