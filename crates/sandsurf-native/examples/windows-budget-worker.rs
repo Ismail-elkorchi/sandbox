@@ -38,6 +38,30 @@ fn main() {
             }
         }
         Some("hold") => std::thread::sleep(Duration::from_secs(30)),
+        Some("disk-access") => {
+            use std::io::{Read, Write};
+            use std::os::windows::io::FromRawHandle;
+            #[repr(align(4096))]
+            struct Sector([u8; 4096]);
+            assert_eq!(args.next().unwrap(), "--sandsurf-disk-handles");
+            let mut disks: [std::fs::File; 2] = std::array::from_fn(|_| {
+                let handle: usize = args.next().unwrap().to_str().unwrap().parse().unwrap();
+                // SAFETY: this fixture consumes each explicit inherited disk
+                // handle exactly once; the parent's launch provided originals.
+                unsafe { std::fs::File::from_raw_handle(handle as _) }
+            });
+            assert!(args.next().is_none());
+            let bytes = Sector([42; 4096]);
+            disks[0].write_all(&bytes.0).unwrap();
+            disks[0].sync_all().unwrap();
+            assert_eq!(
+                disks[1].write(&bytes.0).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            let mut original = Sector([0; 4096]);
+            disks[1].read_exact(&mut original.0).unwrap();
+            assert_eq!(original.0, [0; 4096]);
+        }
         Some("owner") => {
             use sandsurf_native::{owned_windows::OwnedWorker, process_budget::ProcessBudget};
             use std::io::Write;
@@ -45,6 +69,13 @@ fn main() {
             let custody = sandsurf_native::storage::disk_lease(&root.join("disk.lock")).unwrap();
             let snapshot =
                 sandsurf_native::storage::read_lease(&root.join("snapshot.lock")).unwrap();
+            let disks = std::array::from_fn(|slot| {
+                let path = root.join(format!("io-{slot}"));
+                let file = sandsurf_native::local::create_private_file(&path).unwrap();
+                file.set_len(4096).unwrap();
+                drop(file);
+                sandsurf_native::owned_windows::disk_input(&path, slot == 1).unwrap()
+            });
             let worker = OwnedWorker::launch_vm(
                 &std::env::current_exe().unwrap(),
                 &["hold".into()],
@@ -54,6 +85,7 @@ fn main() {
                     processes: 1,
                 },
                 vec![std::sync::Arc::new(custody), std::sync::Arc::new(snapshot)],
+                disks,
             )
             .unwrap();
             let mut ready =

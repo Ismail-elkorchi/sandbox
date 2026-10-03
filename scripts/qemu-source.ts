@@ -66,3 +66,53 @@ export function ownerHooks(main: string, whpx: string, misc: string, schema: str
     // new Meson QAPI module and can silently omit its handlers from linking.
     misc: misc + "\n" + schema };
 }
+
+/** The Windows raw backend accepts only the two original device handles.
+ * No pathname reopening, backing-file probe or increased access is possible. */
+export function windowsDiskHooks(source: string): string {
+  const replace = (before: string, after: string): void => {
+    if (source.split(before).length !== 2) throw new Error("pinned Windows raw disk hook drifted");
+    source = source.replace(before, after);
+  };
+  replace('#include <winioctl.h>', '#include <winioctl.h>\n#include "../sandsurf-entry.h"');
+  replace(`    s->hfile = CreateFile(filename, access_flags,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                          OPEN_EXISTING, overlapped, NULL);`, `    if (use_aio) {
+        error_setg(errp, "Sandsurf disk handles require threaded I/O");
+        ret = -ENOTSUP;
+        goto fail;
+    }
+    s->hfile = sandsurf_qemu_disk(filename);`);
+  const start = source.indexOf("static int raw_reopen_prepare(");
+  const end = source.indexOf("static QemuOptsList raw_create_opts", start);
+  if (start < 0 || end < 0 || !source.slice(start, end).includes("rs->hfile = CreateFile(")) throw new Error("pinned raw reopen implementation drifted");
+  source = source.slice(0, start) + `static int raw_reopen_prepare(BDRVReopenState *state,
+                              BlockReopenQueue *queue, Error **errp)
+{
+    (void)state;
+    (void)queue;
+    error_setg(errp, "Sandsurf device access is immutable for this native owner");
+    return -ENOTSUP;
+}
+` + source.slice(end);
+  replace(`typedef struct BDRVRawReopenState {
+    HANDLE hfile;
+} BDRVRawReopenState;`, "");
+  replace("    .bdrv_reopen_commit  = raw_reopen_commit,\n    .bdrv_reopen_abort   = raw_reopen_abort,", "");
+  const allocation = source.indexOf("static int64_t coroutine_fn raw_co_get_allocated_file_size(");
+  const create = source.indexOf("static int raw_co_create(", allocation);
+  if (allocation < 0 || create < 0 || !source.slice(allocation, create).includes("GetCompressedFileSizeA")) throw new Error("pinned raw allocation implementation drifted");
+  source = source.slice(0, allocation) + `static int64_t coroutine_fn raw_co_get_allocated_file_size(BlockDriverState *bs)
+{
+    BDRVRawState *s = bs->opaque;
+    FILE_STANDARD_INFO information = {0};
+    if (!GetFileInformationByHandleEx(s->hfile, FileStandardInfo,
+                                    &information, sizeof(information))) {
+        return -EIO;
+    }
+    return information.AllocationSize.QuadPart;
+}
+
+` + source.slice(create);
+  return source;
+}

@@ -15,7 +15,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+};
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
@@ -46,6 +48,47 @@ pub struct OwnedWorker {
     exit: Option<u32>,
 }
 
+enum LaunchRole {
+    Standalone,
+    Factory,
+    VirtualMachine([Arc<File>; 2]),
+}
+
+/// Open an explicit disk role through the already validated original file,
+/// not another pathname lookup. QEMU's threaded raw I/O uses unbuffered handles.
+pub fn disk_input(path: &Path, read_only: bool) -> io::Result<Arc<File>> {
+    let access = if read_only {
+        crate::PrivateFileAccess::ReadOnly
+    } else {
+        crate::PrivateFileAccess::ReadWrite
+    };
+    let original = crate::local::open_private_file(path, access)?;
+    let bytes = original.metadata()?.len();
+    if bytes == 0 || bytes > 128 * 1024 * 1024 * 1024 || bytes % 512 != 0 {
+        return Err(invalid("native disk input geometry exceeds bound"));
+    }
+    // SAFETY: original is retained and validated. ReOpenFile opens that kernel
+    // file identity with only the admitted access; it cannot resolve a new path.
+    let handle = unsafe {
+        ReOpenFile(
+            original.as_raw_handle().cast(),
+            windows_sys::Win32::Foundation::GENERIC_READ
+                | if read_only {
+                    0
+                } else {
+                    windows_sys::Win32::Foundation::GENERIC_WRITE
+                },
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_FLAG_NO_BUFFERING,
+        )
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile returned one newly owned file handle.
+    Ok(Arc::new(unsafe { File::from_raw_handle(handle.cast()) }))
+}
+
 impl OwnedWorker {
     /// `executable` must already have been verified against the installed
     /// native manifest by the host. A no-write/no-delete lease prevents path
@@ -56,7 +99,13 @@ impl OwnedWorker {
         arguments: &[OsString],
         budget: ProcessBudget,
     ) -> io::Result<Self> {
-        Self::launch_inner(executable, arguments, budget, Vec::new(), false, false)
+        Self::launch_inner(
+            executable,
+            arguments,
+            budget,
+            Vec::new(),
+            LaunchRole::Standalone,
+        )
     }
 
     /// The only factory entry is this installed host executable with a closed
@@ -80,7 +129,13 @@ impl OwnedWorker {
         }
         let mut admitted = vec![mode.into()];
         admitted.extend_from_slice(arguments);
-        Self::launch_inner(executable, &admitted, budget, Vec::new(), true, true)
+        Self::launch_inner(
+            executable,
+            &admitted,
+            budget,
+            Vec::new(),
+            LaunchRole::Factory,
+        )
     }
 
     /// Closed image-worker launch, retaining the pool lease before the child
@@ -100,8 +155,7 @@ impl OwnedWorker {
             &admitted,
             crate::service_pool::ServicePool::Images.process_budget(),
             vec![custody],
-            true,
-            true,
+            LaunchRole::Factory,
         )
     }
 
@@ -151,6 +205,7 @@ impl OwnedWorker {
         arguments: &[OsString],
         budget: ProcessBudget,
         custody: Vec<Arc<File>>,
+        disks: [Arc<File>; 2],
     ) -> io::Result<Self> {
         if budget.processes != 1 {
             return Err(invalid("a VMM cannot launch native descendants"));
@@ -159,7 +214,13 @@ impl OwnedWorker {
             crate::resource_broker::WorkerKind::VirtualMachine,
             custody.len(),
         )?;
-        Self::launch_inner(executable, arguments, budget, custody, false, true)
+        Self::launch_inner(
+            executable,
+            arguments,
+            budget,
+            custody,
+            LaunchRole::VirtualMachine(disks),
+        )
     }
 
     fn launch_inner(
@@ -167,8 +228,7 @@ impl OwnedWorker {
         arguments: &[OsString],
         budget: ProcessBudget,
         custody: Vec<Arc<File>>,
-        factory: bool,
-        break_away: bool,
+        role: LaunchRole,
     ) -> io::Result<Self> {
         if !executable.is_absolute() {
             return Err(invalid("native worker path must be absolute"));
@@ -191,15 +251,21 @@ impl OwnedWorker {
         // Preserve only the OS's native SystemRoot, not loader-influencing
         // caller variables or an inherited PATH, TEMP, HOME or credentials.
         let environment = environment()?;
+        let factory = matches!(&role, LaunchRole::Factory);
+        let break_away = !matches!(&role, LaunchRole::Standalone);
         let job = if factory {
             JobEnvelope::create_factory(budget)?
         } else {
             JobEnvelope::create_owned(budget)?
         };
-        let mut inherited = if custody.is_empty() {
+        let mut files = custody.clone();
+        if let LaunchRole::VirtualMachine(disks) = &role {
+            files.extend(disks.iter().cloned());
+        }
+        let mut inherited = if files.is_empty() {
             None
         } else {
-            Some(InheritedCustody::new(&custody)?)
+            Some(InheritedCustody::new(&files)?)
         };
         let mut admitted = arguments.to_vec();
         if factory && let Some(value) = &inherited {
@@ -208,6 +274,15 @@ impl OwnedWorker {
                 return Err(invalid("an image factory owns exactly one pool lease"));
             }
             admitted.push((value.handles[0].0 as usize).to_string().into());
+        }
+        if matches!(&role, LaunchRole::VirtualMachine(_)) {
+            let value = inherited
+                .as_ref()
+                .ok_or_else(|| invalid("native disk handles are missing"))?;
+            admitted.push("--sandsurf-disk-handles".into());
+            for handle in &value.handles[custody.len()..] {
+                admitted.push((handle.0 as usize).to_string().into());
+            }
         }
         let mut command_line =
             crate::windows_arguments::command_line(executable.as_os_str(), &admitted)?;
@@ -377,7 +452,7 @@ struct InheritedCustody {
 
 impl InheritedCustody {
     fn new(files: &[Arc<File>]) -> io::Result<Self> {
-        if files.is_empty() || files.len() > crate::MAX_WORKER_CUSTODY {
+        if files.is_empty() || files.len() > crate::MAX_WORKER_CUSTODY + 2 {
             return Err(invalid("invalid native custody closure"));
         }
         let mut handles = Vec::with_capacity(files.len());

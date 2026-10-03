@@ -6,6 +6,38 @@
 #include "sandsurf-entry.h"
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+static HANDLE disk_handles[2];
+
+static HANDLE disk_number(const char *number)
+{
+    uintptr_t value = 0;
+    if (!*number || strlen(number) > 20) { exit(70); }
+    for (const char *digit = number; *digit; ++digit) {
+        if (*digit < '0' || *digit > '9' || value > (UINTPTR_MAX - (unsigned)(*digit - '0')) / 10) { exit(70); }
+        value = value * 10 + (unsigned)(*digit - '0');
+    }
+    DWORD flags = 0;
+    HANDLE handle = (HANDLE)value;
+    if (!value || handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
+        !GetHandleInformation(handle, &flags) || !(flags & HANDLE_FLAG_INHERIT) ||
+        !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)) { exit(70); }
+    return handle;
+}
+
+void *sandsurf_qemu_disk(const char *role)
+{
+    unsigned slot;
+    if (!strcmp(role, "sandsurf-disk:0")) { slot = 0; }
+    else if (!strcmp(role, "sandsurf-disk:1")) { slot = 1; }
+    else { SetLastError(ERROR_ACCESS_DENIED); return INVALID_HANDLE_VALUE; }
+    HANDLE copy = INVALID_HANDLE_VALUE;
+    if (!disk_handles[slot] || !DuplicateHandle(GetCurrentProcess(), disk_handles[slot], GetCurrentProcess(),
+        &copy, 0, FALSE, DUPLICATE_SAME_ACCESS)) { return INVALID_HANDLE_VALUE; }
+    return copy;
+}
+#endif
 
 #ifdef __APPLE__
 #include <errno.h>
@@ -163,7 +195,8 @@ int sandsurf_qemu_enter(int argc, char ***argv)
     memmove(*argv + 1, *argv + 7, (size_t)(argc - 6) * sizeof(char *));
     return argc - 6;
 #elif defined(_WIN32)
-    if (argc < 4 || strcmp((*argv)[1], "--sandsurf-cpu-cap")) {
+    if (argc < 7 || strcmp((*argv)[1], "--sandsurf-cpu-cap") ||
+        strcmp((*argv)[argc - 3], "--sandsurf-disk-handles")) {
         exit(70);
     }
     const char *number = (*argv)[2];
@@ -179,6 +212,11 @@ int sandsurf_qemu_enter(int argc, char ***argv)
     if (guest_cpu_cap == 0 || guest_cpu_cap > 65536) {
         exit(70);
     }
+    disk_handles[0] = disk_number((*argv)[argc - 2]);
+    disk_handles[1] = disk_number((*argv)[argc - 1]);
+    if (disk_handles[0] == disk_handles[1]) { exit(70); }
+    argc -= 3;
+    (*argv)[argc] = NULL;
     memmove(*argv + 1, *argv + 3, (size_t)(argc - 2) * sizeof(char *));
     return argc - 2;
 #else

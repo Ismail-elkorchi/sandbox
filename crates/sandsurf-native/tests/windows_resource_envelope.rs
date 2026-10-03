@@ -24,6 +24,36 @@ fn budget() -> ProcessBudget {
 }
 
 #[test]
+fn original_disk_handles_keep_exact_bytes_and_read_only_access_in_the_native_child() {
+    let Some(executable) = fixture() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("sandsurf-disk-input-{}", std::process::id()));
+    sandsurf_native::local::create_private_directory(&root).unwrap();
+    let disks = std::array::from_fn(|slot| {
+        let path = root.join(format!("disk-{slot}"));
+        let file = sandsurf_native::local::create_private_file(&path).unwrap();
+        file.set_len(4096).unwrap();
+        drop(file);
+        sandsurf_native::owned_windows::disk_input(&path, slot == 1).unwrap()
+    });
+    let lease = sandsurf_native::storage::disk_lease(&root.join("disk.lock")).unwrap();
+    let mut worker = OwnedWorker::launch_vm(
+        &executable,
+        &["disk-access".into()],
+        budget(),
+        vec![std::sync::Arc::new(lease)],
+        disks,
+    )
+    .unwrap();
+    assert_eq!(worker.wait_for(Duration::from_secs(5)).unwrap(), Some(0));
+    assert_eq!(std::fs::read(root.join("disk-0")).unwrap(), [42; 4096]);
+    assert_eq!(std::fs::read(root.join("disk-1")).unwrap(), [0; 4096]);
+    drop(worker);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn kernel_limits_precede_execution_and_native_exit_259_is_not_running() {
     let Some(executable) = fixture() else {
         return;

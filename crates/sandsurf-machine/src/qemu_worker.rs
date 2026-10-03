@@ -122,11 +122,17 @@ impl QemuWorker {
             )?;
             let mut admitted = vec!["--sandsurf-cpu-cap".into(), cap.to_string().into()];
             admitted.extend(arguments);
+            let [(root, root_read_only), (secondary, secondary_read_only)] = config.devices.disks();
+            let disks = [
+                sandsurf_native::owned_windows::disk_input(root, root_read_only)?,
+                sandsurf_native::owned_windows::disk_input(secondary, secondary_read_only)?,
+            ];
             sandsurf_native::owned_windows::OwnedWorker::launch_vm(
                 executable,
                 &admitted,
                 budget,
                 custody.clone(),
+                disks,
             )?
         };
         let mut child = child;

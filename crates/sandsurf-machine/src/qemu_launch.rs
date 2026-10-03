@@ -126,7 +126,10 @@ impl LaunchConfig {
                     "ttyAMA0"
                 }),
         );
-        for (node, (path, read_only)) in ["root", "secondary"].into_iter().zip(self.devices.disks())
+        for (slot, (node, (path, read_only))) in ["root", "secondary"]
+            .into_iter()
+            .zip(self.devices.disks())
+            .enumerate()
         {
             // Explicit raw format disables guest-selected backing files and
             // image-format probes. JSON preserves commas and other path bytes.
@@ -134,7 +137,10 @@ impl LaunchConfig {
                 "-blockdev",
                 json!({
                     "driver": "raw", "node-name": node, "read-only": read_only,
-                    "file": { "driver": "file", "filename": path_text(path)?,
+                    "file": { "driver": "file", "filename": if self.accelerator == Accelerator::Whpx {
+                        format!("sandsurf-disk:{slot}")
+                    } else { path_text(path)?.to_owned() },
+                        "aio": "threads",
                         "cache": { "direct": true, "no-flush": false } },
                 })
                 .to_string(),
@@ -286,12 +292,17 @@ mod tests {
                     assert_eq!(disk["file"]["cache"]["direct"], true);
                     assert_eq!(disk["file"]["cache"]["no-flush"], false);
                 }
-                assert!(
-                    disks[0]["file"]["filename"]
-                        .as_str()
-                        .unwrap()
-                        .contains("system,disk.raw")
-                );
+                if accelerator == Accelerator::Whpx {
+                    assert_eq!(disks[0]["file"]["filename"], "sandsurf-disk:0");
+                    assert_eq!(disks[1]["file"]["filename"], "sandsurf-disk:1");
+                } else {
+                    assert!(
+                        disks[0]["file"]["filename"]
+                            .as_str()
+                            .unwrap()
+                            .contains("system,disk.raw")
+                    );
+                }
             }
         }
     }

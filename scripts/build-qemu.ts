@@ -5,7 +5,7 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFil
 import { tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ownerHooks, QEMU_CORRESPONDING_FILES, QEMU_SOURCE } from "./qemu-source.ts";
+import { ownerHooks, windowsDiskHooks, QEMU_CORRESPONDING_FILES, QEMU_SOURCE } from "./qemu-source.ts";
 import { qemuRequiredInputs, runtimeDigest, verifyQemuRuntime } from "./qemu-runtime.ts";
 import { collectDependencySources, verifyDependencySources } from "./qemu-dependencies.ts";
 import type { CommandLimits, LibraryInput } from "./qemu-dependencies.ts";
@@ -49,6 +49,8 @@ export async function buildQemu(destination: string): Promise<void> {
     const hooked = ownerHooks(await readFile(main, "utf8"), await readFile(whpx, "utf8"), await readFile(misc, "utf8"),
       await readFile(resolve(repository, "vmm/qemu/sandsurf-qapi.json"), "utf8"));
     await writeFile(main, hooked.main); await writeFile(whpx, hooked.whpx); await writeFile(misc, hooked.misc);
+    const rawWindows = resolve(source, "block/file-win32.c");
+    await writeFile(rawWindows, windowsDiskHooks(await readFile(rawWindows, "utf8")));
     for (const name of ["sandsurf-entry.c", "sandsurf-entry.h", "sandsurf-whpx.c"]) {
       await copyFile(resolve(repository, "vmm/qemu", name), resolve(source, name));
     }
