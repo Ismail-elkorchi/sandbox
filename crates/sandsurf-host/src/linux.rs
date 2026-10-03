@@ -546,6 +546,30 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for LinuxGuardianEffect {
+    fn staged_restore_binding(&self) -> Option<&Digest> {
+        self.machine.staged_restore_binding()
+    }
+    fn restore_preparation(
+        &self,
+        snapshot_id: sandsurf_protocol::SnapshotId,
+        manifest_digest: Digest,
+        system_disk: sandsurf_protocol::SnapshotArtifact,
+        expected: sandsurf_protocol::FullSnapshotMetadata,
+    ) -> ControlResult<crate::restore_preparation::RestorePreparation> {
+        self.prepare_full_restore(crate::restore_preparation::RestorePreparation {
+            machine_root: self.machine_root.clone(),
+            snapshot_id,
+            manifest_digest,
+            system_disk,
+            expected,
+        })
+    }
+    fn install_prepared_restore(
+        &mut self,
+        prepared: crate::restore_preparation::PreparedRestore,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        self.install_full_restore(prepared)
+    }
     fn boot_preparation(
         &self,
         command: &LifecycleCommand,
@@ -628,6 +652,11 @@ impl GuardianEffect for LinuxGuardianEffect {
             && current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Failed)
             });
+        if cold_boot && crate::restore::complete(&self.machine_root).is_err() {
+            return MachineOutcome::NotApplied(bytes_digest(
+                b"cold-boot-could-not-retire-restore-integration",
+            ));
+        }
         self.machine.generation_factory_mut().prepared_boot = prepared;
         let mut outcome = apply_lifecycle(&mut self.machine, command, current);
         self.machine.generation_factory_mut().prepared_boot = None;
@@ -684,6 +713,11 @@ impl GuardianEffect for LinuxGuardianEffect {
                 *active = None;
             }
             self.stop_runtime_data_planes();
+        }
+        if matches!(&outcome, MachineOutcome::Observed(values) if values.last().is_some_and(|value| matches!(value.state, MachineState::Stopped | MachineState::Destroyed)))
+            && crate::restore::complete(&self.machine_root).is_err()
+        {
+            return MachineOutcome::Unknown;
         }
         if matches!(
             &outcome,
@@ -910,12 +944,9 @@ impl GuardianEffect for LinuxGuardianEffect {
                     .map_err(|_| ControlError::Protocol("suspend evidence digest failed"))?,
                 })
             }
-            NativeSnapshotRequest::StageRestore {
-                snapshot_id,
-                manifest_digest,
-                system_disk,
-                expected,
-            } => self.stage_full_restore(snapshot_id, manifest_digest, system_disk, *expected),
+            NativeSnapshotRequest::StageRestore { .. } => Err(ControlError::Protocol(
+                "full restore requires detached preparation",
+            )),
         }
     }
 
@@ -1004,13 +1035,11 @@ struct ReconnectState {
 }
 
 impl LinuxGuardianEffect {
-    fn stage_full_restore(
-        &mut self,
-        snapshot_id: sandsurf_protocol::SnapshotId,
-        manifest_digest: Digest,
-        system_disk: SnapshotArtifact,
-        expected: sandsurf_protocol::FullSnapshotMetadata,
-    ) -> ControlResult<NativeSnapshotResponse> {
+    fn prepare_full_restore(
+        &self,
+        mut input: crate::restore_preparation::RestorePreparation,
+    ) -> ControlResult<crate::restore_preparation::RestorePreparation> {
+        let expected = &input.expected;
         let architecture = match crate::service::native_guest_architecture() {
             sandsurf_machine::GuestArchitecture::Amd64 => "amd64",
             sandsurf_machine::GuestArchitecture::Arm64 => "arm64",
@@ -1026,48 +1055,36 @@ impl LinuxGuardianEffect {
                 "full snapshot is incompatible with this Firecracker configuration",
             ));
         }
-        let memory = expected.memory.as_ref().ok_or(ControlError::Unsupported(
+        expected.memory.as_ref().ok_or(ControlError::Unsupported(
             "Firecracker full snapshots require a separate memory artifact",
         ))?;
-        let directory = self
-            .machine_root
-            .join("snapshots")
-            .join(object_name(snapshot_id.as_str()));
-        let _snapshot_custody =
-            crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
-                .map_err(|_| {
-                    ControlError::Unsupported("full snapshot inputs are retired or unavailable")
-                })?;
-        let artifacts = [
-            ("system.ext4", &system_disk),
-            ("snapshot.vmstate", &expected.snapshot_state),
-            ("memory", memory),
-            ("reconnect.json", &expected.reconnect_state),
-        ];
-        for (name, artifact) in artifacts {
-            let actual = crate::snapshots::file_digest(&directory.join(name), artifact.bytes.get())
-                .map_err(|_| ControlError::Protocol("full snapshot artifact is corrupt"))?;
-            if actual != artifact.digest {
-                return Err(ControlError::Protocol(
-                    "full snapshot artifact digest mismatch",
-                ));
-            }
-        }
-        if crate::snapshots::file_digest(
-            &self.machine_root.join("disks/system.ext4"),
-            system_disk.bytes.get(),
-        )
-        .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
-            != system_disk.digest
+        input.machine_root = self.machine_root.clone();
+        Ok(input)
+    }
+
+    fn install_full_restore(
+        &mut self,
+        prepared: crate::restore_preparation::PreparedRestore,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        if self.prepare_full_restore(prepared.input.clone())? != prepared.input
+            || prepared.staged_state.is_some()
         {
-            return Err(ControlError::Unsupported(
-                "mutable disks no longer match the suspended full snapshot",
+            return Err(ControlError::Protocol(
+                "prepared restore native binding changed",
             ));
         }
-        let reconnect: ReconnectState =
-            read_json(&directory.join("reconnect.json"), 1024 * 1024)
-                .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
-        if reconnect.snapshot_id != snapshot_id {
+        let preparation_digest = prepared.input.binding()?;
+        let response = prepared.input.evidence()?;
+        let crate::restore_preparation::RestorePreparation {
+            snapshot_id,
+            manifest_digest,
+            expected,
+            ..
+        } = prepared.input;
+        let directory = prepared.directory;
+        let reconnect: ReconnectState = serde_json::from_slice(&prepared.reconnect)
+            .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
+        if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
                 "restore reconnect identity does not match snapshot",
             ));
@@ -1089,6 +1106,7 @@ impl LinuxGuardianEffect {
         })?;
         self.machine
             .stage_restore(FirecrackerRestoreSource {
+                preparation_digest,
                 snapshot_id: snapshot_id.clone(),
                 capture_operation_id: reconnect.capture_operation_id,
                 source_machine_id: reconnect.machine_id,
@@ -1097,20 +1115,11 @@ impl LinuxGuardianEffect {
                 snapshot_state: directory.join("snapshot.vmstate"),
                 snapshot_memory: directory.join("memory"),
                 reconnect_state: directory.join("reconnect.json"),
+                disk_custody: prepared.disk_custody,
+                snapshot_custody: prepared.snapshot_custody,
             })
             .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
-        Ok(NativeSnapshotResponse::Complete {
-            evidence: digest(
-                Domain::Snapshot,
-                &(
-                    "sandsurf-firecracker-restore-staged-v1",
-                    snapshot_id,
-                    manifest_digest,
-                    expected.generation,
-                ),
-            )
-            .map_err(|_| ControlError::Protocol("restore stage evidence digest failed"))?,
-        })
+        Ok(response)
     }
 
     fn prepare_capture_boundary(
@@ -1558,8 +1567,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         }
         // StageRestore already verified the restored disk against the capture.
         // Resume does not install an OS, customize identities, or read /boot.
-        let storage_lease = crate::storage::attach(&self.system_disk)
-            .map_err(|_| bytes_digest(b"linux-restore-storage-custody"))?;
+        let storage_lease = Arc::clone(&source.disk_custody);
         let resources = self.config.resources.clone();
         let configuration = self.configuration_from_boot(
             machine_id,
@@ -1987,6 +1995,7 @@ mod storage_tests {
             prepared_boot: None,
         };
         let source = FirecrackerRestoreSource {
+            preparation_digest: bytes_digest(b"prepared-restore"),
             snapshot_id,
             capture_operation_id: operation,
             source_machine_id: machine_id.clone(),
@@ -1995,6 +2004,14 @@ mod storage_tests {
             snapshot_state: root.join("snapshot/vmstate"),
             snapshot_memory: root.join("snapshot/memory"),
             reconnect_state: root.join("snapshot/reconnect.json"),
+            disk_custody: crate::storage::attach(&disk).unwrap(),
+            snapshot_custody: Arc::new(
+                sandsurf_native::local::open_private_file(
+                    &root.join("snapshot/reconnect.json"),
+                    sandsurf_native::PrivateFileAccess::ReadOnly,
+                )
+                .unwrap(),
+            ),
         };
         let (configuration, _) = factory
             .restore_configuration(&machine_id, Counter::try_from(2).unwrap(), &source)

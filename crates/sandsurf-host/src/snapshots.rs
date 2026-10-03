@@ -118,6 +118,38 @@ pub(crate) fn cleanup(
         remove_stage(&directory)?;
     }
     sync_directory(&root)?;
+    // Interrupted QEMU preparation can leave a native state copy before the
+    // integration record is published. Its name is owned by this exact
+    // immutable capture; retirement also waits for original VMM disk custody.
+    if snapshot.request.kind == SnapshotKind::Full {
+        let restore_root = host_root
+            .join("machines")
+            .join(object_name(record.machine_id.as_str()))
+            .join("guardian/restores");
+        match fs::symlink_metadata(&restore_root) {
+            Ok(_) => {
+                sandsurf_native::local::Directory::open(&restore_root)?;
+                let manifest = snapshot
+                    .manifest_digest
+                    .as_ref()
+                    .ok_or(SnapshotError::Invalid(
+                        "full snapshot has no manifest identity",
+                    ))?;
+                let copy = restore_root.join(format!("{}.vmstate", manifest.as_str()));
+                match open_read(&copy) {
+                    Ok(file) => {
+                        drop(file);
+                        fs::remove_file(copy)?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                sync_directory(&restore_root)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     // Native capture duplicates belong to this exact capture operation. Native
     // detachment above excludes readers of full-state restore inputs.
     let native_root = host_root
@@ -1218,6 +1250,54 @@ mod tests {
         drop(native);
         cleanup(&temp.0, &snapshot, &record).unwrap();
         assert!(retirement_path(&root, &snapshot.request.id).exists());
+    }
+
+    #[test]
+    fn full_snapshot_retirement_reclaims_interrupted_native_restore_copy_only_after_detachment() {
+        let temp = Temp::new();
+        let mut snapshot = snapshot();
+        snapshot.request.kind = SnapshotKind::Full;
+        snapshot.manifest_digest = Some(bytes_digest(b"full manifest"));
+        let root = temp.capture_root(&snapshot);
+        private_directory(&root).unwrap();
+        let machine = root.parent().unwrap();
+        let disks = machine.join("disks");
+        private_directory(&disks).unwrap();
+        let disk = disks.join("system.ext4");
+        crate::storage::publish_disk(&disk, 4096, |stage| open_write(stage)?.set_len(4096))
+            .unwrap();
+        let guardian = machine.join("guardian");
+        private_directory(&guardian).unwrap();
+        let restores = guardian.join("restores");
+        private_directory(&restores).unwrap();
+        let copy = restores.join(format!(
+            "{}.vmstate",
+            snapshot.manifest_digest.as_ref().unwrap().as_str()
+        ));
+        open_write(&copy)
+            .unwrap()
+            .write_all(b"interrupted native state copy")
+            .unwrap();
+        let other = restores.join("another-owner.vmstate");
+        open_write(&other)
+            .unwrap()
+            .write_all(b"other capture")
+            .unwrap();
+        let archive = guardian.join("retained-output");
+        open_write(&archive)
+            .unwrap()
+            .write_all(b"original bytes")
+            .unwrap();
+        let original = crate::storage::attach(&disk).unwrap();
+        let record = retirement(&mut snapshot);
+        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        assert_eq!(fs::read(&copy).unwrap(), b"interrupted native state copy");
+        drop(original);
+        cleanup(&temp.0, &snapshot, &record).unwrap();
+        assert!(!copy.exists());
+        assert_eq!(fs::read(other).unwrap(), b"other capture");
+        assert_eq!(fs::read(archive).unwrap(), b"original bytes");
+        cleanup(&temp.0, &snapshot, &record).unwrap();
     }
 
     #[test]

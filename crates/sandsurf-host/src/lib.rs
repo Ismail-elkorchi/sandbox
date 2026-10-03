@@ -20,6 +20,7 @@ pub mod qemu;
 pub mod qualification;
 pub mod resources;
 mod restore;
+mod restore_preparation;
 pub mod secrets;
 pub mod service;
 mod snapshots;

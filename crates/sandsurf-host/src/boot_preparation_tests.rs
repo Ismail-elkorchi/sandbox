@@ -9,6 +9,7 @@ impl GuestDriver for NoGuest {
 }
 
 struct Native {
+    restore: Option<(Digest, PreparedRestore)>,
     root: PathBuf,
     measured: Option<MachineState>,
     reset: bool,
@@ -17,6 +18,33 @@ struct Native {
     resource_checks: std::cell::RefCell<Vec<(&'static str, MachineObservation)>>,
 }
 impl GuardianEffect for Native {
+    fn staged_restore_binding(&self) -> Option<&Digest> {
+        self.restore.as_ref().map(|(binding, _)| binding)
+    }
+    fn restore_preparation(
+        &self,
+        snapshot_id: SnapshotId,
+        manifest_digest: Digest,
+        system_disk: SnapshotArtifact,
+        expected: FullSnapshotMetadata,
+    ) -> Result<RestorePreparation> {
+        Ok(RestorePreparation {
+            machine_root: self.root.clone(),
+            snapshot_id,
+            manifest_digest,
+            system_disk,
+            expected,
+        })
+    }
+    fn install_prepared_restore(
+        &mut self,
+        prepared: PreparedRestore,
+    ) -> Result<NativeSnapshotResponse> {
+        let response = prepared.input.evidence()?;
+        self.restore = Some((prepared.input.binding()?, prepared));
+        self.installed += 1;
+        Ok(response)
+    }
     fn validate_resources(
         &self,
         resources: &Resources,
@@ -91,6 +119,9 @@ impl GuardianEffect for Native {
             DesiredState::Destroyed => MachineState::Destroyed,
             _ => panic!("unsupported fixture lifecycle"),
         };
+        if matches!(target, MachineState::Stopped | MachineState::Destroyed) {
+            self.restore = None;
+        }
         let mut states = Vec::new();
         if current.is_none() {
             states.push(MachineState::Creating);
@@ -245,6 +276,7 @@ impl Fixture {
         let guardian = Guardian::new(
             journal,
             Native {
+                restore: None,
                 root: root.clone(),
                 measured: None,
                 reset: false,
@@ -335,6 +367,207 @@ fn retire(fixture: Fixture) {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn restore_request(f: &mut Fixture) -> NativeSnapshotRequest {
+    f.start();
+    let current = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    f.guardian
+        .journal
+        .observe(MachineObservation {
+            sequence: current.sequence.next().unwrap(),
+            state: MachineState::Suspended,
+            cause: ObservationCause::Native {},
+            evidence_digest: bytes_digest(b"native-suspension-fixture"),
+            ..current
+        })
+        .unwrap();
+    f.guardian.effect.as_mut().unwrap().measured = None;
+    let input = crate::restore_preparation::tests::fixture(&f.root, VmEngine::Firecracker);
+    NativeSnapshotRequest::StageRestore {
+        snapshot_id: input.snapshot_id,
+        manifest_digest: input.manifest_digest,
+        system_disk: input.system_disk,
+        expected: Box::new(input.expected),
+    }
+}
+
+#[test]
+fn unapplied_host_authority_prevents_restore_admission_and_staged_response_retry() {
+    for stage_first in [false, true] {
+        let mut f = Fixture::new();
+        let request = restore_request(&mut f);
+        let machine = f.guardian.journal.machine_id().clone();
+        if stage_first {
+            let RestoreAdmission::Queued { input, pending } = f
+                .guardian
+                .begin_restore(machine.clone(), request.clone())
+                .unwrap()
+            else {
+                panic!("restore must prepare off owner");
+            };
+            f.guardian.finish_restore(pending, input.execute()).unwrap();
+        }
+        let stop = f.intent("accepted-stop-before-restore", DesiredState::Stopped);
+        f.guardian.journal.admit_lifecycle(stop).unwrap();
+        assert!(f.guardian.begin_restore(machine, request).is_err());
+        assert!(!f.guardian.offline_in_flight);
+        assert_eq!(
+            f.guardian.effect.as_ref().unwrap().installed,
+            1 + usize::from(stage_first)
+        );
+        retire(f);
+    }
+}
+
+#[test]
+fn restore_preparation_is_fenced_by_new_authority_even_without_a_changed_native_observation() {
+    let mut f = Fixture::new();
+    let request = restore_request(&mut f);
+    let machine = f.guardian.journal.machine_id().clone();
+    let RestoreAdmission::Queued { input, pending } = f
+        .guardian
+        .begin_restore(machine.clone(), request.clone())
+        .unwrap()
+    else {
+        panic!("restore must prepare off owner");
+    };
+    assert!(f.guardian.begin_restore(machine, request).is_err());
+    let prepared = input.execute().unwrap();
+    let before = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .map(|v| v.value().clone());
+    let stop = f.intent("stop-before-delivery", DesiredState::Stopped);
+    f.guardian.journal.admit_lifecycle(stop).unwrap();
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .map(|v| v.value().clone()),
+        before
+    );
+    assert!(f.guardian.finish_restore(pending, Ok(prepared)).is_err());
+    assert_eq!(f.guardian.effect.as_ref().unwrap().installed, 1);
+    assert!(!f.guardian.offline_in_flight);
+    assert!(crate::storage::attach(&f.root.join("disks/system.ext4")).is_ok());
+    retire(f);
+}
+
+#[test]
+fn native_stop_overtakes_detached_restore_and_a_late_completion_cannot_stage_state() {
+    let mut f = Fixture::new();
+    let request = restore_request(&mut f);
+    let machine = f.guardian.journal.machine_id().clone();
+    let RestoreAdmission::Queued { input, pending } =
+        f.guardian.begin_restore(machine, request).unwrap()
+    else {
+        panic!("restore must prepare off owner");
+    };
+    let prepared = input.execute().unwrap();
+    let stop = f.intent("force-stop", DesiredState::Stopped);
+    let BootAdmission::Ready(response) = f.guardian.begin_boot(stop).unwrap() else {
+        panic!("stop must not queue behind restore");
+    };
+    assert_eq!(delivery(response), Delivery::Applied);
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .state,
+        MachineState::Stopped
+    );
+    assert!(f.guardian.finish_restore(pending, Ok(prepared)).is_err());
+    assert!(f.guardian.effect.as_ref().unwrap().restore.is_none());
+    assert!(crate::storage::attach(&f.root.join("disks/system.ext4")).is_ok());
+    retire(f);
+}
+
+#[test]
+fn prepared_restore_installs_once_and_exact_response_retry_retains_actual_custody() {
+    let mut f = Fixture::new();
+    let request = restore_request(&mut f);
+    let machine = f.guardian.journal.machine_id().clone();
+    let RestoreAdmission::Queued { input, pending } = f
+        .guardian
+        .begin_restore(machine.clone(), request.clone())
+        .unwrap()
+    else {
+        panic!("restore must prepare off owner");
+    };
+    let prepared = input.execute().unwrap();
+    let response = f.guardian.finish_restore(pending, Ok(prepared)).unwrap();
+    let RestoreAdmission::Ready(retried) = f
+        .guardian
+        .begin_restore(machine.clone(), request.clone())
+        .unwrap()
+    else {
+        panic!("lost response must not release and reacquire original storage");
+    };
+    assert_eq!(response, retried);
+    assert_eq!(f.guardian.effect.as_ref().unwrap().installed, 2);
+    assert!(crate::storage::attach(&f.root.join("disks/system.ext4")).is_err());
+    let NativeSnapshotRequest::StageRestore {
+        mut expected,
+        snapshot_id,
+        manifest_digest,
+        system_disk,
+    } = request
+    else {
+        unreachable!()
+    };
+    expected.generation = bytes_digest(b"substituted-generation");
+    assert!(
+        f.guardian
+            .begin_restore(
+                machine,
+                NativeSnapshotRequest::StageRestore {
+                    expected,
+                    snapshot_id,
+                    manifest_digest,
+                    system_disk
+                }
+            )
+            .is_err()
+    );
+    let stop = f.intent("stop-staged-restore", DesiredState::Stopped);
+    let BootAdmission::Ready(response) = f.guardian.begin_boot(stop).unwrap() else {
+        panic!("stop must not need an offline job");
+    };
+    assert_eq!(delivery(response), Delivery::Applied);
+    assert!(crate::storage::attach(&f.root.join("disks/system.ext4")).is_ok());
+    retire(f);
+}
+
+#[test]
+fn substituted_prepared_restore_is_rejected_without_consuming_native_custody() {
+    let mut f = Fixture::new();
+    let request = restore_request(&mut f);
+    let machine = f.guardian.journal.machine_id().clone();
+    let RestoreAdmission::Queued { input, pending } =
+        f.guardian.begin_restore(machine, request).unwrap()
+    else {
+        panic!("restore must prepare off owner");
+    };
+    let mut prepared = input.execute().unwrap();
+    prepared.input.manifest_digest = bytes_digest(b"substituted-capture");
+    assert!(f.guardian.finish_restore(pending, Ok(prepared)).is_err());
+    assert!(f.guardian.effect.as_ref().unwrap().restore.is_none());
+    assert!(crate::storage::attach(&f.root.join("disks/system.ext4")).is_ok());
+    retire(f);
+}
+
 #[test]
 fn lost_native_handle_requires_original_custody_release_and_never_replays_boot() {
     let mut f = Fixture::new();
@@ -372,6 +605,7 @@ fn lost_native_handle_requires_original_custody_release_and_never_replays_boot()
             RuntimeJournal::open(&root.join("runtime"), &machine).unwrap(),
             Native {
                 root,
+                restore: None,
                 measured: None,
                 reset: false,
                 installed: 0,
@@ -823,6 +1057,7 @@ fn admitted_boot_recovers_after_owner_restart_without_any_dispatch_evidence() {
             journal,
             Native {
                 root,
+                restore: None,
                 measured: None,
                 reset: false,
                 installed: 0,

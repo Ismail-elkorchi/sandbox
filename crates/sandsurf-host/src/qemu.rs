@@ -368,8 +368,14 @@ impl QemuGuardianEffect {
                     command.configuration.resources.disk_bytes.get(),
                 )?
         };
-        let custody = crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
-            .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?;
+        let custody = if restoring.is_some() {
+            self.machine
+                .restore_custody()
+                .ok_or_else(|| bytes_digest(b"qemu-restore-custody-missing"))?
+        } else {
+            crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
+                .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?
+        };
         let (kernel, initramfs) = sandsurf_image::boot::paths(&boot_directory, &boot);
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
             .and_then(|format| format.require_qemu())
@@ -638,13 +644,11 @@ impl QemuGuardianEffect {
         }
     }
 
-    fn stage_full_restore(
-        &mut self,
-        snapshot_id: sandsurf_protocol::SnapshotId,
-        manifest_digest: Digest,
-        system_disk: SnapshotArtifact,
-        expected: sandsurf_protocol::FullSnapshotMetadata,
-    ) -> ControlResult<NativeSnapshotResponse> {
+    fn prepare_full_restore(
+        &self,
+        mut input: crate::restore_preparation::RestorePreparation,
+    ) -> ControlResult<crate::restore_preparation::RestorePreparation> {
+        let expected = &input.expected;
         let configuration_digest = qemu_configuration_digest(&self.config)
             .map_err(|_| ControlError::Protocol("restore configuration digest failed"))?;
         if expected.engine != native_engine()
@@ -657,42 +661,32 @@ impl QemuGuardianEffect {
                 "full snapshot is incompatible with this Qemu VM configuration",
             ));
         }
-        let directory = self
-            .machine_root
-            .join("snapshots")
-            .join(object_name(snapshot_id.as_str()));
-        let _snapshot_custody =
-            crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
-                .map_err(|_| {
-                    ControlError::Unsupported("full snapshot inputs are retired or unavailable")
-                })?;
-        for (name, artifact) in [
-            ("system.ext4", &system_disk),
-            ("snapshot.vmstate", &expected.snapshot_state),
-            ("reconnect.json", &expected.reconnect_state),
-        ] {
-            let actual = crate::snapshots::file_digest(&directory.join(name), artifact.bytes.get())
-                .map_err(|_| ControlError::Protocol("full snapshot artifact is corrupt"))?;
-            if actual != artifact.digest {
-                return Err(ControlError::Protocol(
-                    "full snapshot artifact digest mismatch",
-                ));
-            }
-        }
-        if crate::snapshots::file_digest(
-            &self.machine_root.join("disks/system.ext4"),
-            system_disk.bytes.get(),
-        )
-        .map_err(|_| ControlError::Protocol("restore disk is unavailable"))?
-            != system_disk.digest
-        {
-            return Err(ControlError::Unsupported(
-                "mutable disks no longer match the suspended full snapshot",
+        input.machine_root = self.machine_root.clone();
+        Ok(input)
+    }
+
+    fn install_full_restore(
+        &mut self,
+        prepared: crate::restore_preparation::PreparedRestore,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        if self.prepare_full_restore(prepared.input.clone())? != prepared.input {
+            return Err(ControlError::Protocol(
+                "prepared restore native binding changed",
             ));
         }
-        let reconnect: ReconnectState =
-            read_json(&directory.join("reconnect.json"), 1024 * 1024)
-                .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
+        let preparation_digest = prepared.input.binding()?;
+        let response = prepared.input.evidence()?;
+        let staged_state = prepared.staged_state.ok_or(ControlError::Protocol(
+            "prepared restore has no native state copy",
+        ))?;
+        let crate::restore_preparation::RestorePreparation {
+            snapshot_id,
+            manifest_digest,
+            expected,
+            ..
+        } = prepared.input;
+        let reconnect: ReconnectState = serde_json::from_slice(&prepared.reconnect)
+            .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
         if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
                 "restore reconnect identity does not match snapshot",
@@ -703,45 +697,26 @@ impl QemuGuardianEffect {
                 "full memory forks are unsupported",
             ));
         }
-        let restore_root = self.machine_root.join("guardian/restores");
-        crate::snapshots::private_directory(&restore_root)
-            .map_err(|_| ControlError::Protocol("restore staging root is not private"))?;
-        let staged_state = restore_root.join(format!("{}.vmstate", manifest_digest.as_str()));
-        crate::snapshots::copy_and_verify(
-            &directory.join("snapshot.vmstate"),
-            &staged_state,
-            expected.snapshot_state.bytes.get(),
-            Some(&expected.snapshot_state.digest),
-        )
-        .map_err(|_| ControlError::Protocol("saved machine state could not be staged"))?;
-        self.machine
-            .stage_restore(QemuRestoreSource {
-                saved_state: staged_state.clone(),
-                manifest_digest: manifest_digest.clone(),
-            })
-            .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
         crate::restore::stage(&self.machine_root, manifest_digest.clone(), || {
             Ok(RestoreLineage {
                 executions: expected.executions.clone(),
                 snapshot_id: snapshot_id.clone(),
                 source: reconnect,
-                staged_state,
+                staged_state: staged_state.clone(),
                 generation_seed: random_bytes()
                     .map_err(|_| ControlError::Protocol("restore entropy unavailable"))?,
             })
         })?;
-        Ok(NativeSnapshotResponse::Complete {
-            evidence: digest(
-                Domain::Snapshot,
-                &(
-                    "sandsurf-qemu-restore-staged-v1",
-                    snapshot_id,
-                    manifest_digest,
-                    expected.generation,
-                ),
-            )
-            .map_err(|_| ControlError::Protocol("restore stage evidence digest failed"))?,
-        })
+        self.machine
+            .stage_restore(QemuRestoreSource {
+                preparation_digest,
+                saved_state: staged_state,
+                manifest_digest,
+                disk_custody: prepared.disk_custody,
+                snapshot_custody: prepared.snapshot_custody,
+            })
+            .map_err(|_| ControlError::Unsupported("native restore stage conflicts"))?;
+        Ok(response)
     }
 
     fn record_installed_runtime(
@@ -849,6 +824,30 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for QemuGuardianEffect {
+    fn staged_restore_binding(&self) -> Option<&Digest> {
+        self.machine.staged_restore_binding()
+    }
+    fn restore_preparation(
+        &self,
+        snapshot_id: sandsurf_protocol::SnapshotId,
+        manifest_digest: Digest,
+        system_disk: sandsurf_protocol::SnapshotArtifact,
+        expected: sandsurf_protocol::FullSnapshotMetadata,
+    ) -> ControlResult<crate::restore_preparation::RestorePreparation> {
+        self.prepare_full_restore(crate::restore_preparation::RestorePreparation {
+            machine_root: self.machine_root.clone(),
+            snapshot_id,
+            manifest_digest,
+            system_disk,
+            expected,
+        })
+    }
+    fn install_prepared_restore(
+        &mut self,
+        prepared: crate::restore_preparation::PreparedRestore,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        self.install_full_restore(prepared)
+    }
     fn boot_preparation(
         &self,
         command: &LifecycleCommand,
@@ -923,6 +922,11 @@ impl GuardianEffect for QemuGuardianEffect {
             && current.is_none_or(|value| {
                 matches!(value.state, MachineState::Stopped | MachineState::Failed)
             });
+        if cold_boot && crate::restore::complete(&self.machine_root).is_err() {
+            return MachineOutcome::NotApplied(bytes_digest(
+                b"cold-boot-could-not-retire-restore-integration",
+            ));
+        }
         let restoring = command.desired == sandsurf_protocol::DesiredState::Running
             && current.is_some_and(|value| value.state == MachineState::Suspended);
         if cold_boot {
@@ -1013,6 +1017,11 @@ impl GuardianEffect for QemuGuardianEffect {
                 *active = None;
             }
             self.stop_data_planes();
+        }
+        if matches!(&outcome, MachineOutcome::Observed(values) if values.last().is_some_and(|value| matches!(value.state, MachineState::Stopped | MachineState::Destroyed)))
+            && crate::restore::complete(&self.machine_root).is_err()
+        {
+            return MachineOutcome::Unknown;
         }
         if matches!(
             &outcome,
@@ -1324,12 +1333,9 @@ impl GuardianEffect for QemuGuardianEffect {
                     .map_err(|_| ControlError::Protocol("suspend evidence digest failed"))?,
                 })
             }
-            NativeSnapshotRequest::StageRestore {
-                snapshot_id,
-                manifest_digest,
-                system_disk,
-                expected,
-            } => self.stage_full_restore(snapshot_id, manifest_digest, system_disk, *expected),
+            NativeSnapshotRequest::StageRestore { .. } => Err(ControlError::Protocol(
+                "full restore requires detached preparation",
+            )),
         }
     }
 

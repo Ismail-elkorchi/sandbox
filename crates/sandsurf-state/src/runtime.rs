@@ -158,6 +158,16 @@ impl DispatchPermit<'_> {
 }
 
 impl RuntimeJournal {
+    /// Accepted signed host revision, independently of applied native facts.
+    /// Offline completions must not reinstall inputs after newer authority.
+    pub fn accepted_revision(&self) -> Result<Counter> {
+        let accepted: u64 = self.db.connection.query_row(
+            "SELECT accepted_revision FROM configuration WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(accepted.try_into()?)
+    }
     pub fn create(
         path: &Path,
         machine: MachineId,

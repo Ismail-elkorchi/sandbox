@@ -106,8 +106,11 @@ mod native {
     }
 
     pub struct QemuRestoreSource {
+        pub preparation_digest: Digest,
         pub saved_state: PathBuf,
         pub manifest_digest: Digest,
+        pub disk_custody: Arc<File>,
+        pub snapshot_custody: Arc<File>,
     }
 
     pub struct QemuDriver {
@@ -310,6 +313,16 @@ mod native {
             }
             self.restore = Some(source);
             Ok(())
+        }
+        pub fn restore_custody(&self) -> Option<Arc<File>> {
+            self.restore
+                .as_ref()
+                .map(|source| Arc::clone(&source.disk_custody))
+        }
+        pub fn staged_restore_binding(&self) -> Option<&Digest> {
+            self.restore
+                .as_ref()
+                .map(|source| &source.preparation_digest)
         }
         pub fn contain_unobserved(&mut self) {
             if let Some(owner) = &mut self.owner
@@ -553,6 +566,7 @@ mod native {
                 return MachineOutcome::Unknown;
             }
             self.owner.take();
+            self.restore.take();
             self.pending_custody.take();
             self.reset = None;
             observed(

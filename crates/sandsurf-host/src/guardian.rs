@@ -94,8 +94,31 @@ use crate::guest_worker::{ExecutionHint, GuestJob, GuestJobResult};
 pub use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 
 pub use crate::boot_preparation::{BootPreparation, PreparedBoot};
+pub use crate::restore_preparation::{PreparedRestore, RestorePreparation};
 
 pub trait GuardianEffect {
+    fn staged_restore_binding(&self) -> Option<&Digest> {
+        None
+    }
+    fn restore_preparation(
+        &self,
+        _snapshot_id: SnapshotId,
+        _manifest_digest: Digest,
+        _system_disk: SnapshotArtifact,
+        _expected: FullSnapshotMetadata,
+    ) -> Result<RestorePreparation> {
+        Err(Error::Unsupported(
+            "native full-state restore is unavailable",
+        ))
+    }
+    fn install_prepared_restore(
+        &mut self,
+        _prepared: PreparedRestore,
+    ) -> Result<NativeSnapshotResponse> {
+        Err(Error::Unsupported(
+            "native full-state restore is unavailable",
+        ))
+    }
     fn boot_preparation(
         &self,
         _command: &LifecycleCommand,
@@ -291,7 +314,7 @@ pub struct Guardian<E> {
     console: crate::console::ConsoleStore,
     // Scheduling only. Durable operation admission and the authority fence
     // decide whether a completed offline job can ever start virtual hardware.
-    boot_in_flight: bool,
+    offline_in_flight: bool,
     reset_pending: Option<MachineObservation>,
 }
 
@@ -306,6 +329,19 @@ enum BootAdmission {
 enum BootPending {
     Lifecycle(Box<AuthorizedLifecycle>),
     Reset(MachineObservation),
+}
+
+struct RestorePending {
+    observation: MachineObservation,
+    accepted_revision: Counter,
+    input: RestorePreparation,
+}
+enum RestoreAdmission {
+    Ready(GuardianResponse),
+    Queued {
+        input: RestorePreparation,
+        pending: Box<RestorePending>,
+    },
 }
 
 enum GuestAdmission {
@@ -337,6 +373,109 @@ fn rejected(error: Error) -> GuardianResponse {
 }
 
 impl<E: GuardianEffect> Guardian<E> {
+    fn begin_restore(
+        &mut self,
+        machine_id: MachineId,
+        request: NativeSnapshotRequest,
+    ) -> Result<RestoreAdmission> {
+        if &machine_id != self.journal.machine_id() {
+            return Err(Error::Protocol("guardian machine identity mismatch"));
+        }
+        if self.offline_in_flight {
+            return Err(Error::Rejected {
+                category: "capacity".into(),
+                message: "offline preparation is already in flight".into(),
+            });
+        }
+        self.refresh_native_observation()?;
+        let observation = self
+            .journal
+            .last_observation()?
+            .ok_or(Error::Protocol("restore has no native machine observation"))?
+            .value()
+            .clone();
+        if observation.state != MachineState::Suspended {
+            return Err(Error::Protocol(
+                "full restore requires a suspended native computer",
+            ));
+        }
+        let accepted_revision = self.journal.accepted_revision()?;
+        if accepted_revision != observation.applied_revision {
+            return Err(Error::Protocol(
+                "full restore requires all accepted host authority to be applied",
+            ));
+        }
+        let NativeSnapshotRequest::StageRestore {
+            snapshot_id,
+            manifest_digest,
+            system_disk,
+            expected,
+        } = request
+        else {
+            return Err(Error::Protocol(
+                "offline restore requires a full-state input",
+            ));
+        };
+        let input = self
+            .effect
+            .as_ref()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?
+            .restore_preparation(snapshot_id, manifest_digest, system_disk, *expected)?;
+        if let Some(binding) = self
+            .effect
+            .as_ref()
+            .and_then(GuardianEffect::staged_restore_binding)
+        {
+            if binding != &input.binding()? {
+                return Err(Error::Protocol(
+                    "another prepared restore owns native custody",
+                ));
+            }
+            return Ok(RestoreAdmission::Ready(GuardianResponse::NativeSnapshot {
+                response: input.evidence()?,
+            }));
+        }
+        let pending = Box::new(RestorePending {
+            observation,
+            accepted_revision,
+            input: input.clone(),
+        });
+        self.offline_in_flight = true;
+        Ok(RestoreAdmission::Queued { input, pending })
+    }
+
+    fn finish_restore(
+        &mut self,
+        pending: Box<RestorePending>,
+        result: Result<PreparedRestore>,
+    ) -> Result<GuardianResponse> {
+        self.offline_in_flight = false;
+        self.refresh_native_observation()?;
+        if self.journal.accepted_revision()? != pending.accepted_revision
+            || self
+                .journal
+                .last_observation()?
+                .as_ref()
+                .map(|value| value.value())
+                != Some(&pending.observation)
+        {
+            return Err(Error::Protocol(
+                "offline restore was superseded by native state or host authority",
+            ));
+        }
+        let prepared = result?;
+        if prepared.input != pending.input {
+            return Err(Error::Protocol(
+                "offline restore completion binding changed",
+            ));
+        }
+        let response = self
+            .effect
+            .as_mut()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?
+            .install_prepared_restore(prepared)?;
+        Ok(GuardianResponse::NativeSnapshot { response })
+    }
     pub fn new(journal: RuntimeJournal, effect: E) -> Self {
         let console = crate::console::ConsoleStore::new(journal.retention_root());
         Self {
@@ -345,7 +484,7 @@ impl<E: GuardianEffect> Guardian<E> {
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
             console,
-            boot_in_flight: false,
+            offline_in_flight: false,
             reset_pending: None,
         }
     }
@@ -366,7 +505,7 @@ impl<E: GuardianEffect> Guardian<E> {
             management_seen: None,
             execution_seen: std::collections::BTreeMap::new(),
             console,
-            boot_in_flight: false,
+            offline_in_flight: false,
             reset_pending: None,
         })
     }
@@ -691,7 +830,7 @@ impl<E: GuardianEffect> Guardian<E> {
     /// A destroyed VM no longer needs a resident owner. Its journal remains
     /// durable and can be reopened if the host later reads historical evidence.
     pub fn can_retire(&mut self) -> Result<bool> {
-        Ok(!self.boot_in_flight
+        Ok(!self.offline_in_flight
             && self.reset_pending.is_none()
             && self
                 .journal
@@ -860,7 +999,7 @@ impl<E: GuardianEffect> Guardian<E> {
         let Some(input) = input else {
             return Ok(BootAdmission::Ready(self.transition(authorization, None)?));
         };
-        if self.boot_in_flight {
+        if self.offline_in_flight {
             // An exact retry observes admission; it is not a second worker.
             // A later host revision is already fenced and may be retried once
             // the physical disk worker releases its custody.
@@ -868,7 +1007,7 @@ impl<E: GuardianEffect> Guardian<E> {
                 operation,
             }));
         }
-        self.boot_in_flight = true;
+        self.offline_in_flight = true;
         Ok(BootAdmission::Queued {
             input,
             pending: BootPending::Lifecycle(Box::new(authorization)),
@@ -876,7 +1015,7 @@ impl<E: GuardianEffect> Guardian<E> {
     }
 
     fn begin_reset_boot(&mut self) -> Result<Option<(BootPreparation, BootPending)>> {
-        if self.boot_in_flight {
+        if self.offline_in_flight {
             return Ok(None);
         }
         let Some(starting) = self.reset_pending.clone() else {
@@ -896,7 +1035,7 @@ impl<E: GuardianEffect> Guardian<E> {
             self.complete_reset(starting, None)?;
             return Ok(None);
         };
-        self.boot_in_flight = true;
+        self.offline_in_flight = true;
         Ok(Some((input, BootPending::Reset(starting))))
     }
 
@@ -905,7 +1044,7 @@ impl<E: GuardianEffect> Guardian<E> {
         pending: BootPending,
         result: Result<PreparedBoot>,
     ) -> Result<Option<GuardianResponse>> {
-        self.boot_in_flight = false;
+        self.offline_in_flight = false;
         match pending {
             BootPending::Lifecycle(authorization) => {
                 let command = authorization.statement.command.clone();
@@ -1276,6 +1415,11 @@ impl<E: GuardianEffect> Guardian<E> {
                     return Err(Error::Protocol("guardian machine identity mismatch"));
                 }
                 match &request {
+                    NativeSnapshotRequest::StageRestore { .. } => {
+                        return Err(Error::Protocol(
+                            "full restore must use detached preparation",
+                        ));
+                    }
                     NativeSnapshotRequest::PrepareDisk {
                         expected_generation,
                         expected_revision,
@@ -2041,28 +2185,47 @@ pub fn serve_guardian<E: GuardianEffect>(
     let events = Arc::clone(&guardian.console.notifications);
     events.publish(guardian.journal.event_cursor()?);
     let (sender, receiver) = mpsc::sync_channel::<GuardianIngress>(MAX_GUARDIAN_CONNECTIONS);
-    let (boot_jobs, boot_queue) = mpsc::sync_channel::<BootWorkItem>(1);
+    let (boot_jobs, boot_queue) = mpsc::sync_channel::<OfflineWorkItem>(1);
     let boot_completions = sender.clone();
     let boot_worker = std::thread::Builder::new()
-        .name("sandsurf-offline-boot".into())
+        .name("sandsurf-offline-native".into())
         .spawn(move || {
-            while let Ok(BootWorkItem {
-                input,
-                pending,
-                reply,
-            }) = boot_queue.recv()
-            {
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| input.execute()))
-                        .unwrap_or_else(|_| Err(Error::Protocol("offline boot worker panicked")));
-                if boot_completions
-                    .send(GuardianIngress::BootComplete {
+            while let Ok(item) = boot_queue.recv() {
+                let completion = match item {
+                    OfflineWorkItem::Boot(BootWorkItem {
+                        input,
                         pending,
-                        result,
                         reply,
-                    })
-                    .is_err()
-                {
+                    }) => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            input.execute()
+                        }))
+                        .unwrap_or_else(|_| Err(Error::Protocol("offline boot worker panicked")));
+                        GuardianIngress::BootComplete {
+                            pending,
+                            result,
+                            reply,
+                        }
+                    }
+                    OfflineWorkItem::Restore {
+                        input,
+                        pending,
+                        reply,
+                    } => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            input.execute()
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(Error::Protocol("offline restore worker panicked"))
+                        });
+                        GuardianIngress::RestoreComplete {
+                            pending,
+                            result,
+                            reply,
+                        }
+                    }
+                };
+                if boot_completions.send(completion).is_err() {
                     break;
                 }
             }
@@ -2244,6 +2407,52 @@ pub fn serve_guardian<E: GuardianEffect>(
                 Ok(GuardianIngress::Request { parsed, reply }) => {
                     last_request = std::time::Instant::now();
                     let response = match *parsed {
+                        Ok(GuardianRequest::NativeSnapshot {
+                            machine_id,
+                            request: request @ NativeSnapshotRequest::StageRestore { .. },
+                        }) => {
+                            if outstanding_guest_jobs + usize::from(guardian.offline_in_flight)
+                                >= inflight_limit
+                            {
+                                let _ = reply.send(rejected(Error::Rejected {
+                                    category: "capacity".into(),
+                                    message: "host in-flight resource budget exhausted".into(),
+                                }));
+                                continue;
+                            }
+                            match guardian.begin_restore(machine_id, request) {
+                                Ok(RestoreAdmission::Ready(response)) => response,
+                                Ok(RestoreAdmission::Queued { input, pending }) => {
+                                    if let Err(error) =
+                                        boot_jobs.try_send(OfflineWorkItem::Restore {
+                                            input,
+                                            pending,
+                                            reply: reply.clone(),
+                                        })
+                                    {
+                                        let item = match error {
+                                            mpsc::TrySendError::Full(item)
+                                            | mpsc::TrySendError::Disconnected(item) => item,
+                                        };
+                                        let OfflineWorkItem::Restore { pending, reply, .. } = item
+                                        else {
+                                            unreachable!()
+                                        };
+                                        let response = guardian
+                                            .finish_restore(
+                                                pending,
+                                                Err(Error::Unsupported(
+                                                    "offline restore queue is unavailable",
+                                                )),
+                                            )
+                                            .unwrap_or_else(rejected);
+                                        let _ = reply.send(response);
+                                    }
+                                    continue;
+                                }
+                                Err(error) => rejected(error),
+                            }
+                        }
                         Ok(GuardianRequest::Transition { authorization }) => {
                             match guardian.begin_boot(authorization) {
                                 Ok(BootAdmission::Ready(response)) => response,
@@ -2283,7 +2492,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                                     | GuardianRequest::Guest { .. }
                             ) =>
                         {
-                            if outstanding_guest_jobs + usize::from(guardian.boot_in_flight)
+                            if outstanding_guest_jobs + usize::from(guardian.offline_in_flight)
                                 >= inflight_limit
                             {
                                 let _ = reply.send(rejected(Error::Rejected {
@@ -2340,7 +2549,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                             ..
                         }) if resources.channels.get() < active.load(Ordering::Acquire) as u64
                             || resources.inflight_requests.get()
-                                < (outstanding_guest_jobs + usize::from(guardian.boot_in_flight))
+                                < (outstanding_guest_jobs + usize::from(guardian.offline_in_flight))
                                     as u64 =>
                         {
                             rejected(Error::Rejected {
@@ -2364,7 +2573,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                                 usage.inflight_requests_current = Some(
                                     Counter::try_from(
                                         (outstanding_guest_jobs
-                                            + usize::from(guardian.boot_in_flight))
+                                            + usize::from(guardian.offline_in_flight))
                                             as u64,
                                     )
                                     .map_err(|_| Error::Protocol("request accounting overflow"))?,
@@ -2425,6 +2634,16 @@ pub fn serve_guardian<E: GuardianEffect>(
                         }
                     }
                 },
+                Ok(GuardianIngress::RestoreComplete {
+                    pending,
+                    result,
+                    reply,
+                }) => {
+                    let response = guardian
+                        .finish_restore(pending, result)
+                        .unwrap_or_else(rejected);
+                    let _ = reply.send(response);
+                }
                 Ok(GuardianIngress::Failed(error)) => break Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if outstanding_guest_jobs == 0
@@ -2456,7 +2675,7 @@ pub fn serve_guardian<E: GuardianEffect>(
                 guardian.refresh_native_observation()?;
                 guardian.reconcile_execution_integration();
                 if !poll_in_flight
-                    && outstanding_guest_jobs + usize::from(guardian.boot_in_flight)
+                    && outstanding_guest_jobs + usize::from(guardian.offline_in_flight)
                         < inflight_limit
                     && let Some(job) = guardian.poll_job()?
                     && guest_jobs
@@ -2509,6 +2728,11 @@ enum GuardianIngress {
         result: Result<PreparedBoot>,
         reply: Option<mpsc::Sender<GuardianResponse>>,
     },
+    RestoreComplete {
+        pending: Box<RestorePending>,
+        result: Result<PreparedRestore>,
+        reply: mpsc::Sender<GuardianResponse>,
+    },
     Failed(std::io::Error),
 }
 
@@ -2520,14 +2744,27 @@ struct BootWorkItem {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+enum OfflineWorkItem {
+    Boot(BootWorkItem),
+    Restore {
+        input: RestorePreparation,
+        pending: Box<RestorePending>,
+        reply: mpsc::Sender<GuardianResponse>,
+    },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn queue_boot<E: GuardianEffect>(
     guardian: &mut Guardian<E>,
-    queue: &mpsc::SyncSender<BootWorkItem>,
+    queue: &mpsc::SyncSender<OfflineWorkItem>,
     item: BootWorkItem,
 ) -> Result<()> {
-    if let Err(error) = queue.try_send(item) {
+    if let Err(error) = queue.try_send(OfflineWorkItem::Boot(item)) {
         let item = match error {
             mpsc::TrySendError::Full(item) | mpsc::TrySendError::Disconnected(item) => item,
+        };
+        let OfflineWorkItem::Boot(item) = item else {
+            unreachable!()
         };
         let response = guardian.finish_boot(
             item.pending,

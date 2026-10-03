@@ -25,6 +25,7 @@ pub struct FirecrackerQualification {
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerRestoreSource {
+    pub preparation_digest: Digest,
     pub snapshot_id: SnapshotId,
     pub capture_operation_id: OperationId,
     pub source_machine_id: MachineId,
@@ -33,6 +34,8 @@ pub struct FirecrackerRestoreSource {
     pub snapshot_state: std::path::PathBuf,
     pub snapshot_memory: std::path::PathBuf,
     pub reconnect_state: std::path::PathBuf,
+    pub disk_custody: std::sync::Arc<std::fs::File>,
+    pub snapshot_custody: std::sync::Arc<std::fs::File>,
 }
 
 /// Supplies a verified native boot configuration and binds the optional guest
@@ -185,6 +188,7 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         if !self.identity_matches(command) {
             return Self::unavailable(b"firecracker-machine-identity-mismatch");
         }
+        self.staged_restore = None;
         let generation = current.map_or(Counter::ONE, |value| value.generation);
         if self.process.is_none() {
             return if current.is_none_or(|value| {
@@ -322,6 +326,11 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         }
         self.staged_restore = Some(source);
         Ok(())
+    }
+    pub fn staged_restore_binding(&self) -> Option<&Digest> {
+        self.staged_restore
+            .as_ref()
+            .map(|source| &source.preparation_digest)
     }
 
     pub fn resume_after_capture(&mut self) -> Result<(), Digest> {
