@@ -715,8 +715,11 @@ fn text_argument(values: &[std::ffi::OsString], name: &str) -> Result<String, &'
 mod windows_service {
     use super::*;
     use std::ptr::{null, null_mut};
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::NO_ERROR;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    };
+    use windows_sys::Win32::Foundation::{ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR};
     use windows_sys::Win32::System::Services::{
         RegisterServiceCtrlHandlerW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
         SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING,
@@ -728,6 +731,7 @@ mod windows_service {
     static EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
     static SERVICE_NAME: OnceLock<Vec<u16>> = OnceLock::new();
     static STATUS: OnceLock<usize> = OnceLock::new();
+    static FAILED: AtomicBool = AtomicBool::new(false);
     #[derive(Clone, Copy)]
     pub(super) enum Role {
         Host,
@@ -776,6 +780,11 @@ mod windows_service {
         if unsafe { StartServiceCtrlDispatcherW(entries.as_ptr()) } == 0 {
             return Err(io::Error::last_os_error().into());
         }
+        if FAILED.load(Ordering::Acquire) {
+            return Err(
+                "Windows service failed; see its native service status and diagnostics".into(),
+            );
+        }
         Ok(())
     }
 
@@ -787,10 +796,10 @@ mod windows_service {
         // name is its stable NUL-terminated service name.
         let handle = unsafe { RegisterServiceCtrlHandlerW(name, Some(control_handler)) };
         if handle.is_null() || STATUS.set(handle as usize).is_err() {
+            FAILED.store(true, Ordering::Release);
             return;
         }
-        report(SERVICE_START_PENDING, 0, 10_000);
-        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
+        report(SERVICE_START_PENDING, 0, 10_000, 0);
         let directory = DIRECTORY.get().expect("service directory");
         let executable = EXECUTABLE.get().expect("service executable").clone();
         let pool = match ROLE.get().expect("service role") {
@@ -799,18 +808,23 @@ mod windows_service {
         };
         if let Err(error) = super::windows_pool(pool) {
             eprintln!("sandsurf service resource envelope: {error}");
-            report(SERVICE_STOPPED, 0, 0);
+            FAILED.store(true, Ordering::Release);
+            report(SERVICE_STOPPED, 0, 0, 1);
             return;
         }
+        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0, 0);
         let result = match ROLE.get().expect("service role") {
             Role::Host => serve_host(directory, executable),
             Role::Supervisor => {
                 sandsurf_host::supervision::serve(directory, executable).map_err(HostError::Io)
             }
         };
-        report(SERVICE_STOPPED, 0, 0);
         if let Err(error) = result {
             eprintln!("sandsurf-host service: {error}");
+            FAILED.store(true, Ordering::Release);
+            report(SERVICE_STOPPED, 0, 0, 1);
+        } else {
+            report(SERVICE_STOPPED, 0, 0, 0);
         }
     }
 
@@ -820,7 +834,7 @@ mod windows_service {
         if control != SERVICE_CONTROL_STOP {
             return;
         }
-        report(SERVICE_STOP_PENDING, 0, 10_000);
+        report(SERVICE_STOP_PENDING, 0, 10_000, 0);
         if let Some(directory) = DIRECTORY.get().cloned() {
             std::thread::spawn(move || match ROLE.get().expect("service role") {
                 Role::Host => {
@@ -836,7 +850,7 @@ mod windows_service {
         }
     }
 
-    fn report(state: u32, accepted: u32, wait_hint: u32) {
+    fn report(state: u32, accepted: u32, wait_hint: u32, failure: u32) {
         let Some(raw) = STATUS.get().copied() else {
             return;
         };
@@ -844,8 +858,12 @@ mod windows_service {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: state,
             dwControlsAccepted: accepted,
-            dwWin32ExitCode: NO_ERROR,
-            dwServiceSpecificExitCode: 0,
+            dwWin32ExitCode: if failure == 0 {
+                NO_ERROR
+            } else {
+                ERROR_SERVICE_SPECIFIC_ERROR
+            },
+            dwServiceSpecificExitCode: failure,
             dwCheckPoint: 0,
             dwWaitHint: wait_hint,
         };
