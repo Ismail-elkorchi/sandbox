@@ -1460,40 +1460,25 @@ impl HostService {
             .catalog
             .intent(&intent.operation_id)?
             .ok_or(HostError::Invalid("lifecycle admission disappeared"))?;
-        if intent.completion.is_none() && intent.desired == DesiredState::Running {
-            let config = self
-                .machine_root(&intent.machine_id)
-                .join("guardian/config.json");
-            if !config.exists() {
-                let record = self
-                    .catalog
-                    .machine(&intent.machine_id)?
-                    .ok_or(HostError::Invalid("machine bootstrap is missing"))?;
-                return Ok(HostDispatch::Task(Box::new(HostTask::MachineBootstrap {
-                    root: self.root.clone(),
-                    executable: self.executable.clone(),
-                    record: Box::new(record),
-                    intent,
-                })));
-            }
-            if let Some(fork) = self.catalog.fork(&intent.machine_id)?
-                && fork.materialized_disk.is_none()
-            {
-                let snapshot = self
-                    .catalog
-                    .snapshot(&fork.snapshot_id)?
-                    .ok_or(HostError::Invalid("fork recovery snapshot is missing"))?;
-                let provision = self.prepare_guardian_inner(&intent.machine_id)?;
-                return Ok(HostDispatch::Task(Box::new(HostTask::Fork {
-                    root: self.root.clone(),
-                    executable: self.executable.clone(),
-                    snapshot: Box::new(snapshot),
-                    record: fork,
-                    clone_profile: None,
-                    provision,
-                    continuation: intent.operation_id,
-                })));
-            }
+        if intent.completion.is_none()
+            && intent.desired == DesiredState::Running
+            && let Some(fork) = self.catalog.fork(&intent.machine_id)?
+            && fork.materialized_disk.is_none()
+        {
+            let snapshot = self
+                .catalog
+                .snapshot(&fork.snapshot_id)?
+                .ok_or(HostError::Invalid("fork recovery snapshot is missing"))?;
+            let provision = self.prepare_guardian_inner(&intent.machine_id)?;
+            return Ok(HostDispatch::Task(Box::new(HostTask::Fork {
+                root: self.root.clone(),
+                executable: self.executable.clone(),
+                snapshot: Box::new(snapshot),
+                record: fork,
+                clone_profile: None,
+                provision,
+                continuation: intent.operation_id,
+            })));
         }
         let provision = self.prepare_guardian_inner(&intent.machine_id)?;
         if intent.completion.is_none()
@@ -2150,11 +2135,6 @@ impl HostService {
             HostTaskCompletion::MachineInputs { request, result } => {
                 self.admit_machine_inputs(*request, result?)
             }
-            HostTaskCompletion::MachineBootstrap { intent, result } => {
-                let inputs = result?;
-                self.prepare_guardian_with_config(&intent.machine_id, &inputs.configuration)?;
-                self.prepare_lifecycle_intent(intent)
-            }
             HostTaskCompletion::LifecycleInspect {
                 intent,
                 provision,
@@ -2331,7 +2311,6 @@ impl HostService {
             | HostTaskCompletion::Configuration { .. }
             | HostTaskCompletion::ResourceAssessment { .. }
             | HostTaskCompletion::MachineInputs { .. }
-            | HostTaskCompletion::MachineBootstrap { .. }
             | HostTaskCompletion::LifecycleInspect { .. }
             | HostTaskCompletion::SuspendCapture { .. }
             | HostTaskCompletion::Lifecycle { .. }
@@ -2410,52 +2389,29 @@ impl HostService {
         machine: &MachineId,
         config: &NativeGuardianConfig,
     ) -> Result<GuardianProvision> {
-        let root = self.machine_root(machine);
-        prepare_directory(&root)?;
-        prepare_directory(&root.join("guardian"))?;
-        let path = root.join("guardian/config.json");
-        #[cfg(target_os = "linux")]
-        crate::linux::write_config(&path, config)?;
-        #[cfg(any(target_os = "macos", windows))]
-        crate::qemu::write_config(&path, config)?;
-        self.prepare_guardian_inner(machine)
+        let mut provision = self.prepare_guardian_inner(machine)?;
+        provision
+            .initialization
+            .as_mut()
+            .expect("catalog provisioning has inputs")
+            .configuration = Some(Box::new(config.clone()));
+        Ok(provision)
     }
 
     fn prepare_guardian_inner(&self, machine: &MachineId) -> Result<GuardianProvision> {
-        let root = self.machine_root(machine);
-        #[cfg(target_os = "linux")]
-        crate::resources::require_machine_storage(
-            &self.root,
-            machine,
-            &self
-                .catalog
-                .machine(machine)?
-                .ok_or(HostError::Invalid("machine is missing from host authority"))?
-                .runtime_configuration
-                .resources,
-        )?;
-        prepare_directory(&root)?;
-        prepare_directory(&root.join("guardian"))?;
-        prepare_directory(&root.join("disks"))?;
-        prepare_directory(&root.join("output"))?;
-        let runtime = root.join("runtime");
-        if !runtime.exists() {
-            let resources = self
-                .catalog
-                .machine(machine)?
-                .ok_or(HostError::Invalid("machine is missing from host authority"))?
-                .runtime_configuration
-                .resources;
-            RuntimeJournal::create(
-                &runtime,
-                machine.clone(),
-                runtime_limits(&resources),
-                self.catalog.authority_binding().clone(),
-            )?;
-        }
+        let record = self
+            .catalog
+            .machine(machine)?
+            .ok_or(HostError::Invalid("machine is missing from host authority"))?;
         Ok(GuardianProvision {
             host_root: self.root.clone(),
             machine: machine.clone(),
+            initialization: Some(GuardianInitialization {
+                executable: self.executable.clone(),
+                record: Box::new(record),
+                binding: self.catalog.authority_binding().clone(),
+                configuration: None,
+            }),
         })
     }
 
@@ -2617,6 +2573,7 @@ impl HostService {
         let provision = GuardianProvision {
             host_root: self.root.clone(),
             machine: snapshot.request.machine_id.clone(),
+            initialization: None,
         };
         Ok(HostDispatch::Task(Box::new(HostTask::Snapshot {
             root: self.root.clone(),
@@ -2883,6 +2840,16 @@ impl LifecycleEffect {
 struct GuardianProvision {
     host_root: PathBuf,
     machine: MachineId,
+    initialization: Option<GuardianInitialization>,
+}
+
+/// Immutable admitted inputs for filesystem materialization. This task has no
+/// catalog writer or permission to change authority/lifecycle intent.
+struct GuardianInitialization {
+    executable: PathBuf,
+    record: Box<MachineRecord>,
+    binding: AuthorityBinding,
+    configuration: Option<Box<NativeGuardianConfig>>,
 }
 
 impl GuardianProvision {
@@ -2900,6 +2867,9 @@ impl GuardianProvision {
             .join("machines")
             .join(object_name(machine.as_str()));
         let endpoint = root.join("guardian");
+        if let Some(initialization) = &self.initialization {
+            self.initialize(initialization, &root)?;
+        }
         match GuardianClient::new(endpoint.clone()).owner_identity(machine.clone()) {
             Ok(_) => return Ok(()),
             Err(crate::guardian::Error::Io(error))
@@ -2953,6 +2923,83 @@ impl GuardianProvision {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn initialize(&self, inputs: &GuardianInitialization, root: &Path) -> Result<()> {
+        let resources = &inputs.record.runtime_configuration.resources;
+        #[cfg(target_os = "linux")]
+        crate::resources::require_machine_storage(&self.host_root, &self.machine, resources)?;
+        prepare_directory(root)?;
+        // All initialization workers serialize on this exact storage object;
+        // an interrupted worker cannot leave a published partial journal.
+        let _custody = sandsurf_native::storage::disk_lease(&root.join(".initialize.lock"))?;
+        prepare_directory(&root.join("guardian"))?;
+        prepare_directory(&root.join("disks"))?;
+        prepare_directory(&root.join("output"))?;
+        let config_path = root.join("guardian/config.json");
+        match fs::symlink_metadata(&config_path) {
+            Ok(_) => {
+                // Published configuration is immutable. The native owner
+                // verifies its artifacts when attaching; never rematerialize
+                // or overwrite it from a later mutable resource envelope.
+                if let Some(config) = &inputs.configuration {
+                    write_guardian_configuration(&config_path, config)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let prepared;
+                let config = match &inputs.configuration {
+                    Some(config) => &**config,
+                    None => {
+                        prepared = verify_machine_inputs(
+                            &self.host_root,
+                            &inputs.executable,
+                            &self.machine,
+                            &inputs.record.image_digest,
+                            resources,
+                        )?;
+                        &prepared.configuration
+                    }
+                };
+                write_guardian_configuration(&config_path, config)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let runtime = root.join("runtime");
+        match fs::symlink_metadata(&runtime) {
+            Ok(_) => {
+                // Do not open a live writer merely to provision an attachment.
+                // If a native owner is present, its authenticated identity is
+                // the next step; otherwise open validates the whole journal.
+                if GuardianClient::new(self.endpoint())
+                    .owner_identity(self.machine.clone())
+                    .is_err()
+                {
+                    let journal = RuntimeJournal::open(&runtime, &self.machine)?;
+                    if journal.authority_binding() != &inputs.binding {
+                        return Err(HostError::Invalid("guardian authority binding differs"));
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                RuntimeJournal::create(
+                    &runtime,
+                    self.machine.clone(),
+                    runtime_limits(resources),
+                    inputs.binding.clone(),
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+}
+
+fn write_guardian_configuration(path: &Path, config: &NativeGuardianConfig) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    crate::linux::write_config(path, config)?;
+    #[cfg(any(target_os = "macos", windows))]
+    crate::qemu::write_config(path, config)?;
+    Ok(())
 }
 
 fn observe_machine(host_root: &Path, record: MachineRecord) -> Result<MachineView> {
@@ -3514,12 +3561,6 @@ enum HostTask {
         resources: Resources,
         update: Option<ResourceUpdateAdmission>,
     },
-    MachineBootstrap {
-        root: PathBuf,
-        executable: PathBuf,
-        record: Box<MachineRecord>,
-        intent: LifecycleIntent,
-    },
     LifecycleInspect {
         intent: LifecycleIntent,
         provision: GuardianProvision,
@@ -3635,10 +3676,6 @@ enum HostTaskCompletion {
         resources: Resources,
         update: Option<ResourceUpdateAdmission>,
         result: Result<ResourceChangeAssessment>,
-    },
-    MachineBootstrap {
-        intent: LifecycleIntent,
-        result: Result<MachineInputs>,
     },
     LifecycleInspect {
         intent: LifecycleIntent,
@@ -3864,21 +3901,6 @@ impl HostTask {
                     update,
                     result,
                 }
-            }
-            Self::MachineBootstrap {
-                root,
-                executable,
-                record,
-                intent,
-            } => {
-                let result = verify_machine_inputs(
-                    &root,
-                    &executable,
-                    &record.id,
-                    &record.image_digest,
-                    &record.runtime_configuration.resources,
-                );
-                HostTaskCompletion::MachineBootstrap { intent, result }
             }
             Self::LifecycleInspect { intent, provision } => {
                 let result = provision.execute().and_then(|()| {
@@ -4991,6 +5013,7 @@ mod tests {
             provision: GuardianProvision {
                 host_root: root.clone(),
                 machine: machine.clone(),
+                initialization: None,
             },
             record,
             result: result.map(|()| Zeroizing::new(b"secret".to_vec())),
@@ -5385,6 +5408,62 @@ mod tests {
             HostResponse::Machines { .. }
         ));
         drop(custody);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guardian_provisioning_is_a_detached_materialization_plan_and_reopens_from_authority() {
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("ssprovision-{:x}", u64::from_le_bytes(nonce)));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "computer", MachineLifetime::default());
+        let machine_root = service.machine_root(&machine);
+        let provision = service.prepare_guardian_inner(&machine).unwrap();
+        assert!(
+            !machine_root.exists(),
+            "preparation performed filesystem effects on the catalog owner"
+        );
+        let inputs = provision.initialization.as_ref().unwrap();
+        let record = service.catalog.machine(&machine).unwrap().unwrap();
+        assert_eq!(inputs.record.id, machine);
+        assert_eq!(inputs.record.image_digest, record.image_digest);
+        assert_eq!(&inputs.binding, service.catalog.authority_binding());
+        let operation = record.latest_intent.operation_id;
+        drop(provision);
+        drop(service); // admitted identity survives a host restart before any effects
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let intent = service.catalog.intent(&operation).unwrap().unwrap();
+        let HostDispatch::Task(task) = service.prepare_lifecycle_intent(intent).unwrap() else {
+            panic!("recovery must enqueue admitted initialization, not run it inline");
+        };
+        assert!(
+            matches!(&*task, HostTask::LifecycleInspect { provision, .. }
+            if provision.initialization.is_some())
+        );
+        assert!(!machine_root.exists());
+        let completion = task.execute();
+        // The fixture has no image/native storage. Its refusal belongs to the
+        // worker and cannot fabricate native completion or remove admission.
+        assert!(service.complete_task(completion).is_err());
+        assert!(
+            service
+                .catalog
+                .intent(&operation)
+                .unwrap()
+                .unwrap()
+                .completion
+                .is_none()
+        );
+        assert!(matches!(
+            service.handle(HostRequest::ListImages {
+                after: None,
+                maximum: Counter::ONE
+            }),
+            HostResponse::Images { .. }
+        ));
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }
@@ -5848,7 +5927,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.len(), 1);
         assert!(matches!(&second[0].1, HostDispatch::Task(task) if matches!(
-            &**task, HostTask::MachineBootstrap { .. }
+            &**task, HostTask::LifecycleInspect { .. }
         )));
         drop(service);
         fs::remove_dir_all(root).unwrap();

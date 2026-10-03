@@ -164,6 +164,83 @@ impl RuntimeJournal {
         limits: RuntimeLimits,
         binding: AuthorityBinding,
     ) -> Result<Self> {
+        let machine_for_open = machine.clone();
+        Self::publish_initialization(path, |stage| {
+            let journal = Self::create_unpublished(stage, machine, limits, binding)?;
+            // Finish and close SQLite before changing its pathname. A live WAL
+            // connection must never retain paths in the unpublished directory.
+            journal
+                .db
+                .connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            drop(journal);
+            crate::database::sync_file(&crate::database::private_file(
+                &stage.join("authority.sqlite"),
+                false,
+            )?)?;
+            crate::database::sync_directory(&stage.join("output"))?;
+            crate::database::sync_directory(stage)?;
+            Ok(())
+        })?;
+        Self::open(path, &machine_for_open)
+    }
+
+    /// Publish only a complete journal. The exact hidden stage is disposable
+    /// solely under its crash-released initialization custody; an existing
+    /// published journal, even corrupt, is never replaced or repaired.
+    fn publish_initialization(
+        path: &Path,
+        initialize: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let parent = path
+            .parent()
+            .filter(|_| path.is_absolute())
+            .ok_or(Error::Conflict(
+                "journal initialization needs an absolute parent",
+            ))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::Conflict(
+                "journal initialization needs an ordinary name",
+            ))?;
+        sandsurf_native::local::canonical_private_directory(parent)?;
+        let identity = sandsurf_native::storage::object_name(name);
+        let _custody = sandsurf_native::storage::disk_lease(
+            &parent.join(format!(".{identity}.initialize.lock")),
+        )?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "published journal already exists",
+                )
+                .into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let stage = parent.join(format!(".{identity}.initialize.pending"));
+        match std::fs::symlink_metadata(&stage) {
+            Ok(_) => {
+                sandsurf_native::local::canonical_private_directory(&stage)?;
+                std::fs::remove_dir_all(&stage)?;
+                crate::database::sync_directory(parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        initialize(&stage)?;
+        sandsurf_native::storage::publish_new_directory(&stage, path)?;
+        Ok(())
+    }
+
+    fn create_unpublished(
+        path: &Path,
+        machine: MachineId,
+        limits: RuntimeLimits,
+        binding: AuthorityBinding,
+    ) -> Result<Self> {
         if [
             limits.identities,
             limits.managed_executions,
@@ -2952,4 +3029,136 @@ fn require_execution_target(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::*;
+    use crate::{CatalogLimits, HostCatalog};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    struct Root(std::path::PathBuf);
+    impl Root {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ss-runtime-init-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            sandsurf_native::local::create_private_directory(&path).unwrap();
+            Self(path)
+        }
+        fn binding(&self) -> AuthorityBinding {
+            HostCatalog::create(
+                &self.0.join("catalog"),
+                "host".try_into().unwrap(),
+                CatalogLimits {
+                    identities: Counter::ONE,
+                    operations: Counter::ONE,
+                    usage_records: Counter::ONE,
+                    image_bytes: Counter::ONE,
+                    cpu_quota_micros: Counter::ONE,
+                    host_memory_bytes: Counter::ONE,
+                },
+            )
+            .unwrap()
+            .authority_binding()
+            .clone()
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn limits() -> RuntimeLimits {
+        RuntimeLimits {
+            identities: Counter::ONE,
+            managed_executions: Counter::ONE,
+            operations: Counter::ONE,
+            observations: Counter::ONE,
+            events: Counter::ONE,
+            chunks: Counter::ONE,
+            output_segments: Counter::ONE,
+            output_bytes: Counter::ONE,
+        }
+    }
+
+    #[test]
+    fn interrupted_initialization_never_publishes_partial_state_and_retries_only_its_stage() {
+        for phase in 0..3 {
+            let root = Root::new();
+            let binding = root.binding();
+            let machine: MachineId = "computer".try_into().unwrap();
+            let path = root.0.join("runtime");
+            let foreign = root.0.join("unrelated.pending");
+            sandsurf_native::local::create_private_directory(&foreign).unwrap();
+            let result = RuntimeJournal::publish_initialization(&path, |stage| {
+                if phase < 2 {
+                    let db = Database::create(stage, "guardian", SCHEMA)?;
+                    if phase == 1 {
+                        crate::output_store::create(&db.root)?;
+                    }
+                    drop(db);
+                } else {
+                    drop(RuntimeJournal::create_unpublished(
+                        stage,
+                        machine.clone(),
+                        limits(),
+                        binding.clone(),
+                    )?);
+                }
+                Err(Error::Conflict("interrupted initialization"))
+            });
+            assert!(result.is_err());
+            assert!(!path.exists(), "phase {phase} published partial state");
+            let journal =
+                RuntimeJournal::create(&path, machine.clone(), limits(), binding.clone()).unwrap();
+            assert_eq!(journal.machine_id(), &machine);
+            assert_eq!(journal.authority_binding(), &binding);
+            assert!(foreign.exists());
+            drop(journal);
+            let reopened = RuntimeJournal::open(&path, &machine).unwrap();
+            assert!(reopened.events(Counter::ZERO, 1).is_ok());
+        }
+    }
+
+    #[test]
+    fn initialization_has_one_crash_released_custodian_and_never_replaces_a_published_object() {
+        let root = Root::new();
+        let binding = root.binding();
+        let machine: MachineId = "computer".try_into().unwrap();
+        let path = root.0.join("runtime");
+        let custody = sandsurf_native::storage::disk_lease(&root.0.join(format!(
+            ".{}.initialize.lock",
+            sandsurf_native::storage::object_name("runtime"),
+        )))
+        .unwrap();
+        assert!(RuntimeJournal::create(&path, machine.clone(), limits(), binding.clone()).is_err());
+        assert!(!path.exists());
+        drop(custody);
+        let journal =
+            RuntimeJournal::create(&path, machine.clone(), limits(), binding.clone()).unwrap();
+        assert!(
+            matches!(RuntimeJournal::create(&path, machine.clone(), limits(), binding.clone()),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        drop(journal);
+        // A corrupt published identity is diagnostic evidence, not an
+        // interrupted hidden stage and not permission to silently reconstruct.
+        std::fs::remove_file(path.join("authority.sqlite")).unwrap();
+        sandsurf_native::local::create_private_file(&path.join("authority.sqlite")).unwrap();
+        assert!(
+            matches!(RuntimeJournal::create(&path, machine.clone(), limits(), binding),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            std::fs::metadata(path.join("authority.sqlite"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(RuntimeJournal::open(&path, &machine).is_err());
+    }
 }
