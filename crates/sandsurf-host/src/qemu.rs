@@ -521,30 +521,21 @@ impl QemuGuardianEffect {
         self.guest_transport.release_capture()
     }
 
-    fn prepare_full_capture(
+    fn begin_full_capture(
         &mut self,
         snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeSnapshotResponse> {
-        let result = self.prepare_full_capture_inner(snapshot_id, operation_id.clone(), journal);
-        if result.is_err()
-            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
-                .is_some()
-        {
-            self.finish_native_capture(journal)?;
-            crate::capture::remove_full(&self.machine_root, &operation_id)?;
+    ) -> ControlResult<crate::capture_preparation::CaptureAdmission> {
+        if matches!(
+            sandsurf_machine::qemu_driver::full_state_capability(),
+            sandsurf_protocol::Capability::Unsupported { .. }
+        ) {
+            return Err(ControlError::Unsupported(
+                "native WHPX full-state transfer is unavailable",
+            ));
         }
-        result
-    }
-
-    fn prepare_full_capture_inner(
-        &mut self,
-        snapshot_id: sandsurf_protocol::SnapshotId,
-        operation_id: sandsurf_protocol::OperationId,
-        journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeSnapshotResponse> {
-        let _snapshot_custody =
+        let custody =
             crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
                 .map_err(|_| {
                     ControlError::Unsupported("full snapshot storage is retired or unavailable")
@@ -552,106 +543,61 @@ impl QemuGuardianEffect {
         self.prepare_capture_boundary(operation_id.clone(), journal)?;
         let directory = qemu_full_capture_directory(&self.machine_root, &operation_id);
         if directory.join("capture.json").exists() {
-            let capture = read_json(&directory.join("capture.json"), 1024 * 1024)
-                .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeSnapshotResponse::Prepared { capture });
+            return Ok(crate::capture_preparation::CaptureAdmission::Ready(
+                Box::new(
+                    read_json(&directory.join("capture.json"), 1024 * 1024)
+                        .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?,
+                ),
+            ));
         }
         crate::capture::reset_unpublished_full(&self.machine_root, &operation_id)?;
+        crate::snapshots::private_directory(
+            directory
+                .parent()
+                .ok_or(ControlError::Protocol("capture has no parent"))?,
+        )?;
+        crate::snapshots::private_directory(&directory)?;
         let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
             .ok_or(ControlError::Protocol(
                 "full capture has no native boundary",
             ))?;
+        let active = self.management_binding().ok_or(ControlError::Unsupported(
+            "guest reconnect state is unavailable",
+        ))?;
+        let reconnect = ReconnectState {
+            format_version: 1,
+            snapshot_id,
+            capture_operation_id: operation_id.clone(),
+            machine_id: active.machine_id,
+            generation: active.generation,
+            boot_identity: active.boot_identity,
+            capability: active.capability,
+            boot: active.boot,
+        };
+        let configuration_digest = qemu_configuration_digest(&self.config)
+            .map_err(|_| ControlError::Protocol("native configuration digest failed"))?;
         let executions = journal.capture_executions(boundary.generation)?;
-        crate::snapshots::private_directory(
-            directory
-                .parent()
-                .ok_or(ControlError::Protocol("capture root has no parent"))?,
-        )
-        .map_err(|_| ControlError::Protocol("full capture root is not private"))?;
-        crate::snapshots::private_directory(&directory)
-            .map_err(|_| ControlError::Protocol("full capture directory is not private"))?;
-        let saved_state = directory.join("snapshot.vmstate");
-        if self
+        let native = self
             .machine
-            .save_full_state(&operation_id, &saved_state)
-            .is_err()
-        {
-            return Err(ControlError::Unsupported(
-                "Qemu Virtualization could not save full machine state",
-            ));
-        }
-        let result = (|| -> Result<sandsurf_protocol::NativeFullCapture, QemuError> {
-            let active = self
-                .management_binding()
-                .ok_or_else(|| QemuError::Invalid("guest reconnect state is unavailable".into()))?;
-            let reconnect = ReconnectState {
-                format_version: 1,
-                snapshot_id: snapshot_id.clone(),
-                capture_operation_id: operation_id.clone(),
-                machine_id: active.machine_id,
-                generation: active.generation,
-                boot_identity: active.boot_identity,
-                capability: active.capability,
-                boot: crate::storage::copy_boot(&active.boot_directory, &directory.join("boot"))?,
-            };
-            let reconnect_path = directory.join("reconnect.json");
-            write_private_json(&reconnect_path, &reconnect)?;
-            let state_bytes = fs::metadata(&saved_state)?.len();
-            let state_bound = self
-                .config
-                .resources
-                .memory_mib
-                .get()
-                .checked_mul(1024 * 1024)
-                .and_then(|value| value.checked_add(1024 * 1024 * 1024))
-                .ok_or_else(|| QemuError::Invalid("saved-state bound overflow".into()))?;
-            let state_digest = file_digest(&saved_state, state_bound)?;
-            let reconnect_bytes = fs::metadata(&reconnect_path)?.len();
-            let reconnect_digest = file_digest(&reconnect_path, 1024 * 1024)?;
-            let configuration_digest = qemu_configuration_digest(&self.config)
-                .map_err(|error| QemuError::Invalid(error.to_string()))?;
-            let generation = digest(
-                Domain::Snapshot,
-                &(
-                    "sandsurf-qemu-full-capture-generation-v1",
-                    &snapshot_id,
-                    &operation_id,
-                    &state_digest,
-                    &reconnect_digest,
-                ),
-            )
-            .map_err(|error| QemuError::Invalid(error.to_string()))?;
-            let capture = sandsurf_protocol::NativeFullCapture {
+            .prepare_full_state(&operation_id, &directory.join("snapshot.vmstate"))?;
+        Ok(crate::capture_preparation::CaptureAdmission::Queued(
+            Box::new(crate::capture_preparation::CapturePreparation {
+                machine_root: self.machine_root.clone(),
+                operation: operation_id,
+                boot_directory: active.boot_directory,
+                reconnect,
                 engine: native_engine(),
                 engine_version: "qemu-11.1.2-state-v1".into(),
                 architecture: native_architecture_name().into(),
                 configuration_digest,
                 executions,
-                snapshot_state: SnapshotArtifact {
-                    digest: state_digest,
-                    bytes: Counter::try_from(state_bytes)
-                        .map_err(|error| QemuError::Invalid(error.to_string()))?,
-                },
-                memory: None,
-                reconnect_state: SnapshotArtifact {
-                    digest: reconnect_digest,
-                    bytes: Counter::try_from(reconnect_bytes)
-                        .map_err(|error| QemuError::Invalid(error.to_string()))?,
-                },
-                generation,
-            };
-            write_private_json(&directory.join("capture.json"), &capture)?;
-            crate::snapshots::sync_directory(&directory)
-                .map_err(|error| QemuError::Invalid(error.to_string()))?;
-            Ok(capture)
-        })();
-        match result {
-            Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
-            Err(error) => Err(ControlError::Rejected {
-                category: "snapshot".into(),
-                message: error.to_string(),
+                state_bound: self.config.resources.memory_mib.get() * 1024 * 1024
+                    + 1024 * 1024 * 1024,
+                memory_bound: 0,
+                native: Some(native),
+                custody,
             }),
-        }
+        ))
     }
 
     fn prepare_full_restore(
@@ -836,6 +782,61 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for QemuGuardianEffect {
+    fn prepare_capture(
+        &mut self,
+        snapshot: sandsurf_protocol::SnapshotId,
+        operation: sandsurf_protocol::OperationId,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<crate::capture_preparation::CaptureAdmission> {
+        let result = self.begin_full_capture(snapshot, operation.clone(), journal);
+        if result.is_err()
+            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?.is_some()
+        {
+            self.finish_native_capture(journal)?;
+            crate::capture::remove_full(&self.machine_root, &operation)?;
+        }
+        result
+    }
+
+    fn complete_capture(
+        &mut self,
+        mut prepared: Box<crate::capture_preparation::PreparedCapture>,
+        publish: bool,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        if prepared.machine_root != self.machine_root {
+            return Err(ControlError::Protocol("full capture storage owner changed"));
+        }
+        let operation = prepared.operation.clone();
+        let completion = prepared.native.take().ok_or(ControlError::Protocol(
+            "native save completion was consumed",
+        ))?;
+        let native = self.machine.complete_full_state(&operation, completion);
+        let result = native
+            .map_err(|_| {
+                ControlError::Unsupported("QEMU native save owner or state is unavailable")
+            })
+            .and_then(|_| {
+                if !publish
+                    || crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?
+                        .is_none()
+                {
+                    return Err(ControlError::Protocol(
+                        "full capture no longer owns its native boundary",
+                    ));
+                }
+                Ok(NativeSnapshotResponse::Prepared {
+                    capture: crate::capture_preparation::publish(&prepared)?,
+                })
+            });
+        if result.is_err() {
+            if crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?.is_some() {
+                self.finish_native_capture(journal)?;
+            }
+            crate::capture::remove_full(&self.machine_root, &operation)?;
+        }
+        result
+    }
     fn staged_restore_binding(&self) -> Option<&Digest> {
         self.machine.staged_restore_binding()
     }
@@ -1316,21 +1317,9 @@ impl GuardianEffect for QemuGuardianEffect {
                     evidence: bytes_digest(b"native-disk-capture-released-v1"),
                 })
             }
-            NativeSnapshotRequest::PrepareFull {
-                snapshot_id,
-                operation_id,
-                ..
-            } => {
-                if matches!(
-                    sandsurf_machine::qemu_driver::full_state_capability(),
-                    sandsurf_protocol::Capability::Unsupported { .. }
-                ) {
-                    return Err(ControlError::Unsupported(
-                        "native WHPX full-state transfer is unavailable",
-                    ));
-                }
-                self.prepare_full_capture(snapshot_id, operation_id, journal)
-            }
+            NativeSnapshotRequest::PrepareFull { .. } => Err(ControlError::Protocol(
+                "full capture requires detached preparation",
+            )),
             NativeSnapshotRequest::FinishFull { operation_id } => {
                 crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
                 self.finish_native_capture(journal).map_err(|_| {

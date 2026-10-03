@@ -251,11 +251,11 @@ mod native {
             self.committed_suspend = None;
             Ok(())
         }
-        pub fn save_full_state(
+        pub fn prepare_full_state(
             &mut self,
             operation: &OperationId,
             destination: &Path,
-        ) -> io::Result<()> {
+        ) -> io::Result<crate::capture::CaptureTask> {
             if matches!(full_state_capability(), Capability::Unsupported { .. }) {
                 return Err(invalid("native accelerator cannot save full state"));
             }
@@ -267,12 +267,26 @@ mod native {
             {
                 return Err(invalid("full capture does not own its native pause"));
             }
-            self.owner
+            let task = self
+                .owner
                 .as_mut()
                 .ok_or_else(|| invalid("full capture owner unavailable"))?
-                .save_state(destination)?;
+                .prepare_save(destination)?;
             self.capture_operation = Some(operation.clone());
-            Ok(())
+            Ok(task)
+        }
+        pub fn complete_full_state(
+            &mut self,
+            operation: &OperationId,
+            completion: crate::capture::CaptureCompletion,
+        ) -> io::Result<crate::capture::SnapshotFiles> {
+            if !self.capture_paused || self.capture_operation.as_ref() != Some(operation) {
+                return Err(invalid("native capture owner changed"));
+            }
+            self.owner
+                .as_mut()
+                .ok_or_else(|| invalid("native capture owner unavailable"))?
+                .complete_save(completion)
         }
         pub fn commit_suspend(
             &mut self,

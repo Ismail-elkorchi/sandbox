@@ -22,8 +22,8 @@ use sandsurf_network::NativeNetworkGateway;
 use sandsurf_protocol::{BootCapability, BootIdentity, GUEST_CONTROL_PORT};
 use sandsurf_protocol::{
     Counter, Digest, Domain, GuestServiceRequest, LifecycleCommand, MachineId, MachineObservation,
-    MachineState, NativeFullCapture, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy,
-    Resources, RuntimeConfiguration, SnapshotArtifact, VmEngine, bytes_digest, digest,
+    MachineState, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources,
+    RuntimeConfiguration, VmEngine, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -547,6 +547,61 @@ enum RuntimeInstallation {
 }
 
 impl GuardianEffect for LinuxGuardianEffect {
+    fn prepare_capture(
+        &mut self,
+        snapshot: sandsurf_protocol::SnapshotId,
+        operation: sandsurf_protocol::OperationId,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<crate::capture_preparation::CaptureAdmission> {
+        let result = self.begin_full_capture(snapshot, operation.clone(), journal);
+        if result.is_err()
+            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?.is_some()
+        {
+            self.finish_native_capture(journal)?;
+            crate::capture::remove_full(&self.machine_root, &operation)?;
+        }
+        result
+    }
+
+    fn complete_capture(
+        &mut self,
+        mut prepared: Box<crate::capture_preparation::PreparedCapture>,
+        publish: bool,
+        journal: &mut RuntimeJournal,
+    ) -> ControlResult<NativeSnapshotResponse> {
+        if prepared.machine_root != self.machine_root {
+            return Err(ControlError::Protocol("full capture storage owner changed"));
+        }
+        let operation = prepared.operation.clone();
+        let completion = prepared.native.take().ok_or(ControlError::Protocol(
+            "native save completion was consumed",
+        ))?;
+        let native = self.machine.complete_full_snapshot(&operation, completion);
+        let result = native
+            .map_err(|_| {
+                ControlError::Unsupported("Firecracker native save owner or state is unavailable")
+            })
+            .and_then(|_| {
+                if !publish
+                    || crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?
+                        .is_none()
+                {
+                    return Err(ControlError::Protocol(
+                        "full capture no longer owns its native boundary",
+                    ));
+                }
+                Ok(NativeSnapshotResponse::Prepared {
+                    capture: crate::capture_preparation::publish(&prepared)?,
+                })
+            });
+        if result.is_err() {
+            if crate::capture::CaptureBoundary::require(&self.machine_root, &operation)?.is_some() {
+                self.finish_native_capture(journal)?;
+            }
+            crate::capture::remove_full(&self.machine_root, &operation)?;
+        }
+        result
+    }
     fn staged_restore_binding(&self) -> Option<&Digest> {
         self.machine.staged_restore_binding()
     }
@@ -934,11 +989,9 @@ impl GuardianEffect for LinuxGuardianEffect {
                     evidence: bytes_digest(b"native-disk-capture-released-v1"),
                 })
             }
-            NativeSnapshotRequest::PrepareFull {
-                snapshot_id,
-                operation_id,
-                ..
-            } => self.prepare_full_capture(snapshot_id, operation_id, journal),
+            NativeSnapshotRequest::PrepareFull { .. } => Err(ControlError::Protocol(
+                "full capture requires detached preparation",
+            )),
             NativeSnapshotRequest::FinishFull { operation_id } => {
                 crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
                 self.finish_native_capture(journal).map_err(|_| {
@@ -1196,32 +1249,13 @@ impl LinuxGuardianEffect {
         self.guest_transport.release_capture()
     }
 
-    fn prepare_full_capture(
+    fn begin_full_capture(
         &mut self,
         snapshot_id: sandsurf_protocol::SnapshotId,
         operation_id: sandsurf_protocol::OperationId,
         journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeSnapshotResponse> {
-        let result = self.prepare_full_capture_inner(snapshot_id, operation_id.clone(), journal);
-        if result.is_err()
-            && crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
-                .is_some()
-        {
-            // Do not erase an indeterminate pause owner. Only confirmed native
-            // completion permits retiring this operation's unpublished copy.
-            self.finish_native_capture(journal)?;
-            crate::capture::remove_full(&self.machine_root, &operation_id)?;
-        }
-        result
-    }
-
-    fn prepare_full_capture_inner(
-        &mut self,
-        snapshot_id: sandsurf_protocol::SnapshotId,
-        operation_id: sandsurf_protocol::OperationId,
-        journal: &mut RuntimeJournal,
-    ) -> ControlResult<NativeSnapshotResponse> {
-        let _snapshot_custody =
+    ) -> ControlResult<crate::capture_preparation::CaptureAdmission> {
+        let custody =
             crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
                 .map_err(|_| {
                     ControlError::Unsupported("full snapshot storage is retired or unavailable")
@@ -1229,81 +1263,50 @@ impl LinuxGuardianEffect {
         self.prepare_capture_boundary(operation_id.clone(), journal)?;
         let directory = full_capture_directory(&self.machine_root, &operation_id);
         if directory.join("capture.json").exists() {
-            let capture: NativeFullCapture =
-                read_json(&directory.join("capture.json"), 1024 * 1024)
-                    .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?;
-            return Ok(NativeSnapshotResponse::Prepared { capture });
+            return Ok(crate::capture_preparation::CaptureAdmission::Ready(
+                Box::new(
+                    read_json(&directory.join("capture.json"), 1024 * 1024)
+                        .map_err(|_| ControlError::Protocol("retained full capture is invalid"))?,
+                ),
+            ));
         }
         crate::capture::reset_unpublished_full(&self.machine_root, &operation_id)?;
+        crate::snapshots::private_directory(
+            directory
+                .parent()
+                .ok_or(ControlError::Protocol("capture has no parent"))?,
+        )?;
+        crate::snapshots::private_directory(&directory)?;
         let boundary = crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?
             .ok_or(ControlError::Protocol(
                 "full capture has no native boundary",
             ))?;
+        let active = self.management_binding().ok_or(ControlError::Unsupported(
+            "guest reconnect state is unavailable",
+        ))?;
+        let reconnect = ReconnectState {
+            format_version: 1,
+            snapshot_id,
+            capture_operation_id: operation_id.clone(),
+            machine_id: active.machine_id,
+            generation: active.generation,
+            boot_identity: active.boot_identity,
+            capability: active.capability,
+            boot: active.boot,
+        };
+        let configuration_digest = firecracker_configuration_digest(&self.config)
+            .map_err(|_| ControlError::Protocol("native configuration digest failed"))?;
         let executions = journal.capture_executions(boundary.generation)?;
-        let snapshot = self
+        let native = self
             .machine
-            .create_full_snapshot(&operation_id)
-            .map_err(|_| {
-                ControlError::Unsupported("Firecracker could not create a full snapshot")
-            })?;
-        let result = (|| -> Result<NativeFullCapture, LinuxError> {
-            crate::snapshots::private_directory(
-                directory
-                    .parent()
-                    .ok_or_else(|| LinuxError::Invalid("capture root has no parent".into()))?,
-            )
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            crate::snapshots::private_directory(&directory)
-                .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let snapshot_state = directory.join("snapshot.vmstate");
-            let memory = directory.join("memory");
-            let state_digest = crate::snapshots::copy_and_verify(
-                &snapshot.snapshot_state,
-                &snapshot_state,
-                snapshot.state_bytes,
-                None,
-            )
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let memory_digest = crate::snapshots::copy_and_verify(
-                &snapshot.snapshot_memory,
-                &memory,
-                snapshot.memory_bytes,
-                None,
-            )
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let active = self.management_binding().ok_or_else(|| {
-                LinuxError::Invalid("guest reconnect state is unavailable".into())
-            })?;
-            let reconnect = ReconnectState {
-                format_version: 1,
-                snapshot_id: snapshot_id.clone(),
-                capture_operation_id: operation_id.clone(),
-                machine_id: active.machine_id,
-                generation: active.generation,
-                boot_identity: active.boot_identity,
-                capability: active.capability,
-                boot: crate::storage::copy_boot(&active.boot_directory, &directory.join("boot"))?,
-            };
-            let reconnect_path = directory.join("reconnect.json");
-            write_private_json(&reconnect_path, &reconnect)?;
-            let reconnect_bytes = reconnect_path.metadata()?.len();
-            let reconnect_digest = crate::snapshots::file_digest(&reconnect_path, reconnect_bytes)
-                .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let configuration_digest = firecracker_configuration_digest(&self.config)
-                .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let generation = digest(
-                Domain::Snapshot,
-                &(
-                    "sandsurf-full-capture-generation-v1",
-                    snapshot_id,
-                    &operation_id,
-                    &state_digest,
-                    &memory_digest,
-                    &reconnect_digest,
-                ),
-            )
-            .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            let capture = NativeFullCapture {
+            .prepare_full_snapshot(&operation_id)
+            .map_err(|_| ControlError::Unsupported("Firecracker save preparation failed"))?;
+        Ok(crate::capture_preparation::CaptureAdmission::Queued(
+            Box::new(crate::capture_preparation::CapturePreparation {
+                machine_root: self.machine_root.clone(),
+                operation: operation_id,
+                boot_directory: active.boot_directory,
+                reconnect,
                 engine: VmEngine::Firecracker,
                 engine_version: "1.17.0".into(),
                 architecture: match crate::service::native_guest_architecture() {
@@ -1313,35 +1316,12 @@ impl LinuxGuardianEffect {
                 .into(),
                 configuration_digest,
                 executions,
-                snapshot_state: SnapshotArtifact {
-                    digest: state_digest,
-                    bytes: Counter::try_from(snapshot.state_bytes)
-                        .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-                },
-                memory: Some(SnapshotArtifact {
-                    digest: memory_digest,
-                    bytes: Counter::try_from(snapshot.memory_bytes)
-                        .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-                }),
-                reconnect_state: SnapshotArtifact {
-                    digest: reconnect_digest,
-                    bytes: Counter::try_from(reconnect_bytes)
-                        .map_err(|error| LinuxError::Invalid(error.to_string()))?,
-                },
-                generation,
-            };
-            write_private_json(&directory.join("capture.json"), &capture)?;
-            crate::snapshots::sync_directory(&directory)
-                .map_err(|error| LinuxError::Invalid(error.to_string()))?;
-            Ok(capture)
-        })();
-        match result {
-            Ok(capture) => Ok(NativeSnapshotResponse::Prepared { capture }),
-            Err(error) => Err(ControlError::Rejected {
-                category: "snapshot".into(),
-                message: error.to_string(),
+                state_bound: 1024 * 1024 * 1024,
+                memory_bound: self.config.resources.memory_mib.get() * 1024 * 1024,
+                native: Some(native),
+                custody,
             }),
-        }
+        ))
     }
 }
 

@@ -13,6 +13,7 @@ use sandsurf_protocol::{Digest, Exposure, MachineState, NetworkPolicy, bytes_dig
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct QemuOwner {
@@ -22,6 +23,40 @@ pub struct QemuOwner {
     console: Option<NativeConsole>,
     exit: Option<NativePowerObservation>,
     reset: Option<Digest>,
+}
+
+pub(crate) struct CaptureControl {
+    identity: [u8; 32],
+    channel: crate::qemu::QemuControl,
+}
+pub struct QemuCapture {
+    control: CaptureControl,
+    destination: PathBuf,
+}
+impl QemuCapture {
+    pub(crate) fn execute(mut self) -> crate::capture::CaptureCompletion {
+        let files = self
+            .control
+            .channel
+            .save_state(&self.destination)
+            .and_then(|()| {
+                let file = sandsurf_native::local::open_private_file(
+                    &self.destination,
+                    sandsurf_native::PrivateFileAccess::ReadOnly,
+                )?;
+                let state_bytes = file.metadata()?.len();
+                file.sync_all()?;
+                Ok(crate::capture::SnapshotFiles {
+                    state: self.destination,
+                    state_bytes,
+                    memory: None,
+                })
+            });
+        crate::capture::CaptureCompletion {
+            files,
+            control: self.control,
+        }
+    }
 }
 
 impl QemuOwner {
@@ -84,7 +119,7 @@ impl QemuOwner {
 
     #[cfg(windows)]
     pub fn partition_usage(&mut self) -> io::Result<crate::qemu::PartitionUsage> {
-        self.worker.control.partition_usage()
+        self.worker.control()?.partition_usage()
     }
 
     pub fn configure_network(
@@ -95,13 +130,13 @@ impl QemuOwner {
         self.network.configure(policy, exposures)
     }
     pub fn pause(&mut self) -> io::Result<()> {
-        self.worker.control.pause()
+        self.worker.control()?.pause()
     }
     pub fn resume(&mut self) -> io::Result<()> {
         if !self.network.is_alive() {
             return Err(invalid("external NIC enforcement is unavailable"));
         }
-        self.worker.control.resume()
+        self.worker.control()?.resume()
     }
 
     pub fn observe_power(&mut self) -> io::Result<NativePowerObservation> {
@@ -110,8 +145,17 @@ impl QemuOwner {
         }
         if let Some((clean, native)) = self.worker.native_exit()? {
             self.serial.close();
-            let complete = self.worker.control.drain_exit_events().is_ok();
-            let events = self.worker.control.take_power_events();
+            let complete = self
+                .worker
+                .control
+                .as_mut()
+                .is_some_and(|control| control.drain_exit_events().is_ok());
+            let events = self
+                .worker
+                .control
+                .as_mut()
+                .map(|control| control.take_power_events())
+                .unwrap_or_default();
             if clean && complete && events.failed.is_none() {
                 self.reset = events.guest_reset;
             }
@@ -126,7 +170,7 @@ impl QemuOwner {
             self.exit = Some(exit.clone());
             return Ok(exit);
         }
-        let status = self.worker.control.status()?;
+        let status = self.worker.control()?.status()?;
         let state = match status.as_str() {
             "running" => MachineState::Running,
             "paused" | "prelaunch" | "postmigrate" | "inmigrate" => MachineState::Paused,
@@ -149,12 +193,36 @@ impl QemuOwner {
         self.reset.take()
     }
 
-    pub fn save_state(&mut self, destination: &Path) -> io::Result<()> {
-        self.worker.control.save_state(destination)
+    pub fn prepare_save(&mut self, destination: &Path) -> io::Result<crate::capture::CaptureTask> {
+        let channel = self
+            .worker
+            .control
+            .take()
+            .ok_or_else(|| invalid("native save is already in flight"))?;
+        Ok(crate::capture::CaptureTask::Qemu(QemuCapture {
+            control: CaptureControl {
+                identity: self.worker.control_identity,
+                channel,
+            },
+            destination: destination.to_owned(),
+        }))
+    }
+
+    pub fn complete_save(
+        &mut self,
+        completion: crate::capture::CaptureCompletion,
+    ) -> io::Result<crate::capture::SnapshotFiles> {
+        if self.worker.control.is_some()
+            || completion.control.identity != self.worker.control_identity
+        {
+            return Err(invalid("native save belongs to a different original owner"));
+        }
+        self.worker.control = Some(completion.control.channel);
+        completion.files
     }
 
     pub fn load_state(&mut self, source: &Path) -> io::Result<()> {
-        self.worker.control.load_state(source)
+        self.worker.control()?.load_state(source)
     }
 
     pub fn terminate(&mut self) -> io::Result<()> {

@@ -933,13 +933,20 @@ fn remove_stage(stage: &Path) -> Result<()> {
     }
     // Validate the entire bounded closure before the first removal. Never
     // follow substituted directories or reclaim undeclared files on retry.
-    for entry in fs::read_dir(stage)?.take(33) {
+    let mut directories = Vec::new();
+    let mut pending = Vec::new();
+    for (index, entry) in fs::read_dir(stage)?.take(33).enumerate() {
+        if index == 32 {
+            return Err(SnapshotError::Invalid(
+                "snapshot payload inventory exceeds bound",
+            ));
+        }
         let entry = entry?;
         let name = entry.file_name();
         let name = name
             .to_str()
             .ok_or(SnapshotError::Invalid("snapshot payload name is invalid"))?;
-        if name == "boot" {
+        if name == "boot" || boot_stage_name(name) {
             sandsurf_native::local::Directory::open(&entry.path())?;
             for artifact in fs::read_dir(entry.path())?.take(4) {
                 let artifact = artifact?;
@@ -951,6 +958,7 @@ fn remove_stage(stage: &Path) -> Result<()> {
                 }
                 drop(open_read(&artifact.path())?);
             }
+            directories.push(entry.path());
         } else if matches!(
             name,
             "manifest.json"
@@ -963,12 +971,20 @@ fn remove_stage(stage: &Path) -> Result<()> {
                 | "capture.json"
         ) {
             drop(open_read(&entry.path())?);
+        } else if crate::image_records::pending_name("reconnect", name)
+            || crate::image_records::pending_name("capture", name)
+        {
+            drop(open_read(&entry.path())?);
+            pending.push(entry.path());
         } else {
             return Err(SnapshotError::Invalid("undeclared snapshot payload"));
         }
     }
-    if stage.join("boot").exists() {
-        fs::remove_dir_all(stage.join("boot"))?;
+    for directory in directories {
+        fs::remove_dir_all(directory)?;
+    }
+    for file in pending {
+        fs::remove_file(file)?;
     }
     for name in [
         "manifest.json",
@@ -987,6 +1003,17 @@ fn remove_stage(stage: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn boot_stage_name(name: &str) -> bool {
+    name.strip_prefix(".boot-")
+        .and_then(|name| name.strip_suffix(".stage"))
+        .is_some_and(|nonce| {
+            nonce.len() == 32
+                && nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -1437,6 +1464,48 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &stage).unwrap();
         assert!(remove_stage(&stage).is_err());
         assert_eq!(fs::read(outside.join("system.ext4")).unwrap(), b"retain");
+    }
+
+    #[test]
+    fn interrupted_boot_and_record_stages_are_reclaimed_only_after_complete_inventory_validation() {
+        let temp = Temp::new();
+        let stage = temp.0.join("capture-stage");
+        private_directory(&stage).unwrap();
+        let boot = stage.join(format!(".boot-{}.stage", "a".repeat(32)));
+        private_directory(&boot).unwrap();
+        open_write(&boot.join("kernel"))
+            .unwrap()
+            .write_all(b"unfinished kernel")
+            .unwrap();
+        let record = stage.join(format!("reconnect.{}.pending", "b".repeat(64)));
+        open_write(&record)
+            .unwrap()
+            .write_all(b"{\"partial\":")
+            .unwrap();
+        let unknown = stage.join("unowned.json");
+        open_write(&unknown).unwrap().write_all(b"keep").unwrap();
+        assert!(remove_stage(&stage).is_err());
+        assert_eq!(fs::read(boot.join("kernel")).unwrap(), b"unfinished kernel");
+        assert!(record.exists());
+        fs::remove_file(unknown).unwrap();
+        remove_stage(&stage).unwrap();
+        assert!(!stage.exists());
+        for name in [
+            ".boot-.stage",
+            ".boot-../escape.stage",
+            ".boot-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.stage",
+            ".boot-abc.stage",
+        ] {
+            assert!(!boot_stage_name(name));
+        }
+        assert!(!crate::image_records::pending_name(
+            "capture",
+            "capture.pending"
+        ));
+        assert!(!crate::image_records::pending_name(
+            "capture",
+            &format!("reconnect.{}.pending", "b".repeat(64))
+        ));
     }
 
     #[test]

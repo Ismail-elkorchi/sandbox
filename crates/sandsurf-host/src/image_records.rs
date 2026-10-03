@@ -8,6 +8,21 @@ use std::path::Path;
 
 const MAXIMUM: usize = 1024 * 1024;
 
+/// Recognize only this publisher's owned interrupted record names. Callers
+/// must still validate the original directory/file and hold exclusive custody
+/// before reclaiming them; a name alone is never deletion authority.
+pub(crate) fn pending_name(stem: &str, name: &str) -> bool {
+    name.strip_prefix(stem)
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.strip_suffix(".pending"))
+        .is_some_and(|nonce| {
+            nonce.len() == 64
+                && nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 pub(crate) fn read<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     let file = open_private_file(path, sandsurf_native::PrivateFileAccess::ReadOnly)?;
     let mut bytes = Vec::new();

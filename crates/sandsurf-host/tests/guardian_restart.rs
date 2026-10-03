@@ -243,6 +243,9 @@ impl Fixture {
         )
         .unwrap();
         runtime
+            .admit_configuration(host.authorize_configuration(&machine, n(2)).unwrap())
+            .unwrap();
+        runtime
             .observe(MachineObservation {
                 machine_id: machine.clone(),
                 generation: Counter::ONE,
@@ -250,7 +253,7 @@ impl Fixture {
                 state: MachineState::Running,
                 applied_revision: n(2),
                 cause: ObservationCause::Configuration {
-                    operation_id: "configure-fixture".try_into().unwrap(),
+                    operation_id: "configuration-2".try_into().unwrap(),
                 },
                 evidence_digest: hash("revision-2"),
             })

@@ -19,6 +19,7 @@ pub mod launcher;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub use hardware::validate_hardware;
+pub mod capture;
 pub mod qemu;
 pub mod qemu_driver;
 mod qemu_endpoints;

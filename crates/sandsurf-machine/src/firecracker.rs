@@ -34,6 +34,54 @@ pub struct FirecrackerSnapshot {
     pub memory_bytes: u64,
 }
 
+/// The original connected API channel, not a pathname to reopen after stop or
+/// replacement. It contains exactly one permitted save request. VM ownership
+/// and the independent native termination channel remain in the guardian.
+pub struct FirecrackerCapture {
+    connection: UnixStream,
+    directory: PathBuf,
+    state_name: String,
+    memory_name: String,
+}
+
+impl FirecrackerCapture {
+    pub(crate) fn paths(&self) -> FirecrackerSnapshot {
+        FirecrackerSnapshot {
+            snapshot_state: self.directory.join(&self.state_name),
+            snapshot_memory: self.directory.join(&self.memory_name),
+            state_bytes: 0,
+            memory_bytes: 0,
+        }
+    }
+    pub fn execute(mut self) -> Result<FirecrackerSnapshot, FirecrackerError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "snapshot_type": "Full",
+            "snapshot_path": format!("/vm/state/{}", self.state_name),
+            "mem_file_path": format!("/vm/state/{}", self.memory_name)
+        }))
+        .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+        request_on(
+            &mut self.connection,
+            "PUT",
+            "/snapshot/create",
+            &body,
+            204,
+            Instant::now() + Duration::from_secs(120),
+        )?;
+        let snapshot_state = self.directory.join(self.state_name);
+        let snapshot_memory = self.directory.join(self.memory_name);
+        let state_bytes = sync_regular_file(&snapshot_state)?;
+        let memory_bytes = sync_regular_file(&snapshot_memory)?;
+        File::open(self.directory)?.sync_all()?;
+        Ok(FirecrackerSnapshot {
+            snapshot_state,
+            snapshot_memory,
+            state_bytes,
+            memory_bytes,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FirecrackerConfig {
     pub network_identity: sandsurf_network::LinkIdentity,
@@ -381,13 +429,11 @@ impl FirecrackerProcess {
         })
     }
 
-    /// Create a full snapshot while the VM is paused. Files are produced in
-    /// the already confined private state directory and synchronized before
-    /// their paths are returned to the guardian.
-    pub fn create_full_snapshot(
+    /// Bind a save to this original native connection before queuing I/O.
+    pub fn prepare_full_snapshot(
         &self,
         identity: &str,
-    ) -> Result<FirecrackerSnapshot, FirecrackerError> {
+    ) -> Result<FirecrackerCapture, FirecrackerError> {
         if identity.is_empty()
             || identity.len() > 128
             || !identity
@@ -400,27 +446,15 @@ impl FirecrackerProcess {
         }
         let state_name = format!("snapshot-{identity}.vmstate");
         let memory_name = format!("snapshot-{identity}.memory");
-        let body = serde_json::to_vec(&serde_json::json!({
-            "snapshot_type": "Full",
-            "snapshot_path": format!("/vm/state/{state_name}"),
-            "mem_file_path": format!("/vm/state/{memory_name}")
-        }))
-        .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
-        self.api_request("PUT", "/snapshot/create", &body, 204)?;
         let directory = self
             .api_socket_path
             .parent()
             .ok_or_else(|| FirecrackerError::Invalid("API socket has no parent".into()))?;
-        let snapshot_state = directory.join(state_name);
-        let snapshot_memory = directory.join(memory_name);
-        let state = sync_regular_file(&snapshot_state)?;
-        let memory = sync_regular_file(&snapshot_memory)?;
-        File::open(directory)?.sync_all()?;
-        Ok(FirecrackerSnapshot {
-            snapshot_state,
-            snapshot_memory,
-            state_bytes: state,
-            memory_bytes: memory,
+        Ok(FirecrackerCapture {
+            connection: self.api_connection(Instant::now() + OBSERVATION_TIMEOUT)?,
+            directory: directory.to_owned(),
+            state_name,
+            memory_name,
         })
     }
 
@@ -537,18 +571,7 @@ impl FirecrackerProcess {
             ));
         }
         let mut stream = self.api_connection(deadline)?;
-        let mut connection = sandsurf_native::unix_io::DeadlineIo {
-            stream: &mut stream,
-            deadline: Some(deadline),
-        };
-        write!(
-            connection,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )?;
-        connection.write_all(body)?;
-        connection.flush()?;
-        read_api_response(BufReader::with_capacity(4096, connection), expected_status)
+        request_on(&mut stream, method, path, body, expected_status, deadline)
     }
 
     #[must_use]
@@ -579,11 +602,6 @@ impl FirecrackerProcess {
     pub fn observe_power(&mut self) -> Result<crate::NativePowerObservation, FirecrackerError> {
         if self.has_exited()? {
             let status = self.wait()?;
-            if !status.tree_reaped || !status.cleanup_failures.is_empty() {
-                return Err(FirecrackerError::Setup(
-                    "native exit containment is unconfirmed".into(),
-                ));
-            }
             let evidence = serde_json::to_vec(status)
                 .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
             return Ok(crate::NativePowerObservation {
@@ -617,9 +635,12 @@ impl FirecrackerProcess {
             let _ = self.child.wait()?;
             self.finish_diagnostics();
         }
-        self.final_status
+        let status = self
+            .final_status
             .as_ref()
-            .ok_or_else(|| FirecrackerError::Setup("missing VMM final status".into()))
+            .ok_or_else(|| FirecrackerError::Setup("missing VMM final status".into()))?;
+        require_contained(status)?;
+        Ok(status)
     }
 
     fn finish_diagnostics(&mut self) {
@@ -632,6 +653,17 @@ impl FirecrackerProcess {
             let _ = thread.join();
         }
     }
+}
+
+fn require_contained(
+    status: &crate::launcher::LauncherFinalStatus,
+) -> Result<(), FirecrackerError> {
+    if !status.tree_reaped || !status.cleanup_failures.is_empty() {
+        return Err(FirecrackerError::Setup(
+            "native exit containment is unconfirmed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn serial_input_pair() -> io::Result<(File, File)> {
@@ -923,6 +955,28 @@ impl From<io::Error> for FirecrackerError {
 
 /// Bounded native-control decoding. The caller supplies the transport's single
 /// absolute deadline; buffering does not admit unbounded lines or chunked data.
+fn request_on(
+    stream: &mut UnixStream,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    expected_status: u16,
+    deadline: Instant,
+) -> Result<Vec<u8>, FirecrackerError> {
+    let mut connection = sandsurf_native::unix_io::DeadlineIo {
+        stream,
+        deadline: Some(deadline),
+    };
+    write!(
+        connection,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    connection.write_all(body)?;
+    connection.flush()?;
+    read_api_response(BufReader::with_capacity(4096, connection), expected_status)
+}
+
 pub fn read_api_response(
     mut reader: impl BufRead,
     expected_status: u16,
@@ -1213,6 +1267,69 @@ struct Vsock {
 
 #[cfg(test)]
 mod control_tests {
+    #[test]
+    fn detached_save_is_bound_to_original_connection_and_cannot_contact_a_replacement() {
+        use super::*;
+        use std::os::unix::net::UnixListener;
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "ssf-save-{}",
+            sandsurf_protocol::bytes_digest(&nonce).as_str()
+        ));
+        sandsurf_native::local::create_private_directory(&directory).unwrap();
+        let endpoint = directory.join("api");
+        let replacement = UnixListener::bind(&endpoint).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let (connection, mut original) = UnixStream::pair().unwrap();
+        original
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let task = FirecrackerCapture {
+            connection,
+            directory: directory.clone(),
+            state_name: "snapshot-capture.vmstate".into(),
+            memory_name: "snapshot-capture.memory".into(),
+        };
+        let saving = std::thread::spawn(move || task.execute());
+        let mut request = Vec::new();
+        let mut reader = BufReader::new(&mut original);
+        loop {
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).unwrap();
+            assert!(!line.is_empty() && request.len() + line.len() < 4096);
+            request.extend_from_slice(&line);
+            if line == b"\r\n" {
+                break;
+            }
+        }
+        assert!(request.starts_with(b"PUT /snapshot/create HTTP/1.1\r\n"));
+        let header = String::from_utf8(request).unwrap();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .map(|value| value.parse().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["snapshot_type"],
+            "Full"
+        );
+        drop(reader);
+        // Original native exit interrupts this save. A new listener cannot
+        // receive a late save or be adopted merely because its path exists.
+        drop(original);
+        assert!(saving.join().unwrap().is_err());
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(replacement);
+        fs::remove_dir_all(directory).unwrap();
+    }
     use super::*;
 
     #[test]
@@ -1358,6 +1475,15 @@ mod control_tests {
             reset: true,
             invalid: false,
         };
+        assert!(require_contained(&status).is_ok());
+        let mut unconfirmed = status.clone();
+        unconfirmed.tree_reaped = false;
+        assert!(require_contained(&unconfirmed).is_err());
+        unconfirmed.tree_reaped = true;
+        unconfirmed
+            .cleanup_failures
+            .push("remaining native child".into());
+        assert!(require_contained(&unconfirmed).is_err());
         assert_eq!(
             qualifies_guest_reset(&status, &metrics, false),
             cfg!(target_arch = "x86_64")

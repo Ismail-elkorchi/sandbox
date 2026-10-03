@@ -4,6 +4,7 @@ pub mod api;
 pub mod artifacts;
 mod boot_preparation;
 mod capture;
+mod capture_preparation;
 mod console;
 pub mod guardian;
 pub mod guest;

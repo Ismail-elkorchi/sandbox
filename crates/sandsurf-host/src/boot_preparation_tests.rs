@@ -16,8 +16,20 @@ struct Native {
     installed: usize,
     started: usize,
     resource_checks: std::cell::RefCell<Vec<(&'static str, MachineObservation)>>,
+    capture_publications: Vec<bool>,
 }
 impl GuardianEffect for Native {
+    fn complete_capture(
+        &mut self,
+        _: Box<PreparedCapture>,
+        publish: bool,
+        _: &mut RuntimeJournal,
+    ) -> Result<NativeSnapshotResponse> {
+        self.capture_publications.push(publish);
+        Ok(NativeSnapshotResponse::Complete {
+            evidence: bytes_digest(b"fixture-completion"),
+        })
+    }
     fn staged_restore_binding(&self) -> Option<&Digest> {
         self.restore.as_ref().map(|(binding, _)| binding)
     }
@@ -325,6 +337,7 @@ impl Fixture {
                 installed: 0,
                 started: 0,
                 resource_checks: Default::default(),
+                capture_publications: Vec::new(),
             },
         );
         Self {
@@ -407,6 +420,100 @@ fn retire(fixture: Fixture) {
     let root = fixture.root.clone();
     drop(fixture);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn detached_full_capture_cannot_publish_after_forced_stop_pause_or_native_exit() {
+    for change in ["stop", "pause", "native-exit", "unchanged"] {
+        let mut f = Fixture::new();
+        f.start();
+        let observation = f
+            .guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .clone();
+        let pending = CapturePending {
+            accepted_revision: f.guardian.journal.accepted_revision().unwrap(),
+            observation,
+        };
+        f.guardian.offline_in_flight = true;
+        let prepared = crate::capture_preparation::completion_fixture(&f.root);
+        match change {
+            "stop" | "pause" => {
+                let desired = if change == "stop" {
+                    DesiredState::Stopped
+                } else {
+                    DesiredState::Paused
+                };
+                let authorization = f.intent(change, desired);
+                let BootAdmission::Ready(response) = f.guardian.begin_boot(authorization).unwrap()
+                else {
+                    panic!("native control must not wait for the save worker");
+                };
+                assert_eq!(delivery(response), Delivery::Applied);
+                assert!(
+                    f.guardian.offline_in_flight,
+                    "capture remains accounted until actual completion"
+                );
+            }
+            "native-exit" => {
+                f.guardian.effect.as_mut().unwrap().measured = Some(MachineState::Failed)
+            }
+            _ => {}
+        }
+        let result = f.guardian.finish_capture(pending, Ok(prepared));
+        assert_eq!(result.is_ok(), change == "unchanged");
+        assert_eq!(
+            f.guardian.effect.as_ref().unwrap().capture_publications,
+            [change == "unchanged"]
+        );
+        assert!(!f.guardian.offline_in_flight);
+        retire(f);
+    }
+}
+
+#[test]
+fn detached_full_capture_cannot_publish_after_accepted_unapplied_authority() {
+    let mut f = Fixture::new();
+    f.start();
+    let observation = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let pending = CapturePending {
+        accepted_revision: f.guardian.journal.accepted_revision().unwrap(),
+        observation: observation.clone(),
+    };
+    let authorization = f.intent("pending-stop", DesiredState::Stopped);
+    f.guardian.journal.admit_lifecycle(authorization).unwrap();
+    f.guardian.offline_in_flight = true;
+    let prepared = crate::capture_preparation::completion_fixture(&f.root);
+    assert!(f.guardian.finish_capture(pending, Ok(prepared)).is_err());
+    assert_eq!(
+        f.guardian.effect.as_ref().unwrap().capture_publications,
+        [false]
+    );
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &observation
+    );
+    assert_eq!(
+        f.guardian.effect.as_ref().unwrap().measured,
+        Some(MachineState::Running)
+    );
+    retire(f);
 }
 
 #[test]
@@ -790,6 +897,7 @@ fn lost_native_handle_requires_original_custody_release_and_never_replays_boot()
                 installed: 0,
                 started: 0,
                 resource_checks: Default::default(),
+                capture_publications: Vec::new(),
             },
         ),
     };
@@ -1242,6 +1350,7 @@ fn admitted_boot_recovers_after_owner_restart_without_any_dispatch_evidence() {
                 installed: 0,
                 started: 0,
                 resource_checks: Default::default(),
+                capture_publications: Vec::new(),
             },
         ),
     };

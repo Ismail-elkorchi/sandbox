@@ -18,7 +18,8 @@ type NativeWorker = sandsurf_native::resource_broker::macos::OwnedWorker;
 type NativeWorker = sandsurf_native::owned_windows::OwnedWorker;
 pub(crate) struct QemuWorker {
     pub(crate) child: NativeWorker,
-    pub(crate) control: QemuControl,
+    pub(crate) control: Option<QemuControl>,
+    pub(crate) control_identity: [u8; 32],
     endpoints: Endpoints,
     startup_deadline: Instant,
     _custody: Vec<Arc<File>>,
@@ -114,6 +115,8 @@ impl QemuWorker {
             )?
         };
         let mut child = child;
+        let mut control_identity = [0; 32];
+        getrandom::getrandom(&mut control_identity).map_err(io::Error::other)?;
         let timeout = Duration::from_secs(15);
         let deadline = Instant::now() + timeout;
         // Resource-gate acknowledgement is not device readiness. Wait for
@@ -148,7 +151,8 @@ impl QemuWorker {
         };
         Ok(Self {
             child,
-            control,
+            control: Some(control),
+            control_identity,
             endpoints,
             startup_deadline: deadline,
             _custody: custody,
@@ -157,6 +161,14 @@ impl QemuWorker {
     }
     pub(crate) fn process_id(&self) -> u32 {
         self.child.process_id()
+    }
+    pub(crate) fn control(&mut self) -> io::Result<&mut QemuControl> {
+        self.control.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native save owns the original control channel",
+            )
+        })
     }
     pub(crate) fn endpoints(&self) -> &Path {
         self.endpoints.path()

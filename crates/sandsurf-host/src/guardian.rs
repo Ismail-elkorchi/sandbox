@@ -76,6 +76,18 @@ impl From<sandsurf_state::Error> for Error {
         Self::State(value)
     }
 }
+impl From<crate::snapshots::SnapshotError> for Error {
+    fn from(value: crate::snapshots::SnapshotError) -> Self {
+        match value {
+            crate::snapshots::SnapshotError::Io(error) => Self::Io(error),
+            crate::snapshots::SnapshotError::Json(error) => Self::Json(error),
+            other => Self::Rejected {
+                category: "snapshot".into(),
+                message: other.to_string(),
+            },
+        }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -94,9 +106,30 @@ use crate::guest_worker::{ExecutionHint, GuestJob, GuestJobResult};
 pub use crate::guest_worker::{ExecutionHints, GuestPoll, GuestProgress};
 
 pub use crate::boot_preparation::{BootPreparation, PreparedBoot};
+pub use crate::capture_preparation::{CaptureAdmission, CapturePreparation, PreparedCapture};
 pub use crate::restore_preparation::{PreparedRestore, RestorePreparation};
 
 pub trait GuardianEffect {
+    fn prepare_capture(
+        &mut self,
+        _snapshot: SnapshotId,
+        _operation: OperationId,
+        _journal: &mut RuntimeJournal,
+    ) -> Result<CaptureAdmission> {
+        Err(Error::Unsupported(
+            "native full-state capture is unavailable",
+        ))
+    }
+    fn complete_capture(
+        &mut self,
+        _prepared: Box<PreparedCapture>,
+        _publish: bool,
+        _journal: &mut RuntimeJournal,
+    ) -> Result<NativeSnapshotResponse> {
+        Err(Error::Unsupported(
+            "native full-state capture is unavailable",
+        ))
+    }
     fn staged_restore_binding(&self) -> Option<&Digest> {
         None
     }
@@ -336,6 +369,17 @@ struct RestorePending {
     accepted_revision: Counter,
     input: RestorePreparation,
 }
+struct CapturePending {
+    observation: MachineObservation,
+    accepted_revision: Counter,
+}
+enum FullCaptureAdmission {
+    Ready(Box<GuardianResponse>),
+    Queued {
+        input: Box<CapturePreparation>,
+        pending: CapturePending,
+    },
+}
 enum RestoreAdmission {
     Ready(GuardianResponse),
     Queued {
@@ -373,6 +417,110 @@ fn rejected(error: Error) -> GuardianResponse {
 }
 
 impl<E: GuardianEffect> Guardian<E> {
+    fn capture_observation(
+        &mut self,
+        generation: Counter,
+        revision: Counter,
+    ) -> Result<MachineObservation> {
+        self.refresh_native_observation()?;
+        let observation = self
+            .journal
+            .last_observation()?
+            .ok_or(Error::Protocol("capture has no native machine observation"))?
+            .value()
+            .clone();
+        if observation.generation != generation
+            || observation.applied_revision != revision
+            || self.journal.accepted_revision()? != revision
+            || !matches!(
+                observation.state,
+                MachineState::Running | MachineState::Paused
+            )
+        {
+            return Err(Error::Protocol(
+                "capture generation, revision or native power changed",
+            ));
+        }
+        Ok(observation)
+    }
+    fn begin_capture(
+        &mut self,
+        machine_id: MachineId,
+        request: NativeSnapshotRequest,
+    ) -> Result<FullCaptureAdmission> {
+        if &machine_id != self.journal.machine_id() {
+            return Err(Error::Protocol("guardian machine identity mismatch"));
+        }
+        if self.offline_in_flight {
+            return Err(Error::Rejected {
+                category: "capacity".into(),
+                message: "offline preparation is already in flight".into(),
+            });
+        }
+        let NativeSnapshotRequest::PrepareFull {
+            snapshot_id,
+            operation_id,
+            expected_generation,
+            expected_revision,
+        } = request
+        else {
+            return Err(Error::Protocol(
+                "detached capture requires a full-state request",
+            ));
+        };
+        let observation = self.capture_observation(expected_generation, expected_revision)?;
+        let accepted_revision = self.journal.accepted_revision()?;
+        match self
+            .effect
+            .as_mut()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?
+            .prepare_capture(snapshot_id, operation_id, &mut self.journal)?
+        {
+            CaptureAdmission::Ready(capture) => Ok(FullCaptureAdmission::Ready(Box::new(
+                GuardianResponse::NativeSnapshot {
+                    response: NativeSnapshotResponse::Prepared { capture: *capture },
+                },
+            ))),
+            CaptureAdmission::Queued(input) => {
+                self.offline_in_flight = true;
+                Ok(FullCaptureAdmission::Queued {
+                    input,
+                    pending: CapturePending {
+                        observation,
+                        accepted_revision,
+                    },
+                })
+            }
+        }
+    }
+
+    fn finish_capture(
+        &mut self,
+        pending: CapturePending,
+        result: Result<Box<PreparedCapture>>,
+    ) -> Result<GuardianResponse> {
+        self.offline_in_flight = false;
+        self.refresh_native_observation()?;
+        let current = self.journal.accepted_revision()? == pending.accepted_revision
+            && self
+                .journal
+                .last_observation()?
+                .as_ref()
+                .map(|value| value.value())
+                == Some(&pending.observation);
+        let prepared = result?;
+        let response = self
+            .effect
+            .as_mut()
+            .ok_or(Error::Unsupported("native owner is unavailable"))?
+            .complete_capture(prepared, current, &mut self.journal)?;
+        if !current {
+            return Err(Error::Protocol(
+                "full capture was superseded by native state or host authority",
+            ));
+        }
+        Ok(GuardianResponse::NativeSnapshot { response })
+    }
     fn begin_restore(
         &mut self,
         machine_id: MachineId,
@@ -1433,7 +1581,7 @@ impl<E: GuardianEffect> Guardian<E> {
                 match &request {
                     NativeSnapshotRequest::StageRestore { .. } => {
                         return Err(Error::Protocol(
-                            "full restore must use detached preparation",
+                            "full state operations must use detached preparation",
                         ));
                     }
                     NativeSnapshotRequest::PrepareDisk {
@@ -1446,20 +1594,10 @@ impl<E: GuardianEffect> Guardian<E> {
                         expected_revision,
                         ..
                     } => {
-                        self.refresh_native_observation()?;
-                        let current = self
-                            .journal
-                            .last_observation()?
-                            .ok_or(Error::Protocol("capture has no native machine observation"))?;
-                        if current.value().generation != *expected_generation
-                            || current.value().applied_revision != *expected_revision
-                            || !matches!(
-                                current.value().state,
-                                MachineState::Running | MachineState::Paused
-                            )
-                        {
+                        self.capture_observation(*expected_generation, *expected_revision)?;
+                        if matches!(request, NativeSnapshotRequest::PrepareFull { .. }) {
                             return Err(Error::Protocol(
-                                "capture generation, revision or native power changed",
+                                "full capture must use detached preparation",
                             ));
                         }
                     }
@@ -2251,6 +2389,23 @@ pub fn serve_guardian<E: GuardianEffect>(
                             reply,
                         }
                     }
+                    OfflineWorkItem::Capture {
+                        input,
+                        pending,
+                        reply,
+                    } => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            input.execute()
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(Error::Protocol("offline capture worker panicked"))
+                        });
+                        GuardianIngress::CaptureComplete {
+                            pending,
+                            result,
+                            reply,
+                        }
+                    }
                 };
                 if boot_completions.send(completion).is_err() {
                     break;
@@ -2434,6 +2589,59 @@ pub fn serve_guardian<E: GuardianEffect>(
                 Ok(GuardianIngress::Request { parsed, reply }) => {
                     last_request = std::time::Instant::now();
                     let response = match *parsed {
+                        Ok(GuardianRequest::NativeSnapshot {
+                            machine_id,
+                            request: request @ NativeSnapshotRequest::PrepareFull { .. },
+                        }) => {
+                            if outstanding_guest_jobs + usize::from(guardian.offline_in_flight)
+                                >= inflight_limit
+                            {
+                                let _ = reply.send(rejected(Error::Rejected {
+                                    category: "capacity".into(),
+                                    message: "host in-flight resource budget exhausted".into(),
+                                }));
+                                continue;
+                            }
+                            match guardian.begin_capture(machine_id, request) {
+                                Ok(FullCaptureAdmission::Ready(response)) => *response,
+                                Ok(FullCaptureAdmission::Queued { input, pending }) => {
+                                    if let Err(error) =
+                                        boot_jobs.try_send(OfflineWorkItem::Capture {
+                                            input,
+                                            pending,
+                                            reply: reply.clone(),
+                                        })
+                                    {
+                                        let item = match error {
+                                            mpsc::TrySendError::Full(item)
+                                            | mpsc::TrySendError::Disconnected(item) => item,
+                                        };
+                                        let OfflineWorkItem::Capture {
+                                            input,
+                                            pending,
+                                            reply,
+                                        } = item
+                                        else {
+                                            unreachable!()
+                                        };
+                                        // A failed queue never discards a transferred control channel. The
+                                        // bounded single-worker queue cannot be full after admission; if
+                                        // its receiver has failed, retire this guardian and contain its VM.
+                                        drop(input);
+                                        guardian.offline_in_flight = false;
+                                        drop(pending);
+                                        let _ = reply.send(rejected(Error::Protocol(
+                                            "offline capture queue is unavailable",
+                                        )));
+                                        break Err(Error::Protocol(
+                                            "offline capture worker is unavailable",
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                Err(error) => rejected(error),
+                            }
+                        }
                         Ok(GuardianRequest::NativeSnapshot {
                             machine_id,
                             request: request @ NativeSnapshotRequest::StageRestore { .. },
@@ -2671,6 +2879,16 @@ pub fn serve_guardian<E: GuardianEffect>(
                         .unwrap_or_else(rejected);
                     let _ = reply.send(response);
                 }
+                Ok(GuardianIngress::CaptureComplete {
+                    pending,
+                    result,
+                    reply,
+                }) => {
+                    let response = guardian
+                        .finish_capture(pending, result)
+                        .unwrap_or_else(rejected);
+                    let _ = reply.send(response);
+                }
                 Ok(GuardianIngress::Failed(error)) => break Err(error.into()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if outstanding_guest_jobs == 0
@@ -2741,6 +2959,11 @@ pub fn serve_guardian<E: GuardianEffect>(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 enum GuardianIngress {
+    CaptureComplete {
+        pending: CapturePending,
+        result: Result<Box<PreparedCapture>>,
+        reply: mpsc::Sender<GuardianResponse>,
+    },
     Request {
         parsed: Box<Result<GuardianRequest>>,
         reply: mpsc::Sender<GuardianResponse>,
@@ -2772,6 +2995,11 @@ struct BootWorkItem {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 enum OfflineWorkItem {
+    Capture {
+        input: Box<CapturePreparation>,
+        pending: CapturePending,
+        reply: mpsc::Sender<GuardianResponse>,
+    },
     Boot(BootWorkItem),
     Restore {
         input: RestorePreparation,

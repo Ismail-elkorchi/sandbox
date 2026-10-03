@@ -225,8 +225,12 @@ Pending forks, rollback, suspension and image publication prevent retirement;
 completed independent copies do not pin their source. Retirement blocks new
 uses, but storage remains charged until detached cleanup commits.
 
-Suspension retains its capture from admission through native completion. Its
-resumable input is derived from committed lifecycle evidence, not a second
+Suspension retains its capture from admission through native completion. The
+native save and large artifact copies run outside the serialized guardian
+control loop. The original native termination handle remains available during
+the save; changed host authority or native state fences late publication.
+The worker retains original snapshot custody until that completion is handled.
+Resumable input is derived from committed lifecycle evidence, not a second
 state transaction. A newer request alone cannot release possibly consumed
 saved-state bytes; a later completed native lifecycle closes that dependency.
 A full-state

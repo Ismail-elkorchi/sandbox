@@ -134,6 +134,9 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         if self.process.is_some() {
             return MachineOutcome::Unknown;
         }
+        if self.remove_full_snapshot().is_err() {
+            return Self::unavailable(b"firecracker-previous-save-cleanup-pending");
+        }
         let configuration = match self.factory.configuration(
             &self.machine_id,
             generation,
@@ -227,6 +230,12 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
             }
             return MachineOutcome::Unknown;
         }
+        // The original native tree has exited. Remove the exact save targets,
+        // including a transfer overtaken by power-off. Open worker readers can
+        // finish against their original inodes; a stale result cannot publish.
+        if self.remove_full_snapshot().is_err() {
+            eprintln!("sandsurf native capture files remain cleanup-pending after confirmed stop");
+        }
         MachineOutcome::Observed(vec![transition(
             command,
             generation,
@@ -270,13 +279,11 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
         self.remove_full_snapshot()
     }
 
-    /// Create engine state for the exact already-frozen workload boundary.
-    /// Repeating the same operation is safe; a different capture cannot replace
-    /// an active paused transaction.
-    pub fn create_full_snapshot(
+    /// Transfer only the save channel; the original native kill owner stays here.
+    pub fn prepare_full_snapshot(
         &mut self,
         operation_id: &OperationId,
-    ) -> Result<FirecrackerSnapshot, Digest> {
+    ) -> Result<crate::capture::CaptureTask, Digest> {
         if self
             .full_capture_operation
             .as_ref()
@@ -289,11 +296,41 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
             .process
             .as_ref()
             .ok_or_else(|| bytes_digest(b"firecracker-capture-owner-unavailable"))?;
-        let snapshot = process
-            .create_full_snapshot(operation_id.as_str())
+        let task = process
+            .prepare_full_snapshot(operation_id.as_str())
             .map_err(|_| bytes_digest(b"firecracker-full-snapshot-failed"))?;
         self.full_capture_operation = Some(operation_id.clone());
-        self.full_snapshot = Some(snapshot.clone());
+        // Cleanup owns the exact future native files before the save worker
+        // can write them, including interrupted or failed native transfers.
+        self.full_snapshot = Some(task.paths());
+        Ok(crate::capture::CaptureTask::Firecracker(task))
+    }
+
+    pub fn complete_full_snapshot(
+        &mut self,
+        operation: &OperationId,
+        completion: crate::capture::CaptureCompletion,
+    ) -> Result<crate::capture::SnapshotFiles, std::io::Error> {
+        let snapshot = completion.files?;
+        if !self.capture_paused
+            || self.full_capture_operation.as_ref() != Some(operation)
+            || self
+                .process
+                .as_ref()
+                .is_none_or(|process| snapshot.state.parent() != process.api_socket_path.parent())
+        {
+            return Err(std::io::Error::other("full capture native owner changed"));
+        }
+        let (memory, memory_bytes) = snapshot
+            .memory
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Firecracker capture has no RAM"))?;
+        self.full_snapshot = Some(FirecrackerSnapshot {
+            snapshot_state: snapshot.state.clone(),
+            snapshot_memory: memory.clone(),
+            state_bytes: snapshot.state_bytes,
+            memory_bytes: *memory_bytes,
+        });
         Ok(snapshot)
     }
 
@@ -404,6 +441,11 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
             // observe_power confirmed and reaped the confined process tree.
             self.guest_reset = process.guest_reset_evidence();
             self.process.take();
+            if self.remove_full_snapshot().is_err() {
+                eprintln!(
+                    "sandsurf native capture files remain cleanup-pending after confirmed exit"
+                );
+            }
             self.boot_resources = None;
             self.capture_paused = false;
             self.full_capture_operation = None;
