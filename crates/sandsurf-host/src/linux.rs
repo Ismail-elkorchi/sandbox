@@ -900,7 +900,7 @@ impl GuardianEffect for LinuxGuardianEffect {
             }
             NativeSnapshotRequest::FinishDisk { operation_id } => {
                 crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
-                self.finish_native_capture()?;
+                self.finish_native_capture(journal)?;
                 Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"native-disk-capture-released-v1"),
                 })
@@ -912,7 +912,7 @@ impl GuardianEffect for LinuxGuardianEffect {
             } => self.prepare_full_capture(snapshot_id, operation_id, journal),
             NativeSnapshotRequest::FinishFull { operation_id } => {
                 crate::capture::CaptureBoundary::require(&self.machine_root, &operation_id)?;
-                self.finish_native_capture().map_err(|_| {
+                self.finish_native_capture(journal).map_err(|_| {
                     ControlError::Unsupported("native VM could not resume after full capture")
                 })?;
                 remove_full_capture(&self.machine_root, &operation_id)?;
@@ -1131,8 +1131,8 @@ impl LinuxGuardianEffect {
         let boundary = crate::capture::CaptureBoundary::begin(
             &self.machine_root,
             operation_id,
-            observation.value().generation,
-            observation.value().state,
+            observation.value(),
+            journal.accepted_revision()?,
         )?;
         // A capture can reset the vsock device, including connections in the
         // source VM. Close the reusable session only after its active bounded
@@ -1146,7 +1146,7 @@ impl LinuxGuardianEffect {
         result.map_err(|_| ControlError::Unsupported("native capture pause failed"))
     }
 
-    fn finish_native_capture(&mut self) -> ControlResult<()> {
+    fn finish_native_capture(&mut self, journal: &RuntimeJournal) -> ControlResult<()> {
         let Some(boundary) = crate::capture::CaptureBoundary::read(&self.machine_root)? else {
             return Ok(());
         };
@@ -1161,7 +1161,14 @@ impl LinuxGuardianEffect {
             .ok_or(ControlError::Unsupported(
                 "native capture owner unavailable",
             ))?;
-        let result = if boundary.needs_resume(power.state)? {
+        let observation = journal.last_observation()?.ok_or(ControlError::Protocol(
+            "capture release has no native machine observation",
+        ))?;
+        let result = if boundary.needs_resume(
+            power.state,
+            observation.value(),
+            journal.accepted_revision()?,
+        )? {
             self.machine
                 .adopt_pause_for_capture()
                 .map_err(|_| ControlError::Unsupported("native capture owner unavailable"))?;
@@ -1187,7 +1194,7 @@ impl LinuxGuardianEffect {
         {
             // Do not erase an indeterminate pause owner. Only confirmed native
             // completion permits retiring this operation's unpublished copy.
-            self.finish_native_capture()?;
+            self.finish_native_capture(journal)?;
             crate::capture::remove_full(&self.machine_root, &operation_id)?;
         }
         result

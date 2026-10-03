@@ -3,7 +3,7 @@
 //! precisely its own capture, preserving a pause requested by the application.
 
 use crate::guardian::{Error, Result};
-use sandsurf_protocol::{Counter, MachineState, OperationId};
+use sandsurf_protocol::{Counter, MachineObservation, MachineState, OperationId};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
@@ -91,11 +91,36 @@ impl CaptureBoundary {
         ) && Self::read(root)?.is_none())
     }
 
-    /// A lost native resume response is not permission to resume twice, and a
-    /// failed preparation is not proof that the computer was ever paused.
-    pub fn needs_resume(&self, observed: MachineState) -> Result<bool> {
+    /// A temporary native pause is not lifecycle intent. Releasing it may
+    /// resume only the current, fully applied running authority. Newer accepted
+    /// authority instead releases custody without resuming; the guardian then
+    /// records the unmasked native pause, not an applied lifecycle decision.
+    /// A lost resume response is never permission to resume twice.
+    pub fn needs_resume(
+        &self,
+        observed: MachineState,
+        current: &MachineObservation,
+        accepted_revision: Counter,
+    ) -> Result<bool> {
         match observed {
-            MachineState::Paused => Ok(!self.preserve_pause),
+            MachineState::Paused => {
+                if current.generation != self.generation {
+                    return Err(Error::Unsupported("capture release has a stale generation"));
+                }
+                if self.preserve_pause {
+                    return Ok(false);
+                }
+                if accepted_revision != current.applied_revision {
+                    return Ok(false);
+                }
+                match current.state {
+                    MachineState::Running => Ok(true),
+                    MachineState::Paused => Ok(false),
+                    _ => Err(Error::Unsupported(
+                        "capture release lacks an applied native power boundary",
+                    )),
+                }
+            }
             MachineState::Running | MachineState::Stopped | MachineState::Failed => Ok(false),
             _ => Err(Error::Unsupported(
                 "native capture power state is indeterminate",
@@ -124,9 +149,16 @@ impl CaptureBoundary {
     pub fn begin(
         root: &Path,
         operation_id: OperationId,
-        generation: Counter,
-        state: MachineState,
+        current: &MachineObservation,
+        accepted_revision: Counter,
     ) -> Result<Self> {
+        if current.applied_revision != accepted_revision {
+            return Err(Error::Unsupported(
+                "capture admission awaits accepted host authority",
+            ));
+        }
+        let generation = current.generation;
+        let state = current.state;
         if !matches!(state, MachineState::Running | MachineState::Paused) {
             return Err(Error::Unsupported(
                 "capture requires a running or paused computer",
@@ -206,6 +238,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    fn current(state: MachineState) -> MachineObservation {
+        MachineObservation {
+            machine_id: "computer".try_into().unwrap(),
+            generation: Counter::ONE,
+            sequence: Counter::ONE,
+            state,
+            applied_revision: Counter::ONE,
+            cause: sandsurf_protocol::ObservationCause::Native {},
+            evidence_digest: sandsurf_protocol::bytes_digest(b"native power"),
+        }
+    }
 
     #[test]
     fn uncertain_or_running_power_never_retires_an_interrupted_capture() {
@@ -213,8 +256,8 @@ mod tests {
         CaptureBoundary::begin(
             &root.0,
             "capture".try_into().unwrap(),
+            &current(MachineState::Running),
             Counter::ONE,
-            MachineState::Running,
         )
         .unwrap();
         assert!(
@@ -281,17 +324,88 @@ mod tests {
             generation: Counter::ONE,
             preserve_pause: false,
         };
-        assert!(boundary.needs_resume(MachineState::Paused).unwrap());
+        let observation = current(MachineState::Running);
+        assert!(
+            boundary
+                .needs_resume(MachineState::Paused, &observation, Counter::ONE)
+                .unwrap()
+        );
         for state in [
             MachineState::Running,
             MachineState::Stopped,
             MachineState::Failed,
         ] {
-            assert!(!boundary.needs_resume(state).unwrap());
+            assert!(
+                !boundary
+                    .needs_resume(state, &observation, Counter::ONE)
+                    .unwrap()
+            );
         }
-        assert!(boundary.needs_resume(MachineState::Starting).is_err());
+        assert!(
+            boundary
+                .needs_resume(MachineState::Starting, &observation, Counter::ONE)
+                .is_err()
+        );
         boundary.preserve_pause = true;
-        assert!(!boundary.needs_resume(MachineState::Paused).unwrap());
+        assert!(
+            !boundary
+                .needs_resume(MachineState::Paused, &observation, Counter::ONE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn pending_authority_blocks_capture_admission_and_cannot_be_overridden_by_cleanup() {
+        let root = Temp::new();
+        let operation: OperationId = "capture".try_into().unwrap();
+        let running = current(MachineState::Running);
+        let next = Counter::ONE.next().unwrap();
+        assert!(CaptureBoundary::begin(&root.0, operation.clone(), &running, next).is_err());
+        assert!(CaptureBoundary::read(&root.0).unwrap().is_none());
+        let boundary =
+            CaptureBoundary::begin(&root.0, operation.clone(), &running, Counter::ONE).unwrap();
+        // A host pause/stop/configuration accepted during byte copying has not
+        // yet produced native evidence. Cleanup cannot restore old authority.
+        assert!(
+            !boundary
+                .needs_resume(MachineState::Paused, &running, next)
+                .unwrap()
+        );
+        assert!(CaptureBoundary::begin(&root.0, operation, &running, next).is_err());
+        assert_eq!(
+            CaptureBoundary::read(&root.0).unwrap(),
+            Some(boundary.clone())
+        );
+        let paused = MachineObservation {
+            applied_revision: next,
+            ..current(MachineState::Paused)
+        };
+        assert!(
+            !boundary
+                .needs_resume(MachineState::Paused, &paused, next)
+                .unwrap(),
+            "applied application pause must survive capture completion"
+        );
+        let reconfigured = MachineObservation {
+            applied_revision: next,
+            ..running.clone()
+        };
+        assert!(
+            boundary
+                .needs_resume(MachineState::Paused, &reconfigured, next)
+                .unwrap(),
+            "a fully applied non-power change does not strand a temporary pause"
+        );
+        let different = MachineObservation {
+            generation: next,
+            ..running
+        };
+        assert!(
+            boundary
+                .needs_resume(MachineState::Paused, &different, Counter::ONE)
+                .is_err()
+        );
+        assert_eq!(CaptureBoundary::read(&root.0).unwrap(), Some(boundary));
     }
 
     #[test]
@@ -301,8 +415,8 @@ mod tests {
         let boundary = CaptureBoundary::begin(
             &root.0,
             operation.clone(),
+            &current(MachineState::Running),
             Counter::ONE,
-            MachineState::Running,
         )
         .unwrap();
         let directory = root.stage(&operation);
@@ -333,8 +447,8 @@ mod tests {
         CaptureBoundary::begin(
             &root.0,
             operation.clone(),
+            &current(MachineState::Paused),
             Counter::ONE,
-            MachineState::Paused,
         )
         .unwrap();
         let directory = root.stage(&operation);
@@ -368,8 +482,8 @@ mod tests {
         CaptureBoundary::begin(
             &root.0,
             operation.clone(),
+            &current(MachineState::Paused),
             Counter::ONE,
-            MachineState::Paused,
         )
         .unwrap();
         let directory = root.stage(&operation);
@@ -396,9 +510,13 @@ mod tests {
         #[cfg(windows)]
         sandsurf_native::local::create_private_directory(&root).unwrap();
         let operation: OperationId = "capture".try_into().unwrap();
-        let original =
-            CaptureBoundary::begin(&root, operation.clone(), Counter::ONE, MachineState::Paused)
-                .unwrap();
+        let original = CaptureBoundary::begin(
+            &root,
+            operation.clone(),
+            &current(MachineState::Paused),
+            Counter::ONE,
+        )
+        .unwrap();
         assert!(
             CaptureBoundary::read(&root)
                 .unwrap()
@@ -407,16 +525,21 @@ mod tests {
         );
         assert_eq!(
             original,
-            CaptureBoundary::begin(&root, operation.clone(), Counter::ONE, MachineState::Paused)
-                .unwrap()
+            CaptureBoundary::begin(
+                &root,
+                operation.clone(),
+                &current(MachineState::Paused),
+                Counter::ONE
+            )
+            .unwrap()
         );
         assert_eq!(
             original,
             CaptureBoundary::begin(
                 &root,
                 operation.clone(),
-                Counter::ONE,
-                MachineState::Running
+                &current(MachineState::Running),
+                Counter::ONE
             )
             .unwrap(),
             "retry must preserve the recorded pause owner, not reinterpret a later observation"
@@ -426,8 +549,11 @@ mod tests {
             CaptureBoundary::begin(
                 &root,
                 operation.clone(),
-                Counter::ONE.next().unwrap(),
-                MachineState::Paused
+                &MachineObservation {
+                    generation: Counter::ONE.next().unwrap(),
+                    ..current(MachineState::Paused)
+                },
+                Counter::ONE
             )
             .is_err()
         );

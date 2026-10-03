@@ -1444,7 +1444,7 @@ fn durable_capture_ownership_fences_native_delivery_and_never_blocks_forced_cont
                 DesiredState::Running,
                 Delivery::NotApplied,
             ),
-            ("captured-pause", DesiredState::Paused, Delivery::NotApplied),
+            ("captured-pause", DesiredState::Paused, Delivery::Applied),
             (
                 "captured-power-off",
                 DesiredState::Stopped,

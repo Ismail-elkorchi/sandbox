@@ -19,6 +19,7 @@ const TERMINATE: [u8; 8] = *b"SSTERM01";
 const MEASURE: [u8; 8] = *b"SSUSG001";
 pub const BROKER_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 pub const BROKER_CPU_MICROS: u64 = 10000;
+pub const VMM_PROFILE_BYTES: usize = 65536;
 
 /// Native child termination reported by its retained privileged parent. The
 /// broker dying without this evidence does not establish that its worker died.
@@ -186,9 +187,45 @@ pub(crate) fn validate_custody_count(kind: WorkerKind, count: usize) -> io::Resu
 #[cfg(any(target_os = "macos", test))]
 fn argument_bounds(kind: WorkerKind) -> (usize, usize) {
     match kind {
-        WorkerKind::VirtualMachine => (128, 64 * 1024),
+        WorkerKind::VirtualMachine => (128, 128 * 1024),
         _ => (16, 16 * 1024),
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_arguments(kind: WorkerKind, arguments: &[std::ffi::OsString]) -> io::Result<()> {
+    let (maximum_count, maximum_bytes) = argument_bounds(kind);
+    if kind == WorkerKind::VirtualMachine
+        && (arguments
+            .first()
+            .is_none_or(|arg| arg != "--sandsurf-seatbelt")
+            || arguments.get(1).is_none_or(|arg| arg.is_empty()))
+    {
+        return Err(invalid(
+            "virtual-machine role requires a native confinement profile",
+        ));
+    }
+    if arguments.len() > maximum_count
+        || arguments
+            .iter()
+            .map(|value| value.as_encoded_bytes().len())
+            .sum::<usize>()
+            > maximum_bytes
+        || arguments.iter().enumerate().any(|(index, value)| {
+            value.as_encoded_bytes().len()
+                > if kind == WorkerKind::VirtualMachine && index == 1 {
+                    VMM_PROFILE_BYTES
+                } else {
+                    4096
+                }
+                || value.as_encoded_bytes().contains(&0)
+        })
+    {
+        return Err(invalid(
+            "worker arguments exceed the bounded launch envelope",
+        ));
+    }
+    Ok(())
 }
 
 /// Split an admitted envelope, never add a second allowance outside it. The
@@ -687,25 +724,6 @@ pub mod macos {
         }
     }
 
-    fn validate_arguments(kind: WorkerKind, arguments: &[OsString]) -> io::Result<()> {
-        let (maximum_count, maximum_bytes) = argument_bounds(kind);
-        if arguments.len() > maximum_count
-            || arguments
-                .iter()
-                .map(|value| value.as_encoded_bytes().len())
-                .sum::<usize>()
-                > maximum_bytes
-            || arguments.iter().any(|value| {
-                value.as_encoded_bytes().len() > 4096 || value.as_encoded_bytes().contains(&0)
-            })
-        {
-            return Err(invalid(
-                "worker arguments exceed the bounded launch envelope",
-            ));
-        }
-        Ok(())
-    }
-
     /// The single-threaded elevated entrypoint discards all caller descriptors
     /// except stdio and the original owner lease. Enumerate actual open FDs,
     /// not RLIMIT_NOFILE: a caller may lower that limit after opening high FDs.
@@ -1167,7 +1185,7 @@ mod tests {
     }
     #[test]
     fn virtual_hardware_has_a_bounded_larger_launch_envelope_than_host_modes() {
-        assert_eq!(argument_bounds(WorkerKind::VirtualMachine), (128, 65536));
+        assert_eq!(argument_bounds(WorkerKind::VirtualMachine), (128, 131072));
         for kind in [
             WorkerKind::Api,
             WorkerKind::Supervisor,
@@ -1176,6 +1194,28 @@ mod tests {
         ] {
             assert_eq!(argument_bounds(kind), (16, 16384));
         }
+    }
+    #[test]
+    fn only_the_mandatory_vmm_profile_can_exceed_an_ordinary_argument_bound() {
+        use std::ffi::OsString;
+        let mut args = vec![
+            OsString::from("--sandsurf-seatbelt"),
+            "x".repeat(VMM_PROFILE_BYTES).into(),
+            "-S".into(),
+        ];
+        validate_arguments(WorkerKind::VirtualMachine, &args).unwrap();
+        args[1] = "x".repeat(VMM_PROFILE_BYTES + 1).into();
+        assert!(validate_arguments(WorkerKind::VirtualMachine, &args).is_err());
+        args[1] = "policy".into();
+        args.push("x".repeat(4097).into());
+        assert!(validate_arguments(WorkerKind::VirtualMachine, &args).is_err());
+        args.pop();
+        args[1] = "".into();
+        assert!(validate_arguments(WorkerKind::VirtualMachine, &args).is_err());
+        args[1] = "policy\0injection".into();
+        assert!(validate_arguments(WorkerKind::VirtualMachine, &args).is_err());
+        assert!(validate_arguments(WorkerKind::VirtualMachine, &["-S".into()]).is_err());
+        assert!(validate_arguments(WorkerKind::Api, &["x".repeat(4097).into()]).is_err());
     }
     #[test]
     fn broker_loss_or_invalid_receipts_cannot_be_read_as_clean_worker_exit() {

@@ -16,6 +16,10 @@ fn main() {
         assert_eq!(args.next().as_deref(), Some("--owned-leases"));
         let count: usize = args.next().unwrap().parse().unwrap();
         assert!((1..=sandsurf_native::MAX_WORKER_CUSTODY).contains(&count));
+        assert_eq!(args.next().as_deref(), Some("--sandsurf-seatbelt"));
+        // This Rust fixture tests resource ownership only. Filesystem policy
+        // is exercised by the actual C VMM gate, not implemented again here.
+        assert!(!args.next().unwrap().is_empty());
     }
     match args.next().as_deref() {
         Some("cpu") => {

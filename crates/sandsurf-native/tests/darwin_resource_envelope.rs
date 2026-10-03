@@ -99,7 +99,11 @@ fn kernel_envelopes_apply_after_exec_and_service_lifetime_is_not_observer_lifeti
     let snapshot = sandsurf_native::storage::read_lease(&snapshot_path).unwrap();
     let mut worker = launch_vm(
         budget,
-        &["owner-loss".into()],
+        &[
+            "--sandsurf-seatbelt".into(),
+            "(version 1)(deny default)".into(),
+            "owner-loss".into(),
+        ],
         vec![std::sync::Arc::new(custody), std::sync::Arc::new(snapshot)],
         Stdio::inherit(),
     )

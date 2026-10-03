@@ -903,8 +903,10 @@ impl<E: GuardianEffect> Guardian<E> {
             ));
         }
         if measured.state == MachineState::Paused && !matches!(effect.capture_owner(), Ok(None)) {
-            // Capture owns this temporary pause; it is not public pause intent.
-            return Ok(false);
+            // Mask only the temporary pause. A lifecycle pause which adopted
+            // this same physical boundary remains a current native fact, even
+            // while the capture journal is busy or unreadable.
+            return Ok(current.state == MachineState::Paused);
         }
         if measured.state == MachineState::Stopped
             && current.state == MachineState::Starting
@@ -1158,7 +1160,10 @@ impl<E: GuardianEffect> Guardian<E> {
                     .as_mut()
                     .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
                 let outcome = permit.perform(|actual| {
-                    if matches!(actual.desired, DesiredState::Running | DesiredState::Paused) {
+                    // Running would invalidate an in-flight disk/memory copy.
+                    // An authorized pause may take over the same native paused
+                    // boundary; capture cleanup will preserve that public state.
+                    if actual.desired == DesiredState::Running {
                         match native.capture_owner() {
                             Ok(None) => {}
                             Ok(Some(_)) => {
@@ -1449,11 +1454,22 @@ impl<E: GuardianEffect> Guardian<E> {
                     }
                     _ => {}
                 }
+                let releasing = matches!(
+                    request,
+                    NativeSnapshotRequest::FinishDisk { .. }
+                        | NativeSnapshotRequest::FinishFull { .. }
+                );
                 let response = self
                     .effect
                     .as_mut()
                     .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
                     .native_snapshot(request, &mut self.journal)?;
+                if releasing {
+                    // Releasing under newer unapplied authority deliberately
+                    // does not resume an older envelope. With capture masking
+                    // gone, record actual power without completing host intent.
+                    self.refresh_native_observation()?;
+                }
                 Ok(GuardianResponse::NativeSnapshot { response })
             }
             GuardianRequest::Runtime {

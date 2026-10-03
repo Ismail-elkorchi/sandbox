@@ -71,7 +71,48 @@ impl GuardianEffect for Native {
         }
     }
     fn capture_owner(&self) -> Result<Option<OperationId>> {
-        Ok(None)
+        Ok(crate::capture::CaptureBoundary::read(&self.root)?.map(|value| value.operation_id))
+    }
+    fn native_snapshot(
+        &mut self,
+        request: NativeSnapshotRequest,
+        journal: &mut RuntimeJournal,
+    ) -> Result<NativeSnapshotResponse> {
+        match request {
+            NativeSnapshotRequest::PrepareDisk { operation_id, .. } => {
+                let current = journal.last_observation()?.unwrap();
+                crate::capture::CaptureBoundary::begin(
+                    &self.root,
+                    operation_id,
+                    current.value(),
+                    journal.accepted_revision()?,
+                )?;
+                self.measured = Some(MachineState::Paused);
+            }
+            NativeSnapshotRequest::FinishDisk { operation_id } => {
+                if let Some(boundary) =
+                    crate::capture::CaptureBoundary::require(&self.root, &operation_id)?
+                {
+                    let current = journal.last_observation()?.unwrap();
+                    if boundary.needs_resume(
+                        self.measured.unwrap(),
+                        current.value(),
+                        journal.accepted_revision()?,
+                    )? {
+                        self.measured = Some(MachineState::Running);
+                    }
+                    crate::capture::CaptureBoundary::clear(&self.root)?;
+                }
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "fixture snapshot operation is unsupported",
+                ));
+            }
+        }
+        Ok(NativeSnapshotResponse::Complete {
+            evidence: bytes_digest(b"fixture-native-capture"),
+        })
     }
     fn guest_driver(&mut self) -> Box<dyn GuestDriver> {
         Box::new(NoGuest)
@@ -116,6 +157,7 @@ impl GuardianEffect for Native {
         let target = match command.desired {
             DesiredState::Running => MachineState::Running,
             DesiredState::Stopped => MachineState::Stopped,
+            DesiredState::Paused => MachineState::Paused,
             DesiredState::Destroyed => MachineState::Destroyed,
             _ => panic!("unsupported fixture lifecycle"),
         };
@@ -365,6 +407,142 @@ fn retire(fixture: Fixture) {
     let root = fixture.root.clone();
     drop(fixture);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn capture_release_preserves_applied_pause_and_never_replays_pending_running_authority() {
+    for desired in [DesiredState::Paused, DesiredState::Running] {
+        let mut f = Fixture::new();
+        f.start();
+        let current = f
+            .guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .clone();
+        let operation_id: OperationId = "capture".try_into().unwrap();
+        let response = f.guardian.handle(GuardianRequest::NativeSnapshot {
+            machine_id: current.machine_id.clone(),
+            request: NativeSnapshotRequest::PrepareDisk {
+                operation_id: operation_id.clone(),
+                expected_generation: current.generation,
+                expected_revision: current.applied_revision,
+            },
+        });
+        assert!(
+            matches!(
+                response,
+                GuardianResponse::NativeSnapshot {
+                    response: NativeSnapshotResponse::Complete { .. }
+                }
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            f.guardian.effect.as_ref().unwrap().measured,
+            Some(MachineState::Paused)
+        );
+        assert_eq!(
+            f.guardian
+                .journal
+                .last_observation()
+                .unwrap()
+                .unwrap()
+                .value(),
+            &current,
+            "temporary capture pause is not public lifecycle intent"
+        );
+        let authorization = f.intent("during-capture", desired);
+        let response = f.guardian.transition(authorization.clone(), None).unwrap();
+        assert_eq!(
+            delivery(response),
+            if desired == DesiredState::Paused {
+                Delivery::Applied
+            } else {
+                Delivery::NotApplied
+            }
+        );
+        let finish = GuardianRequest::NativeSnapshot {
+            machine_id: current.machine_id.clone(),
+            request: NativeSnapshotRequest::FinishDisk { operation_id },
+        };
+        let response = f.guardian.handle(finish.clone());
+        assert!(
+            matches!(
+                response,
+                GuardianResponse::NativeSnapshot {
+                    response: NativeSnapshotResponse::Complete { .. }
+                }
+            ),
+            "{response:?}"
+        );
+        let after = f
+            .guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value()
+            .clone();
+        assert_eq!(after.state, MachineState::Paused);
+        assert_eq!(after.generation, current.generation);
+        assert!(
+            f.guardian
+                .effect
+                .as_ref()
+                .unwrap()
+                .capture_owner()
+                .unwrap()
+                .is_none()
+        );
+        if desired == DesiredState::Paused {
+            assert_eq!(
+                after.applied_revision,
+                authorization.statement.command.revision
+            );
+            assert_eq!(
+                after.cause,
+                ObservationCause::Lifecycle {
+                    operation_id: "during-capture".try_into().unwrap()
+                }
+            );
+        } else {
+            assert_eq!(after.applied_revision, current.applied_revision);
+            assert_eq!(after.cause, ObservationCause::Native {});
+            assert_eq!(
+                f.guardian
+                    .journal
+                    .lifecycle_operation(&"during-capture".try_into().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .delivery,
+                Delivery::NotApplied
+            );
+        }
+        let response = f.guardian.handle(finish);
+        assert!(
+            matches!(
+                response,
+                GuardianResponse::NativeSnapshot {
+                    response: NativeSnapshotResponse::Complete { .. }
+                }
+            ),
+            "{response:?}"
+        );
+        assert_eq!(
+            f.guardian
+                .journal
+                .last_observation()
+                .unwrap()
+                .unwrap()
+                .value(),
+            &after,
+            "lost finish response must not resume or append another native observation"
+        );
+        retire(f);
+    }
 }
 
 fn restore_request(f: &mut Fixture) -> NativeSnapshotRequest {

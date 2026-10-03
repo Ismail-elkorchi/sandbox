@@ -48,7 +48,12 @@ int main(int argc, char **argv)
     cannot_open(argv[3], O_RDONLY);
     cannot_open(argv[3], O_WRONLY);
     int capture = open(argv[4], O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    assert(capture >= 0 && write(capture, "S", 1) == 1 && fsync(capture) == 0);
+    if (capture < 0) {
+        perror("admitted native capture open");
+        _exit(99);
+    }
+    assert(write(capture, "S", 1) == 1);
+    assert(fsync(capture) == 0);
     close(capture);
     cannot_open(argv[5], O_WRONLY | O_CREAT);
     // The native machine has only AF_UNIX device endpoints, never host IP

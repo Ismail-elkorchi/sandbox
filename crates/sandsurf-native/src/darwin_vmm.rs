@@ -5,8 +5,6 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const MAX_PROFILE_BYTES: usize = 65536;
-
 pub struct Files {
     /// Individually verified executable, libraries, firmware and boot inputs.
     /// Never the runtime directory, guardian directory, or image directory.
@@ -92,17 +90,18 @@ impl Files {
         // Only native state bytes may be written in future capture directories.
         // In particular capture.json, reconnect.json and boot/auth are NOT
         // writable by the VMM. The host creates each operation directory.
-        let pattern = format!(
-            "^{}/id-[0-9a-f]{{64}}/snapshot[.]vmstate$",
-            regex_literal(text(&captures)?)
-        );
+        // Keep caller path bytes in a literal filter, not the kernel regex
+        // language. Express the bounded address explicitly rather than relying
+        // on counted repetition or pathname regexp escaping in Seatbelt.
+        let pattern = format!("/id-{}/snapshot[.]vmstate$", "[0-9a-f]".repeat(64));
         writeln!(
             profile,
-            "(allow file-read* file-write* (regex {}))",
+            "(allow file-read* file-write* (require-all (subpath {}) (regex {})))",
+            quoted(&captures)?,
             string_literal(&pattern)
         )
         .unwrap();
-        if profile.len() > MAX_PROFILE_BYTES {
+        if profile.len() > crate::resource_broker::VMM_PROFILE_BYTES {
             return Err(invalid("VMM confinement profile exceeds its byte bound"));
         }
         Ok(profile)
@@ -134,16 +133,6 @@ fn quoted(path: &Path) -> io::Result<String> {
 fn string_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
-fn regex_literal(value: &str) -> String {
-    let mut escaped = String::new();
-    for character in value.chars() {
-        if "\\.^$|?*+()[]{}".contains(character) {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -174,9 +163,15 @@ mod tests {
         let profile = files.profile().unwrap();
         assert!(profile.contains("(deny network*)"));
         assert!(!profile.contains("allow network-outbound"));
-        assert!(profile.contains("/id-[0-9a-f]{64}/snapshot[.]vmstate$"));
+        assert!(profile.contains(&format!(
+            "/id-{}/snapshot[.]vmstate$",
+            "[0-9a-f]".repeat(64)
+        )));
         assert!(profile.contains(&quoted(&kernel).unwrap()));
-        assert_eq!(regex_literal("/a\"(x)\\"), "/a\"\\(x\\)\\\\");
+        assert!(profile.contains(&format!(
+            "(require-all (subpath {})",
+            quoted(&captures).unwrap()
+        )));
         assert!(!profile.contains("capture.json"));
         assert_eq!(string_literal("\"\\"), "\"\\\"\\\\\"");
         files.read_only.push(disk.clone());

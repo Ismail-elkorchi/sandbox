@@ -369,15 +369,20 @@ impl FirecrackerProcess {
         self.termination_requested
     }
 
-    /// Pause vCPUs through the private Firecracker API and wait for the API's
-    /// committed response. This retains the VMM and guest memory.
+    /// Establish a native paused postcondition. A capture may already own that
+    /// physical pause; an authorized lifecycle pause can adopt it without an
+    /// invalid duplicate patch or changing capture's byte-copy boundary.
     pub fn pause(&self) -> Result<(), FirecrackerError> {
-        self.patch_vm_state("Paused")
+        ensure_power(true, |method, resource, body, status| {
+            self.api_request(method, resource, body, status)
+        })
     }
 
     /// Resume a VM previously paused through the same private API socket.
     pub fn resume(&self) -> Result<(), FirecrackerError> {
-        self.patch_vm_state("Resumed")
+        ensure_power(false, |method, resource, body, status| {
+            self.api_request(method, resource, body, status)
+        })
     }
 
     /// Create a full snapshot while the VM is paused. Files are produced in
@@ -421,12 +426,6 @@ impl FirecrackerProcess {
             state_bytes: state,
             memory_bytes: memory,
         })
-    }
-
-    fn patch_vm_state(&self, state: &str) -> Result<(), FirecrackerError> {
-        let body = serde_json::to_vec(&serde_json::json!({ "state": state }))
-            .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
-        self.api_request("PATCH", "/vm", &body, 204).map(drop)
     }
 
     fn wait_for_api(&self) -> Result<(), FirecrackerError> {
@@ -751,6 +750,32 @@ fn read_reset_metrics(
 #[derive(Deserialize)]
 struct InstanceInfo {
     state: String,
+}
+
+fn ensure_power(
+    paused: bool,
+    mut request: impl FnMut(&str, &str, &[u8], u16) -> Result<Vec<u8>, FirecrackerError>,
+) -> Result<(), FirecrackerError> {
+    let expected = if paused {
+        sandsurf_protocol::MachineState::Paused
+    } else {
+        sandsurf_protocol::MachineState::Running
+    };
+    let before = parse_instance_power(&request("GET", "/", &[], 200)?)?;
+    if before.state == expected {
+        return Ok(());
+    }
+    let body = serde_json::to_vec(
+        &serde_json::json!({ "state": if paused { "Paused" } else { "Resumed" } }),
+    )
+    .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
+    request("PATCH", "/vm", &body, 204)?;
+    if parse_instance_power(&request("GET", "/", &[], 200)?)?.state != expected {
+        return Err(FirecrackerError::Invalid(
+            "native power postcondition was not established".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_instance(bytes: &[u8]) -> Result<InstanceInfo, FirecrackerError> {
@@ -1172,6 +1197,58 @@ struct Vsock {
 mod control_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn native_power_changes_are_idempotent_observed_postconditions_not_patch_acknowledgements() {
+        use std::collections::VecDeque;
+        for paused in [true, false] {
+            let target = if paused { "Paused" } else { "Running" };
+            let opposite = if paused { "Running" } else { "Paused" };
+            let instance = |state: &str| format!("{{\"state\":\"{state}\"}}").into_bytes();
+            let mut calls = Vec::new();
+            ensure_power(paused, |method, path, body, status| {
+                calls.push((method.to_owned(), path.to_owned(), body.to_vec(), status));
+                Ok(instance(target))
+            })
+            .unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "already-established power must not be patched twice"
+            );
+            assert_eq!((&*calls[0].0, &*calls[0].1, calls[0].3), ("GET", "/", 200));
+            let mut replies = VecDeque::from([instance(opposite), vec![], instance(target)]);
+            calls.clear();
+            ensure_power(paused, |method, path, body, status| {
+                calls.push((method.to_owned(), path.to_owned(), body.to_vec(), status));
+                Ok(replies.pop_front().unwrap())
+            })
+            .unwrap();
+            assert!(replies.is_empty());
+            assert_eq!(
+                calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+                ["GET", "PATCH", "GET"]
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&calls[1].2).unwrap()["state"],
+                if paused { "Paused" } else { "Resumed" }
+            );
+            let mut replies = VecDeque::from([instance(opposite), vec![], instance(opposite)]);
+            assert!(
+                ensure_power(paused, |_, _, _, _| Ok(replies.pop_front().unwrap())).is_err(),
+                "successful patch response alone must not prove power"
+            );
+            let mut calls = 0;
+            assert!(
+                ensure_power(paused, |_, _, _, _| {
+                    calls += 1;
+                    Ok(instance("Not started"))
+                })
+                .is_err()
+            );
+            assert_eq!(calls, 1);
+        }
+    }
 
     #[test]
     fn reset_requires_native_metric_clean_exit_and_confirmed_containment() {
