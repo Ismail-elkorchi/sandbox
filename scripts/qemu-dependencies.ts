@@ -212,7 +212,7 @@ export async function downloadMsysSource(source: string, signature: string, file
         if (seconds <= 0) throw new Error("MSYS2 source acquisition deadline exceeded");
         await run("curl", ["--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
           "--connect-timeout", "10", "--max-time", String(seconds), "--max-filesize", String(limit),
-          "--output", destination, address], scratch, false, {},
+          "--output", destination, address], scratch, true, {},
         { timeoutMs: (seconds + 5) * 1000, maximumOutputBytes: 65536 });
         await regular(destination, limit);
       }

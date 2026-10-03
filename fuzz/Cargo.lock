@@ -1242,6 +1242,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
 ]
 
 [[package]]
@@ -1254,7 +1255,9 @@ dependencies = [
  "reqwest",
  "ruzstd",
  "sandsurf-format",
+ "sandsurf-machine",
  "sandsurf-native",
+ "sandsurf-protocol",
  "serde",
  "serde_json",
  "sha2",

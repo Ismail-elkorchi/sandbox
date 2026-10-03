@@ -7,7 +7,7 @@ import { resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { collectDependencySources, dependencySourceFiles, downloadMsysSource, licenseExpression, msysLicenseExpression, msysSourceMirrors, pacmanDescription, requireDetachedSignature, requireTrustedSignature, verifyDependencySources, verifyMsysSource } from "../qemu-dependencies.ts";
-import { windowsLibraries } from "../build-qemu.ts";
+import { run as runBuild, windowsLibraries } from "../build-qemu.ts";
 
 const fingerprint = "A".repeat(40);
 const trustedStatus = `[GNUPG:] NEWSIG\n[GNUPG:] KEY_CONSIDERED ${fingerprint} 0\n[GNUPG:] SIG_ID abcdef123 2026-10-02 1790937600\n[GNUPG:] GOODSIG ${fingerprint.slice(-16)} Distribution signer\n[GNUPG:] VALIDSIG ${fingerprint} 2026-10-02 1790937600 0 4 0 22 8 00 ${fingerprint}\n[GNUPG:] TRUST_FULLY 0 pgp\n`;
@@ -30,7 +30,7 @@ test("mirror retries never combine a partial source with another mirror's signat
   const source = resolve(root, "source.src.tar.zst"), signature = `${source}.sig`, addresses = [];
   await downloadMsysSource(source, signature, "source.src.tar.zst", ["https://first.invalid/", "https://second.invalid/"], root,
     async (command, args, _cwd, capture, environment, limits) => {
-      assert.equal(command, "curl"); assert.equal(capture, false); assert.deepEqual(environment, {});
+      assert.equal(command, "curl"); assert.equal(capture, true); assert.deepEqual(environment, {});
       assert.ok(limits.timeoutMs <= 125000); assert.equal(limits.maximumOutputBytes, 65536);
       const address = args.at(-1), destination = args[args.indexOf("--output") + 1]; addresses.push(address);
       if (address.startsWith("https://first.invalid/")) {
@@ -42,6 +42,24 @@ test("mirror retries never combine a partial source with another mirror's signat
   assert.deepEqual(addresses, ["https://first.invalid/source.src.tar.zst", "https://second.invalid/source.src.tar.zst", "https://second.invalid/source.src.tar.zst.sig"]);
   assert.equal(await readFile(source, "utf8"), "source-second");
   assert.equal(await readFile(signature, "utf8"), "signature-second");
+});
+
+test("source downloads satisfy the actual bounded native build runner contract", async (context) => {
+  const root = await mkdtemp(resolve(tmpdir(), "sandsurf-source-runner-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const source = resolve(root, "source.src.tar.zst"), signature = `${source}.sig`;
+  await downloadMsysSource(source, signature, "source.src.tar.zst", ["https://mirror.invalid/"], root,
+    async (command, args, cwd, capture, environment, limits) => {
+      assert.equal(command, "curl");
+      // Exercise the production process runner without a network dependency.
+      // Archive body goes to an opened output path, not captured stdout.
+      const destination = args[args.indexOf("--output") + 1];
+      return runBuild(process.execPath, ["--input-type=module", "-e",
+        'import fs from "node:fs"; fs.writeFileSync(process.argv[1], "bounded download");', destination],
+      cwd, capture, environment, limits);
+    });
+  assert.equal(await readFile(source, "utf8"), "bounded download");
+  assert.equal(await readFile(signature, "utf8"), "bounded download");
 });
 
 test("detached signatures admit one bounded packet, never expandable OpenPGP messages", () => {
