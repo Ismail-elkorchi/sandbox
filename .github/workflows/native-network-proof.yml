@@ -1,0 +1,35 @@
+name: Native network boundary experiments
+on:
+  push:
+    branches: [main]
+    paths:
+      - vmm/qemu/tests/windows-local-delivery.c
+      - .github/workflows/native-network-proof.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-network:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          update: true
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Build the actual native socket-isolation experiment
+        shell: msys2 {0}
+        run: gcc -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/windows-local-delivery.c -o windows-local-delivery.exe -lws2_32 -luserenv -ladvapi32
+      - name: Socket transfer, original owner exit and address changes (no VM hardware required)
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'This address experiment requires a disposable hosted runner' }
+          try {
+            ./windows-local-delivery.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Native socket isolation is insufficient; no product guarantee is established' }
+          } finally {
+            Get-NetIPAddress -InterfaceIndex 1 -IPAddress 198.18.0.9 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false
+          }
