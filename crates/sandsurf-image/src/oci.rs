@@ -175,9 +175,9 @@ pub fn unpack_layout_archive(
     }
     prepare_empty_destination(destination)?;
     let file = File::open(archive_path)?;
-    let mut archive = crate::archive::Archive::new(
+    let mut archive = sandsurf_format::archive::Archive::new(
         file,
-        crate::archive::Limits {
+        sandsurf_format::archive::Limits {
             headers: limits.entries,
             bytes: limits.compressed_bytes,
             file_bytes: limits.compressed_bytes,
@@ -601,9 +601,9 @@ impl OciLayout {
         };
         let mut hashing = HashingReader::new(decoder, remaining_expanded);
         {
-            let mut archive = crate::archive::Archive::new(
+            let mut archive = sandsurf_format::archive::Archive::new(
                 &mut hashing,
-                crate::archive::Limits {
+                sandsurf_format::archive::Limits {
                     headers: self.limits.entries.saturating_sub(*total_entries),
                     bytes: remaining_expanded,
                     file_bytes: self.limits.file_bytes,
@@ -976,7 +976,7 @@ fn validate_defaults(value: &OciDefaults) -> Result<(), OciError> {
 }
 
 fn apply_entry<R: Read>(
-    mut entry: crate::archive::Entry<'_, R>,
+    mut entry: sandsurf_format::archive::Entry<'_, R>,
     root: &Path,
     metadata: &mut BTreeMap<String, EntryMetadata>,
     limits: &ConversionLimits,
@@ -1178,7 +1178,7 @@ fn resolve_existing_regular(root: &Path, relative: &Path) -> Result<PathBuf, Oci
 }
 
 fn normalized_link<R: Read>(
-    entry: &crate::archive::Entry<'_, R>,
+    entry: &sandsurf_format::archive::Entry<'_, R>,
     maximum: usize,
 ) -> Result<String, OciError> {
     let target = entry

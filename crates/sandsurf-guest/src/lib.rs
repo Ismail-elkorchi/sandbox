@@ -9,6 +9,8 @@
 #[cfg(target_os = "linux")]
 mod admission;
 #[cfg(target_os = "linux")]
+pub mod disk_executor;
+#[cfg(target_os = "linux")]
 mod executions;
 #[cfg(target_os = "linux")]
 mod filesystem;

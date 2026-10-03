@@ -17,7 +17,12 @@ zeroize.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 sandsurf-protocol = { path = "../sandsurf-protocol" }
+sandsurf-format = { path = "../sandsurf-format" }
+flate2 = "=1.1.10"
 cap-std = "=4.0.3"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tar = "=0.4.46"

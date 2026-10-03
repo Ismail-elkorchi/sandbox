@@ -39,9 +39,9 @@ fn actual_vmm_gate_denies_host_files_and_network_outside_its_footprint() {
     let unrelated = UnixListener::bind(&other).unwrap();
     let profile = Files {
         read_only: vec![input.clone()],
-        disk: disk.clone(),
+        writable: vec![disk.clone()],
         endpoints: endpoints.clone(),
-        captures: captures.clone(),
+        captures: Some(captures.clone()),
     }
     .profile()
     .unwrap();

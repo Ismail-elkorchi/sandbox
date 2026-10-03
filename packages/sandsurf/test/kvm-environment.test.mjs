@@ -61,6 +61,8 @@ test("KVM provides a persistent administrator-controlled Linux computer", { skip
     await run(machine, "sudo -n sh -c 'printf computer > /etc/sandsurf-test; printf \"#!/bin/sh\\nprintf installed\\n\" > /usr/local/bin/agent-tool; chmod 755 /usr/local/bin/agent-tool'; mkdir -p /home/agent/cache; printf durable > /home/agent/cache/value");
     assert.equal(await run(machine, "/usr/local/bin/agent-tool"), "installed");
     assert.match(await run(machine, "apk info --installed git sudo openrc"), /git[\s\S]*sudo[\s\S]*openrc/u);
+    assert.match(await run(machine, "sudo -n dumpe2fs -h /dev/vda 2>/dev/null"), /Filesystem features:[^\n]*has_journal/u,
+      "the complete persistent root must retain an ext4 journal");
 
     const daemon = await machine.executions.start({ argv: ["/bin/sh", "-c", "(sleep 3; printf descendant) & printf leader"] });
     const leader = await daemon.waitLeader({ signal: AbortSignal.timeout(30_000) });

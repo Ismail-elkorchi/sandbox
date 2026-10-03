@@ -31,6 +31,8 @@ fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let result = if args.len() == 2 && args[0] == "--execution-keeper" {
         sandsurf_guest::execution_keeper_main(Path::new(&args[1]))
+    } else if args.is_empty() && std::process::id() == 1 {
+        disk_executor_main()
     } else if args.is_empty() {
         supervisor_main()
     } else {
@@ -46,6 +48,25 @@ fn main() {
         );
         std::process::exit(1);
     }
+}
+
+fn disk_executor_main() -> io::Result<()> {
+    let writable = sandsurf_guest::disk_executor::prepare()?;
+    let file = if let Some(ports) =
+        control_transport::serial_ports(Path::new("/sys/class/virtio-ports"), Path::new("/dev"))?
+    {
+        OpenOptions::new().read(true).write(true).open(
+            ports
+                .first()
+                .ok_or_else(|| io::Error::other("offline serial device is missing"))?,
+        )?
+    } else {
+        let listener = listen_vsock(sandsurf_protocol::disk::DISK_EXECUTOR_PORT)?;
+        let fd = accept_connection(listener.as_raw_fd())?;
+        // SAFETY: accept_connection transfers this sole accepted descriptor.
+        unsafe { File::from_raw_fd(fd) }
+    };
+    sandsurf_guest::disk_executor::serve(file, writable)
 }
 
 fn supervisor_main() -> io::Result<()> {

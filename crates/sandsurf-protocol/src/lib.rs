@@ -4,6 +4,7 @@ mod binary;
 mod boot;
 mod console;
 mod control_page;
+pub mod disk;
 mod environment;
 mod frame;
 mod guest;

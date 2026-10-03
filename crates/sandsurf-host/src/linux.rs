@@ -1332,6 +1332,7 @@ fn firecracker_configuration_digest(
         Domain::Snapshot,
         &(
             "sandsurf-firecracker-configuration-v1",
+            ("root", "secondary", "computer-root-rw-auth-ro"),
             &config.image_digest,
             &config.firecracker_sha256,
             &config.resources,
@@ -1502,7 +1503,13 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest> {
-        bind_network_owner(&self.network, &self.network_usage, &process.network)?;
+        bind_network_owner(
+            &self.network,
+            &self.network_usage,
+            process
+                .network()
+                .map_err(|_| bytes_digest(b"native-network-role"))?,
+        )?;
         let pending = self
             .pending
             .take()
@@ -1608,7 +1615,13 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         generation: Counter,
         process: &mut FirecrackerProcess,
     ) -> Result<Digest, Digest> {
-        bind_network_owner(&self.network, &self.network_usage, &process.network)?;
+        bind_network_owner(
+            &self.network,
+            &self.network_usage,
+            process
+                .network()
+                .map_err(|_| bytes_digest(b"native-network-role"))?,
+        )?;
         let pending = self
             .pending_restore
             .take()
@@ -1712,16 +1725,18 @@ impl LinuxGenerationFactory {
             boot,
         });
         Ok(FirecrackerConfig {
-            network_identity: sandsurf_network::LinkIdentity::for_machine(machine_id),
+            devices: sandsurf_machine::devices::Devices::Computer {
+                machine_id: machine_id.clone(),
+                system_disk: self.system_disk.clone(),
+                authentication_disk: authentication_image,
+            },
             launcher_executable: self.config.launcher.clone(),
             firecracker_executable: self.config.firecracker.clone(),
             firecracker_sha256: self.config.firecracker_sha256.clone(),
             state_directory,
             kernel_image: kernel,
             initial_ramdisk,
-            system_disk: self.system_disk.clone(),
             storage_custody,
-            authentication_image,
             owner_token,
             guest_cid: self.config.guest_cid,
             guest_port: GUEST_CONTROL_PORT,
@@ -1903,7 +1918,7 @@ mod storage_tests {
             sandsurf_native::local::create_private_directory(&root.join(name)).unwrap();
         }
         let disk = root.join("disks/system.ext4");
-        crate::storage::publish_disk(&disk, 4096, |stage| {
+        crate::storage::publish_disk(&disk, 4096, |stage, _custody| {
             // Not a filesystem at all: any disk interpretation is a bug here.
             sandsurf_native::local::create_private_file(stage)?.write_all(&[7; 4096])
         })
@@ -2058,13 +2073,16 @@ mod storage_tests {
             .unwrap()
             .write_all(contents)
             .unwrap();
-        crate::storage::materialize(&source, &destination, 8192, |_| Ok(())).unwrap();
+        crate::storage::materialize(&source, &destination, 8192, |_, _custody| Ok(())).unwrap();
         assert_eq!(fs::metadata(&destination).unwrap().len(), 8192);
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         fs::remove_file(source).unwrap();
-        crate::storage::materialize(&root.join("missing-seed"), &destination, 8192, |_| {
-            panic!("published storage must not be prepared again")
-        })
+        crate::storage::materialize(
+            &root.join("missing-seed"),
+            &destination,
+            8192,
+            |_, _custody| panic!("published storage must not be prepared again"),
+        )
         .unwrap();
         assert_eq!(&fs::read(&destination).unwrap()[..contents.len()], contents);
         crate::storage::retire(&destination, 8192).unwrap();

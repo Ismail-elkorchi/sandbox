@@ -6,11 +6,43 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import { collectDependencySources, dependencySourceFiles, licenseExpression, msysLicenseExpression, pacmanDescription, requireDetachedSignature, requireTrustedSignature, verifyDependencySources, verifyMsysSource } from "../qemu-dependencies.ts";
+import { collectDependencySources, dependencySourceFiles, downloadMsysSource, licenseExpression, msysLicenseExpression, msysSourceMirrors, pacmanDescription, requireDetachedSignature, requireTrustedSignature, verifyDependencySources, verifyMsysSource } from "../qemu-dependencies.ts";
 import { windowsLibraries } from "../build-qemu.ts";
 
 const fingerprint = "A".repeat(40);
 const trustedStatus = `[GNUPG:] NEWSIG\n[GNUPG:] KEY_CONSIDERED ${fingerprint} 0\n[GNUPG:] SIG_ID abcdef123 2026-10-02 1790937600\n[GNUPG:] GOODSIG ${fingerprint.slice(-16)} Distribution signer\n[GNUPG:] VALIDSIG ${fingerprint} 2026-10-02 1790937600 0 4 0 22 8 00 ${fingerprint}\n[GNUPG:] TRUST_FULLY 0 pgp\n`;
+
+test("corresponding source mirrors come from bounded installed HTTPS repositories", () => {
+  assert.deepEqual(msysSourceMirrors("https://first.invalid/mingw/ucrt64/\r\nhttps://second.invalid/pub/msys2/mingw/ucrt64/\r\n", "ucrt64"),
+    ["https://first.invalid/mingw/sources/", "https://second.invalid/pub/msys2/mingw/sources/"]);
+  for (const value of ["", "http://mirror.invalid/mingw/ucrt64/", "https://user@mirror.invalid/mingw/ucrt64/",
+    "https://mirror.invalid/mingw/clang64/", "https://mirror.invalid/mingw/ucrt64/?x=y",
+    "https://mirror.invalid/mingw/ucrt64/#x", "https://mirror.invalid/%2f/mingw/ucrt64/",
+    "https://mirror.invalid/../mingw/ucrt64/", "https://mirror.invalid/mingw/$repo/",
+    "https://mirror.invalid/mingw/ucrt64/\0", "https://mirror.invalid/mingw/ucrt64/\n".repeat(41)]) {
+    assert.throws(() => msysSourceMirrors(value, "ucrt64"));
+  }
+});
+
+test("mirror retries never combine a partial source with another mirror's signature", async (context) => {
+  const root = await mkdtemp(resolve(tmpdir(), "sandsurf-source-mirror-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const source = resolve(root, "source.src.tar.zst"), signature = `${source}.sig`, addresses = [];
+  await downloadMsysSource(source, signature, "source.src.tar.zst", ["https://first.invalid/", "https://second.invalid/"], root,
+    async (command, args, _cwd, capture, environment, limits) => {
+      assert.equal(command, "curl"); assert.equal(capture, false); assert.deepEqual(environment, {});
+      assert.ok(limits.timeoutMs <= 125000); assert.equal(limits.maximumOutputBytes, 65536);
+      const address = args.at(-1), destination = args[args.indexOf("--output") + 1]; addresses.push(address);
+      if (address.startsWith("https://first.invalid/")) {
+        await writeFile(destination, "partial"); throw new Error("mirror unavailable");
+      }
+      if (destination === source) await assert.rejects(readFile(signature), { code: "ENOENT" });
+      await writeFile(destination, address.endsWith(".sig") ? "signature-second" : "source-second"); return "";
+    });
+  assert.deepEqual(addresses, ["https://first.invalid/source.src.tar.zst", "https://second.invalid/source.src.tar.zst", "https://second.invalid/source.src.tar.zst.sig"]);
+  assert.equal(await readFile(source, "utf8"), "source-second");
+  assert.equal(await readFile(signature, "utf8"), "signature-second");
+});
 
 test("detached signatures admit one bounded packet, never expandable OpenPGP messages", () => {
   for (const bytes of [[0x88, 1, 4], [0x89, 0, 1, 4], [0x8a, 0, 0, 0, 1, 4],
@@ -196,7 +228,8 @@ test("split binary packages retain every declaration and combine obligations whi
   async function run(command, args) {
     if (command === "cygpath") return args[1];
     if (command === "pacman") return owners.get(args.at(-1));
-    if (command === "pacman-conf") return args[0] === "DBPath" ? database : "/distribution/keyring";
+    if (command === "pacman-conf") return args[0] === "DBPath" ? database
+      : args[0] === "--repo" ? "https://mirror.example.invalid/mingw/ucrt64/" : "/distribution/keyring";
     if (command === "curl") {
       downloads++;
       const destination = args[args.indexOf("--output") + 1];
@@ -319,7 +352,8 @@ for (const platform of ["darwin", "win32"]) {
       }
       if (command === "cygpath") return args[1];
       if (command === "pacman") return owner;
-      if (command === "pacman-conf") return args[0] === "DBPath" ? database : "/etc/pacman.d/gnupg";
+      if (command === "pacman-conf") return args[0] === "DBPath" ? database
+        : args[0] === "--repo" ? "https://mirror.example.invalid/mingw/ucrt64/" : "/etc/pacman.d/gnupg";
       if (command === "curl") {
         const destination = args[args.indexOf("--output") + 1];
         await writeFile(destination, destination.endsWith(".sig") ? Buffer.from([0x88, 1, 4]) : "signed package source"); return "";

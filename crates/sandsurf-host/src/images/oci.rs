@@ -18,6 +18,7 @@ pub(crate) struct BuildInput<'a> {
 }
 
 pub(crate) fn import(
+    executor: &mut dyn sandsurf_image::appliance::Executor,
     host_root: &Path,
     input: BuildInput<'_>,
     operation: &OperationId,
@@ -39,7 +40,7 @@ pub(crate) fn import(
             "OCI platform must exactly match the native Linux guest architecture".into(),
         ));
     }
-    let _custody = image_custody(host_root, &recipe.boot_image_digest)?;
+    let custody = std::sync::Arc::new(image_custody(host_root, &recipe.boot_image_digest)?);
     let base = resolve_native_image(host_root, &recipe.boot_image_digest)?;
     let architecture = match requested.architecture.as_str() {
         "amd64" => Architecture::X64,
@@ -55,7 +56,8 @@ pub(crate) fn import(
             "recipe boot image architecture differs from the OCI filesystem".into(),
         ));
     }
-    let (stage, old, _operation_custody) = prepare_import(host_root, operation, request_digest)?;
+    let (stage, old, operation_custody) = prepare_import(host_root, operation, request_digest)?;
+    let operation_custody = std::sync::Arc::new(operation_custody);
     if let Some(image) = old {
         return Ok(image);
     }
@@ -105,8 +107,14 @@ pub(crate) fn import(
     let artifact = stage.join("artifact");
     prepare_private_directory(&artifact)?;
     let system_path = artifact.join("oci-system.ext4");
-    let builder = materialize_tar(&filesystem_tar, &system_path, rootfs_bytes)
-        .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
+    let builder = materialize_tar(
+        executor,
+        vec![custody, operation_custody],
+        &filesystem_tar,
+        &system_path,
+        rootfs_bytes,
+    )
+    .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     let kernel_name = "boot-kernel";
     copy_regular(&base.kernel_path, &artifact.join(kernel_name))?;
     if let Some(initramfs) = &base.initramfs_path {

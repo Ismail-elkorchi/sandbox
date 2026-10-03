@@ -62,7 +62,10 @@ struct Handoff {
 /// The namespace helper preserves unconsumed descriptors across exec. Mount input
 /// descriptors are separate from the authority retained by the isolated supervisor.
 pub(super) fn launch(spec: &VmmMachineSpec, files: &[File]) -> io::Result<i32> {
-    let mut command = namespace_command(&files[spec.launcher_fd_index], true);
+    let mut command = namespace_command(
+        &files[spec.launcher_fd_index],
+        spec.nic_handoff_fd_index.is_some(),
+    );
     let mut inputs = vec![File::open(std::env::current_exe()?)?];
     data_mount(&mut command, &inputs[0], RUNTIME_PATH, "0500");
     command.args(["--remount-ro", "/proc"]);
@@ -203,6 +206,7 @@ fn namespace_command(launcher: &File, network: bool) -> Command {
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
+        "--unshare-net",
         "--as-pid-1",
         "--die-with-parent",
         "--uid",
@@ -222,13 +226,7 @@ fn namespace_command(launcher: &File, network: bool) -> Command {
         "/dev",
     ]);
     if network {
-        command.args([
-            "--unshare-net",
-            "--cap-add",
-            "CAP_NET_ADMIN",
-            "--cap-add",
-            "CAP_NET_RAW",
-        ]);
+        command.args(["--cap-add", "CAP_NET_ADMIN", "--cap-add", "CAP_NET_RAW"]);
     }
     command
 }

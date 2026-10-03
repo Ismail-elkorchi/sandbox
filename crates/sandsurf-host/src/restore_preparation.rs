@@ -169,7 +169,7 @@ pub(crate) mod tests {
         ensure_private_directory(&root.join("disks")).unwrap();
         ensure_private_directory(&root.join("guardian")).unwrap();
         let disk = vec![7; 4096];
-        crate::storage::publish_disk(&root.join("disks/system.ext4"), 4096, |stage| {
+        crate::storage::publish_disk(&root.join("disks/system.ext4"), 4096, |stage, _custody| {
             create_private_file(stage)?.write_all(&disk)
         })
         .unwrap();

@@ -1,7 +1,6 @@
 #![deny(unsafe_code)]
 
 pub mod appliance;
-pub mod archive;
 pub mod boot;
 pub mod distribution;
 pub mod ext4;

@@ -9,9 +9,9 @@ pub struct Files {
     /// Individually verified executable, libraries, firmware and boot inputs.
     /// Never the runtime directory, guardian directory, or image directory.
     pub read_only: Vec<PathBuf>,
-    pub disk: PathBuf,
+    pub writable: Vec<PathBuf>,
     pub endpoints: PathBuf,
-    pub captures: PathBuf,
+    pub captures: Option<PathBuf>,
 }
 
 impl Files {
@@ -19,20 +19,39 @@ impl Files {
         if self.read_only.is_empty() || self.read_only.len() > 144 {
             return Err(invalid("VMM input closure exceeds its bound"));
         }
-        let disk = canonical_file(&self.disk)?;
+        if self.writable.len() > 1 {
+            return Err(invalid("VMM mutable disk closure exceeds its bound"));
+        }
+        let disks = self
+            .writable
+            .iter()
+            .map(|path| canonical_file(path))
+            .collect::<io::Result<BTreeSet<_>>>()?;
         let endpoints = crate::local::canonical_private_directory(&self.endpoints)?;
-        let captures = crate::local::canonical_private_directory(&self.captures)?;
-        if endpoints.starts_with(&captures)
-            || captures.starts_with(&endpoints)
-            || disk.starts_with(&endpoints)
-            || disk.starts_with(&captures)
-        {
+        let captures = self
+            .captures
+            .as_ref()
+            .map(|path| crate::local::canonical_private_directory(path))
+            .transpose()?;
+        if captures.as_ref().is_some_and(|captures| {
+            endpoints.starts_with(captures) || captures.starts_with(&endpoints)
+        }) || disks.iter().any(|disk| {
+            disk.starts_with(&endpoints)
+                || captures
+                    .as_ref()
+                    .is_some_and(|captures| disk.starts_with(captures))
+        }) {
             return Err(invalid("VMM input and output roles overlap"));
         }
         let mut inputs = BTreeSet::new();
         for input in &self.read_only {
             let input = canonical_file(input)?;
-            if input == disk || input.starts_with(&endpoints) || input.starts_with(&captures) {
+            if disks.contains(&input)
+                || input.starts_with(&endpoints)
+                || captures
+                    .as_ref()
+                    .is_some_and(|captures| input.starts_with(captures))
+            {
                 return Err(invalid("VMM read input overlaps a mutable role"));
             }
             inputs.insert(input);
@@ -58,13 +77,15 @@ impl Files {
         for input in inputs {
             writeln!(profile, "(allow file-read* (literal {}))", quoted(&input)?).unwrap();
         }
-        writeln!(profile, "(allow file-read* (literal {}))", quoted(&disk)?).unwrap();
-        writeln!(
-            profile,
-            "(allow file-write-data (literal {}))",
-            quoted(&disk)?
-        )
-        .unwrap();
+        for disk in disks {
+            writeln!(profile, "(allow file-read* (literal {}))", quoted(&disk)?).unwrap();
+            writeln!(
+                profile,
+                "(allow file-write-data (literal {}))",
+                quoted(&disk)?
+            )
+            .unwrap();
+        }
         writeln!(
             profile,
             "(allow file-read* file-write* (subpath {}))",
@@ -93,14 +114,16 @@ impl Files {
         // Keep caller path bytes in a literal filter, not the kernel regex
         // language. Express the bounded address explicitly rather than relying
         // on counted repetition or pathname regexp escaping in Seatbelt.
-        let pattern = format!("/id-{}/snapshot[.]vmstate$", "[0-9a-f]".repeat(64));
-        writeln!(
-            profile,
-            "(allow file-read* file-write* (require-all (subpath {}) (regex {})))",
-            quoted(&captures)?,
-            string_literal(&pattern)
-        )
-        .unwrap();
+        if let Some(captures) = &captures {
+            let pattern = format!("/id-{}/snapshot[.]vmstate$", "[0-9a-f]".repeat(64));
+            writeln!(
+                profile,
+                "(allow file-read* file-write* (require-all (subpath {}) (regex {})))",
+                quoted(captures)?,
+                string_literal(&pattern)
+            )
+            .unwrap();
+        }
         if profile.len() > crate::resource_broker::VMM_PROFILE_BYTES {
             return Err(invalid("VMM confinement profile exceeds its byte bound"));
         }
@@ -159,9 +182,9 @@ mod tests {
         crate::local::create_private_directory(&captures).unwrap();
         let mut files = Files {
             read_only: vec![kernel.clone()],
-            disk: disk.clone(),
+            writable: vec![disk.clone()],
             endpoints: endpoints.clone(),
-            captures: captures.clone(),
+            captures: Some(captures.clone()),
         };
         let profile = files.profile().unwrap();
         assert!(profile.contains("(deny network*)"));
@@ -176,6 +199,9 @@ mod tests {
             quoted(&captures).unwrap()
         )));
         assert!(!profile.contains("capture.json"));
+        files.captures = None;
+        assert!(!files.profile().unwrap().contains("snapshot[.]vmstate"));
+        files.captures = Some(captures.clone());
         assert_eq!(string_literal("\"\\"), "\"\\\"\\\\\"");
         files.read_only.push(disk.clone());
         assert!(files.profile().is_err());

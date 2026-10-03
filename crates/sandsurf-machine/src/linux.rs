@@ -516,7 +516,8 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         self.process
             .as_ref()
             .ok_or_else(|| bytes_digest(b"firecracker-network-owner-unavailable"))?
-            .network
+            .network()
+            .map_err(|_| bytes_digest(b"firecracker-network-role"))?
             .configure(&configuration.network, &configuration.exposures)
             .map_err(|_| bytes_digest(b"firecracker-network-configuration-incomplete"))
     }

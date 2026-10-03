@@ -1,16 +1,22 @@
-Image construction and mutable disk interpretation use a disposable Linux
-libguestfs/QEMU appliance. Package programs, filesystem mounting, tar import,
-fsck and identity editing run inside that VM. Host QEMU receives explicitly raw
-disks, never autodetected guest container formats. No host chroot, guest ELF
-loader, filesystem mount, debugfs, or package lifecycle script is permitted.
-The root-owned guestfish, QEMU, timeout, system libraries and libguestfs appliance
-are trusted prerequisites. The executor clears environment overrides, forces
-the direct KVM backend, disables networking/shared directories, uses one 512 MiB
-appliance, caps stdout to 16 KiB and kills its process group after 300 seconds.
-See [libguestfs command isolation](https://libguestfs.org/guestfs.3.html#running-commands).
+Runtime filesystem construction, boot extraction and identity editing use one
+disposable, NIC-less hardware VM per disk session. Linux uses the same original
+Firecracker owner as computers; macOS and Windows use owned HVF/WHPX QEMU.
+The executor boots the exact image manifest pinned into the installed native
+host, with a read-only root and an explicitly attached raw target disk. It never
+boots the target's kernel or init. The bounded disk protocol transfers bytes,
+not host filenames, credentials, mounts or network capabilities. Filesystems
+are mounted only inside the VM; distribution programs run in its target-root
+mount namespace. Returned metadata is bounded guest information, not host
+attestation. Original pool, publication and input leases reach the actual VMM;
+publication waits for confirmed native termination. There is no libguestfs
+runtime path, software emulation or host filesystem-execution fallback.
 
-`scripts/build-guest-image.ts` requires a same-architecture Linux/KVM host. Its
-input preparer verifies a signed APK closure inside the isolated appliance.
+`scripts/build-guest-image.ts` is the independent bootstrap producer for that
+reviewed execution image and requires a same-architecture Linux/KVM host. Its
+build-only libguestfs producer is not linked into installed host execution. It
+uses protected root-owned tools, a network-disabled 512MiB KVM appliance and a
+300-second process-group deadline. Its input preparer verifies a signed APK
+closure inside the isolated appliance.
 Reviewed inputs can instead supply an offline gzip tar of signed APKs under `var/cache/apk/`, and a complete installed
 package lock (one `name=version` line per package, sorted). Supply absolute paths
 with `SANDSURF_ALPINE_PACKAGES_ARCHIVE` and `SANDSURF_ALPINE_PACKAGE_LOCK`, and
@@ -50,9 +56,8 @@ tokens and retained data remain copied and sensitive. A custom image must
 explicitly choose `cloneProfile: {kind: "preserve"}` to accept identity cloning;
 there is no universal sanitization claim. Full memory fork remains unsupported.
 
-Managed disk extraction and customization currently require the Linux appliance.
-macOS and Windows must provide a native isolated helper before these managed
-profiles can run there. They fail explicitly; Windows also rejects initramfs
-because its current direct boot contract lacks that input. Source-built images
-are not hardware qualification or signed release artifacts. Packaged guest
-binaries and release signatures must be rebuilt through the isolated recipe.
+Managed disk extraction and customization require the installed reviewed boot
+image, native hardware runtime, bounded storage and original native ownership.
+Missing prerequisites fail explicitly. Source builds and parser tests do not
+qualify VM execution or create signed release artifacts. Installed computer
+tests cover journaled roots, fork identity and persistence on eligible hosts.

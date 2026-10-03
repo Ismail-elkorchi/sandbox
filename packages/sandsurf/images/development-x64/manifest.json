@@ -10,7 +10,7 @@
     },
     "initramfs": {
       "path": "boot-initramfs",
-      "sha256": "c06bc31f5ff994ee5920339dba23e5b07131bd5760ea2994d389253d48e344d9"
+      "sha256": "ced86a31016b57200dd816c44a4da9ab0536f57cb11cb2601c66e8b3588657fe"
     },
     "profile": {
       "kind": "alpine"
@@ -19,7 +19,7 @@
       "version": "1.0.0",
       "protocolMajor": 1,
       "protocolMinor": 0,
-      "sha256": "0f6d7885c9219c37c918bf6914b4bbce7f5d0e0917b9f193d3c88ca3a8069674"
+      "sha256": "8f409c68a2f3ca0e6f2c689ffab1e6dbb2727086e01e31d0f2303db510eccb7e"
     },
     "capabilities": {
       "overlayfs": true,
@@ -35,7 +35,7 @@
     },
     "rootfs": {
       "path": "system.ext4",
-      "sha256": "69a3bef72fc028757dd9bb51bb1af2376409375d005d538335ac18d840376b02",
+      "sha256": "b066d23c57255e85e71b9f505e8b304b43b49093febb3ecc6c5bf1fabeeae9d3",
       "format": "ext4"
     },
     "defaults": {
@@ -47,14 +47,14 @@
     },
     "provenance": {
       "kind": "assembled",
-      "inputDigest": "f73d30731a458d4a7e49025db0870634f84ade24865d86b3e1a5513fa4a3b174",
+      "inputDigest": "b2e393b8a1a54000d0f8c4b1192f65775e1a567f3310b63c8b15c199f469a9a8",
       "materials": {
         "alpine-minirootfs": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677",
         "alpine-offline-packages": "3ed1eca104a718faec7f04ae14a4d199bf542573e3ac88cbc47b2cc0e7b8d7d0",
         "alpine-package-lock": "e058e1e64e00d019f9f5e4155353f3604684fb09d6e12a1c5bd5fe2ed6eb44e2",
         "sandsurf-system-recipe": "077215a44204c4dc5fd7ea9ba4504ce2678ca965903e2fb46ccddd51c22d69cc",
-        "sandsurf-appliance-recipe": "34645cac12c3a79e354dca06389d64d399235eba60385fc2dfc6f8932174682e",
-        "sandsurf-management": "0f6d7885c9219c37c918bf6914b4bbce7f5d0e0917b9f193d3c88ca3a8069674",
+        "sandsurf-appliance-recipe": "a302e9a3b6afd6da4983f07f3186b93788f46affccf7025e5f98f84608f3ff47",
+        "sandsurf-management": "8f409c68a2f3ca0e6f2c689ffab1e6dbb2727086e01e31d0f2303db510eccb7e",
         "alpine-installed-database": "251016b406a0ad724c78c440af1685ec257df6b7a3c6e9056484c588e7f8942c",
         "alpine-corresponding-sources": "ac6e1cb14c2baf980c4575675f88e68325ca05f33a5a55e3c65796123e5eceb8"
       },

@@ -11,6 +11,7 @@ use sandsurf_protocol::{
     MachineObservation, MachineState, Qualification, Resources, VmEngine,
 };
 
+pub mod devices;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
 mod hardware;
@@ -18,6 +19,7 @@ mod hardware;
 pub mod launcher;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod offline;
 pub use hardware::validate_hardware;
 pub mod capture;
 pub mod qemu;

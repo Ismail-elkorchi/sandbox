@@ -296,15 +296,17 @@ impl QemuGuardianEffect {
         let qemu = QemuConfig {
             runtime_manifest: config.runtime_manifest.clone(),
             runtime_digest: config.runtime_digest.clone(),
-            capture_directory,
+            capture_directory: Some(capture_directory),
             launch: LaunchConfig {
                 accelerator: accelerator(),
-                machine_id: config.machine_id.clone(),
+                devices: sandsurf_machine::devices::Devices::Computer {
+                    machine_id: config.machine_id.clone(),
+                    system_disk,
+                    authentication_disk,
+                },
                 architecture: crate::service::native_guest_architecture(),
                 kernel: image.kernel_path,
                 initramfs: image.initramfs_path,
-                system_disk,
-                authentication_disk,
                 firmware_directory: runtime.firmware_directory,
                 memory_mib: u32::try_from(config.resources.memory_mib.get())
                     .map_err(io::Error::other)?,
@@ -1450,6 +1452,7 @@ fn qemu_configuration_digest(
         Domain::Snapshot,
         &(
             "sandsurf-qemu-configuration-v1",
+            ("root", "secondary", "computer-root-rw-auth-ro"),
             &config.image_digest,
             &config.runtime_digest,
             &config.resources,

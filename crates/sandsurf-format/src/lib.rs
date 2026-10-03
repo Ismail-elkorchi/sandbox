@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+pub mod archive;
+
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};

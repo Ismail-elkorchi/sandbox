@@ -3,7 +3,7 @@
 use crate::GuestArchitecture;
 use crate::qemu_endpoints::{CONSOLE, NIC, QMP};
 use sandsurf_network::LinkIdentity;
-use sandsurf_protocol::{GUEST_SERIAL_CONNECTIONS, GUEST_SERIAL_PREFIX, MachineId, VmEngine};
+use sandsurf_protocol::{GUEST_SERIAL_CONNECTIONS, GUEST_SERIAL_PREFIX, VmEngine};
 use serde_json::json;
 use std::ffi::OsString;
 use std::io;
@@ -34,11 +34,9 @@ impl Accelerator {
 pub struct LaunchConfig {
     pub accelerator: Accelerator,
     pub architecture: GuestArchitecture,
-    pub machine_id: MachineId,
+    pub devices: crate::devices::Devices,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
-    pub system_disk: PathBuf,
-    pub authentication_disk: PathBuf,
     /// Verified, bundled firmware only; never QEMU's host-wide search path.
     pub firmware_directory: PathBuf,
     pub memory_mib: u32,
@@ -47,12 +45,11 @@ pub struct LaunchConfig {
 
 impl LaunchConfig {
     pub fn validate(&self) -> io::Result<()> {
-        for path in [
-            &self.kernel,
-            &self.system_disk,
-            &self.authentication_disk,
-            &self.firmware_directory,
-        ] {
+        for path in [&self.kernel, &self.firmware_directory] {
+            path_text(path)?;
+        }
+        self.devices.validate()?;
+        for (path, _) in self.devices.disks() {
             path_text(path)?;
         }
         if let Some(path) = &self.initramfs {
@@ -63,9 +60,6 @@ impl LaunchConfig {
             self.vcpus.into(),
             self.memory_mib.into(),
         )?;
-        if self.system_disk == self.authentication_disk {
-            return Err(invalid("QEMU disks must have separate identities"));
-        }
         Ok(())
     }
 
@@ -125,19 +119,15 @@ impl LaunchConfig {
         }
         pair(
             "-append",
-            crate::linux_boot_arguments(
-                if self.architecture == GuestArchitecture::Amd64 {
+            self.devices
+                .boot_arguments(if self.architecture == GuestArchitecture::Amd64 {
                     "ttyS0"
                 } else {
                     "ttyAMA0"
-                },
-                "/dev/vda",
-            ),
+                }),
         );
-        for (node, path, read_only) in [
-            ("system", &self.system_disk, false),
-            ("authentication", &self.authentication_disk, true),
-        ] {
+        for (node, (path, read_only)) in ["root", "secondary"].into_iter().zip(self.devices.disks())
+        {
             // Explicit raw format disables guest-selected backing files and
             // image-format probes. JSON preserves commas and other path bytes.
             pair(
@@ -183,20 +173,22 @@ impl LaunchConfig {
                 ),
             );
         }
-        pair(
-            "-netdev",
-            format!(
-                "stream,id=external,server=on,addr.type=unix,addr.path={}",
-                escaped_path(&endpoints.join(NIC))?
-            ),
-        );
-        pair(
-            "-device",
-            format!(
-                "virtio-net-pci,netdev=external,mac={},host_mtu=1500,romfile=,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,guest_uso4=off,guest_uso6=off,guest_tunnel=off,guest_tunnel_csum=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,host_uso=off,host_tunnel=off,host_tunnel_csum=off,guest_rsc_ext=off,ctrl_guest_offloads=off",
-                LinkIdentity::for_machine(&self.machine_id).mac_address(),
-            ),
-        );
+        if let Some(machine_id) = self.devices.machine_id() {
+            pair(
+                "-netdev",
+                format!(
+                    "stream,id=external,server=on,addr.type=unix,addr.path={}",
+                    escaped_path(&endpoints.join(NIC))?
+                ),
+            );
+            pair(
+                "-device",
+                format!(
+                    "virtio-net-pci,netdev=external,mac={},host_mtu=1500,romfile=,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,guest_uso4=off,guest_uso6=off,guest_tunnel=off,guest_tunnel_csum=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,host_uso=off,host_tunnel=off,host_tunnel_csum=off,guest_rsc_ext=off,ctrl_guest_offloads=off",
+                    LinkIdentity::for_machine(machine_id).mac_address(),
+                ),
+            );
+        }
         Ok(args)
     }
 }
@@ -232,11 +224,13 @@ mod tests {
         LaunchConfig {
             accelerator,
             architecture,
-            machine_id: "qemu-machine".try_into().unwrap(),
+            devices: crate::devices::Devices::Computer {
+                machine_id: "qemu-machine".try_into().unwrap(),
+                system_disk: root.join("system,disk.raw"),
+                authentication_disk: root.join("auth.raw"),
+            },
             kernel: root.join("boot,kernel"),
             initramfs: Some(root.join("initramfs")),
-            system_disk: root.join("system,disk.raw"),
-            authentication_disk: root.join("auth.raw"),
             firmware_directory: root.join("firmware"),
             memory_mib: 512,
             vcpus: 2,
@@ -305,9 +299,17 @@ mod tests {
     fn launch_rejects_alias_disks_unbounded_sockets_and_control_injection() {
         let mut config = config(Accelerator::Hvf, GuestArchitecture::Arm64);
         let endpoints = crate::qemu_endpoints::Endpoints::create().unwrap();
-        config.authentication_disk = config.system_disk.clone();
+        let original = config.devices.clone();
+        if let crate::devices::Devices::Computer {
+            system_disk,
+            authentication_disk,
+            ..
+        } = &mut config.devices
+        {
+            *authentication_disk = system_disk.clone();
+        }
         assert!(config.arguments(endpoints.path()).is_err());
-        config.authentication_disk = std::env::temp_dir().join("auth.raw");
+        config.devices = original;
         assert!(
             config
                 .arguments(&std::env::temp_dir().join("x".repeat(104)))

@@ -102,7 +102,7 @@ mod native {
         pub launch: LaunchConfig,
         pub runtime_manifest: PathBuf,
         pub runtime_digest: Digest,
-        pub capture_directory: PathBuf,
+        pub capture_directory: Option<PathBuf>,
     }
 
     pub struct QemuRestoreSource {
@@ -148,6 +148,9 @@ mod native {
     impl QemuDriver {
         pub fn new(config: QemuConfig) -> io::Result<Self> {
             config.launch.validate()?;
+            if config.launch.devices.machine_id().is_none() {
+                return Err(invalid("computer driver requires computer device roles"));
+            }
             Ok(Self {
                 config,
                 owner: None,
@@ -171,7 +174,14 @@ mod native {
             }
             self.config.launch.kernel = kernel;
             self.config.launch.initramfs = initramfs;
-            self.config.launch.authentication_disk = authentication;
+            let crate::devices::Devices::Computer {
+                authentication_disk,
+                ..
+            } = &mut self.config.launch.devices
+            else {
+                return Err(invalid("computer driver device role changed"));
+            };
+            *authentication_disk = authentication;
             self.config.launch.validate()
         }
         pub fn stage_storage_custody(&mut self, custody: Vec<Arc<File>>) -> io::Result<()> {
@@ -342,7 +352,9 @@ mod native {
             self.pending_custody.take();
         }
         fn boot(&mut self, command: &LifecycleCommand, generation: Counter) -> MachineOutcome {
-            if command.machine_id != self.config.launch.machine_id || self.owner.is_some() {
+            if Some(&command.machine_id) != self.config.launch.devices.machine_id()
+                || self.owner.is_some()
+            {
                 return unavailable(b"qemu-boot-identity-or-owner-conflict");
             }
             let resources = &command.configuration.resources;
@@ -423,7 +435,7 @@ mod native {
             current: &MachineObservation,
             paused: bool,
         ) -> MachineOutcome {
-            if command.machine_id != self.config.launch.machine_id {
+            if Some(&command.machine_id) != self.config.launch.devices.machine_id() {
                 return unavailable(b"qemu-machine-mismatch");
             }
             let Some(owner) = &mut self.owner else {
@@ -484,8 +496,8 @@ mod native {
             current: &MachineObservation,
         ) -> Result<(), Digest> {
             let live = matches!(current.state, MachineState::Running | MachineState::Paused);
-            if *machine_id != self.config.launch.machine_id
-                || current.machine_id != self.config.launch.machine_id
+            if Some(machine_id) != self.config.launch.devices.machine_id()
+                || Some(&current.machine_id) != self.config.launch.devices.machine_id()
                 || revision <= current.applied_revision
                 || live != self.owner.is_some()
                 || (live && self.resources.as_ref() != Some(resources))
@@ -531,7 +543,7 @@ mod native {
             command: &LifecycleCommand,
             current: &MachineObservation,
         ) -> MachineOutcome {
-            if command.machine_id != self.config.launch.machine_id
+            if Some(&command.machine_id) != self.config.launch.devices.machine_id()
                 || self.resources.as_ref() != Some(&command.configuration.resources)
             {
                 return unavailable(b"qemu-live-resource-change-requires-reboot");
@@ -565,7 +577,7 @@ mod native {
             command: &LifecycleCommand,
             current: Option<&MachineObservation>,
         ) -> MachineOutcome {
-            if command.machine_id != self.config.launch.machine_id {
+            if Some(&command.machine_id) != self.config.launch.devices.machine_id() {
                 return unavailable(b"qemu-machine-mismatch");
             }
             if let Some(owner) = &mut self.owner

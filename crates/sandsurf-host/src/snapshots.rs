@@ -360,6 +360,8 @@ pub(crate) fn prepare_filesystem(
 }
 
 pub(crate) fn finish_filesystem(
+    executor: &mut dyn sandsurf_image::appliance::Executor,
+    mut custody: Vec<std::sync::Arc<File>>,
     root: &Path,
     snapshot: &Snapshot,
     image: &sandsurf_image::VerifiedImage,
@@ -371,12 +373,14 @@ pub(crate) fn finish_filesystem(
             "disk capture image differs from host admission",
         ));
     }
-    let _input_custody = retain_input(root, &snapshot.request.id)?;
+    let input_custody = std::sync::Arc::new(retain_input(root, &snapshot.request.id)?);
     private_directory(root)?;
-    let _custody = sandsurf_native::storage::disk_lease(&root.join(format!(
-        ".{}.capture.lock",
-        object_name(snapshot.request.operation_id.as_str())
-    )))?;
+    let capture_custody =
+        std::sync::Arc::new(sandsurf_native::storage::disk_lease(&root.join(format!(
+            ".{}.capture.lock",
+            object_name(snapshot.request.operation_id.as_str())
+        )))?);
+    custody.extend([input_custody, capture_custody]);
     let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
         return verify_published(&final_directory, snapshot);
@@ -397,7 +401,7 @@ pub(crate) fn finish_filesystem(
         sensitive: snapshot.sensitive,
         kind: SnapshotKind::Disk,
         full: None,
-        boot: crate::storage::freeze_boot(image, &disk, &stage.join("boot"))?,
+        boot: crate::storage::freeze_boot(executor, custody, image, &disk, &stage.join("boot"))?,
     };
     let manifest_digest = digest(Domain::Snapshot, &manifest)?;
     // Exact interrupted retries may already have a complete immutable record.
@@ -580,12 +584,13 @@ struct ForkReceipt {
 }
 
 pub fn materialize_fork(
+    executor: &mut dyn sandsurf_image::appliance::Executor,
     root: &Path,
     snapshot: &Snapshot,
     destination: &Path,
     profile: &sandsurf_image::identity::CloneProfile,
 ) -> Result<()> {
-    let _custody = retain_input(root, &snapshot.request.id)?;
+    let custody = std::sync::Arc::new(retain_input(root, &snapshot.request.id)?);
     let expected = snapshot
         .system_disk_digest
         .as_ref()
@@ -596,34 +601,43 @@ pub fn materialize_fork(
         .ok_or(SnapshotError::Invalid("fork destination has no parent"))?;
     private_directory(parent)?;
     let receipt_path = destination.with_extension("fork.json");
-    crate::storage::publish_disk(destination, snapshot.system_disk_bytes.get(), |staged| {
-        copy_and_verify(
-            &source,
-            staged,
-            snapshot.system_disk_bytes.get(),
-            Some(expected),
-        )
-        .map_err(io::Error::other)?;
-        if *profile != sandsurf_image::identity::CloneProfile::Preserve {
-            sandsurf_image::identity::customize(staged, profile)?;
-        }
-        let customized =
-            file_digest(staged, snapshot.system_disk_bytes.get()).map_err(io::Error::other)?;
-        let receipt = ForkReceipt {
-            source: expected.clone(),
-            profile: *profile,
-            customized,
-        };
-        let staged_receipt = receipt_path.with_extension("fork-building");
-        if staged_receipt.exists() {
-            fs::remove_file(&staged_receipt)?;
-        }
-        let mut file = sandsurf_native::local::create_private_file(&staged_receipt)?;
-        file.write_all(&serde_json::to_vec(&receipt).map_err(io::Error::other)?)?;
-        file.sync_all()?;
-        drop(file);
-        sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
-    })?;
+    crate::storage::publish_disk(
+        destination,
+        snapshot.system_disk_bytes.get(),
+        |staged, disk_custody| {
+            copy_and_verify(
+                &source,
+                staged,
+                snapshot.system_disk_bytes.get(),
+                Some(expected),
+            )
+            .map_err(io::Error::other)?;
+            if *profile != sandsurf_image::identity::CloneProfile::Preserve {
+                sandsurf_image::identity::customize(
+                    executor,
+                    vec![custody, disk_custody],
+                    staged,
+                    profile,
+                )?;
+            }
+            let customized =
+                file_digest(staged, snapshot.system_disk_bytes.get()).map_err(io::Error::other)?;
+            let receipt = ForkReceipt {
+                source: expected.clone(),
+                profile: *profile,
+                customized,
+            };
+            let staged_receipt = receipt_path.with_extension("fork-building");
+            if staged_receipt.exists() {
+                fs::remove_file(&staged_receipt)?;
+            }
+            let mut file = sandsurf_native::local::create_private_file(&staged_receipt)?;
+            file.write_all(&serde_json::to_vec(&receipt).map_err(io::Error::other)?)?;
+            file.sync_all()?;
+            drop(file);
+            sandsurf_native::storage::replace_journal_file(&staged_receipt, &receipt_path)
+        },
+    )?;
     verify_fork(snapshot, destination, profile)?;
     sync_directory(parent)
 }
@@ -1176,7 +1190,14 @@ mod tests {
         let mut snapshot = snapshot();
         let root = temp.capture_root(&snapshot);
         prepare_filesystem(&root, &snapshot, &source).unwrap();
-        finish_filesystem(&root, &snapshot, &temp.image(&snapshot)).unwrap();
+        finish_filesystem(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+            vec![],
+            &root,
+            &snapshot,
+            &temp.image(&snapshot),
+        )
+        .unwrap();
         let original = snapshot.clone();
         let first = retain_input(&root, &snapshot.request.id).unwrap();
         let second = retain_input(&root, &snapshot.request.id).unwrap();
@@ -1257,8 +1278,10 @@ mod tests {
         let disks = root.parent().unwrap().join("disks");
         private_directory(&disks).unwrap();
         let disk = disks.join("system.ext4");
-        crate::storage::publish_disk(&disk, 4096, |stage| open_write(stage)?.set_len(4096))
-            .unwrap();
+        crate::storage::publish_disk(&disk, 4096, |stage, _custody| {
+            open_write(stage)?.set_len(4096)
+        })
+        .unwrap();
         let unrelated_disk = crate::storage::attach(&disk).unwrap();
         let original = retain_input(&root, &snapshot.request.id).unwrap();
         let native = original.try_clone().unwrap();
@@ -1341,8 +1364,10 @@ mod tests {
         let disks = machine.join("disks");
         private_directory(&disks).unwrap();
         let disk = disks.join("system.ext4");
-        crate::storage::publish_disk(&disk, 4096, |stage| open_write(stage)?.set_len(4096))
-            .unwrap();
+        crate::storage::publish_disk(&disk, 4096, |stage, _custody| {
+            open_write(stage)?.set_len(4096)
+        })
+        .unwrap();
         let guardian = machine.join("guardian");
         private_directory(&guardian).unwrap();
         let restores = guardian.join("restores");
@@ -1404,7 +1429,16 @@ mod tests {
         )))
         .unwrap();
         let image = temp.image(&snapshot);
-        assert!(finish_filesystem(&root, &snapshot, &image).is_err());
+        assert!(
+            finish_filesystem(
+                &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+                vec![],
+                &root,
+                &snapshot,
+                &image
+            )
+            .is_err()
+        );
         drop(custody);
         // A crash while writing the final manifest must not recopy the source
         // or discard the already complete captured input.
@@ -1412,8 +1446,22 @@ mod tests {
             .unwrap()
             .write_all(b"partial")
             .unwrap();
-        let captured = finish_filesystem(&root, &snapshot, &image).unwrap();
-        let retried = finish_filesystem(&root, &snapshot, &image).unwrap();
+        let captured = finish_filesystem(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+            vec![],
+            &root,
+            &snapshot,
+            &image,
+        )
+        .unwrap();
+        let retried = finish_filesystem(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+            vec![],
+            &root,
+            &snapshot,
+            &image,
+        )
+        .unwrap();
         assert_eq!(captured.disk_digest, retried.disk_digest);
         assert_eq!(captured.manifest_digest, retried.manifest_digest);
         assert_eq!(
@@ -1439,7 +1487,16 @@ mod tests {
         assert!(prepared_filesystem(&root, &changed).is_err());
         fs::write(disk_stage(&root, &snapshot).join("system.ext4"), [9; 4096]).unwrap();
         assert!(prepared_filesystem(&root, &snapshot).is_err());
-        assert!(finish_filesystem(&root, &snapshot, &temp.image(&snapshot)).is_err());
+        assert!(
+            finish_filesystem(
+                &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+                vec![],
+                &root,
+                &snapshot,
+                &temp.image(&snapshot)
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1514,14 +1571,30 @@ mod tests {
         let image = temp.image(&snapshot);
         let mut foreign = snapshot.clone();
         foreign.image_digest = bytes_digest(b"another image");
-        assert!(finish_filesystem(&root, &foreign, &image).is_err());
+        assert!(
+            finish_filesystem(
+                &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+                vec![],
+                &root,
+                &foreign,
+                &image
+            )
+            .is_err()
+        );
         assert!(
             !root.exists(),
             "reject another image before allocating capture storage"
         );
         assert!(!root.parent().unwrap().join("images").exists());
         prepare_filesystem(&root, &snapshot, &disk).unwrap();
-        finish_filesystem(&root, &snapshot, &image).unwrap();
+        finish_filesystem(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+            vec![],
+            &root,
+            &snapshot,
+            &image,
+        )
+        .unwrap();
         let directory = root.join(object_name(snapshot.request.id.as_str()));
         let kernel = directory.join("boot/kernel");
         #[cfg(unix)]
@@ -1697,7 +1770,14 @@ mod tests {
         let root = temp.capture_root(&snapshot);
         let image = temp.image(&snapshot);
         prepare_filesystem(&root, &snapshot, &source).unwrap();
-        let captured = finish_filesystem(&root, &snapshot, &image).unwrap();
+        let captured = finish_filesystem(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
+            vec![],
+            &root,
+            &snapshot,
+            &image,
+        )
+        .unwrap();
         snapshot.phase = SnapshotPhase::Ready;
         snapshot.consistency = Some(SnapshotConsistency::Crash);
         snapshot.system_disk_digest = Some(captured.disk_digest.clone());
@@ -1713,6 +1793,7 @@ mod tests {
             .write_all(b"partial fork")
             .unwrap();
         materialize_fork(
+            &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
             &root,
             &snapshot,
             &fork,
@@ -1752,6 +1833,7 @@ mod tests {
         fs::write(&fork, vec![8_u8; 4096]).unwrap();
         assert!(
             materialize_fork(
+                &mut crate::offline::Executor::new(&root, vec![], std::env::current_exe().unwrap()),
                 &root,
                 &snapshot,
                 &fork,
@@ -1772,7 +1854,7 @@ mod tests {
         let target_directory = temp.0.join("target");
         private_directory(&target_directory).unwrap();
         let target = target_directory.join("system.ext4");
-        crate::storage::publish_disk(&target, 4096, |staged| {
+        crate::storage::publish_disk(&target, 4096, |staged, _custody| {
             open_write(staged)?.write_all(&vec![9_u8; 4096])
         })
         .unwrap();

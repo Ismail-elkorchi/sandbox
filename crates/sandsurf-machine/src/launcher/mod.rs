@@ -33,7 +33,7 @@ const INTERNAL_EXIT: u8 = 103;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct VmmMachineSpec {
-    pub nic_handoff_fd_index: usize,
+    pub nic_handoff_fd_index: Option<usize>,
     pub launcher_fd_index: usize,
     pub mounts: Vec<MountSpec>,
     pub firecracker_fd_index: usize,
@@ -56,17 +56,14 @@ pub(crate) struct VmmMachineSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VmmLaunchSpec {
-    pub nic_handoff_fd_index: usize,
-    pub tun_device_fd_index: usize,
+    pub devices: DeviceAttachments,
     pub namespace_launcher_fd_index: usize,
     pub firecracker_fd_index: usize,
     pub firecracker_identity: FileIdentity,
     pub firecracker_sha256: String,
     pub kernel_fd_index: usize,
     pub initramfs_fd_index: Option<usize>,
-    pub system_fd_index: usize,
     pub storage_custody: Vec<CustodyDescriptor>,
-    pub authentication_fd_index: usize,
     pub serial_input_fd_index: usize,
     /// Present only when a fresh Firecracker process is started for snapshot
     /// loading. These files are mounted read-only at fixed paths and remain
@@ -79,6 +76,44 @@ pub struct VmmLaunchSpec {
     pub open_files_limit: u64,
     pub file_size_limit: u64,
     pub termination_grace_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DeviceAttachments {
+    Computer {
+        system: usize,
+        authentication: usize,
+        nic_handoff: usize,
+        tun: usize,
+    },
+    OfflineDisk {
+        root: usize,
+        target: usize,
+        writable: bool,
+    },
+}
+
+impl DeviceAttachments {
+    fn indexes(&self) -> Vec<usize> {
+        match self {
+            Self::Computer {
+                system,
+                authentication,
+                nic_handoff,
+                tun,
+            } => {
+                vec![*system, *authentication, *nic_handoff, *tun]
+            }
+            Self::OfflineDisk { root, target, .. } => vec![*root, *target],
+        }
+    }
+    fn nic_handoff(&self) -> Option<usize> {
+        match self {
+            Self::Computer { nic_handoff, .. } => Some(*nic_handoff),
+            Self::OfflineDisk { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,17 +558,14 @@ fn run_vmm_launcher() -> io::Result<i32> {
 
 fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Result<()> {
     let mut indexes = vec![
-        spec.nic_handoff_fd_index,
-        spec.tun_device_fd_index,
         spec.namespace_launcher_fd_index,
         spec.firecracker_fd_index,
         spec.kernel_fd_index,
-        spec.system_fd_index,
-        spec.authentication_fd_index,
         spec.serial_input_fd_index,
         spec.state_directory_fd_index,
         spec.kvm_fd_index,
     ];
+    indexes.extend(spec.devices.indexes());
     if spec.storage_custody.is_empty()
         || spec.storage_custody.len() > sandsurf_native::MAX_WORKER_CUSTODY
     {
@@ -589,22 +621,7 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
 
 fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
     let mut mounts = vec![
-        (
-            spec.tun_device_fd_index,
-            "/dev/net/tun",
-            "file",
-            false,
-            false,
-        ),
         (spec.kernel_fd_index, "/vm/kernel", "file", true, false),
-        (spec.system_fd_index, "/vm/system", "file", false, false),
-        (
-            spec.authentication_fd_index,
-            "/vm/auth",
-            "file",
-            true,
-            false,
-        ),
         (
             spec.state_directory_fd_index,
             "/vm/state",
@@ -625,6 +642,35 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         },
     )
     .collect::<Vec<_>>();
+    let mut device_mount = |fd_index, target_path: &str, read_only| {
+        mounts.push(MountSpec {
+            fd_index,
+            target_path: target_path.into(),
+            kind: "file".into(),
+            read_only,
+            executable: false,
+        })
+    };
+    match &spec.devices {
+        DeviceAttachments::Computer {
+            system,
+            authentication,
+            tun,
+            ..
+        } => {
+            device_mount(*system, "/vm/root", false);
+            device_mount(*authentication, "/vm/secondary", true);
+            device_mount(*tun, "/dev/net/tun", false);
+        }
+        DeviceAttachments::OfflineDisk {
+            root,
+            target,
+            writable,
+        } => {
+            device_mount(*root, "/vm/root", true);
+            device_mount(*target, "/vm/secondary", !writable);
+        }
+    }
     if let Some(index) = spec.initramfs_fd_index {
         mounts.push(MountSpec {
             fd_index: index,
@@ -660,7 +706,7 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         "/vm/state/native-metrics.fifo".into(),
     ];
     VmmMachineSpec {
-        nic_handoff_fd_index: spec.nic_handoff_fd_index,
+        nic_handoff_fd_index: spec.devices.nic_handoff(),
         launcher_fd_index: spec.namespace_launcher_fd_index,
         mounts,
         firecracker_fd_index: spec.firecracker_fd_index,
@@ -682,8 +728,10 @@ fn namespace_init(
     spec: &VmmMachineSpec,
     files: Vec<File>,
 ) -> io::Result<i32> {
-    let packet = sandsurf_network::linux::create_isolated_packet_socket()?;
-    send_fds(files[spec.nic_handoff_fd_index].as_raw_fd(), 0, &[packet])?;
+    if let Some(index) = spec.nic_handoff_fd_index {
+        let packet = sandsurf_network::linux::create_isolated_packet_socket()?;
+        send_fds(files[index].as_raw_fd(), 0, &[packet])?;
+    }
     drop_capabilities(true)?;
     // Keep custody until the VMM and its descendants have actually been reaped.
     // The VMM inherits a duplicate too, fencing replacement if this supervisor
@@ -971,7 +1019,9 @@ fn final_status(
 
 fn validate_vmm_machine_spec(spec: &VmmMachineSpec, descriptor_count: usize) -> io::Result<()> {
     if spec.launcher_fd_index >= descriptor_count
-        || spec.nic_handoff_fd_index >= descriptor_count
+        || spec
+            .nic_handoff_fd_index
+            .is_some_and(|index| index >= descriptor_count)
         || spec.firecracker_fd_index >= descriptor_count
         || spec.state_directory_fd_index >= descriptor_count
         || spec.storage_custody.is_empty()

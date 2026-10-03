@@ -65,7 +65,14 @@ impl QemuWorker {
         let mut arguments = config.arguments(endpoints.path())?;
         // The namespace exists before the kernel policy is installed. Future
         // capture files have one fixed shape, not access to the guardian tree.
-        sandsurf_native::local::canonical_private_directory(captures)?;
+        if config.devices.machine_id().is_some() != captures.is_some() {
+            return Err(invalid(
+                "native capture footprint differs from the device role",
+            ));
+        }
+        if let Some(captures) = captures {
+            sandsurf_native::local::canonical_private_directory(captures)?;
+        }
         if restore.is_some() {
             arguments.extend(["-incoming".into(), "defer".into()]);
         }
@@ -80,14 +87,22 @@ impl QemuWorker {
                 ));
             }
             let mut read_only = runtime.read_paths.clone();
-            read_only.extend([config.kernel.clone(), config.authentication_disk.clone()]);
+            read_only.push(config.kernel.clone());
+            let mut writable = Vec::new();
+            for (path, read_only_disk) in config.devices.disks() {
+                if read_only_disk {
+                    read_only.push(path.to_owned());
+                } else {
+                    writable.push(path.to_owned());
+                }
+            }
             read_only.extend(config.initramfs.iter().cloned());
             read_only.extend(restore.map(Path::to_owned));
             let profile = sandsurf_native::darwin_vmm::Files {
                 read_only,
-                disk: config.system_disk.clone(),
+                writable,
                 endpoints: endpoints.path().to_owned(),
-                captures: captures.to_owned(),
+                captures: captures.clone(),
             }
             .profile()?;
             let mut admitted = vec!["--sandsurf-seatbelt".into(), profile.into()];
@@ -181,6 +196,14 @@ impl QemuWorker {
             &self.endpoints.path().join(name),
             &mut self.child,
             self.startup_deadline,
+        )
+    }
+    pub(crate) fn attach_control(&mut self, slot: usize) -> io::Result<SocketConnection> {
+        let name = sandsurf_native::serial_channel::socket_name(slot)?;
+        connect_device(
+            &self.endpoints.path().join(name),
+            &mut self.child,
+            Instant::now() + Duration::from_secs(1),
         )
     }
     pub(crate) fn native_exit(&mut self) -> io::Result<Option<(bool, Digest)>> {

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sandsurf_image::archive::{Archive, Limits};
+use sandsurf_format::archive::{Archive, Limits};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > 1024 * 1024 {

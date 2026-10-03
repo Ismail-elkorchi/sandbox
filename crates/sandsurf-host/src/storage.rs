@@ -131,6 +131,8 @@ fn copy_boot_inputs(
 /// Caller owns a detached disk lease or an immutable captured disk. Corrupt
 /// selection never falls back to the creation kernel.
 pub(crate) fn freeze_boot(
+    executor: &mut dyn sandsurf_image::appliance::Executor,
+    custody: Vec<std::sync::Arc<fs::File>>,
     image: &sandsurf_image::VerifiedImage,
     disk: &Path,
     directory: &Path,
@@ -157,7 +159,13 @@ pub(crate) fn freeze_boot(
             }
             boot
         } else {
-            boot::extract(disk, stage, image.manifest.architecture)?
+            use sandsurf_image::appliance::Filesystem;
+            let mut appliance = executor.open(disk, false, custody)?;
+            appliance.run(sandsurf_protocol::disk::DiskOperation::Mount { writable: false })?;
+            let boot = boot::extract(&mut appliance, stage, image.manifest.architecture)?;
+            appliance.run(sandsurf_protocol::disk::DiskOperation::Unmount)?;
+            appliance.finish()?;
+            boot
         };
         Ok(boot)
     })
@@ -536,12 +544,12 @@ pub(crate) fn materialize(
     source: &Path,
     destination: &Path,
     bytes: u64,
-    prepare_storage: impl FnOnce(&Path) -> io::Result<()>,
+    prepare_storage: impl FnOnce(&Path, std::sync::Arc<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
     if !source.is_absolute() {
         return Err(invalid("creation seed path must be absolute"));
     }
-    publish_disk(destination, bytes, |staged| {
+    publish_disk(destination, bytes, |staged, custody| {
         let mut input = open_private_file(source, PrivateFileAccess::ReadOnly)?;
         let source_metadata = input.metadata()?;
         if source_metadata.len() == 0 || source_metadata.len() > MAX_DISK_BYTES {
@@ -564,7 +572,7 @@ pub(crate) fn materialize(
         output.set_len(bytes)?;
         sync_file(&output)?;
         drop(output);
-        prepare_storage(staged)
+        prepare_storage(staged, custody)
     })
 }
 
@@ -573,7 +581,7 @@ pub(crate) fn materialize(
 pub(crate) fn publish_disk(
     destination: &Path,
     bytes: u64,
-    build: impl FnOnce(&Path) -> io::Result<()>,
+    build: impl FnOnce(&Path, std::sync::Arc<fs::File>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut owner = DiskOwner::open(destination, Some(bytes))?;
     match owner.record.phase {
@@ -590,7 +598,8 @@ pub(crate) fn publish_disk(
             ));
         }
     }
-    publish_prepared(destination, bytes, build)?;
+    let custody = std::sync::Arc::new(owner.lease.try_clone()?);
+    publish_prepared(destination, bytes, |staged| build(staged, custody))?;
     if owner.record.phase != DiskPhase::Ready {
         owner.set_phase(DiskPhase::Ready)?;
     }
@@ -714,6 +723,35 @@ mod tests {
 
     struct Fixture(std::path::PathBuf);
 
+    #[test]
+    fn surviving_offline_owner_keeps_preparation_and_original_slot_custody() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("seed");
+        let target = fixture.0.join("system.ext4");
+        let mut surviving = None;
+        assert!(
+            materialize(&source, &target, 4096, |stage, custody| {
+                fs::write(stage, b"partial native effect")?;
+                surviving = Some(custody);
+                Err(io::Error::other(
+                    "controller interrupted before native containment",
+                ))
+            })
+            .is_err()
+        );
+        let stage = target.with_extension("building");
+        let original = fs::read(&stage).unwrap();
+        let retry = materialize(&source, &target, 4096, |_, _| {
+            panic!("native custody must prevent replay")
+        });
+        assert_eq!(retry.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&stage).unwrap(), original);
+        drop(surviving);
+        materialize(&source, &target, 4096, |_, _| Ok(())).unwrap();
+        assert!(!stage.exists());
+        assert_eq!(fs::metadata(target).unwrap().len(), 4096);
+    }
+
     fn pinned_image(root: &Path, kernel: &Path) -> sandsurf_image::VerifiedImage {
         let mut manifest: sandsurf_image::ImageManifest = serde_json::from_str(include_str!(
             "../../../packages/sandsurf/images/development-x64/manifest.json"
@@ -744,7 +782,20 @@ mod tests {
             .unwrap();
         let target = fixture.0.join("frozen-boot");
         let image = pinned_image(&fixture.0, &kernel);
-        assert!(freeze_boot(&image, &image.system_path, &target).is_err());
+        assert!(
+            freeze_boot(
+                &mut crate::offline::Executor::new(
+                    &fixture.0,
+                    vec![],
+                    std::env::current_exe().unwrap()
+                ),
+                vec![],
+                &image,
+                &image.system_path,
+                &target
+            )
+            .is_err()
+        );
         assert!(!target.exists());
         assert!(
             !fs::read_dir(&fixture.0).unwrap().any(|v| v
@@ -760,17 +811,52 @@ mod tests {
         bytes[0x206..0x208].copy_from_slice(&0x020c_u16.to_le_bytes());
         fs::write(&kernel, &bytes).unwrap();
         let image = pinned_image(&fixture.0, &kernel);
-        let boot = freeze_boot(&image, &image.system_path, &target).unwrap();
+        let boot = freeze_boot(
+            &mut crate::offline::Executor::new(
+                &fixture.0,
+                vec![],
+                std::env::current_exe().unwrap(),
+            ),
+            vec![],
+            &image,
+            &image.system_path,
+            &target,
+        )
+        .unwrap();
         fs::remove_file(&kernel).unwrap();
         assert_eq!(
-            freeze_boot(&image, &image.system_path, &target).unwrap(),
+            freeze_boot(
+                &mut crate::offline::Executor::new(
+                    &fixture.0,
+                    vec![],
+                    std::env::current_exe().unwrap()
+                ),
+                vec![],
+                &image,
+                &image.system_path,
+                &target
+            )
+            .unwrap(),
             boot
         );
         assert_eq!(fs::read(target.join("kernel")).unwrap(), bytes);
         let partial = fixture.0.join("partial-boot");
         create_private_directory(&partial).unwrap();
         fs::write(partial.join("kernel"), b"partial").unwrap();
-        assert!(freeze_boot(&image, &image.system_path, &partial).is_err());
+        assert!(
+            freeze_boot(
+                &mut crate::offline::Executor::new(
+                    &fixture.0,
+                    vec![],
+                    std::env::current_exe().unwrap()
+                ),
+                vec![],
+                &image,
+                &image.system_path,
+                &partial
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(partial.join("kernel")).unwrap(), b"partial");
     }
 
@@ -864,7 +950,7 @@ mod tests {
     }
 
     fn create_disk(target: &Path, byte: u8) {
-        publish_disk(target, 4096, |staged| {
+        publish_disk(target, 4096, |staged, _custody| {
             create_private_file(staged)?.write_all(&vec![byte; 4096])
         })
         .unwrap();
@@ -886,7 +972,7 @@ mod tests {
         let operation = "replace".try_into().unwrap();
         for error in [
             attach(&target).unwrap_err(),
-            publish_disk(&target, 4096, |_| {
+            publish_disk(&target, 4096, |_, _custody| {
                 panic!("an attached slot must not be materialized")
             })
             .unwrap_err(),
@@ -1058,13 +1144,16 @@ mod tests {
         create_disk(&target, 1);
         fs::remove_file(&target).unwrap();
         assert!(
-            publish_disk(&target, 4096, |_| panic!("lost disk must not be recreated")).is_err()
+            publish_disk(&target, 4096, |_, _custody| panic!(
+                "lost disk must not be recreated"
+            ))
+            .is_err()
         );
         assert!(!target.exists());
         retire(&target, 4096).unwrap();
         retire(&target, 4096).unwrap();
         assert!(
-            publish_disk(&target, 4096, |_| panic!(
+            publish_disk(&target, 4096, |_, _custody| panic!(
                 "retired slot must not be recreated"
             ))
             .is_err()
@@ -1086,7 +1175,7 @@ mod tests {
             DiskPhase::Retired
         );
         assert!(
-            publish_disk(&target, 4096, |_| panic!(
+            publish_disk(&target, 4096, |_, _custody| panic!(
                 "destroyed unbooted machine must not be created"
             ))
             .is_err()
@@ -1099,7 +1188,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let fixture = Fixture::new();
         let target = fixture.0.join("system.ext4");
-        publish_disk(&target, 65536, |staged| {
+        publish_disk(&target, 65536, |staged, _custody| {
             create_private_file(staged)?.set_len(65536)
         })
         .unwrap();
@@ -1108,7 +1197,7 @@ mod tests {
             DiskOwner::open(&target, None).unwrap().record.phase,
             DiskPhase::Ready
         );
-        publish_disk(&target, 65536, |_| {
+        publish_disk(&target, 65536, |_, _custody| {
             panic!("capacity checks must not rebuild a published disk")
         })
         .unwrap();
@@ -1126,7 +1215,10 @@ mod tests {
         })
         .unwrap();
         drop(owner);
-        publish_disk(&target, 4096, |_| panic!("published payload is complete")).unwrap();
+        publish_disk(&target, 4096, |_, _custody| {
+            panic!("published payload is complete")
+        })
+        .unwrap();
         assert_eq!(
             DiskOwner::open(&target, None).unwrap().record.phase,
             DiskPhase::Ready
@@ -1150,7 +1242,7 @@ mod tests {
             .write_all(&vec![9; 4096])
             .unwrap();
         assert!(
-            publish_disk(&untracked, 4096, |_| panic!(
+            publish_disk(&untracked, 4096, |_, _custody| panic!(
                 "untracked original must remain intact"
             ))
             .is_err()
@@ -1249,7 +1341,7 @@ mod tests {
             let target = fixture.0.join("system.ext4");
             assert_eq!(target.exists(), stage < 2 || stage == 3);
             assert_eq!(
-                publish_disk(&target, 4096, |_| panic!(
+                publish_disk(&target, 4096, |_, _custody| panic!(
                     "active writer must not be replaced"
                 ))
                 .unwrap_err()
@@ -1259,7 +1351,7 @@ mod tests {
             child.0.kill().unwrap();
             child.0.wait().unwrap();
             assert!(
-                publish_disk(&target, 4096, |_| panic!(
+                publish_disk(&target, 4096, |_, _custody| panic!(
                     "interrupted replacement must not be reseeded"
                 ))
                 .is_err()
@@ -1295,7 +1387,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(&target).unwrap(), vec![1; 4096]);
-        assert!(publish_disk(&target, 4096, |_| Ok(())).is_err());
+        assert!(publish_disk(&target, 4096, |_, _custody| Ok(())).is_err());
         replace(&target, &operation).unwrap();
         assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
     }
@@ -1361,7 +1453,7 @@ mod tests {
         ] {
             fs::write(&record_path, &corrupt).unwrap();
             assert!(
-                publish_disk(&target, 4096, |_| panic!(
+                publish_disk(&target, 4096, |_, _custody| panic!(
                     "invalid record must never prepare"
                 ))
                 .is_err()
@@ -1392,13 +1484,16 @@ mod tests {
     fn shared_disk_identity_is_never_attached_or_deleted() {
         let fixture = Fixture::new();
         let target = fixture.0.join("system.raw");
-        materialize(&fixture.0.join("seed"), &target, 4096, |_| Ok(())).unwrap();
+        materialize(&fixture.0.join("seed"), &target, 4096, |_, _custody| Ok(())).unwrap();
         let alias = fixture.0.join("other-owner.raw");
         fs::hard_link(&target, &alias).unwrap();
         assert!(
-            materialize(&fixture.0.join("seed"), &target, 4096, |_| panic!(
-                "shared live disk must not be prepared"
-            ))
+            materialize(
+                &fixture.0.join("seed"),
+                &target,
+                4096,
+                |_, _custody| panic!("shared live disk must not be prepared")
+            )
             .is_err()
         );
         assert!(retire(&target, 4096).is_err());
@@ -1416,7 +1511,7 @@ mod tests {
         let staged = target.with_extension("building");
         fs::hard_link(&source, &staged).unwrap();
         assert!(
-            materialize(&source, &target, 4096, |_| panic!(
+            materialize(&source, &target, 4096, |_, _custody| panic!(
                 "unowned stage must not be prepared"
             ))
             .is_err()
@@ -1432,7 +1527,7 @@ mod tests {
         let source = fixture.0.join("seed");
         let target = fixture.0.join("system.raw");
         assert!(
-            materialize(&source, &target, 4096, |staged| {
+            materialize(&source, &target, 4096, |staged, _custody| {
                 open_private_file(staged, PrivateFileAccess::ReadWrite)?.set_len(8192)
             })
             .is_err()
@@ -1444,7 +1539,7 @@ mod tests {
                 .len(),
             8192
         );
-        materialize(&source, &target, 4096, |_| Ok(())).unwrap();
+        materialize(&source, &target, 4096, |_, _custody| Ok(())).unwrap();
         assert_eq!(fs::metadata(&target).unwrap().len(), 4096);
         assert_eq!(&fs::read(target).unwrap()[..10], b"seed bytes");
     }
@@ -1457,13 +1552,13 @@ mod tests {
         let alias = fixture.0.join("seed-link");
         std::os::unix::fs::symlink(&source, &alias).unwrap();
         let target = fixture.0.join("system.raw");
-        assert!(materialize(&alias, &target, 4096, |_| Ok(())).is_err());
+        assert!(materialize(&alias, &target, 4096, |_, _custody| Ok(())).is_err());
         std::os::unix::fs::symlink(&source, target.with_extension("building")).unwrap();
-        assert!(materialize(&source, &target, 4096, |_| Ok(())).is_err());
+        assert!(materialize(&source, &target, 4096, |_, _custody| Ok(())).is_err());
         assert!(retire(&target, 4096).is_err());
         fs::remove_file(target.with_extension("building")).unwrap();
         std::os::unix::fs::symlink(&source, &target).unwrap();
-        assert!(materialize(&source, &target, 4096, |_| Ok(())).is_err());
+        assert!(materialize(&source, &target, 4096, |_, _custody| Ok(())).is_err());
         assert!(retire(&target, 4096).is_err());
         assert_eq!(fs::read(source).unwrap(), b"seed bytes");
         assert!(
@@ -1492,14 +1587,14 @@ mod tests {
             .write_all(b"verified-seed")
             .unwrap();
         assert!(
-            materialize(&source, &target, 4096, |_| {
+            materialize(&source, &target, 4096, |_, _custody| {
                 Err(io::Error::other("interrupted seed preparation"))
             })
             .is_err()
         );
         assert!(!target.exists());
         assert!(target.with_extension("building").exists());
-        materialize(&source, &target, 4096, |_| Ok(())).unwrap();
+        materialize(&source, &target, 4096, |_, _custody| Ok(())).unwrap();
         assert!(!target.with_extension("building").exists());
         fs::remove_file(&source).unwrap();
         let disk = open_private_file(&target, PrivateFileAccess::ReadWrite).unwrap();
@@ -1509,13 +1604,13 @@ mod tests {
             .unwrap()
             .write_all(b"unpublished build")
             .unwrap();
-        materialize(&source, &target, 4096, |_| {
+        materialize(&source, &target, 4096, |_, _custody| {
             panic!("published guest disk must never enter seed preparation")
         })
         .unwrap();
         assert!(!target.with_extension("building").exists());
         assert_eq!(&fs::read(&target).unwrap()[..12], b"guest-owned!");
-        assert!(materialize(&source, &target, 8192, |_| Ok(())).is_err());
+        assert!(materialize(&source, &target, 8192, |_, _custody| Ok(())).is_err());
         let retained = root.join("retained-output");
         create_private_file(&retained)
             .unwrap()

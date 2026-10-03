@@ -70,6 +70,11 @@ impl QemuOwner {
         custody: Vec<Arc<File>>,
         restore: Option<&Path>,
     ) -> io::Result<Self> {
+        let machine_id = config
+            .launch
+            .devices
+            .machine_id()
+            .ok_or_else(|| invalid("computer owner requires a native NIC"))?;
         let mut worker = QemuWorker::launch(config, budget, guest_cpu_quota, custody, restore)?;
         let process = worker.process_id();
         let timeout = std::time::Duration::from_secs(15);
@@ -81,7 +86,7 @@ impl QemuOwner {
         let socket = worker.attach(NIC)?;
         let network = Arc::new(NativeNetworkGateway::start(
             PacketTransport::Stream(Box::new(PacketStream::new(socket.into_socket())?)),
-            LinkIdentity::for_machine(&config.launch.machine_id),
+            LinkIdentity::for_machine(machine_id),
         )?);
         Ok(Self {
             worker,

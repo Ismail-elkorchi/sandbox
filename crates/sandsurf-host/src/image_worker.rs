@@ -474,15 +474,29 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
         ServicePool::Images.process_budget(),
     )?;
     sandsurf_native::storage::verify_transferred_lease(&lease, &root.join("image-workers/.lease"))?;
-    let _custody = lease;
+    let pool_custody = std::sync::Arc::new(lease);
     let job = admitted(&root, &operation)?;
+    let operation_custody = std::sync::Arc::new(sandsurf_native::storage::disk_lease(
+        &directory(&root, &operation).join(".owner"),
+    )?);
+    let mut executor = crate::offline::Executor::new(
+        &root,
+        vec![pool_custody, operation_custody],
+        std::env::current_exe()?,
+    );
     if result(&root, &job)?.is_some() {
         return Ok(());
     }
     let image = match &job.build {
         Build::DiskSnapshot { snapshot } => {
+            executor.retain(std::sync::Arc::new(crate::images::image_custody(
+                &root,
+                &snapshot.image_digest,
+            )?));
             let image = crate::images::resolve_native_image(&root, &snapshot.image_digest)?;
             crate::snapshots::finish_filesystem(
+                &mut executor,
+                vec![],
                 &crate::snapshots::root(&root, snapshot),
                 snapshot,
                 &image,
@@ -494,6 +508,10 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
             machine_id,
             profile,
         } => {
+            executor.retain(std::sync::Arc::new(crate::images::image_custody(
+                &root,
+                &snapshot.image_digest,
+            )?));
             let image = crate::images::resolve_native_image(&root, &snapshot.image_digest)?;
             if image.manifest.system.clone_profile != *profile {
                 return Err(HostError::Invalid(
@@ -501,6 +519,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
                 ));
             }
             crate::snapshots::materialize_fork(
+                &mut executor,
                 &crate::snapshots::root(&root, snapshot),
                 snapshot,
                 &fork_disk(&root, machine_id),
@@ -522,6 +541,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
             boot_name,
         } => {
             prepare_machine(
+                &mut executor,
                 &root,
                 machine_id,
                 *generation,
@@ -583,6 +603,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
                 _ => None,
             };
             crate::images::oci::import(
+                &mut executor,
                 &root,
                 crate::images::oci::BuildInput {
                     source,
@@ -641,6 +662,7 @@ fn boot_directory(
 }
 
 fn prepare_machine(
+    executor: &mut dyn sandsurf_image::appliance::Executor,
     root: &Path,
     machine: &MachineId,
     generation: Counter,
@@ -651,13 +673,30 @@ fn prepare_machine(
     let boot_directory = boot_directory(root, machine, generation, boot_name)?;
     let machine_root = root.join("machines").join(object_name(machine.as_str()));
     sandsurf_native::local::canonical_private_directory(&machine_root)?;
+    let image_custody = std::sync::Arc::new(crate::images::image_custody(root, image_digest)?);
     let image = crate::images::resolve_native_image(root, image_digest)?;
     let disk = machine_root.join("disks/system.ext4");
-    crate::storage::materialize(&image.system_path, &disk, disk_bytes, |staged| {
-        sandsurf_image::identity::customize(staged, &image.manifest.system.clone_profile)
-    })?;
-    let _custody = crate::storage::attach(&disk)?;
-    crate::storage::freeze_boot(&image, &disk, &boot_directory)?;
+    crate::storage::materialize(
+        &image.system_path,
+        &disk,
+        disk_bytes,
+        |staged, disk_custody| {
+            sandsurf_image::identity::customize(
+                executor,
+                vec![disk_custody, image_custody.clone()],
+                staged,
+                &image.manifest.system.clone_profile,
+            )
+        },
+    )?;
+    let disk_custody = crate::storage::attach(&disk)?;
+    crate::storage::freeze_boot(
+        executor,
+        vec![disk_custody, image_custody],
+        &image,
+        &disk,
+        &boot_directory,
+    )?;
     Ok(())
 }
 

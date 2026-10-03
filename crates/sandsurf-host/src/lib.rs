@@ -16,6 +16,7 @@ pub mod images;
 mod ipc_frames;
 #[cfg(target_os = "linux")]
 pub mod linux;
+mod offline;
 #[cfg(any(target_os = "macos", windows))]
 pub mod qemu;
 pub mod qualification;

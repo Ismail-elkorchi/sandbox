@@ -84,19 +84,16 @@ impl FirecrackerCapture {
 
 #[derive(Debug, Clone)]
 pub struct FirecrackerConfig {
-    pub network_identity: sandsurf_network::LinkIdentity,
+    pub devices: crate::devices::Devices,
     pub launcher_executable: PathBuf,
     pub firecracker_executable: PathBuf,
     pub firecracker_sha256: String,
     pub state_directory: PathBuf,
     pub kernel_image: PathBuf,
     pub initial_ramdisk: Option<PathBuf>,
-    /// Exclusively attached, host-owned writable Linux system disk.
-    pub system_disk: PathBuf,
     /// Complete original storage/input custody transferred into the actual
     /// VMM. Never unlock a duplicate while a native attachment still exists.
     pub storage_custody: Vec<std::sync::Arc<File>>,
-    pub authentication_image: PathBuf,
     pub owner_token: String,
     pub guest_cid: u32,
     pub guest_port: u32,
@@ -105,7 +102,7 @@ pub struct FirecrackerConfig {
 }
 
 pub struct FirecrackerProcess {
-    pub network: std::sync::Arc<sandsurf_network::NativeNetworkGateway>,
+    network: Option<std::sync::Arc<sandsurf_network::NativeNetworkGateway>>,
     child: Child,
     control: UnixStream,
     diagnostics: Vec<JoinHandle<()>>,
@@ -125,7 +122,29 @@ impl FirecrackerProcess {
         config: &FirecrackerConfig,
         configuration: &sandsurf_protocol::RuntimeConfiguration,
     ) -> Result<Self, FirecrackerError> {
-        Self::spawn_inner(config, None, configuration)
+        if config.devices.machine_id().is_none() {
+            return Err(FirecrackerError::Invalid(
+                "computer launch requires a native NIC".into(),
+            ));
+        }
+        Self::spawn_inner(config, None, Some(configuration))
+    }
+
+    pub fn spawn_offline(config: &FirecrackerConfig) -> Result<Self, FirecrackerError> {
+        if config.devices.machine_id().is_some() {
+            return Err(FirecrackerError::Invalid(
+                "offline launch cannot attach a native NIC".into(),
+            ));
+        }
+        Self::spawn_inner(config, None, None)
+    }
+
+    pub fn network(
+        &self,
+    ) -> Result<&std::sync::Arc<sandsurf_network::NativeNetworkGateway>, FirecrackerError> {
+        self.network
+            .as_ref()
+            .ok_or_else(|| FirecrackerError::Invalid("offline executor has no NIC".into()))
     }
 
     /// Start a fresh VMM, load exactly the supplied Firecracker state and
@@ -144,13 +163,18 @@ impl FirecrackerProcess {
                 )));
             }
         }
-        Self::spawn_inner(config, Some(restore), configuration)
+        if config.devices.machine_id().is_none() {
+            return Err(FirecrackerError::Invalid(
+                "offline executor cannot restore computer state".into(),
+            ));
+        }
+        Self::spawn_inner(config, Some(restore), Some(configuration))
     }
 
     fn spawn_inner(
         config: &FirecrackerConfig,
         restore: Option<&FirecrackerRestore>,
-        configuration: &sandsurf_protocol::RuntimeConfiguration,
+        configuration: Option<&sandsurf_protocol::RuntimeConfiguration>,
     ) -> Result<Self, FirecrackerError> {
         validate_config(config)?;
         fs::DirBuilder::new()
@@ -174,20 +198,16 @@ impl FirecrackerProcess {
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&metrics_path)?;
         let (serial_input, serial_slave) = serial_input_pair()?;
-        let drives = vec![
-            Drive {
-                drive_id: "system".into(),
-                path_on_host: "/vm/system".into(),
-                is_root_device: true,
-                is_read_only: false,
-            },
-            Drive {
-                drive_id: "auth".into(),
-                path_on_host: "/vm/auth".into(),
-                is_root_device: false,
-                is_read_only: true,
-            },
-        ];
+        let drives = ["root", "secondary"]
+            .into_iter()
+            .zip(config.devices.disks())
+            .map(|(role, (_, read_only))| Drive {
+                drive_id: role.into(),
+                path_on_host: format!("/vm/{role}"),
+                is_root_device: role == "root",
+                is_read_only: read_only,
+            })
+            .collect();
         let boot_devices = BootDevices {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
@@ -195,7 +215,7 @@ impl FirecrackerProcess {
                     .initial_ramdisk
                     .as_ref()
                     .map(|_| "/vm/initramfs".into()),
-                boot_args: crate::linux_boot_arguments("ttyS0", "/dev/vda"),
+                boot_args: config.devices.boot_arguments("ttyS0"),
             },
             drives,
             machine_config: MachineConfig {
@@ -208,11 +228,16 @@ impl FirecrackerProcess {
                 guest_cid: config.guest_cid,
                 uds_path: "/vm/state/guest.vsock".into(),
             },
-            network_interfaces: vec![NetworkInterface {
-                iface_id: "eth0".into(),
-                host_dev_name: sandsurf_network::linux::TAP_NAME.into(),
-                guest_mac: config.network_identity.mac_address(),
-            }],
+            network_interfaces: config
+                .devices
+                .machine_id()
+                .map(|machine| NetworkInterface {
+                    iface_id: "eth0".into(),
+                    host_dev_name: sandsurf_network::linux::TAP_NAME.into(),
+                    guest_mac: sandsurf_network::LinkIdentity::for_machine(machine).mac_address(),
+                })
+                .into_iter()
+                .collect(),
         };
         let mut files = Vec::new();
         let kernel_fd_index = add_file(&mut files, &config.kernel_image)?;
@@ -221,7 +246,9 @@ impl FirecrackerProcess {
             .as_ref()
             .map(|path| add_file(&mut files, path))
             .transpose()?;
-        let system_fd_index = add_file(&mut files, &config.system_disk)?;
+        let [(root, _), (secondary, _)] = config.devices.disks();
+        let root_fd_index = add_file(&mut files, root)?;
+        let secondary_fd_index = add_file(&mut files, secondary)?;
         if config.storage_custody.is_empty()
             || config.storage_custody.len() > sandsurf_native::MAX_WORKER_CUSTODY
         {
@@ -237,7 +264,6 @@ impl FirecrackerProcess {
             });
             files.push(original.try_clone()?);
         }
-        let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
         let serial_input_fd_index = files.len();
         files.push(serial_slave);
         let snapshot_state_fd_index = restore
@@ -267,22 +293,38 @@ impl FirecrackerProcess {
         let namespace_launcher_fd_index = files.len();
         files.push(crate::launcher::NamespaceLauncher::open()?.file);
         let kvm_fd_index = add_file(&mut files, Path::new("/dev/kvm"))?;
-        let tun_device_fd_index = add_file(&mut files, Path::new("/dev/net/tun"))?;
-        let (nic_channel, nic_sender) = UnixStream::pair()?;
-        let nic_handoff_fd_index = files.len();
-        files.push(File::from(OwnedFd::from(nic_sender)));
+        let mut nic_channel = None;
+        let devices = match &config.devices {
+            crate::devices::Devices::Computer { .. } => {
+                let tun = add_file(&mut files, Path::new("/dev/net/tun"))?;
+                let (channel, sender) = UnixStream::pair()?;
+                nic_channel = Some(channel);
+                let nic_handoff = files.len();
+                files.push(File::from(OwnedFd::from(sender)));
+                crate::launcher::DeviceAttachments::Computer {
+                    system: root_fd_index,
+                    authentication: secondary_fd_index,
+                    nic_handoff,
+                    tun,
+                }
+            }
+            crate::devices::Devices::OfflineDisk { writable, .. } => {
+                crate::launcher::DeviceAttachments::OfflineDisk {
+                    root: root_fd_index,
+                    target: secondary_fd_index,
+                    writable: *writable,
+                }
+            }
+        };
         let spec = VmmLaunchSpec {
-            nic_handoff_fd_index,
-            tun_device_fd_index,
+            devices,
             namespace_launcher_fd_index,
             firecracker_fd_index,
             firecracker_identity: executable_identity,
             firecracker_sha256: actual_digest,
             kernel_fd_index,
             initramfs_fd_index,
-            system_fd_index,
             storage_custody,
-            authentication_fd_index,
             serial_input_fd_index,
             snapshot_state_fd_index,
             snapshot_memory_fd_index,
@@ -305,7 +347,7 @@ impl FirecrackerProcess {
             .stderr(Stdio::piped())
             .spawn()?;
         let mut guard = ChildLaunchGuard::new(child);
-        let setup = (|| -> Result<std::sync::Arc<sandsurf_network::NativeNetworkGateway>, FirecrackerError> {
+        let setup = (|| -> Result<Option<std::sync::Arc<sandsurf_network::NativeNetworkGateway>>, FirecrackerError> {
             send_vmm_launch_spec(&mut control, &spec, &files)?;
             drop(files);
             control.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -319,11 +361,14 @@ impl FirecrackerProcess {
                 }
             }
             control.set_read_timeout(None)?;
+            let Some(nic_channel) = nic_channel else { return Ok(None); };
+            let machine = config.devices.machine_id().ok_or_else(|| FirecrackerError::Invalid("NIC without computer identity".into()))?;
+            let configuration = configuration.ok_or_else(|| FirecrackerError::Invalid("NIC without authority configuration".into()))?;
             nic_channel.set_read_timeout(Some(Duration::from_secs(5)))?;
             let packet = crate::launcher::receive_native_nic(&nic_channel)?;
-            let gateway = sandsurf_network::NativeNetworkGateway::start(sandsurf_network::PacketTransport::LinuxPacket(packet), config.network_identity)?;
+            let gateway = sandsurf_network::NativeNetworkGateway::start(sandsurf_network::PacketTransport::LinuxPacket(packet), sandsurf_network::LinkIdentity::for_machine(machine))?;
             gateway.configure(&configuration.network, &configuration.exposures)?;
-            Ok(std::sync::Arc::new(gateway))
+            Ok(Some(std::sync::Arc::new(gateway)))
         })();
         let network = match setup {
             Ok(network) => network,
@@ -1110,6 +1155,7 @@ pub fn read_api_response(
 }
 
 fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
+    config.devices.validate()?;
     crate::validate_hardware(
         &sandsurf_protocol::VmEngine::Firecracker,
         config.vcpu_count.into(),
@@ -1133,9 +1179,11 @@ fn validate_config(config: &FirecrackerConfig) -> Result<(), FirecrackerError> {
         &config.launcher_executable,
         &config.firecracker_executable,
         &config.kernel_image,
-        &config.system_disk,
-        &config.authentication_image,
-    ] {
+    ]
+    .into_iter()
+    .map(PathBuf::as_path)
+    .chain(config.devices.disks().into_iter().map(|(path, _)| path))
+    {
         if !path.is_absolute() || !path.is_file() {
             return Err(FirecrackerError::Invalid(format!(
                 "missing VM input {}",

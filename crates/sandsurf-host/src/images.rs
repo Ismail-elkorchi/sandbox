@@ -678,7 +678,7 @@ fn copy_regular(source: &Path, destination: &Path) -> Result<(), ImageBuildError
 /// catalog may retire an image while a worker reads it, but byte reclamation
 /// and quota release must wait for custody to drain. Kernel locks disappear
 /// on worker failure; lock files retain stable identities for later owners.
-fn image_custody(host_root: &Path, digest: &Digest) -> Result<File, ImageBuildError> {
+pub(crate) fn image_custody(host_root: &Path, digest: &Digest) -> Result<File, ImageBuildError> {
     let directory = host_root.join("images/custody");
     prepare_private_directory(&host_root.join("images"))?;
     prepare_private_directory(&directory)?;
@@ -1040,7 +1040,7 @@ mod tests {
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
-    #[ignore = "native KVM/libguestfs image qualification; run explicitly with --ignored"]
+    #[ignore = "native Firecracker offline-worker image qualification; run explicitly with --ignored"]
     fn converted_machine_seed_has_a_verified_internal_journal() {
         let root = Path::new("/var/tmp").join(format!(
             "sandsurf-oci-journal-{}-{}",
@@ -1074,7 +1074,21 @@ mod tests {
         archive.finish().unwrap();
         drop(archive);
         let image = root.join("system.ext4");
-        materialize_tar(&archive_path, &image, 128 * 1024 * 1024).unwrap();
+        materialize_tar(
+            &mut crate::offline::Executor::new(
+                &root,
+                vec![std::sync::Arc::new(
+                    sandsurf_native::storage::disk_lease(&root.join(".executor")).unwrap(),
+                )],
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../packages/sandsurf/native/linux-x64/sandsurf-host-linux-x64"),
+            ),
+            vec![],
+            &archive_path,
+            &image,
+            128 * 1024 * 1024,
+        )
+        .unwrap();
         let mut file = File::open(&image).unwrap();
         let mut superblock = [0u8; 1024];
         file.seek(SeekFrom::Start(1024)).unwrap();
@@ -1089,7 +1103,8 @@ mod tests {
         );
         fs::remove_file(image).unwrap();
         fs::remove_file(archive_path).unwrap();
-        fs::remove_dir_all(root.join(".appliance")).unwrap();
+        fs::remove_dir_all(root.join(".offline")).unwrap();
+        fs::remove_file(root.join(".executor")).unwrap();
         fs::remove_dir(root).unwrap();
     }
 }

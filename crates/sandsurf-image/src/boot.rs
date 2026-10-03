@@ -1,5 +1,6 @@
-use crate::appliance::{self, Operation};
+use crate::appliance::Filesystem;
 use crate::{Architecture, ImageArtifact};
+use sandsurf_protocol::disk::DiskOperation;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -66,27 +67,21 @@ pub fn validate_selection(value: &BootSelection, architecture: Architecture) -> 
 /// Caller holds disk custody or uses an immutable captured copy. No guest
 /// programs execute during extraction; no pristine fallback on any error.
 pub fn extract(
-    disk: &Path,
+    filesystem: &mut impl Filesystem,
     directory: &Path,
     architecture: Architecture,
 ) -> io::Result<FrozenBoot> {
     let selection_path = directory.join("selection.json");
-    appliance::download(disk, "/boot/sandsurf.json", &selection_path, 4096)?;
+    filesystem.download("/boot/sandsurf.json", &selection_path, 4096)?;
     let selection: BootSelection = serde_json::from_slice(&fs::read(&selection_path)?)
         .map_err(|_| invalid("corrupt /boot/sandsurf.json"))?;
     validate_selection(&selection, architecture)?;
     // realpath is interpreted only inside the appliance. Reject symlink escapes
     // from /boot even though those could never reach the host filesystem.
     for path in std::iter::once(&selection.kernel).chain(selection.initramfs.iter()) {
-        let resolved = appliance::run(
-            disk,
-            false,
-            &[
-                Operation::Mount { writable: false },
-                Operation::Realpath { path: path.clone() },
-            ],
-        )?
-        .text()?;
+        let resolved = filesystem
+            .run(DiskOperation::Realpath { path: path.clone() })?
+            .text()?;
         let resolved = resolved.trim();
         let check = BootSelection {
             architecture,
@@ -96,11 +91,11 @@ pub fn extract(
         validate_selection(&check, architecture)?;
     }
     let kernel = directory.join("kernel");
-    appliance::download(disk, &selection.kernel, &kernel, MAX_KERNEL)?;
+    filesystem.download(&selection.kernel, &kernel, MAX_KERNEL)?;
     validate_kernel(&kernel, architecture)?;
     let initramfs = if let Some(path) = &selection.initramfs {
         let output = directory.join("initramfs");
-        appliance::download(disk, path, &output, MAX_INITRAMFS)?;
+        filesystem.download(path, &output, MAX_INITRAMFS)?;
         validate_initramfs(&output)?;
         Some(artifact(&output, "initramfs", MAX_INITRAMFS)?)
     } else {

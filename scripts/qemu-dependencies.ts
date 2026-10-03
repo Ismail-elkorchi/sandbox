@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { runtimeDigest } from "./qemu-runtime.ts";
@@ -146,18 +146,17 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
     throw new Error(`MSYS2 ${owner} ${version} has unresolved installed license metadata: ${JSON.stringify(licenses)}`, { cause });
   }
   const filename = `${name}-${version.replace(/^[0-9]+:/u, "")}.src.tar.zst`;
+  const repository = msysRepository(owner);
   return { manager: "msys2", name, version, license,
     declaration: { path: selected.path, name: `installed-package.${owner}.txt`, sha256: selected.sha256 },
     async capture(output, materials) {
     const source = resolve(scratch, filename), signature = `${source}.sig`;
-    // Corresponding source is addressed by the installed package identity.
-    // Use the distribution's primary repository, not its geo redirector;
-    // signature verification below remains the authority for these bytes.
-    const url = `https://repo.msys2.org/mingw/sources/${filename}`;
-    for (const [destination, address, limit] of [[source, url, maximumBytes], [signature, `${url}.sig`, 65536]] as const) {
-      await run("curl", ["--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
-        "--max-time", "600", "--max-filesize", String(limit), "--output", destination, address], scratch);
-    }
+    // Use the same resolved mirror configuration as the installed package
+    // manager. Mirror availability is not trust: the installed identity and
+    // distribution keyring below remain the authority for corresponding bytes.
+    const mirrors = msysSourceMirrors(await run("pacman-conf", ["--repo", repository, "Server"],
+      scratch, true, {}, { timeoutMs: 30000, maximumOutputBytes: 65536 }), repository);
+    await downloadMsysSource(source, signature, filename, mirrors, scratch, run);
     // Never extract or run a downloaded PKGBUILD to establish its trust.
     const verified = await verifyMsysSource(source, signature, scratch, run);
     if (await material(source, output, filename, materials) !== verified.source
@@ -165,6 +164,64 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
       throw new Error("verified MSYS2 source changed during capture");
     }
   } };
+}
+
+function msysRepository(owner: string): string {
+  for (const [prefix, repository] of [["ucrt-x86_64", "ucrt64"], ["clang-aarch64", "clangarm64"],
+    ["clang-x86_64", "clang64"], ["x86_64", "mingw64"], ["i686", "mingw32"]] as const) {
+    if (owner.startsWith(`mingw-w64-${prefix}-`)) return repository;
+  }
+  throw new Error("installed DLL owner has no supported native repository");
+}
+
+/** pacman-conf resolves Include, $repo and $arch. No second mirror registry,
+ * downloaded keyring, or hard-coded primary server belongs to Sandsurf.
+ * https://man.archlinux.org/man/pacman-conf.8.en
+ * https://www.msys2.org/dev/mirrors/ */
+export function msysSourceMirrors(configuration: string, repository: string): string[] {
+  if (!/^(?:ucrt64|clangarm64|clang64|mingw64|mingw32)$/u.test(repository)
+    || Buffer.byteLength(configuration) > 65536 || /[\0\r]/u.test(configuration.replaceAll("\r\n", "\n"))) {
+    throw new Error("invalid installed MSYS2 mirror configuration");
+  }
+  const lines = configuration.trim().split(/\r?\n/u);
+  if (lines.length === 0 || lines.length > 40) throw new Error("installed MSYS2 mirror count exceeds its bound");
+  const urls = new Set<string>();
+  for (const line of lines) {
+    if (line.length > 4096 || /[\s%\\]/u.test(line)) throw new Error("invalid installed MSYS2 mirror URL");
+    const url = new URL(line), suffix = `/mingw/${repository}/`;
+    if (url.protocol !== "https:" || url.username !== "" || url.password !== ""
+      || url.search !== "" || url.hash !== "" || !url.pathname.endsWith(suffix)
+      || url.href !== line || url.hostname === "") throw new Error("invalid installed MSYS2 mirror URL");
+    url.pathname = url.pathname.slice(0, -suffix.length) + "/mingw/sources/";
+    urls.add(url.href);
+  }
+  return [...urls];
+}
+
+export async function downloadMsysSource(source: string, signature: string, filename: string,
+  mirrors: readonly string[], scratch: string, run: BuildRunner): Promise<void> {
+  if (!safeName.test(filename) || mirrors.length === 0 || mirrors.length > 40) throw new Error("invalid source acquisition request");
+  const deadline = performance.now() + 600000;
+  let failure: unknown;
+  for (const mirror of mirrors) {
+    await rm(source, { force: true }); await rm(signature, { force: true });
+    try {
+      const url = `${mirror}${filename}`;
+      for (const [destination, address, limit] of [[source, url, maximumBytes], [signature, `${url}.sig`, 65536]] as const) {
+        const seconds = Math.min(120, Math.floor((deadline - performance.now()) / 1000));
+        if (seconds <= 0) throw new Error("MSYS2 source acquisition deadline exceeded");
+        await run("curl", ["--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
+          "--connect-timeout", "10", "--max-time", String(seconds), "--max-filesize", String(limit),
+          "--output", destination, address], scratch, false, {},
+        { timeoutMs: (seconds + 5) * 1000, maximumOutputBytes: 65536 });
+        await regular(destination, limit);
+      }
+      return;
+    } catch (cause) { failure = cause; }
+    if (performance.now() >= deadline) break;
+  }
+  await rm(source, { force: true }); await rm(signature, { force: true });
+  throw new Error("configured MSYS2 mirrors did not supply corresponding source and signature", { cause: failure });
 }
 
 /** Verify against the installed distribution trust database without modifying

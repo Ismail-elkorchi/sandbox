@@ -858,7 +858,7 @@ fn lost_native_handle_requires_original_custody_release_and_never_replays_boot()
     let mut f = Fixture::new();
     f.start();
     let disk = f.root.join("system.ext4");
-    crate::storage::publish_disk(&disk, 4096, |stage| {
+    crate::storage::publish_disk(&disk, 4096, |stage, _custody| {
         sandsurf_native::local::create_private_file(stage)?.set_len(4096)
     })
     .unwrap();
@@ -961,7 +961,7 @@ fn interrupted_destruction_detachment_is_failure_not_successful_destroy() {
     let mut f = Fixture::new();
     f.start();
     let disk = f.root.join("system.ext4");
-    crate::storage::publish_disk(&disk, 4096, |stage| {
+    crate::storage::publish_disk(&disk, 4096, |stage, _custody| {
         sandsurf_native::local::create_private_file(stage)?.set_len(4096)
     })
     .unwrap();

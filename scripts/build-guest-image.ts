@@ -242,7 +242,7 @@ async function buildLinuxSystem(
   await run("cargo", ["run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "build_alpine", "--",
     targetArchive, stagedPackages, archive, output, resolve(temporary, "boot")]);
   const recipe = Object.fromEntries(await Promise.all(recipePaths.map(async (path) => [path, sha256(await readFile(resolve("scripts/guest-image", path)))])));
-  const helperSources = ["crates/sandsurf-image/src/appliance.rs", "crates/sandsurf-image/src/appliance/operations.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/src/packages.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
+  const helperSources = ["crates/sandsurf-image/examples/producer/mod.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/src/packages.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
   const helperRecipe = Object.fromEntries(await Promise.all(helperSources.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
   const distribution: unknown = JSON.parse((await boundedRegularFile(resolve(temporary, "boot/distribution.json"), 1024 * 1024, "installed package provenance")).toString("utf8"));
   const cachedSources = process.env.SANDSURF_ALPINE_SOURCE_DIRECTORY;

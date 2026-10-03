@@ -3059,20 +3059,13 @@ fn reserve_compute(
     let mut cpu = requested.cpu_quota_micros;
     let mut memory = requested.host_memory_bytes()?;
     let mut statement =
-        db.prepare("SELECT id,configuration,released FROM machines WHERE id<>?1")?;
+        db.prepare("SELECT configuration FROM machines WHERE released=0 AND id<>?1")?;
     for row in statement.query_map([excluding.map_or("", MachineId::as_str)], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, bool>(2)?,
-        ))
+        row.get::<_, String>(0)
     })? {
-        let (_id, configuration, released) = row?;
-        if !released {
-            let resources = decode::<RuntimeConfiguration>(&configuration)?.resources;
-            cpu = cpu.checked_add(resources.cpu_quota_micros.get())?;
-            memory = memory.checked_add(resources.host_memory_bytes()?.get())?;
-        }
+        let resources = decode::<RuntimeConfiguration>(&row?)?.resources;
+        cpu = cpu.checked_add(resources.cpu_quota_micros.get())?;
+        memory = memory.checked_add(resources.host_memory_bytes()?.get())?;
     }
     if cpu > limits.cpu_quota_micros || memory > limits.host_memory_bytes {
         return Err(Error::Capacity("host compute reservations exhausted"));

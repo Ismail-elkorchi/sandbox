@@ -20,6 +20,11 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     if data.len() <= MAX_CONTROL_BYTES {
+        if let Ok(operation) = serde_json::from_slice::<sandsurf_protocol::disk::DiskOperation>(data) {
+            let _ = operation.validate(false);
+            let _ = operation.validate(true);
+        }
+        let _ = serde_json::from_slice::<sandsurf_protocol::disk::DiskReply>(data);
         let _ = serde_json::from_slice::<GuestCommand>(data);
         let _ = serde_json::from_slice::<Receipt>(data);
         let _ = serde_json::from_slice::<ReleaseRequest>(data);
