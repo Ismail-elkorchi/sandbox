@@ -3873,26 +3873,19 @@ impl HostTask {
                     let client = GuardianClient::new(provision.endpoint());
                     let response = client.runtime(
                         provision.machine.clone(),
-                        RuntimeRequest::AssessResources {
-                            resources: resources.clone(),
+                        if update.is_some() {
+                            RuntimeRequest::ValidateResources {
+                                resources: resources.clone(),
+                            }
+                        } else {
+                            RuntimeRequest::AssessResources {
+                                resources: resources.clone(),
+                            }
                         },
                     )?;
                     let RuntimeResponse::ResourceAssessment { assessment } = response else {
                         return Err(HostError::Invalid("native resource assessment unavailable"));
                     };
-                    if update.is_some() {
-                        let response = client.runtime(
-                            provision.machine.clone(),
-                            RuntimeRequest::ValidateResources {
-                                resources: resources.clone(),
-                            },
-                        )?;
-                        if !matches!(response, RuntimeResponse::Complete) {
-                            return Err(HostError::Invalid(
-                                "unexpected native resource validation response",
-                            ));
-                        }
-                    }
                     Ok(assessment)
                 })();
                 HostTaskCompletion::ResourceAssessment {

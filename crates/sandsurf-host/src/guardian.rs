@@ -1345,11 +1345,14 @@ impl<E: GuardianEffect> Guardian<E> {
                             .last_observation()?
                             .ok_or(Error::Protocol("native resource state is unavailable"))?;
                         self.journal.validate_resource_envelope(&resources)?;
-                        self.effect
+                        let effect = self
+                            .effect
                             .as_ref()
-                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?
-                            .validate_resources(&resources, current.value())?;
-                        RuntimeResponse::Complete
+                            .ok_or(Error::Unsupported("destroyed machine has no native owner"))?;
+                        effect.validate_resources(&resources, current.value())?;
+                        RuntimeResponse::ResourceAssessment {
+                            assessment: effect.assess_resources(&resources, current.value()),
+                        }
                     }
                     RuntimeRequest::Usage => {
                         let generation = self

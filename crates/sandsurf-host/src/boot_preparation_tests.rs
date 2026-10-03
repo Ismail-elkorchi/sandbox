@@ -14,8 +14,34 @@ struct Native {
     reset: bool,
     installed: usize,
     started: usize,
+    resource_checks: std::cell::RefCell<Vec<(&'static str, MachineObservation)>>,
 }
 impl GuardianEffect for Native {
+    fn validate_resources(
+        &self,
+        resources: &Resources,
+        current: &MachineObservation,
+    ) -> Result<()> {
+        self.resource_checks
+            .borrow_mut()
+            .push(("validate", current.clone()));
+        resources
+            .validate()
+            .map_err(|_| Error::Protocol("invalid resource fixture"))
+    }
+    fn assess_resources(
+        &self,
+        _: &Resources,
+        current: &MachineObservation,
+    ) -> ResourceChangeAssessment {
+        self.resource_checks
+            .borrow_mut()
+            .push(("assess", current.clone()));
+        ResourceChangeAssessment {
+            mode: ResourceChangeMode::Live,
+            reasons: vec![format!("native generation {}", current.generation.get())],
+        }
+    }
     fn capture_owner(&self) -> Result<Option<OperationId>> {
         Ok(None)
     }
@@ -215,6 +241,7 @@ impl Fixture {
                 reset: false,
                 installed: 0,
                 started: 0,
+                resource_checks: Default::default(),
             },
         );
         Self {
@@ -297,6 +324,96 @@ fn retire(fixture: Fixture) {
     let root = fixture.root.clone();
     drop(fixture);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resource_update_validation_returns_the_assessment_from_the_same_native_observation() {
+    let mut f = Fixture::new();
+    f.start();
+    let machine = f.guardian.journal.machine_id().clone();
+    let before = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let response = f.guardian.handle(GuardianRequest::Runtime {
+        machine_id: machine.clone(),
+        request: RuntimeRequest::ValidateResources {
+            resources: RuntimeConfiguration::default().resources,
+        },
+    });
+    assert!(matches!(response, GuardianResponse::Runtime {
+        response: RuntimeResponse::ResourceAssessment { assessment }
+    } if assessment.mode == ResourceChangeMode::Live && assessment.reasons == ["native generation 1"]));
+    assert_eq!(
+        *f.guardian.effect.as_ref().unwrap().resource_checks.borrow(),
+        vec![("validate", before.clone()), ("assess", before.clone())]
+    );
+    assert_eq!(
+        f.host
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .configuration_revision,
+        Counter::ONE
+    );
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+    // Capacity refusal is not a successful assessment/validation, and never
+    // becomes host authority. Preview remains a separate read-only operation.
+    let mut excluded = RuntimeConfiguration::default().resources;
+    excluded.output_bytes = Counter::ZERO;
+    assert!(matches!(
+        f.guardian.handle(GuardianRequest::Runtime {
+            machine_id: machine.clone(),
+            request: RuntimeRequest::ValidateResources {
+                resources: excluded
+            },
+        }),
+        GuardianResponse::Rejected { .. }
+    ));
+    assert_eq!(
+        f.guardian
+            .effect
+            .as_ref()
+            .unwrap()
+            .resource_checks
+            .borrow()
+            .len(),
+        2
+    );
+    assert!(matches!(
+        f.guardian.handle(GuardianRequest::Runtime {
+            machine_id: machine,
+            request: RuntimeRequest::AssessResources {
+                resources: RuntimeConfiguration::default().resources
+            },
+        }),
+        GuardianResponse::Runtime {
+            response: RuntimeResponse::ResourceAssessment { .. }
+        }
+    ));
+    assert_eq!(
+        f.guardian
+            .effect
+            .as_ref()
+            .unwrap()
+            .resource_checks
+            .borrow()
+            .len(),
+        3
+    );
+    retire(f);
 }
 
 #[test]
@@ -494,6 +611,7 @@ fn admitted_boot_recovers_after_owner_restart_without_any_dispatch_evidence() {
                 reset: false,
                 installed: 0,
                 started: 0,
+                resource_checks: Default::default(),
             },
         ),
     };
