@@ -17,6 +17,7 @@ import { isAbsolute, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { packImageSources, writeImageIndex } from "./image-sources.ts";
 import { prepare as prepareAlpineInputs } from "./prepare-alpine-inputs.ts";
+import { alpinePackageOrigins, collectAlpineSources, publishAlpineSources, verifyAlpineSources } from "./alpine-sources.ts";
 
 process.umask(0o022);
 
@@ -120,6 +121,8 @@ try {
   await replaceArtifact(kernel, resolve(destination, kernelName));
   await replaceArtifact(initramfs, resolve(destination, "boot-initramfs"));
   await replaceArtifact(system, resolve(destination, "system.ext4"));
+  await publishAlpineSources(systemMaterials.sourceDirectory, resolve(destination, "source-materials"),
+    systemMaterials.materials["alpine-corresponding-sources"]!, alpinePackageOrigins(systemMaterials.distribution));
 
   const unsigned = {
     formatVersion: 1,
@@ -185,7 +188,7 @@ async function buildLinuxSystem(
   temporary: string,
   output: string,
   guestAgent: string,
-): Promise<{ inputDigest: string; materials: Readonly<Record<string, string>>; distribution: unknown }> {
+): Promise<{ inputDigest: string; materials: Readonly<Record<string, string>>; distribution: unknown; sourceDirectory: string }> {
   if ((architecture === "x64" ? "x64" : "arm64") !== process.arch) {
     throw new Error("the isolated Alpine builder requires a Linux host of the target architecture");
   }
@@ -241,6 +244,16 @@ async function buildLinuxSystem(
   const recipe = Object.fromEntries(await Promise.all(recipePaths.map(async (path) => [path, sha256(await readFile(resolve("scripts/guest-image", path)))])));
   const helperSources = ["crates/sandsurf-image/src/appliance.rs", "crates/sandsurf-image/src/appliance/operations.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/src/packages.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
   const helperRecipe = Object.fromEntries(await Promise.all(helperSources.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
+  const distribution: unknown = JSON.parse((await boundedRegularFile(resolve(temporary, "boot/distribution.json"), 1024 * 1024, "installed package provenance")).toString("utf8"));
+  const cachedSources = process.env.SANDSURF_ALPINE_SOURCE_DIRECTORY;
+  const cachedDigest = process.env.SANDSURF_ALPINE_SOURCE_SHA256;
+  if ((cachedSources === undefined) !== (cachedDigest === undefined) ||
+      cachedSources !== undefined && (!isAbsolute(cachedSources) || !/^[a-f0-9]{64}$/u.test(cachedDigest!))) {
+    throw new Error("corresponding source inputs require an absolute directory and its inventory SHA256 together");
+  }
+  const sourceDirectory = cachedSources ?? resolve(temporary, "source-materials");
+  const correspondingSources = cachedDigest ?? await collectAlpineSources(sourceDirectory, alpinePackageOrigins(distribution));
+  await verifyAlpineSources(sourceDirectory, correspondingSources, alpinePackageOrigins(distribution));
   const materials = {
     "alpine-minirootfs": imageBuild.alpineSha256,
     "alpine-offline-packages": packageDigest!,
@@ -249,12 +262,9 @@ async function buildLinuxSystem(
     "sandsurf-appliance-recipe": identityDigest(helperRecipe),
     "sandsurf-management": sha256(await readFile(guestAgent)),
     "alpine-installed-database": await sha256BoundedFile(resolve(temporary, "boot/package-database"), 4 * 1024 * 1024),
+    "alpine-corresponding-sources": correspondingSources,
   };
-  // The isolated builder parses the final installed database. This is not the
-  // solver's predicted package list, and its build commits are source pointers,
-  // not a claim that corresponding source archives have already been supplied.
-  const distribution: unknown = JSON.parse((await boundedRegularFile(resolve(temporary, "boot/distribution.json"), 1024 * 1024, "installed package provenance")).toString("utf8"));
-  return { inputDigest: identityDigest(materials), materials, distribution };
+  return { inputDigest: identityDigest(materials), materials, distribution, sourceDirectory };
 }
 
 function assertElfArchitecture(bytes: Buffer, label: string): void {

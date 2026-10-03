@@ -26,7 +26,7 @@ impl Root {
             NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
         create_private_directory(&path).unwrap();
-        Self(path)
+        Self(sandsurf_native::local::canonical_private_directory(&path).unwrap())
     }
 }
 impl Drop for Root {

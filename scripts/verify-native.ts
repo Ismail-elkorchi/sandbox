@@ -39,7 +39,7 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
       !isRecord(imageManifest.system.provenance.materials)) {
     throw new Error(`${architecture} VM image manifest has an invalid shape`);
   }
-  for (const material of ["alpine-minirootfs", "alpine-offline-packages", "alpine-package-lock", "alpine-installed-database", "sandsurf-system-recipe", "sandsurf-appliance-recipe", "sandsurf-management"]) {
+  for (const material of ["alpine-minirootfs", "alpine-offline-packages", "alpine-package-lock", "alpine-installed-database", "alpine-corresponding-sources", "sandsurf-system-recipe", "sandsurf-appliance-recipe", "sandsurf-management"]) {
     if (!validDigest(imageManifest.system.provenance.materials[material])) {
       throw new Error(`${architecture} VM image is missing ${material} provenance`);
     }

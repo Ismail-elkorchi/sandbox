@@ -262,7 +262,9 @@ pub fn peer_process(socket: &Socket) -> io::Result<u32> {
         {
             return Err(native_socket_error());
         }
-        if size != 4 || pid == 0 {
+        // This IOCTL writes a fixed ULONG peer identity. Its byte-count slot
+        // does not describe the initialized identity returned by the kernel.
+        if pid == 0 {
             return Err(io::Error::other("invalid native socket peer identity"));
         }
         Ok(pid)
@@ -298,6 +300,7 @@ mod tests {
         let mut client =
             SocketConnection::connect(&path, std::process::id(), Duration::from_secs(1)).unwrap();
         let (socket, _) = server.accept().unwrap();
+        assert_eq!(peer_process(&socket).unwrap(), std::process::id());
         let mut peer = SocketConnection::new(socket, Some(Duration::from_secs(1))).unwrap();
         client.write_all(b"owned").unwrap();
         let mut bytes = [0; 5];

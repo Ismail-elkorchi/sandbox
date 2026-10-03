@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { imageComponents } from "../image-supply-chain.ts";
+import { collectAlpineSources } from "../alpine-sources.ts";
 
 const package_ = { name: "sudo", version: "1.0-r0", origin: "sudo", architecture: "noarch",
   license: "custom ISC", buildCommit: "a".repeat(40), packageChecksum: `Q1${"A".repeat(27)}=` };
@@ -14,12 +15,21 @@ async function fixture(action) {
   try {
     const files = {};
     for (const architecture of ["x64", "arm64"]) {
+      const directory = join(root, `development-${architecture}`);
+      await mkdir(directory);
+      const recipe = Buffer.from('pkgname=sudo\nsource=""\n');
+      const sourceDigest = await collectAlpineSources(join(directory, "source-materials"), [package_], async (url) => {
+        const bytes = url.startsWith("https://api.github.com/") ? Buffer.from(JSON.stringify([{
+          type: "file", name: "APKBUILD", path: "main/sudo/APKBUILD", size: recipe.length,
+          sha: createHash("sha1").update(`blob ${recipe.length}\0`).update(recipe).digest("hex"),
+        }])) : recipe;
+        return (async function* () { yield bytes; })();
+      });
       const manifest = { formatVersion: 1, architecture, system: { provenance: {
-        kind: "assembled", materials: { "alpine-installed-database": "b".repeat(64) },
+        kind: "assembled", materials: { "alpine-installed-database": "b".repeat(64), "alpine-corresponding-sources": sourceDigest },
         distribution: { kind: "alpine", databaseDigest: "b".repeat(64), packages: [package_] },
       } } };
       const relative = `development-${architecture}/manifest.json`;
-      await mkdir(join(root, `development-${architecture}`));
       const bytes = JSON.stringify(manifest); await writeFile(join(root, relative), bytes);
       files[relative] = createHash("sha256").update(bytes).digest("hex");
       manifests.push(manifest);
@@ -36,7 +46,7 @@ test("OS package provenance preserves distribution licenses and deduplicates act
     assert.equal(values[0].properties.filter((v) => v.name === "sandsurf:machine-image").length, 2);
     assert.ok(values[0].properties.some((v) => v.name === "sandsurf:source-pointer"));
     assert.equal(values[0].hashes, undefined, "an installed-record checksum is not a whole-APK digest");
-    assert.ok(!values[0].properties.some((v) => v.name === "sandsurf:corresponding-source"));
+    assert.equal(values[0].properties.filter((v) => v.name === "sandsurf:corresponding-source").length, 2);
   });
 });
 test("OS inventory cannot be substituted under a packaged image identity", async () => {
@@ -51,6 +61,7 @@ test("default OS provenance rejects missing, conflicting and foreign package cla
     (v) => { v.kind = "source-built"; },
     (v) => { delete v.distribution; },
     (v) => { v.materials["alpine-installed-database"] = "c".repeat(64); },
+    (v) => { delete v.materials["alpine-corresponding-sources"]; },
     (v) => { v.distribution.packages = []; },
     (v) => { v.distribution.packages.push(package_); },
     (v) => { v.distribution.packages = [{ ...package_, origin: "../host" }]; },

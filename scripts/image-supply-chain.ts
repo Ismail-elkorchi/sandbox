@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Component } from "./native-supply-chain.ts";
+import { alpinePackageOrigins, verifyAlpineSources } from "./alpine-sources.ts";
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -46,6 +47,10 @@ export async function imageComponents(root: string): Promise<Component[]> {
         manifest.system.provenance.materials["alpine-installed-database"] !== inventory.databaseDigest) {
       throw new Error("default OS package inventory differs from the assembled input materials");
     }
+    const sourceIdentity = manifest.system.provenance.materials["alpine-corresponding-sources"];
+    if (typeof sourceIdentity !== "string") throw new Error("default OS lacks corresponding source bytes");
+    const sourceRoot = `development-${match[1]}/source-materials`;
+    await verifyAlpineSources(resolve(root, sourceRoot), sourceIdentity, alpinePackageOrigins(inventory));
     let previous = "";
     for (const item of inventory.packages as unknown[]) {
       if (!record(item) || Object.keys(item).sort().join(",") !== "architecture,buildCommit,license,name,origin,packageChecksum,version" ||
@@ -76,6 +81,10 @@ export async function imageComponents(root: string): Promise<Component[]> {
         components.set(identity, entry);
       }
       entry.images.add(expected);
+      const sourceProperty = { name: "sandsurf:corresponding-source", value: `images/${sourceRoot}/${sourceIdentity}.json` };
+      if (!entry.component.properties!.some((item) => item.name === sourceProperty.name && item.value === sourceProperty.value)) {
+        entry.component = { ...entry.component, properties: [...entry.component.properties!, sourceProperty] };
+      }
     }
   }
   return [...components.values()].map(({ component, images }) => ({ ...component,

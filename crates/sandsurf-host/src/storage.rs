@@ -16,6 +16,25 @@ use std::path::{Path, PathBuf};
 
 const MAX_DISK_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
+/// Boot producers and interrupted-operation recovery share one owned namespace.
+pub(crate) fn boot_stage_path(parent: &Path) -> io::Result<PathBuf> {
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(parent.join(format!(".boot-{nonce}.stage")))
+}
+
+pub(crate) fn boot_stage_name(name: &str) -> bool {
+    name.strip_prefix(".boot-")
+        .and_then(|name| name.strip_suffix(".stage"))
+        .is_some_and(|nonce| {
+            nonce.len() == 32
+                && nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 /// Read the host's frozen boot record, never the mutable guest's next selection.
 pub(crate) fn read_boot(directory: &Path) -> io::Result<sandsurf_image::boot::FrozenBoot> {
     let file = open_private_file(&directory.join("boot.json"), PrivateFileAccess::ReadOnly)?;
@@ -46,10 +65,7 @@ pub(crate) fn copy_boot(
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("boot destination has no owner"))?;
-    let mut nonce = [0_u8; 16];
-    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
-    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
-    let stage = parent.join(format!(".boot-{nonce}.stage"));
+    let stage = boot_stage_path(parent)?;
     sandsurf_native::local::create_private_directory(&stage)?;
     let result = (|| {
         for (artifact, bound) in std::iter::once((&boot.kernel, sandsurf_image::boot::MAX_KERNEL))
@@ -161,12 +177,7 @@ pub(crate) fn freeze_boot(
     let parent = directory
         .parent()
         .ok_or_else(|| invalid("boot object has no owner"))?;
-    let mut nonce = [0; 16];
-    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
-    let stage = parent.join(format!(
-        ".boot-{}.stage",
-        sandsurf_protocol::bytes_digest(&nonce).as_str()
-    ));
+    let stage = boot_stage_path(parent)?;
     // Publication, including its record, is atomic. An interrupted extraction
     // cannot turn a partly populated public directory into a frozen boot.
     let result = (|| {

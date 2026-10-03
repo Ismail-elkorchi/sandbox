@@ -3,11 +3,12 @@ import { spawn } from "node:child_process";
 import { captureCommand as capture } from "./capture-command.ts";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { relative as relativePath, resolve } from "node:path";
 import { assertPayloadClosure, packageArchive } from "./package-archive.ts";
 import { QEMU_CORRESPONDING_FILES } from "./qemu-source.ts";
 import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependencies.ts";
 import { verifyQemuRuntime } from "./qemu-runtime.ts";
+import { alpinePackageOrigins, verifyAlpineSources } from "./alpine-sources.ts";
 
 const temporary = await mkdtemp(resolve(process.platform === "linux" ? "/var/tmp" : tmpdir(), "machine-package-test-"));
 const npmCli = requiredEnvironment("npm_execpath");
@@ -122,6 +123,12 @@ async function packagedImagePaths(): Promise<readonly string[]> {
       throw new Error(`${relative} is malformed`);
     }
     paths.push(`package/images/${relative}`);
+    const sourceDigest = manifest.system.provenance.materials["alpine-corresponding-sources"];
+    if (typeof sourceDigest !== "string") throw new Error(`${relative} lacks corresponding source bytes`);
+    for (const file of await verifyAlpineSources(resolve(root, match[1]!, "source-materials"), sourceDigest,
+      alpinePackageOrigins(manifest.system.provenance.distribution))) {
+      paths.push(`package/images/${relativePath(root, file).replaceAll("\\", "/")}`);
+    }
     if (!record(manifest.bootBundle.initramfs)) throw new Error(`${relative} lacks the distribution initramfs`);
     const artifacts = [manifest.bootBundle.kernel, manifest.bootBundle.initramfs];
     const disks = [manifest.system.rootfs];

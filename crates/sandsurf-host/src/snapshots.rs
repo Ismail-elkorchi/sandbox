@@ -946,13 +946,13 @@ fn remove_stage(stage: &Path) -> Result<()> {
         let name = name
             .to_str()
             .ok_or(SnapshotError::Invalid("snapshot payload name is invalid"))?;
-        if name == "boot" || boot_stage_name(name) {
+        if name == "boot" || crate::storage::boot_stage_name(name) {
             sandsurf_native::local::Directory::open(&entry.path())?;
-            for artifact in fs::read_dir(entry.path())?.take(4) {
+            for artifact in fs::read_dir(entry.path())?.take(5) {
                 let artifact = artifact?;
                 if !matches!(
                     artifact.file_name().to_str(),
-                    Some("kernel" | "initramfs" | "boot.json")
+                    Some("kernel" | "initramfs" | "boot.json" | "selection.json")
                 ) {
                     return Err(SnapshotError::Invalid("undeclared snapshot boot payload"));
                 }
@@ -1003,17 +1003,6 @@ fn remove_stage(stage: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn boot_stage_name(name: &str) -> bool {
-    name.strip_prefix(".boot-")
-        .and_then(|name| name.strip_suffix(".stage"))
-        .is_some_and(|nonce| {
-            nonce.len() == 32
-                && nonce
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -1471,11 +1460,18 @@ mod tests {
         let temp = Temp::new();
         let stage = temp.0.join("capture-stage");
         private_directory(&stage).unwrap();
-        let boot = stage.join(format!(".boot-{}.stage", "a".repeat(32)));
+        let boot = crate::storage::boot_stage_path(&stage).unwrap();
+        assert!(crate::storage::boot_stage_name(
+            boot.file_name().unwrap().to_str().unwrap()
+        ));
         private_directory(&boot).unwrap();
         open_write(&boot.join("kernel"))
             .unwrap()
             .write_all(b"unfinished kernel")
+            .unwrap();
+        open_write(&boot.join("selection.json"))
+            .unwrap()
+            .write_all(b"{\"partial\":")
             .unwrap();
         let record = stage.join(format!("reconnect.{}.pending", "b".repeat(64)));
         open_write(&record)
@@ -1496,7 +1492,7 @@ mod tests {
             ".boot-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.stage",
             ".boot-abc.stage",
         ] {
-            assert!(!boot_stage_name(name));
+            assert!(!crate::storage::boot_stage_name(name));
         }
         assert!(!crate::image_records::pending_name(
             "capture",

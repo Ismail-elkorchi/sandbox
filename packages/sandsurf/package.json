@@ -39,6 +39,7 @@
     "images/**/*.json",
     "images/**/boot-*",
     "images/**/*.gz",
+    "images/development-*/source-materials/**",
     "LICENSE",
     "SBOM.cdx.json",
     "THIRD-PARTY"
