@@ -122,6 +122,11 @@ impl GuardianEffect for Native {
                 evidence_digest: bytes_digest(b"fixture-native-power"),
             }))
     }
+    fn observe_detachment(&self) -> Result<Option<Digest>> {
+        Ok(crate::storage::observe_detached(
+            &self.root.join("system.ext4"),
+        )?)
+    }
     fn take_guest_reset(&mut self) -> Option<Digest> {
         std::mem::take(&mut self.reset).then(|| bytes_digest(b"fixture-native-reset"))
     }
@@ -324,6 +329,213 @@ fn retire(fixture: Fixture) {
     let root = fixture.root.clone();
     drop(fixture);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lost_native_handle_requires_original_custody_release_and_never_replays_boot() {
+    let mut f = Fixture::new();
+    f.start();
+    let disk = f.root.join("system.ext4");
+    crate::storage::publish_disk(&disk, 4096, |stage| {
+        sandsurf_native::local::create_private_file(stage)?.set_len(4096)
+    })
+    .unwrap();
+    let custody = crate::storage::attach(&disk).unwrap();
+    let native_custody = custody.try_clone().unwrap();
+    drop(custody);
+    let before = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    let machine = before.machine_id.clone();
+    // Reopen after losing the volatile owner. A surviving actual VMM still
+    // owns the original open description; a new guardian must not adopt its
+    // PID, declare it stopped, or create a replacement.
+    let Fixture {
+        guardian,
+        host,
+        root,
+    } = f;
+    drop(guardian);
+    f = Fixture {
+        host,
+        root: root.clone(),
+        guardian: Guardian::new(
+            RuntimeJournal::open(&root.join("runtime"), &machine).unwrap(),
+            Native {
+                root,
+                measured: None,
+                reset: false,
+                installed: 0,
+                started: 0,
+                resource_checks: Default::default(),
+            },
+        ),
+    };
+    assert!(!f.guardian.refresh_native_observation().unwrap());
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+    drop(native_custody);
+    // Disk corruption is not evidence of live hardware and cannot prevent
+    // native containment recovery. No filesystem parser is involved.
+    sandsurf_native::local::open_private_file(&disk, sandsurf_native::PrivateFileAccess::ReadWrite)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(f.guardian.refresh_native_observation().unwrap());
+    let stopped = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    assert_eq!(stopped.state, MachineState::Stopped);
+    assert_eq!(stopped.generation, before.generation);
+    assert_eq!(stopped.applied_revision, before.applied_revision);
+    assert_eq!(stopped.sequence, before.sequence.next().unwrap());
+    assert_eq!(stopped.cause, ObservationCause::Native {});
+    assert_eq!(f.guardian.effect.as_ref().unwrap().started, 0);
+    assert!(f.guardian.refresh_native_observation().unwrap());
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &stopped
+    );
+    // Host intent remains its separate authority; no stop command or new
+    // revision was fabricated by native observation.
+    assert_eq!(
+        f.host
+            .machine(&machine)
+            .unwrap()
+            .unwrap()
+            .latest_intent
+            .desired,
+        DesiredState::Running
+    );
+    retire(f);
+}
+
+#[test]
+fn interrupted_destruction_detachment_is_failure_not_successful_destroy() {
+    let mut f = Fixture::new();
+    f.start();
+    let disk = f.root.join("system.ext4");
+    crate::storage::publish_disk(&disk, 4096, |stage| {
+        sandsurf_native::local::create_private_file(stage)?.set_len(4096)
+    })
+    .unwrap();
+    let authorization = f.intent("destroy", DesiredState::Destroyed);
+    let operation = authorization.statement.command.operation_id.clone();
+    f.guardian
+        .journal
+        .admit_lifecycle(authorization.clone())
+        .unwrap();
+    assert!(matches!(
+        f.guardian.journal.begin_lifecycle(authorization).unwrap(),
+        sandsurf_state::LifecycleDecision::Perform(_)
+    ));
+    let mut destroying = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    destroying.sequence = destroying.sequence.next().unwrap();
+    destroying.state = MachineState::Destroying;
+    destroying.cause = ObservationCause::Lifecycle {
+        operation_id: operation.clone(),
+    };
+    f.guardian.journal.observe(destroying.clone()).unwrap();
+    f.guardian.effect.as_mut().unwrap().measured = None;
+    assert!(f.guardian.refresh_native_observation().unwrap());
+    let failed = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    assert_eq!(failed.state, MachineState::Failed);
+    assert_eq!(failed.generation, destroying.generation);
+    assert_eq!(failed.applied_revision, destroying.applied_revision);
+    assert_eq!(failed.cause, ObservationCause::Native {});
+    assert_eq!(
+        f.guardian
+            .journal
+            .lifecycle_operation(&operation)
+            .unwrap()
+            .unwrap()
+            .delivery,
+        Delivery::Dispatched
+    );
+    assert!(
+        disk.exists(),
+        "native detachment must not delete persistent data"
+    );
+    retire(f);
+}
+
+#[test]
+fn missing_or_invalid_custody_record_cannot_turn_handle_loss_into_shutdown() {
+    let mut f = Fixture::new();
+    f.start();
+    let before = f
+        .guardian
+        .journal
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    f.guardian.effect.as_mut().unwrap().measured = None;
+    assert!(!f.guardian.refresh_native_observation().unwrap());
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+    let record = f.root.join("system.storage.json");
+    use std::io::Write;
+    sandsurf_native::local::create_private_file(&record)
+        .unwrap()
+        .write_all(b"invalid")
+        .unwrap();
+    assert!(!f.guardian.refresh_native_observation().unwrap());
+    assert_eq!(
+        f.guardian
+            .journal
+            .last_observation()
+            .unwrap()
+            .unwrap()
+            .value(),
+        &before
+    );
+    assert_eq!(std::fs::read(record).unwrap(), b"invalid");
+    retire(f);
 }
 
 #[test]

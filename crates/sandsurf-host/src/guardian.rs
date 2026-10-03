@@ -198,6 +198,11 @@ pub trait GuardianEffect {
         Ok(())
     }
     fn observe_power(&mut self) -> Result<Option<sandsurf_machine::NativePowerObservation>>;
+    /// Externally verifiable absence of a native owner after handle loss. A
+    /// driver without a custody mechanism cannot turn absence into shutdown.
+    fn observe_detachment(&self) -> Result<Option<Digest>> {
+        Ok(None)
+    }
 }
 
 /// Guest/defaults dispatch is deliberately separate from native VM ownership.
@@ -716,14 +721,33 @@ impl<E: GuardianEffect> Guardian<E> {
             Ok(measured) => measured,
             Err(_) => return Ok(false),
         };
-        let Some(measured) = measured else {
-            return Ok(matches!(
-                current.state,
-                MachineState::Stopped
-                    | MachineState::Suspended
-                    | MachineState::Destroyed
-                    | MachineState::Failed
-            ));
+        let measured = match measured {
+            Some(measured) => measured,
+            None => {
+                if matches!(
+                    current.state,
+                    MachineState::Stopped
+                        | MachineState::Suspended
+                        | MachineState::Destroyed
+                        | MachineState::Failed
+                ) {
+                    return Ok(true);
+                }
+                let evidence_digest = match effect.observe_detachment() {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) | Err(_) => return Ok(false),
+                };
+                sandsurf_machine::NativePowerObservation {
+                    // Detachment proves no computer is running, not completion
+                    // of a partially dispatched destruction transaction.
+                    state: if current.state == MachineState::Destroying {
+                        MachineState::Failed
+                    } else {
+                        MachineState::Stopped
+                    },
+                    evidence_digest,
+                }
+            }
         };
         // Only a positive, consumed native reset witness can enter recovery.
         // Neither arbitrary VMM exit nor management loss reaches this branch.

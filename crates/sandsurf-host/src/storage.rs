@@ -397,6 +397,32 @@ pub(crate) fn attach(disk: &Path) -> io::Result<std::sync::Arc<std::fs::File>> {
     Ok(std::sync::Arc::new(lease))
 }
 
+/// Positive native-detachment evidence after loss of the volatile VM handle.
+/// Every computer VMM retains this slot's original open description until
+/// native exit. Acquiring it excludes those owners; an absent process handle
+/// or management endpoint does not. This never repairs or adopts a disk and
+/// does not interpret its potentially corrupt guest filesystem.
+pub(crate) fn observe_detached(disk: &Path) -> io::Result<Option<sandsurf_protocol::Digest>> {
+    let owner = match DiskOwner::open(disk, None) {
+        Ok(owner) => owner,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let evidence = sandsurf_protocol::digest(
+        sandsurf_protocol::Domain::Machine,
+        &(
+            "sandsurf-native-disk-custody-released-v1",
+            disk,
+            &owner.record,
+        ),
+    )
+    .map_err(io::Error::other)?;
+    // Observation only: do not install a native owner, mutate storage, or
+    // retain this lease as another lifetime authority.
+    drop(owner);
+    Ok(Some(evidence))
+}
+
 /// Replace a detached disk under an already journaled host operation. The
 /// native owner must have released its attachment before entry. Power state
 /// alone is not a storage lease. Original bytes survive until the replacement
@@ -847,6 +873,30 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), vec![2; 4096]);
         retire(&target, 4096).unwrap();
         assert!(attach(&target).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn detachment_observation_never_repairs_adopts_or_requires_guest_disk_health() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("system.ext4");
+        assert!(observe_detached(&target).is_err());
+        assert!(!target.with_extension("storage.json").exists());
+        create_disk(&target, 1);
+        let record = fs::read(target.with_extension("storage.json")).unwrap();
+        let guardian = attach(&target).unwrap();
+        let native = guardian.try_clone().unwrap();
+        drop(guardian);
+        assert_eq!(observe_detached(&target).unwrap(), None);
+        drop(native);
+        let evidence = observe_detached(&target).unwrap().unwrap();
+        fs::remove_file(&target).unwrap();
+        assert_eq!(observe_detached(&target).unwrap(), Some(evidence));
+        assert_eq!(
+            fs::read(target.with_extension("storage.json")).unwrap(),
+            record
+        );
+        assert!(!target.exists());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

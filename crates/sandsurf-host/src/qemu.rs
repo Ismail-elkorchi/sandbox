@@ -105,6 +105,8 @@ pub fn prepare_config(
     resources: &Resources,
 ) -> Result<QemuGuardianConfig, QemuError> {
     QemuBudgets::derive(resources, accelerator())?;
+    crate::resources::require_network_capacity(resources)?;
+    crate::resources::require_machine_storage(host_root, machine_id, resources)?;
     let existing_path = host_root
         .join("machines")
         .join(object_name(machine_id.as_str()))
@@ -1358,6 +1360,11 @@ impl GuardianEffect for QemuGuardianEffect {
         self.machine
             .observe_power()
             .map_err(|_| ControlError::Protocol("native power observation unavailable"))
+    }
+    fn observe_detachment(&self) -> ControlResult<Option<Digest>> {
+        Ok(crate::storage::observe_detached(
+            &self.machine_root.join("disks/system.ext4"),
+        )?)
     }
     fn take_console(&mut self) -> Option<sandsurf_machine::NativeConsole> {
         self.machine.take_console()

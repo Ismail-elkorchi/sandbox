@@ -2926,7 +2926,6 @@ impl GuardianProvision {
 
     fn initialize(&self, inputs: &GuardianInitialization, root: &Path) -> Result<()> {
         let resources = &inputs.record.runtime_configuration.resources;
-        #[cfg(target_os = "linux")]
         crate::resources::require_machine_storage(&self.host_root, &self.machine, resources)?;
         prepare_directory(root)?;
         // All initialization workers serialize on this exact storage object;
