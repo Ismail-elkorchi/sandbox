@@ -22,7 +22,7 @@ jobs:
           install: mingw-w64-ucrt-x86_64-gcc
       - name: Build the actual native socket-isolation experiment
         shell: msys2 {0}
-        run: gcc -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/windows-local-delivery.c -o windows-local-delivery.exe -lws2_32 -luserenv -ladvapi32
+        run: gcc -std=c11 -Wall -Wextra -Werror -static vmm/qemu/tests/windows-local-delivery.c -o windows-local-delivery.exe -lws2_32 -luserenv -ladvapi32
       - name: Socket transfer, original owner exit and address changes (no VM hardware required)
         shell: pwsh
         run: |

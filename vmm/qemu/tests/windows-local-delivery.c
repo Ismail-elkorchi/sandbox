@@ -132,9 +132,14 @@ static int experiment(const wchar_t *binary) {
     require(CreatePipe(&read_pipe, &write_pipe, &inheritance, 0), "receipt pipe");
     require(SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0),
             "private receipt reader");
+    HANDLE diagnostic = NULL;
+    require(DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
+                GetCurrentProcess(), &diagnostic, 0, TRUE, DUPLICATE_SAME_ACCESS),
+            "original diagnostic inheritance");
+    HANDLE inherited[2] = {write_pipe, diagnostic};
     require(UpdateProcThreadAttribute(attributes, 0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &write_pipe,
-                sizeof(write_pipe), NULL, NULL), "explicit receipt inheritance");
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+                sizeof(inherited), NULL, NULL), "explicit receipt inheritance");
     require(UpdateProcThreadAttribute(attributes, 0,
                 PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security,
                 sizeof(security), NULL, NULL), "original network identity");
@@ -146,15 +151,22 @@ static int experiment(const wchar_t *binary) {
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdOutput = write_pipe;
+    startup.StartupInfo.hStdError = diagnostic;
     startup.lpAttributeList = attributes;
     wchar_t command[2 * MAX_PATH];
     require(swprintf(command, 2 * MAX_PATH, L"\"%ls\" child %lu", executable,
               (unsigned long)GetCurrentProcessId()) > 0, "fixture child command");
     PROCESS_INFORMATION process = {0};
+    wchar_t environment[MAX_PATH + 16] = {0};
+    wcscpy(environment, L"SystemRoot=");
+    require(GetEnvironmentVariableW(L"SystemRoot", environment + 11,
+                MAX_PATH) > 0, "original OS environment");
     require(CreateProcessW(executable, command, NULL, NULL, TRUE,
-                EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                environment, temporary,
                 &startup.StartupInfo, &process), "restricted native socket owner");
     CloseHandle(write_pipe);
+    CloseHandle(diagnostic);
     WSAPROTOCOL_INFOW receipts[2] = {0};
     DWORD offset = 0;
     while (offset < sizeof(receipts)) {
