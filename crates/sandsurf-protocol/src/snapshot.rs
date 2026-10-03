@@ -191,6 +191,7 @@ pub struct NativeFullCapture {
 )]
 pub enum NativeSnapshotRequest {
     PrepareDisk {
+        snapshot_id: SnapshotId,
         operation_id: OperationId,
         expected_generation: Counter,
         expected_revision: Counter,

@@ -909,7 +909,18 @@ impl GuardianEffect for LinuxGuardianEffect {
         journal: &mut RuntimeJournal,
     ) -> ControlResult<NativeSnapshotResponse> {
         match request {
-            NativeSnapshotRequest::PrepareDisk { operation_id, .. } => {
+            NativeSnapshotRequest::PrepareDisk {
+                snapshot_id,
+                operation_id,
+                ..
+            } => {
+                let _custody = crate::snapshots::retain_input(
+                    &self.machine_root.join("snapshots"),
+                    &snapshot_id,
+                )
+                .map_err(|_| {
+                    ControlError::Unsupported("disk snapshot storage is retired or unavailable")
+                })?;
                 self.prepare_capture_boundary(operation_id, journal)?;
                 Ok(NativeSnapshotResponse::Complete {
                     evidence: bytes_digest(b"native-computer-paused-for-disk-capture-v1"),

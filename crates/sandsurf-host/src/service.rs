@@ -1645,8 +1645,18 @@ impl HostService {
             .ok_or(HostError::Invalid(
                 "snapshot release lost its ownership record",
             ))?;
+        let provision =
+            if crate::capture::CaptureBoundary::read(&self.machine_root(&record.machine_id))?
+                .is_some_and(|boundary| boundary.operation_id == snapshot.request.operation_id)
+            {
+                Some(self.prepare_guardian_inner(&record.machine_id)?)
+            } else {
+                None
+            };
         Ok(HostDispatch::Task(Box::new(HostTask::SnapshotCleanup {
             root: self.root.clone(),
+            endpoint: self.guardian_endpoint(&record.machine_id),
+            provision,
             snapshot: Box::new(snapshot),
             record,
             reply,
@@ -3418,6 +3428,42 @@ impl HostDispatch {
 
 /// Immutable admitted effects run away from the catalog writer. Only owner
 /// completion may change durable host state; workers never receive the catalog.
+fn finish_retired_capture(
+    root: &Path,
+    endpoint: &Path,
+    snapshot: &Snapshot,
+    provision: Option<&GuardianProvision>,
+) -> Result<()> {
+    let machine_root = root
+        .join("machines")
+        .join(object_name(snapshot.request.machine_id.as_str()));
+    let Some(boundary) = crate::capture::CaptureBoundary::read(&machine_root)? else {
+        return Ok(());
+    };
+    if boundary.operation_id != snapshot.request.operation_id {
+        return Ok(()); // A different capture's pause is not ours to release.
+    }
+    if let Some(provision) = provision {
+        provision.execute()?;
+    }
+    let operation_id = snapshot.request.operation_id.clone();
+    let request = match snapshot.request.kind {
+        SnapshotKind::Disk => NativeSnapshotRequest::FinishDisk { operation_id },
+        SnapshotKind::Full => NativeSnapshotRequest::FinishFull { operation_id },
+    };
+    let response = GuardianClient::new(endpoint.to_path_buf())
+        .native_snapshot(snapshot.request.machine_id.clone(), request)?;
+    if !matches!(response, NativeSnapshotResponse::Complete { .. })
+        || crate::capture::CaptureBoundary::read(&machine_root)?
+            .is_some_and(|boundary| boundary.operation_id == snapshot.request.operation_id)
+    {
+        return Err(HostError::Invalid(
+            "retired capture still owns a native boundary",
+        ));
+    }
+    Ok(())
+}
+
 fn capture_snapshot(
     root: &Path,
     executable: &Path,
@@ -3472,6 +3518,7 @@ fn capture_snapshot(
                 let prepared = client.native_snapshot(
                     request.machine_id.clone(),
                     NativeSnapshotRequest::PrepareDisk {
+                        snapshot_id: request.id.clone(),
                         operation_id: request.operation_id.clone(),
                         expected_generation: request.expected_generation,
                         expected_revision: request.expected_revision,
@@ -3571,6 +3618,8 @@ fn capture_full_state(
 enum HostTask {
     SnapshotCleanup {
         root: PathBuf,
+        endpoint: PathBuf,
+        provision: Option<GuardianProvision>,
         snapshot: Box<Snapshot>,
         record: sandsurf_state::SnapshotReleaseRecord,
         reply: bool,
@@ -3801,12 +3850,17 @@ impl HostTask {
         match self {
             Self::SnapshotCleanup {
                 root,
+                endpoint,
+                provision,
                 snapshot,
                 record,
                 reply,
             } => {
-                let result =
-                    crate::snapshots::cleanup(&root, &snapshot, &record).map_err(HostError::from);
+                let result = crate::snapshots::cleanup(&root, &snapshot, &record, || {
+                    finish_retired_capture(&root, &endpoint, &snapshot, provision.as_ref())
+                        .map_err(|error| io::Error::other(error.to_string()))
+                })
+                .map_err(HostError::from);
                 HostTaskCompletion::SnapshotCleanup {
                     record,
                     reply,

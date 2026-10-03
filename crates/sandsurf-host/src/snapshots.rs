@@ -74,6 +74,7 @@ pub(crate) fn cleanup(
     host_root: &Path,
     snapshot: &Snapshot,
     record: &sandsurf_state::SnapshotReleaseRecord,
+    finish_capture: impl FnOnce() -> io::Result<()>,
 ) -> Result<()> {
     if record.snapshot_id != snapshot.request.id
         || record.machine_id != snapshot.request.machine_id
@@ -95,19 +96,9 @@ pub(crate) fn cleanup(
     }
     let root = root(host_root, snapshot);
     let _custody = object_lease(&root, &record.snapshot_id, false)?;
-    // Full-state captures may be original native restore inputs, not merely
-    // byte-copy sources. Keep retirement pending while that machine's VMM has
-    // original attachment custody, including after guardian/control loss.
-    let _native_custody = if snapshot.request.kind == SnapshotKind::Full {
-        Some(crate::storage::detached_custody(
-            &host_root
-                .join("machines")
-                .join(object_name(record.machine_id.as_str()))
-                .join("disks/system.ext4"),
-        )?)
-    } else {
-        None
-    };
+    // This exact original object excludes capture workers AND native restore
+    // consumers. A running VMM using only its independent system disk is not
+    // a consumer of every historical full snapshot.
     let marker = retirement_path(&root, &record.snapshot_id);
     match crate::image_records::read::<sandsurf_state::SnapshotReleaseRecord>(&marker) {
         Ok(old) if old == *record => {}
@@ -121,6 +112,10 @@ pub(crate) fn cleanup(
         }
         Err(error) => return Err(error.into()),
     }
+    // The marker fences delayed native Prepare calls before their pause. Only
+    // then release this operation's remaining native capture boundary. Failure
+    // leaves both retirement and payload intact for exact retry after restart.
+    finish_capture()?;
     for directory in [
         root.join(object_name(record.snapshot_id.as_str())),
         disk_stage(&root, snapshot),
@@ -129,10 +124,14 @@ pub(crate) fn cleanup(
         remove_stage(&directory)?;
     }
     sync_directory(&root)?;
-    // Interrupted QEMU preparation can leave a native state copy before the
-    // integration record is published. Its name is owned by this exact
-    // immutable capture; retirement also waits for original VMM disk custody.
-    if snapshot.request.kind == SnapshotKind::Full {
+    // Interrupted QEMU restore preparation can leave a copy before integration
+    // is published. Original snapshot custody, not a power report, excludes its
+    // native consumers. An unpublished/cancelled capture has no restore input.
+    if let Some(manifest) = snapshot
+        .manifest_digest
+        .as_ref()
+        .filter(|_| snapshot.request.kind == SnapshotKind::Full)
+    {
         let restore_root = host_root
             .join("machines")
             .join(object_name(record.machine_id.as_str()))
@@ -140,12 +139,6 @@ pub(crate) fn cleanup(
         match fs::symlink_metadata(&restore_root) {
             Ok(_) => {
                 sandsurf_native::local::Directory::open(&restore_root)?;
-                let manifest = snapshot
-                    .manifest_digest
-                    .as_ref()
-                    .ok_or(SnapshotError::Invalid(
-                        "full snapshot has no manifest identity",
-                    ))?;
                 let copy = restore_root.join(format!("{}.vmstate", manifest.as_str()));
                 match open_read(&copy) {
                     Ok(file) => {
@@ -161,8 +154,8 @@ pub(crate) fn cleanup(
             Err(error) => return Err(error.into()),
         }
     }
-    // Native capture duplicates belong to this exact capture operation. Native
-    // detachment above excludes readers of full-state restore inputs.
+    // Native working copies belong to this exact operation and its released
+    // capture boundary, not all snapshots from a source machine.
     let native_root = host_root
         .join("machines")
         .join(object_name(record.machine_id.as_str()))
@@ -1173,14 +1166,14 @@ mod tests {
         let second = retain_input(&root, &snapshot.request.id).unwrap();
         let record = retirement(&mut snapshot);
         assert!(
-            matches!(cleanup(&temp.0, &snapshot, &record), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(cleanup(&temp.0, &snapshot, &record, || Ok(())), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
         );
         assert!(!retirement_path(&root, &snapshot.request.id).exists());
         drop(first);
-        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        assert!(cleanup(&temp.0, &snapshot, &record, || Ok(())).is_err());
         drop(second);
-        cleanup(&temp.0, &snapshot, &record).unwrap();
-        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
         assert!(
             !root
                 .join(object_name(snapshot.request.id.as_str()))
@@ -1202,7 +1195,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(cleanup(&temp.0, &snapshot, &changed).is_err());
+        assert!(cleanup(&temp.0, &snapshot, &changed, || Ok(())).is_err());
     }
 
     #[test]
@@ -1222,7 +1215,7 @@ mod tests {
             .write_all(b"unknown")
             .unwrap();
         let record = retirement(&mut snapshot);
-        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        assert!(cleanup(&temp.0, &snapshot, &record, || Ok(())).is_err());
         assert_eq!(fs::read(payload.join("system.ext4")).unwrap(), b"disk");
         assert_eq!(fs::read(payload.join("unowned")).unwrap(), b"unknown");
         // The marker survives interruption and excludes every future reader.
@@ -1233,13 +1226,13 @@ mod tests {
             .unwrap()
             .write_all(b"original output")
             .unwrap();
-        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
         assert_eq!(fs::read(archive).unwrap(), b"original output");
         assert!(!payload.exists());
     }
 
     #[test]
-    fn full_snapshot_retirement_waits_for_original_native_custody_not_power_or_control_reports() {
+    fn full_snapshot_retirement_waits_for_its_original_native_input_not_unrelated_disk_custody() {
         let temp = Temp::new();
         let mut snapshot = snapshot();
         snapshot.request.kind = SnapshotKind::Full;
@@ -1250,17 +1243,55 @@ mod tests {
         let disk = disks.join("system.ext4");
         crate::storage::publish_disk(&disk, 4096, |stage| open_write(stage)?.set_len(4096))
             .unwrap();
-        let original = crate::storage::attach(&disk).unwrap();
+        let unrelated_disk = crate::storage::attach(&disk).unwrap();
+        let original = retain_input(&root, &snapshot.request.id).unwrap();
         let native = original.try_clone().unwrap();
         drop(original);
         let record = retirement(&mut snapshot);
         assert!(
-            matches!(cleanup(&temp.0, &snapshot, &record), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            matches!(cleanup(&temp.0, &snapshot, &record, || Ok(())), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
         );
         assert!(!retirement_path(&root, &snapshot.request.id).exists());
         drop(native);
-        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
+        drop(unrelated_disk);
         assert!(retirement_path(&root, &snapshot.request.id).exists());
+    }
+
+    #[test]
+    fn retirement_fences_native_preparation_before_finishing_and_keeps_bytes_on_uncertain_release()
+    {
+        let temp = Temp::new();
+        let mut snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        private_directory(&root).unwrap();
+        let stage = disk_stage(&root, &snapshot).with_extension("input-building");
+        private_directory(&stage).unwrap();
+        open_write(&stage.join("system.ext4"))
+            .unwrap()
+            .write_all(b"partial disk")
+            .unwrap();
+        let record = retirement(&mut snapshot);
+        let finish = || {
+            assert!(retirement_path(&root, &snapshot.request.id).exists());
+            assert!(retain_input(&root, &snapshot.request.id).is_err());
+            assert_eq!(
+                fs::read(stage.join("system.ext4")).unwrap(),
+                b"partial disk"
+            );
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "native finish response lost",
+            ))
+        };
+        assert!(cleanup(&temp.0, &snapshot, &record, finish).is_err());
+        assert_eq!(
+            fs::read(stage.join("system.ext4")).unwrap(),
+            b"partial disk"
+        );
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
+        assert!(!stage.exists());
+        assert!(capture_custody(&root, &snapshot).is_err());
     }
 
     #[test]
@@ -1282,7 +1313,8 @@ mod tests {
     }
 
     #[test]
-    fn full_snapshot_retirement_reclaims_interrupted_native_restore_copy_only_after_detachment() {
+    fn full_snapshot_retirement_reclaims_interrupted_native_restore_copy_after_original_input_release()
+     {
         let temp = Temp::new();
         let mut snapshot = snapshot();
         snapshot.request.kind = SnapshotKind::Full;
@@ -1317,16 +1349,16 @@ mod tests {
             .unwrap()
             .write_all(b"original bytes")
             .unwrap();
-        let original = crate::storage::attach(&disk).unwrap();
+        let original = retain_input(&root, &snapshot.request.id).unwrap();
         let record = retirement(&mut snapshot);
-        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        assert!(cleanup(&temp.0, &snapshot, &record, || Ok(())).is_err());
         assert_eq!(fs::read(&copy).unwrap(), b"interrupted native state copy");
         drop(original);
-        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
         assert!(!copy.exists());
         assert_eq!(fs::read(other).unwrap(), b"other capture");
         assert_eq!(fs::read(archive).unwrap(), b"original bytes");
-        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record, || Ok(())).unwrap();
     }
 
     #[test]

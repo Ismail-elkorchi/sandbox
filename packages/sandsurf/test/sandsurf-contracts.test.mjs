@@ -60,6 +60,28 @@ test("snapshot retirement returns durable host status and validates the exact re
     await assert.rejects(stale.release({ operationId: "release" }), (error) => error.category === "protocol");
   }
 });
+test("unfinished snapshot handles retire without manufacturing captured artifacts", async () => {
+  for (const phase of ["admitted", "capturing"]) {
+    const resources = fixtureView().runtimeConfiguration.resources;
+    const snapshot = { request: { id: "unfinished", operationId: "capture", machineId: "box", expectedGeneration: 1, expectedRevision: 1, kind: "full", parent: null }, requestDigest: "a".repeat(64), phase, imageDigest: "b".repeat(64), resources, consistency: null, systemDiskDigest: null, systemDiskBytes: resources.diskBytes, manifestDigest: null, sensitive: true, full: null };
+    let retired = false;
+    const release = { operationId: "cancel", machineId: "box", snapshotId: "unfinished", requestDigest: sandsurfDigest("snapshot", ["sandsurf-release-snapshot-v1", "cancel", "unfinished"]), cleanupPending: true };
+    const host = new Sandsurf({ request: async (request) => {
+      if (request.kind === "get-snapshot") return { kind: "snapshot", value: { ...snapshot, phase: retired ? "retiring" : phase } };
+      assert.equal(request.kind, "release-snapshot");
+      assert.equal(request.snapshotId, "unfinished");
+      retired = true;
+      return { kind: "snapshot-release", operation: release };
+    } }, () => true);
+    const handle = await host.snapshots.get("unfinished");
+    assert.equal(handle.inspection.manifestDigest, null);
+    const operation = await handle.release({ operationId: "cancel" });
+    assert.equal(operation.observation.observation.cleanupPending, true);
+    assert.equal((await host.snapshots.get("unfinished")).inspection.phase, "retiring");
+    assert.equal(handle.inspection.phase, phase);
+  }
+});
+
 function completedState() {
   return { kind: "exited", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64), cleanupDigest: "d".repeat(64),
     output: { finalCursor: 0, chunks: 0, stdoutBytes: 0, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "a".repeat(64) } };

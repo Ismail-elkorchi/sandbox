@@ -426,6 +426,7 @@ fn capture_release_preserves_applied_pause_and_never_replays_pending_running_aut
         let response = f.guardian.handle(GuardianRequest::NativeSnapshot {
             machine_id: current.machine_id.clone(),
             request: NativeSnapshotRequest::PrepareDisk {
+                snapshot_id: "snapshot".try_into().unwrap(),
                 operation_id: operation_id.clone(),
                 expected_generation: current.generation,
                 expected_revision: current.applied_revision,

@@ -1243,8 +1243,11 @@ impl HostCatalog {
         host_operation_identity_available(&tx, &operation_id)?;
         let mut snapshot =
             snapshot_record(&tx, &snapshot_id)?.ok_or(Error::Missing("snapshot does not exist"))?;
-        if snapshot.phase != SnapshotPhase::Ready {
-            return Err(Error::Conflict("only a ready snapshot can be retired"));
+        if matches!(
+            snapshot.phase,
+            SnapshotPhase::Retiring | SnapshotPhase::Released
+        ) {
+            return Err(Error::Conflict("snapshot already has a retirement owner"));
         }
         for query in [
             "SELECT EXISTS(SELECT 1 FROM forks f JOIN machines m ON f.machine=m.id WHERE f.snapshot=?1 AND m.released=0 AND json_extract(f.value,'$.materializedDisk') IS NULL)",
@@ -2915,15 +2918,20 @@ fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<
     raw.map(|raw| {
         let value: Snapshot = decode(&raw)?;
         let expected = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &value.request))?;
-        if value.request.id != *id
-            || value.request_digest != expected
-            || matches!(
-                value.phase,
-                SnapshotPhase::Ready | SnapshotPhase::Retiring | SnapshotPhase::Released
-            ) != (value.consistency.is_some()
-                && value.system_disk_digest.is_some()
-                && value.manifest_digest.is_some())
-        {
+        let empty = value.consistency.is_none()
+            && value.system_disk_digest.is_none()
+            && value.manifest_digest.is_none()
+            && value.full.is_none();
+        let published = value.consistency.is_some()
+            && value.system_disk_digest.is_some()
+            && value.manifest_digest.is_some()
+            && (value.request.kind == SnapshotKind::Full) == value.full.is_some();
+        let valid_capture = match value.phase {
+            SnapshotPhase::Admitted | SnapshotPhase::Capturing => empty,
+            SnapshotPhase::Ready => published,
+            SnapshotPhase::Retiring | SnapshotPhase::Released => empty || published,
+        };
+        if value.request.id != *id || value.request_digest != expected || !valid_capture {
             return Err(Error::Corrupt("snapshot record is inconsistent"));
         }
         Ok(value)

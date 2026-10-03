@@ -370,6 +370,112 @@ fn late_suspend_completion_after_confirmed_stop_and_retirement_is_history_not_re
 }
 
 #[test]
+fn unfinished_capture_retirement_is_terminal_recovers_and_never_accepts_a_late_result() {
+    for kind in [SnapshotKind::Disk, SnapshotKind::Full] {
+        for capturing in [false, true] {
+            let mut f = Fixture::new();
+            let revision = f
+                .host
+                .machine(&f.machine)
+                .unwrap()
+                .unwrap()
+                .configuration_revision;
+            let request = SnapshotRequest {
+                id: "cancelled-snapshot".try_into().unwrap(),
+                operation_id: "cancelled-capture".try_into().unwrap(),
+                machine_id: f.machine.clone(),
+                expected_generation: n(1),
+                expected_revision: revision,
+                kind,
+                parent: None,
+            };
+            let admitted = f
+                .host
+                .admit_snapshot(
+                    request.clone(),
+                    Approval {
+                        id: "approve-capture".try_into().unwrap(),
+                        request_digest: digest(
+                            Domain::Snapshot,
+                            &("sandsurf-snapshot-v1", &request),
+                        )
+                        .unwrap(),
+                    },
+                )
+                .unwrap();
+            if capturing {
+                f.host
+                    .begin_snapshot(&request.id, &admitted.request_digest)
+                    .unwrap();
+            }
+            let operation: OperationId = "cancel-capture".try_into().unwrap();
+            let approval = Approval {
+                id: "approve-cancellation".try_into().unwrap(),
+                request_digest: digest(
+                    Domain::Snapshot,
+                    &("sandsurf-release-snapshot-v1", &operation, &request.id),
+                )
+                .unwrap(),
+            };
+            let record = f
+                .host
+                .release_snapshot(operation.clone(), request.id.clone(), approval.clone())
+                .unwrap();
+            let root = f.root.0.join("host");
+            drop(f.host);
+            let mut host = HostCatalog::open(&root).unwrap();
+            assert_eq!(
+                host.snapshot(&request.id).unwrap().unwrap().phase,
+                SnapshotPhase::Retiring
+            );
+            assert!(
+                host.begin_snapshot(&request.id, &admitted.request_digest)
+                    .is_err()
+            );
+            let late = match kind {
+                SnapshotKind::Disk => host.complete_snapshot(
+                    &request.id,
+                    &admitted.request_digest,
+                    bytes_digest(b"late disk"),
+                    bytes_digest(b"late manifest"),
+                    SnapshotConsistency::Crash,
+                ),
+                SnapshotKind::Full => host.complete_full_snapshot(
+                    &request.id,
+                    &admitted.request_digest,
+                    bytes_digest(b"late disk"),
+                    bytes_digest(b"late manifest"),
+                    SnapshotConsistency::Crash,
+                    full_snapshot_metadata(),
+                ),
+            };
+            assert!(late.is_err());
+            assert_eq!(
+                host.release_snapshot(operation.clone(), request.id.clone(), approval)
+                    .unwrap(),
+                record
+            );
+            host.complete_snapshot_release(&operation, &record.request_digest)
+                .unwrap();
+            drop(host);
+            let mut host = HostCatalog::open(&root).unwrap();
+            let final_record = host.snapshot(&request.id).unwrap().unwrap();
+            assert_eq!(final_record.phase, SnapshotPhase::Released);
+            assert!(final_record.manifest_digest.is_none());
+            assert!(
+                host.begin_snapshot(&request.id, &admitted.request_digest)
+                    .is_err()
+            );
+            assert!(
+                host.pending_snapshot_releases(None, n(32))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
 fn substituted_snapshot_retirement_is_rejected_intact_and_recovery_uses_indexes() {
     let mut f = Fixture::new();
     let snapshot = ready_snapshot(&mut f, "source");

@@ -929,6 +929,7 @@ fn capture_generation_and_revision_are_fenced_at_the_native_owner() {
     for (generation, revision) in [(n(2), n(2)), (n(1), n(3))] {
         for request in [
             NativeSnapshotRequest::PrepareDisk {
+                snapshot_id: "snapshot".try_into().unwrap(),
                 operation_id: "capture".try_into().unwrap(),
                 expected_generation: generation,
                 expected_revision: revision,
@@ -953,6 +954,7 @@ fn capture_generation_and_revision_are_fenced_at_the_native_owner() {
         guardian.handle(GuardianRequest::NativeSnapshot {
             machine_id: fixture.machine.clone(),
             request: NativeSnapshotRequest::PrepareDisk {
+                snapshot_id: "snapshot".try_into().unwrap(),
                 operation_id: "capture".try_into().unwrap(),
                 expected_generation: n(1),
                 expected_revision: n(2)
@@ -970,6 +972,7 @@ fn capture_generation_and_revision_are_fenced_at_the_native_owner() {
         guardian.handle(GuardianRequest::NativeSnapshot {
             machine_id: fixture.machine.clone(),
             request: NativeSnapshotRequest::PrepareDisk {
+                snapshot_id: "snapshot".try_into().unwrap(),
                 operation_id: "capture".try_into().unwrap(),
                 expected_generation: n(1),
                 expected_revision: n(2)
@@ -1019,6 +1022,7 @@ fn retained_ledger_requires_destroyed_evidence_and_has_no_native_or_guest_owner(
         guardian.handle(GuardianRequest::NativeSnapshot {
             machine_id: fixture.machine.clone(),
             request: NativeSnapshotRequest::PrepareDisk {
+                snapshot_id: "snapshot-retired".try_into().unwrap(),
                 operation_id: "capture-retired".try_into().unwrap(),
                 expected_generation: Counter::ONE,
                 expected_revision: Counter::ONE,
