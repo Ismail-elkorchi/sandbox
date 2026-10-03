@@ -2571,7 +2571,7 @@ impl HostService {
         let records = self
             .catalog
             .active_machines(cursor.after_machine.as_ref(), counter(remaining as u64))?;
-        let at_end = records.len() < remaining;
+        let at_end = records.is_empty();
         for record in records {
             let id = record.id.clone();
             cursor.after_machine = Some(id.clone());
@@ -2608,7 +2608,7 @@ impl HostService {
         let snapshots = self
             .catalog
             .capturing_disk_snapshots(cursor.after_snapshot.as_ref(), counter(remaining as u64))?;
-        let at_end = snapshots.len() < remaining;
+        let at_end = snapshots.is_empty();
         for snapshot in snapshots {
             cursor.after_snapshot = Some(snapshot.request.id.clone());
             let machine = snapshot.request.machine_id.clone();
@@ -2644,7 +2644,7 @@ impl HostService {
         let records = self
             .catalog
             .pending_image_imports(cursor.after_import.as_ref(), counter(remaining as u64))?;
-        let at_end = records.len() < remaining;
+        let at_end = records.is_empty();
         for record in records {
             cursor.after_import = Some(record.operation_id.clone());
             let identity = ReconciliationIdentity::Image(record.operation_id.clone());
@@ -2678,7 +2678,7 @@ impl HostService {
         let releases = self
             .catalog
             .pending_image_releases(cursor.after_image.as_ref(), counter(remaining as u64))?;
-        let at_end = releases.len() < remaining;
+        let at_end = releases.is_empty();
         for record in releases {
             cursor.after_image = Some(record.operation_id.clone());
             let identity = ReconciliationIdentity::Image(record.operation_id.clone());
@@ -2715,7 +2715,7 @@ impl HostService {
             cursor.after_candidate.as_ref(),
             counter(remaining as u64),
         )?;
-        let at_end = records.len() < remaining;
+        let at_end = records.is_empty();
         for record in records {
             cursor.after_candidate = Some(record.operation_id.clone());
             let identity = ReconciliationIdentity::Image(record.operation_id.clone());
@@ -2770,7 +2770,7 @@ impl HostService {
             cursor.after_snapshot_release.as_ref(),
             counter(remaining as u64),
         )?;
-        let at_end = records.len() < remaining;
+        let at_end = records.is_empty();
         for record in records {
             cursor.after_snapshot_release = Some(record.operation_id.clone());
             let identity = ReconciliationIdentity::SnapshotRelease(record.operation_id.clone());
@@ -3469,12 +3469,14 @@ struct DeferredMachineViews {
 
 impl DeferredMachineViews {
     fn execute(self) -> Result<HostResponse> {
+        let mut page = ControlPage::default();
+        for record in self.records {
+            if !page.push(observe_machine(&self.root, record)?)? {
+                break;
+            }
+        }
         Ok(HostResponse::Machines {
-            values: self
-                .records
-                .into_iter()
-                .map(|record| observe_machine(&self.root, record))
-                .collect::<Result<_>>()?,
+            values: page.into_values(),
         })
     }
 }
@@ -5166,6 +5168,15 @@ mod tests {
         name: &str,
         lifetime: MachineLifetime,
     ) -> MachineId {
+        admit_machine_with_defaults(service, name, lifetime, ExecutionDefaults::default())
+    }
+
+    fn admit_machine_with_defaults(
+        service: &mut HostService,
+        name: &str,
+        lifetime: MachineLifetime,
+        defaults: ExecutionDefaults,
+    ) -> MachineId {
         let machine: MachineId = name.try_into().unwrap();
         let create: OperationId = format!("create-{name}").try_into().unwrap();
         let image = bytes_digest(b"seed");
@@ -5214,7 +5225,6 @@ mod tests {
             8_u64.try_into().unwrap(),
         )
         .expect("static resource envelope");
-        let defaults = ExecutionDefaults::default();
         let request_digest = digest(
             Domain::Machine,
             &(&machine, &image, &resources, &defaults, &lifetime, &create),
@@ -6826,6 +6836,50 @@ mod tests {
         );
         assert!(service.catalog.machine(&machine).unwrap().is_some());
         drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn byte_limited_recovery_pages_do_not_reset_before_later_machine_identities() {
+        let root = std::env::temp_dir().join(format!(
+            "ssbyte-sweep-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let mut identities = Vec::new();
+        for name in ["a-large", "b-large", "c-large"] {
+            identities.push(admit_machine_with_defaults(
+                &mut service,
+                name,
+                MachineLifetime::default(),
+                ExecutionDefaults {
+                    environment: (0..3)
+                        .map(|index| (format!("LARGE_{index}"), "x".repeat(64 * 1024)))
+                        .collect(),
+                    ..ExecutionDefaults::default()
+                },
+            ));
+        }
+        let busy = identities
+            .iter()
+            .cloned()
+            .map(ReconciliationIdentity::Machine)
+            .collect();
+        let mut cursor = ReconciliationCursor::default();
+        let mut work = Vec::new();
+        for identity in &identities {
+            service
+                .reconcile_machine_page(&mut cursor, &busy, 8, Counter::ONE, &mut work)
+                .unwrap();
+            assert_eq!(cursor.after_machine.as_ref(), Some(identity));
+            assert!(work.is_empty());
+        }
+        service
+            .reconcile_machine_page(&mut cursor, &busy, 8, Counter::ONE, &mut work)
+            .unwrap();
+        assert!(cursor.after_machine.is_none());
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }

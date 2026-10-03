@@ -3,6 +3,7 @@
 mod binary;
 mod boot;
 mod console;
+mod control_page;
 mod environment;
 mod frame;
 mod guest;
@@ -14,6 +15,7 @@ mod types;
 pub use binary::*;
 pub use boot::*;
 pub use console::*;
+pub use control_page::ControlPage;
 pub use environment::*;
 pub use frame::*;
 pub use guest::*;

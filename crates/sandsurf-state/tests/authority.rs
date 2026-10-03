@@ -1061,6 +1061,114 @@ fn mismatched_schema_identity_is_rejected_untouched_at_version_one() {
 }
 
 #[test]
+fn catalog_machine_pages_are_byte_bounded_and_resume_without_skipping_identities() {
+    let mut limits = catalog_limits();
+    limits.cpu_quota_micros = n(2_000_000);
+    limits.host_memory_bytes = n(64 * 1024 * 1024 * 1024);
+    let mut f = Fixture::with_limits(limits);
+    let image = f.host.machine(&f.machine).unwrap().unwrap().image_digest;
+    for index in 0..3 {
+        let machine: MachineId = format!("large-{index}").try_into().unwrap();
+        let operation: OperationId = format!("create-{index}").try_into().unwrap();
+        let defaults = ExecutionDefaults {
+            environment: (0..3)
+                .map(|item| (format!("LARGE_{item}"), "x".repeat(64 * 1024)))
+                .collect(),
+            ..ExecutionDefaults::default()
+        };
+        let request = digest(
+            Domain::Machine,
+            &(
+                &machine,
+                &image,
+                resources(),
+                &defaults,
+                &MachineLifetime::default(),
+                &operation,
+            ),
+        )
+        .unwrap();
+        f.host
+            .create_machine(
+                MachineAdmission {
+                    id: machine,
+                    image: image.clone(),
+                    resources: resources(),
+                    defaults,
+                    image_defaults: ExecutionDefaults::default(),
+                    lifetime: MachineLifetime::default(),
+                    operation,
+                },
+                Approval {
+                    id: format!("approve-{index}").try_into().unwrap(),
+                    request_digest: request,
+                },
+            )
+            .unwrap();
+    }
+    let mut after = None;
+    let mut identities = Vec::new();
+    loop {
+        let page = f.host.machines(after.as_ref(), n(256)).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() < 256);
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_CONTROL_BYTES - 4096);
+        let active = f.host.active_machines(after.as_ref(), n(256)).unwrap();
+        assert_eq!(page, active);
+        after = page.last().map(|record| record.id.clone());
+        identities.extend(page.into_iter().map(|record| record.id));
+    }
+    assert_eq!(
+        identities,
+        vec![
+            "box".try_into().unwrap(),
+            "large-0".try_into().unwrap(),
+            "large-1".try_into().unwrap(),
+            "large-2".try_into().unwrap()
+        ]
+    );
+    // Each column fits independently, but admitting both would make a machine
+    // unreadable over its control channel. Rejection must roll back authority.
+    let machine: MachineId = "large-0".try_into().unwrap();
+    let before = f.host.machine(&machine).unwrap().unwrap();
+    let mut configuration = before.runtime_configuration.clone();
+    configuration.network.rules = (0..400)
+        .map(|_| NetworkRule {
+            plane: NetworkPlane::Tcp,
+            destination: NetworkDestination::Ip {
+                cidr: "198.51.100.0/24".into(),
+                allow_private_addresses: false,
+            },
+            ports: vec![PortRange { from: 443, to: 443 }],
+        })
+        .collect();
+    configuration.validate().unwrap();
+    let operation: OperationId = "oversized-authority".try_into().unwrap();
+    let approval = Approval {
+        id: "approve-oversized-authority".try_into().unwrap(),
+        request_digest: hash("oversized-authority"),
+    };
+    assert!(matches!(
+        f.host.set_runtime_configuration(
+            &machine,
+            &operation,
+            before.configuration_revision,
+            configuration,
+            approval.request_digest.clone(),
+            approval,
+        ),
+        Err(Error::Capacity(_))
+    ));
+    assert_eq!(f.host.machine(&machine).unwrap().unwrap(), before);
+    assert!(f.host.operation(&operation).unwrap().is_none());
+    drop(f.host);
+    let host = HostCatalog::open(&f.root.0.join("host")).unwrap();
+    assert_eq!(host.machines(None, n(256)).unwrap().len(), 2);
+}
+
+#[test]
 fn machine_execution_defaults_is_host_owned_and_durable() {
     let root = TempRoot::new();
     let path = root.0.join("defaults-configuration-host");

@@ -47,7 +47,7 @@ impl MachineLifetime {
 impl ExecutionDefaults {
     pub fn validate(&self) -> Result<(), Invalid> {
         if self.environment.len() > 4096 {
-            return Err(Invalid("workload environment exceeds 4096 entries"));
+            return Err(Invalid("execution environment exceeds 4096 entries"));
         }
         if self.environment.iter().any(|(name, value)| {
             name.is_empty()
@@ -56,19 +56,19 @@ impl ExecutionDefaults {
                 || value.len() > 64 * 1024
                 || value.contains('\0')
         }) {
-            return Err(Invalid("workload environment is malformed"));
+            return Err(Invalid("execution environment is malformed"));
         }
         if self
             .user
             .as_ref()
             .is_some_and(|value| value.is_empty() || value.len() > 256 || value.contains('\0'))
         {
-            return Err(Invalid("workload user is malformed"));
+            return Err(Invalid("Linux execution user is malformed"));
         }
         if self.working_directory.as_ref().is_some_and(|value| {
             value.len() > 4096 || !value.starts_with('/') || value.contains('\0')
         }) {
-            return Err(Invalid("workload working directory is malformed"));
+            return Err(Invalid("execution working directory is malformed"));
         }
         Ok(())
     }

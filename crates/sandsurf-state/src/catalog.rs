@@ -1098,13 +1098,10 @@ impl HostCatalog {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        operations
-            .into_iter()
-            .map(|operation| {
-                image_import(&self.db.connection, &operation.try_into()?)?
-                    .ok_or(Error::Corrupt("image candidate cleanup disappeared"))
-            })
-            .collect()
+        control_page(operations.into_iter().map(|operation| {
+            image_import(&self.db.connection, &operation.try_into()?)?
+                .ok_or(Error::Corrupt("image candidate cleanup disappeared"))
+        }))
     }
 
     pub fn complete_image_candidate_cleanup(
@@ -1151,13 +1148,10 @@ impl HostCatalog {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        operations
-            .into_iter()
-            .map(|operation| {
-                image_import(&self.db.connection, &operation.try_into()?)?
-                    .ok_or(Error::Corrupt("pending image import disappeared"))
-            })
-            .collect()
+        control_page(operations.into_iter().map(|operation| {
+            image_import(&self.db.connection, &operation.try_into()?)?
+                .ok_or(Error::Corrupt("pending image import disappeared"))
+        }))
     }
 
     pub fn image(&self, digest: &Digest) -> Result<Option<ImageRecord>> {
@@ -1173,13 +1167,14 @@ impl HostCatalog {
         let mut statement = self.db.connection.prepare(
             "SELECT value FROM images WHERE retired=0 AND digest>?1 ORDER BY digest ASC LIMIT ?2",
         )?;
-        statement
-            .query_map(
-                params![after.map_or("", Digest::as_str), limit.get()],
-                |row| row.get::<_, String>(0),
-            )?
-            .map(|value| decode(&value?))
-            .collect()
+        let mut rows = statement.query(params![after.map_or("", Digest::as_str), limit.get()])?;
+        let mut page = ControlPage::default();
+        while let Some(row) = rows.next()? {
+            if !page.push(decode::<ImageRecord>(&row.get::<_, String>(0)?)?)? {
+                break;
+            }
+        }
+        Ok(page.into_values())
     }
 
     pub fn release_image(
@@ -1452,13 +1447,10 @@ impl HostCatalog {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        operations
-            .into_iter()
-            .map(|operation| {
-                snapshot_release(&self.db.connection, &operation.try_into()?)?
-                    .ok_or(Error::Corrupt("pending snapshot retirement disappeared"))
-            })
-            .collect()
+        control_page(operations.into_iter().map(|operation| {
+            snapshot_release(&self.db.connection, &operation.try_into()?)?
+                .ok_or(Error::Corrupt("pending snapshot retirement disappeared"))
+        }))
     }
 
     pub fn suspension(&self, machine: &MachineId) -> Result<Option<SuspensionRecord>> {
@@ -1499,16 +1491,18 @@ impl HostCatalog {
             params![after.map_or("", SnapshotId::as_str), limit.get()],
             |row| row.get::<_, String>(0),
         )?;
-        let mut values = Vec::new();
+        let mut page = ControlPage::default();
         for row in rows {
             let id: SnapshotId = row?.try_into()?;
-            values.push(
+            if !page.push(
                 snapshot_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
                     "listed snapshot disappeared from the catalog",
                 ))?,
-            );
+            )? {
+                break;
+            }
         }
-        Ok(values)
+        Ok(page.into_values())
     }
 
     /// Recovery candidates, not all historical snapshots. The partial index
@@ -1524,13 +1518,15 @@ impl HostCatalog {
         let mut statement = self.db.connection.prepare(
             "SELECT value FROM snapshots WHERE id>?1 AND json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk' ORDER BY id LIMIT ?2",
         )?;
-        statement
-            .query_map(
-                params![after.map_or("", SnapshotId::as_str), limit.get()],
-                |row| row.get::<_, String>(0),
-            )?
-            .map(|row| decode(&row?))
-            .collect()
+        let mut rows =
+            statement.query(params![after.map_or("", SnapshotId::as_str), limit.get()])?;
+        let mut page = ControlPage::default();
+        while let Some(row) = rows.next()? {
+            if !page.push(decode::<Snapshot>(&row.get::<_, String>(0)?)?)? {
+                break;
+            }
+        }
+        Ok(page.into_values())
     }
 
     pub fn admit_snapshot(
@@ -1814,15 +1810,12 @@ impl HostCatalog {
         let identities = statement
             .query_map(params![after, limit.get()], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        identities
-            .into_iter()
-            .map(|id| {
-                let id: MachineId = id.try_into()?;
-                machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
-                    "listed machine disappeared from the host transaction view",
-                ))
-            })
-            .collect()
+        control_page(identities.into_iter().map(|id| {
+            let id: MachineId = id.try_into()?;
+            machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
+                "listed machine disappeared from the host transaction view",
+            ))
+        }))
     }
 
     /// Machines whose storage reservation still has an owner. Retirement
@@ -1846,15 +1839,12 @@ impl HostCatalog {
                 |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        identities
-            .into_iter()
-            .map(|id| {
-                let id: MachineId = id.try_into()?;
-                machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
-                    "active machine disappeared from the host transaction view",
-                ))
-            })
-            .collect()
+        control_page(identities.into_iter().map(|id| {
+            let id: MachineId = id.try_into()?;
+            machine_record(&self.db.connection, &id)?.ok_or(Error::Corrupt(
+                "active machine disappeared from the host transaction view",
+            ))
+        }))
     }
 
     pub fn create_machine(
@@ -1934,6 +1924,7 @@ impl HostCatalog {
             completion: None,
         };
         save_intent(&tx, &value)?;
+        validate_machine_metadata(&tx, &value.machine_id)?;
         tx.commit()?;
         Ok(value)
     }
@@ -2030,6 +2021,7 @@ impl HostCatalog {
                 encode(&fork)?,
             ],
         )?;
+        validate_machine_metadata(&tx, &value.machine_id)?;
         tx.commit()?;
         Ok(value)
     }
@@ -2360,6 +2352,7 @@ impl HostCatalog {
             "UPDATE machines SET configuration=?2,revision=?3 WHERE id=?1",
             params![machine.as_str(), encode(&configuration)?, revision.get()],
         )?;
+        validate_machine_metadata(&tx, machine)?;
         let value = HostConfigurationOperation {
             operation_id: operation.clone(),
             machine_id: machine.clone(),
@@ -2450,6 +2443,7 @@ impl HostCatalog {
             "UPDATE machines SET configuration=?2,revision=?3 WHERE id=?1",
             params![machine.as_str(), encode(&configuration)?, revision.get()],
         )?;
+        validate_machine_metadata(&tx, machine)?;
         let value = HostConfigurationOperation {
             operation_id: operation.clone(),
             machine_id: machine.clone(),
@@ -2912,6 +2906,19 @@ fn add_optional_observed(
         }
         _ => Ok(None),
     }
+}
+
+// Defaults and configuration have separate storage columns, but their combined
+// authority metadata must fit one control observation. Reserve space for later
+// bounded lifecycle receipts, native observations and the authenticated envelope.
+// Validate before admission commits, not while a recovery sweep tries to read it.
+fn validate_machine_metadata(db: &rusqlite::Connection, machine: &MachineId) -> Result<()> {
+    let record = machine_record(db, machine)?.ok_or(Error::Missing("machine is missing"))?;
+    let mut page = ControlPage::with_envelope_bytes(32 * 1024)?;
+    page.push(record).map_err(|_| {
+        Error::Capacity("combined machine authority metadata exceeds control bound")
+    })?;
+    Ok(())
 }
 
 fn machine_record(db: &rusqlite::Connection, machine: &MachineId) -> Result<Option<MachineRecord>> {
@@ -3510,6 +3517,16 @@ fn image_import(
     )
     .transpose()
 }
+fn control_page<T: Serialize>(rows: impl IntoIterator<Item = Result<T>>) -> Result<Vec<T>> {
+    let mut page = ControlPage::default();
+    for row in rows {
+        if !page.push(row?)? {
+            break;
+        }
+    }
+    Ok(page.into_values())
+}
+
 fn save_intent(db: &rusqlite::Connection, value: &LifecycleIntent) -> Result<()> {
     db.execute(
         "INSERT INTO intents VALUES (?1,?2,?3,?4)",

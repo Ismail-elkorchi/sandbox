@@ -150,7 +150,10 @@ async function msysOrigin(library: string, scratch: string, run: BuildRunner): P
     declaration: { path: selected.path, name: `installed-package.${owner}.txt`, sha256: selected.sha256 },
     async capture(output, materials) {
     const source = resolve(scratch, filename), signature = `${source}.sig`;
-    const url = `https://mirror.msys2.org/mingw/sources/${filename}`;
+    // Corresponding source is addressed by the installed package identity.
+    // Use the distribution's primary repository, not its geo redirector;
+    // signature verification below remains the authority for these bytes.
+    const url = `https://repo.msys2.org/mingw/sources/${filename}`;
     for (const [destination, address, limit] of [[source, url, maximumBytes], [signature, `${url}.sig`, 65536]] as const) {
       await run("curl", ["--fail", "--location", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
         "--max-time", "600", "--max-filesize", String(limit), "--output", destination, address], scratch);

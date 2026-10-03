@@ -1,9 +1,9 @@
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt};
 use sandsurf_protocol::{
-    Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind, FileRange,
-    FileReadObservation, FileRevision, FileStat, FileTransfer, GuestPath, OperationId, WatchEvent,
-    WatchEventKind, WatchPage, WatcherId,
+    ControlPage, Counter, Digest, DirectoryEntry, DirectoryPage, FileExpectation, FileKind,
+    FileRange, FileReadObservation, FileRevision, FileStat, FileTransfer, GuestPath, OperationId,
+    WatchEvent, WatchEventKind, WatchPage, WatcherId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -292,25 +292,40 @@ impl FilesystemService {
             return Err(FilesystemError::Invalid("directory cursor is malformed"));
         }
         let relative = linux_path(guest_path);
-        let mut values = Vec::new();
+        // Keep only the next bounded name window. Directory size is not a
+        // management-service allocation permission; do not stat/copy the
+        // whole directory merely to return one lexical page.
+        let mut names = BTreeSet::new();
         for entry in fs::read_dir(&relative)? {
             let entry = entry?;
-            if values.len() >= MAX_DIRECTORY_ENTRIES {
-                return Err(FilesystemError::Capacity);
-            }
             let name = entry.file_name().as_bytes().to_vec();
-            let entry_path = relative.join(OsStr::from_bytes(&name));
-            values.push(DirectoryEntry {
-                name,
-                stat: file_stat(fs::symlink_metadata(entry_path)?),
-            });
+            if after.is_none_or(|cursor| name.as_slice() > cursor) {
+                names.insert(name);
+                if names.len() > maximum + 1 {
+                    names.pop_last();
+                }
+            }
         }
-        values.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut selected = values
-            .into_iter()
-            .filter(|entry| after.is_none_or(|cursor| entry.name.as_slice() > cursor));
-        let entries: Vec<_> = selected.by_ref().take(maximum).collect();
-        let next = if selected.next().is_some() {
+        let mut more = names.len() > maximum;
+        if more {
+            names.pop_last();
+        }
+        let mut page = ControlPage::default();
+        for name in names {
+            let entry_path = relative.join(OsStr::from_bytes(&name));
+            if !page
+                .push(DirectoryEntry {
+                    name,
+                    stat: file_stat(fs::symlink_metadata(entry_path)?),
+                })
+                .map_err(|_| FilesystemError::Capacity)?
+            {
+                more = true;
+                break;
+            }
+        }
+        let entries = page.into_values();
+        let next = if more {
             entries.last().map(|entry| entry.name.clone())
         } else {
             None
@@ -1379,6 +1394,37 @@ mod tests {
             .set_len(MAX_WATCH_RECORD_BYTES as u64 + 1)
             .unwrap();
         assert!(FilesystemService::open(&ledger.0).is_err());
+    }
+
+    #[test]
+    fn directory_pagination_bounds_encoded_metadata_and_resumes_long_names() {
+        let root = Temp::new();
+        let ledger = Temp::new();
+        let service = FilesystemService::open(&ledger.0).unwrap();
+        let mut expected = Vec::new();
+        for index in 0..512 {
+            let name = format!("{index:04}-{}", "z".repeat(245));
+            fs::write(root.0.join(&name), b"file").unwrap();
+            expected.push(name.into_bytes());
+        }
+        let scope = GuestPath::try_from(root.path("").as_str()).unwrap();
+        let mut after = None;
+        let mut captured = Vec::new();
+        loop {
+            let page = service.list_page(&scope, after.as_deref(), 4096).unwrap();
+            assert!(
+                serde_json::to_vec(&page).unwrap().len() <= sandsurf_protocol::MAX_CONTROL_BYTES
+            );
+            assert!(!page.entries.is_empty());
+            assert!(page.entries.len() < 512);
+            captured.extend(page.entries.into_iter().map(|entry| entry.name));
+            let Some(next) = page.next else {
+                break;
+            };
+            after = Some(next);
+        }
+        assert_eq!(captured, expected);
+        assert_eq!(service.list(scope.to_utf8().unwrap()).unwrap().len(), 512);
     }
 
     #[test]
