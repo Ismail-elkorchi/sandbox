@@ -48,7 +48,7 @@ fn fuzz_policy(random: &mut XorShift64, index: usize) {
         bytes.splice(0..0, br#"{"rules":[{"plane":"tcp","destination":{"kind":"ip","cidr":"203.0.113.0/24","allowPrivateAddresses":false},"ports":[{"from":443,"to":443}]}]}"#.iter().copied());
     }
     if let Ok(policy) = serde_json::from_slice::<NetworkPolicy>(&bytes) {
-        let _ = PacketPolicy::compile(&policy, Vec::new());
+        let _ = PacketPolicy::compile(&policy);
     }
 }
 

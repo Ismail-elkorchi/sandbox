@@ -1,5 +1,5 @@
 use crate::packet::{self, FlowKey, Packet};
-use crate::policy::{PacketPolicy, host_addresses};
+use crate::policy::PacketPolicy;
 use crate::*;
 use sandsurf_protocol::{Exposure, NetworkPlane, NetworkPolicy};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -160,7 +160,6 @@ pub struct NativeNetworkGateway {
 impl NativeNetworkGateway {
     pub fn start(transport: PacketTransport, link: LinkIdentity) -> io::Result<Self> {
         transport.nonblocking()?;
-        let hosts = host_addresses()?;
         let (control, receiver) = mpsc::sync_channel(1);
         let snapshot = Arc::new(Mutex::new(NetworkSnapshot::default()));
         let violations = Arc::new(Mutex::new(Vec::new()));
@@ -168,7 +167,7 @@ impl NativeNetworkGateway {
         let denied = Arc::clone(&violations);
         let worker = thread::Builder::new()
             .name("sandsurf-native-network".into())
-            .spawn(move || Worker::new(transport, link, hosts, stats, denied).run(receiver))?;
+            .spawn(move || Worker::new(transport, link, stats, denied).run(receiver))?;
         Ok(Self {
             control,
             worker: Some(worker),
@@ -334,11 +333,9 @@ struct Worker {
     pending: HashMap<(FlowKey, bool), PendingFlow>,
     inbound: Vec<Inbound>,
     policy: PacketPolicy,
-    authority: NetworkPolicy,
     snapshot: Arc<Mutex<NetworkSnapshot>>,
     violations: Arc<Mutex<Vec<NetworkViolation>>>,
     start: Instant,
-    host_refresh: Instant,
     rate_start: Instant,
     packets: usize,
     bytes: usize,
@@ -349,7 +346,6 @@ impl Worker {
     fn new(
         transport: PacketTransport,
         link: LinkIdentity,
-        hosts: Vec<IpAddr>,
         snapshot: Arc<Mutex<NetworkSnapshot>>,
         violations: Arc<Mutex<Vec<NetworkViolation>>>,
     ) -> Self {
@@ -385,12 +381,10 @@ impl Worker {
             #[cfg(target_os = "linux")]
             pending: HashMap::new(),
             inbound: Vec::new(),
-            policy: PacketPolicy::compile(&NetworkPolicy::default(), hosts).expect("empty policy"),
-            authority: NetworkPolicy::default(),
+            policy: PacketPolicy::default(),
             snapshot,
             violations,
             start: Instant::now(),
-            host_refresh: Instant::now(),
             rate_start: Instant::now(),
             packets: 0,
             bytes: 0,
@@ -444,7 +438,6 @@ impl Worker {
         self.device.input.clear();
         self.device.output.clear();
         self.policy = PacketPolicy::default();
-        self.authority = NetworkPolicy::default();
     }
     fn apply(&mut self, policy: NetworkPolicy, exposures: Vec<Exposure>) -> io::Result<()> {
         // Install deny and close native sockets before validation/bind. Failure
@@ -461,7 +454,7 @@ impl Worker {
         if !policy.rules.is_empty() {
             sandsurf_native::network_sockets::probe()?;
         }
-        let compiled = PacketPolicy::compile(&policy, host_addresses()?)?;
+        let compiled = PacketPolicy::compile(&policy)?;
         let mut listeners = Vec::new();
         for exposure in exposures.iter().filter(|e| e.active) {
             exposure
@@ -498,7 +491,6 @@ impl Worker {
         }
         self.inbound = listeners;
         self.policy = compiled;
-        self.authority = policy;
         Ok(())
     }
     fn run(mut self, commands: mpsc::Receiver<Command>) -> io::Result<()> {
@@ -519,26 +511,6 @@ impl Worker {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) => {}
-            }
-            // Host interface changes must not turn an existing remote socket
-            // into access to a newly assigned host management address.
-            if self.host_refresh.elapsed() >= Duration::from_secs(1) {
-                self.host_refresh = Instant::now();
-                let refreshed = PacketPolicy::compile(&self.authority, host_addresses()?)?;
-                let affected = self
-                    .tcp
-                    .keys()
-                    .filter(|k| {
-                        !self.tcp[*k].inbound && !refreshed.allows(NetworkPlane::Tcp, k.remote)
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
-                for k in affected {
-                    self.remove_tcp(&k);
-                }
-                self.udp
-                    .retain(|k, _| refreshed.allows(NetworkPlane::Udp, k.remote));
-                self.policy = refreshed;
             }
             for _ in 0..64 {
                 match self.transport.receive() {
@@ -619,10 +591,6 @@ impl Worker {
                     {
                         return Ok(());
                     }
-                    if host_addresses()?.contains(&key.remote.ip()) {
-                        self.deny(Some(key), "host address denied");
-                        return Ok(());
-                    }
                     #[cfg(target_os = "linux")]
                     {
                         self.admit(key, false, frame)?;
@@ -645,10 +613,6 @@ impl Worker {
                 }
                 if !self.udp.contains_key(&key) {
                     if self.flow_count() >= MAX_FLOWS {
-                        return Ok(());
-                    }
-                    if host_addresses()?.contains(&key.remote.ip()) {
-                        self.deny(Some(key), "host address denied");
                         return Ok(());
                     }
                     #[cfg(target_os = "linux")]
@@ -751,8 +715,9 @@ impl Worker {
             } else {
                 NetworkPlane::Tcp
             };
-            // Current authority is checked again. An address-inventory refresh
-            // or revision can never turn a pending request into stale authority.
+            // Current authority is checked again. A revision can never turn a
+            // pending socket request into stale authority. Actual local delivery
+            // remains forbidden by the socket's kernel boundary on every packet.
             if !self.policy.allows(plane, key.remote) {
                 continue;
             }

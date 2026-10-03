@@ -194,7 +194,12 @@ jobs:
           trap 'sudo ifconfig lo0 -alias 198.18.0.9 2>/dev/null || true; sudo pfctl -f /etc/pf.conf' EXIT
           sudo pfctl -f vmm/qemu/tests/darwin-local-delivery.conf
           sudo pfctl -e || sudo pfctl -s info | grep -q 'Status: Enabled'
-          sudo target/debug/darwin-local-delivery
+          if ! sudo target/debug/darwin-local-delivery; then
+            sudo pfctl -vvsr
+            sudo pfctl -vvs Interfaces
+            sudo pfctl -ss
+            exit 1
+          fi
 
   windows:
     runs-on: windows-2025

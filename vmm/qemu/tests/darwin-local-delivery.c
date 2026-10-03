@@ -122,7 +122,10 @@ static void readable(int descriptor, int expected, const char *message)
 
 static void local_contract(int family, const char *text)
 {
-    for (int type = SOCK_STREAM; type <= SOCK_DGRAM; type++) {
+    const int types[] = {SOCK_STREAM, SOCK_DGRAM};
+    for (size_t index = 0; index < sizeof(types) / sizeof(types[0]); index++) {
+        int type = types[index];
+        fprintf(stderr, "local-delivery case: %s %s\n", text, type == SOCK_STREAM ? "TCP" : "UDP");
         struct sockaddr_storage target;
         socklen_t length;
         int server = listener(family, type, text, &target, &length);

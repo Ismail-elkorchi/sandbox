@@ -9,6 +9,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     if let Ok(policy) = serde_json::from_slice::<NetworkPolicy>(data) {
-        let _ = PacketPolicy::compile(&policy, Vec::new());
+        let _ = PacketPolicy::compile(&policy);
     }
 });

@@ -11,6 +11,3 @@ sandsurf-protocol = { path = "../sandsurf-protocol" }
 sandsurf-native = { path = "../sandsurf-native" }
 smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 socket2 = "=0.6.5"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

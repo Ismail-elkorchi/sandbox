@@ -1460,14 +1460,6 @@ fn qemu_configuration_digest(
     )
 }
 
-fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), QemuError> {
-    let mut file = sandsurf_native::local::create_private_file(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    Ok(())
-}
-
 fn managed_guest(active: &ActiveGuest) -> ManagedGuestClient<SerialChannel> {
     let pending = active.rebind.as_ref().map(|binding| {
         let source = ActiveGuest {
