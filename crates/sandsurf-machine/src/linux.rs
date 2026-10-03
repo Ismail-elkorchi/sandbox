@@ -12,8 +12,8 @@ use crate::{
     DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome, MachineTransition,
 };
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineId, MachineObservation,
-    MachineState, OperationId, Qualification, SnapshotId, VmEngine, bytes_digest,
+    Counter, Digest, LifecycleCommand, MachineId, MachineObservation, MachineState, OperationId,
+    Qualification, SnapshotId, VmEngine, bytes_digest,
 };
 use std::fs;
 
@@ -142,7 +142,7 @@ impl<F: FirecrackerGenerationFactory> FirecrackerDriver<F> {
             Ok(value) => value,
             Err(evidence) => return MachineOutcome::NotApplied(evidence),
         };
-        let mut process = match FirecrackerProcess::spawn(&configuration) {
+        let mut process = match FirecrackerProcess::spawn(&configuration, &command.configuration) {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("sandsurf Firecracker spawn failed: {error}");
@@ -428,24 +428,26 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         }
     }
 
-    fn validate_configuration(
+    fn validate_attachment(
         &self,
-        command: &ConfigurationCommand,
+        machine_id: &MachineId,
+        revision: Counter,
+        requested: &sandsurf_protocol::Resources,
         current: &MachineObservation,
     ) -> Result<(), Digest> {
         let live = matches!(current.state, MachineState::Running | MachineState::Paused);
         if live
             && self.boot_resources.as_ref().is_none_or(|resources| {
-                resources.vcpus != command.configuration.resources.vcpus
-                    || resources.memory_mib != command.configuration.resources.memory_mib
-                    || resources.disk_bytes != command.configuration.resources.disk_bytes
+                resources.vcpus != requested.vcpus
+                    || resources.memory_mib != requested.memory_mib
+                    || resources.disk_bytes != requested.disk_bytes
             })
         {
             return Err(bytes_digest(b"live-machine-geometry-change-unsupported"));
         }
-        if command.machine_id != self.machine_id
+        if *machine_id != self.machine_id
             || current.machine_id != self.machine_id
-            || command.revision <= current.applied_revision
+            || revision <= current.applied_revision
             || live != self.process.is_some()
             || matches!(
                 current.state,
@@ -464,6 +466,17 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
 
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {
         self.boot(command, Counter::ONE)
+    }
+    fn install_network(
+        &mut self,
+        configuration: &sandsurf_protocol::RuntimeConfiguration,
+    ) -> Result<(), Digest> {
+        self.process
+            .as_ref()
+            .ok_or_else(|| bytes_digest(b"firecracker-network-owner-unavailable"))?
+            .network
+            .configure(&configuration.network, &configuration.exposures)
+            .map_err(|_| bytes_digest(b"firecracker-network-configuration-incomplete"))
     }
 
     fn reconfigure(
@@ -486,9 +499,6 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         ) {
             return MachineOutcome::Unknown;
         }
-        // Grant policy is enforced by host/guardian services. The VM shape is
-        // unchanged, so applying a newer authority revision is a control-plane
-        // rebind rather than a reboot or unsupported resource hotplug.
         MachineOutcome::Observed(vec![transition(
             command,
             current.generation,
@@ -623,7 +633,11 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
                 Ok(value) => value,
                 Err(evidence) => return MachineOutcome::NotApplied(evidence),
             };
-        let mut process = match FirecrackerProcess::spawn_restore(&configuration, &restore) {
+        let mut process = match FirecrackerProcess::spawn_restore(
+            &configuration,
+            &restore,
+            &command.configuration,
+        ) {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("sandsurf Firecracker restore failed: {error}");
@@ -764,7 +778,7 @@ fn transition_with_digest(
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
-    use sandsurf_protocol::{ObservationCause, RuntimeConfiguration};
+    use sandsurf_protocol::{ConfigurationCommand, ObservationCause, RuntimeConfiguration};
 
     struct NoEffects;
     impl FirecrackerGenerationFactory for NoEffects {
@@ -830,17 +844,25 @@ mod configuration_tests {
             evidence_digest: bytes_digest(b"native power"),
             cause: ObservationCause::Native {},
         };
-        assert!(driver.validate_configuration(&command, &current).is_ok());
+        let validate = |command: &ConfigurationCommand, current: &MachineObservation| {
+            driver.validate_attachment(
+                &command.machine_id,
+                command.revision,
+                &command.configuration.resources,
+                current,
+            )
+        };
+        assert!(validate(&command, &current).is_ok());
         assert!(driver.process.is_none());
         assert!(driver.boot_resources.is_none());
         command.machine_id = "other".try_into().unwrap();
-        assert!(driver.validate_configuration(&command, &current).is_err());
+        assert!(validate(&command, &current).is_err());
         command.machine_id = machine;
         current.machine_id = "other".try_into().unwrap();
-        assert!(driver.validate_configuration(&command, &current).is_err());
+        assert!(validate(&command, &current).is_err());
         current.machine_id = command.machine_id.clone();
         command.revision = Counter::ONE;
-        assert!(driver.validate_configuration(&command, &current).is_err());
+        assert!(validate(&command, &current).is_err());
         command.revision = 2.try_into().unwrap();
         for state in [
             MachineState::Creating,
@@ -853,13 +875,10 @@ mod configuration_tests {
             MachineState::Paused,
         ] {
             current.state = state;
-            assert!(
-                driver.validate_configuration(&command, &current).is_err(),
-                "{state:?}"
-            );
+            assert!(validate(&command, &current).is_err(), "{state:?}");
         }
         current.state = MachineState::Stopped;
-        assert!(driver.validate_configuration(&command, &current).is_ok());
+        assert!(validate(&command, &current).is_ok());
         assert!(driver.process.is_none());
         assert!(driver.boot_resources.is_none());
     }

@@ -145,6 +145,9 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("sandsurf-footprint-{}-\"(x)\\", std::process::id()));
         crate::local::create_private_directory(&root).unwrap();
+        // macOS's temporary root commonly traverses /var -> /private/var.
+        // The policy deliberately binds the canonical input, not that alias.
+        let root = std::fs::canonicalize(root).unwrap();
         let disk = root.join("disk");
         let kernel = root.join("kernel");
         for path in [&disk, &kernel] {

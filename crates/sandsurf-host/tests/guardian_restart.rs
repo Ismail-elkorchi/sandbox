@@ -449,6 +449,26 @@ impl GuestDriver for FileGuest {
     }
 }
 impl GuardianEffect for FileEffect {
+    fn validate_resources(
+        &self,
+        resources: &Resources,
+        _: &MachineObservation,
+    ) -> sandsurf_host::guardian::Result<()> {
+        if self
+            .path
+            .parent()
+            .unwrap()
+            .join("reject-resources")
+            .exists()
+        {
+            return Err(sandsurf_host::guardian::Error::Unsupported(
+                "injected resource mismatch",
+            ));
+        }
+        resources
+            .validate()
+            .map_err(|_| sandsurf_host::guardian::Error::Protocol("invalid fixture resources"))
+    }
     fn native_snapshot(
         &mut self,
         _request: NativeSnapshotRequest,
@@ -701,6 +721,58 @@ fn failed_execution_integration_cannot_hide_committed_native_resume() {
             .delivery,
         Delivery::Applied
     );
+}
+
+#[test]
+fn lifecycle_resource_preflight_precedes_mutation_but_cannot_prevent_containment() {
+    for (desired, expected) in [
+        (DesiredState::Running, Delivery::NotApplied),
+        (DesiredState::Paused, Delivery::NotApplied),
+        (DesiredState::Suspended, Delivery::NotApplied),
+        (DesiredState::Stopped, Delivery::Applied),
+        (DesiredState::Destroyed, Delivery::Applied),
+    ] {
+        let mut fixture = Fixture::new();
+        fs::write(fixture.root.0.join("reject-resources"), []).unwrap();
+        let runtime =
+            RuntimeJournal::open(&fixture.root.0.join("runtime"), &fixture.machine).unwrap();
+        let mut guardian = Guardian::new(
+            runtime,
+            FileEffect {
+                path: fixture.root.0.join("effects"),
+            },
+        );
+        let id: OperationId = "power-with-unapplied-resources".try_into().unwrap();
+        let revision = fixture.host.revision(&fixture.machine).unwrap();
+        let request_digest = digest(
+            Domain::Operation,
+            &(&fixture.machine, &id, revision, desired),
+        )
+        .unwrap();
+        fixture
+            .host
+            .request_lifecycle(
+                &fixture.machine,
+                id.clone(),
+                revision,
+                desired,
+                Approval {
+                    id: "approve-power".try_into().unwrap(),
+                    request_digest,
+                },
+            )
+            .unwrap();
+        let authorization = fixture.host.authorize_lifecycle(&id).unwrap();
+        let response = guardian.handle(GuardianRequest::Transition { authorization });
+        assert!(
+            matches!(response, GuardianResponse::Lifecycle { ref operation } if operation.delivery == expected),
+            "{desired:?}: {response:?}"
+        );
+        assert_eq!(
+            fixture.root.0.join("native-power").exists(),
+            expected == Delivery::Applied
+        );
+    }
 }
 
 #[test]

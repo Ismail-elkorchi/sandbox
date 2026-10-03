@@ -7,8 +7,8 @@
 //! the guardian; returning `Observed` is not itself a journal commit.
 
 use sandsurf_protocol::{
-    Capability, ConfigurationCommand, Counter, DesiredState, Digest, GuestPowerCapabilities,
-    LifecycleCommand, MachineObservation, MachineState, Qualification, VmEngine,
+    Capability, Counter, DesiredState, Digest, GuestPowerCapabilities, LifecycleCommand, MachineId,
+    MachineObservation, MachineState, Qualification, Resources, VmEngine,
 };
 
 #[cfg(target_os = "linux")]
@@ -156,10 +156,19 @@ pub trait MachineDriver {
     /// Pure native attachment/topology preflight. It cannot install authority
     /// or report a configuration as applied. The guardian's effect owner
     /// coordinates its resource and network planes and records completion.
-    fn validate_configuration(
+    fn validate_attachment(
         &self,
-        command: &ConfigurationCommand,
+        machine_id: &MachineId,
+        revision: Counter,
+        resources: &Resources,
         current: &MachineObservation,
+    ) -> Result<(), Digest>;
+    /// Apply the current external policy to the original live packet owner.
+    /// Success includes revoking affected existing flows. Failure is an
+    /// incomplete effect, not proof that no policy change was made.
+    fn install_network(
+        &mut self,
+        configuration: &sandsurf_protocol::RuntimeConfiguration,
     ) -> Result<(), Digest>;
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome;
     fn reconfigure(
@@ -209,6 +218,25 @@ pub fn apply_lifecycle<D: MachineDriver>(
         return MachineOutcome::NotApplied(sandsurf_protocol::bytes_digest(
             b"native-lifecycle-machine-mismatch",
         ));
+    }
+    if let Some(current) = current
+        && matches!(current.state, MachineState::Running | MachineState::Paused)
+        && !matches!(
+            command.desired,
+            DesiredState::Stopped | DesiredState::Destroyed
+        )
+    {
+        if let Err(evidence) = driver.validate_attachment(
+            &command.machine_id,
+            command.revision,
+            &command.configuration.resources,
+            current,
+        ) {
+            return MachineOutcome::NotApplied(evidence);
+        }
+        if driver.install_network(&command.configuration).is_err() {
+            return MachineOutcome::Unknown;
+        }
     }
     let outcome = match (command.desired, current) {
         (DesiredState::Running, None) => driver.create(command),
@@ -357,9 +385,18 @@ mod tests {
     struct Driver {
         called: Option<&'static str>,
         output: Option<MachineOutcome>,
+        reject_attachment: bool,
+        reject_network: bool,
+        network_configured: bool,
     }
     impl Driver {
         fn take(&mut self, called: &'static str) -> MachineOutcome {
+            if matches!(called, "resume" | "reconfigure" | "pause" | "suspend") {
+                assert!(
+                    self.network_configured,
+                    "native power ran before current network authority"
+                );
+            }
             self.called = Some(called);
             self.output.take().unwrap()
         }
@@ -380,11 +417,27 @@ mod tests {
                 },
             }
         }
-        fn validate_configuration(
+        fn validate_attachment(
             &self,
-            _: &ConfigurationCommand,
+            _: &MachineId,
+            _: Counter,
+            _: &Resources,
             _: &MachineObservation,
         ) -> Result<(), Digest> {
+            if self.reject_attachment {
+                Err(hash("attachment mismatch"))
+            } else {
+                Ok(())
+            }
+        }
+        fn install_network(
+            &mut self,
+            _: &sandsurf_protocol::RuntimeConfiguration,
+        ) -> Result<(), Digest> {
+            if self.reject_network {
+                return Err(hash("policy application incomplete"));
+            }
+            self.network_configured = true;
             Ok(())
         }
         fn create(&mut self, _: &LifecycleCommand) -> MachineOutcome {
@@ -524,6 +577,7 @@ mod tests {
             let mut driver = Driver {
                 called: None,
                 output: Some(output(generation, terminal)),
+                ..Driver::default()
             };
             let actual = apply_lifecycle(&mut driver, &command(desired), current.as_ref());
             assert!(matches!(actual, MachineOutcome::Observed(_)));
@@ -540,6 +594,7 @@ mod tests {
             let mut driver = Driver {
                 called: None,
                 output: Some(output(1, terminal)),
+                ..Driver::default()
             };
             let MachineOutcome::Observed(transitions) =
                 apply_lifecycle(&mut driver, &command(desired), None)
@@ -557,6 +612,7 @@ mod tests {
             let mut uncertain = Driver {
                 called: None,
                 output: Some(MachineOutcome::Unknown),
+                ..Driver::default()
             };
             assert_eq!(
                 apply_lifecycle(&mut uncertain, &command(desired), None),
@@ -570,6 +626,7 @@ mod tests {
         let mut driver = Driver {
             called: None,
             output: Some(output(1, MachineState::Running)),
+            ..Driver::default()
         };
         let current = observation(MachineState::Stopped, 1);
         assert_eq!(
@@ -579,6 +636,7 @@ mod tests {
         let mut driver = Driver {
             called: None,
             output: Some(MachineOutcome::Observed(Vec::new())),
+            ..Driver::default()
         };
         assert_eq!(
             apply_lifecycle(&mut driver, &command(DesiredState::Running), None),
@@ -605,10 +663,87 @@ mod tests {
     }
 
     #[test]
+    fn live_policy_is_installed_before_power_and_bad_attachment_cannot_mutate_it() {
+        for (state, desired, terminal) in [
+            (
+                MachineState::Paused,
+                DesiredState::Running,
+                MachineState::Running,
+            ),
+            (
+                MachineState::Running,
+                DesiredState::Running,
+                MachineState::Running,
+            ),
+            (
+                MachineState::Running,
+                DesiredState::Paused,
+                MachineState::Paused,
+            ),
+            (
+                MachineState::Paused,
+                DesiredState::Suspended,
+                MachineState::Suspended,
+            ),
+        ] {
+            let current = observation(state, 1);
+            let mut driver = Driver {
+                output: Some(output(1, terminal)),
+                ..Driver::default()
+            };
+            assert!(matches!(
+                apply_lifecycle(&mut driver, &command(desired), Some(&current)),
+                MachineOutcome::Observed(_)
+            ));
+            assert!(driver.network_configured);
+            let mut driver = Driver {
+                reject_attachment: true,
+                ..Driver::default()
+            };
+            assert!(matches!(
+                apply_lifecycle(&mut driver, &command(desired), Some(&current)),
+                MachineOutcome::NotApplied(_)
+            ));
+            assert!(!driver.network_configured);
+            assert_eq!(driver.called, None);
+            let mut driver = Driver {
+                reject_network: true,
+                ..Driver::default()
+            };
+            assert_eq!(
+                apply_lifecycle(&mut driver, &command(desired), Some(&current)),
+                MachineOutcome::Unknown
+            );
+            assert_eq!(driver.called, None);
+        }
+        for (desired, terminal) in [
+            (DesiredState::Stopped, MachineState::Stopped),
+            (DesiredState::Destroyed, MachineState::Destroyed),
+        ] {
+            let mut driver = Driver {
+                reject_attachment: true,
+                reject_network: true,
+                output: Some(output(1, terminal)),
+                ..Driver::default()
+            };
+            assert!(matches!(
+                apply_lifecycle(
+                    &mut driver,
+                    &command(desired),
+                    Some(&observation(MachineState::Paused, 1))
+                ),
+                MachineOutcome::Observed(_)
+            ));
+            assert!(!driver.network_configured);
+        }
+    }
+
+    #[test]
     fn rejects_cross_machine_observations_before_driver_dispatch() {
         let mut driver = Driver {
             called: None,
             output: Some(output(1, MachineState::Stopped)),
+            ..Driver::default()
         };
         let mut current = observation(MachineState::Running, 1);
         current.machine_id = MachineId::try_from("other").unwrap();

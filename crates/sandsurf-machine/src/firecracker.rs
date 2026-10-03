@@ -73,8 +73,11 @@ pub struct FirecrackerProcess {
 }
 
 impl FirecrackerProcess {
-    pub fn spawn(config: &FirecrackerConfig) -> Result<Self, FirecrackerError> {
-        Self::spawn_inner(config, None)
+    pub fn spawn(
+        config: &FirecrackerConfig,
+        configuration: &sandsurf_protocol::RuntimeConfiguration,
+    ) -> Result<Self, FirecrackerError> {
+        Self::spawn_inner(config, None, configuration)
     }
 
     /// Start a fresh VMM, load exactly the supplied Firecracker state and
@@ -83,6 +86,7 @@ impl FirecrackerProcess {
     pub fn spawn_restore(
         config: &FirecrackerConfig,
         restore: &FirecrackerRestore,
+        configuration: &sandsurf_protocol::RuntimeConfiguration,
     ) -> Result<Self, FirecrackerError> {
         for path in [&restore.snapshot_state, &restore.snapshot_memory] {
             if !path.is_absolute() || !path.is_file() {
@@ -92,12 +96,13 @@ impl FirecrackerProcess {
                 )));
             }
         }
-        Self::spawn_inner(config, Some(restore))
+        Self::spawn_inner(config, Some(restore), configuration)
     }
 
     fn spawn_inner(
         config: &FirecrackerConfig,
         restore: Option<&FirecrackerRestore>,
+        configuration: &sandsurf_protocol::RuntimeConfiguration,
     ) -> Result<Self, FirecrackerError> {
         validate_config(config)?;
         fs::DirBuilder::new()
@@ -107,7 +112,6 @@ impl FirecrackerProcess {
         fs::DirBuilder::new().mode(0o700).create(&vm_state)?;
         let vsock_path = vm_state.join("guest.vsock");
         let api_socket_path = vm_state.join("firecracker.socket");
-        let config_path = vm_state.join("firecracker.json");
         let metrics_path = vm_state.join("native-metrics.fifo");
         let metrics_name = std::ffi::CString::new(metrics_path.as_os_str().as_encoded_bytes())
             .map_err(|_| FirecrackerError::Invalid("invalid metrics path".into()))?;
@@ -136,7 +140,7 @@ impl FirecrackerProcess {
                 is_read_only: true,
             },
         ];
-        let firecracker_json = FirecrackerJson {
+        let boot_devices = BootDevices {
             boot_source: BootSource {
                 kernel_image_path: "/vm/kernel".into(),
                 initrd_path: config
@@ -162,17 +166,6 @@ impl FirecrackerProcess {
                 guest_mac: config.network_identity.mac_address(),
             }],
         };
-        let mut config_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&config_path)?;
-        config_file.write_all(
-            &serde_json::to_vec(&firecracker_json)
-                .map_err(|error| FirecrackerError::Invalid(error.to_string()))?,
-        )?;
-        config_file.sync_all()?;
-
         let mut files = Vec::new();
         let kernel_fd_index = add_file(&mut files, &config.kernel_image)?;
         let initramfs_fd_index = config
@@ -199,7 +192,6 @@ impl FirecrackerProcess {
         let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
         let serial_input_fd_index = files.len();
         files.push(serial_slave);
-        let configuration_fd_index = add_file(&mut files, &config_path)?;
         let snapshot_state_fd_index = restore
             .map(|value| add_file(&mut files, &value.snapshot_state))
             .transpose()?;
@@ -244,7 +236,6 @@ impl FirecrackerProcess {
             storage_custody,
             authentication_fd_index,
             serial_input_fd_index,
-            configuration_fd_index,
             snapshot_state_fd_index,
             snapshot_memory_fd_index,
             state_directory_fd_index,
@@ -283,6 +274,7 @@ impl FirecrackerProcess {
             nic_channel.set_read_timeout(Some(Duration::from_secs(5)))?;
             let packet = crate::launcher::receive_native_nic(&nic_channel)?;
             let gateway = sandsurf_network::NativeNetworkGateway::start(sandsurf_network::PacketTransport::LinuxPacket(packet), config.network_identity)?;
+            gateway.configure(&configuration.network, &configuration.exposures)?;
             Ok(std::sync::Arc::new(gateway))
         })();
         let network = match setup {
@@ -332,8 +324,8 @@ impl FirecrackerProcess {
             metrics_stopped,
             reset_metrics: None,
         };
+        process.wait_for_api()?;
         if restore.is_some() {
-            process.wait_for_api()?;
             let body = serde_json::to_vec(&serde_json::json!({
                 "snapshot_path": "/vm/snapshot-state",
                 "mem_backend": {
@@ -347,6 +339,10 @@ impl FirecrackerProcess {
             }))
             .map_err(|error| FirecrackerError::Invalid(error.to_string()))?;
             process.api_request("PUT", "/snapshot/load", &body, 204)?;
+        } else {
+            configure_boot(&boot_devices, |path, body| {
+                process.api_request("PUT", path, body, 204).map(|_| ())
+            })?;
         }
         process.wait_for_power(if restore.is_some() {
             "Paused"
@@ -1144,16 +1140,38 @@ fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[derive(Serialize, Deserialize)]
-struct FirecrackerJson {
-    #[serde(rename = "network-interfaces")]
+struct BootDevices {
     network_interfaces: Vec<NetworkInterface>,
-    #[serde(rename = "boot-source")]
     boot_source: BootSource,
     drives: Vec<Drive>,
-    #[serde(rename = "machine-config")]
     machine_config: MachineConfig,
     vsock: Vsock,
+}
+
+/// No --config-file auto-start: hardware configuration is installed only
+/// after the original packet gateway has applied the signed host envelope.
+/// A failed PUT never reaches InstanceStart. Postcondition observation remains
+/// separate from delivery of any of these requests.
+fn configure_boot(
+    configuration: &BootDevices,
+    mut put: impl FnMut(&str, &[u8]) -> Result<(), FirecrackerError>,
+) -> Result<(), FirecrackerError> {
+    fn encode(value: &impl Serialize) -> Result<Vec<u8>, FirecrackerError> {
+        serde_json::to_vec(value).map_err(|error| FirecrackerError::Invalid(error.to_string()))
+    }
+    put("/machine-config", &encode(&configuration.machine_config)?)?;
+    put("/boot-source", &encode(&configuration.boot_source)?)?;
+    for drive in &configuration.drives {
+        put(&format!("/drives/{}", drive.drive_id), &encode(drive)?)?;
+    }
+    put("/vsock", &encode(&configuration.vsock)?)?;
+    for network in &configuration.network_interfaces {
+        put(
+            &format!("/network-interfaces/{}", network.iface_id),
+            &encode(network)?,
+        )?;
+    }
+    put("/actions", br#"{"action_type":"InstanceStart"}"#)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1196,6 +1214,82 @@ struct Vsock {
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    fn cold_start_is_last_and_failed_device_installation_never_starts_guest_cpus() {
+        let configuration = BootDevices {
+            boot_source: BootSource {
+                kernel_image_path: "/vm/kernel".into(),
+                initrd_path: None,
+                boot_args: "root=/dev/vda rw".into(),
+            },
+            drives: vec![
+                Drive {
+                    drive_id: "system".into(),
+                    path_on_host: "/vm/system".into(),
+                    is_root_device: true,
+                    is_read_only: false,
+                },
+                Drive {
+                    drive_id: "auth".into(),
+                    path_on_host: "/vm/auth".into(),
+                    is_root_device: false,
+                    is_read_only: true,
+                },
+            ],
+            machine_config: MachineConfig {
+                vcpu_count: 1,
+                mem_size_mib: 128,
+                smt: false,
+                track_dirty_pages: true,
+            },
+            vsock: Vsock {
+                guest_cid: 17,
+                uds_path: "/vm/state/guest.vsock".into(),
+            },
+            network_interfaces: vec![NetworkInterface {
+                iface_id: "eth0".into(),
+                host_dev_name: "tap0".into(),
+                guest_mac: "02:00:00:00:00:01".into(),
+            }],
+        };
+        let expected = [
+            "/machine-config",
+            "/boot-source",
+            "/drives/system",
+            "/drives/auth",
+            "/vsock",
+            "/network-interfaces/eth0",
+            "/actions",
+        ];
+        let mut delivered = Vec::new();
+        configure_boot(&configuration, |path, body| {
+            assert!(serde_json::from_slice::<serde_json::Value>(body).is_ok());
+            delivered.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(delivered, expected);
+        for failure in 0..expected.len() {
+            let mut calls = 0;
+            assert!(
+                configure_boot(&configuration, |path, _| {
+                    assert_eq!(path, expected[calls]);
+                    let index = calls;
+                    calls += 1;
+                    if index == failure {
+                        Err(FirecrackerError::Setup(
+                            "injected native PUT failure".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+            assert_eq!(calls, failure + 1);
+        }
+    }
     use std::io::Cursor;
 
     #[test]

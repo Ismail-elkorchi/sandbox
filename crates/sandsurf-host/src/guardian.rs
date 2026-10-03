@@ -1181,6 +1181,17 @@ impl<E: GuardianEffect> Guardian<E> {
                     // Forced containment must not depend on a readable
                     // capture journal; suspension verifies its own
                     // committed full-state witness in the native owner.
+                    if !matches!(
+                        actual.desired,
+                        DesiredState::Stopped | DesiredState::Destroyed
+                    ) && let Some(current) = current.as_ref()
+                        && let Err(error) =
+                            native.validate_resources(&actual.configuration.resources, current)
+                    {
+                        return LifecycleEffect::NotApplied(bytes_digest(
+                            error.to_string().as_bytes(),
+                        ));
+                    }
                     if let Some(prepared) = prepared
                         && let Err(error) = native.install_prepared_boot(prepared)
                     {

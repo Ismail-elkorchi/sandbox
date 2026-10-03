@@ -68,7 +68,6 @@ pub struct VmmLaunchSpec {
     pub storage_custody: Vec<CustodyDescriptor>,
     pub authentication_fd_index: usize,
     pub serial_input_fd_index: usize,
-    pub configuration_fd_index: usize,
     /// Present only when a fresh Firecracker process is started for snapshot
     /// loading. These files are mounted read-only at fixed paths and remain
     /// pinned for the VMM lifetime; Firecracker maps the memory file lazily.
@@ -532,7 +531,6 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
         spec.system_fd_index,
         spec.authentication_fd_index,
         spec.serial_input_fd_index,
-        spec.configuration_fd_index,
         spec.state_directory_fd_index,
         spec.kvm_fd_index,
     ];
@@ -608,13 +606,6 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
             false,
         ),
         (
-            spec.configuration_fd_index,
-            "/vm/state/firecracker.json",
-            "file",
-            true,
-            false,
-        ),
-        (
             spec.state_directory_fd_index,
             "/vm/state",
             "directory",
@@ -661,17 +652,13 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
             executable: false,
         });
     }
-    let mut args = vec![
+    let args = vec![
         "--enable-pci".into(),
         "--api-sock".into(),
         "/vm/state/firecracker.socket".into(),
         "--metrics-path".into(),
         "/vm/state/native-metrics.fifo".into(),
     ];
-    if spec.snapshot_state_fd_index.is_none() {
-        args.push("--config-file".into());
-        args.push("/vm/state/firecracker.json".into());
-    }
     VmmMachineSpec {
         nic_handoff_fd_index: spec.nic_handoff_fd_index,
         launcher_fd_index: spec.namespace_launcher_fd_index,

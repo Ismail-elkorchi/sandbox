@@ -1096,13 +1096,22 @@ impl GuardianEffect for QemuGuardianEffect {
         {
             return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
         }
-        if let Err(evidence) = self.machine.validate_configuration(command, current) {
+        if let Err(evidence) = self.machine.validate_attachment(
+            &command.machine_id,
+            command.revision,
+            &command.configuration.resources,
+            current,
+        ) {
             return EffectOutcome::NotApplied(evidence);
         }
         let runtime = if matches!(current.state, MachineState::Stopped | MachineState::Failed) {
             None
         } else {
-            if self.machine.install_network_configuration(command).is_err() {
+            if self
+                .machine
+                .install_network(&command.configuration)
+                .is_err()
+            {
                 self.contain_unpublished();
                 return EffectOutcome::Unknown;
             }

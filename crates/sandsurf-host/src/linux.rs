@@ -456,7 +456,7 @@ impl LinuxGuardianEffect {
         })
     }
 
-    fn install_runtime_configuration(
+    fn record_installed_runtime(
         &mut self,
         configuration: &RuntimeConfiguration,
     ) -> RuntimeInstallation {
@@ -480,10 +480,10 @@ impl LinuxGuardianEffect {
         let Some(gateway) = network.as_ref() else {
             return RuntimeInstallation::Unknown;
         };
-        if gateway
-            .configure(&configuration.network, &configuration.exposures)
-            .is_err()
-        {
+        // The native adapter applies network authority before start/resume or
+        // revision completion. This cache records that effect, never repeats
+        // it or supplies independent authority to the gateway.
+        if !gateway.is_alive() {
             return RuntimeInstallation::Unknown;
         }
         drop(network);
@@ -632,11 +632,15 @@ impl GuardianEffect for LinuxGuardianEffect {
         let prepared = self.machine.generation_factory_mut().prepared_boot.take();
         // Current signed authority is installed outside the guest before any
         // start/resume transition can execute guest code.
-        if (command.desired == sandsurf_protocol::DesiredState::Running
-            && self
-                .process_envelope
-                .apply(&command.configuration.resources)
-                .is_err())
+        if (matches!(
+            command.desired,
+            sandsurf_protocol::DesiredState::Running
+                | sandsurf_protocol::DesiredState::Paused
+                | sandsurf_protocol::DesiredState::Suspended
+        ) && self
+            .process_envelope
+            .apply(&command.configuration.resources)
+            .is_err())
             || (matches!(
                 command.desired,
                 sandsurf_protocol::DesiredState::Running
@@ -665,10 +669,11 @@ impl GuardianEffect for LinuxGuardianEffect {
             MachineOutcome::Observed(values)
                 if values.last().is_some_and(|value| value.state == MachineState::Running)
         );
+        if matches!(&outcome, MachineOutcome::Observed(values) if values.last().is_some_and(|value| matches!(value.state, MachineState::Running | MachineState::Paused | MachineState::Suspended)))
+        {
+            self.config.resources = command.configuration.resources.clone();
+        }
         if running {
-            if cold_boot {
-                self.config.resources = command.configuration.resources.clone();
-            }
             if self
                 .refresh_qualification(&command.configuration.resources)
                 .is_err()
@@ -676,8 +681,7 @@ impl GuardianEffect for LinuxGuardianEffect {
                 self.contain_unpublished_machine();
                 return MachineOutcome::Unknown;
             }
-            let runtime_evidence = match self.install_runtime_configuration(&command.configuration)
-            {
+            let runtime_evidence = match self.record_installed_runtime(&command.configuration) {
                 RuntimeInstallation::Applied(evidence) => evidence,
                 RuntimeInstallation::Unknown => {
                     self.contain_unpublished_machine();
@@ -781,7 +785,12 @@ impl GuardianEffect for LinuxGuardianEffect {
         {
             return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
         }
-        if let Err(evidence) = self.machine.validate_configuration(command, current) {
+        if let Err(evidence) = self.machine.validate_attachment(
+            &command.machine_id,
+            command.revision,
+            &command.configuration.resources,
+            current,
+        ) {
             return EffectOutcome::NotApplied(evidence);
         }
         if self
@@ -798,7 +807,15 @@ impl GuardianEffect for LinuxGuardianEffect {
         let runtime_evidence = if current.state == MachineState::Stopped {
             None
         } else {
-            match self.install_runtime_configuration(&command.configuration) {
+            if self
+                .machine
+                .install_network(&command.configuration)
+                .is_err()
+            {
+                self.contain_unpublished_machine();
+                return EffectOutcome::Unknown;
+            }
+            match self.record_installed_runtime(&command.configuration) {
                 RuntimeInstallation::Applied(evidence) => Some(evidence),
                 RuntimeInstallation::Unknown => {
                     self.contain_unpublished_machine();

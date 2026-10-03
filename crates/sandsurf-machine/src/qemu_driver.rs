@@ -91,9 +91,8 @@ mod native {
     use crate::{DriverQualification, MachineDriver, MachineOutcome, MachineTransition};
     use sandsurf_native::serial_channel::SerialChannel;
     use sandsurf_protocol::{
-        Capability, ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand,
-        MachineObservation, MachineState, OperationId, Qualification, VmEngine, bytes_digest,
-        digest,
+        Capability, Counter, Digest, Domain, LifecycleCommand, MachineObservation, MachineState,
+        OperationId, Qualification, VmEngine, bytes_digest, digest,
     };
     use std::fs::File;
     use std::path::{Path, PathBuf};
@@ -190,18 +189,6 @@ mod native {
         }
         pub fn network(&self) -> Option<Arc<sandsurf_network::NativeNetworkGateway>> {
             self.owner.as_ref().map(QemuOwner::network)
-        }
-        pub fn install_network_configuration(
-            &self,
-            command: &ConfigurationCommand,
-        ) -> io::Result<()> {
-            self.owner
-                .as_ref()
-                .ok_or_else(|| invalid("native network owner is absent"))?
-                .configure_network(
-                    &command.configuration.network,
-                    &command.configuration.exposures,
-                )
         }
         pub fn management_channel(&self) -> Option<SerialChannel> {
             self.owner.as_ref().map(QemuOwner::management_channel)
@@ -475,17 +462,19 @@ mod native {
             }
             Ok(Some(power))
         }
-        fn validate_configuration(
+        fn validate_attachment(
             &self,
-            command: &ConfigurationCommand,
+            machine_id: &sandsurf_protocol::MachineId,
+            revision: Counter,
+            resources: &Resources,
             current: &MachineObservation,
         ) -> Result<(), Digest> {
             let live = matches!(current.state, MachineState::Running | MachineState::Paused);
-            if command.machine_id != self.config.launch.machine_id
+            if *machine_id != self.config.launch.machine_id
                 || current.machine_id != self.config.launch.machine_id
-                || command.revision <= current.applied_revision
+                || revision <= current.applied_revision
                 || live != self.owner.is_some()
-                || (live && self.resources.as_ref() != Some(&command.configuration.resources))
+                || (live && self.resources.as_ref() != Some(resources))
                 || !matches!(
                     current.state,
                     MachineState::Stopped
@@ -502,6 +491,16 @@ mod native {
         }
         fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {
             self.boot(command, Counter::ONE)
+        }
+        fn install_network(
+            &mut self,
+            configuration: &sandsurf_protocol::RuntimeConfiguration,
+        ) -> Result<(), Digest> {
+            self.owner
+                .as_ref()
+                .ok_or_else(|| bytes_digest(b"qemu-network-owner-unavailable"))?
+                .configure_network(&configuration.network, &configuration.exposures)
+                .map_err(|_| bytes_digest(b"qemu-network-configuration-incomplete"))
         }
         fn start(
             &mut self,
@@ -522,18 +521,6 @@ mod native {
                 || self.resources.as_ref() != Some(&command.configuration.resources)
             {
                 return unavailable(b"qemu-live-resource-change-requires-reboot");
-            }
-            let Some(owner) = &self.owner else {
-                return unavailable(b"qemu-owner-unavailable");
-            };
-            if owner
-                .configure_network(
-                    &command.configuration.network,
-                    &command.configuration.exposures,
-                )
-                .is_err()
-            {
-                return MachineOutcome::Unknown;
             }
             match self.observe_power() {
                 Ok(Some(power)) if power.state == MachineState::Running => observed(
