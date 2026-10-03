@@ -37,10 +37,8 @@ export function parseOperationRecord(raw: unknown, expectedId: string, expectedM
       }
       case "image-release": observation = { kind, imageDigest: digest(text(value.imageDigest)), cleanupPending: operationBoolean(value.cleanupPending) }; break;
       case "secret-delivery": {
-        const disclosure = value.disclosure;
-        if (!record(value.delivery) || !record(value.delivery.secret) || (disclosure !== "not-sent" && disclosure !== "possible" && disclosure !== "guest-reported-received")) throw protocol("secret delivery observation");
-        observation = { kind, secret: parseSecret(value.delivery.secret), disclosure, revoked: operationBoolean(value.revoked),
-          revocationOperation: value.revocationOperation === null ? null : validateIdentity(text(value.revocationOperation)) }; break;
+        const { secret, disclosure, revoked, revocationOperation } = parseSecretDelivery(value);
+        observation = { kind, secret, disclosure, revoked, revocationOperation }; break;
       }
       case "secret-put":
         if (!record(value.secret)) throw protocol("secret put observation");
@@ -490,9 +488,20 @@ export function parseExposure(value: unknown): Exposure { if (!record(value) || 
 
 export function parseSecret(value: Record<string, unknown>): SecretVersion { return { id: validateIdentity(text(value.id)), version: validateIdentity(text(value.version)), bytes: integer(value.bytes) }; }
 
+export function parseSecretDelivery(value: Record<string, unknown>): import("./contracts.js").SecretDeliveryResult {
+  if (!record(value.delivery) || !record(value.delivery.secret)) throw protocol("secret delivery observation");
+  const disclosure = value.disclosure;
+  if (disclosure !== "not-sent" && disclosure !== "possible" && disclosure !== "guest-reported-received") throw protocol("secret disclosure state");
+  const revoked = operationBoolean(value.revoked);
+  const revocationOperation = value.revocationOperation === null ? null : validateIdentity(text(value.revocationOperation));
+  if (revoked !== (revocationOperation !== null)) throw protocol("secret revocation state");
+  return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.delivery.secret), disclosure, revoked, revocationOperation };
+}
+
 export function parseSecretRevocation(value: Record<string, unknown>): SecretRevocation {
   const evidence = value.guestCleanupReport;
-  if (!record(value.secret) || (evidence !== null && !record(evidence))) throw protocol("secret revocation evidence");
+  if (!record(value.secret) || !Array.isArray(value.deliveries) || value.deliveries.length > 1024 || (evidence !== null && !record(evidence))) throw protocol("secret revocation evidence");
+  const guestCleanupScope = { selectedDeliveries: value.deliveries.length, allKnownDisclosuresSelected: operationBoolean(value.cleanupSelectionComplete) };
   const parsedEvidence = evidence === null ? null : {
     filesRemoved: integer(evidence.filesRemoved),
     environmentBindingsRemoved: integer(evidence.environmentBindingsRemoved),
@@ -501,7 +510,7 @@ export function parseSecretRevocation(value: Record<string, unknown>): SecretRev
     residualCopiesPossible: operationBoolean(evidence.residualCopiesPossible),
     actionsReportedComplete: operationBoolean(evidence.actionsReportedComplete),
   };
-  return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.secret), terminateRecipients: operationBoolean(value.terminateRecipients), futureDeliveryRevoked: true, guestCleanupReport: parsedEvidence };
+  return { operationId: validateIdentity(text(value.operationId)), machineId: validateIdentity(text(value.machineId)), secret: parseSecret(value.secret), terminateRecipients: operationBoolean(value.terminateRecipients), futureDeliveryRevoked: true, guestCleanupScope, guestCleanupReport: parsedEvidence };
 }
 
 function identityList(value: unknown): readonly string[] { if (!Array.isArray(value) || value.length > 1024) throw protocol("identity list"); return value.map((item) => validateIdentity(text(item))); }

@@ -123,7 +123,7 @@ export interface ResourceUsage { readonly provenance: ResourceProvenance; readon
 
 export interface SecretVersion { readonly id: string; readonly version: string; readonly bytes: number; }
 
-export interface SecretDeliveryResult { readonly operationId: string; readonly machineId: string; readonly secret: SecretVersion; readonly disclosure: "not-sent" | "possible" | "guest-reported-received"; readonly revoked: boolean; }
+export interface SecretDeliveryResult { readonly operationId: string; readonly machineId: string; readonly secret: SecretVersion; readonly disclosure: "not-sent" | "possible" | "guest-reported-received"; readonly revoked: boolean; readonly revocationOperation: string | null; }
 
 export interface SecretRevocation {
   readonly operationId: string;
@@ -131,6 +131,11 @@ export interface SecretRevocation {
   readonly secret: SecretVersion;
   readonly terminateRecipients: boolean;
   readonly futureDeliveryRevoked: true;
+  /** Cooperative cleanup covers this bounded selection, not all root-controlled copies. */
+  readonly guestCleanupScope: {
+    readonly selectedDeliveries: number;
+    readonly allKnownDisclosuresSelected: boolean;
+  };
   readonly guestCleanupReport: null | {
     readonly filesRemoved: number;
     readonly environmentBindingsRemoved: number;

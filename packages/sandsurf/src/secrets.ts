@@ -1,7 +1,7 @@
 import type { MachineRevisionPrecondition, SecretDeliveryResult, SecretRevocation, SecretVersion } from "./contracts.js";
 import type { Machine } from "./machines.js";
-import { record, text } from "./native-host.js";
-import { parseSecret, parseSecretRevocation, resolveRevisionPrecondition } from "./observations.js";
+import { record } from "./native-host.js";
+import { parseSecret, parseSecretDelivery, parseSecretRevocation, resolveRevisionPrecondition } from "./observations.js";
 import { createSandsurfGuestPath, sandsurfDigest } from "./sandsurf-protocol.js";
 import type { Sandsurf } from "./sandsurf.js";
 import { authorize, identity, protocol, transport, validateIdentity } from "./sdk-internal.js";
@@ -30,10 +30,8 @@ export class MachineSecrets {
     const lifetime = options.lifetime ?? (options.executionId === undefined ? "machine" : "process"); const executionId = options.executionId === undefined ? null : validateIdentity(options.executionId); const delivery = { secret: parsed, destination, lifetime, executionId };
     const approvalId = await this.#machine[authorize]({ kind: "secret-delivery", machineId: this.#machine.id, operationId, request: { expectedRevision, delivery } });
     const response = await this.#machine[transport]({ kind: "deliver-secret", machineId: this.#machine.id, operationId, expectedRevision, delivery, approvalId });
-    if (response.kind !== "secret-delivery" || !record(response.delivery) || !record(response.delivery.delivery) || !record(response.delivery.delivery.secret)) throw protocol("secret delivery response");
-    const disclosure = response.delivery.disclosure;
-    if (disclosure !== "not-sent" && disclosure !== "possible" && disclosure !== "guest-reported-received") throw protocol("secret disclosure state");
-    return { operationId: validateIdentity(text(response.delivery.operationId)), machineId: validateIdentity(text(response.delivery.machineId)), secret: parseSecret(response.delivery.delivery.secret), disclosure, revoked: response.delivery.revoked === true };
+    if (response.kind !== "secret-delivery" || !record(response.delivery)) throw protocol("secret delivery response");
+    return parseSecretDelivery(response.delivery);
   }
   async revoke(secret: SecretVersion, options: MachineRevisionPrecondition & { readonly terminateRecipients?: boolean; readonly operationId?: string } = {}): Promise<SecretRevocation> {
     const parsed = parseSecret(secret as unknown as Record<string, unknown>); const operationId = validateIdentity(options.operationId ?? identity("revoke-secret")); const expectedRevision = await resolveRevisionPrecondition(this.#machine, options.expectedRevision); const terminateRecipients = options.terminateRecipients ?? true;

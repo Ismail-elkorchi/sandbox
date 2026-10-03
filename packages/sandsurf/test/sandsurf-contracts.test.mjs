@@ -8,6 +8,20 @@ import { Artifact, Machine, Execution, ExecutionInterruptedError, Operation, San
 import { createSandsurfGuestPath, createSandsurfGuestCommand, encodeSandsurfFrame, SandsurfFrameDecoder, sandsurfDigest, sandsurfGuestRequestMetadata, sandsurfGuestPathUtf8, validateSandsurfGuestPath, validateSandsurfGuestCommand, validateSandsurfRelease } from "../dist/sandsurf-protocol.js";
 import { parseExecutionInspection, parseExecutionOutcome, parseExecutionReceipt } from "../dist/execution.js";
 import { validateProtocol } from "../dist/protocol-validation.js";
+import { parseSecretDelivery, parseSecretRevocation } from "../dist/observations.js";
+
+test("secret observations derive one revocation reference and expose bounded cleanup scope", () => {
+  const secret = { id: "credential", version: "opaque", bytes: 6 };
+  const delivery = { operationId: "deliver", machineId: "box", delivery: { secret }, disclosure: "possible", revoked: true, revocationOperation: "revoke" };
+  assert.equal(parseSecretDelivery(delivery).revocationOperation,"revoke");
+  for (const invalid of [{ ...delivery, revoked: false },{ ...delivery, revocationOperation: null },{ ...delivery, revoked: "true" },{ ...delivery, disclosure: "erased" }]) assert.throws(() => parseSecretDelivery(invalid),SandsurfHostError);
+  const revocation = { operationId: "revoke", machineId: "box", secret, deliveries: [{ secret }], cleanupSelectionComplete: false, terminateRecipients: true, guestCleanupReport: null };
+  const parsed = parseSecretRevocation(revocation);
+  assert.equal(parsed.futureDeliveryRevoked,true);
+  assert.deepEqual(parsed.guestCleanupScope,{ selectedDeliveries: 1, allKnownDisclosuresSelected: false });
+  assert.equal(parsed.guestCleanupReport,null);
+  for (const invalid of [{ ...revocation, deliveries: Array(1025).fill({ secret }) },{ ...revocation, cleanupSelectionComplete: undefined },{ ...revocation, cleanupSelectionComplete: "true" }]) assert.throws(() => parseSecretRevocation(invalid),SandsurfHostError);
+});
 
 function executionRequest(id = "command", stdio = "pipes") {
   return { machineId: "box", generation: 1, executionId: id, operationId: "spawn-command", argv: ["/bin/sh"], cwd: "/workspace",
@@ -157,7 +171,7 @@ test("typed operation observations cover each host record without inventing effe
     ["image-release", { operationId: "op", requestDigest: common.requestDigest, imageDigest: "b".repeat(64), cleanupPending: true }],
     ["secret-delivery", { ...common, delivery: { secret }, disclosure: "possible", revocationOperation: null, revoked: false }],
     ["secret-put", { operationId: "op", requestDigest: common.requestDigest, secret, applied: false }],
-    ["secret-revocation", { ...common, secret, deliveries: [], terminateRecipients: false, guestCleanupReport: null }],
+    ["secret-revocation", { ...common, secret, deliveries: [], cleanupSelectionComplete: true, terminateRecipients: false, guestCleanupReport: null }],
     ["snapshot", snapshot],
     ["rollback", { ...common, snapshotId: "snapshot", expectedRevision: 1, phase: "admitted", evidenceDigest: null }],
   ];

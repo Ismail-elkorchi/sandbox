@@ -1141,6 +1141,222 @@ fn machine_execution_defaults_is_host_owned_and_durable() {
 }
 
 #[test]
+fn secret_revocation_bounds_cleanup_without_limiting_authority_or_rewriting_delivery_facts() {
+    let mut limits = catalog_limits();
+    limits.operations = n(3000);
+    let mut f = Fixture::with_limits(limits);
+    let secret = SecretVersion {
+        id: "credential".try_into().unwrap(),
+        version: "opaque".try_into().unwrap(),
+        bytes: n(6),
+    };
+    let db = rusqlite::Connection::open_with_flags(
+        f.root.0.join("host/authority.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut last = None;
+    for index in 0..1026 {
+        let operation: OperationId = format!("deliver-{index:04}").try_into().unwrap();
+        let request = hash(operation.as_str());
+        f.host
+            .admit_secret_delivery(
+                SecretDeliveryAdmission {
+                    operation_id: operation.clone(),
+                    machine_id: f.machine.clone(),
+                    request_digest: request.clone(),
+                    delivery: SecretDelivery {
+                        secret: secret.clone(),
+                        destination: SecretDestination::File {
+                            path: format!("/run/credential-{index}")
+                                .as_str()
+                                .try_into()
+                                .unwrap(),
+                            mode: 0o600,
+                        },
+                        lifetime: SecretLifetime::UntilRevoked,
+                        execution_id: None,
+                    },
+                },
+                n(2),
+                Approval {
+                    id: format!("approve-{index}").try_into().unwrap(),
+                    request_digest: request.clone(),
+                },
+            )
+            .unwrap();
+        if index < 1025 {
+            f.host
+                .begin_secret_disclosure(&operation, &request)
+                .unwrap();
+        }
+        last = Some((operation, request));
+    }
+    let before: Vec<(String, String)> = db
+        .prepare("SELECT operation,value FROM secret_deliveries ORDER BY operation")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let revoke: OperationId = "revoke-oversized".try_into().unwrap();
+    let request = hash("revoke-oversized");
+    let record = f
+        .host
+        .admit_secret_revocation(
+            SecretRevocationAdmission {
+                machine_id: f.machine.clone(),
+                operation_id: revoke.clone(),
+                expected_revision: n(2),
+                secret: secret.clone(),
+                terminate_recipients: true,
+                request_digest: request.clone(),
+            },
+            Approval {
+                id: "approve-revoke".try_into().unwrap(),
+                request_digest: request,
+            },
+        )
+        .unwrap();
+    assert!(!record.deliveries.is_empty());
+    assert!(record.deliveries.len() <= 1024);
+    assert!(!record.cleanup_selection_complete);
+    assert!(record.guest_cleanup_report.is_none());
+    assert!(f.host.secret_version_revoked(&f.machine, &secret).unwrap());
+    let after: Vec<(String, String)> = db
+        .prepare("SELECT operation,value FROM secret_deliveries ORDER BY operation")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "host revocation must not introduce a second delivery-owned authority"
+    );
+    for (_, raw) in &after {
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(value.get("revoked").is_none());
+        assert!(value.get("revocationOperation").is_none());
+    }
+    let (undisclosed, request) = last.unwrap();
+    assert!(
+        f.host
+            .begin_secret_disclosure(&undisclosed, &request)
+            .is_err()
+    );
+    assert!(
+        matches!(f.host.operation(&undisclosed).unwrap(),Some(HostOperationRecord::SecretDelivery(record)) if record.revoked && record.revocation_operation == Some(revoke.clone()) && record.disclosure == SecretDisclosure::NotSent)
+    );
+    let unselected: OperationId = "deliver-1024".try_into().unwrap();
+    let received = f
+        .host
+        .complete_secret_delivery(&unselected, &hash(unselected.as_str()))
+        .unwrap();
+    assert!(received.revoked);
+    assert_eq!(received.revocation_operation, Some(revoke.clone()));
+    assert_eq!(received.disclosure, SecretDisclosure::GuestReportedReceived);
+    let other_audience: MachineId = "different-machine".try_into().unwrap();
+    assert!(
+        !f.host
+            .secret_version_revoked(&other_audience, &secret)
+            .unwrap()
+    );
+    let other_version = SecretVersion {
+        version: "different-version".try_into().unwrap(),
+        ..secret.clone()
+    };
+    assert!(
+        !f.host
+            .secret_version_revoked(&f.machine, &other_version)
+            .unwrap()
+    );
+    drop(db);
+    drop(f.host);
+    let host = HostCatalog::open(&f.root.0.join("host")).unwrap();
+    assert_eq!(
+        host.operation(&revoke).unwrap(),
+        Some(HostOperationRecord::SecretRevocation(record))
+    );
+    assert!(
+        matches!(host.operation(&unselected).unwrap(),Some(HostOperationRecord::SecretDelivery(record)) if record.revoked && record.disclosure == SecretDisclosure::GuestReportedReceived)
+    );
+}
+
+#[test]
+fn secret_cleanup_is_byte_bounded_and_excludes_undisclosed_destinations() {
+    let mut f = Fixture::new();
+    let secret = SecretVersion {
+        id: "credential".try_into().unwrap(),
+        version: "opaque".try_into().unwrap(),
+        bytes: n(6),
+    };
+    for index in 0..48 {
+        let operation: OperationId = format!("deliver-{index:04}").try_into().unwrap();
+        let request = hash(operation.as_str());
+        f.host
+            .admit_secret_delivery(
+                SecretDeliveryAdmission {
+                    operation_id: operation.clone(),
+                    machine_id: f.machine.clone(),
+                    request_digest: request.clone(),
+                    delivery: SecretDelivery {
+                        secret: secret.clone(),
+                        destination: SecretDestination::File {
+                            path: format!("/{}-{index}", "z".repeat(4080))
+                                .as_str()
+                                .try_into()
+                                .unwrap(),
+                            mode: 0o600,
+                        },
+                        lifetime: SecretLifetime::UntilRevoked,
+                        execution_id: None,
+                    },
+                },
+                n(2),
+                Approval {
+                    id: format!("approve-{index}").try_into().unwrap(),
+                    request_digest: request.clone(),
+                },
+            )
+            .unwrap();
+        if index > 0 {
+            f.host
+                .begin_secret_disclosure(&operation, &request)
+                .unwrap();
+        }
+    }
+    let request = hash("revoke-long-paths");
+    let record = f
+        .host
+        .admit_secret_revocation(
+            SecretRevocationAdmission {
+                machine_id: f.machine.clone(),
+                operation_id: "revoke-long-paths".try_into().unwrap(),
+                expected_revision: n(2),
+                secret,
+                terminate_recipients: false,
+                request_digest: request.clone(),
+            },
+            Approval {
+                id: "approve-revoke".try_into().unwrap(),
+                request_digest: request,
+            },
+        )
+        .unwrap();
+    assert!(!record.cleanup_selection_complete);
+    assert!(record.deliveries.len() < 47);
+    assert!(!record.deliveries.is_empty());
+    let bytes: usize = record
+        .deliveries
+        .iter()
+        .map(|value| serde_json::to_string(value).unwrap().len() + 1)
+        .sum();
+    assert!(bytes <= MAX_CONTROL_BYTES - 16 * 1024);
+    assert!(record.deliveries.iter().all(|delivery| !matches!(&delivery.destination,SecretDestination::File { path, .. } if path.as_bytes().ends_with(b"-0"))));
+}
+
+#[test]
 fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() {
     let root = TempRoot::new();
     let path = root.0.join("host");
@@ -1196,14 +1412,11 @@ fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() 
     let delivery_digest = hash("delivery-request");
     let delivery_operation: OperationId = "deliver-credential".try_into().unwrap();
     host.admit_secret_delivery(
-        SecretDeliveryRecord {
+        SecretDeliveryAdmission {
             operation_id: delivery_operation.clone(),
             machine_id: machine.clone(),
             request_digest: delivery_digest.clone(),
             delivery: delivery.clone(),
-            disclosure: SecretDisclosure::NotSent,
-            revocation_operation: None,
-            revoked: false,
         },
         Counter::ONE,
         Approval {
@@ -1239,7 +1452,8 @@ fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() 
     assert_eq!(pending.deliveries, vec![delivery]);
     assert!(pending.guest_cleanup_report.is_none());
     assert!(host.secret_version_revoked(&machine, &secret).unwrap());
-    assert!(host.secret_deliveries(&machine).unwrap()[0].revoked);
+    assert!(matches!(host.operation(&delivery_operation).unwrap(),
+        Some(HostOperationRecord::SecretDelivery(record)) if record.revoked));
     assert!(host.machine(&machine).unwrap().unwrap().known_sensitive);
     let evidence = SecretCleanupReport {
         files_removed: Counter::ONE,
@@ -1257,7 +1471,10 @@ fn secret_revocation_is_host_owned_and_gates_redelivery_without_guest_cleanup() 
 
     let host = HostCatalog::open(&path).unwrap();
     assert!(host.secret_version_revoked(&machine, &secret).unwrap());
-    assert_eq!(host.secret_revocations(&machine).unwrap(), vec![completed]);
+    assert_eq!(
+        host.operation(&revoke_operation).unwrap(),
+        Some(HostOperationRecord::SecretRevocation(completed))
+    );
 }
 
 #[test]
@@ -1305,7 +1522,7 @@ fn possible_disclosure_is_sticky_across_fork_clean_rollback_and_host_restart() {
     let request = hash("ambiguous-secret-request");
     f.host
         .admit_secret_delivery(
-            SecretDeliveryRecord {
+            SecretDeliveryAdmission {
                 operation_id: operation.clone(),
                 machine_id: f.machine.clone(),
                 request_digest: request.clone(),
@@ -1322,9 +1539,6 @@ fn possible_disclosure_is_sticky_across_fork_clean_rollback_and_host_restart() {
                     lifetime: SecretLifetime::UntilRevoked,
                     execution_id: None,
                 },
-                disclosure: SecretDisclosure::NotSent,
-                revocation_operation: None,
-                revoked: false,
             },
             n(2),
             Approval {
@@ -1372,7 +1586,19 @@ fn possible_disclosure_is_sticky_across_fork_clean_rollback_and_host_restart() {
             },
         )
         .unwrap();
-    assert!(f.host.secret_deliveries(&fork).unwrap().is_empty());
+    let db = rusqlite::Connection::open_with_flags(
+        f.root.0.join("host/authority.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert!(
+        !db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM secret_deliveries WHERE machine=?1)",
+            [fork.as_str()],
+            |row| row.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
     assert!(capture(&mut f.host, &fork, Counter::ONE, "fork-capture").sensitive);
     let rollback: OperationId = "rollback-clean".try_into().unwrap();
     let rollback_digest = digest(
@@ -2285,13 +2511,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_limits(catalog_limits())
+    }
+
+    fn with_limits(limits: CatalogLimits) -> Self {
         let root = TempRoot::new();
-        let mut host = HostCatalog::create(
-            &root.0.join("host"),
-            "host".try_into().unwrap(),
-            catalog_limits(),
-        )
-        .unwrap();
+        let mut host =
+            HostCatalog::create(&root.0.join("host"), "host".try_into().unwrap(), limits).unwrap();
         let machine: MachineId = "box".try_into().unwrap();
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");

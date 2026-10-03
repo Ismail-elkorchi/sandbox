@@ -1785,14 +1785,11 @@ impl HostService {
             ),
         )?;
         let record = self.catalog.admit_secret_delivery(
-            sandsurf_state::SecretDeliveryRecord {
+            sandsurf_state::SecretDeliveryAdmission {
                 machine_id: machine_id.clone(),
                 operation_id: operation_id.clone(),
                 request_digest: request_digest.clone(),
                 delivery: delivery.clone(),
-                disclosure: SecretDisclosure::NotSent,
-                revoked: false,
-                revocation_operation: None,
             },
             expected_revision,
             Approval {
@@ -2446,11 +2443,15 @@ impl HostService {
                         .complete_secret_delivery(&record.operation_id, &record.request_digest)?
                 } else {
                     // A transport failure never proves non-disclosure or justifies replay.
-                    self.catalog
-                        .secret_deliveries(&record.machine_id)?
-                        .into_iter()
-                        .find(|delivery| delivery.operation_id == record.operation_id)
-                        .ok_or(HostError::Invalid("admitted secret delivery is missing"))?
+                    match self.catalog.operation(&record.operation_id)? {
+                        Some(sandsurf_state::HostOperationRecord::SecretDelivery(current))
+                            if current.machine_id == record.machine_id
+                                && current.request_digest == record.request_digest =>
+                        {
+                            current
+                        }
+                        _ => return Err(HostError::Invalid("admitted secret delivery is missing")),
+                    }
                 };
                 Ok(HostResponse::SecretDelivery { delivery })
             }
@@ -2461,12 +2462,19 @@ impl HostService {
                         &record.request_digest,
                         report,
                     )?,
-                    None => self
-                        .catalog
-                        .secret_revocations(&record.machine_id)?
-                        .into_iter()
-                        .find(|revocation| revocation.operation_id == record.operation_id)
-                        .ok_or(HostError::Invalid("admitted secret revocation is missing"))?,
+                    None => match self.catalog.operation(&record.operation_id)? {
+                        Some(sandsurf_state::HostOperationRecord::SecretRevocation(current))
+                            if current.machine_id == record.machine_id
+                                && current.request_digest == record.request_digest =>
+                        {
+                            current
+                        }
+                        _ => {
+                            return Err(HostError::Invalid(
+                                "admitted secret revocation is missing",
+                            ));
+                        }
+                    },
                 };
                 Ok(HostResponse::SecretRevocation { revocation })
             }
@@ -5287,7 +5295,7 @@ mod tests {
             version: "opaque-version".try_into().unwrap(),
             bytes: counter(6),
         };
-        let delivery = |id: &str| sandsurf_state::SecretDeliveryRecord {
+        let delivery = |id: &str| sandsurf_state::SecretDeliveryAdmission {
             operation_id: id.try_into().unwrap(),
             machine_id: machine.clone(),
             request_digest: bytes_digest(id.as_bytes()),
@@ -5300,13 +5308,8 @@ mod tests {
                 lifetime: SecretLifetime::UntilRevoked,
                 execution_id: None,
             },
-            disclosure: SecretDisclosure::NotSent,
-            revoked: false,
-            revocation_operation: None,
         };
-        let first = delivery("deliver");
-        let revoked = delivery("deliver-after-revocation");
-        for record in [&first, &revoked] {
+        let mut admit = |record: sandsurf_state::SecretDeliveryAdmission| {
             service
                 .catalog
                 .admit_secret_delivery(
@@ -5319,8 +5322,10 @@ mod tests {
                         request_digest: record.request_digest.clone(),
                     },
                 )
-                .unwrap();
-        }
+                .unwrap()
+        };
+        let first = admit(delivery("deliver"));
+        let revoked = admit(delivery("deliver-after-revocation"));
         let completion = |record, result: Result<()>| HostTaskCompletion::SecretPrepare {
             provision: GuardianProvision {
                 host_root: root.clone(),
@@ -5338,14 +5343,11 @@ mod tests {
                 ))
                 .is_err()
         );
-        assert!(
-            service
-                .catalog
-                .secret_deliveries(&machine)
-                .unwrap()
-                .iter()
-                .all(|record| record.disclosure == SecretDisclosure::NotSent)
-        );
+        for operation in [&first.operation_id, &revoked.operation_id] {
+            assert!(matches!(service.catalog.operation(operation).unwrap(),
+                Some(sandsurf_state::HostOperationRecord::SecretDelivery(record))
+                    if record.disclosure == SecretDisclosure::NotSent));
+        }
         assert!(
             !service
                 .catalog
@@ -5394,14 +5396,9 @@ mod tests {
                 .is_err()
         );
         assert!(
-            service
-                .catalog
-                .secret_deliveries(&machine)
-                .unwrap()
-                .iter()
-                .any(|record| record.operation_id == revoked.operation_id
-                    && record.revoked
-                    && record.disclosure == SecretDisclosure::NotSent)
+            matches!(service.catalog.operation(&revoked.operation_id).unwrap(),
+            Some(sandsurf_state::HostOperationRecord::SecretDelivery(record))
+                if record.revoked && record.disclosure == SecretDisclosure::NotSent)
         );
         drop(service);
         fs::remove_dir_all(root).unwrap();

@@ -29,7 +29,9 @@ CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFE
 CREATE INDEX pending_image_releases ON image_releases(operation) WHERE cleanup_pending=1;
 CREATE UNIQUE INDEX pending_image_cleanup ON image_releases(image) WHERE cleanup_pending=1;
 CREATE TABLE secret_deliveries(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
+CREATE INDEX secret_delivery_version ON secret_deliveries(machine,json_extract(value,'$.delivery.secret.id'),json_extract(value,'$.delivery.secret.version'),operation) WHERE json_extract(value,'$.disclosure')<>'not-sent';
 CREATE TABLE secret_revocations(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
+CREATE INDEX secret_revocation_version ON secret_revocations(machine,json_extract(value,'$.secret.id'),json_extract(value,'$.secret.version'));
 CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE INDEX capturing_disk_snapshots ON snapshots(id) WHERE json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk';
@@ -50,6 +52,9 @@ CREATE INDEX pending_fork_snapshot ON forks(snapshot,machine) WHERE json_extract
 // completion. There is no separately installed/cleared suspension authority
 // and no crash window after committing the native lifecycle reference.
 const SUSPENSION_INPUTS: &str = "SELECT c.snapshot,i.id AS lifecycle,i.machine,json_extract(i.value,'$.completion') AS completed FROM suspension_captures c JOIN intents i ON c.lifecycle=i.id WHERE NOT EXISTS(SELECT 1 FROM intents newer WHERE newer.machine=i.machine AND newer.rowid>i.rowid AND json_extract(newer.value,'$.completion') IS NOT NULL)";
+
+const SECRET_CLEANUP_SELECTION: &str = "SELECT value FROM secret_deliveries WHERE machine=?1 AND json_extract(value,'$.delivery.secret.id')=?2 AND json_extract(value,'$.delivery.secret.version')=?3 AND json_extract(value,'$.disclosure')<>'not-sent' ORDER BY operation LIMIT 1025";
+const SECRET_REVOCATION_OBSERVATION: &str = "SELECT operation,value FROM secret_revocations WHERE machine=?1 AND json_extract(value,'$.secret.id')=?2 AND json_extract(value,'$.secret.version')=?3 ORDER BY rowid LIMIT 1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -172,6 +177,28 @@ pub struct SecretDeliveryRecord {
     pub revoked: bool,
 }
 
+/// Approval input, not an application-supplied disclosure/revocation state.
+#[derive(Debug, Clone)]
+pub struct SecretDeliveryAdmission {
+    pub operation_id: OperationId,
+    pub machine_id: MachineId,
+    pub request_digest: Digest,
+    pub delivery: SecretDelivery,
+}
+
+/// Only delivery facts are persisted here. Revocation has exactly one owner:
+/// the version/audience decision in secret_revocations. Public delivery views
+/// derive their current revocation reference from that decision.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredSecretDelivery {
+    operation_id: OperationId,
+    machine_id: MachineId,
+    request_digest: Digest,
+    delivery: SecretDelivery,
+    disclosure: SecretDisclosure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretPutRecord {
@@ -189,6 +216,9 @@ pub struct SecretRevocationRecord {
     pub request_digest: Digest,
     pub secret: SecretVersion,
     pub deliveries: Vec<SecretDelivery>,
+    /// Bounded cooperative cleanup targets, not the scope of host revocation.
+    /// False means more known disclosures exist than this selection covers.
+    pub cleanup_selection_complete: bool,
     pub terminate_recipients: bool,
     pub guest_cleanup_report: Option<SecretCleanupReport>,
 }
@@ -399,7 +429,9 @@ impl HostCatalog {
             )
             .optional()?
         {
-            result.push(HostOperationRecord::SecretDelivery(decode(&value)?));
+            result.push(HostOperationRecord::SecretDelivery(
+                observe_secret_delivery(db, decode(&value)?)?,
+            ));
         }
         if let Some(value) = db
             .query_row(
@@ -612,10 +644,17 @@ impl HostCatalog {
 
     pub fn admit_secret_delivery(
         &mut self,
-        record: SecretDeliveryRecord,
+        admission: SecretDeliveryAdmission,
         expected_revision: Counter,
         approval: Approval,
     ) -> Result<SecretDeliveryRecord> {
+        let record = StoredSecretDelivery {
+            operation_id: admission.operation_id,
+            machine_id: admission.machine_id,
+            request_digest: admission.request_digest,
+            delivery: admission.delivery,
+            disclosure: SecretDisclosure::NotSent,
+        };
         record.delivery.validate()?;
         if approval.request_digest != record.request_digest {
             return Err(Error::Conflict("secret delivery approval mismatch"));
@@ -629,9 +668,9 @@ impl HostCatalog {
             )
             .optional()?
         {
-            let old: SecretDeliveryRecord = decode(&encoded)?;
+            let old: StoredSecretDelivery = decode(&encoded)?;
             if old.request_digest == record.request_digest {
-                return Ok(old);
+                return observe_secret_delivery(&tx, old);
             }
             return Err(Error::Conflict(
                 "secret delivery operation identity conflict",
@@ -639,11 +678,7 @@ impl HostCatalog {
         }
         host_operation_identity_available(&tx, &record.operation_id)?;
         require_revision(&tx, &record.machine_id, expected_revision)?;
-        if record.revoked
-            || record.revocation_operation.is_some()
-            || record.disclosure != SecretDisclosure::NotSent
-            || secret_version_revoked(&tx, &record.machine_id, &record.delivery.secret)?
-        {
+        if secret_version_revoked(&tx, &record.machine_id, &record.delivery.secret)? {
             return Err(Error::Conflict(
                 "secret delivery starts undisclosed and requires unrevoked host authority",
             ));
@@ -659,7 +694,7 @@ impl HostCatalog {
             ],
         )?;
         tx.commit()?;
-        Ok(record)
+        observe_secret_delivery(&self.db.connection, record)
     }
 
     pub fn begin_secret_disclosure(
@@ -673,9 +708,8 @@ impl HostCatalog {
             params![operation.as_str(), request.as_str()],
             |row| row.get(0),
         )?;
-        let mut record: SecretDeliveryRecord = decode(&raw)?;
+        let mut record: StoredSecretDelivery = decode(&raw)?;
         if record.disclosure != SecretDisclosure::NotSent
-            || record.revoked
             || secret_version_revoked(&tx, &record.machine_id, &record.delivery.secret)?
         {
             return Err(Error::Conflict(
@@ -692,7 +726,7 @@ impl HostCatalog {
             params![operation.as_str(), encode(&record)?],
         )?;
         tx.commit()?;
-        Ok(record)
+        observe_secret_delivery(&self.db.connection, record)
     }
 
     pub fn complete_secret_delivery(
@@ -706,7 +740,7 @@ impl HostCatalog {
             params![operation.as_str(), request.as_str()],
             |row| row.get(0),
         )?;
-        let mut record: SecretDeliveryRecord = decode(&raw)?;
+        let mut record: StoredSecretDelivery = decode(&raw)?;
         if record.disclosure == SecretDisclosure::NotSent {
             return Err(Error::Conflict(
                 "guest receipt cannot precede the durable disclosure boundary",
@@ -718,7 +752,7 @@ impl HostCatalog {
             params![operation.as_str(), encode(&record)?],
         )?;
         tx.commit()?;
-        Ok(record)
+        observe_secret_delivery(&self.db.connection, record)
     }
 
     pub fn secret_version_revoked(
@@ -727,17 +761,6 @@ impl HostCatalog {
         secret: &SecretVersion,
     ) -> Result<bool> {
         secret_version_revoked(&self.db.connection, machine, secret)
-    }
-
-    pub fn secret_deliveries(&self, machine: &MachineId) -> Result<Vec<SecretDeliveryRecord>> {
-        let mut statement = self
-            .db
-            .connection
-            .prepare("SELECT value FROM secret_deliveries WHERE machine=?1 ORDER BY rowid ASC")?;
-        statement
-            .query_map([machine.as_str()], |row| row.get::<_, String>(0))?
-            .map(|value| decode(&value?))
-            .collect()
     }
 
     pub fn admit_secret_revocation(
@@ -768,37 +791,34 @@ impl HostCatalog {
         }
         host_operation_identity_available(&tx, &request.operation_id)?;
         require_revision(&tx, &request.machine_id, request.expected_revision)?;
-        let mut statement = tx.prepare(
-            "SELECT operation,value FROM secret_deliveries WHERE machine=?1 ORDER BY rowid ASC",
-        )?;
-        let encoded = statement
-            .query_map([request.machine_id.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
+        let mut statement = tx.prepare(SECRET_CLEANUP_SELECTION)?;
+        let mut rows = statement.query(params![
+            request.machine_id.as_str(),
+            request.secret.id.as_str(),
+            request.secret.version.as_str()
+        ])?;
         let mut deliveries = Vec::new();
-        let mut updates = Vec::new();
-        for (delivery_operation, value) in encoded {
-            let mut record: SecretDeliveryRecord = decode(&value)?;
-            if !record.revoked
-                && record.delivery.secret == request.secret
-                && record
-                    .revocation_operation
-                    .as_ref()
-                    .is_none_or(|value| value == &request.operation_id)
-            {
-                record.revocation_operation = Some(request.operation_id.clone());
-                record.revoked = true;
-                deliveries.push(record.delivery.clone());
-                updates.push((delivery_operation, encode(&record)?));
+        let mut selection_bytes = 0_usize;
+        let mut cleanup_selection_complete = true;
+        while let Some(row) = rows.next()? {
+            let record: StoredSecretDelivery = decode(&row.get::<_, String>(0)?)?;
+            if record.delivery.secret != request.secret || record.machine_id != request.machine_id {
+                return Err(Error::Corrupt("secret cleanup selection binding changed"));
             }
+            let bytes = encode(&record.delivery)?.len() + 1;
+            // Leave bounded room for host/wire envelopes and cleanup evidence.
+            // Authority must commit even when cooperative targets do not fit.
+            if deliveries.len() == 1024
+                || bytes > sandsurf_protocol::MAX_CONTROL_BYTES - 16 * 1024 - selection_bytes
+            {
+                cleanup_selection_complete = false;
+                break;
+            }
+            selection_bytes += bytes;
+            deliveries.push(record.delivery);
         }
-        if deliveries.len() > 1024 {
-            return Err(Error::Capacity(
-                "secret revocation delivery set is oversized",
-            ));
-        }
+        drop(rows);
+        drop(statement);
         capacity(&tx, "secret_revocations", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let record = SecretRevocationRecord {
@@ -807,15 +827,10 @@ impl HostCatalog {
             request_digest: request.request_digest,
             secret: request.secret,
             deliveries,
+            cleanup_selection_complete,
             terminate_recipients: request.terminate_recipients,
             guest_cleanup_report: None,
         };
-        for (delivery_operation, value) in updates {
-            tx.execute(
-                "UPDATE secret_deliveries SET value=?2 WHERE operation=?1",
-                params![delivery_operation, value],
-            )?;
-        }
         tx.execute(
             "INSERT INTO secret_revocations(operation,machine,request_digest,value) VALUES (?1,?2,?3,?4)",
             params![
@@ -859,17 +874,6 @@ impl HostCatalog {
         )?;
         tx.commit()?;
         Ok(record)
-    }
-
-    pub fn secret_revocations(&self, machine: &MachineId) -> Result<Vec<SecretRevocationRecord>> {
-        let mut statement = self
-            .db
-            .connection
-            .prepare("SELECT value FROM secret_revocations WHERE machine=?1 ORDER BY rowid ASC")?;
-        statement
-            .query_map([machine.as_str()], |row| row.get::<_, String>(0))?
-            .map(|value| decode(&value?))
-            .collect()
     }
 
     /// Admit an image command before any source is read or builder is run.
@@ -990,20 +994,8 @@ impl HostCatalog {
                 ));
             }
         }
-        let mut reserved = reserved_images(&tx)?;
-        if let Some(previous) = reserved.insert(image.digest.as_str().to_owned(), image.clone())
-            && previous != image
-        {
-            return Err(Error::Conflict("image candidate metadata changed"));
-        }
-        let identities: u64 = tx.query_row(
-            "SELECT count(*) FROM (SELECT digest FROM images UNION SELECT json_extract(candidate,'$.digest') FROM image_imports WHERE json_extract(phase,'$')='prepared' UNION SELECT ?1)",
-            [image.digest.as_str()],
-            |row| row.get(0),
-        )?;
-        if identities > self.limits.identities.get()
-            || sum_image_storage(reserved.values())? > self.limits.image_bytes.get()
-        {
+        let (identities, bytes) = image_reservations(&tx, &image)?;
+        if identities > self.limits.identities.get() || bytes > self.limits.image_bytes.get() {
             return Err(Error::Capacity("image candidate reservation exhausted"));
         }
         tx.execute(
@@ -3141,8 +3133,56 @@ fn secret_version_revoked(
     machine: &MachineId,
     secret: &SecretVersion,
 ) -> Result<bool> {
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM secret_revocations WHERE machine=?1 AND json_extract(value,'$.secret.id')=?2 AND json_extract(value,'$.secret.version')=?3)",
-        params![machine.as_str(), secret.id.as_str(), secret.version.as_str()], |row| row.get(0))?)
+    Ok(secret_revocation_operation(db, machine, secret)?.is_some())
+}
+
+fn secret_revocation_operation(
+    db: &rusqlite::Connection,
+    machine: &MachineId,
+    secret: &SecretVersion,
+) -> Result<Option<OperationId>> {
+    let row: Option<(String, String)> = db
+        .query_row(
+            SECRET_REVOCATION_OBSERVATION,
+            params![
+                machine.as_str(),
+                secret.id.as_str(),
+                secret.version.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(operation, value)| {
+        let record: SecretRevocationRecord = decode(&value)?;
+        if record.operation_id.as_str() != operation
+            || record.machine_id != *machine
+            || record.secret.id != secret.id
+            || record.secret.version != secret.version
+        {
+            return Err(Error::Corrupt(
+                "secret revocation authority binding changed",
+            ));
+        }
+        Ok(record.operation_id)
+    })
+    .transpose()
+}
+
+fn observe_secret_delivery(
+    db: &rusqlite::Connection,
+    record: StoredSecretDelivery,
+) -> Result<SecretDeliveryRecord> {
+    let revocation_operation =
+        secret_revocation_operation(db, &record.machine_id, &record.delivery.secret)?;
+    Ok(SecretDeliveryRecord {
+        operation_id: record.operation_id,
+        machine_id: record.machine_id,
+        request_digest: record.request_digest,
+        delivery: record.delivery,
+        disclosure: record.disclosure,
+        revoked: revocation_operation.is_some(),
+        revocation_operation,
+    })
 }
 
 fn initial_runtime_configuration(resources: &Resources) -> Result<RuntimeConfiguration> {
@@ -3263,44 +3303,57 @@ fn image_state(
     .transpose()
 }
 
-fn reserved_images(
-    db: &rusqlite::Connection,
-) -> Result<std::collections::BTreeMap<String, ImageRecord>> {
-    // Retirement gates new attachments immediately, but its storage remains
-    // reserved until exact artifact cleanup is durably complete.
-    let mut statement =
-        db.prepare("SELECT value FROM images WHERE retired=0 OR EXISTS(SELECT 1 FROM image_releases r WHERE r.image=images.digest AND r.cleanup_pending=1)")?;
-    let values = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut images = std::collections::BTreeMap::new();
-    for value in values {
-        let image: ImageRecord = decode(&value)?;
-        images.insert(image.digest.as_str().to_owned(), image);
-    }
-    let mut statement =
-        db.prepare("SELECT candidate FROM image_imports WHERE json_extract(phase,'$')='prepared'")?;
-    for value in statement.query_map([], |row| row.get::<_, String>(0))? {
-        let image: ImageRecord = decode(&value?)?;
-        if let Some(previous) = images.insert(image.digest.as_str().to_owned(), image.clone())
-            && previous != image
-        {
-            return Err(Error::Corrupt(
-                "image reservations disagree about immutable metadata",
-            ));
-        }
-    }
-    Ok(images)
-}
+const IMAGE_RESERVATION_IDENTITIES: &str = "SELECT (SELECT count(*) FROM images)+(SELECT count(*) FROM (SELECT json_extract(candidate,'$.digest') FROM image_imports i WHERE json_extract(phase,'$')='prepared' AND NOT EXISTS(SELECT 1 FROM images WHERE digest=json_extract(i.candidate,'$.digest')) GROUP BY json_extract(candidate,'$.digest')))+CASE WHEN EXISTS(SELECT 1 FROM images WHERE digest=?1) OR EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$')='prepared' AND json_extract(candidate,'$.digest')=?1) THEN 0 ELSE 1 END";
+const IMAGE_RESERVATION_STORAGE: &str = "SELECT value FROM images WHERE retired=0 OR EXISTS(SELECT 1 FROM image_releases r WHERE r.image=images.digest AND r.cleanup_pending=1) UNION ALL SELECT candidate FROM image_imports i WHERE json_extract(phase,'$')='prepared' AND NOT EXISTS(SELECT 1 FROM images WHERE digest=json_extract(i.candidate,'$.digest') AND (retired=0 OR EXISTS(SELECT 1 FROM image_releases r WHERE r.image=images.digest AND r.cleanup_pending=1))) GROUP BY json_extract(candidate,'$.digest')";
 
-fn sum_image_storage<'a>(images: impl IntoIterator<Item = &'a ImageRecord>) -> Result<u64> {
+/// Derive admission from canonical rows without materializing the entire
+/// image catalog in the API owner's bounded heap. The expression index groups
+/// candidates by immutable identity; an already retained image is charged once.
+fn image_reservations(db: &rusqlite::Connection, incoming: &ImageRecord) -> Result<(u64, u64)> {
+    let previous: Option<String> = db.query_row(
+        "SELECT candidate FROM image_imports WHERE json_extract(phase,'$')='prepared' AND json_extract(candidate,'$.digest')=?1 LIMIT 1",
+        [incoming.digest.as_str()], |row| row.get(0),
+    ).optional()?;
+    if previous
+        .map(|value| decode::<ImageRecord>(&value))
+        .transpose()?
+        .as_ref()
+        .is_some_and(|previous| previous != incoming)
+    {
+        return Err(Error::Conflict("image candidate metadata changed"));
+    }
+    let identities: u64 = db.query_row(
+        IMAGE_RESERVATION_IDENTITIES,
+        [incoming.digest.as_str()],
+        |row| row.get(0),
+    )?;
+    // Retirement gates attachments immediately, but its bytes stay reserved
+    // until exact artifact cleanup completes. Prepared candidates against that
+    // same identity cannot be admitted until cleanup completes either.
+    let mut statement = db.prepare(IMAGE_RESERVATION_STORAGE)?;
+    let mut rows = statement.query([])?;
     let mut total = 0_u64;
-    for image in images {
+    let mut includes_incoming = false;
+    while let Some(row) = rows.next()? {
+        let image: ImageRecord = decode(&row.get::<_, String>(0)?)?;
+        if image.digest == incoming.digest {
+            if image != *incoming {
+                return Err(Error::Corrupt(
+                    "image reservations disagree about immutable metadata",
+                ));
+            }
+            includes_incoming = true;
+        }
         total = total
             .checked_add(image.storage_bytes.get())
             .ok_or(Error::Capacity("image storage reservation overflow"))?;
     }
-    Ok(total)
+    if !includes_incoming {
+        total = total
+            .checked_add(incoming.storage_bytes.get())
+            .ok_or(Error::Capacity("image storage reservation overflow"))?;
+    }
+    Ok((identities, total))
 }
 
 fn image_release(
@@ -3490,4 +3543,58 @@ fn record_approval(db: &rusqlite::Connection, approval: &Approval, limit: Counte
         params![approval.id.as_str(), approval.request_digest.as_str()],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_query_tests {
+    use super::*;
+
+    #[test]
+    fn actual_admission_queries_stream_indexed_identities_without_temporary_catalogs() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        for query in [IMAGE_RESERVATION_IDENTITIES, IMAGE_RESERVATION_STORAGE] {
+            let mut statement = db.prepare(&format!("EXPLAIN QUERY PLAN {query}")).unwrap();
+            let parameters = vec!["a".repeat(64); statement.parameter_count()];
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(parameters.iter()))
+                .unwrap();
+            let mut indexed = false;
+            while let Some(row) = rows.next().unwrap() {
+                let detail: String = row.get(3).unwrap();
+                assert!(!detail.contains("USE TEMP B-TREE"), "{detail}");
+                indexed |= detail.contains("prepared_image_target");
+            }
+            assert!(
+                indexed,
+                "prepared identity accounting lost its expression index"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_decisions_and_bounded_cleanup_use_their_exact_version_indexes() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        for (query, index) in [
+            (SECRET_CLEANUP_SELECTION, "secret_delivery_version"),
+            (SECRET_REVOCATION_OBSERVATION, "secret_revocation_version"),
+        ] {
+            let mut statement = db.prepare(&format!("EXPLAIN QUERY PLAN {query}")).unwrap();
+            let mut rows = statement
+                .query(["machine", "credential", "opaque-version"])
+                .unwrap();
+            let mut indexed = false;
+            while let Some(row) = rows.next().unwrap() {
+                let detail: String = row.get(3).unwrap();
+                assert!(!detail.contains("USE TEMP B-TREE"), "{detail}");
+                assert!(!detail.starts_with("SCAN secret_"), "{detail}");
+                indexed |= detail.contains(index);
+            }
+            assert!(
+                indexed,
+                "secret admission lost its indexed audience/version boundary"
+            );
+        }
+    }
 }
