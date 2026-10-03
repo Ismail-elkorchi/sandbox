@@ -1,9 +1,5 @@
 * text=auto eol=lf
 packages/sandsurf/images/development-*/source-materials/objects/* -text -diff
 *.ext4 binary
-*.vhdx binary
-packages/**/vmlinux-* binary
-packages/**/hyperv-vmlinuz-* binary
-packages/sandsurf/image-build-inputs/** binary
 packages/**/sandsurf-host-* binary
 packages/**/firecracker-* binary

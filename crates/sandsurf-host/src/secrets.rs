@@ -42,23 +42,42 @@ pub struct SecretAuthority {
 impl SecretAuthority {
     pub fn open(root: &Path) -> Result<Self, SecretError> {
         sandsurf_native::local::ensure_private_directory(root)?;
+        let root = sandsurf_native::local::canonical_private_directory(root)?;
+        // The API service and the independently supervised image pool both
+        // open this store. Initialization is one storage transaction, not a
+        // check-then-rename that can replace another owner's integrity key.
+        let _custody = sandsurf_native::storage::disk_lease(&root.join(".integrity-key.lock"))?;
         let key_path = root.join(".integrity-key");
+        let temporary = root.join(".integrity-key.pending");
         let key_missing = match fs::symlink_metadata(&key_path) {
             Ok(_) => false,
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(error) => return Err(error.into()),
         };
         if key_missing {
+            // Losing a published key is corruption, not an empty store. Never
+            // manufacture a new authority for already retained secret bytes.
+            for entry in fs::read_dir(&root)?.take(3) {
+                let name = entry?.file_name();
+                if name != ".integrity-key.lock" && name != ".integrity-key.pending" {
+                    return Err(SecretError::Invalid(
+                        "secret integrity key is missing from a populated store; store preserved",
+                    ));
+                }
+            }
+        }
+        reclaim_key_stage(&temporary, &root)?;
+        if key_missing {
             let mut key = Zeroizing::new([0u8; 32]);
             getrandom::getrandom(&mut *key)
                 .map_err(|_| SecretError::Invalid("secret integrity entropy unavailable"))?;
-            let temporary = root.join(format!(".integrity-key-{}.pending", random_nonce()?));
             let mut file = sandsurf_native::local::create_private_file(&temporary)?;
             file.write_all(&*key)?;
             sandsurf_native::storage::sync_file(&file)?;
             drop(file);
-            fs::rename(&temporary, &key_path)?;
-            sync_directory(root)?;
+            sandsurf_native::storage::publish_new_file(&temporary, &key_path)?;
+            sync_directory(&root)?;
+            reclaim_key_stage(&temporary, &root)?;
         }
         let mut file = sandsurf_native::local::open_private_file(
             &key_path,
@@ -72,7 +91,7 @@ impl SecretAuthority {
         let mut integrity_key = Zeroizing::new([0u8; 32]);
         file.read_exact(&mut *integrity_key)?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             integrity_key,
         })
     }
@@ -215,11 +234,26 @@ fn validate_bytes(bytes: &[u8]) -> Result<(), SecretError> {
     }
     Ok(())
 }
-fn random_nonce() -> Result<String, SecretError> {
-    let mut nonce = [0u8; 16];
-    getrandom::getrandom(&mut nonce)
-        .map_err(|_| SecretError::Invalid("secret publication entropy unavailable"))?;
-    Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
+// Only the sole key writer may reclaim this exact unpublished object. Unknown
+// files, foreign owners, links and oversized bytes never acquire that owner.
+fn reclaim_key_stage(path: &Path, root: &Path) -> Result<(), SecretError> {
+    let file = match sandsurf_native::local::open_private_file(
+        path,
+        sandsurf_native::PrivateFileAccess::ReadOnly,
+    ) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() > 32 {
+        return Err(SecretError::Invalid(
+            "unowned secret integrity-key stage; store preserved",
+        ));
+    }
+    drop(file);
+    fs::remove_file(path)?;
+    sync_directory(root)?;
+    Ok(())
 }
 fn sync_directory(path: &Path) -> io::Result<()> {
     sandsurf_native::storage::sync_directory(path)
@@ -230,6 +264,152 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    fn fresh_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sandsurf-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn concurrent_store_open_has_one_integrity_key_and_all_versions_remain_readable() {
+        use std::sync::{Arc, Barrier};
+        let root = fresh_root("secret-key-race");
+        sandsurf_native::local::ensure_private_directory(&root).unwrap();
+        let barrier = Arc::new(Barrier::new(16));
+        let commitments = std::thread::scope(|scope| {
+            let workers = (0..16)
+                .map(|index| {
+                    let root = &root;
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let authority = loop {
+                            match SecretAuthority::open(root) {
+                                Err(SecretError::Io(error))
+                                    if error.kind() == io::ErrorKind::WouldBlock =>
+                                {
+                                    assert!(std::time::Instant::now() < deadline);
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                                result => break result.unwrap(),
+                            }
+                        };
+                        let id: SecretId = format!("secret-{index}").try_into().unwrap();
+                        let version: SecretVersionId = "version".try_into().unwrap();
+                        authority.put(id, version, b"immutable secret").unwrap();
+                        authority
+                            .commitment(
+                                &"same-id".try_into().unwrap(),
+                                &"same-version".try_into().unwrap(),
+                                b"same bytes",
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(commitments.iter().all(|value| value == &commitments[0]));
+        let authority = SecretAuthority::open(&root).unwrap();
+        for index in 0..16 {
+            assert_eq!(
+                authority
+                    .read(
+                        &format!("secret-{index}").try_into().unwrap(),
+                        &"version".try_into().unwrap()
+                    )
+                    .unwrap(),
+                b"immutable secret"
+            );
+        }
+        assert!(!root.join(".integrity-key.pending").exists());
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_published_key_is_corruption_not_permission_to_reinitialize() {
+        let root = fresh_root("secret-missing-key");
+        let authority = SecretAuthority::open(&root).unwrap();
+        authority
+            .put(
+                "secret".try_into().unwrap(),
+                "version".try_into().unwrap(),
+                b"retained",
+            )
+            .unwrap();
+        drop(authority);
+        let object = root
+            .join(object_name("secret"))
+            .join(object_name("version"));
+        let before = fs::read(&object).unwrap();
+        fs::remove_file(root.join(".integrity-key")).unwrap();
+        assert!(matches!(
+            SecretAuthority::open(&root),
+            Err(SecretError::Invalid(_))
+        ));
+        assert!(!root.join(".integrity-key").exists());
+        assert_eq!(fs::read(object).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_key_publication_is_reclaimed_only_under_original_writer_custody() {
+        let root = fresh_root("secret-key-interruption");
+        sandsurf_native::local::ensure_private_directory(&root).unwrap();
+        let stage = root.join(".integrity-key.pending");
+        let custody =
+            sandsurf_native::storage::disk_lease(&root.join(".integrity-key.lock")).unwrap();
+        let mut file = sandsurf_native::local::create_private_file(&stage).unwrap();
+        file.write_all(b"interrupted").unwrap();
+        drop(file);
+        assert!(
+            matches!(SecretAuthority::open(&root), Err(SecretError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"interrupted");
+        drop(custody);
+        let authority = SecretAuthority::open(&root).unwrap();
+        let key = fs::read(root.join(".integrity-key")).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(!stage.exists());
+        // A crash after key publication but before unlinking its stage must
+        // neither rotate the key nor retain the unfinished secret-bearing file.
+        let mut file = sandsurf_native::local::create_private_file(&stage).unwrap();
+        file.write_all(&key).unwrap();
+        drop(file);
+        let reopened = SecretAuthority::open(&root).unwrap();
+        assert_eq!(fs::read(root.join(".integrity-key")).unwrap(), key);
+        assert!(!stage.exists());
+        drop((authority, reopened));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initialization_refuses_unowned_key_stages_and_unknown_store_contents() {
+        let root = fresh_root("secret-unowned-key-stage");
+        sandsurf_native::local::ensure_private_directory(&root).unwrap();
+        let stage = root.join(".integrity-key.pending");
+        let mut file = sandsurf_native::local::create_private_file(&stage).unwrap();
+        file.write_all(&[7; 33]).unwrap();
+        drop(file);
+        assert!(SecretAuthority::open(&root).is_err());
+        assert_eq!(fs::read(&stage).unwrap(), [7; 33]);
+        assert!(!root.join(".integrity-key").exists());
+        fs::remove_file(&stage).unwrap();
+        fs::write(root.join("unowned"), b"preserve").unwrap();
+        assert!(SecretAuthority::open(&root).is_err());
+        assert_eq!(fs::read(root.join("unowned")).unwrap(), b"preserve");
+        assert!(!root.join(".integrity-key").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn secret_identities_and_versions_do_not_inherit_host_filename_semantics() {
