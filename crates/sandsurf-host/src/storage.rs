@@ -56,73 +56,43 @@ pub(crate) fn copy_boot(
     destination: &Path,
 ) -> io::Result<sandsurf_image::boot::FrozenBoot> {
     let boot = read_boot(source)?;
-    if destination.exists() {
-        if read_boot(destination)? != boot {
-            return Err(invalid("frozen boot publication conflict"));
+    let kernel = source.join(&boot.kernel.path);
+    let initramfs = boot
+        .initramfs
+        .as_ref()
+        .map(|value| source.join(&value.path));
+    let published = publish_boot(destination, |stage| {
+        let copied = copy_boot_inputs(&kernel, initramfs.as_deref(), boot.architecture, stage)?;
+        if copied != boot {
+            return Err(invalid("frozen boot source changed during transfer"));
         }
-        return Ok(boot);
+        Ok(copied)
+    })?;
+    if published != boot {
+        return Err(invalid("frozen boot publication conflict"));
     }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| invalid("boot destination has no owner"))?;
-    let stage = boot_stage_path(parent)?;
-    sandsurf_native::local::create_private_directory(&stage)?;
-    let result = (|| {
-        for (artifact, bound) in std::iter::once((&boot.kernel, sandsurf_image::boot::MAX_KERNEL))
-            .chain(
-                boot.initramfs
-                    .iter()
-                    .map(|v| (v, sandsurf_image::boot::MAX_INITRAMFS)),
-            )
-        {
-            let mut input =
-                open_private_file(&source.join(&artifact.path), PrivateFileAccess::ReadOnly)?;
-            let mut output = create_private_file(&stage.join(&artifact.path))?;
-            if io::copy(&mut Read::by_ref(&mut input).take(bound + 1), &mut output)? > bound {
-                return Err(invalid("frozen boot artifact exceeds bound"));
-            }
-            sync_file(&output)?;
-            drop(output);
-            #[cfg(unix)]
-            {
-                let mut permissions = fs::metadata(stage.join(&artifact.path))?.permissions();
-                permissions.set_readonly(true);
-                fs::set_permissions(stage.join(&artifact.path), permissions)?;
-            }
-        }
-        sandsurf_image::boot::verify(&stage, &boot)?;
-        let mut record = create_private_file(&stage.join("boot.json"))?;
-        record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
-        sync_file(&record)?;
-        drop(record);
-        sync_directory(&stage)?;
-        match sandsurf_native::storage::publish_new_directory(&stage, destination) {
-            Ok(()) => sync_directory(parent),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if read_boot(destination)? != boot {
-                    return Err(invalid("frozen boot publication conflict"));
-                }
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    })();
-    // Only this call's freshly created stage is reclaimed.
-    if stage.exists() {
-        fs::remove_dir_all(&stage)?;
-    }
-    result?;
-    Ok(boot)
+    Ok(published)
 }
 
+#[cfg(test)]
 pub(crate) fn pin_boot(
     kernel: &Path,
     initramfs: Option<&Path>,
     architecture: sandsurf_image::Architecture,
     directory: &Path,
 ) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    publish_boot(directory, |stage| {
+        copy_boot_inputs(kernel, initramfs, architecture, stage)
+    })
+}
+
+fn copy_boot_inputs(
+    kernel: &Path,
+    initramfs: Option<&Path>,
+    architecture: sandsurf_image::Architecture,
+    directory: &Path,
+) -> io::Result<sandsurf_image::boot::FrozenBoot> {
     use sandsurf_image::boot;
-    sandsurf_native::local::create_private_directory(directory)?;
     let copy =
         |input: &Path, name: &str, maximum: u64| -> io::Result<sandsurf_image::ImageArtifact> {
             let mut source = open_private_file(input, PrivateFileAccess::ReadOnly)?;
@@ -155,11 +125,6 @@ pub(crate) fn pin_boot(
             .map(|path| copy(path, "initramfs", boot::MAX_INITRAMFS))
             .transpose()?,
     };
-    boot::verify(directory, &boot)?;
-    let mut record = create_private_file(&directory.join("boot.json"))?;
-    record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
-    sync_file(&record)?;
-    sync_directory(directory)?;
     Ok(boot)
 }
 
@@ -171,22 +136,13 @@ pub(crate) fn freeze_boot(
     directory: &Path,
 ) -> io::Result<sandsurf_image::boot::FrozenBoot> {
     use sandsurf_image::boot::{self, BootProfile};
-    if object_exists(directory)? {
-        return read_boot(directory);
-    }
-    let parent = directory
-        .parent()
-        .ok_or_else(|| invalid("boot object has no owner"))?;
-    let stage = boot_stage_path(parent)?;
-    // Publication, including its record, is atomic. An interrupted extraction
-    // cannot turn a partly populated public directory into a frozen boot.
-    let result = (|| {
+    publish_boot(directory, |stage| {
         let boot = if image.manifest.boot_bundle.profile == BootProfile::Pinned {
-            let boot = pin_boot(
+            let boot = copy_boot_inputs(
                 &image.kernel_path,
                 image.initramfs_path.as_deref(),
                 image.manifest.architecture,
-                &stage,
+                stage,
             )?;
             if boot.kernel.sha256 != image.manifest.boot_bundle.kernel.sha256
                 || boot.initramfs.as_ref().map(|v| &v.sha256)
@@ -201,17 +157,44 @@ pub(crate) fn freeze_boot(
             }
             boot
         } else {
-            sandsurf_native::local::create_private_directory(&stage)?;
-            let boot = boot::extract(disk, &stage, image.manifest.architecture)?;
-            boot::verify(&stage, &boot)?;
-            let mut record = create_private_file(&stage.join("boot.json"))?;
-            record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
-            sync_file(&record)?;
-            sync_directory(&stage)?;
-            boot
+            boot::extract(disk, stage, image.manifest.architecture)?
         };
-        sandsurf_native::storage::publish_new_directory(&stage, directory)?;
-        sync_directory(parent)?;
+        Ok(boot)
+    })
+}
+
+/// One transaction for selected, pinned and captured boot artifacts. Exclusive
+/// stage creation precedes cleanup ownership; creation failure cannot authorize
+/// deleting a pre-existing object. The complete record publishes with its bytes.
+fn publish_boot(
+    directory: &Path,
+    prepare: impl FnOnce(&Path) -> io::Result<sandsurf_image::boot::FrozenBoot>,
+) -> io::Result<sandsurf_image::boot::FrozenBoot> {
+    if object_exists(directory)? {
+        return read_boot(directory);
+    }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| invalid("boot object has no owner"))?;
+    let stage = boot_stage_path(parent)?;
+    sandsurf_native::local::create_private_directory(&stage)?;
+    let result = (|| {
+        let boot = prepare(&stage)?;
+        sandsurf_image::boot::verify(&stage, &boot)?;
+        let mut record = create_private_file(&stage.join("boot.json"))?;
+        record.write_all(&serde_json::to_vec(&boot).map_err(io::Error::other)?)?;
+        sync_file(&record)?;
+        drop(record);
+        sync_directory(&stage)?;
+        match sandsurf_native::storage::publish_new_directory(&stage, directory) {
+            Ok(()) => sync_directory(parent)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_boot(directory)? != boot {
+                    return Err(invalid("frozen boot publication conflict"));
+                }
+            }
+            Err(error) => return Err(error),
+        }
         Ok(boot)
     })();
     if stage.exists() {
@@ -821,6 +804,40 @@ mod tests {
             "original deletion cannot erase captured bytes"
         );
         assert_eq!(fs::read(published.join("kernel")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn failed_boot_preparation_reclaims_its_stage_not_another_owners_destination() {
+        let fixture = Fixture::new();
+        let destination = fixture.0.join("frozen-boot");
+        let result = publish_boot(&destination, |stage| {
+            create_private_file(&stage.join("selection.json"))?
+                .write_all(b"interrupted selection")?;
+            create_private_directory(&destination)?;
+            create_private_file(&destination.join("another-owner"))?
+                .write_all(b"retain original")?;
+            Err(io::Error::other("interrupted before boot verification"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(destination.join("another-owner")).unwrap(),
+            b"retain original"
+        );
+        assert!(
+            !fs::read_dir(&fixture.0)
+                .unwrap()
+                .any(|entry| { boot_stage_name(entry.unwrap().file_name().to_str().unwrap()) })
+        );
+        assert!(
+            publish_boot(&destination, |_| panic!(
+                "partial destinations cannot be rebuilt"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(destination.join("another-owner")).unwrap(),
+            b"retain original"
+        );
     }
 
     impl Fixture {

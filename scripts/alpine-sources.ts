@@ -5,7 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { chmod, copyFile, link, lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { get } from "node:https";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 
 const CHUNK = 32 * 1024 * 1024;
 const MAX_SOURCE = 384 * 1024 * 1024;
@@ -172,6 +172,7 @@ async function verifyChunk(root: string, chunk: SourceChunk): Promise<string> {
 }
 
 export async function collectAlpineSources(root: string, packages: readonly PackageOrigin[], transport = sourceTransport): Promise<string> {
+  root = resolve(root);
   await mkdir(root, { recursive: true });
   const inventory: SourceInventory = { formatVersion: 1, origins: [] };
   let total = 0;
@@ -229,6 +230,7 @@ export async function collectAlpineSources(root: string, packages: readonly Pack
 /** The inventory is an immutable declaration; only verification of all actual
  * chunks and reassembled material digests establishes source-byte coverage. */
 export async function verifyAlpineSources(root: string, digest: string, packages: readonly PackageOrigin[]): Promise<string[]> {
+  root = resolve(root);
   for (const path of [root, resolve(root, "objects")]) {
     const metadata = await lstat(path);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) fail("source namespace is aliased");
@@ -279,6 +281,7 @@ export async function verifyAlpineSources(root: string, digest: string, packages
 /** Replace only a generated source bundle after its whole byte closure has
  * verified. Existing unknown names or aliases are never erased by a build. */
 export async function publishAlpineSources(source: string, destination: string, digest: string, packages: readonly PackageOrigin[]): Promise<void> {
+  source = resolve(source); destination = resolve(destination);
   const files = await verifyAlpineSources(source, digest, packages);
   async function owned(root: string): Promise<void> {
     const metadata = await lstat(root);
@@ -293,9 +296,9 @@ export async function publishAlpineSources(source: string, destination: string, 
       if (!record(item) || typeof item.origin !== "string" || typeof item.buildCommit !== "string") fail("invalid previous source origin");
       return { origin: item.origin, buildCommit: item.buildCommit };
     });
-    const expected = new Set((await verifyAlpineSources(root, inventory[0]!.slice(0, 64), origins_)).map((path) => path.slice(root.length + 1)));
+    const expected = new Set(await verifyAlpineSources(root, inventory[0]!.slice(0, 64), origins_));
     const objects = await readdir(resolve(root, "objects"));
-    if (objects.length > 4096 || objects.length + 1 !== expected.size || objects.some((name) => !expected.has(`objects/${name}`))) fail("generated source namespace has unowned objects");
+    if (objects.length > 4096 || objects.length + 1 !== expected.size || objects.some((name) => !expected.has(resolve(root, "objects", name)))) fail("generated source namespace has unowned objects");
   }
   let exists = false;
   try { await lstat(destination); exists = true; }
@@ -306,7 +309,7 @@ export async function publishAlpineSources(source: string, destination: string, 
   let moved = false, published = false;
   try {
     for (const file of files) {
-      const output = resolve(stage, file.slice(source.length + 1));
+      const output = resolve(stage, relative(source, file));
       await copyFile(file, output); await chmod(output, 0o444);
     }
     await verifyAlpineSources(stage, digest, packages);
