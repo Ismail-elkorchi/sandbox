@@ -171,10 +171,20 @@ static int experiment(const wchar_t *binary) {
     require(swprintf(command, 2 * MAX_PATH, L"\"%ls\" child %lu", executable,
               (unsigned long)GetCurrentProcessId()) > 0, "fixture child command");
     PROCESS_INFORMATION process = {0};
-    wchar_t environment[MAX_PATH + 16] = {0};
+    wchar_t environment[4 * MAX_PATH + 128] = {0};
     wcscpy(environment, L"SystemRoot=");
     require(GetEnvironmentVariableW(L"SystemRoot", environment + 11,
                 MAX_PATH) > 0, "original OS environment");
+    size_t environment_offset = wcslen(environment) + 1;
+    for (int slot = 0; slot < 3; ++slot) {
+        const wchar_t *key = slot == 0 ? L"LOCALAPPDATA" :
+                             slot == 1 ? L"TEMP" : L"TMP";
+        int count = swprintf(environment + environment_offset,
+            sizeof(environment) / sizeof(*environment) - environment_offset,
+            L"%ls=%ls", key, temporary);
+        require(count > 0, "bounded native scratch environment");
+        environment_offset += (size_t)count + 1;
+    }
     require(CreateProcessW(executable, command, NULL, NULL, TRUE,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                 environment, temporary,
