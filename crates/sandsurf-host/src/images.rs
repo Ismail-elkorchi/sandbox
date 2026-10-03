@@ -80,6 +80,12 @@ struct ImportResult {
     image: ImageRecord,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportBinding {
+    request_digest: Digest,
+}
+
 pub fn qualification() -> Qualification {
     Qualification::Unqualified {
         reasons: vec!["machine-image boot, administration and native publication have no retained hardware qualification for this exact build/profile".into()],
@@ -99,17 +105,35 @@ pub(crate) fn import_native(
         ));
     }
     let _custody = image_custody(host_root, manifest_digest)?;
-    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    let (stage, old, _operation_custody) = prepare_import(host_root, operation, request_digest)?;
     if let Some(image) = old {
         return Ok(image);
     }
-    let store = host_root.join("images");
+    let store = stage.join("candidate");
     let installed_manifest = store.join(manifest_digest.as_str()).join("manifest.json");
+    let shared_manifest = host_root
+        .join("images")
+        .join(manifest_digest.as_str())
+        .join("manifest.json");
     // After publication, recovery needs only the immutable host-owned bundle,
     // never the caller's possibly deleted or changed source directory.
     let verified = if installed_manifest.exists() {
         verify_image(
             &installed_manifest,
+            ImageTrust::Pinned {
+                manifest_digest: manifest_digest.as_str(),
+            },
+        )?
+    } else if shared_manifest.exists() {
+        let shared = verify_image(
+            &shared_manifest,
+            ImageTrust::Pinned {
+                manifest_digest: manifest_digest.as_str(),
+            },
+        )?;
+        let candidate = install_image(&store, &shared)?;
+        verify_image(
+            &candidate.join("manifest.json"),
             ImageTrust::Pinned {
                 manifest_digest: manifest_digest.as_str(),
             },
@@ -132,17 +156,17 @@ pub(crate) fn import_native(
             "native image architecture differs from the native Linux machine".into(),
         ));
     }
-    let (published, verified) = publish_image(host_root, &verified)?;
+    let (published, verified) = publish_image(&stage, &verified)?;
     let image = image_record(&published, &verified)?;
     finish_import(&stage, request_digest, &image)?;
     Ok(image)
 }
 
 fn publish_image(
-    host_root: &Path,
+    stage: &Path,
     image: &VerifiedImage,
 ) -> Result<(PathBuf, VerifiedImage), ImageBuildError> {
-    let published = install_image(&host_root.join("images"), image)?;
+    let published = install_image(&stage.join("candidate"), image)?;
     // Record only the host-owned immutable copy, never caller/build paths.
     let verified = verify_image(
         &published.join("manifest.json"),
@@ -157,24 +181,107 @@ fn prepare_import(
     host_root: &Path,
     operation: &OperationId,
     request_digest: &Digest,
-) -> Result<(PathBuf, Option<ImageRecord>), ImageBuildError> {
+) -> Result<(PathBuf, Option<ImageRecord>, File), ImageBuildError> {
     prepare_private_directory(&host_root.join("images"))?;
     let imports = host_root.join("images/imports");
     prepare_private_directory(&imports)?;
     let stage = imports.join(object_name(operation.as_str()));
-    if let Some(image) = completed(host_root, operation, request_digest)? {
-        return Ok((stage, Some(image)));
-    }
-    if stage.exists() {
-        let quarantine = imports.join(format!(
-            "quarantine-{}-{}",
-            object_name(operation.as_str()),
-            short_nonce()?
-        ));
-        fs::rename(&stage, quarantine)?;
-    }
+    let custody = sandsurf_native::storage::disk_lease(
+        &imports.join(format!(".owner-{}", object_name(operation.as_str()))),
+    )?;
     prepare_private_directory(&stage)?;
-    Ok((stage, None))
+    let binding = stage.join("request.json");
+    match crate::image_records::read::<ImportBinding>(&binding) {
+        Ok(old) if old.request_digest == *request_digest => {}
+        Ok(_) => {
+            return Err(ImageBuildError::Invalid(
+                "image candidate request binding changed".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let entries = fs::read_dir(&stage)?
+                .take(9)
+                .collect::<io::Result<Vec<_>>>()?;
+            if entries.len() > 8
+                || entries.iter().any(|entry| {
+                    !entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| crate::image_records::pending_name("request", name))
+                })
+            {
+                return Err(ImageBuildError::Invalid(
+                    "unbound image stage contains unowned bytes; preserved".into(),
+                ));
+            }
+            for entry in &entries {
+                let path = entry.path();
+                let file = sandsurf_native::local::open_private_file(
+                    &path,
+                    sandsurf_native::PrivateFileAccess::ReadOnly,
+                )?;
+                if file.metadata()?.len() > 1024 * 1024 {
+                    return Err(ImageBuildError::Invalid(
+                        "image binding stage exceeds its bound".into(),
+                    ));
+                }
+                drop(file);
+            }
+            for entry in entries {
+                fs::remove_file(entry.path())?;
+            }
+            sandsurf_native::storage::sync_directory(&stage)?;
+            crate::image_records::publish(
+                &binding,
+                &ImportBinding {
+                    request_digest: request_digest.clone(),
+                },
+            )?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(image) = read_completion(host_root, operation, request_digest, &custody)? {
+        return Ok((stage, Some(image), custody));
+    }
+    // These namespaces were created only after the immutable binding above.
+    // Re-entry owns their interrupted preparation, not the completed candidate
+    // namespace. The independently supervised pool establishes containment of
+    // a prior builder before running another job; this original writer lease
+    // also excludes concurrent in-process materializers.
+    reclaim_preparation(&stage)?;
+    Ok((stage, None, custody))
+}
+
+fn reclaim_preparation(stage: &Path) -> Result<(), ImageBuildError> {
+    for name in ["artifact", "tree", "layout", "rootfs.tar"] {
+        let path = stage.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && name != "rootfs.tar" =>
+            {
+                sandsurf_native::local::canonical_private_directory(&path)?;
+                fs::remove_dir_all(&path)?;
+            }
+            Ok(metadata) if metadata.is_file() && name == "rootfs.tar" => {
+                drop(sandsurf_native::local::open_private_file(
+                    &path,
+                    sandsurf_native::PrivateFileAccess::ReadOnly,
+                )?);
+                fs::remove_file(&path)?;
+            }
+            Ok(_) => {
+                return Err(ImageBuildError::Invalid(
+                    "image preparation has an unowned input role; preserved".into(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sandsurf_native::storage::sync_directory(stage)?;
+    Ok(())
 }
 
 /// The sole durable materialization outcome. The worker and API read this same
@@ -183,6 +290,28 @@ pub(crate) fn completed(
     root: &Path,
     operation: &OperationId,
     request_digest: &Digest,
+) -> Result<Option<ImageRecord>, ImageBuildError> {
+    let imports = root.join("images/imports");
+    let result = imports
+        .join(object_name(operation.as_str()))
+        .join("result.json");
+    // An absent operation is a read-only observation, not stage creation.
+    match crate::image_records::read::<ImportResult>(&result) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let custody = sandsurf_native::storage::read_lease(
+        &imports.join(format!(".owner-{}", object_name(operation.as_str()))),
+    )?;
+    read_completion(root, operation, request_digest, &custody)
+}
+
+fn read_completion(
+    root: &Path,
+    operation: &OperationId,
+    request_digest: &Digest,
+    _custody: &File,
 ) -> Result<Option<ImageRecord>, ImageBuildError> {
     let path = root
         .join("images/imports")
@@ -198,7 +327,7 @@ pub(crate) fn completed(
             "image operation result binding changed".into(),
         ));
     }
-    verify_published(root, &result.image)?;
+    verify_candidate(root, operation, &result.image)?;
     Ok(Some(result.image))
 }
 
@@ -307,7 +436,7 @@ pub fn publish_snapshot(
         ));
     }
 
-    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    let (stage, old, _operation_custody) = prepare_import(host_root, operation, request_digest)?;
     if let Some(image) = old {
         return Ok(image);
     }
@@ -389,26 +518,120 @@ pub fn publish_snapshot(
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
     let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
-    let (final_root, verified) = publish_image(host_root, &verified)?;
+    let (final_root, verified) = publish_image(&stage, &verified)?;
     fs::remove_dir_all(&artifact)?;
     let image = image_record(&final_root, &verified)?;
     finish_import(&stage, request_digest, &image)?;
     Ok(image)
 }
 
-fn verify_published(host_root: &Path, image: &ImageRecord) -> Result<(), ImageBuildError> {
+fn candidate_directory(root: &Path, operation: &OperationId, image: &Digest) -> PathBuf {
+    root.join("images/imports")
+        .join(object_name(operation.as_str()))
+        .join("candidate")
+        .join(image.as_str())
+}
+
+fn verify_candidate(
+    root: &Path,
+    operation: &OperationId,
+    image: &ImageRecord,
+) -> Result<VerifiedImage, ImageBuildError> {
+    let candidate = candidate_directory(root, operation, &image.digest);
     let verified = verify_image(
-        &host_root
-            .join("images")
-            .join(image.digest.as_str())
-            .join("manifest.json"),
-        ImageTrust::ExplicitLocal,
+        &candidate.join("manifest.json"),
+        ImageTrust::Pinned {
+            manifest_digest: image.digest.as_str(),
+        },
     )?;
-    if verified.manifest_digest != image.digest.as_str() {
+    if image_record(&candidate, &verified)? != *image {
         return Err(ImageBuildError::Invalid(
-            "published image failed identity verification".into(),
+            "image candidate metadata or retained bytes changed".into(),
         ));
     }
+    Ok(verified)
+}
+
+/// The catalog has already reserved this exact candidate. This effect copies
+/// it into the shared namespace, never executes guest programs, and retains
+/// original publication custody until the catalog owner commits the handoff.
+pub(crate) struct PublicationCustody {
+    _operation: File,
+    _image: File,
+}
+
+pub(crate) fn publish_candidate(
+    root: &Path,
+    operation: &OperationId,
+    request: &Digest,
+    image: &ImageRecord,
+) -> Result<PublicationCustody, ImageBuildError> {
+    let operation_custody = sandsurf_native::storage::disk_lease(
+        &root
+            .join("images/imports")
+            .join(format!(".owner-{}", object_name(operation.as_str()))),
+    )?;
+    if read_completion(root, operation, request, &operation_custody)?.as_ref() != Some(image) {
+        return Err(ImageBuildError::Invalid(
+            "image publication lacks its exact completed candidate".into(),
+        ));
+    }
+    let custody = image_custody(root, &image.digest)?;
+    let verified = verify_candidate(root, operation, image)?;
+    let published = install_image(&root.join("images"), &verified)?;
+    let final_image = verify_image(
+        &published.join("manifest.json"),
+        ImageTrust::Pinned {
+            manifest_digest: image.digest.as_str(),
+        },
+    )?;
+    if image_record(&published, &final_image)? != *image {
+        return Err(ImageBuildError::Invalid(
+            "published image differs from its reserved candidate".into(),
+        ));
+    }
+    Ok(PublicationCustody {
+        _operation: operation_custody,
+        _image: custody,
+    })
+}
+
+/// Called only for a catalog-committed publication. Original writer custody
+/// excludes materializers and publication readers; the immutable result binds
+/// the exact namespace whose byte ownership has already transferred.
+pub(crate) fn reclaim_candidate(
+    root: &Path,
+    operation: &OperationId,
+    request: &Digest,
+    image: &ImageRecord,
+) -> Result<(), ImageBuildError> {
+    let imports = root.join("images/imports");
+    let _custody = sandsurf_native::storage::disk_lease(
+        &imports.join(format!(".owner-{}", object_name(operation.as_str()))),
+    )?;
+    let stage = imports.join(object_name(operation.as_str()));
+    sandsurf_native::local::canonical_private_directory(&stage)?;
+    let binding: ImportBinding = crate::image_records::read(&stage.join("request.json"))?;
+    let result: ImportResult = crate::image_records::read(&stage.join("result.json"))?;
+    if binding.request_digest != *request
+        || result.request_digest != *request
+        || result.image != *image
+    {
+        return Err(ImageBuildError::Invalid(
+            "image candidate cleanup binding changed; preserved".into(),
+        ));
+    }
+    reclaim_preparation(&stage)?;
+    let candidate = stage.join("candidate");
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => {
+            sandsurf_native::local::canonical_private_directory(&candidate)?;
+            fs::remove_dir_all(&candidate)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    sandsurf_native::storage::sync_directory(&stage)?;
     Ok(())
 }
 
@@ -459,20 +682,9 @@ fn image_custody(host_root: &Path, digest: &Digest) -> Result<File, ImageBuildEr
     let directory = host_root.join("images/custody");
     prepare_private_directory(&host_root.join("images"))?;
     prepare_private_directory(&directory)?;
-    let path = directory.join(digest.as_str());
-    let held = match create_private_file(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            sandsurf_native::local::open_private_file(
-                &path,
-                sandsurf_native::PrivateFileAccess::ReadWrite,
-            )?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    held.try_lock()
-        .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error.to_string()))?;
-    Ok(held)
+    Ok(sandsurf_native::storage::disk_lease(
+        &directory.join(digest.as_str()),
+    )?)
 }
 
 pub fn cleanup(host_root: &Path, digest: &Digest) -> Result<(), ImageBuildError> {
@@ -531,6 +743,7 @@ fn sha256_file(path: &Path, maximum: u64) -> Result<String, ImageBuildError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+#[cfg(test)]
 fn short_nonce() -> Result<String, ImageBuildError> {
     let mut bytes = [0u8; 8];
     getrandom::getrandom(&mut bytes)
@@ -544,17 +757,17 @@ fn short_nonce() -> Result<String, ImageBuildError> {
 }
 
 #[cfg(test)]
-mod native_import_tests {
+pub(crate) mod native_import_tests {
     use super::*;
     use sandsurf_image::{BootBundleManifest, ImageArtifact, ImageCapabilities};
 
-    struct Fixture {
-        root: PathBuf,
-        manifest: PathBuf,
-        digest: Digest,
+    pub(crate) struct Fixture {
+        pub(crate) root: PathBuf,
+        pub(crate) manifest: PathBuf,
+        pub(crate) digest: Digest,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
                 "sandsurf-native-image-{}-{}",
                 std::process::id(),
@@ -630,13 +843,17 @@ mod native_import_tests {
             }
         }
         fn import(&self, operation: &str, request: &str) -> Result<ImageRecord, ImageBuildError> {
-            import_native(
+            let operation = OperationId::try_from(operation.to_owned()).unwrap();
+            let request = Digest::try_from(request.repeat(64)).unwrap();
+            let image = import_native(
                 &self.root,
                 &self.manifest,
                 &self.digest,
-                &OperationId::try_from(operation.to_owned()).unwrap(),
-                &Digest::try_from(request.repeat(64)).unwrap(),
-            )
+                &operation,
+                &request,
+            )?;
+            let _custody = publish_candidate(&self.root, &operation, &request, &image)?;
+            Ok(image)
         }
     }
     impl Drop for Fixture {

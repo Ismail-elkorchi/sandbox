@@ -852,6 +852,13 @@ fn pending_fork_rollback_and_image_publication_pin_snapshot_bytes_but_not_comple
             .is_err()
     );
     f.host
+        .prepare_image_import(
+            &publish_operation,
+            &publish_digest,
+            image("published-copy", 100),
+        )
+        .unwrap();
+    f.host
         .complete_image_import(
             &publish_operation,
             &publish_digest,
@@ -927,6 +934,8 @@ fn admit_fixture_image(host: &mut HostCatalog, digest: &Digest) {
     .unwrap();
     let mut record = image("fixture", 1);
     record.digest = digest.clone();
+    host.prepare_image_import(&operation, &request, record.clone())
+        .unwrap();
     host.complete_image_import(&operation, &request, record)
         .unwrap();
 }
@@ -1418,6 +1427,9 @@ fn new_machine_inherits_sensitive_image_classification() {
     let mut image = image("sensitive-image", 1000);
     image.sensitive = true;
     f.host
+        .prepare_image_import(&image_operation, &request, image.clone())
+        .unwrap();
+    f.host
         .complete_image_import(&image_operation, &request, image.clone())
         .unwrap();
     let id: MachineId = "from-sensitive-image".try_into().unwrap();
@@ -1557,6 +1569,8 @@ fn image_recipes_reopen_exactly_and_pending_dependencies_cannot_be_reclaimed() {
         .is_err()
     );
     assert!(host.operation(&release).unwrap().is_none());
+    host.prepare_image_import(&operation, &request, image("derived", 1000))
+        .unwrap();
     host.complete_image_import(&operation, &request, image("derived", 1000))
         .unwrap();
     assert!(host.pending_image_imports(None, n(256)).unwrap().is_empty());
@@ -1579,16 +1593,24 @@ fn image_recipes_reopen_exactly_and_pending_dependencies_cannot_be_reclaimed() {
     .unwrap();
     for (query, index) in [
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND operation>'' ORDER BY operation LIMIT 32",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND operation>'' ORDER BY operation LIMIT 32",
             "pending_image_imports",
         ),
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_image='image'",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND dependency_image='image'",
             "pending_import_image",
         ),
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_snapshot='snapshot'",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND dependency_snapshot='snapshot'",
             "pending_import_snapshot",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='prepared' AND json_extract(candidate,'$.digest')='image'",
+            "prepared_image_target",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE candidate_cleanup_pending=1 AND operation>'' ORDER BY operation LIMIT 32",
+            "pending_candidate_cleanup",
         ),
     ] {
         let details: String = db.query_row(query, [], |row| row.get(3)).unwrap();
@@ -1814,6 +1836,23 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
         provenance_digest: hash("conversion"),
         sensitive: false,
     };
+    assert!(
+        host.complete_image_import(&operation, &request, image.clone())
+            .is_err()
+    );
+    let prepared = host
+        .prepare_image_import(&operation, &request, image.clone())
+        .unwrap();
+    assert_eq!(prepared.phase, ImageImportPhase::Prepared);
+    assert_eq!(prepared.image, Some(image.clone()));
+    assert!(host.image(&image.digest).unwrap().is_none());
+    assert!(host.images(None, n(10)).unwrap().is_empty());
+    drop(host);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert_eq!(
+        host.pending_image_imports(None, n(10)).unwrap(),
+        vec![prepared]
+    );
     let published = host
         .complete_image_import(&operation, &request, image.clone())
         .unwrap();
@@ -1931,14 +1970,14 @@ fn historical_image_cleanup_completion_cannot_release_new_cleanup_reservation() 
     .unwrap();
     assert!(
         matches!(
-            host.complete_image_import(&import, &request_digest, image("second", 2_000)),
+            host.prepare_image_import(&import, &request_digest, image("second", 2_000)),
             Err(sandsurf_state::Error::Capacity(_))
         ),
         "historical completion freed a newer operation's actual storage reservation"
     );
     assert!(
         matches!(
-            host.complete_image_import(&import, &request_digest, first),
+            host.prepare_image_import(&import, &request_digest, first),
             Err(sandsurf_state::Error::Conflict(_))
         ),
         "historical completion permitted re-import while new cleanup still owns the bytes"
@@ -1946,6 +1985,8 @@ fn historical_image_cleanup_completion_cannot_release_new_cleanup_reservation() 
     host.complete_image_release(&releases[1].0, &releases[1].1)
         .unwrap();
     assert!(host.pending_image_releases(None, n(1)).unwrap().is_empty());
+    host.prepare_image_import(&import, &request_digest, image("second", 2_000))
+        .unwrap();
     host.complete_image_import(&import, &request_digest, image("second", 2_000))
         .unwrap();
 }
@@ -1993,11 +2034,13 @@ fn retired_image_storage_remains_reserved_until_cleanup_completion() {
     .unwrap();
     let second = image("second-image", 2_000);
     assert!(
-        host.complete_image_import(&second_operation, &second_request, second.clone())
+        host.prepare_image_import(&second_operation, &second_request, second.clone())
             .is_err()
     );
 
     host.complete_image_release(&release_operation, &release_digest)
+        .unwrap();
+    host.prepare_image_import(&second_operation, &second_request, second.clone())
         .unwrap();
     assert!(
         host.complete_image_import(&second_operation, &second_request, second)
@@ -2026,9 +2069,166 @@ fn publish_image(
     )
     .unwrap();
     let image = image(label, storage_bytes);
+    host.prepare_image_import(&operation, &request, image.clone())
+        .unwrap();
     host.complete_image_import(&operation, &request, image.clone())
         .unwrap();
     image
+}
+
+#[test]
+fn prepared_candidates_reserve_unique_images_before_publication_and_survive_restart() {
+    let root = TempRoot::new();
+    let path = root.0.join("candidate-quota");
+    let mut limits = catalog_limits();
+    limits.image_bytes = n(3_000);
+    let mut host =
+        HostCatalog::create(&path, "candidate-quota-host".try_into().unwrap(), limits).unwrap();
+    let candidate = image("candidate", 2_000);
+    let mut admissions = Vec::new();
+    for label in ["first", "duplicate", "other"] {
+        let operation: OperationId = label.try_into().unwrap();
+        let input = image_input(hash(label));
+        let request = input.request_digest(&operation).unwrap();
+        host.admit_image_import(
+            operation.clone(),
+            input,
+            Approval {
+                id: format!("approve-{label}").try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+        admissions.push((operation, request));
+    }
+    for (operation, request) in &admissions[..2] {
+        host.prepare_image_import(operation, request, candidate.clone())
+            .unwrap();
+        assert!(
+            host.complete_image_candidate_cleanup(operation, request)
+                .is_err()
+        );
+    }
+    let (other, other_request) = &admissions[2];
+    assert!(matches!(
+        host.prepare_image_import(other, other_request, image("other", 2_000)),
+        Err(Error::Capacity(_))
+    ));
+    let mut substitution = candidate.clone();
+    substitution.sensitive = true;
+    assert!(matches!(
+        host.prepare_image_import(other, other_request, substitution),
+        Err(Error::Conflict(_))
+    ));
+    drop(host);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert_eq!(host.pending_image_imports(None, n(10)).unwrap().len(), 3);
+    let (first, first_request) = &admissions[0];
+    host.complete_image_import(first, first_request, candidate.clone())
+        .unwrap();
+    assert_eq!(
+        host.pending_image_candidate_cleanup(None, n(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    let release: OperationId = "release-prepared-target".try_into().unwrap();
+    let release_request = digest(
+        Domain::Image,
+        &("sandsurf-release-image-v1", &release, &candidate.digest),
+    )
+    .unwrap();
+    assert!(
+        host.release_image(
+            release.clone(),
+            candidate.digest.clone(),
+            Approval {
+                id: "approve-release-prepared".try_into().unwrap(),
+                request_digest: release_request,
+            }
+        )
+        .is_err(),
+        "another prepared publication still depends on these exact bytes"
+    );
+    let (duplicate, duplicate_request) = &admissions[1];
+    host.complete_image_import(duplicate, duplicate_request, candidate.clone())
+        .unwrap();
+    assert_eq!(host.images(None, n(10)).unwrap(), vec![candidate]);
+    assert_eq!(
+        host.pending_image_candidate_cleanup(None, n(10))
+            .unwrap()
+            .len(),
+        2
+    );
+    host.complete_image_candidate_cleanup(first, first_request)
+        .unwrap();
+    assert_eq!(
+        host.pending_image_candidate_cleanup(None, n(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        host.complete_image_candidate_cleanup(duplicate, &hash("wrong"))
+            .is_err()
+    );
+    host.complete_image_candidate_cleanup(duplicate, duplicate_request)
+        .unwrap();
+    host.complete_image_candidate_cleanup(duplicate, duplicate_request)
+        .unwrap();
+    assert!(
+        host.pending_image_candidate_cleanup(None, n(10))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        host.pending_image_candidate_cleanup(None, Counter::ZERO)
+            .is_err()
+    );
+    assert!(host.pending_image_candidate_cleanup(None, n(257)).is_err());
+}
+
+#[test]
+fn retired_image_history_and_prepared_targets_share_one_bounded_identity_namespace() {
+    let root = TempRoot::new();
+    let path = root.0.join("candidate-identities");
+    let mut limits = catalog_limits();
+    limits.identities = n(1);
+    let mut host =
+        HostCatalog::create(&path, "candidate-identity-host".try_into().unwrap(), limits).unwrap();
+    let first = publish_image(&mut host, "first", "first-image", 100);
+    let release: OperationId = "release-first".try_into().unwrap();
+    let request = digest(
+        Domain::Image,
+        &("sandsurf-release-image-v1", &release, &first.digest),
+    )
+    .unwrap();
+    host.release_image(
+        release.clone(),
+        first.digest,
+        Approval {
+            id: "approve-retire-first".try_into().unwrap(),
+            request_digest: request.clone(),
+        },
+    )
+    .unwrap();
+    host.complete_image_release(&release, &request).unwrap();
+    let operation: OperationId = "second".try_into().unwrap();
+    let input = image_input(hash("second"));
+    let request = input.request_digest(&operation).unwrap();
+    host.admit_image_import(
+        operation.clone(),
+        input,
+        Approval {
+            id: "approve-second-image".try_into().unwrap(),
+            request_digest: request.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        host.prepare_image_import(&operation, &request, image("second-image", 100)),
+        Err(Error::Capacity(_))
+    ));
 }
 
 fn image(label: &str, storage_bytes: u64) -> ImageRecord {

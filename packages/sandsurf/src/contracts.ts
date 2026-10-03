@@ -170,7 +170,7 @@ export type OperationObservation =
   | { readonly kind: "lifecycle"; readonly intent: MachineLifecycleIntent }
   | { readonly kind: "configuration"; readonly revision: number; readonly configuration: RuntimeConfiguration }
   | { readonly kind: "transfer"; readonly applied: boolean }
-  | { readonly kind: "image-import"; readonly phase: "admitted" | "published"; readonly image: ImageInspection | null }
+  | { readonly kind: "image-import"; readonly phase: "admitted" | "prepared" | "published"; readonly image: ImageInspection | null }
   | { readonly kind: "image-release"; readonly imageDigest: string; readonly cleanupPending: boolean }
   | { readonly kind: "secret-delivery"; readonly secret: SecretVersion; readonly disclosure: "not-sent" | "possible" | "guest-reported-received"; readonly revoked: boolean; readonly revocationOperation: string | null }
   | { readonly kind: "secret-put"; readonly secret: SecretVersion; readonly applied: boolean }

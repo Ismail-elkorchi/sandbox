@@ -268,21 +268,20 @@ impl Fixture {
             },
         )
         .unwrap();
-        host.complete_image_import(
-            &operation,
-            &request,
-            ImageRecord {
-                digest: image.clone(),
-                source_digest: image.clone(),
-                platform: "linux".into(),
-                architecture: "amd64".into(),
-                logical_bytes: n(1),
-                storage_bytes: n(1),
-                provenance_digest: image.clone(),
-                sensitive: false,
-            },
-        )
-        .unwrap();
+        let candidate = ImageRecord {
+            digest: image.clone(),
+            source_digest: image.clone(),
+            platform: "linux".into(),
+            architecture: "amd64".into(),
+            logical_bytes: n(1),
+            storage_bytes: n(1),
+            provenance_digest: image.clone(),
+            sensitive: false,
+        };
+        host.prepare_image_import(&operation, &request, candidate.clone())
+            .unwrap();
+        host.complete_image_import(&operation, &request, candidate)
+            .unwrap();
         let machine: MachineId = "computer".try_into().unwrap();
         let operation: OperationId = "create".try_into().unwrap();
         let resources = RuntimeConfiguration::default().resources;

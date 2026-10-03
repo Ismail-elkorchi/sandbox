@@ -178,6 +178,7 @@ struct ReconciliationCursor {
     next_domain: usize,
     after_image: Option<OperationId>,
     after_import: Option<OperationId>,
+    after_candidate: Option<OperationId>,
     after_snapshot_release: Option<OperationId>,
 }
 
@@ -963,6 +964,9 @@ impl HostService {
         &self,
         record: sandsurf_state::ImageImportRecord,
     ) -> Result<HostDispatch> {
+        if record.phase == sandsurf_state::ImageImportPhase::Prepared {
+            return Ok(self.prepare_image_publication(record, ImageLookupReply::ImageImport));
+        }
         let input = self
             .catalog
             .image_import_input(&record.operation_id)?
@@ -981,6 +985,18 @@ impl HostService {
                 build: crate::image_worker::Build::Image { input },
             },
         })))
+    }
+
+    fn prepare_image_publication(
+        &self,
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+    ) -> HostDispatch {
+        HostDispatch::Task(Box::new(HostTask::ImagePublish {
+            root: self.root.clone(),
+            record,
+            reply,
+        }))
     }
 
     fn prepare_guest_dispatch(
@@ -1669,7 +1685,7 @@ impl HostService {
         reply: ImageLookupReply,
     ) -> Result<HostDispatch> {
         if let Some(record) = self.catalog.image_import(&operation)?
-            && record.phase == sandsurf_state::ImageImportPhase::Admitted
+            && record.phase != sandsurf_state::ImageImportPhase::Published
         {
             return Ok(HostDispatch::Task(Box::new(HostTask::ImageInspect {
                 root: self.root.clone(),
@@ -1995,6 +2011,81 @@ impl HostService {
 
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostDispatch> {
         match completion {
+            HostTaskCompletion::Image {
+                operation,
+                request_digest,
+                result,
+            } => {
+                let record =
+                    self.catalog
+                        .prepare_image_import(&operation, &request_digest, result?)?;
+                if record.phase == sandsurf_state::ImageImportPhase::Published {
+                    Ok(HostDispatch::Ready(Box::new(self.image_lookup_response(
+                        &operation,
+                        ImageLookupReply::ImageImport,
+                    )?)))
+                } else {
+                    Ok(self.prepare_image_publication(record, ImageLookupReply::ImageImport))
+                }
+            }
+            HostTaskCompletion::ImageInspect {
+                record,
+                reply,
+                result,
+            } => {
+                let current = self
+                    .catalog
+                    .image_import(&record.operation_id)?
+                    .ok_or(HostError::Invalid("image lookup admission disappeared"))?;
+                if current.request_digest != record.request_digest {
+                    return Err(HostError::Invalid("image lookup binding changed"));
+                }
+                if current.phase == sandsurf_state::ImageImportPhase::Published {
+                    return Ok(HostDispatch::Ready(Box::new(
+                        self.image_lookup_response(&record.operation_id, reply)?,
+                    )));
+                }
+                if let Some(image) = result? {
+                    let record = self.catalog.prepare_image_import(
+                        &record.operation_id,
+                        &record.request_digest,
+                        image,
+                    )?;
+                    if record.phase == sandsurf_state::ImageImportPhase::Published {
+                        Ok(HostDispatch::Ready(Box::new(
+                            self.image_lookup_response(&record.operation_id, reply)?,
+                        )))
+                    } else {
+                        Ok(self.prepare_image_publication(record, reply))
+                    }
+                } else {
+                    Ok(HostDispatch::Ready(Box::new(
+                        self.image_lookup_response(&record.operation_id, reply)?,
+                    )))
+                }
+            }
+            HostTaskCompletion::ImagePublish {
+                record,
+                reply,
+                result,
+            } => {
+                let custody = result?;
+                let record = self.catalog.complete_image_import(
+                    &record.operation_id,
+                    &record.request_digest,
+                    record.image.clone().ok_or(HostError::Invalid(
+                        "image publication has no reserved candidate",
+                    ))?,
+                )?;
+                drop(custody);
+                Ok(HostDispatch::Task(Box::new(
+                    HostTask::ImageCandidateCleanup {
+                        root: self.root.clone(),
+                        record,
+                        reply: Some(reply),
+                    },
+                )))
+            }
             HostTaskCompletion::SecretPrepare {
                 provision,
                 record,
@@ -2279,19 +2370,24 @@ impl HostService {
                     HostResponse::Complete
                 })
             }
-            HostTaskCompletion::ImageInspect {
+            HostTaskCompletion::ImageCandidateCleanup {
                 record,
                 reply,
                 result,
             } => {
-                if let Some(image) = result? {
-                    self.catalog.complete_image_import(
+                match result {
+                    Ok(()) => self.catalog.complete_image_candidate_cleanup(
                         &record.operation_id,
                         &record.request_digest,
-                        image,
-                    )?;
+                    )?,
+                    Err(HostError::Image(crate::images::ImageBuildError::Io(error)))
+                        if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
                 }
-                self.image_lookup_response(&record.operation_id, reply)
+                match reply {
+                    Some(reply) => self.image_lookup_response(&record.operation_id, reply),
+                    None => Ok(HostResponse::Complete),
+                }
             }
             HostTaskCompletion::Rollback { record, result } => Ok(HostResponse::Rollback {
                 value: self.catalog.complete_rollback(
@@ -2315,7 +2411,10 @@ impl HostService {
             | HostTaskCompletion::LifecycleInspect { .. }
             | HostTaskCompletion::SuspendCapture { .. }
             | HostTaskCompletion::Lifecycle { .. }
-            | HostTaskCompletion::Fork { .. } => Err(HostError::Invalid(
+            | HostTaskCompletion::Fork { .. }
+            | HostTaskCompletion::Image { .. }
+            | HostTaskCompletion::ImagePublish { .. }
+            | HostTaskCompletion::ImageInspect { .. } => Err(HostError::Invalid(
                 "machine effects require staged completion",
             )),
             HostTaskCompletion::Snapshot {
@@ -2326,17 +2425,6 @@ impl HostService {
                 value: complete_snapshot_capture(
                     &mut self.catalog,
                     &snapshot_id,
-                    &request_digest,
-                    result?,
-                )?,
-            }),
-            HostTaskCompletion::Image {
-                operation,
-                request_digest,
-                result,
-            } => Ok(HostResponse::ImageImport {
-                operation: self.catalog.complete_image_import(
-                    &operation,
                     &request_digest,
                     result?,
                 )?,
@@ -2445,14 +2533,15 @@ impl HostService {
         // Rotate the first domain so a single free slot cannot starve either
         // snapshot publication, lifecycle policy or independently owned images.
         let first = cursor.next_domain;
-        cursor.next_domain = (first + 1) % 5;
-        for offset in 0..5 {
-            match (first + offset) % 5 {
+        cursor.next_domain = (first + 1) % 6;
+        for offset in 0..6 {
+            match (first + offset) % 6 {
                 0 => self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?,
                 1 => self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?,
                 2 => self.reconcile_image_page(cursor, busy, slots, &mut work)?,
                 3 => self.reconcile_import_page(cursor, busy, slots, &mut work)?,
                 4 => self.reconcile_snapshot_release_page(cursor, busy, slots, &mut work)?,
+                5 => self.reconcile_candidate_page(cursor, busy, slots, &mut work)?,
                 _ => unreachable!(),
             }
         }
@@ -2599,6 +2688,43 @@ impl HostService {
         }
         if at_end {
             cursor.after_image = None;
+        }
+        Ok(())
+    }
+
+    fn reconcile_candidate_page(
+        &self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<ReconciliationIdentity>,
+        slots: usize,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let records = self.catalog.pending_image_candidate_cleanup(
+            cursor.after_candidate.as_ref(),
+            counter(remaining as u64),
+        )?;
+        let at_end = records.len() < remaining;
+        for record in records {
+            cursor.after_candidate = Some(record.operation_id.clone());
+            let identity = ReconciliationIdentity::Image(record.operation_id.clone());
+            if busy.contains(&identity) || work.iter().any(|(key, _)| *key == identity) {
+                continue;
+            }
+            work.push((
+                identity,
+                HostDispatch::Task(Box::new(HostTask::ImageCandidateCleanup {
+                    root: self.root.clone(),
+                    record,
+                    reply: None,
+                })),
+            ));
+        }
+        if at_end {
+            cursor.after_candidate = None;
         }
         Ok(())
     }
@@ -3616,6 +3742,16 @@ fn capture_full_state(
 }
 
 enum HostTask {
+    ImageCandidateCleanup {
+        root: PathBuf,
+        record: sandsurf_state::ImageImportRecord,
+        reply: Option<ImageLookupReply>,
+    },
+    ImagePublish {
+        root: PathBuf,
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+    },
     SnapshotCleanup {
         root: PathBuf,
         endpoint: PathBuf,
@@ -3740,6 +3876,16 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    ImageCandidateCleanup {
+        record: sandsurf_state::ImageImportRecord,
+        reply: Option<ImageLookupReply>,
+        result: Result<()>,
+    },
+    ImagePublish {
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+        result: Result<crate::images::PublicationCustody>,
+    },
     SnapshotCleanup {
         record: sandsurf_state::SnapshotReleaseRecord,
         reply: bool,
@@ -3848,6 +3994,58 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::ImageCandidateCleanup {
+                root,
+                record,
+                reply,
+            } => {
+                let result = record
+                    .image
+                    .as_ref()
+                    .ok_or(HostError::Invalid(
+                        "image cleanup has no published candidate",
+                    ))
+                    .and_then(|image| {
+                        crate::images::reclaim_candidate(
+                            &root,
+                            &record.operation_id,
+                            &record.request_digest,
+                            image,
+                        )
+                        .map_err(HostError::from)
+                    });
+                HostTaskCompletion::ImageCandidateCleanup {
+                    record,
+                    reply,
+                    result,
+                }
+            }
+            Self::ImagePublish {
+                root,
+                record,
+                reply,
+            } => {
+                let result = record
+                    .image
+                    .as_ref()
+                    .ok_or(HostError::Invalid(
+                        "image publication has no reserved candidate",
+                    ))
+                    .and_then(|image| {
+                        crate::images::publish_candidate(
+                            &root,
+                            &record.operation_id,
+                            &record.request_digest,
+                            image,
+                        )
+                        .map_err(HostError::from)
+                    });
+                HostTaskCompletion::ImagePublish {
+                    record,
+                    reply,
+                    result,
+                }
+            }
             Self::SnapshotCleanup {
                 root,
                 endpoint,
@@ -4981,22 +5179,23 @@ mod tests {
                     },
                 )
                 .unwrap();
+            let candidate = sandsurf_state::ImageRecord {
+                digest: image.clone(),
+                source_digest: image.clone(),
+                platform: "linux".into(),
+                architecture: "amd64".into(),
+                logical_bytes: Counter::ONE,
+                storage_bytes: Counter::ONE,
+                provenance_digest: image.clone(),
+                sensitive: false,
+            };
             service
                 .catalog
-                .complete_image_import(
-                    &operation,
-                    &request,
-                    sandsurf_state::ImageRecord {
-                        digest: image.clone(),
-                        source_digest: image.clone(),
-                        platform: "linux".into(),
-                        architecture: "amd64".into(),
-                        logical_bytes: Counter::ONE,
-                        storage_bytes: Counter::ONE,
-                        provenance_digest: image.clone(),
-                        sensitive: false,
-                    },
-                )
+                .prepare_image_import(&operation, &request, candidate.clone())
+                .unwrap();
+            service
+                .catalog
+                .complete_image_import(&operation, &request, candidate)
                 .unwrap();
         }
         let resources = Resources::from_geometry(
@@ -5760,6 +5959,204 @@ mod tests {
     }
 
     #[test]
+    fn image_candidate_ownership_recovers_each_handoff_without_rebuilding_or_retaining_duplicates()
+    {
+        let fixture = crate::images::native_import_tests::Fixture::new();
+        let mut service = intent_service(&fixture.root);
+        let operation: OperationId = "candidate-handoff".try_into().unwrap();
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: fixture.manifest.clone(),
+            manifest_digest: fixture.digest.clone(),
+        };
+        let request = input.request_digest(&operation).unwrap();
+        service
+            .catalog
+            .admit_image_import(
+                operation.clone(),
+                input,
+                Approval {
+                    id: "approve-candidate-handoff".try_into().unwrap(),
+                    request_digest: request.clone(),
+                },
+            )
+            .unwrap();
+        let image = crate::images::import_native(
+            &fixture.root,
+            &fixture.manifest,
+            &fixture.digest,
+            &operation,
+            &request,
+        )
+        .unwrap();
+        let shared = fixture.root.join("images").join(image.digest.as_str());
+        let stage = fixture
+            .root
+            .join("images/imports")
+            .join(object_name(operation.as_str()));
+        assert!(!shared.exists());
+        fs::remove_dir_all(fixture.manifest.parent().unwrap()).unwrap();
+        let dispatch = service
+            .complete_task(HostTaskCompletion::Image {
+                operation: operation.clone(),
+                request_digest: request.clone(),
+                result: Ok(image.clone()),
+            })
+            .unwrap();
+        assert!(matches!(dispatch, HostDispatch::Task(_)));
+        assert!(service.catalog.image(&image.digest).unwrap().is_none());
+        drop(dispatch);
+        drop(service);
+        let service =
+            HostService::open(&fixture.root, fixture.root.join("absent-executable")).unwrap();
+        let prepared = service.catalog.image_import(&operation).unwrap().unwrap();
+        assert_eq!(prepared.phase, sandsurf_state::ImageImportPhase::Prepared);
+        let HostDispatch::Task(task) = service
+            .prepare_image_materialization(prepared.clone())
+            .unwrap()
+        else {
+            panic!("prepared publication was not detached");
+        };
+        let completion = task.execute();
+        assert!(shared.exists());
+        assert!(service.catalog.image(&image.digest).unwrap().is_none());
+        assert!(
+            crate::images::cleanup(&fixture.root, &image.digest).is_err(),
+            "original publication custody must exclude retirement"
+        );
+        drop(completion); // publication happened, but no catalog commit
+        drop(service);
+        let mut service =
+            HostService::open(&fixture.root, fixture.root.join("absent-executable")).unwrap();
+        let prepared = service.catalog.image_import(&operation).unwrap().unwrap();
+        let HostDispatch::Task(task) = service
+            .prepare_image_materialization(prepared.clone())
+            .unwrap()
+        else {
+            panic!("interrupted publication was not recovered");
+        };
+        let cleanup = service.complete_task(task.execute()).unwrap();
+        assert_eq!(
+            service.catalog.image(&image.digest).unwrap(),
+            Some(image.clone())
+        );
+        assert_eq!(
+            service
+                .catalog
+                .pending_image_candidate_cleanup(None, counter(1))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(stage.join("candidate").exists());
+        drop(cleanup); // ownership committed, reclamation interrupted
+        drop(service);
+        let mut service =
+            HostService::open(&fixture.root, fixture.root.join("absent-executable")).unwrap();
+        assert!(matches!(
+            service
+                .prepare_image_lookup(operation.clone(), ImageLookupReply::ImageImport)
+                .unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        let reader = sandsurf_native::storage::read_lease(
+            &fixture
+                .root
+                .join("images/imports")
+                .join(format!(".owner-{}", object_name(operation.as_str()))),
+        )
+        .unwrap();
+        let HostDispatch::Ready(_) = service
+            .complete_task(
+                HostTask::ImageCandidateCleanup {
+                    root: fixture.root.clone(),
+                    record: service.catalog.image_import(&operation).unwrap().unwrap(),
+                    reply: Some(ImageLookupReply::ImageImport),
+                }
+                .execute(),
+            )
+            .unwrap()
+        else {
+            panic!("a busy reader cannot undo publication");
+        };
+        assert!(stage.join("candidate").exists());
+        assert_eq!(
+            service
+                .catalog
+                .pending_image_candidate_cleanup(None, counter(1))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reader);
+        // A partial byte cleanup must resume from committed ownership, not
+        // demand a second verification of the already-transferred originals.
+        fs::remove_file(
+            stage
+                .join("candidate")
+                .join(image.digest.as_str())
+                .join("system.ext4"),
+        )
+        .unwrap();
+        let mut work = Vec::new();
+        service
+            .reconcile_candidate_page(
+                &mut ReconciliationCursor::default(),
+                &BTreeSet::new(),
+                1,
+                &mut work,
+            )
+            .unwrap();
+        let (_, HostDispatch::Task(task)) = work.pop().unwrap() else {
+            panic!("candidate cleanup was not recovered");
+        };
+        assert!(matches!(
+            service.complete_task(task.execute()).unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        assert!(!stage.join("candidate").exists());
+        assert!(stage.join("result.json").exists());
+        assert!(
+            service
+                .catalog
+                .pending_image_candidate_cleanup(None, counter(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(shared.join("system.ext4")).unwrap(),
+            b"opaque-system-seed"
+        );
+        assert!(matches!(
+            service
+                .complete_task(HostTaskCompletion::ImageInspect {
+                    record: prepared,
+                    reply: ImageLookupReply::HostOperation,
+                    result: Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "candidate reclaimed after inspection admission"
+                    )
+                    .into()),
+                })
+                .unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        // A late, exact worker response is an observation of the committed
+        // publication, not authorization to recreate a reclaimed candidate.
+        assert!(matches!(
+            service
+                .complete_task(HostTaskCompletion::Image {
+                    operation,
+                    request_digest: request,
+                    result: Ok(image),
+                })
+                .unwrap(),
+            HostDispatch::Ready(_)
+        ));
+        assert!(!stage.join("candidate").exists());
+        drop(service);
+    }
+
+    #[test]
     fn image_recovery_has_bounded_rotating_visits_and_busy_work_cannot_starve_later_recipes() {
         let mut nonce = [0; 8];
         getrandom::getrandom(&mut nonce).unwrap();
@@ -5955,22 +6352,23 @@ mod tests {
                 },
             )
             .unwrap();
+        let candidate = sandsurf_state::ImageRecord {
+            digest: image.clone(),
+            source_digest: image.clone(),
+            platform: "linux".into(),
+            architecture: "amd64".into(),
+            logical_bytes: Counter::ONE,
+            storage_bytes: Counter::ONE,
+            provenance_digest: image.clone(),
+            sensitive: false,
+        };
         service
             .catalog
-            .complete_image_import(
-                &import,
-                &request_digest,
-                sandsurf_state::ImageRecord {
-                    digest: image.clone(),
-                    source_digest: image.clone(),
-                    platform: "linux".into(),
-                    architecture: "amd64".into(),
-                    logical_bytes: Counter::ONE,
-                    storage_bytes: Counter::ONE,
-                    provenance_digest: image.clone(),
-                    sensitive: false,
-                },
-            )
+            .prepare_image_import(&import, &request_digest, candidate.clone())
+            .unwrap();
+        service
+            .catalog
+            .complete_image_import(&import, &request_digest, candidate)
             .unwrap();
         let bytes = root.join("images").join(image.as_str());
         prepare_directory(&bytes).unwrap();

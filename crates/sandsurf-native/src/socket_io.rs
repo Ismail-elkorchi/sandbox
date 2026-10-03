@@ -17,6 +17,12 @@ impl SocketConnection {
     pub fn connect(path: &Path, process_id: u32, timeout: Duration) -> io::Result<Self> {
         if process_id == 0
             || !path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
             || timeout.is_zero()
             || timeout > Duration::from_secs(300)
         {

@@ -49,7 +49,7 @@ export class Snapshot {
     const allowSensitive = options.allowSensitive ?? false;
     const approvalId = await this.#host[authorize]({ kind: "image-publish", machineId: this.inspection.machineId, operationId, request: { snapshotId: this.id, allowSensitive } });
     const response = await this.#host[transport]({ kind: "publish-snapshot-image", snapshotId: this.id, allowSensitive, operationId, approvalId });
-    if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("derived image response");
+    if (response.kind !== "image-import" || !record(response.operation) || response.operation.phase !== "published" || !record(response.operation.image)) throw protocol("derived image response");
     return new Image(parseImage(response.operation.image));
   }
   /** Retire snapshot bytes, not output archives or execution history. Native

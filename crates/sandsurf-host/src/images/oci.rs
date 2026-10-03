@@ -55,7 +55,7 @@ pub(crate) fn import(
             "recipe boot image architecture differs from the OCI filesystem".into(),
         ));
     }
-    let (stage, old) = prepare_import(host_root, operation, request_digest)?;
+    let (stage, old, _operation_custody) = prepare_import(host_root, operation, request_digest)?;
     if let Some(image) = old {
         return Ok(image);
     }
@@ -172,7 +172,7 @@ pub(crate) fn import(
     manifest_file.write_all(b"\n")?;
     manifest_file.sync_all()?;
     let verified = verify_image(&manifest_path, ImageTrust::ExplicitLocal)?;
-    let (final_root, verified) = publish_image(host_root, &verified)?;
+    let (final_root, verified) = publish_image(&stage, &verified)?;
     fs::remove_dir_all(&artifact)?;
     let image = image_record(&final_root, &verified)?;
     finish_import(&stage, request_digest, &image)?;

@@ -15,7 +15,7 @@ export class ImageCollection {
     const request = { manifestPath: options.manifestPath, manifestDigest };
     const approvalId = await this.#host[authorize]({ kind: "image-import", machineId: "host", operationId, request });
     const response = await this.#host[transport]({ kind: "import-native-image", ...request, operationId, approvalId });
-    if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("native image import response");
+    if (response.kind !== "image-import" || !record(response.operation) || response.operation.phase !== "published" || !record(response.operation.image)) throw protocol("native image import response");
     const image = parseImage(response.operation.image);
     if (image.digest !== manifestDigest) throw protocol("native image import identity");
     return new Image(image);
@@ -28,7 +28,7 @@ export class ImageCollection {
     const source = normalizeOciSource(options);
     const approvalId = await this.#host[authorize]({ kind: "image-import", machineId: "host", operationId, request: { source, recipe, platform } });
     const response = await this.#host[transport]({ kind: "import-oci", source, recipe, platform, operationId, approvalId });
-    if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("image import response");
+    if (response.kind !== "image-import" || !record(response.operation) || response.operation.phase !== "published" || !record(response.operation.image)) throw protocol("image import response");
     return new Image(parseImage(response.operation.image));
   }
   async get(digestValue: string): Promise<Image> {

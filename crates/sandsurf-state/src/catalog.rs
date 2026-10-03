@@ -16,10 +16,14 @@ CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL
 CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
-CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, input TEXT NOT NULL, dependency_image TEXT REFERENCES images(digest), dependency_snapshot TEXT REFERENCES snapshots(id), phase TEXT NOT NULL, image TEXT) STRICT;
-CREATE INDEX pending_image_imports ON image_imports(operation) WHERE json_extract(phase,'$')='admitted';
-CREATE INDEX pending_import_image ON image_imports(dependency_image) WHERE json_extract(phase,'$')='admitted';
-CREATE INDEX pending_import_snapshot ON image_imports(dependency_snapshot) WHERE json_extract(phase,'$')='admitted';
+CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, input TEXT NOT NULL, dependency_image TEXT REFERENCES images(digest), dependency_snapshot TEXT REFERENCES snapshots(id), phase TEXT NOT NULL, candidate TEXT, image TEXT, candidate_cleanup_pending INTEGER NOT NULL CHECK(candidate_cleanup_pending IN (0,1)),
+ CHECK(candidate_cleanup_pending=0 OR json_extract(phase,'$')='published'),
+ CHECK((json_extract(phase,'$')='admitted' AND candidate IS NULL AND image IS NULL) OR (json_extract(phase,'$')='prepared' AND candidate IS NOT NULL AND image IS NULL) OR (json_extract(phase,'$')='published' AND candidate IS NULL AND image IS NOT NULL))) STRICT;
+CREATE INDEX pending_image_imports ON image_imports(operation) WHERE json_extract(phase,'$')<>'published';
+CREATE INDEX pending_import_image ON image_imports(dependency_image) WHERE json_extract(phase,'$')<>'published';
+CREATE INDEX pending_import_snapshot ON image_imports(dependency_snapshot) WHERE json_extract(phase,'$')<>'published';
+CREATE INDEX prepared_image_target ON image_imports(json_extract(candidate,'$.digest')) WHERE json_extract(phase,'$')='prepared';
+CREATE INDEX pending_candidate_cleanup ON image_imports(operation) WHERE candidate_cleanup_pending=1;
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFERENCES images(digest), request_digest TEXT NOT NULL, cleanup_pending INTEGER NOT NULL) STRICT;
 CREATE INDEX pending_image_releases ON image_releases(operation) WHERE cleanup_pending=1;
@@ -99,6 +103,7 @@ pub enum ReservationState {
 #[serde(rename_all = "kebab-case")]
 pub enum ImageImportPhase {
     Admitted,
+    Prepared,
     Published,
 }
 
@@ -934,7 +939,7 @@ impl HostCatalog {
             image: None,
         };
         tx.execute(
-            "INSERT INTO image_imports VALUES (?1,?2,?3,?4,?5,?6,NULL)",
+            "INSERT INTO image_imports VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,0)",
             params![
                 value.operation_id.as_str(),
                 value.request_digest.as_str(),
@@ -948,7 +953,10 @@ impl HostCatalog {
         Ok(value)
     }
 
-    pub fn complete_image_import(
+    /// Reserve and bind a private materialization before shared publication.
+    /// A candidate is not yet an image from which a machine can be created.
+    /// Only this catalog owner may adopt it; builders own bytes, not authority.
+    pub fn prepare_image_import(
         &mut self,
         operation_id: &OperationId,
         request_digest: &Digest,
@@ -960,12 +968,12 @@ impl HostCatalog {
         if &old.request_digest != request_digest {
             return Err(Error::Conflict("image import request digest changed"));
         }
-        if old.phase == ImageImportPhase::Published {
+        if old.phase != ImageImportPhase::Admitted {
             return if old.image.as_ref() == Some(&image) {
                 Ok(old)
             } else {
                 Err(Error::Conflict(
-                    "image import already published another image",
+                    "image import already bound another candidate",
                 ))
             };
         }
@@ -981,17 +989,69 @@ impl HostCatalog {
                     "retired image cleanup must finish before re-import",
                 ));
             }
-        } else {
-            capacity(&tx, "images", self.limits.identities)?;
         }
-        if existing.as_ref().is_none_or(|(_, retired, _)| *retired) {
-            let mut reserved = image_storage_bytes(&tx)?;
-            reserved = reserved
-                .checked_add(image.storage_bytes.get())
-                .ok_or(Error::Capacity("image storage reservation overflow"))?;
-            if reserved > self.limits.image_bytes.get() {
-                return Err(Error::Capacity("image storage reservation exhausted"));
-            }
+        let mut reserved = reserved_images(&tx)?;
+        if let Some(previous) = reserved.insert(image.digest.as_str().to_owned(), image.clone())
+            && previous != image
+        {
+            return Err(Error::Conflict("image candidate metadata changed"));
+        }
+        let identities: u64 = tx.query_row(
+            "SELECT count(*) FROM (SELECT digest FROM images UNION SELECT json_extract(candidate,'$.digest') FROM image_imports WHERE json_extract(phase,'$')='prepared' UNION SELECT ?1)",
+            [image.digest.as_str()],
+            |row| row.get(0),
+        )?;
+        if identities > self.limits.identities.get()
+            || sum_image_storage(reserved.values())? > self.limits.image_bytes.get()
+        {
+            return Err(Error::Capacity("image candidate reservation exhausted"));
+        }
+        tx.execute(
+            "UPDATE image_imports SET phase=?2,candidate=?3 WHERE operation=?1",
+            params![
+                operation_id.as_str(),
+                encode(&ImageImportPhase::Prepared)?,
+                encode(&image)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ImageImportRecord {
+            operation_id: operation_id.clone(),
+            request_digest: request_digest.clone(),
+            phase: ImageImportPhase::Prepared,
+            image: Some(image),
+        })
+    }
+
+    pub fn complete_image_import(
+        &mut self,
+        operation_id: &OperationId,
+        request_digest: &Digest,
+        image: ImageRecord,
+    ) -> Result<ImageImportRecord> {
+        let tx = self.db.connection.transaction()?;
+        let old = image_import(&tx, operation_id)?
+            .ok_or(Error::Missing("image import operation is missing"))?;
+        if &old.request_digest != request_digest || old.image.as_ref() != Some(&image) {
+            return Err(Error::Conflict(
+                "image publication differs from its reserved candidate",
+            ));
+        }
+        if old.phase == ImageImportPhase::Published {
+            return Ok(old);
+        }
+        if old.phase != ImageImportPhase::Prepared {
+            return Err(Error::Conflict(
+                "image publication has no prepared reservation",
+            ));
+        }
+        let existing = image_state(&tx, &image.digest)?;
+        if let Some((previous, _, cleanup_pending)) = &existing
+            && (previous != &image || *cleanup_pending)
+        {
+            return Err(Error::Conflict(
+                "image publication conflicts with existing ownership",
+            ));
         }
         if existing.is_some() {
             tx.execute(
@@ -1005,7 +1065,7 @@ impl HostCatalog {
             )?;
         }
         tx.execute(
-            "UPDATE image_imports SET phase=?2,image=?3 WHERE operation=?1",
+            "UPDATE image_imports SET phase=?2,candidate=NULL,image=?3,candidate_cleanup_pending=1 WHERE operation=?1",
             params![
                 operation_id.as_str(),
                 encode(&ImageImportPhase::Published)?,
@@ -1025,6 +1085,58 @@ impl HostCatalog {
         image_import(&self.db.connection, operation)
     }
 
+    /// Publication transferred byte ownership to the immutable image store.
+    /// Reclaiming the private copy is a separately recoverable storage effect.
+    pub fn pending_image_candidate_cleanup(
+        &self,
+        after: Option<&OperationId>,
+        limit: Counter,
+    ) -> Result<Vec<ImageImportRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity(
+                "image candidate cleanup page limit must be in 1..=256",
+            ));
+        }
+        let mut statement = self.db.connection.prepare(
+            "SELECT operation FROM image_imports WHERE candidate_cleanup_pending=1 AND operation>?1 ORDER BY operation LIMIT ?2",
+        )?;
+        let operations = statement
+            .query_map(
+                params![after.map_or("", OperationId::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        operations
+            .into_iter()
+            .map(|operation| {
+                image_import(&self.db.connection, &operation.try_into()?)?
+                    .ok_or(Error::Corrupt("image candidate cleanup disappeared"))
+            })
+            .collect()
+    }
+
+    pub fn complete_image_candidate_cleanup(
+        &mut self,
+        operation: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<()> {
+        let tx = self.db.connection.transaction()?;
+        let record = image_import(&tx, operation)?.ok_or(Error::Missing(
+            "image candidate cleanup operation is missing",
+        ))?;
+        if record.request_digest != *request_digest || record.phase != ImageImportPhase::Published {
+            return Err(Error::Conflict(
+                "image candidate ownership has not transferred",
+            ));
+        }
+        tx.execute(
+            "UPDATE image_imports SET candidate_cleanup_pending=0 WHERE operation=?1",
+            [operation.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn image_import_input(&self, operation: &OperationId) -> Result<Option<ImageImportInput>> {
         image_import_input(&self.db.connection, operation)
     }
@@ -1040,7 +1152,7 @@ impl HostCatalog {
             ));
         }
         let mut statement = self.db.connection.prepare(
-            "SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND operation>?1 ORDER BY operation LIMIT ?2")?;
+            "SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND operation>?1 ORDER BY operation LIMIT ?2")?;
         let operations = statement
             .query_map(
                 params![after.map_or("", OperationId::as_str), limit.get()],
@@ -1122,7 +1234,7 @@ impl HostCatalog {
             return Err(Error::Conflict("retained snapshots pin this image"));
         }
         let import_references: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_image=?1)",
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$')<>'published' AND (dependency_image=?1 OR json_extract(candidate,'$.digest')=?1))",
             [image_digest.as_str()], |row| row.get(0))?;
         if import_references {
             return Err(Error::Conflict(
@@ -1252,7 +1364,7 @@ impl HostCatalog {
         for query in [
             "SELECT EXISTS(SELECT 1 FROM forks f JOIN machines m ON f.machine=m.id WHERE f.snapshot=?1 AND m.released=0 AND json_extract(f.value,'$.materializedDisk') IS NULL)",
             "SELECT EXISTS(SELECT 1 FROM rollbacks WHERE json_extract(value,'$.snapshotId')=?1 AND json_extract(value,'$.phase') IS NOT 'applied')",
-            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$')='admitted')",
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$')<>'published')",
         ] {
             if tx.query_row(query, [snapshot_id.as_str()], |row| row.get::<_, bool>(0))? {
                 return Err(Error::Conflict("pending host operation pins this snapshot"));
@@ -3151,7 +3263,9 @@ fn image_state(
     .transpose()
 }
 
-fn image_storage_bytes(db: &rusqlite::Connection) -> Result<u64> {
+fn reserved_images(
+    db: &rusqlite::Connection,
+) -> Result<std::collections::BTreeMap<String, ImageRecord>> {
     // Retirement gates new attachments immediately, but its storage remains
     // reserved until exact artifact cleanup is durably complete.
     let mut statement =
@@ -3159,10 +3273,31 @@ fn image_storage_bytes(db: &rusqlite::Connection) -> Result<u64> {
     let values = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut total = 0_u64;
+    let mut images = std::collections::BTreeMap::new();
     for value in values {
+        let image: ImageRecord = decode(&value)?;
+        images.insert(image.digest.as_str().to_owned(), image);
+    }
+    let mut statement =
+        db.prepare("SELECT candidate FROM image_imports WHERE json_extract(phase,'$')='prepared'")?;
+    for value in statement.query_map([], |row| row.get::<_, String>(0))? {
+        let image: ImageRecord = decode(&value?)?;
+        if let Some(previous) = images.insert(image.digest.as_str().to_owned(), image.clone())
+            && previous != image
+        {
+            return Err(Error::Corrupt(
+                "image reservations disagree about immutable metadata",
+            ));
+        }
+    }
+    Ok(images)
+}
+
+fn sum_image_storage<'a>(images: impl IntoIterator<Item = &'a ImageRecord>) -> Result<u64> {
+    let mut total = 0_u64;
+    for image in images {
         total = total
-            .checked_add(decode::<ImageRecord>(&value)?.storage_bytes.get())
+            .checked_add(image.storage_bytes.get())
             .ok_or(Error::Capacity("image storage reservation overflow"))?;
     }
     Ok(total)
@@ -3274,32 +3409,52 @@ fn image_import(
     db: &rusqlite::Connection,
     operation: &OperationId,
 ) -> Result<Option<ImageImportRecord>> {
-    let row: Option<(String, String, Option<String>, String)> = db
+    struct ImportRow {
+        request_digest: String,
+        phase: String,
+        candidate: Option<String>,
+        published: Option<String>,
+        input: String,
+    }
+    let row = db
         .query_row(
-            "SELECT request_digest,phase,image,input FROM image_imports WHERE operation=?1",
+            "SELECT request_digest,phase,candidate,image,input FROM image_imports WHERE operation=?1",
             [operation.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok(ImportRow { request_digest: row.get(0)?, phase: row.get(1)?, candidate: row.get(2)?, published: row.get(3)?, input: row.get(4)? }),
         )
         .optional()?;
-    row.map(|(request_digest, phase, image, input)| {
-        decode_image_input(operation, &request_digest, &input)?;
-        let image = image
-            .map(|digest| {
-                image_record(db, &Digest::try_from(digest)?)?
-                    .ok_or(Error::Corrupt("published image import has no image record"))
+    row.map(
+        |ImportRow {
+             request_digest,
+             phase,
+             candidate,
+             published,
+             input,
+         }| {
+            decode_image_input(operation, &request_digest, &input)?;
+            let phase: ImageImportPhase = decode(&phase)?;
+            if match phase {
+                ImageImportPhase::Admitted => candidate.is_some() || published.is_some(),
+                ImageImportPhase::Prepared => candidate.is_none() || published.is_some(),
+                ImageImportPhase::Published => candidate.is_some() || published.is_none(),
+            } {
+                return Err(Error::Corrupt("image import phase and result disagree"));
+            }
+            let image = published
+                .map(|digest| {
+                    image_record(db, &Digest::try_from(digest)?)?
+                        .ok_or(Error::Corrupt("published image import has no image record"))
+                })
+                .transpose()?;
+            let image = image.or(candidate.map(|value| decode(&value)).transpose()?);
+            Ok(ImageImportRecord {
+                operation_id: operation.clone(),
+                request_digest: request_digest.try_into()?,
+                phase,
+                image,
             })
-            .transpose()?;
-        let phase: ImageImportPhase = decode(&phase)?;
-        if (phase == ImageImportPhase::Published) != image.is_some() {
-            return Err(Error::Corrupt("image import phase and result disagree"));
-        }
-        Ok(ImageImportRecord {
-            operation_id: operation.clone(),
-            request_digest: request_digest.try_into()?,
-            phase,
-            image,
-        })
-    })
+        },
+    )
     .transpose()
 }
 fn save_intent(db: &rusqlite::Connection, value: &LifecycleIntent) -> Result<()> {

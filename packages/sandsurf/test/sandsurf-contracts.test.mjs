@@ -714,7 +714,7 @@ test("OCI conversion binds explicit boot artifacts into approval and admission",
   const host = new Sandsurf({ request: async (request) => {
     requests.push(request);
     assert.equal(request.kind, "import-oci");
-    return { kind: "image-import", operation: { image } };
+    return { kind: "image-import", operation: { phase: "published", image } };
   } }, async (change) => { approvals.push(change); return true; });
   const options = { source: { kind: "layout", path: "/images/source" },
     platform: "linux/amd64", operationId: "build-machine",
@@ -727,6 +727,24 @@ test("OCI conversion binds explicit boot artifacts into approval and admission",
   assert.equal(approvals.length, 1);
 });
 
+test("image preparation is observable but cannot produce a ready image handle", async () => {
+  const image = { digest: "a".repeat(64), sourceDigest: "b".repeat(64), platform: "linux", architecture: "amd64",
+    logicalBytes: 1024, storageBytes: 1024, provenanceDigest: "c".repeat(64), sensitive: false };
+  const operation = { operationId: "prepared-image", requestDigest: "d".repeat(64), phase: "prepared", image };
+  const host = new Sandsurf({ request: async (request) => request.kind === "get-host-operation"
+    ? { kind: "host-operation", value: { kind: "image-import", value: operation } }
+    : { kind: "image-import", operation } }, () => true);
+  const observed = (await host.operations.get(operation.operationId)).observation;
+  assert.equal(observed.observation.phase, "prepared");
+  assert.equal(observed.observation.image.digest, image.digest);
+  await assert.rejects(host.images.importNative({
+    manifestPath: process.platform === "win32" ? "C:\\images\\manifest.json" : "/images/manifest.json",
+    manifestDigest: image.digest, operationId: operation.operationId,
+  }), SandsurfHostError);
+  await assert.rejects(host.images.importOCI({ source: { kind: "layout", path: "/images/source" },
+    platform: "linux/amd64", operationId: operation.operationId, recipe: { bootImage: image.digest } }), SandsurfHostError);
+});
+
 test("native image import binds immutable input authority and rejects mismatched publication", async () => {
   const requests = [];
   const approvals = [];
@@ -734,7 +752,7 @@ test("native image import binds immutable input authority and rejects mismatched
     logicalBytes: 1024, storageBytes: 1024, provenanceDigest: "c".repeat(64), sensitive: true };
   const host = new Sandsurf({ request: async (request) => {
     requests.push(request);
-    return { kind: "image-import", operation: { image } };
+    return { kind: "image-import", operation: { phase: "published", image } };
   } }, async (change) => { approvals.push(change); return true; });
   const manifestPath = process.platform === "win32" ? "C:\\images\\manifest.json" : "/images/manifest.json";
   const options = { manifestPath, manifestDigest: image.digest, operationId: "native-image" };

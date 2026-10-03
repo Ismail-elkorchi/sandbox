@@ -492,23 +492,7 @@ impl ImageStage {
         validate_digest(digest)?;
         sandsurf_native::local::ensure_private_directory(store)?;
         let lease_path = store.join(format!(".image-owner-{digest}"));
-        let lease = match sandsurf_native::local::create_private_file(&lease_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                sandsurf_native::local::open_private_file(
-                    &lease_path,
-                    sandsurf_native::PrivateFileAccess::ReadWrite,
-                )?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        lease.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "image materialization already has an owner",
-            ),
-            std::fs::TryLockError::Error(error) => error,
-        })?;
+        let lease = sandsurf_native::storage::disk_lease(&lease_path)?;
         let path = store.join(format!(".image-stage-{digest}"));
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {

@@ -146,21 +146,20 @@ impl Fixture {
             },
         )
         .unwrap();
-        host.complete_image_import(
-            &import,
-            &request,
-            ImageRecord {
-                digest: image.clone(),
-                source_digest: image.clone(),
-                platform: "linux".into(),
-                architecture: "amd64".into(),
-                logical_bytes: n(1),
-                storage_bytes: n(1),
-                provenance_digest: image.clone(),
-                sensitive: false,
-            },
-        )
-        .unwrap();
+        let candidate = ImageRecord {
+            digest: image.clone(),
+            source_digest: image.clone(),
+            platform: "linux".into(),
+            architecture: "amd64".into(),
+            logical_bytes: n(1),
+            storage_bytes: n(1),
+            provenance_digest: image.clone(),
+            sensitive: false,
+        };
+        host.prepare_image_import(&import, &request, candidate.clone())
+            .unwrap();
+        host.complete_image_import(&import, &request, candidate)
+            .unwrap();
         let defaults = ExecutionDefaults::default();
         let request_digest = digest(
             Domain::Machine,
