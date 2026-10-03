@@ -233,6 +233,11 @@ pub enum HostRequest {
     GetSnapshot {
         snapshot_id: SnapshotId,
     },
+    ReleaseSnapshot {
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    },
     CreateSnapshot {
         request: SnapshotRequest,
         approval_id: CommitmentId,
@@ -513,6 +518,9 @@ pub enum HostResponse {
     },
     Snapshot {
         value: Snapshot,
+    },
+    SnapshotRelease {
+        operation: sandsurf_state::SnapshotReleaseRecord,
     },
     Rollback {
         value: RollbackRecord,

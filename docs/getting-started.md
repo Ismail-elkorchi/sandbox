@@ -216,6 +216,14 @@ Each retained event's digest and cursor coverage are checked before its public
 projection is returned. The digest identifies the retained wire event, not the
 SDK's projected value. `machine.snapshots.rollback()` returns the same
 reconnectable `Operation` model; it does not silently replace live handles.
+`snapshot.release({ operationId? })` returns a host-owned retirement operation.
+Pending forks, rollback, suspension and image publication prevent retirement;
+completed independent copies do not pin their source. Retirement blocks new
+uses, but storage remains charged until detached cleanup commits. A full-state
+snapshot can remain cleanup-pending while its source VMM retains native input
+custody, including after control-channel loss. `host.operations.get(id)` observes
+that progress after reconnection. Released snapshot metadata and lineage remain
+readable; release never removes retained execution output or receipts.
 Authorized resource geometry is available at
 `inspection.runtimeConfiguration.resources`, not a competing top-level copy.
 The computer state format and native SDK bridge are version 1. Incompatible

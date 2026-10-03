@@ -6,7 +6,7 @@ import type { OutputBoundary } from "./sandsurf-protocol.js";
 
 export type DesiredMachineState = "running" | "paused" | "stopped" | "suspended" | "destroyed";
 
-export interface AuthorityChange { readonly kind: "machine-create" | "lifecycle" | "image-import" | "image-publish" | "image-release" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "snapshot" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery" | "secret-revocation"; readonly machineId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
+export interface AuthorityChange { readonly kind: "machine-create" | "lifecycle" | "image-import" | "image-publish" | "image-release" | "evidence-loss" | "host-import" | "host-export" | "host-apply" | "snapshot" | "snapshot-release" | "fork" | "resource-increase" | "network-access" | "port-exposure" | "secret-delivery" | "secret-revocation"; readonly machineId: string; readonly operationId: string; readonly request: Readonly<Record<string, unknown>>; }
 
 export type AuthorityDecision = boolean | { readonly approvalId: string };
 
@@ -58,7 +58,7 @@ export type SnapshotKind = "disk" | "full";
 
 export type SnapshotConsistency = "crash" | "machine";
 
-export interface SnapshotInspection { readonly id: string; readonly operationId: string; readonly machineId: string; readonly expectedGeneration: number; readonly expectedRevision: number; readonly kind: SnapshotKind; readonly parent: string | null; readonly requestDigest: string; readonly phase: "admitted" | "capturing" | "ready"; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly consistency: SnapshotConsistency | null; readonly systemDiskDigest: string | null; readonly systemDiskBytes: number; readonly manifestDigest: string | null; readonly sensitive: boolean; }
+export interface SnapshotInspection { readonly id: string; readonly operationId: string; readonly machineId: string; readonly expectedGeneration: number; readonly expectedRevision: number; readonly kind: SnapshotKind; readonly parent: string | null; readonly requestDigest: string; readonly phase: "admitted" | "capturing" | "ready" | "retiring" | "released"; readonly imageDigest: string; readonly resources: Required<ResourceEnvelope>; readonly consistency: SnapshotConsistency | null; readonly systemDiskDigest: string | null; readonly systemDiskBytes: number; readonly manifestDigest: string | null; readonly sensitive: boolean; }
 
 export interface SnapshotCreateOptions extends MachineGenerationPrecondition, MachineRevisionPrecondition { readonly id?: string; readonly operationId?: string; readonly kind?: SnapshotKind; readonly parent?: string; }
 
@@ -176,6 +176,7 @@ export type OperationObservation =
   | { readonly kind: "secret-put"; readonly secret: SecretVersion; readonly applied: boolean }
   | { readonly kind: "secret-revocation"; readonly revocation: SecretRevocation }
   | { readonly kind: "snapshot"; readonly snapshot: SnapshotInspection }
+  | { readonly kind: "snapshot-release"; readonly snapshotId: string; readonly cleanupPending: boolean }
   | { readonly kind: "rollback"; readonly snapshotId: string; readonly expectedRevision: number; readonly phase: "admitted" | "applied"; readonly evidenceDigest: string | null }
   | { readonly kind: "guest"; readonly generation: number; readonly requestKind: "spawn" | "close-input" | "write-input" | "acquire-terminal-input" | "release-terminal-input" | "resize-terminal" | "signal" | "terminate" | "filesystem"; readonly delivery: OperationDelivery; readonly evidenceDigest: string | null }
   | { readonly kind: "receipt-acknowledgement"; readonly executionId: string; readonly receiptDigest: string }

@@ -83,7 +83,9 @@ mod native {
     use std::mem::size_of;
     use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
     use std::path::{Path, PathBuf};
-    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        ERROR_NO_MORE_FILES, ERROR_NOT_A_REPARSE_POINT, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         FindFirstVolumeMountPointW, FindNextVolumeMountPointW, FindVolumeMountPointClose,
@@ -129,7 +131,14 @@ mod native {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(
+                if error.raw_os_error() == Some(ERROR_NOT_A_REPARSE_POINT as i32) {
+                    unsupported("provision a whole NTFS volume at the exact storage root")
+                } else {
+                    error
+                },
+            );
         }
         let value = terminated(&output)?;
         if !volume_guid(&value) {

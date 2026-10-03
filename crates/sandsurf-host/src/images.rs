@@ -288,6 +288,11 @@ pub fn publish_snapshot(
     operation: &OperationId,
     request_digest: &Digest,
 ) -> Result<ImageRecord, ImageBuildError> {
+    let _snapshot_custody = crate::snapshots::retain_input(
+        &crate::snapshots::root(host_root, snapshot),
+        &snapshot.request.id,
+    )
+    .map_err(|error| ImageBuildError::Invalid(error.to_string()))?;
     if snapshot.phase != SnapshotPhase::Ready
         || snapshot.system_disk_digest.is_none()
         || snapshot.manifest_digest.is_none()

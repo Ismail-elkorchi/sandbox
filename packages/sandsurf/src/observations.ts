@@ -47,6 +47,7 @@ export function parseOperationRecord(raw: unknown, expectedId: string, expectedM
         observation = { kind, secret: parseSecret(value.secret), applied: operationBoolean(value.applied) }; break;
       case "secret-revocation": observation = { kind, revocation: parseSecretRevocation(value) }; break;
       case "snapshot": observation = { kind, snapshot: parseSnapshot(value) }; break;
+      case "snapshot-release": observation = { kind, snapshotId: validateIdentity(text(value.snapshotId)), cleanupPending: operationBoolean(value.cleanupPending) }; break;
       case "rollback": {
         const phase = text(value.phase); const evidenceDigest = operationEvidence(value.evidenceDigest);
         if ((phase !== "admitted" && phase !== "applied") || integer(value.expectedRevision) < 1 || (phase === "applied" && evidenceDigest === null)) throw protocol("rollback observation");
@@ -562,7 +563,7 @@ export function parseSnapshot(value: unknown): SnapshotInspection {
   const consistency = value.consistency === null ? null : text(value.consistency) as SnapshotConsistency;
   if (consistency !== null && !["crash", "machine"].includes(consistency)) throw protocol("snapshot consistency");
   const kind = text(value.request.kind) as SnapshotKind; if (kind !== "disk" && kind !== "full") throw protocol("snapshot kind");
-  const phase = text(value.phase) as SnapshotInspection["phase"]; if (!["admitted", "capturing", "ready"].includes(phase)) throw protocol("snapshot phase");
+  const phase = text(value.phase) as SnapshotInspection["phase"]; if (!["admitted", "capturing", "ready", "retiring", "released"].includes(phase)) throw protocol("snapshot phase");
   return { id: validateIdentity(text(value.request.id)), operationId: validateIdentity(text(value.request.operationId)), machineId: validateIdentity(text(value.request.machineId)), expectedGeneration: integer(value.request.expectedGeneration), expectedRevision: integer(value.request.expectedRevision), kind, parent: value.request.parent === null ? null : validateIdentity(text(value.request.parent)), requestDigest: digest(text(value.requestDigest)), phase, imageDigest: digest(text(value.imageDigest)), resources: parseResources(value.resources), consistency, systemDiskDigest: value.systemDiskDigest === null ? null : digest(text(value.systemDiskDigest)), systemDiskBytes: integer(value.systemDiskBytes), manifestDigest: value.manifestDigest === null ? null : digest(text(value.manifestDigest)), sensitive: operationBoolean(value.sensitive) };
 }
 

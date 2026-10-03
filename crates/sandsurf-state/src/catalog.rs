@@ -11,6 +11,7 @@ CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NUL
 CREATE TABLE machines(id TEXT PRIMARY KEY, image TEXT NOT NULL, configuration TEXT NOT NULL, defaults TEXT NOT NULL, lifetime TEXT NOT NULL, activity INTEGER NOT NULL, revision INTEGER NOT NULL, sensitive INTEGER NOT NULL CHECK(sensitive IN (0,1)), released INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE INDEX active_machines ON machines(id) WHERE released=0;
 CREATE TABLE intents(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
+CREATE INDEX completed_terminal_intents ON intents(machine) WHERE json_extract(value,'$.desired') IN ('stopped','destroyed') AND json_extract(value,'$.completion') IS NOT NULL;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
@@ -29,11 +30,17 @@ CREATE TABLE secret_puts(operation TEXT PRIMARY KEY, request_digest TEXT NOT NUL
 CREATE TABLE snapshots(id TEXT PRIMARY KEY, operation TEXT UNIQUE NOT NULL, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE INDEX capturing_disk_snapshots ON snapshots(id) WHERE json_extract(value,'$.phase')='capturing' AND json_extract(value,'$.request.kind')='disk';
 CREATE INDEX snapshot_image ON snapshots(json_extract(value,'$.imageDigest'));
+CREATE INDEX retained_snapshot_capacity ON snapshots(machine) WHERE json_extract(value,'$.phase') IS NOT 'released';
+CREATE TABLE snapshot_releases(operation TEXT PRIMARY KEY, snapshot TEXT UNIQUE NOT NULL REFERENCES snapshots(id), value TEXT NOT NULL) STRICT;
+CREATE INDEX pending_snapshot_releases ON snapshot_releases(operation) WHERE json_extract(value,'$.cleanupPending')=1;
 CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), value TEXT NOT NULL) STRICT;
 CREATE UNIQUE INDEX pending_rollback_machine ON rollbacks(machine) WHERE json_extract(value,'$.phase') IS NOT 'applied';
+CREATE INDEX pending_rollback_snapshot ON rollbacks(json_extract(value,'$.snapshotId')) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
 CREATE TABLE suspensions(machine TEXT PRIMARY KEY REFERENCES machines(id), value TEXT NOT NULL) STRICT;
+CREATE INDEX suspension_snapshot ON suspensions(json_extract(value,'$.snapshotId'));
 CREATE TABLE forks(machine TEXT PRIMARY KEY REFERENCES machines(id), operation TEXT UNIQUE NOT NULL REFERENCES intents(id), snapshot TEXT NOT NULL REFERENCES snapshots(id), value TEXT NOT NULL) STRICT;
+CREATE INDEX pending_fork_snapshot ON forks(snapshot,machine) WHERE json_extract(value,'$.materializedDisk') IS NULL;
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +128,16 @@ pub struct ForkRecord {
 pub struct ImageReleaseRecord {
     pub operation_id: OperationId,
     pub image_digest: Digest,
+    pub request_digest: Digest,
+    pub cleanup_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotReleaseRecord {
+    pub operation_id: OperationId,
+    pub machine_id: MachineId,
+    pub snapshot_id: SnapshotId,
     pub request_digest: Digest,
     pub cleanup_pending: bool,
 }
@@ -237,6 +254,7 @@ pub enum HostOperationRecord {
     SecretPut(SecretPutRecord),
     SecretRevocation(SecretRevocationRecord),
     Snapshot(Box<Snapshot>),
+    SnapshotRelease(SnapshotReleaseRecord),
     Rollback(RollbackRecord),
 }
 
@@ -249,6 +267,7 @@ impl HostOperationRecord {
             Self::SecretDelivery(value) => Some(&value.machine_id),
             Self::SecretRevocation(value) => Some(&value.machine_id),
             Self::Snapshot(value) => Some(&value.request.machine_id),
+            Self::SnapshotRelease(value) => Some(&value.machine_id),
             Self::Rollback(value) => Some(&value.machine_id),
             Self::ImageImport(_) | Self::ImageRelease(_) | Self::SecretPut(_) => None,
         }
@@ -359,6 +378,9 @@ impl HostCatalog {
         }
         if let Some(value) = image_release(db, operation)? {
             result.push(HostOperationRecord::ImageRelease(value));
+        }
+        if let Some(value) = snapshot_release(db, operation)? {
+            result.push(HostOperationRecord::SnapshotRelease(value));
         }
         if let Some(value) = db
             .query_row(
@@ -1088,7 +1110,7 @@ impl HostCatalog {
             return Err(Error::Conflict("active machines pin this image"));
         }
         let snapshot_references: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshots WHERE json_extract(value,'$.imageDigest')=?1)",
+            "SELECT EXISTS(SELECT 1 FROM snapshots WHERE json_extract(value,'$.imageDigest')=?1 AND json_extract(value,'$.phase') IS NOT 'released')",
             [image_digest.as_str()],
             |row| row.get(0),
         )?;
@@ -1188,6 +1210,135 @@ impl HostCatalog {
         snapshot_record(&self.db.connection, id)
     }
 
+    /// Retirement closes admission before any filesystem deletion. Historical
+    /// snapshot/lineage identities remain readable; only physical dependencies
+    /// pin bytes. A completed independent fork does not pin its source forever.
+    pub fn release_snapshot(
+        &mut self,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        approval: Approval,
+    ) -> Result<SnapshotReleaseRecord> {
+        let request_digest = digest(
+            Domain::Snapshot,
+            &("sandsurf-release-snapshot-v1", &operation_id, &snapshot_id),
+        )?;
+        if approval.request_digest != request_digest {
+            return Err(Error::Conflict("snapshot release approval mismatch"));
+        }
+        let tx = self.db.connection.transaction()?;
+        if let Some(old) = snapshot_release(&tx, &operation_id)? {
+            return if old.snapshot_id == snapshot_id && old.request_digest == request_digest {
+                Ok(old)
+            } else {
+                Err(Error::Conflict(
+                    "snapshot release operation identity conflict",
+                ))
+            };
+        }
+        host_operation_identity_available(&tx, &operation_id)?;
+        let mut snapshot =
+            snapshot_record(&tx, &snapshot_id)?.ok_or(Error::Missing("snapshot does not exist"))?;
+        if snapshot.phase != SnapshotPhase::Ready {
+            return Err(Error::Conflict("only a ready snapshot can be retired"));
+        }
+        for query in [
+            "SELECT EXISTS(SELECT 1 FROM forks f JOIN machines m ON f.machine=m.id WHERE f.snapshot=?1 AND m.released=0 AND json_extract(f.value,'$.materializedDisk') IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM rollbacks WHERE json_extract(value,'$.snapshotId')=?1 AND json_extract(value,'$.phase') IS NOT 'applied')",
+            "SELECT EXISTS(SELECT 1 FROM suspensions WHERE json_extract(value,'$.snapshotId')=?1)",
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$')='admitted')",
+        ] {
+            if tx.query_row(query, [snapshot_id.as_str()], |row| row.get::<_, bool>(0))? {
+                return Err(Error::Conflict("pending host operation pins this snapshot"));
+            }
+        }
+        capacity(&tx, "snapshot_releases", self.limits.operations)?;
+        record_approval(&tx, &approval, self.limits.operations)?;
+        let record = SnapshotReleaseRecord {
+            operation_id,
+            machine_id: snapshot.request.machine_id.clone(),
+            snapshot_id,
+            request_digest,
+            cleanup_pending: true,
+        };
+        snapshot.phase = SnapshotPhase::Retiring;
+        tx.execute(
+            "INSERT INTO snapshot_releases VALUES (?1,?2,?3)",
+            params![
+                record.operation_id.as_str(),
+                record.snapshot_id.as_str(),
+                encode(&record)?
+            ],
+        )?;
+        tx.execute(
+            "UPDATE snapshots SET value=?2 WHERE id=?1",
+            params![snapshot.request.id.as_str(), encode(&snapshot)?],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Called by the catalog owner only after the detached storage task has
+    /// durably removed the complete owned payload closure.
+    pub fn complete_snapshot_release(
+        &mut self,
+        operation: &OperationId,
+        request_digest: &Digest,
+    ) -> Result<SnapshotReleaseRecord> {
+        let tx = self.db.connection.transaction()?;
+        let mut record = snapshot_release(&tx, operation)?
+            .ok_or(Error::Missing("snapshot release is missing"))?;
+        if record.request_digest != *request_digest {
+            return Err(Error::Conflict("snapshot release request changed"));
+        }
+        let mut snapshot = snapshot_record(&tx, &record.snapshot_id)?
+            .ok_or(Error::Corrupt("retired snapshot disappeared"))?;
+        if !matches!(
+            snapshot.phase,
+            SnapshotPhase::Retiring | SnapshotPhase::Released
+        ) {
+            return Err(Error::Corrupt("snapshot retirement phase changed"));
+        }
+        record.cleanup_pending = false;
+        snapshot.phase = SnapshotPhase::Released;
+        tx.execute(
+            "UPDATE snapshot_releases SET value=?2 WHERE operation=?1",
+            params![operation.as_str(), encode(&record)?],
+        )?;
+        tx.execute(
+            "UPDATE snapshots SET value=?2 WHERE id=?1",
+            params![record.snapshot_id.as_str(), encode(&snapshot)?],
+        )?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    pub fn pending_snapshot_releases(
+        &self,
+        after: Option<&OperationId>,
+        limit: Counter,
+    ) -> Result<Vec<SnapshotReleaseRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity(
+                "snapshot cleanup page limit must be in 1..=256",
+            ));
+        }
+        let mut statement = self.db.connection.prepare("SELECT operation FROM snapshot_releases WHERE json_extract(value,'$.cleanupPending')=1 AND operation>?1 ORDER BY operation LIMIT ?2")?;
+        let operations = statement
+            .query_map(
+                params![after.map_or("", OperationId::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        operations
+            .into_iter()
+            .map(|operation| {
+                snapshot_release(&self.db.connection, &operation.try_into()?)?
+                    .ok_or(Error::Corrupt("pending snapshot retirement disappeared"))
+            })
+            .collect()
+    }
+
     pub fn suspension(&self, machine: &MachineId) -> Result<Option<SuspensionRecord>> {
         self.db
             .connection
@@ -1213,6 +1364,12 @@ impl HostCatalog {
             .ok_or(Error::Missing("suspension snapshot is missing"))?;
         let lifecycle = intent(&tx, lifecycle_operation)?
             .ok_or(Error::Missing("suspension lifecycle intent is missing"))?;
+        let superseded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM intents WHERE machine=?1 AND json_extract(value,'$.desired') IN ('stopped','destroyed') AND json_extract(value,'$.completion') IS NOT NULL AND rowid>(SELECT rowid FROM intents WHERE id=?2))", params![machine.as_str(), lifecycle_operation.as_str()], |row| row.get(0))?;
+        if superseded {
+            return Err(Error::Conflict(
+                "completed native stop supersedes suspension association",
+            ));
+        }
         if snapshot.request.machine_id != *machine
             || snapshot.request.kind != SnapshotKind::Full
             || snapshot.phase != SnapshotPhase::Ready
@@ -1476,6 +1633,12 @@ impl HostCatalog {
         }
         if value.phase == SnapshotPhase::Ready {
             return Ok(value);
+        }
+        if !matches!(
+            value.phase,
+            SnapshotPhase::Admitted | SnapshotPhase::Capturing
+        ) {
+            return Err(Error::Conflict("retired snapshot cannot resume capture"));
         }
         value.phase = SnapshotPhase::Capturing;
         self.db.connection.execute(
@@ -2327,6 +2490,14 @@ impl HostCatalog {
             "UPDATE intents SET value=?2 WHERE id=?1",
             params![value.operation_id.as_str(), encode(&value)?],
         )?;
+        if matches!(
+            value.desired,
+            DesiredState::Stopped | DesiredState::Destroyed
+        ) {
+            // Applied stop/destruction discards resumable RAM intent. A late
+            // historical completion cannot clear a newer suspension owner.
+            tx.execute("DELETE FROM suspensions WHERE machine=?1 AND json_extract(value,'$.lifecycleOperationId') IN (SELECT id FROM intents WHERE machine=?1 AND rowid<(SELECT rowid FROM intents WHERE id=?2))", params![value.machine_id.as_str(), value.operation_id.as_str()])?;
+        }
         tx.commit()?;
         Ok(value)
     }
@@ -2758,10 +2929,12 @@ fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<
         let expected = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &value.request))?;
         if value.request.id != *id
             || value.request_digest != expected
-            || (value.phase == SnapshotPhase::Ready)
-                != (value.consistency.is_some()
-                    && value.system_disk_digest.is_some()
-                    && value.manifest_digest.is_some())
+            || matches!(
+                value.phase,
+                SnapshotPhase::Ready | SnapshotPhase::Retiring | SnapshotPhase::Released
+            ) != (value.consistency.is_some()
+                && value.system_disk_digest.is_some()
+                && value.manifest_digest.is_some())
         {
             return Err(Error::Corrupt("snapshot record is inconsistent"));
         }
@@ -2825,7 +2998,7 @@ fn snapshot_charge(resources: &Resources, kind: SnapshotKind) -> Result<u64> {
 }
 
 fn snapshot_capacity_held(db: &rusqlite::Connection, machine: &MachineId) -> Result<u64> {
-    let mut statement = db.prepare("SELECT value FROM snapshots WHERE machine=?1")?;
+    let mut statement = db.prepare("SELECT value FROM snapshots WHERE machine=?1 AND json_extract(value,'$.phase') IS NOT 'released'")?;
     let mut total = 0_u64;
     for row in statement.query_map([machine.as_str()], |row| row.get::<_, String>(0))? {
         let record: Snapshot = decode(&row?)?;
@@ -2935,7 +3108,7 @@ fn host_operation_identity_available(
     operation: &OperationId,
 ) -> Result<()> {
     let used: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM intents WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM transfer_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM image_imports WHERE operation=?1) OR EXISTS(SELECT 1 FROM image_releases WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_puts WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_deliveries WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_revocations WHERE operation=?1) OR EXISTS(SELECT 1 FROM snapshots WHERE operation=?1) OR EXISTS(SELECT 1 FROM rollbacks WHERE operation=?1)",
+        "SELECT EXISTS(SELECT 1 FROM intents WHERE id=?1) OR EXISTS(SELECT 1 FROM configuration_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM transfer_operations WHERE id=?1) OR EXISTS(SELECT 1 FROM image_imports WHERE operation=?1) OR EXISTS(SELECT 1 FROM image_releases WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_puts WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_deliveries WHERE operation=?1) OR EXISTS(SELECT 1 FROM secret_revocations WHERE operation=?1) OR EXISTS(SELECT 1 FROM snapshots WHERE operation=?1) OR EXISTS(SELECT 1 FROM snapshot_releases WHERE operation=?1) OR EXISTS(SELECT 1 FROM rollbacks WHERE operation=?1)",
         [operation.as_str()],
         |row| row.get(0),
     )?;
@@ -3022,6 +3195,46 @@ fn image_release(
             request_digest: request.try_into()?,
             cleanup_pending,
         })
+    })
+    .transpose()
+}
+
+fn snapshot_release(
+    db: &rusqlite::Connection,
+    operation: &OperationId,
+) -> Result<Option<SnapshotReleaseRecord>> {
+    db.query_row(
+        "SELECT snapshot,value FROM snapshot_releases WHERE operation=?1",
+        [operation.as_str()],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()?
+    .map(|(id, value)| {
+        let record: SnapshotReleaseRecord = decode(&value)?;
+        let snapshot = snapshot_record(db, &record.snapshot_id)?
+            .ok_or(Error::Corrupt("snapshot retirement lost its payload owner"))?;
+        if record.operation_id != *operation
+            || record.snapshot_id.as_str() != id
+            || record.machine_id != snapshot.request.machine_id
+            || record.request_digest
+                != digest(
+                    Domain::Snapshot,
+                    &(
+                        "sandsurf-release-snapshot-v1",
+                        operation,
+                        &record.snapshot_id,
+                    ),
+                )?
+            || snapshot.phase
+                != if record.cleanup_pending {
+                    SnapshotPhase::Retiring
+                } else {
+                    SnapshotPhase::Released
+                }
+        {
+            return Err(Error::Corrupt("snapshot retirement binding changed"));
+        }
+        Ok(record)
     })
     .transpose()
 }

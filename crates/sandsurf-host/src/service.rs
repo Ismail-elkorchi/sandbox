@@ -178,18 +178,21 @@ struct ReconciliationCursor {
     next_domain: usize,
     after_image: Option<OperationId>,
     after_import: Option<OperationId>,
+    after_snapshot_release: Option<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ReconciliationIdentity {
     Machine(MachineId),
     Image(OperationId),
+    SnapshotRelease(OperationId),
 }
 impl fmt::Display for ReconciliationIdentity {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Machine(id) => write!(output, "machine {}", id.as_str()),
             Self::Image(id) => write!(output, "image operation {}", id.as_str()),
+            Self::SnapshotRelease(id) => write!(output, "snapshot release {}", id.as_str()),
         }
     }
 }
@@ -272,6 +275,11 @@ impl HostService {
                 self.prepare_image_lookup(operation_id, ImageLookupReply::ImageImport)
             }
             request @ HostRequest::ReleaseImage { .. } => self.prepare_image_release(request),
+            HostRequest::ReleaseSnapshot {
+                snapshot_id,
+                operation_id,
+                approval_id,
+            } => self.admit_snapshot_release(snapshot_id, operation_id, approval_id),
             HostRequest::CreateSnapshot {
                 request,
                 approval_id,
@@ -1274,6 +1282,9 @@ impl HostService {
             | HostRequest::ReleaseImage { .. } => Err(HostError::Invalid(
                 "image verification and cleanup require detached effects",
             )),
+            HostRequest::ReleaseSnapshot { .. } => Err(HostError::Invalid(
+                "snapshot release requires detached cleanup",
+            )),
             HostRequest::ListImages { after, maximum } => Ok(HostResponse::Images {
                 values: self.catalog.images(after.as_ref(), maximum)?,
             }),
@@ -1610,6 +1621,51 @@ impl HostService {
             root: self.root.clone(),
             record,
             reply: true,
+        })))
+    }
+
+    fn admit_snapshot_release(
+        &mut self,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+        approval_id: CommitmentId,
+    ) -> Result<HostDispatch> {
+        let request_digest = digest(
+            Domain::Snapshot,
+            &("sandsurf-release-snapshot-v1", &operation_id, &snapshot_id),
+        )?;
+        let record = self.catalog.release_snapshot(
+            operation_id,
+            snapshot_id,
+            Approval {
+                id: approval_id,
+                request_digest,
+            },
+        )?;
+        self.prepare_snapshot_release(record, true)
+    }
+
+    fn prepare_snapshot_release(
+        &self,
+        record: sandsurf_state::SnapshotReleaseRecord,
+        reply: bool,
+    ) -> Result<HostDispatch> {
+        if !record.cleanup_pending {
+            return Ok(HostDispatch::Ready(Box::new(
+                HostResponse::SnapshotRelease { operation: record },
+            )));
+        }
+        let snapshot = self
+            .catalog
+            .snapshot(&record.snapshot_id)?
+            .ok_or(HostError::Invalid(
+                "snapshot release lost its ownership record",
+            ))?;
+        Ok(HostDispatch::Task(Box::new(HostTask::SnapshotCleanup {
+            root: self.root.clone(),
+            snapshot: Box::new(snapshot),
+            record,
+            reply,
         })))
     }
 
@@ -2231,6 +2287,28 @@ impl HostService {
                     HostResponse::Complete
                 })
             }
+            HostTaskCompletion::SnapshotCleanup {
+                record,
+                reply,
+                result,
+            } => {
+                let operation = match result {
+                    Ok(()) => self
+                        .catalog
+                        .complete_snapshot_release(&record.operation_id, &record.request_digest)?,
+                    Err(HostError::Snapshot(crate::snapshots::SnapshotError::Io(error)))
+                        if error.kind() == io::ErrorKind::WouldBlock =>
+                    {
+                        record
+                    }
+                    Err(error) => return Err(error),
+                };
+                Ok(if reply {
+                    HostResponse::SnapshotRelease { operation }
+                } else {
+                    HostResponse::Complete
+                })
+            }
             HostTaskCompletion::ImageInspect {
                 record,
                 reply,
@@ -2397,13 +2475,14 @@ impl HostService {
         // Rotate the first domain so a single free slot cannot starve either
         // snapshot publication, lifecycle policy or independently owned images.
         let first = cursor.next_domain;
-        cursor.next_domain = (first + 1) % 4;
-        for offset in 0..4 {
-            match (first + offset) % 4 {
+        cursor.next_domain = (first + 1) % 5;
+        for offset in 0..5 {
+            match (first + offset) % 5 {
                 0 => self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?,
                 1 => self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?,
                 2 => self.reconcile_image_page(cursor, busy, slots, &mut work)?,
                 3 => self.reconcile_import_page(cursor, busy, slots, &mut work)?,
+                4 => self.reconcile_snapshot_release_page(cursor, busy, slots, &mut work)?,
                 _ => unreachable!(),
             }
         }
@@ -2570,6 +2649,39 @@ impl HostService {
             capturing: Box::new(snapshot),
             provision: Some(provision),
         })))
+    }
+
+    fn reconcile_snapshot_release_page(
+        &self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<ReconciliationIdentity>,
+        slots: usize,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let records = self.catalog.pending_snapshot_releases(
+            cursor.after_snapshot_release.as_ref(),
+            counter(remaining as u64),
+        )?;
+        let at_end = records.len() < remaining;
+        for record in records {
+            cursor.after_snapshot_release = Some(record.operation_id.clone());
+            let identity = ReconciliationIdentity::SnapshotRelease(record.operation_id.clone());
+            if busy.contains(&identity) {
+                continue;
+            }
+            match self.prepare_snapshot_release(record, false) {
+                Ok(dispatch) => work.push((identity, dispatch)),
+                Err(error) => eprintln!("sandsurf snapshot retirement recovery deferred: {error}"),
+            }
+        }
+        if at_end {
+            cursor.after_snapshot_release = None;
+        }
+        Ok(())
     }
 
     fn reconcile_machine(
@@ -3369,6 +3481,7 @@ fn capture_snapshot(
     let request = &capturing.request;
     let capture_root = crate::snapshots::root(root, capturing);
     crate::snapshots::private_directory(&capture_root)?;
+    let _snapshot_custody = crate::snapshots::retain_input(&capture_root, &request.id)?;
     let _custody = sandsurf_native::storage::disk_lease(&capture_root.join(format!(
         ".{}.task.lock",
         object_name(request.operation_id.as_str())
@@ -3514,6 +3627,12 @@ fn capture_full_state(
 }
 
 enum HostTask {
+    SnapshotCleanup {
+        root: PathBuf,
+        snapshot: Box<Snapshot>,
+        record: sandsurf_state::SnapshotReleaseRecord,
+        reply: bool,
+    },
     ImageCleanup {
         root: PathBuf,
         record: sandsurf_state::ImageReleaseRecord,
@@ -3630,6 +3749,11 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    SnapshotCleanup {
+        record: sandsurf_state::SnapshotReleaseRecord,
+        reply: bool,
+        result: Result<()>,
+    },
     ImageCleanup {
         record: sandsurf_state::ImageReleaseRecord,
         reply: bool,
@@ -3731,6 +3855,20 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::SnapshotCleanup {
+                root,
+                snapshot,
+                record,
+                reply,
+            } => {
+                let result =
+                    crate::snapshots::cleanup(&root, &snapshot, &record).map_err(HostError::from);
+                HostTaskCompletion::SnapshotCleanup {
+                    record,
+                    reply,
+                    result,
+                }
+            }
             Self::ImageCleanup {
                 root,
                 record,
@@ -5990,6 +6128,147 @@ mod tests {
         assert_eq!(record.latest_intent.desired, DesiredState::Stopped);
         assert!(record.latest_intent.completion.is_none());
         assert_eq!(record.reservation, ReservationState::Held);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_retirement_recovers_after_disconnect_and_busy_readers_never_complete_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "sssnapret-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let machine = admit_machine(&mut service, "box", MachineLifetime::default());
+        let request = SnapshotRequest {
+            id: "snapshot".try_into().unwrap(),
+            operation_id: "capture".try_into().unwrap(),
+            machine_id: machine.clone(),
+            expected_generation: Counter::ONE,
+            expected_revision: Counter::ONE,
+            kind: SnapshotKind::Disk,
+            parent: None,
+        };
+        let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+        service
+            .catalog
+            .admit_snapshot(
+                request.clone(),
+                Approval {
+                    id: "approve-snapshot".try_into().unwrap(),
+                    request_digest: request_digest.clone(),
+                },
+            )
+            .unwrap();
+        service
+            .catalog
+            .begin_snapshot(&request.id, &request_digest)
+            .unwrap();
+        let snapshot = service
+            .catalog
+            .complete_snapshot(
+                &request.id,
+                &request_digest,
+                bytes_digest(b"disk"),
+                bytes_digest(b"manifest"),
+                SnapshotConsistency::Crash,
+            )
+            .unwrap();
+        prepare_directory(&root.join("machines")).unwrap();
+        prepare_directory(&root.join("machines").join(object_name(machine.as_str()))).unwrap();
+        let snapshots = crate::snapshots::root(&root, &snapshot);
+        prepare_directory(&snapshots).unwrap();
+        let payload = snapshots.join(object_name(request.id.as_str()));
+        prepare_directory(&payload).unwrap();
+        std::io::Write::write_all(
+            &mut sandsurf_native::local::create_private_file(&payload.join("system.ext4")).unwrap(),
+            b"disk",
+        )
+        .unwrap();
+        let original = crate::snapshots::retain_input(&snapshots, &request.id).unwrap();
+        let operation: OperationId = "release-snapshot".try_into().unwrap();
+        let HostDispatch::Task(task) = service.route(HostRequest::ReleaseSnapshot {
+            snapshot_id: request.id.clone(),
+            operation_id: operation.clone(),
+            approval_id: "approve-release".try_into().unwrap(),
+        }) else {
+            panic!("snapshot deletion ran on catalog owner");
+        };
+        assert!(payload.exists());
+        let HostDispatch::Ready(response) = service.complete_task(task.execute()).unwrap() else {
+            panic!("busy retirement must return its durable operation");
+        };
+        assert!(
+            matches!(*response, HostResponse::SnapshotRelease { operation: record } if record.cleanup_pending)
+        );
+        assert!(payload.exists());
+        drop(service); // committed retirement, no filesystem mutation
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        assert!(payload.exists());
+        assert_eq!(
+            service
+                .catalog
+                .snapshot(&request.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            SnapshotPhase::Retiring
+        );
+        drop(original);
+        let mut cursor = ReconciliationCursor {
+            next_domain: 4,
+            ..Default::default()
+        };
+        let work = service
+            .reconcile_lifetime_policies(&mut cursor, &BTreeSet::new(), 1)
+            .unwrap();
+        let (identity, HostDispatch::Task(task)) = work.into_iter().next().unwrap() else {
+            panic!("retirement must recover through its original task");
+        };
+        assert_eq!(
+            identity,
+            ReconciliationIdentity::SnapshotRelease(operation.clone())
+        );
+        let completion = task.execute();
+        assert!(
+            matches!(
+                &completion,
+                HostTaskCompletion::SnapshotCleanup { result: Ok(()), .. }
+            ),
+            "recovered snapshot retirement must finish physical cleanup"
+        );
+        assert!(!payload.exists());
+        assert_eq!(
+            service
+                .catalog
+                .snapshot(&request.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            SnapshotPhase::Retiring,
+            "file deletion cannot commit catalog authority"
+        );
+        service.complete_task(completion).unwrap();
+        assert_eq!(
+            service
+                .catalog
+                .snapshot(&request.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            SnapshotPhase::Released
+        );
+        assert!(
+            service
+                .catalog
+                .pending_snapshot_releases(None, Counter::ONE)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            matches!(service.handle(HostRequest::GetHostOperation { operation_id: operation }), HostResponse::HostOperation { value: Some(sandsurf_state::HostOperationRecord::SnapshotRelease(record)) } if !record.cleanup_pending)
+        );
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }

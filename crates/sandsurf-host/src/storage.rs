@@ -423,6 +423,13 @@ pub(crate) fn observe_detached(disk: &Path) -> io::Result<Option<sandsurf_protoc
     Ok(Some(evidence))
 }
 
+/// Retain original slot exclusion while retiring native saved-state inputs.
+/// A restored VMM may still map their memory file. A power report or missing
+/// guardian handle cannot discharge that physical dependency.
+pub(crate) fn detached_custody(disk: &Path) -> io::Result<fs::File> {
+    Ok(DiskOwner::open(disk, None)?.lease)
+}
+
 /// Replace a detached disk under an already journaled host operation. The
 /// native owner must have released its attachment before entry. Power state
 /// alone is not a storage lease. Original bytes survive until the replacement

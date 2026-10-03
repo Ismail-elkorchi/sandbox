@@ -528,6 +528,11 @@ impl QemuGuardianEffect {
         operation_id: sandsurf_protocol::OperationId,
         journal: &mut RuntimeJournal,
     ) -> ControlResult<NativeSnapshotResponse> {
+        let _snapshot_custody =
+            crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
+                .map_err(|_| {
+                    ControlError::Unsupported("full snapshot storage is retired or unavailable")
+                })?;
         self.prepare_capture_boundary(operation_id.clone(), journal)?;
         let directory = qemu_full_capture_directory(&self.machine_root, &operation_id);
         if directory.join("capture.json").exists() {
@@ -656,6 +661,11 @@ impl QemuGuardianEffect {
             .machine_root
             .join("snapshots")
             .join(object_name(snapshot_id.as_str()));
+        let _snapshot_custody =
+            crate::snapshots::retain_input(&self.machine_root.join("snapshots"), &snapshot_id)
+                .map_err(|_| {
+                    ControlError::Unsupported("full snapshot inputs are retired or unavailable")
+                })?;
         for (name, artifact) in [
             ("system.ext4", &system_disk),
             ("snapshot.vmstate", &expected.snapshot_state),

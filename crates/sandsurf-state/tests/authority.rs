@@ -41,6 +41,617 @@ fn image_input(manifest_digest: Digest) -> ImageImportInput {
         manifest_digest,
     }
 }
+
+fn ready_snapshot(f: &mut Fixture, name: &str) -> Snapshot {
+    let request = SnapshotRequest {
+        id: name.try_into().unwrap(),
+        operation_id: format!("capture-{name}").try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: f
+            .host
+            .machine(&f.machine)
+            .unwrap()
+            .unwrap()
+            .configuration_revision,
+        kind: SnapshotKind::Disk,
+        parent: None,
+    };
+    let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+    let id = request.id.clone();
+    f.host
+        .admit_snapshot(
+            request,
+            Approval {
+                id: format!("approve-{name}").try_into().unwrap(),
+                request_digest: request_digest.clone(),
+            },
+        )
+        .unwrap();
+    f.host.begin_snapshot(&id, &request_digest).unwrap();
+    f.host
+        .complete_snapshot(
+            &id,
+            &request_digest,
+            hash("disk"),
+            hash("manifest"),
+            SnapshotConsistency::Crash,
+        )
+        .unwrap()
+}
+
+fn admitted_lifecycle(f: &mut Fixture, name: &str, desired: DesiredState) -> LifecycleIntent {
+    let expected = f
+        .host
+        .machine(&f.machine)
+        .unwrap()
+        .unwrap()
+        .configuration_revision;
+    let operation: OperationId = name.try_into().unwrap();
+    let request_digest = digest(
+        Domain::Operation,
+        &(&f.machine, &operation, expected, desired),
+    )
+    .unwrap();
+    f.host
+        .request_lifecycle(
+            &f.machine,
+            operation.clone(),
+            expected,
+            desired,
+            Approval {
+                id: format!("approve-{name}").try_into().unwrap(),
+                request_digest,
+            },
+        )
+        .unwrap()
+}
+
+fn complete_lifecycle(
+    f: &mut Fixture,
+    intent: &LifecycleIntent,
+    state: MachineState,
+) -> LifecycleIntent {
+    let mut observation = f
+        .runtime
+        .last_observation()
+        .unwrap()
+        .unwrap()
+        .value()
+        .clone();
+    observation.sequence = n(observation.sequence.get() + 1);
+    observation.applied_revision = intent.revision;
+    observation.state = state;
+    observation.cause = ObservationCause::Lifecycle {
+        operation_id: intent.operation_id.clone(),
+    };
+    observation.evidence_digest = hash(intent.operation_id.as_str());
+    let evidence = f.runtime.observe(observation).unwrap();
+    f.host.complete_intent(&evidence).unwrap()
+}
+
+fn completed_lifecycle(
+    f: &mut Fixture,
+    name: &str,
+    desired: DesiredState,
+    state: MachineState,
+) -> LifecycleIntent {
+    let intent = admitted_lifecycle(f, name, desired);
+    complete_lifecycle(f, &intent, state)
+}
+
+#[test]
+fn suspended_state_pins_snapshot_until_applied_stop_and_late_association_cannot_resurrect_it() {
+    let mut f = Fixture::new();
+    let intent = admitted_lifecycle(&mut f, "suspend", DesiredState::Suspended);
+    let request = SnapshotRequest {
+        id: "suspended".try_into().unwrap(),
+        operation_id: "capture-full".try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(intent.revision.get() - 1),
+        kind: SnapshotKind::Full,
+        parent: None,
+    };
+    let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+    f.host
+        .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+        .unwrap();
+    f.host.begin_snapshot(&request.id, &request_digest).unwrap();
+    f.host
+        .complete_full_snapshot(
+            &request.id,
+            &request_digest,
+            hash("disk"),
+            hash("manifest"),
+            SnapshotConsistency::Machine,
+            FullSnapshotMetadata {
+                engine: VmEngine::Firecracker,
+                engine_version: "fixture".into(),
+                architecture: "amd64".into(),
+                configuration_digest: hash("configuration"),
+                snapshot_state: SnapshotArtifact {
+                    digest: hash("state"),
+                    bytes: n(1),
+                },
+                memory: Some(SnapshotArtifact {
+                    digest: hash("memory"),
+                    bytes: n(1),
+                }),
+                reconnect_state: SnapshotArtifact {
+                    digest: hash("reconnect"),
+                    bytes: n(1),
+                },
+                executions: Vec::new(),
+                generation: hash("generation"),
+                fork_safe: false,
+            },
+        )
+        .unwrap();
+    complete_lifecycle(&mut f, &intent, MachineState::Suspended);
+    f.host
+        .record_suspension(
+            &f.machine,
+            &intent.operation_id,
+            &request.id,
+            &hash("manifest"),
+        )
+        .unwrap();
+    let release: OperationId = "release-suspended".try_into().unwrap();
+    let approval = Approval {
+        id: "approve-release-suspended".try_into().unwrap(),
+        request_digest: digest(
+            Domain::Snapshot,
+            &("sandsurf-release-snapshot-v1", &release, &request.id),
+        )
+        .unwrap(),
+    };
+    assert!(
+        f.host
+            .release_snapshot(release.clone(), request.id.clone(), approval.clone())
+            .is_err()
+    );
+    completed_lifecycle(
+        &mut f,
+        "power-off",
+        DesiredState::Stopped,
+        MachineState::Stopped,
+    );
+    assert!(f.host.suspension(&f.machine).unwrap().is_none());
+    assert!(matches!(
+        f.host.record_suspension(
+            &f.machine,
+            &intent.operation_id,
+            &request.id,
+            &hash("manifest")
+        ),
+        Err(Error::Conflict(_))
+    ));
+    f.host
+        .release_snapshot(release, request.id, approval)
+        .unwrap();
+}
+
+#[test]
+fn substituted_snapshot_retirement_is_rejected_intact_and_recovery_uses_indexes() {
+    let mut f = Fixture::new();
+    let snapshot = ready_snapshot(&mut f, "source");
+    let operation: OperationId = "retire-source".try_into().unwrap();
+    let record = f
+        .host
+        .release_snapshot(
+            operation.clone(),
+            snapshot.request.id.clone(),
+            Approval {
+                id: "approve-retire-source".try_into().unwrap(),
+                request_digest: digest(
+                    Domain::Snapshot,
+                    &(
+                        "sandsurf-release-snapshot-v1",
+                        &operation,
+                        &snapshot.request.id,
+                    ),
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    let path = f.root.0.join("host");
+    drop(f.host);
+    let database = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    for (query, index) in [
+        (
+            "SELECT operation FROM snapshot_releases WHERE json_extract(value,'$.cleanupPending')=1 AND operation>'' ORDER BY operation LIMIT 32",
+            "pending_snapshot_releases",
+        ),
+        (
+            "SELECT value FROM snapshots WHERE machine='box' AND json_extract(value,'$.phase') IS NOT 'released'",
+            "retained_snapshot_capacity",
+        ),
+        (
+            "SELECT machine FROM forks WHERE snapshot='source' AND json_extract(value,'$.materializedDisk') IS NULL",
+            "pending_fork_snapshot",
+        ),
+        (
+            "SELECT operation FROM rollbacks WHERE json_extract(value,'$.snapshotId')='source' AND json_extract(value,'$.phase') IS NOT 'applied'",
+            "pending_rollback_snapshot",
+        ),
+        (
+            "SELECT machine FROM suspensions WHERE json_extract(value,'$.snapshotId')='source'",
+            "suspension_snapshot",
+        ),
+    ] {
+        let mut statement = database
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let plans = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plans.iter().any(|plan| plan.contains(index)),
+            "{query}: {plans:?}"
+        );
+    }
+    let mut altered = record.clone();
+    altered.machine_id = "another-machine".try_into().unwrap();
+    let encoded = serde_json::to_string(&altered).unwrap();
+    database
+        .execute(
+            "UPDATE snapshot_releases SET value=?2 WHERE operation=?1",
+            rusqlite::params![operation.as_str(), encoded],
+        )
+        .unwrap();
+    drop(database);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert!(matches!(host.operation(&operation), Err(Error::Corrupt(_))));
+    assert!(host.pending_snapshot_releases(None, n(32)).is_err());
+    assert!(
+        host.complete_snapshot_release(&operation, &record.request_digest)
+            .is_err()
+    );
+    assert_eq!(
+        host.snapshot(&snapshot.request.id).unwrap().unwrap().phase,
+        SnapshotPhase::Retiring
+    );
+    drop(host);
+    let database = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT value FROM snapshot_releases WHERE operation=?1",
+                [operation.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        encoded
+    );
+}
+
+#[test]
+fn snapshot_retirement_waits_for_actual_deletion_reopens_and_never_releases_output() {
+    let mut f = Fixture::new();
+    let original_receipt = f.terminal();
+    let mut configuration = f
+        .host
+        .machine(&f.machine)
+        .unwrap()
+        .unwrap()
+        .runtime_configuration;
+    configuration.resources.snapshot_bytes =
+        n(2 * (configuration.resources.disk_bytes.get() + 64 * 1024 * 1024));
+    let budget_operation: OperationId = "snapshot-budget".try_into().unwrap();
+    let budget_digest = digest(
+        Domain::Authority,
+        &(
+            "sandsurf-machine-resources-v1",
+            &f.machine,
+            &budget_operation,
+            n(2),
+            &configuration.resources,
+        ),
+    )
+    .unwrap();
+    f.host
+        .update_resources(
+            &f.machine,
+            &budget_operation,
+            n(2),
+            configuration.resources,
+            Approval {
+                id: "approve-budget".try_into().unwrap(),
+                request_digest: budget_digest,
+            },
+        )
+        .unwrap();
+    let snapshot = ready_snapshot(&mut f, "source");
+    let operation: OperationId = "release-source".try_into().unwrap();
+    let approval = Approval {
+        id: "approve-release-source".try_into().unwrap(),
+        request_digest: digest(
+            Domain::Snapshot,
+            &(
+                "sandsurf-release-snapshot-v1",
+                &operation,
+                &snapshot.request.id,
+            ),
+        )
+        .unwrap(),
+    };
+    let record = f
+        .host
+        .release_snapshot(
+            operation.clone(),
+            snapshot.request.id.clone(),
+            approval.clone(),
+        )
+        .unwrap();
+    assert!(record.cleanup_pending);
+    assert_eq!(
+        f.host
+            .snapshot(&snapshot.request.id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        SnapshotPhase::Retiring
+    );
+    assert!(
+        f.host
+            .begin_snapshot(&snapshot.request.id, &snapshot.request_digest)
+            .is_err()
+    );
+    let next = SnapshotRequest {
+        id: "next".try_into().unwrap(),
+        operation_id: "capture-next".try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(3),
+        kind: SnapshotKind::Disk,
+        parent: None,
+    };
+    let next_approval = Approval {
+        id: "approve-next".try_into().unwrap(),
+        request_digest: digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &next)).unwrap(),
+    };
+    assert!(matches!(
+        f.host.admit_snapshot(next.clone(), next_approval.clone()),
+        Err(Error::Capacity(_))
+    ));
+    let path = f.root.0.join("host");
+    drop(f.host);
+    f.host = HostCatalog::open(&path).unwrap();
+    assert_eq!(
+        f.host
+            .release_snapshot(operation.clone(), snapshot.request.id.clone(), approval)
+            .unwrap(),
+        record
+    );
+    assert_eq!(
+        f.host.pending_snapshot_releases(None, n(1)).unwrap(),
+        std::slice::from_ref(&record)
+    );
+    assert!(
+        f.host
+            .pending_snapshot_releases(None, Counter::ZERO)
+            .is_err()
+    );
+    assert!(
+        f.host
+            .complete_snapshot_release(&operation, &hash("wrong"))
+            .is_err()
+    );
+    assert!(
+        f.host
+            .operation(&operation)
+            .unwrap()
+            .is_some_and(|v| matches!(v, HostOperationRecord::SnapshotRelease(r) if r == record))
+    );
+    let released = f
+        .host
+        .complete_snapshot_release(&operation, &record.request_digest)
+        .unwrap();
+    assert!(!released.cleanup_pending);
+    assert_eq!(
+        f.host
+            .complete_snapshot_release(&operation, &record.request_digest)
+            .unwrap(),
+        released
+    );
+    assert!(
+        f.host
+            .pending_snapshot_releases(None, n(1))
+            .unwrap()
+            .is_empty()
+    );
+    let history = f.host.snapshot(&snapshot.request.id).unwrap().unwrap();
+    assert_eq!(history.phase, SnapshotPhase::Released);
+    assert_eq!(history.system_disk_digest, snapshot.system_disk_digest);
+    assert_eq!(history.manifest_digest, snapshot.manifest_digest);
+    f.host.admit_snapshot(next, next_approval).unwrap();
+    assert_eq!(
+        f.runtime.receipt(&f.process).unwrap(),
+        Some(original_receipt),
+        "snapshot release must not delete or rewrite execution evidence"
+    );
+    assert_eq!(
+        f.runtime
+            .read_output(&f.process, Counter::ZERO, 64)
+            .unwrap()
+            .cursor,
+        n(13)
+    );
+}
+
+#[test]
+fn pending_fork_rollback_and_image_publication_pin_snapshot_bytes_but_not_completed_copies() {
+    let mut f = Fixture::new();
+    let snapshot = ready_snapshot(&mut f, "source");
+    let operation: OperationId = "release-source".try_into().unwrap();
+    let approval = Approval {
+        id: "approve-release-source".try_into().unwrap(),
+        request_digest: digest(
+            Domain::Snapshot,
+            &(
+                "sandsurf-release-snapshot-v1",
+                &operation,
+                &snapshot.request.id,
+            ),
+        )
+        .unwrap(),
+    };
+    let fork: MachineId = "fork".try_into().unwrap();
+    let fork_operation: OperationId = "create-fork".try_into().unwrap();
+    let fork_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-fork-v1",
+            &snapshot.request.id,
+            &fork,
+            resources(),
+            MachineLifetime::default(),
+            &fork_operation,
+        ),
+    )
+    .unwrap();
+    f.host
+        .create_machine_from_snapshot(
+            fork.clone(),
+            &snapshot.request.id,
+            resources(),
+            MachineLifetime::default(),
+            fork_operation.clone(),
+            Approval {
+                id: "approve-fork-retention".try_into().unwrap(),
+                request_digest: fork_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        f.host.release_snapshot(
+            operation.clone(),
+            snapshot.request.id.clone(),
+            approval.clone()
+        ),
+        Err(Error::Conflict(_))
+    ));
+    f.host
+        .complete_fork_materialization(
+            &fork,
+            &fork_operation,
+            &fork_digest,
+            hash("independent-copy"),
+        )
+        .unwrap();
+    let rollback_operation: OperationId = "rollback-source".try_into().unwrap();
+    let rollback_digest = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-rollback-v1",
+            &f.machine,
+            &snapshot.request.id,
+            &rollback_operation,
+            n(2),
+        ),
+    )
+    .unwrap();
+    f.host
+        .admit_rollback(
+            &f.machine,
+            &snapshot.request.id,
+            rollback_operation.clone(),
+            n(2),
+            Approval {
+                id: "approve-rollback-retention".try_into().unwrap(),
+                request_digest: rollback_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert!(
+        f.host
+            .release_snapshot(
+                operation.clone(),
+                snapshot.request.id.clone(),
+                approval.clone()
+            )
+            .is_err()
+    );
+    f.host
+        .complete_rollback(
+            &rollback_operation,
+            &rollback_digest,
+            hash("replacement-complete"),
+        )
+        .unwrap();
+    let publish_operation: OperationId = "publish-source".try_into().unwrap();
+    let input = ImageImportInput::PublishSnapshot {
+        snapshot: Box::new(snapshot.clone()),
+        allow_sensitive: true,
+    };
+    let publish_digest = input.request_digest(&publish_operation).unwrap();
+    f.host
+        .admit_image_import(
+            publish_operation.clone(),
+            input,
+            Approval {
+                id: "approve-publication-retention".try_into().unwrap(),
+                request_digest: publish_digest.clone(),
+            },
+        )
+        .unwrap();
+    assert!(
+        f.host
+            .release_snapshot(
+                operation.clone(),
+                snapshot.request.id.clone(),
+                approval.clone()
+            )
+            .is_err()
+    );
+    f.host
+        .complete_image_import(
+            &publish_operation,
+            &publish_digest,
+            image("published-copy", 100),
+        )
+        .unwrap();
+    f.host
+        .release_snapshot(operation.clone(), snapshot.request.id.clone(), approval)
+        .unwrap();
+    let late: MachineId = "late-fork".try_into().unwrap();
+    let late_operation: OperationId = "late-fork-operation".try_into().unwrap();
+    let late_request = digest(
+        Domain::Snapshot,
+        &(
+            "sandsurf-filesystem-fork-v1",
+            &snapshot.request.id,
+            &late,
+            resources(),
+            MachineLifetime::default(),
+            &late_operation,
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        f.host.create_machine_from_snapshot(
+            late.clone(),
+            &snapshot.request.id,
+            resources(),
+            MachineLifetime::default(),
+            late_operation,
+            Approval {
+                id: "approve-late-fork".try_into().unwrap(),
+                request_digest: late_request
+            }
+        ),
+        Err(Error::Conflict(_))
+    ));
+    assert!(f.host.machine(&late).unwrap().is_none());
+    assert!(matches!(
+        f.host.operation(&operation).unwrap(),
+        Some(HostOperationRecord::SnapshotRelease(_))
+    ));
+}
 fn resources() -> Resources {
     Resources::from_geometry(n(2), n(4096), n(100_000), n(1000), n(8))
         .expect("static resource envelope")

@@ -25,6 +25,41 @@ test("machine storage identities are explicit and obsolete resource fields are r
   const malformed = new Sandsurf({ request: async () => ({ kind: "machine", value: view }) }, () => true);
   await assert.rejects(malformed.machines.connect("box"), (error) => error.category === "protocol");
 });
+
+test("snapshot retirement returns durable host status and validates the exact released identity", async () => {
+  const resources = fixtureView().runtimeConfiguration.resources;
+  const snapshot = { request: { id: "snapshot", operationId: "capture", machineId: "box", expectedGeneration: 1, expectedRevision: 1, kind: "disk", parent: null }, requestDigest: "a".repeat(64), phase: "ready", imageDigest: "b".repeat(64), resources, consistency: "crash", systemDiskDigest: "c".repeat(64), systemDiskBytes: resources.diskBytes, manifestDigest: "d".repeat(64), sensitive: false, full: null };
+  let pending = true;
+  const changes = [];
+  const requests = [];
+  const release = { operationId: "release", machineId: "box", snapshotId: "snapshot", requestDigest: sandsurfDigest("snapshot", ["sandsurf-release-snapshot-v1", "release", "snapshot"]), cleanupPending: true };
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request.kind);
+    if (request.kind === "get-snapshot") return { kind: "snapshot", value: { ...snapshot, phase: pending ? "ready" : "released" } };
+    if (request.kind === "release-snapshot") { assert.equal(request.snapshotId, "snapshot"); return { kind: "snapshot-release", operation: release }; }
+    assert.equal(request.kind, "get-host-operation");
+    return { kind: "host-operation", value: { kind: "snapshot-release", value: { ...release, cleanupPending: pending } } };
+  } }, (change) => { changes.push(change); return true; });
+  const handle = await host.snapshots.get("snapshot");
+  const operation = await handle.release({ operationId: "release" });
+  assert.ok(operation instanceof Operation);
+  assert.deepEqual(operation.observation.observation, { kind: "snapshot-release", snapshotId: "snapshot", cleanupPending: true });
+  assert.equal(operation.observation.machineId, "box");
+  pending = false;
+  assert.equal(operation.observation.observation.cleanupPending, true);
+  assert.equal((await operation.inspect()).observation.cleanupPending, false);
+  assert.equal((await host.snapshots.get("snapshot")).inspection.phase, "released");
+  assert.equal(handle.inspection.phase, "ready", "cached handles are observations, not retirement authority");
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].kind, "snapshot-release");
+  assert.deepEqual(changes[0].request, { snapshotId: "snapshot" });
+  assert.deepEqual(requests, ["get-snapshot", "release-snapshot", "get-host-operation", "get-snapshot"]);
+  for (const mutation of [{ operationId: "other" }, { machineId: "other" }, { snapshotId: "other" }, { cleanupPending: "false" }, { requestDigest: "e".repeat(64) }]) {
+    const malformed = new Sandsurf({ request: async (request) => request.kind === "get-snapshot" ? { kind: "snapshot", value: snapshot } : { kind: "snapshot-release", operation: { ...release, ...mutation } } }, () => true);
+    const stale = await malformed.snapshots.get("snapshot");
+    await assert.rejects(stale.release({ operationId: "release" }), (error) => error.category === "protocol");
+  }
+});
 function completedState() {
   return { kind: "exited", outcome: { kind: "exit", code: 0 }, accountingDigest: "c".repeat(64), cleanupDigest: "d".repeat(64),
     output: { finalCursor: 0, chunks: 0, stdoutBytes: 0, stderrBytes: 0, terminalBytes: 0, omittedBytes: 0, finalHash: "a".repeat(64) } };

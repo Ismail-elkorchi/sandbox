@@ -54,6 +54,22 @@ fn frame() -> Frame {
 }
 
 #[test]
+fn ordinary_private_directory_is_not_a_bounded_volume_or_a_transport_failure() {
+    use sandsurf_native::local::create_private_file;
+    let root = Root::new();
+    let payload = root.0.join("retain-original");
+    create_private_file(&payload)
+        .unwrap()
+        .write_all(b"retained original")
+        .unwrap();
+    let error = sandsurf_native::volume::inspect(&root.0).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("whole NTFS volume"));
+    assert_eq!(fs::read(payload).unwrap(), b"retained original");
+    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+}
+
+#[test]
 fn private_storage_is_owner_only_and_refuses_hard_link_aliases() {
     use sandsurf_native::local::{
         create_private_file, ensure_private_directory, open_private_file,

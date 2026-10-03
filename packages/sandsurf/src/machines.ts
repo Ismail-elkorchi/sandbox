@@ -52,6 +52,17 @@ export class Snapshot {
     if (response.kind !== "image-import" || !record(response.operation) || !record(response.operation.image)) throw protocol("derived image response");
     return new Image(parseImage(response.operation.image));
   }
+  /** Retire snapshot bytes, not output archives or execution history. Native
+   * full-state readers can leave cleanup pending until their VMM detaches. */
+  async release(options: { readonly operationId?: string } = {}): Promise<Operation> {
+    const operationId = validateIdentity(options.operationId ?? identity("release-snapshot"));
+    const approvalId = await this.#host[authorize]({ kind: "snapshot-release", machineId: this.inspection.machineId, operationId, request: { snapshotId: this.id } });
+    const response = await this.#host[transport]({ kind: "release-snapshot", snapshotId: this.id, operationId, approvalId });
+    if (response.kind !== "snapshot-release" || !record(response.operation)) throw protocol("snapshot release response");
+    const observation = parseOperationRecord({ kind: "snapshot-release", value: response.operation }, operationId, this.inspection.machineId, "host-authority");
+    if (observation.observation.kind !== "snapshot-release" || observation.observation.snapshotId !== this.id || observation.requestDigest !== sandsurfDigest("snapshot", ["sandsurf-release-snapshot-v1", operationId, this.id])) throw protocol("snapshot release identity");
+    return new Operation(this.#host, observation);
+  }
 }
 
 export class MachineCollection {

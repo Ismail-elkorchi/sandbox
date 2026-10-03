@@ -24,6 +24,8 @@ pub enum SnapshotPhase {
     Admitted,
     Capturing,
     Ready,
+    Retiring,
+    Released,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

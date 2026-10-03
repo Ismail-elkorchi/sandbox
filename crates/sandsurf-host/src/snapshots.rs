@@ -21,6 +21,121 @@ pub fn root(host_root: &Path, snapshot: &Snapshot) -> PathBuf {
         .join("snapshots")
 }
 
+fn retirement_path(root: &Path, id: &SnapshotId) -> PathBuf {
+    root.join(format!(".{}.retirement.json", object_name(id.as_str())))
+}
+
+/// Process-local immutable-input custody, not a transferable mutable disk
+/// lease. Native full-state inputs additionally depend on the original source
+/// machine disk custody until its VMM closes mapped memory files.
+fn object_lease(root: &Path, id: &SnapshotId, shared: bool) -> Result<File> {
+    private_directory(root)?;
+    let file = open_write(&root.join(format!(".{}.object.lock", object_name(id.as_str()))))?;
+    let locked = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    locked.map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "snapshot payload has active readers or retirement",
+        ),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(file)
+}
+
+pub(crate) fn retain_input(root: &Path, id: &SnapshotId) -> Result<File> {
+    let custody = object_lease(root, id, true)?;
+    match fs::symlink_metadata(retirement_path(root, id)) {
+        Ok(_) => return Err(SnapshotError::Invalid("snapshot storage has been retired")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(custody)
+}
+
+/// An authenticated catalog retirement is materialized before deleting any
+/// bytes. The terminal marker fences delayed pre-retirement jobs after restart.
+/// Nothing here touches output archives, receipts, or guest retention claims.
+pub(crate) fn cleanup(
+    host_root: &Path,
+    snapshot: &Snapshot,
+    record: &sandsurf_state::SnapshotReleaseRecord,
+) -> Result<()> {
+    if record.snapshot_id != snapshot.request.id
+        || record.machine_id != snapshot.request.machine_id
+        || snapshot.phase != sandsurf_protocol::SnapshotPhase::Retiring
+        || !record.cleanup_pending
+        || record.request_digest
+            != digest(
+                Domain::Snapshot,
+                &(
+                    "sandsurf-release-snapshot-v1",
+                    &record.operation_id,
+                    &record.snapshot_id,
+                ),
+            )?
+    {
+        return Err(SnapshotError::Invalid(
+            "snapshot cleanup lacks exact retirement authority",
+        ));
+    }
+    let root = root(host_root, snapshot);
+    let _custody = object_lease(&root, &record.snapshot_id, false)?;
+    // Full-state captures may be original native restore inputs, not merely
+    // byte-copy sources. Keep retirement pending while that machine's VMM has
+    // original attachment custody, including after guardian/control loss.
+    let _native_custody = if snapshot.request.kind == SnapshotKind::Full {
+        Some(crate::storage::detached_custody(
+            &host_root
+                .join("machines")
+                .join(object_name(record.machine_id.as_str()))
+                .join("disks/system.ext4"),
+        )?)
+    } else {
+        None
+    };
+    let marker = retirement_path(&root, &record.snapshot_id);
+    match crate::image_records::read::<sandsurf_state::SnapshotReleaseRecord>(&marker) {
+        Ok(old) if old == *record => {}
+        Ok(_) => {
+            return Err(SnapshotError::Invalid(
+                "snapshot retirement binding changed",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::image_records::publish(&marker, record)?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    for directory in [
+        root.join(object_name(record.snapshot_id.as_str())),
+        disk_stage(&root, snapshot),
+        disk_stage(&root, snapshot).with_extension("input-building"),
+    ] {
+        remove_stage(&directory)?;
+    }
+    sync_directory(&root)?;
+    // Native capture duplicates belong to this exact capture operation. Native
+    // detachment above excludes readers of full-state restore inputs.
+    let native_root = host_root
+        .join("machines")
+        .join(object_name(record.machine_id.as_str()))
+        .join("guardian/full-captures");
+    match fs::symlink_metadata(&native_root) {
+        Ok(_) => {
+            sandsurf_native::local::Directory::open(&native_root)?;
+            remove_stage(&native_root.join(object_name(snapshot.request.operation_id.as_str())))?;
+            sync_directory(&native_root)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub enum SnapshotError {
     Io(io::Error),
@@ -85,6 +200,7 @@ pub struct CaptureResult {
 }
 
 pub fn published_filesystem(root: &Path, snapshot: &Snapshot) -> Result<Option<CaptureResult>> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let directory = root.join(object_name(snapshot.request.id.as_str()));
     if !directory.exists() {
         return Ok(None);
@@ -113,6 +229,7 @@ fn disk_stage(root: &Path, snapshot: &Snapshot) -> PathBuf {
 /// live machine. Neither a record nor this observation establishes completion;
 /// the capture task must verify all corresponding bytes before publication.
 pub(crate) fn has_capture_record(root: &Path, snapshot: &Snapshot) -> Result<bool> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let published = root
         .join(object_name(snapshot.request.id.as_str()))
         .join("manifest.json");
@@ -147,6 +264,7 @@ fn read_disk_input(stage: &Path, snapshot: &Snapshot) -> Result<Digest> {
 /// Observe an immutable byte capture, not the current computer or its power.
 /// A resumed/rebooted source cannot alter the bytes this operation finishes.
 pub(crate) fn prepared_filesystem(root: &Path, snapshot: &Snapshot) -> Result<bool> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let stage = disk_stage(root, snapshot);
     match fs::symlink_metadata(&stage) {
         Ok(_) => {
@@ -171,6 +289,7 @@ pub(crate) fn prepare_filesystem(
             "disk input requires a disk snapshot",
         ));
     }
+    let _input_custody = retain_input(root, &snapshot.request.id)?;
     private_directory(root)?;
     let _custody = sandsurf_native::storage::disk_lease(&root.join(format!(
         ".{}.capture.lock",
@@ -216,6 +335,7 @@ pub(crate) fn finish_filesystem(
             "disk capture image differs from host admission",
         ));
     }
+    let _input_custody = retain_input(root, &snapshot.request.id)?;
     private_directory(root)?;
     let _custody = sandsurf_native::storage::disk_lease(&root.join(format!(
         ".{}.capture.lock",
@@ -309,6 +429,7 @@ pub fn capture_full(
             ));
         }
     }
+    let _input_custody = retain_input(root, &snapshot.request.id)?;
     private_directory(root)?;
     let final_directory = root.join(object_name(snapshot.request.id.as_str()));
     if final_directory.exists() {
@@ -428,6 +549,7 @@ pub fn materialize_fork(
     destination: &Path,
     profile: &sandsurf_image::identity::CloneProfile,
 ) -> Result<()> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let expected = snapshot
         .system_disk_digest
         .as_ref()
@@ -515,6 +637,7 @@ pub fn materialize_image_template(
     snapshot: &Snapshot,
     destination: &Path,
 ) -> Result<Digest> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let expected = snapshot
         .system_disk_digest
         .as_ref()
@@ -535,6 +658,7 @@ pub fn rollback(
     target: &Path,
     operation: &OperationId,
 ) -> Result<Digest> {
+    let _custody = retain_input(root, &snapshot.request.id)?;
     let expected = snapshot
         .system_disk_digest
         .as_ref()
@@ -771,6 +895,42 @@ fn remove_stage(stage: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
+    // Validate the entire bounded closure before the first removal. Never
+    // follow substituted directories or reclaim undeclared files on retry.
+    for entry in fs::read_dir(stage)?.take(33) {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or(SnapshotError::Invalid("snapshot payload name is invalid"))?;
+        if name == "boot" {
+            sandsurf_native::local::Directory::open(&entry.path())?;
+            for artifact in fs::read_dir(entry.path())?.take(4) {
+                let artifact = artifact?;
+                if !matches!(
+                    artifact.file_name().to_str(),
+                    Some("kernel" | "initramfs" | "boot.json")
+                ) {
+                    return Err(SnapshotError::Invalid("undeclared snapshot boot payload"));
+                }
+                drop(open_read(&artifact.path())?);
+            }
+        } else if matches!(
+            name,
+            "manifest.json"
+                | "manifest-building"
+                | "disk-input.json"
+                | "system.ext4"
+                | "snapshot.vmstate"
+                | "memory"
+                | "reconnect.json"
+                | "capture.json"
+        ) {
+            drop(open_read(&entry.path())?);
+        } else {
+            return Err(SnapshotError::Invalid("undeclared snapshot payload"));
+        }
+    }
     if stage.join("boot").exists() {
         fs::remove_dir_all(stage.join("boot"))?;
     }
@@ -782,6 +942,7 @@ fn remove_stage(stage: &Path) -> Result<()> {
         "snapshot.vmstate",
         "memory",
         "reconnect.json",
+        "capture.json",
     ] {
         remove_file_if_present(&stage.join(name))?;
     }
@@ -933,6 +1094,130 @@ mod tests {
             sensitive: false,
             full: None,
         }
+    }
+
+    fn retirement(snapshot: &mut Snapshot) -> sandsurf_state::SnapshotReleaseRecord {
+        snapshot.phase = SnapshotPhase::Retiring;
+        let operation_id: OperationId = "retire-snapshot".try_into().unwrap();
+        sandsurf_state::SnapshotReleaseRecord {
+            request_digest: digest(
+                Domain::Snapshot,
+                &(
+                    "sandsurf-release-snapshot-v1",
+                    &operation_id,
+                    &snapshot.request.id,
+                ),
+            )
+            .unwrap(),
+            operation_id,
+            machine_id: snapshot.request.machine_id.clone(),
+            snapshot_id: snapshot.request.id.clone(),
+            cleanup_pending: true,
+        }
+    }
+
+    #[test]
+    fn snapshot_retirement_excludes_all_readers_and_fences_delayed_jobs_after_deletion() {
+        let temp = Temp::new();
+        let source = temp.0.join("source");
+        open_write(&source).unwrap().write_all(&[7; 4096]).unwrap();
+        let mut snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        prepare_filesystem(&root, &snapshot, &source).unwrap();
+        finish_filesystem(&root, &snapshot, &temp.image(&snapshot)).unwrap();
+        let original = snapshot.clone();
+        let first = retain_input(&root, &snapshot.request.id).unwrap();
+        let second = retain_input(&root, &snapshot.request.id).unwrap();
+        let record = retirement(&mut snapshot);
+        assert!(
+            matches!(cleanup(&temp.0, &snapshot, &record), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(!retirement_path(&root, &snapshot.request.id).exists());
+        drop(first);
+        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        drop(second);
+        cleanup(&temp.0, &snapshot, &record).unwrap();
+        cleanup(&temp.0, &snapshot, &record).unwrap();
+        assert!(
+            !root
+                .join(object_name(snapshot.request.id.as_str()))
+                .exists()
+        );
+        assert!(retirement_path(&root, &snapshot.request.id).exists());
+        assert!(retain_input(&root, &snapshot.request.id).is_err());
+        assert!(prepare_filesystem(&root, &original, &source).is_err());
+        assert!(published_filesystem(&root, &original).is_err());
+        assert!(!disk_stage(&root, &snapshot).exists());
+        let mut changed = record.clone();
+        changed.operation_id = "other-retirement".try_into().unwrap();
+        changed.request_digest = digest(
+            Domain::Snapshot,
+            &(
+                "sandsurf-release-snapshot-v1",
+                &changed.operation_id,
+                &changed.snapshot_id,
+            ),
+        )
+        .unwrap();
+        assert!(cleanup(&temp.0, &snapshot, &changed).is_err());
+    }
+
+    #[test]
+    fn interrupted_snapshot_retirement_reclaims_only_declared_bytes_and_preserves_archives() {
+        let temp = Temp::new();
+        let mut snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        private_directory(&root).unwrap();
+        let payload = root.join(object_name(snapshot.request.id.as_str()));
+        private_directory(&payload).unwrap();
+        open_write(&payload.join("system.ext4"))
+            .unwrap()
+            .write_all(b"disk")
+            .unwrap();
+        open_write(&payload.join("unowned"))
+            .unwrap()
+            .write_all(b"unknown")
+            .unwrap();
+        let record = retirement(&mut snapshot);
+        assert!(cleanup(&temp.0, &snapshot, &record).is_err());
+        assert_eq!(fs::read(payload.join("system.ext4")).unwrap(), b"disk");
+        assert_eq!(fs::read(payload.join("unowned")).unwrap(), b"unknown");
+        // The marker survives interruption and excludes every future reader.
+        assert!(retain_input(&root, &snapshot.request.id).is_err());
+        fs::remove_file(payload.join("unowned")).unwrap();
+        let archive = root.parent().unwrap().join("retained-output");
+        open_write(&archive)
+            .unwrap()
+            .write_all(b"original output")
+            .unwrap();
+        cleanup(&temp.0, &snapshot, &record).unwrap();
+        assert_eq!(fs::read(archive).unwrap(), b"original output");
+        assert!(!payload.exists());
+    }
+
+    #[test]
+    fn full_snapshot_retirement_waits_for_original_native_custody_not_power_or_control_reports() {
+        let temp = Temp::new();
+        let mut snapshot = snapshot();
+        snapshot.request.kind = SnapshotKind::Full;
+        let root = temp.capture_root(&snapshot);
+        private_directory(&root).unwrap();
+        let disks = root.parent().unwrap().join("disks");
+        private_directory(&disks).unwrap();
+        let disk = disks.join("system.ext4");
+        crate::storage::publish_disk(&disk, 4096, |stage| open_write(stage)?.set_len(4096))
+            .unwrap();
+        let original = crate::storage::attach(&disk).unwrap();
+        let native = original.try_clone().unwrap();
+        drop(original);
+        let record = retirement(&mut snapshot);
+        assert!(
+            matches!(cleanup(&temp.0, &snapshot, &record), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(!retirement_path(&root, &snapshot.request.id).exists());
+        drop(native);
+        cleanup(&temp.0, &snapshot, &record).unwrap();
+        assert!(retirement_path(&root, &snapshot.request.id).exists());
     }
 
     #[test]
