@@ -1,6 +1,5 @@
 //! Linux-only OCI machine construction in the externally bounded image worker.
 use super::*;
-use crate::api::{MachineImageRecipe, OciSource};
 use sandsurf_image::ext4::materialize_tar;
 use sandsurf_image::oci::{
     ConversionLimits, ConvertedTree, GuestPlatform, OciLayout, TreeEntryKind,
@@ -9,6 +8,7 @@ use sandsurf_image::oci::{
 use sandsurf_image::{
     ImageDefaults, ImageManifest, RootfsArtifact, RootfsFormat, SystemDiskManifest,
 };
+use sandsurf_state::{MachineImageRecipe, OciSource};
 use std::collections::BTreeMap;
 
 pub(crate) struct BuildInput<'a> {

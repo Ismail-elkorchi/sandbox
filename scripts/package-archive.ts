@@ -1,6 +1,9 @@
 import { lstat, mkdir, mkdtemp, readFile, rename, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+import type { Readable } from "node:stream";
 
 /** The image/native manifests define the distribution closure. Reject extra
  * artifacts, not just a growing blacklist of names from retired backends. */
@@ -37,19 +40,30 @@ export async function packageArchive(directory: string, destination: string, npm
       ["prepare", "prepack", "postpack"].some((name) => name in scripts)) {
     throw new Error("package lifecycle hooks are forbidden; build artifacts explicitly before packing");
   }
-  // npm_execpath selects the actual npm installation used by this build. Both
-  // modules are that installation's own packaging implementation, not runtime dependencies.
+  // Use the selected npm installation's package inventory and canonical tar
+  // metadata. Own the streaming budget: pacote's default tar writer permits
+  // four concurrent entries with 16 MiB reads each, even for a small JS heap.
   const npmRequire = createRequire(resolve(npmCli));
   const pacote = npmRequire("pacote") as {
-    tarball: { file(source: string, destination: string, options: Record<string, unknown>): Promise<unknown> };
+    DirFetcher: { tarCreateOptions(manifest: Record<string, unknown>): Record<string, unknown> };
   };
-  const Arborist: unknown = npmRequire("@npmcli/arborist");
+  const Arborist = npmRequire("@npmcli/arborist") as new (options: { path: string }) => {
+    loadActual(): Promise<unknown>;
+  };
+  const packlist = npmRequire("npm-packlist") as (tree: unknown, options: { path: string }) => Promise<string[]>;
+  const tar = npmRequire("tar") as { c(options: Record<string, unknown>, files: readonly string[]): Readable };
+  const tree = await new Arborist({ path: source }).loadActual();
+  const files = await packlist(tree, { path: source });
   await mkdir(destination, { recursive: true });
   const stage = await mkdtemp(resolve(destination, ".package-"));
   const filename = `${manifest.name}-${manifest.version}.tgz`;
   const output = resolve(destination, filename);
   try {
-    await pacote.tarball.file(source, resolve(stage, filename), { Arborist, ignoreScripts: true });
+    await pipeline(tar.c({
+      ...pacote.DirFetcher.tarCreateOptions({ ...manifest, _resolved: source }),
+      maxReadSize: 64 * 1024,
+      jobs: 1,
+    }, files), createWriteStream(resolve(stage, filename), { flags: "wx", highWaterMark: 64 * 1024 }));
     await rename(resolve(stage, filename), output);
     return output;
   } finally {

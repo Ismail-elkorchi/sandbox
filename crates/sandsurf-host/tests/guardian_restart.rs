@@ -132,10 +132,14 @@ impl Fixture {
         let create: OperationId = "create".try_into().unwrap();
         let image = hash("image");
         let import: OperationId = "import-image".try_into().unwrap();
-        let request = hash("import-image");
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: root.0.join("seed-manifest.json"),
+            manifest_digest: image.clone(),
+        };
+        let request = input.request_digest(&import).unwrap();
         host.admit_image_import(
             import.clone(),
-            request.clone(),
+            input,
             Approval {
                 id: "approve-import-image".try_into().unwrap(),
                 request_digest: request.clone(),

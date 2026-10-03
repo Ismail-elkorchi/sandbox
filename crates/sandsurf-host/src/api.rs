@@ -6,7 +6,8 @@ use sandsurf_protocol::{
     SnapshotRequest, VmEngine,
 };
 use sandsurf_state::{
-    HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, SecretRevocationRecord,
+    HostOperationRecord, ImageImportRecord, ImageRecord, ImageReleaseRecord, MachineImageRecipe,
+    OciSource, SecretRevocationRecord,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -50,35 +51,6 @@ pub struct HostInspection {
     /// Verified defaults image packaged for this host architecture. Source
     /// builds without packaged artifacts report `None` explicitly.
     pub default_image_digest: Option<Digest>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum OciSource {
-    Layout {
-        path: PathBuf,
-    },
-    Archive {
-        path: PathBuf,
-    },
-    Registry {
-        reference: String,
-        credential: Option<sandsurf_protocol::SecretVersion>,
-    },
-}
-
-/// OCI supplies an operating-system filesystem. Boot artifacts are an
-/// explicit, independently verified recipe input rather than implicit state
-/// inherited from whichever development image happens to ship with the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MachineImageRecipe {
-    pub boot_image_digest: Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

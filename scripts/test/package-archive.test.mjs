@@ -63,3 +63,19 @@ test("npm archive streams large incompressible payloads with bounded memory", { 
   assert.deepEqual(listing.trim().split(/\r?\n/u).sort(), ["package/README.md", "package/package.json", "package/payload"]);
   assert.deepEqual(await readdir(f.destination), ["sandsurf-1.0.0.tgz"]);
 });
+
+test("bounded archive writer preserves npm selection, bin modes and reproducible metadata", { skip: npmCli === undefined ? "run through npm run test:scripts" : false }, async (context) => {
+  const f = await fixture(context, { bin: { sandsurf: "cli.mjs" } });
+  await writeFile(join(f.source, "cli.mjs"), "#!/usr/bin/env node\nconsole.log('fixture');\n", { mode: 0o600 });
+  await writeFile(join(f.source, "payload"), "payload bytes");
+  await writeFile(join(f.source, "excluded"), "not published");
+  const first = await packageArchive(f.source, f.destination, npmCli);
+  const { stdout: listing } = await exec("tar", ["-tvzf", first], { maxBuffer: 4096 });
+  assert.match(listing, /^-rwx.*package\/cli\.mjs$/mu);
+  assert.doesNotMatch(listing, /excluded/u);
+  const { stdout: payload } = await exec("tar", ["-xOzf", first, "package/payload"], { maxBuffer: 4096 });
+  assert.equal(payload, "payload bytes");
+  const second = await packageArchive(f.source, join(f.root, "second"), npmCli);
+  const { readFile } = await import("node:fs/promises");
+  assert.deepEqual(await readFile(first), await readFile(second));
+});

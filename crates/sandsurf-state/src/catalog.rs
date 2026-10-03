@@ -1,4 +1,6 @@
-use crate::{Error, Result, authority::HostAuthority, database::Database, decode, encode};
+use crate::{
+    Error, ImageImportInput, Result, authority::HostAuthority, database::Database, decode, encode,
+};
 use rusqlite::{OptionalExtension, params};
 use sandsurf_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,10 @@ CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL
 CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
-CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, phase TEXT NOT NULL, image TEXT) STRICT;
+CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, input TEXT NOT NULL, dependency_image TEXT REFERENCES images(digest), dependency_snapshot TEXT REFERENCES snapshots(id), phase TEXT NOT NULL, image TEXT) STRICT;
+CREATE INDEX pending_image_imports ON image_imports(operation) WHERE json_extract(phase,'$')='admitted';
+CREATE INDEX pending_import_image ON image_imports(dependency_image) WHERE json_extract(phase,'$')='admitted';
+CREATE INDEX pending_import_snapshot ON image_imports(dependency_snapshot) WHERE json_extract(phase,'$')='admitted';
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE TABLE image_releases(operation TEXT PRIMARY KEY, image TEXT NOT NULL REFERENCES images(digest), request_digest TEXT NOT NULL, cleanup_pending INTEGER NOT NULL) STRICT;
 CREATE INDEX pending_image_releases ON image_releases(operation) WHERE cleanup_pending=1;
@@ -837,26 +842,63 @@ impl HostCatalog {
     }
 
     /// Admit an image command before any source is read or builder is run.
-    /// The catalog stores only the exact request digest, never registry
-    /// credentials or an independently mutable copy of image metadata.
+    /// Atomically bind executable intent and its storage dependencies to the
+    /// approval. Workers receive facts; they never reconstruct authority from
+    /// filesystem job files. Source addresses do not imply source-byte custody.
     pub fn admit_image_import(
         &mut self,
         operation_id: OperationId,
-        request_digest: Digest,
+        input: ImageImportInput,
         approval: Approval,
     ) -> Result<ImageImportRecord> {
+        let request_digest = input.request_digest(&operation_id)?;
         if approval.request_digest != request_digest {
             return Err(Error::Conflict("image import approval mismatch"));
         }
         let tx = self.db.connection.transaction()?;
         if let Some(old) = image_import(&tx, &operation_id)? {
-            return if old.request_digest == request_digest {
+            return if old.request_digest == request_digest
+                && image_import_input(&tx, &operation_id)?.as_ref() == Some(&input)
+            {
                 Ok(old)
             } else {
                 Err(Error::Conflict("image import operation identity conflict"))
             };
         }
         host_operation_identity_available(&tx, &operation_id)?;
+        let (dependency_image, dependency_snapshot) = match &input {
+            ImageImportInput::Native {
+                manifest_digest, ..
+            } => (
+                image_state(&tx, manifest_digest)?
+                    .filter(|(_, retired, _)| !retired)
+                    .map(|_| manifest_digest.clone()),
+                None,
+            ),
+            ImageImportInput::Oci { recipe, .. } => {
+                require_image(&tx, &recipe.boot_image_digest)?;
+                (Some(recipe.boot_image_digest.clone()), None)
+            }
+            ImageImportInput::PublishSnapshot {
+                snapshot: expected,
+                allow_sensitive,
+            } => {
+                let retained = snapshot_record(&tx, &expected.request.id)?
+                    .ok_or(Error::Missing("image snapshot does not exist"))?;
+                if retained != **expected || retained.phase != SnapshotPhase::Ready {
+                    return Err(Error::Conflict(
+                        "image publication requires the exact ready snapshot",
+                    ));
+                }
+                if retained.sensitive && !allow_sensitive {
+                    return Err(Error::Conflict(
+                        "sensitive snapshot publication needs explicit authorization",
+                    ));
+                }
+                require_image(&tx, &retained.image_digest)?;
+                (Some(retained.image_digest), Some(retained.request.id))
+            }
+        };
         capacity(&tx, "image_imports", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
         let value = ImageImportRecord {
@@ -866,10 +908,13 @@ impl HostCatalog {
             image: None,
         };
         tx.execute(
-            "INSERT INTO image_imports VALUES (?1,?2,?3,NULL)",
+            "INSERT INTO image_imports VALUES (?1,?2,?3,?4,?5,?6,NULL)",
             params![
                 value.operation_id.as_str(),
                 value.request_digest.as_str(),
+                encode(&input)?,
+                dependency_image.as_ref().map(Digest::as_str),
+                dependency_snapshot.as_ref().map(SnapshotId::as_str),
                 encode(&value.phase)?
             ],
         )?;
@@ -954,6 +999,37 @@ impl HostCatalog {
         image_import(&self.db.connection, operation)
     }
 
+    pub fn image_import_input(&self, operation: &OperationId) -> Result<Option<ImageImportInput>> {
+        image_import_input(&self.db.connection, operation)
+    }
+
+    pub fn pending_image_imports(
+        &self,
+        after: Option<&OperationId>,
+        limit: Counter,
+    ) -> Result<Vec<ImageImportRecord>> {
+        if limit == Counter::ZERO || limit.get() > 256 {
+            return Err(Error::Capacity(
+                "image import page limit must be in 1..=256",
+            ));
+        }
+        let mut statement = self.db.connection.prepare(
+            "SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND operation>?1 ORDER BY operation LIMIT ?2")?;
+        let operations = statement
+            .query_map(
+                params![after.map_or("", OperationId::as_str), limit.get()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        operations
+            .into_iter()
+            .map(|operation| {
+                image_import(&self.db.connection, &operation.try_into()?)?
+                    .ok_or(Error::Corrupt("pending image import disappeared"))
+            })
+            .collect()
+    }
+
     pub fn image(&self, digest: &Digest) -> Result<Option<ImageRecord>> {
         Ok(image_state(&self.db.connection, digest)?
             .filter(|(_, retired, _)| !retired)
@@ -1018,6 +1094,14 @@ impl HostCatalog {
         )?;
         if snapshot_references {
             return Err(Error::Conflict("retained snapshots pin this image"));
+        }
+        let import_references: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_image=?1)",
+            [image_digest.as_str()], |row| row.get(0))?;
+        if import_references {
+            return Err(Error::Conflict(
+                "pending image materialization pins this image",
+            ));
         }
         capacity(&tx, "image_releases", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
@@ -2942,18 +3026,54 @@ fn image_release(
     .transpose()
 }
 
+fn require_image(db: &rusqlite::Connection, image: &Digest) -> Result<()> {
+    if image_state(db, image)?.is_none_or(|(_, retired, _)| retired) {
+        return Err(Error::Missing("image build dependency is not admitted"));
+    }
+    Ok(())
+}
+
+fn image_import_input(
+    db: &rusqlite::Connection,
+    operation: &OperationId,
+) -> Result<Option<ImageImportInput>> {
+    let input: Option<(String, String)> = db
+        .query_row(
+            "SELECT input,request_digest FROM image_imports WHERE operation=?1",
+            [operation.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    input
+        .map(|(input, request)| decode_image_input(operation, &request, &input))
+        .transpose()
+}
+
+fn decode_image_input(
+    operation: &OperationId,
+    request: &str,
+    input: &str,
+) -> Result<ImageImportInput> {
+    let input: ImageImportInput = decode(input)?;
+    if input.request_digest(operation)?.as_str() != request {
+        return Err(Error::Corrupt("image input and approved request disagree"));
+    }
+    Ok(input)
+}
+
 fn image_import(
     db: &rusqlite::Connection,
     operation: &OperationId,
 ) -> Result<Option<ImageImportRecord>> {
-    let row: Option<(String, String, Option<String>)> = db
+    let row: Option<(String, String, Option<String>, String)> = db
         .query_row(
-            "SELECT request_digest,phase,image FROM image_imports WHERE operation=?1",
+            "SELECT request_digest,phase,image,input FROM image_imports WHERE operation=?1",
             [operation.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(|(request_digest, phase, image)| {
+    row.map(|(request_digest, phase, image, input)| {
+        decode_image_input(operation, &request_digest, &input)?;
         let image = image
             .map(|digest| {
                 image_record(db, &Digest::try_from(digest)?)?

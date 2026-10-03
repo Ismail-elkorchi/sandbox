@@ -15,10 +15,12 @@
 mod authority;
 mod catalog;
 mod database;
+mod image_import;
 mod output_store;
 mod runtime;
 
 pub use catalog::*;
+pub use image_import::*;
 pub use runtime::*;
 
 use sandsurf_protocol::Invalid;

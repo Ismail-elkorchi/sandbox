@@ -35,6 +35,12 @@ fn n(value: u64) -> Counter {
 fn hash(value: &str) -> Digest {
     bytes_digest(value.as_bytes())
 }
+fn image_input(manifest_digest: Digest) -> ImageImportInput {
+    ImageImportInput::Native {
+        manifest_path: std::env::temp_dir().join("sandsurf-fixture-manifest.json"),
+        manifest_digest,
+    }
+}
 fn resources() -> Resources {
     Resources::from_geometry(n(2), n(4096), n(100_000), n(1000), n(8))
         .expect("static resource envelope")
@@ -52,10 +58,11 @@ fn catalog_limits() -> CatalogLimits {
 
 fn admit_fixture_image(host: &mut HostCatalog, digest: &Digest) {
     let operation: OperationId = format!("image-{}", digest.as_str()).try_into().unwrap();
-    let request = hash(operation.as_str());
+    let input = image_input(digest.clone());
+    let request = input.request_digest(&operation).unwrap();
     host.admit_image_import(
         operation.clone(),
-        request.clone(),
+        input,
         Approval {
             id: format!("approve-{}", operation.as_str())
                 .try_into()
@@ -542,11 +549,12 @@ fn possible_disclosure_is_sticky_across_fork_clean_rollback_and_host_restart() {
 fn new_machine_inherits_sensitive_image_classification() {
     let mut f = Fixture::new();
     let image_operation: OperationId = "publish-sensitive".try_into().unwrap();
-    let request = hash("sensitive-image-request");
+    let input = image_input(hash("sensitive-image"));
+    let request = input.request_digest(&image_operation).unwrap();
     f.host
         .admit_image_import(
             image_operation.clone(),
-            request.clone(),
+            input,
             Approval {
                 id: "approve-sensitive-image".try_into().unwrap(),
                 request_digest: request.clone(),
@@ -595,17 +603,345 @@ fn new_machine_inherits_sensitive_image_classification() {
 }
 
 #[test]
+fn image_recipes_reopen_exactly_and_pending_dependencies_cannot_be_reclaimed() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut host =
+        HostCatalog::create(&path, "image-owner".try_into().unwrap(), catalog_limits()).unwrap();
+    let base = publish_image(&mut host, "base", "base-image", 1000);
+    let operation: OperationId = "build".try_into().unwrap();
+    let input = ImageImportInput::Oci {
+        source: OciSource::Registry { reference: "registry.example/os@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            credential: Some(SecretVersion { id: "registry".try_into().unwrap(),
+                version: "opaque-version".try_into().unwrap(), bytes: n(12) }) },
+        recipe: MachineImageRecipe { boot_image_digest: base.digest.clone() },
+        platform: "linux/amd64".into(),
+    };
+    let request = input.request_digest(&operation).unwrap();
+    assert!(
+        host.admit_image_import(
+            operation.clone(),
+            input.clone(),
+            Approval {
+                id: "wrong-approval".try_into().unwrap(),
+                request_digest: hash("wrong")
+            }
+        )
+        .is_err()
+    );
+    assert!(host.image_import(&operation).unwrap().is_none());
+    let admitted = host
+        .admit_image_import(
+            operation.clone(),
+            input.clone(),
+            Approval {
+                id: "approve-build".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    assert!(host.pending_image_imports(None, Counter::ZERO).is_err());
+    assert!(host.pending_image_imports(None, n(257)).is_err());
+    assert_eq!(
+        host.pending_image_imports(None, n(1)).unwrap(),
+        vec![admitted.clone()]
+    );
+    assert!(
+        host.pending_image_imports(Some(&operation), n(1))
+            .unwrap()
+            .is_empty()
+    );
+    drop(host);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert_eq!(
+        host.image_import_input(&operation).unwrap(),
+        Some(input.clone())
+    );
+    assert_eq!(
+        host.admit_image_import(
+            operation.clone(),
+            input.clone(),
+            Approval {
+                id: "approve-build".try_into().unwrap(),
+                request_digest: request.clone()
+            }
+        )
+        .unwrap(),
+        admitted
+    );
+    let mut other = input.clone();
+    let ImageImportInput::Oci { platform, .. } = &mut other else {
+        unreachable!()
+    };
+    *platform = "linux/arm64/v8".into();
+    assert!(
+        host.admit_image_import(
+            operation.clone(),
+            other.clone(),
+            Approval {
+                id: "approve-conflict".try_into().unwrap(),
+                request_digest: other.request_digest(&operation).unwrap()
+            }
+        )
+        .is_err()
+    );
+    let release: OperationId = "release-base".try_into().unwrap();
+    let release_digest = digest(
+        Domain::Image,
+        &("sandsurf-release-image-v1", &release, &base.digest),
+    )
+    .unwrap();
+    assert!(
+        host.release_image(
+            release.clone(),
+            base.digest.clone(),
+            Approval {
+                id: "approve-release".try_into().unwrap(),
+                request_digest: release_digest.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(host.operation(&release).unwrap().is_none());
+    host.complete_image_import(&operation, &request, image("derived", 1000))
+        .unwrap();
+    assert!(host.pending_image_imports(None, n(256)).unwrap().is_empty());
+    assert_eq!(host.image_import_input(&operation).unwrap(), Some(input));
+    assert!(
+        host.release_image(
+            release,
+            base.digest,
+            Approval {
+                id: "approve-release".try_into().unwrap(),
+                request_digest: release_digest
+            }
+        )
+        .is_ok()
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("authority.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for (query, index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND operation>'' ORDER BY operation LIMIT 32",
+            "pending_image_imports",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_image='image'",
+            "pending_import_image",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')='admitted' AND dependency_snapshot='snapshot'",
+            "pending_import_snapshot",
+        ),
+    ] {
+        let details: String = db.query_row(query, [], |row| row.get(3)).unwrap();
+        assert!(details.contains(index), "{details}");
+    }
+}
+
+#[test]
+fn corrupted_image_recipe_is_unavailable_without_repair_or_completion() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut host =
+        HostCatalog::create(&path, "images".try_into().unwrap(), catalog_limits()).unwrap();
+    let operation: OperationId = "build".try_into().unwrap();
+    let input = image_input(hash("source"));
+    let request = input.request_digest(&operation).unwrap();
+    host.admit_image_import(
+        operation.clone(),
+        input,
+        Approval {
+            id: "approved".try_into().unwrap(),
+            request_digest: request.clone(),
+        },
+    )
+    .unwrap();
+    drop(host);
+    let substituted = image_input(hash("substituted"));
+    let encoded = serde_json::to_string(&substituted).unwrap();
+    let db = rusqlite::Connection::open(path.join("authority.sqlite")).unwrap();
+    db.execute(
+        "UPDATE image_imports SET input=?1 WHERE operation=?2",
+        rusqlite::params![encoded, operation.as_str()],
+    )
+    .unwrap();
+    drop(db);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert!(host.image_import(&operation).is_err());
+    assert!(host.image_import_input(&operation).is_err());
+    assert!(host.pending_image_imports(None, n(1)).is_err());
+    assert!(
+        host.complete_image_import(&operation, &request, image("result", 1000))
+            .is_err()
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("authority.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let retained: String = db
+        .query_row(
+            "SELECT input FROM image_imports WHERE operation=?1",
+            [operation.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, encoded);
+    assert!(host.image(&hash("result")).unwrap().is_none());
+}
+
+#[test]
+fn missing_image_dependency_cannot_publish_partial_admission_or_approval() {
+    let root = TempRoot::new();
+    let mut host = HostCatalog::create(
+        &root.0.join("host"),
+        "images".try_into().unwrap(),
+        catalog_limits(),
+    )
+    .unwrap();
+    let operation: OperationId = "build".try_into().unwrap();
+    let dependency = hash("missing-image");
+    let input = ImageImportInput::Oci {
+        source: OciSource::Layout {
+            path: root.0.join("layout"),
+        },
+        recipe: MachineImageRecipe {
+            boot_image_digest: dependency.clone(),
+        },
+        platform: "linux/amd64".into(),
+    };
+    let request = input.request_digest(&operation).unwrap();
+    assert!(
+        host.admit_image_import(
+            operation.clone(),
+            input.clone(),
+            Approval {
+                id: "approve-build".try_into().unwrap(),
+                request_digest: request.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(host.image_import_input(&operation).unwrap().is_none());
+    assert!(host.pending_image_imports(None, n(256)).unwrap().is_empty());
+    admit_fixture_image(&mut host, &dependency);
+    assert!(
+        host.admit_image_import(
+            operation,
+            input,
+            Approval {
+                id: "approve-build".try_into().unwrap(),
+                request_digest: request
+            }
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn snapshot_image_admission_rejects_substituted_capture_facts_under_the_same_identity() {
+    let mut f = Fixture::new();
+    let request = SnapshotRequest {
+        id: "snapshot".try_into().unwrap(),
+        operation_id: "capture".try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(2),
+        kind: SnapshotKind::Disk,
+        parent: None,
+    };
+    let capture_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request)).unwrap();
+    let admitted = f
+        .host
+        .admit_snapshot(
+            request.clone(),
+            Approval {
+                id: "approve-capture".try_into().unwrap(),
+                request_digest: capture_digest.clone(),
+            },
+        )
+        .unwrap();
+    let operation: OperationId = "publish".try_into().unwrap();
+    let input = ImageImportInput::PublishSnapshot {
+        snapshot: Box::new(admitted),
+        allow_sensitive: false,
+    };
+    let approved = input.request_digest(&operation).unwrap();
+    assert!(
+        f.host
+            .admit_image_import(
+                operation.clone(),
+                input,
+                Approval {
+                    id: "approve-publish".try_into().unwrap(),
+                    request_digest: approved.clone()
+                }
+            )
+            .is_err()
+    );
+    f.host.begin_snapshot(&request.id, &capture_digest).unwrap();
+    let ready = f
+        .host
+        .complete_snapshot(
+            &request.id,
+            &capture_digest,
+            hash("disk"),
+            hash("manifest"),
+            SnapshotConsistency::Crash,
+        )
+        .unwrap();
+    let mut substituted = ready.clone();
+    substituted.image_digest = hash("substituted-image");
+    assert!(
+        f.host
+            .admit_image_import(
+                operation.clone(),
+                ImageImportInput::PublishSnapshot {
+                    snapshot: Box::new(substituted),
+                    allow_sensitive: false
+                },
+                Approval {
+                    id: "approve-publish".try_into().unwrap(),
+                    request_digest: approved.clone()
+                }
+            )
+            .is_err()
+    );
+    assert!(f.host.image_import(&operation).unwrap().is_none());
+    let input = ImageImportInput::PublishSnapshot {
+        snapshot: Box::new(ready),
+        allow_sensitive: false,
+    };
+    f.host
+        .admit_image_import(
+            operation.clone(),
+            input.clone(),
+            Approval {
+                id: "approve-publish".try_into().unwrap(),
+                request_digest: approved,
+            },
+        )
+        .unwrap();
+    assert_eq!(f.host.image_import_input(&operation).unwrap(), Some(input));
+}
+
+#[test]
 fn image_import_admission_and_publication_are_durable_and_idempotent() {
     let root = TempRoot::new();
     let path = root.0.join("host");
     let mut host =
         HostCatalog::create(&path, "image-host".try_into().unwrap(), catalog_limits()).unwrap();
     let operation: OperationId = "import-image".try_into().unwrap();
-    let request = hash("exact-import-request");
+    let input = image_input(hash("exact-import-request"));
+    let request = input.request_digest(&operation).unwrap();
     let admitted = host
         .admit_image_import(
             operation.clone(),
-            request.clone(),
+            input,
             Approval {
                 id: "approve-image".try_into().unwrap(),
                 request_digest: request.clone(),
@@ -728,10 +1064,11 @@ fn historical_image_cleanup_completion_cannot_release_new_cleanup_reservation() 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].operation_id, releases[1].0);
     let import: OperationId = "import-second".try_into().unwrap();
-    let request_digest = hash("second-input");
+    let input = image_input(hash("second-input"));
+    let request_digest = input.request_digest(&import).unwrap();
     host.admit_image_import(
         import.clone(),
-        request_digest.clone(),
+        input,
         Approval {
             id: "approve-second-input".try_into().unwrap(),
             request_digest: request_digest.clone(),
@@ -789,10 +1126,11 @@ fn retired_image_storage_remains_reserved_until_cleanup_completion() {
     .unwrap();
 
     let second_operation: OperationId = "import-second".try_into().unwrap();
-    let second_request = hash("second-request");
+    let input = image_input(hash("second-request"));
+    let second_request = input.request_digest(&second_operation).unwrap();
     host.admit_image_import(
         second_operation.clone(),
-        second_request.clone(),
+        input,
         Approval {
             id: "approve-second".try_into().unwrap(),
             request_digest: second_request.clone(),
@@ -820,10 +1158,11 @@ fn publish_image(
     storage_bytes: u64,
 ) -> ImageRecord {
     let operation: OperationId = operation.try_into().unwrap();
-    let request = hash(&format!("{label}-request"));
+    let input = image_input(hash(&format!("{label}-request")));
+    let request = input.request_digest(&operation).unwrap();
     host.admit_image_import(
         operation.clone(),
-        request.clone(),
+        input,
         Approval {
             id: format!("approve-{}", operation.as_str())
                 .try_into()

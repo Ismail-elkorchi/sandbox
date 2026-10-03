@@ -2,14 +2,13 @@
 //! units. Immutable job bindings and result bytes survive API disconnection.
 //! The worker materializes admitted images; only the catalog owner publishes
 //! their authority records. There is no worker-side catalog or authorization.
-use crate::api::{MachineImageRecipe, OciSource};
 use crate::image_records::{publish, read};
 use crate::service::{HostError, Result};
 use sandsurf_native::local::ensure_private_directory;
 use sandsurf_native::service_pool::ServicePool;
 use sandsurf_native::storage::object_name;
 use sandsurf_protocol::{Counter, Digest, Domain, MachineId, OperationId, Snapshot, digest};
-use sandsurf_state::ImageRecord;
+use sandsurf_state::{ImageImportInput, ImageRecord, OciSource};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,18 +27,8 @@ const DEADLINE: Duration = Duration::from_secs(300);
     deny_unknown_fields
 )]
 pub enum Build {
-    Native {
-        manifest_path: PathBuf,
-        manifest_digest: Digest,
-    },
-    Oci {
-        source: OciSource,
-        recipe: MachineImageRecipe,
-        platform: String,
-    },
-    PublishSnapshot {
-        snapshot: Box<Snapshot>,
-        allow_sensitive: bool,
+    Image {
+        input: ImageImportInput,
     },
     DiskSnapshot {
         snapshot: Box<Snapshot>,
@@ -66,6 +55,19 @@ pub struct Job {
     pub operation: OperationId,
     pub request_digest: Digest,
     pub build: Build,
+}
+
+impl Job {
+    fn validate(&self) -> Result<()> {
+        if let Build::Image { input } = &self.build
+            && input.request_digest(&self.operation)? != self.request_digest
+        {
+            return Err(HostError::Invalid(
+                "image worker recipe differs from approved request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn directory(root: &Path, operation: &OperationId) -> PathBuf {
@@ -165,10 +167,7 @@ fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
 /// Submission never forks image processing in the API process. A busy pool
 /// rejects new work for explicit retry; it does not grow a queue of builders.
 pub fn execute(root: &Path, executable: &Path, job: Job) -> Result<ImageRecord> {
-    if !matches!(
-        job.build,
-        Build::Native { .. } | Build::Oci { .. } | Build::PublishSnapshot { .. }
-    ) {
+    if !matches!(job.build, Build::Image { .. }) {
         return Err(HostError::Invalid(
             "machine disk preparation is not image publication",
         ));
@@ -313,6 +312,7 @@ pub(crate) fn finish_disk_snapshot(
 }
 
 fn dispatch(root: &Path, executable: &Path, job: Job) -> Result<Outcome> {
+    job.validate()?;
     let root = sandsurf_native::local::canonical_private_directory(root)?;
     sandsurf_native::volume::inspect(&root)?;
     ensure_private_directory(&root.join("image-workers"))?;
@@ -448,6 +448,7 @@ pub(crate) fn admitted(root: &Path, operation: &OperationId) -> Result<Job> {
     if job.operation != *operation {
         return Err(HostError::Invalid("image worker job identity changed"));
     }
+    job.validate()?;
     Ok(job)
 }
 
@@ -544,9 +545,12 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
             )?;
             return Ok(());
         }
-        Build::Native {
-            manifest_path,
-            manifest_digest,
+        Build::Image {
+            input:
+                ImageImportInput::Native {
+                    manifest_path,
+                    manifest_digest,
+                },
         } => crate::images::import_native(
             &root,
             manifest_path,
@@ -554,10 +558,13 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
             &operation,
             &job.request_digest,
         )?,
-        Build::Oci {
-            source,
-            recipe,
-            platform,
+        Build::Image {
+            input:
+                ImageImportInput::Oci {
+                    source,
+                    recipe,
+                    platform,
+                },
         } => {
             let credential = match source {
                 OciSource::Registry {
@@ -587,9 +594,12 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
                 credential.as_ref().map(|v| v.as_slice()),
             )?
         }
-        Build::PublishSnapshot {
-            snapshot,
-            allow_sensitive,
+        Build::Image {
+            input:
+                ImageImportInput::PublishSnapshot {
+                    snapshot,
+                    allow_sensitive,
+                },
         } => crate::images::publish_snapshot(
             &root,
             snapshot,
@@ -795,13 +805,14 @@ mod tests {
         let operation: OperationId = "image-operation".try_into().unwrap();
         let stage = directory(&root, &operation);
         ensure_private_directory(&stage).unwrap();
+        let input = ImageImportInput::Native {
+            manifest_path: root.join("manifest.json"),
+            manifest_digest: sandsurf_protocol::bytes_digest(b"image"),
+        };
         let job = Job {
             operation: operation.clone(),
-            request_digest: sandsurf_protocol::bytes_digest(b"request"),
-            build: Build::Native {
-                manifest_path: root.join("manifest.json"),
-                manifest_digest: sandsurf_protocol::bytes_digest(b"image"),
-            },
+            request_digest: input.request_digest(&operation).unwrap(),
+            build: Build::Image { input },
         };
         publish(&stage.join("job.json"), &job).unwrap();
         assert_eq!(
@@ -814,6 +825,15 @@ mod tests {
         ensure_private_directory(&wrong_stage).unwrap();
         publish(&wrong_stage.join("job.json"), &job).unwrap();
         assert!(admitted(&root, &wrong).is_err());
+        let altered: OperationId = "altered-operation".try_into().unwrap();
+        let altered_stage = directory(&root, &altered);
+        ensure_private_directory(&altered_stage).unwrap();
+        let mut changed = job;
+        changed.operation = altered.clone();
+        // Even a well-formed job cannot change its executable input while
+        // retaining another request's approval digest.
+        publish(&altered_stage.join("job.json"), &changed).unwrap();
+        assert!(admitted(&root, &altered).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

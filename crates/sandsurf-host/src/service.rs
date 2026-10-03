@@ -177,6 +177,7 @@ struct ReconciliationCursor {
     after_snapshot: Option<SnapshotId>,
     next_domain: usize,
     after_image: Option<OperationId>,
+    after_import: Option<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -883,96 +884,35 @@ impl HostService {
     }
 
     fn prepare_image(&mut self, request: HostRequest) -> Result<HostDispatch> {
-        sandsurf_native::volume::inspect(&self.root)?;
-        match request {
+        let (operation_id, approval_id, input) = match request {
             HostRequest::ImportOci {
                 source,
                 recipe,
                 platform,
                 operation_id,
                 approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-import-oci-v1",
-                        &source,
-                        &recipe,
-                        &platform,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
-                        operation: admitted,
-                    })));
-                }
-                self.catalog
-                    .image(&recipe.boot_image_digest)?
-                    .ok_or(HostError::Invalid("OCI boot image has not been admitted"))?;
-                Ok(HostDispatch::Task(Box::new(HostTask::Image {
-                    root: self.root.clone(),
-                    executable: self.executable.clone(),
-                    job: crate::image_worker::Job {
-                        operation: operation_id,
-                        request_digest,
-                        build: crate::image_worker::Build::Oci {
-                            source,
-                            recipe,
-                            platform,
-                        },
-                    },
-                })))
-            }
+            } => (
+                operation_id,
+                approval_id,
+                sandsurf_state::ImageImportInput::Oci {
+                    source,
+                    recipe,
+                    platform,
+                },
+            ),
             HostRequest::ImportNativeImage {
                 manifest_path,
                 manifest_digest,
                 operation_id,
                 approval_id,
-            } => {
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-import-native-image-v1",
-                        &manifest_path,
-                        &manifest_digest,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
-                    },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
-                        operation: admitted,
-                    })));
-                }
-                Ok(HostDispatch::Task(Box::new(HostTask::Image {
-                    root: self.root.clone(),
-                    executable: self.executable.clone(),
-                    job: crate::image_worker::Job {
-                        operation: operation_id,
-                        request_digest,
-                        build: crate::image_worker::Build::Native {
-                            manifest_path,
-                            manifest_digest,
-                        },
-                    },
-                })))
-            }
+            } => (
+                operation_id,
+                approval_id,
+                sandsurf_state::ImageImportInput::Native {
+                    manifest_path,
+                    manifest_digest,
+                },
+            ),
             HostRequest::PublishSnapshotImage {
                 snapshot_id,
                 allow_sensitive,
@@ -983,43 +923,56 @@ impl HostService {
                     .catalog
                     .snapshot(&snapshot_id)?
                     .ok_or(HostError::Invalid("image snapshot does not exist"))?;
-                let request_digest = digest(
-                    Domain::Image,
-                    &(
-                        "sandsurf-publish-snapshot-image-v1",
-                        &snapshot_id,
+                (
+                    operation_id,
+                    approval_id,
+                    sandsurf_state::ImageImportInput::PublishSnapshot {
+                        snapshot: Box::new(snapshot),
                         allow_sensitive,
-                        &operation_id,
-                    ),
-                )?;
-                let admitted = self.catalog.admit_image_import(
-                    operation_id.clone(),
-                    request_digest.clone(),
-                    Approval {
-                        id: approval_id,
-                        request_digest: request_digest.clone(),
                     },
-                )?;
-                if admitted.phase == sandsurf_state::ImageImportPhase::Published {
-                    return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
-                        operation: admitted,
-                    })));
-                }
-                Ok(HostDispatch::Task(Box::new(HostTask::Image {
-                    root: self.root.clone(),
-                    executable: self.executable.clone(),
-                    job: crate::image_worker::Job {
-                        operation: operation_id,
-                        request_digest,
-                        build: crate::image_worker::Build::PublishSnapshot {
-                            snapshot: Box::new(snapshot),
-                            allow_sensitive,
-                        },
-                    },
-                })))
+                )
             }
-            _ => Err(HostError::Invalid("request is not an image operation")),
+            _ => return Err(HostError::Invalid("request is not an image operation")),
+        };
+        let request_digest = input.request_digest(&operation_id)?;
+        let admitted = self.catalog.admit_image_import(
+            operation_id,
+            input,
+            Approval {
+                id: approval_id,
+                request_digest,
+            },
+        )?;
+        if admitted.phase == sandsurf_state::ImageImportPhase::Published {
+            return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
+                operation: admitted,
+            })));
         }
+        self.prepare_image_materialization(admitted)
+    }
+
+    fn prepare_image_materialization(
+        &self,
+        record: sandsurf_state::ImageImportRecord,
+    ) -> Result<HostDispatch> {
+        let input = self
+            .catalog
+            .image_import_input(&record.operation_id)?
+            .ok_or(HostError::Invalid(
+                "image admission has no executable input",
+            ))?;
+        if input.request_digest(&record.operation_id)? != record.request_digest {
+            return Err(HostError::Invalid("image admission input binding changed"));
+        }
+        Ok(HostDispatch::Task(Box::new(HostTask::Image {
+            root: self.root.clone(),
+            executable: self.executable.clone(),
+            job: crate::image_worker::Job {
+                operation: record.operation_id,
+                request_digest: record.request_digest,
+                build: crate::image_worker::Build::Image { input },
+            },
+        })))
     }
 
     fn prepare_guest_dispatch(
@@ -2444,12 +2397,13 @@ impl HostService {
         // Rotate the first domain so a single free slot cannot starve either
         // snapshot publication, lifecycle policy or independently owned images.
         let first = cursor.next_domain;
-        cursor.next_domain = (first + 1) % 3;
-        for offset in 0..3 {
-            match (first + offset) % 3 {
+        cursor.next_domain = (first + 1) % 4;
+        for offset in 0..4 {
+            match (first + offset) % 4 {
                 0 => self.reconcile_snapshot_page(cursor, busy, slots, &mut work)?,
                 1 => self.reconcile_machine_page(cursor, busy, slots, now, &mut work)?,
                 2 => self.reconcile_image_page(cursor, busy, slots, &mut work)?,
+                3 => self.reconcile_import_page(cursor, busy, slots, &mut work)?,
                 _ => unreachable!(),
             }
         }
@@ -2526,6 +2480,40 @@ impl HostService {
         }
         if at_end {
             cursor.after_snapshot = None;
+        }
+        Ok(())
+    }
+
+    fn reconcile_import_page(
+        &self,
+        cursor: &mut ReconciliationCursor,
+        busy: &BTreeSet<ReconciliationIdentity>,
+        slots: usize,
+        work: &mut Vec<(ReconciliationIdentity, HostDispatch)>,
+    ) -> Result<()> {
+        let remaining = slots.saturating_sub(work.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let records = self
+            .catalog
+            .pending_image_imports(cursor.after_import.as_ref(), counter(remaining as u64))?;
+        let at_end = records.len() < remaining;
+        for record in records {
+            cursor.after_import = Some(record.operation_id.clone());
+            let identity = ReconciliationIdentity::Image(record.operation_id.clone());
+            if busy.contains(&identity) {
+                continue;
+            }
+            match self.prepare_image_materialization(record) {
+                Ok(dispatch) => work.push((identity, dispatch)),
+                Err(error) => {
+                    eprintln!("sandsurf image materialization recovery deferred: {error}")
+                }
+            }
+        }
+        if at_end {
+            cursor.after_import = None;
         }
         Ok(())
     }
@@ -4848,12 +4836,16 @@ mod tests {
         let image = bytes_digest(b"seed");
         if service.catalog.image(&image).unwrap().is_none() {
             let operation: OperationId = "import-seed".try_into().unwrap();
-            let request = bytes_digest(b"import-seed");
+            let input = sandsurf_state::ImageImportInput::Native {
+                manifest_path: service.root.join("seed-manifest.json"),
+                manifest_digest: image.clone(),
+            };
+            let request = input.request_digest(&operation).unwrap();
             service
                 .catalog
                 .admit_image_import(
                     operation.clone(),
-                    request.clone(),
+                    input,
                     Approval {
                         id: "approve-import-seed".try_into().unwrap(),
                         request_digest: request.clone(),
@@ -5639,6 +5631,128 @@ mod tests {
     }
 
     #[test]
+    fn image_recovery_has_bounded_rotating_visits_and_busy_work_cannot_starve_later_recipes() {
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("ssimage-sweep-{:x}", u64::from_le_bytes(nonce)));
+        let mut service = intent_service(&root);
+        admit_machine(&mut service, "busy-machine", MachineLifetime::default());
+        for label in ["a-build", "b-build", "c-build"] {
+            let operation: OperationId = label.try_into().unwrap();
+            let input = sandsurf_state::ImageImportInput::Native {
+                manifest_path: root.join(format!("{label}.json")),
+                manifest_digest: bytes_digest(label.as_bytes()),
+            };
+            let request_digest = input.request_digest(&operation).unwrap();
+            service
+                .catalog
+                .admit_image_import(
+                    operation,
+                    input,
+                    Approval {
+                        id: format!("approve-{label}").try_into().unwrap(),
+                        request_digest,
+                    },
+                )
+                .unwrap();
+        }
+        let mut cursor = ReconciliationCursor::default();
+        let busy = BTreeSet::from([ReconciliationIdentity::Image("a-build".try_into().unwrap())]);
+        assert!(
+            service
+                .reconcile_lifetime_policies(&mut cursor, &busy, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(cursor.after_import.is_none());
+        let mut visited = BTreeSet::new();
+        for _ in 0..12 {
+            let work = service
+                .reconcile_lifetime_policies(&mut cursor, &busy, 1)
+                .unwrap();
+            assert!(work.len() <= 1);
+            for (identity, _) in work {
+                visited.insert(identity);
+            }
+        }
+        assert!(visited.contains(&ReconciliationIdentity::Machine(
+            "busy-machine".try_into().unwrap()
+        )));
+        assert!(visited.contains(&ReconciliationIdentity::Image(
+            "b-build".try_into().unwrap()
+        )));
+        assert!(visited.contains(&ReconciliationIdentity::Image(
+            "c-build".try_into().unwrap()
+        )));
+        assert!(!visited.contains(&ReconciliationIdentity::Image(
+            "a-build".try_into().unwrap()
+        )));
+        assert!(!root.join("image-workers").exists());
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admitted_image_recipe_recovers_before_worker_publication_without_source_io_on_owner() {
+        let mut nonce = [0; 8];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("ssimage-admission-{:x}", u64::from_le_bytes(nonce)));
+        let mut service = intent_service(&root);
+        let operation: OperationId = "image".try_into().unwrap();
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: root.join("missing-source.json"),
+            manifest_digest: bytes_digest(b"image"),
+        };
+        let request = HostRequest::ImportNativeImage {
+            manifest_path: root.join("missing-source.json"),
+            manifest_digest: bytes_digest(b"image"),
+            operation_id: operation.clone(),
+            approval_id: "approved-image".try_into().unwrap(),
+        };
+        let HostDispatch::Task(task) = service.route(request) else {
+            panic!("image admission must enqueue source work")
+        };
+        assert!(
+            matches!(&*task, HostTask::Image { job, .. } if job.operation == operation
+            && matches!(&job.build, crate::image_worker::Build::Image { input: admitted } if admitted == &input))
+        );
+        assert!(!root.join("image-workers").exists());
+        drop(task);
+        drop(service);
+        let service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let mut cursor = ReconciliationCursor::default();
+        let mut work = Vec::new();
+        service
+            .reconcile_import_page(&mut cursor, &BTreeSet::new(), 1, &mut work)
+            .unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].0, ReconciliationIdentity::Image(operation.clone()));
+        let HostDispatch::Task(task) = &work[0].1 else {
+            panic!("recovery must dispatch the same materializer")
+        };
+        assert!(
+            matches!(&**task, HostTask::Image { job, .. } if job.operation == operation
+            && job.request_digest == input.request_digest(&operation).unwrap()
+            && matches!(&job.build, crate::image_worker::Build::Image { input: retained } if retained == &input))
+        );
+        assert!(!root.join("image-workers").exists());
+        assert_eq!(
+            service
+                .catalog
+                .image_import(&operation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            sandsurf_state::ImageImportPhase::Admitted
+        );
+        drop(work);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn image_lookup_reads_bytes_off_owner_and_absence_never_completes_admission() {
         let root = std::env::temp_dir().join(format!(
             "ssimage-query-{}-{}",
@@ -5647,12 +5761,16 @@ mod tests {
         ));
         let mut service = intent_service(&root);
         let operation: OperationId = "import".try_into().unwrap();
-        let request_digest = bytes_digest(b"image input");
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: root.join("source-manifest.json"),
+            manifest_digest: bytes_digest(b"image input"),
+        };
+        let request_digest = input.request_digest(&operation).unwrap();
         let admitted = service
             .catalog
             .admit_image_import(
                 operation.clone(),
-                request_digest.clone(),
+                input,
                 Approval {
                     id: "approve-import".try_into().unwrap(),
                     request_digest,
@@ -5692,12 +5810,16 @@ mod tests {
         let mut service = intent_service(&root);
         let image = bytes_digest(b"retired image");
         let import: OperationId = "import".try_into().unwrap();
-        let request_digest = bytes_digest(b"input");
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: root.join("source-manifest.json"),
+            manifest_digest: image.clone(),
+        };
+        let request_digest = input.request_digest(&import).unwrap();
         service
             .catalog
             .admit_image_import(
                 import.clone(),
-                request_digest.clone(),
+                input,
                 Approval {
                     id: "approve-import".try_into().unwrap(),
                     request_digest: request_digest.clone(),
