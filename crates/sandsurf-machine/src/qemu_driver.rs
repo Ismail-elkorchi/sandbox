@@ -88,9 +88,7 @@ mod native {
     use super::*;
     use crate::qemu::LaunchConfig;
     use crate::qemu_owner::QemuOwner;
-    use crate::{
-        ConfigurationOutcome, DriverQualification, MachineDriver, MachineOutcome, MachineTransition,
-    };
+    use crate::{DriverQualification, MachineDriver, MachineOutcome, MachineTransition};
     use sandsurf_native::serial_channel::SerialChannel;
     use sandsurf_protocol::{
         Capability, ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand,
@@ -185,6 +183,18 @@ mod native {
         }
         pub fn network(&self) -> Option<Arc<sandsurf_network::NativeNetworkGateway>> {
             self.owner.as_ref().map(QemuOwner::network)
+        }
+        pub fn install_network_configuration(
+            &self,
+            command: &ConfigurationCommand,
+        ) -> io::Result<()> {
+            self.owner
+                .as_ref()
+                .ok_or_else(|| invalid("native network owner is absent"))?
+                .configure_network(
+                    &command.configuration.network,
+                    &command.configuration.exposures,
+                )
         }
         pub fn management_channel(&self) -> Option<SerialChannel> {
             self.owner.as_ref().map(QemuOwner::management_channel)
@@ -445,32 +455,30 @@ mod native {
             }
             Ok(Some(power))
         }
-        fn configure(
-            &mut self,
+        fn validate_configuration(
+            &self,
             command: &ConfigurationCommand,
             current: &MachineObservation,
-        ) -> ConfigurationOutcome {
+        ) -> Result<(), Digest> {
             let live = matches!(current.state, MachineState::Running | MachineState::Paused);
             if command.machine_id != self.config.launch.machine_id
+                || current.machine_id != self.config.launch.machine_id
                 || command.revision <= current.applied_revision
                 || live != self.owner.is_some()
                 || (live && self.resources.as_ref() != Some(&command.configuration.resources))
+                || !matches!(
+                    current.state,
+                    MachineState::Stopped
+                        | MachineState::Failed
+                        | MachineState::Running
+                        | MachineState::Paused
+                )
             {
-                return ConfigurationOutcome::NotApplied(bytes_digest(
+                return Err(bytes_digest(
                     b"qemu-configuration-requires-detached-resource-change",
                 ));
             }
-            if let Some(owner) = &self.owner
-                && owner
-                    .configure_network(
-                        &command.configuration.network,
-                        &command.configuration.exposures,
-                    )
-                    .is_err()
-            {
-                return ConfigurationOutcome::Unknown;
-            }
-            ConfigurationOutcome::Applied(bytes_digest(b"qemu-current-authority-installed"))
+            Ok(())
         }
         fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {
             self.boot(command, Counter::ONE)

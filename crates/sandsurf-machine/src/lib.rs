@@ -138,13 +138,6 @@ pub enum MachineOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigurationOutcome {
-    Applied(Digest),
-    NotApplied(Digest),
-    Unknown,
-}
-
 /// One exclusively owned native VM. Implementations must not silently cold-boot
 /// for restore, infer success from API request delivery, or return before the
 /// reported native postcondition has been observed.
@@ -160,11 +153,14 @@ pub trait MachineDriver {
     /// None means no live native attachment. Errors mean unavailable evidence,
     /// never a stopped computer. Observation must not start or replace a VM.
     fn observe_power(&mut self) -> Result<Option<NativePowerObservation>, Digest>;
-    fn configure(
-        &mut self,
+    /// Pure native attachment/topology preflight. It cannot install authority
+    /// or report a configuration as applied. The guardian's effect owner
+    /// coordinates its resource and network planes and records completion.
+    fn validate_configuration(
+        &self,
         command: &ConfigurationCommand,
         current: &MachineObservation,
-    ) -> ConfigurationOutcome;
+    ) -> Result<(), Digest>;
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome;
     fn reconfigure(
         &mut self,
@@ -384,12 +380,12 @@ mod tests {
                 },
             }
         }
-        fn configure(
-            &mut self,
+        fn validate_configuration(
+            &self,
             _: &ConfigurationCommand,
             _: &MachineObservation,
-        ) -> ConfigurationOutcome {
-            ConfigurationOutcome::Applied(hash("configuration"))
+        ) -> Result<(), Digest> {
+            Ok(())
         }
         fn create(&mut self, _: &LifecycleCommand) -> MachineOutcome {
             self.take("create")

@@ -732,7 +732,10 @@ impl QemuGuardianEffect {
         })
     }
 
-    fn install_runtime(&mut self, configuration: &RuntimeConfiguration) -> RuntimeInstallation {
+    fn record_installed_runtime(
+        &mut self,
+        configuration: &RuntimeConfiguration,
+    ) -> RuntimeInstallation {
         let Some(active) = self.management_binding() else {
             return RuntimeInstallation::Unknown;
         };
@@ -750,10 +753,10 @@ impl QemuGuardianEffect {
         let Some(gateway) = self.machine.network() else {
             return RuntimeInstallation::Unknown;
         };
-        if gateway
-            .configure(&configuration.network, &configuration.exposures)
-            .is_err()
-        {
+        // Boot/resume or the configuration effect has installed this exact
+        // envelope through the original native owner. Recording it must not
+        // reconfigure the same gateway a second time.
+        if !gateway.is_alive() {
             return RuntimeInstallation::Unknown;
         }
         if let Ok(mut network) = self.network.lock() {
@@ -962,7 +965,7 @@ impl GuardianEffect for QemuGuardianEffect {
                     }
                 }
             }
-            let runtime = match self.install_runtime(&command.configuration) {
+            let runtime = match self.record_installed_runtime(&command.configuration) {
                 RuntimeInstallation::Applied(value) => value,
                 RuntimeInstallation::Unknown => {
                     self.contain_unpublished();
@@ -1057,38 +1060,43 @@ impl GuardianEffect for QemuGuardianEffect {
         {
             return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
         }
-        if matches!(current.state, MachineState::Stopped | MachineState::Failed) {
-            return match self.machine.configure(command, current) {
-                sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
-                    self.config.resources = command.configuration.resources.clone();
-                    EffectOutcome::Applied(evidence)
-                }
-                sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
-                    EffectOutcome::NotApplied(evidence)
-                }
-                sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
-            };
+        if let Err(evidence) = self.machine.validate_configuration(command, current) {
+            return EffectOutcome::NotApplied(evidence);
         }
-        match self.machine.configure(command, current) {
-            sandsurf_machine::ConfigurationOutcome::Applied(machine) => {
-                match self.install_runtime(&command.configuration) {
-                    RuntimeInstallation::Applied(runtime) => digest(
-                        Domain::Authority,
-                        &(
-                            "sandsurf-qemu-configuration-applied-v1",
-                            machine,
-                            runtime,
-                            &command.configuration,
-                        ),
-                    )
-                    .map_or(EffectOutcome::Unknown, EffectOutcome::Applied),
-                    RuntimeInstallation::Unknown => EffectOutcome::Unknown,
+        let runtime = if matches!(current.state, MachineState::Stopped | MachineState::Failed) {
+            None
+        } else {
+            if self.machine.install_network_configuration(command).is_err() {
+                self.contain_unpublished();
+                return EffectOutcome::Unknown;
+            }
+            match self.record_installed_runtime(&command.configuration) {
+                RuntimeInstallation::Applied(evidence) => Some(evidence),
+                RuntimeInstallation::Unknown => {
+                    self.contain_unpublished();
+                    return EffectOutcome::Unknown;
                 }
             }
-            sandsurf_machine::ConfigurationOutcome::NotApplied(value) => {
-                EffectOutcome::NotApplied(value)
+        };
+        match digest(
+            Domain::Authority,
+            &(
+                "sandsurf-qemu-configuration-applied-v1",
+                &command.machine_id,
+                command.revision,
+                &command.request_digest,
+                runtime,
+                &command.configuration,
+            ),
+        ) {
+            Ok(evidence) => {
+                self.config.resources = command.configuration.resources.clone();
+                EffectOutcome::Applied(evidence)
             }
-            sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
+            Err(_) => {
+                self.contain_unpublished();
+                EffectOutcome::Unknown
+            }
         }
     }
 

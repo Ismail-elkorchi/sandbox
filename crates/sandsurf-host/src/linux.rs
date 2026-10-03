@@ -747,6 +747,9 @@ impl GuardianEffect for LinuxGuardianEffect {
         {
             return EffectOutcome::NotApplied(bytes_digest(b"native-resource-change-unsupported"));
         }
+        if let Err(evidence) = self.machine.validate_configuration(command, current) {
+            return EffectOutcome::NotApplied(evidence);
+        }
         if self
             .process_envelope
             .apply(&command.configuration.resources)
@@ -758,40 +761,36 @@ impl GuardianEffect for LinuxGuardianEffect {
             self.contain_unpublished_machine();
             return EffectOutcome::Unknown;
         }
-        self.config.resources = command.configuration.resources.clone();
-        if current.state == MachineState::Stopped {
-            return match self.machine.configure(command, current) {
-                sandsurf_machine::ConfigurationOutcome::Applied(evidence) => {
-                    EffectOutcome::Applied(evidence)
-                }
-                sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
-                    EffectOutcome::NotApplied(evidence)
-                }
-                sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
-            };
-        }
-        match self.machine.configure(command, current) {
-            sandsurf_machine::ConfigurationOutcome::Applied(machine_evidence) => {
-                match self.install_runtime_configuration(&command.configuration) {
-                    RuntimeInstallation::Applied(runtime_evidence) => match digest(
-                        Domain::Authority,
-                        &(
-                            "sandsurf-linux-runtime-configuration-v1",
-                            machine_evidence,
-                            runtime_evidence,
-                            &command.configuration,
-                        ),
-                    ) {
-                        Ok(evidence) => EffectOutcome::Applied(evidence),
-                        Err(_) => EffectOutcome::Unknown,
-                    },
-                    RuntimeInstallation::Unknown => EffectOutcome::Unknown,
+        let runtime_evidence = if current.state == MachineState::Stopped {
+            None
+        } else {
+            match self.install_runtime_configuration(&command.configuration) {
+                RuntimeInstallation::Applied(evidence) => Some(evidence),
+                RuntimeInstallation::Unknown => {
+                    self.contain_unpublished_machine();
+                    return EffectOutcome::Unknown;
                 }
             }
-            sandsurf_machine::ConfigurationOutcome::NotApplied(evidence) => {
-                EffectOutcome::NotApplied(evidence)
+        };
+        match digest(
+            Domain::Authority,
+            &(
+                "sandsurf-linux-runtime-configuration-v1",
+                &command.machine_id,
+                command.revision,
+                &command.request_digest,
+                runtime_evidence,
+                &command.configuration,
+            ),
+        ) {
+            Ok(evidence) => {
+                self.config.resources = command.configuration.resources.clone();
+                EffectOutcome::Applied(evidence)
             }
-            sandsurf_machine::ConfigurationOutcome::Unknown => EffectOutcome::Unknown,
+            Err(_) => {
+                self.contain_unpublished_machine();
+                EffectOutcome::Unknown
+            }
         }
     }
 

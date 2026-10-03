@@ -9,12 +9,11 @@ use crate::firecracker::{
     FirecrackerSnapshot,
 };
 use crate::{
-    ConfigurationOutcome, DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome,
-    MachineTransition,
+    DriverQualification, GuestArchitecture, MachineDriver, MachineOutcome, MachineTransition,
 };
 use sandsurf_protocol::{
-    ConfigurationCommand, Counter, Digest, Domain, LifecycleCommand, MachineId, MachineObservation,
-    MachineState, OperationId, Qualification, SnapshotId, VmEngine, bytes_digest, digest,
+    ConfigurationCommand, Counter, Digest, LifecycleCommand, MachineId, MachineObservation,
+    MachineState, OperationId, Qualification, SnapshotId, VmEngine, bytes_digest,
 };
 use std::fs;
 
@@ -420,11 +419,11 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
         }
     }
 
-    fn configure(
-        &mut self,
+    fn validate_configuration(
+        &self,
         command: &ConfigurationCommand,
         current: &MachineObservation,
-    ) -> ConfigurationOutcome {
+    ) -> Result<(), Digest> {
         let live = matches!(current.state, MachineState::Running | MachineState::Paused);
         if live
             && self.boot_resources.as_ref().is_none_or(|resources| {
@@ -433,11 +432,10 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
                     || resources.disk_bytes != command.configuration.resources.disk_bytes
             })
         {
-            return ConfigurationOutcome::NotApplied(bytes_digest(
-                b"live-machine-geometry-change-unsupported",
-            ));
+            return Err(bytes_digest(b"live-machine-geometry-change-unsupported"));
         }
         if command.machine_id != self.machine_id
+            || current.machine_id != self.machine_id
             || command.revision <= current.applied_revision
             || live != self.process.is_some()
             || matches!(
@@ -450,22 +448,9 @@ impl<F: FirecrackerGenerationFactory> MachineDriver for FirecrackerDriver<F> {
                     | MachineState::Failed
             )
         {
-            return ConfigurationOutcome::NotApplied(bytes_digest(
-                b"firecracker-configuration-state-mismatch",
-            ));
+            return Err(bytes_digest(b"firecracker-configuration-state-mismatch"));
         }
-        match digest(
-            Domain::Authority,
-            &(
-                "firecracker-configuration-installed-v1",
-                &command.machine_id,
-                command.revision,
-                &command.request_digest,
-            ),
-        ) {
-            Ok(evidence) => ConfigurationOutcome::Applied(evidence),
-            Err(_) => ConfigurationOutcome::Unknown,
-        }
+        Ok(())
     }
 
     fn create(&mut self, command: &LifecycleCommand) -> MachineOutcome {
@@ -764,5 +749,109 @@ fn transition_with_digest(
         generation,
         state,
         evidence_digest: bytes_digest(&value),
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use sandsurf_protocol::{ObservationCause, RuntimeConfiguration};
+
+    struct NoEffects;
+    impl FirecrackerGenerationFactory for NoEffects {
+        fn configuration(
+            &mut self,
+            _: &MachineId,
+            _: Counter,
+            _: &sandsurf_protocol::Resources,
+        ) -> Result<FirecrackerConfig, Digest> {
+            panic!("preflight attempted a boot");
+        }
+        fn bind_management(
+            &mut self,
+            _: &MachineId,
+            _: Counter,
+            _: &mut FirecrackerProcess,
+        ) -> Result<Digest, Digest> {
+            panic!("preflight attempted management binding");
+        }
+        fn restore_configuration(
+            &mut self,
+            _: &MachineId,
+            _: Counter,
+            _: &FirecrackerRestoreSource,
+        ) -> Result<(FirecrackerConfig, FirecrackerRestore), Digest> {
+            panic!("preflight attempted restore");
+        }
+        fn bind_restored_management(
+            &mut self,
+            _: &MachineId,
+            _: Counter,
+            _: &mut FirecrackerProcess,
+        ) -> Result<Digest, Digest> {
+            panic!("preflight attempted restore binding");
+        }
+    }
+
+    #[test]
+    fn configuration_preflight_is_pure_and_rejects_native_state_identity_and_topology_mismatch() {
+        let machine: MachineId = "computer".try_into().unwrap();
+        let driver = FirecrackerDriver::new(
+            machine.clone(),
+            GuestArchitecture::Amd64,
+            FirecrackerQualification {
+                lifecycle: None,
+                full_state: None,
+            },
+            NoEffects,
+        );
+        let mut command = ConfigurationCommand {
+            machine_id: machine.clone(),
+            operation_id: "configure".try_into().unwrap(),
+            revision: 2.try_into().unwrap(),
+            configuration: RuntimeConfiguration::default(),
+            request_digest: bytes_digest(b"configuration"),
+        };
+        let mut current = MachineObservation {
+            machine_id: machine.clone(),
+            generation: Counter::ONE,
+            sequence: Counter::ONE,
+            applied_revision: Counter::ONE,
+            state: MachineState::Stopped,
+            evidence_digest: bytes_digest(b"native power"),
+            cause: ObservationCause::Native {},
+        };
+        assert!(driver.validate_configuration(&command, &current).is_ok());
+        assert!(driver.process.is_none());
+        assert!(driver.boot_resources.is_none());
+        command.machine_id = "other".try_into().unwrap();
+        assert!(driver.validate_configuration(&command, &current).is_err());
+        command.machine_id = machine;
+        current.machine_id = "other".try_into().unwrap();
+        assert!(driver.validate_configuration(&command, &current).is_err());
+        current.machine_id = command.machine_id.clone();
+        command.revision = Counter::ONE;
+        assert!(driver.validate_configuration(&command, &current).is_err());
+        command.revision = 2.try_into().unwrap();
+        for state in [
+            MachineState::Creating,
+            MachineState::Starting,
+            MachineState::Restoring,
+            MachineState::Destroying,
+            MachineState::Destroyed,
+            MachineState::Failed,
+            MachineState::Running,
+            MachineState::Paused,
+        ] {
+            current.state = state;
+            assert!(
+                driver.validate_configuration(&command, &current).is_err(),
+                "{state:?}"
+            );
+        }
+        current.state = MachineState::Stopped;
+        assert!(driver.validate_configuration(&command, &current).is_ok());
+        assert!(driver.process.is_none());
+        assert!(driver.boot_resources.is_none());
     }
 }
