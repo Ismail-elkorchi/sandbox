@@ -8,6 +8,7 @@ use crate::guardian::{
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
 use crate::guest_transport::GuestTransport;
+use crate::restore::ReconnectState;
 use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::firecracker::{FirecrackerConfig, FirecrackerProcess, FirecrackerRestore};
 use sandsurf_machine::linux::{
@@ -368,7 +369,7 @@ impl LinuxGuardianEffect {
             });
             return Ok(());
         };
-        let boot = crate::storage::read_boot(&active.boot_directory)?;
+        let boot = &active.boot;
         let boundary = match sandsurf_native::network_sockets::observe_boundary() {
             Ok(boundary) => boundary,
             Err(_) => {
@@ -382,7 +383,7 @@ impl LinuxGuardianEffect {
                 return Ok(());
             }
         };
-        let exact = qualification_for_boot(&configuration, &boot, &self.machine_root, &boundary)?;
+        let exact = qualification_for_boot(&configuration, boot, &self.machine_root, &boundary)?;
         let root = self
             .machine_root
             .parent()
@@ -1049,19 +1050,6 @@ impl GuardianEffect for LinuxGuardianEffect {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReconnectState {
-    format_version: u16,
-    snapshot_id: sandsurf_protocol::SnapshotId,
-    capture_operation_id: sandsurf_protocol::OperationId,
-    machine_id: MachineId,
-    generation: Counter,
-    boot_identity: Digest,
-    capability: [u8; 32],
-    boot: sandsurf_image::boot::FrozenBoot,
-}
-
 impl LinuxGuardianEffect {
     fn prepare_full_restore(
         &self,
@@ -1108,8 +1096,7 @@ impl LinuxGuardianEffect {
             expected,
             ..
         } = prepared.input;
-        let reconnect: ReconnectState = serde_json::from_slice(&prepared.reconnect)
-            .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
+        let reconnect = *prepared.reconnect;
         if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
                 "restore reconnect identity does not match snapshot",
@@ -1397,6 +1384,7 @@ struct ActiveGuest {
     boot_identity: Digest,
     capability: [u8; 32],
     boot_directory: PathBuf,
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1409,12 +1397,10 @@ struct NativeBootObservation {
 
 impl LinuxGenerationFactory {
     fn record_boot(&self, active: &ActiveGuest) -> Result<(), Digest> {
-        let boot = crate::storage::read_boot(&active.boot_directory)
-            .map_err(|_| bytes_digest(b"linux-native-boot-artifacts-invalid"))?;
         let observation = NativeBootObservation {
             machine_id: active.machine_id.clone(),
             generation: active.generation,
-            boot,
+            boot: active.boot.clone(),
         };
         let guardian = self.machine_root.join("guardian");
         let stage = guardian.join(format!(
@@ -1440,6 +1426,7 @@ struct PendingGuest {
     boot_identity: Digest,
     capability: [u8; 32],
     boot_directory: PathBuf,
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 struct PendingRestore {
@@ -1550,6 +1537,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             boot_identity: pending.boot_identity,
             capability: pending.capability,
             boot_directory: pending.boot_directory,
+            boot: pending.boot,
             rebind: None,
         };
         let evidence = digest(
@@ -1592,12 +1580,9 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             .parent()
             .ok_or_else(|| bytes_digest(b"linux-restore-boot-owner-missing"))?
             .join("boot");
-        if crate::storage::read_boot(&boot_directory)
-            .map_err(|_| bytes_digest(b"linux-restore-boot-artifacts-invalid"))?
-            != reconnect.boot
-        {
-            return Err(bytes_digest(b"linux-restore-boot-identity-mismatch"));
-        }
+        // PreparedRestore verified these bytes off-owner while acquiring the
+        // original snapshot custody now retained by this actual VMM. Do not
+        // rehash hundreds of MiB on the lifecycle/control owner.
         // StageRestore already verified the restored disk against the capture.
         // Resume does not install an OS, customize identities, or read /boot.
         let storage_custody = vec![
@@ -1682,6 +1667,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             boot_identity: pending.next.boot_identity,
             capability: pending.next.capability,
             boot_directory: pending.next.boot_directory,
+            boot: pending.next.boot,
             rebind: Some(rebind),
         };
         self.record_boot(&active)?;
@@ -1743,6 +1729,7 @@ impl LinuxGenerationFactory {
             boot_identity,
             capability,
             boot_directory,
+            boot,
         });
         Ok(FirecrackerConfig {
             network_identity: sandsurf_network::LinkIdentity::for_machine(machine_id),

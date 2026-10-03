@@ -8,6 +8,7 @@ use crate::guardian::{
 };
 use crate::guest::{GuestClient, ManagedGuestClient, ManagementRebind, PendingRebind};
 use crate::guest_transport::GuestTransport;
+use crate::restore::ReconnectState;
 use sandsurf_image::{Architecture, ImageTrust, RootfsFormat, verify_image};
 use sandsurf_machine::qemu::{Accelerator, LaunchConfig};
 use sandsurf_machine::qemu_driver::{
@@ -340,26 +341,15 @@ impl QemuGuardianEffect {
         let restoring = crate::restore::load::<RestoreLineage>(&self.machine_root)
             .map_err(|_| bytes_digest(b"qemu-restore-lineage-invalid"))?;
         let (boot_directory, boot) = if let Some(lineage) = &restoring {
-            let boot_directory = self.machine_root.join("guardian").join(format!(
-                "boot-{}-{}",
-                generation.get(),
-                random_bytes()
-                    .map_err(|_| bytes_digest(b"qemu-boot-entropy"))?
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            ));
-            let source = self
+            let boot_directory = self
                 .machine_root
                 .join("snapshots")
                 .join(object_name(lineage.snapshot_id.as_str()))
                 .join("boot");
-            let boot = crate::storage::copy_boot(&source, &boot_directory)
-                .map_err(|_| bytes_digest(b"qemu-restore-boot-artifacts-invalid"))?;
-            if boot != lineage.source.boot {
-                return Err(bytes_digest(b"qemu-restore-boot-identity-mismatch"));
-            }
-            (boot_directory, boot)
+            // The restore worker verified this immutable input and transferred
+            // its original custody into QemuDriver and the VMM. No disk/boot
+            // copy or full-file rehash belongs on the native control owner.
+            (boot_directory, lineage.source.boot.clone())
         } else {
             prepared
                 .ok_or_else(|| bytes_digest(b"qemu-prepared-boot-missing"))?
@@ -385,7 +375,15 @@ impl QemuGuardianEffect {
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
             .and_then(|format| format.require_qemu())
             .map_err(|_| bytes_digest(b"qemu-kernel-loader-contract-invalid"))?;
-        let authentication_disk = boot_directory.join("auth.img");
+        let nonce = random_bytes()
+            .map_err(|_| bytes_digest(b"qemu-boot-entropy"))?
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let authentication_disk = self
+            .machine_root
+            .join("guardian")
+            .join(format!("auth-{}-{nonce}.img", generation.get()));
         self.machine
             .stage_boot_artifacts(kernel, initramfs, authentication_disk.clone())
             .map_err(|_| bytes_digest(b"qemu-boot-staging-failed"))?;
@@ -700,8 +698,7 @@ impl QemuGuardianEffect {
             expected,
             ..
         } = prepared.input;
-        let reconnect: ReconnectState = serde_json::from_slice(&prepared.reconnect)
-            .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
+        let reconnect = *prepared.reconnect;
         if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
             return Err(ControlError::Protocol(
                 "restore reconnect identity does not match snapshot",
@@ -1446,19 +1443,6 @@ impl GuardianEffect for QemuGuardianEffect {
                 "guest reset has no applied native envelope",
             ))
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReconnectState {
-    format_version: u16,
-    snapshot_id: sandsurf_protocol::SnapshotId,
-    capture_operation_id: sandsurf_protocol::OperationId,
-    machine_id: MachineId,
-    generation: Counter,
-    boot_identity: Digest,
-    capability: [u8; 32],
-    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 fn native_architecture_name() -> &'static str {

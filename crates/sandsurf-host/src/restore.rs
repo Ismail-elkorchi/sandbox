@@ -3,13 +3,28 @@
 
 use crate::guardian::{Error, Result};
 use sandsurf_native::PrivateFileAccess;
-use sandsurf_protocol::Digest;
+use sandsurf_protocol::{Counter, Digest, MachineId, OperationId, SnapshotId};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{Read, Write};
 use std::path::Path;
 
 const MAX_RECORD_BYTES: u64 = sandsurf_protocol::MAX_CONTROL_BYTES as u64;
 const RECORD: &str = "restore-integration.json";
+
+/// Captured host channel/boot input shared by native adapters. Possession of
+/// its guest-held capability is not guest attestation or host authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReconnectState {
+    pub format_version: u16,
+    pub snapshot_id: SnapshotId,
+    pub capture_operation_id: OperationId,
+    pub machine_id: MachineId,
+    pub generation: Counter,
+    pub boot_identity: Digest,
+    pub capability: [u8; 32],
+    pub boot: sandsurf_image::boot::FrozenBoot,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

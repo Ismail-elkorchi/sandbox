@@ -18,7 +18,7 @@ pub struct RestorePreparation {
 
 pub struct PreparedRestore {
     pub(crate) input: RestorePreparation,
-    pub(crate) reconnect: Vec<u8>,
+    pub(crate) reconnect: Box<crate::restore::ReconnectState>,
     pub(crate) disk_custody: Arc<File>,
     pub(crate) snapshot_custody: Arc<File>,
 }
@@ -116,6 +116,24 @@ impl RestorePreparation {
         if reconnect.len() > 1024 * 1024 {
             return Err(Error::Protocol("restore reconnect state exceeds its bound"));
         }
+        let reconnect: crate::restore::ReconnectState = serde_json::from_slice(&reconnect)?;
+        if reconnect.format_version != 1
+            || reconnect.snapshot_id != self.snapshot_id
+            || reconnect.generation == sandsurf_protocol::Counter::ZERO
+            || match reconnect.boot.architecture {
+                sandsurf_image::Architecture::X64 => "amd64",
+                sandsurf_image::Architecture::Arm64 => "arm64",
+            } != self.expected.architecture
+        {
+            return Err(Error::Protocol(
+                "restore channel or boot input identity changed",
+            ));
+        }
+        if crate::storage::read_boot(&directory.join("boot"))? != reconnect.boot {
+            return Err(Error::Protocol(
+                "saved running boot differs from its captured channel",
+            ));
+        }
         if let Some(staged) = self.staged_state_path() {
             crate::snapshots::private_directory(
                 staged
@@ -133,7 +151,7 @@ impl RestorePreparation {
         }
         Ok(PreparedRestore {
             input: self,
-            reconnect,
+            reconnect: Box::new(reconnect),
             disk_custody,
             snapshot_custody,
         })
@@ -173,7 +191,36 @@ pub(crate) mod tests {
         };
         let system_disk = artifact("system.ext4", &disk);
         let snapshot_state = artifact("snapshot.vmstate", b"native saved state");
-        let reconnect_state = artifact("reconnect.json", b"{}");
+        let mut kernel = vec![0; 4096];
+        kernel[0x202..0x206].copy_from_slice(b"HdrS");
+        kernel[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        kernel[0x236] = 1;
+        kernel[0x206..0x208].copy_from_slice(&0x020c_u16.to_le_bytes());
+        create_private_file(&root.join("fixture-kernel"))
+            .unwrap()
+            .write_all(&kernel)
+            .unwrap();
+        let boot = crate::storage::pin_boot(
+            &root.join("fixture-kernel"),
+            None,
+            sandsurf_image::Architecture::X64,
+            &directory.join("boot"),
+        )
+        .unwrap();
+        let reconnect_state = artifact(
+            "reconnect.json",
+            &serde_json::to_vec(&crate::restore::ReconnectState {
+                format_version: 1,
+                snapshot_id: snapshot_id.clone(),
+                capture_operation_id: "capture".try_into().unwrap(),
+                machine_id: "computer".try_into().unwrap(),
+                generation: Counter::ONE,
+                boot_identity: bytes_digest(b"running boot"),
+                capability: [7; 32],
+                boot,
+            })
+            .unwrap(),
+        );
         let memory =
             (engine == VmEngine::Firecracker).then(|| artifact("memory", b"native memory"));
         RestorePreparation {
@@ -269,9 +316,73 @@ pub(crate) mod tests {
             std::fs::read(prepared.input.directory().join("snapshot.vmstate")).unwrap(),
             b"native saved state"
         );
-        assert_eq!(prepared.reconnect, b"{}");
+        assert_eq!(prepared.reconnect.snapshot_id, prepared.input.snapshot_id);
+        assert_eq!(prepared.reconnect.generation, Counter::ONE);
         drop(prepared);
         assert!(crate::storage::attach(&disk).is_ok());
+    }
+
+    #[test]
+    fn restore_worker_rejects_missing_changed_or_substituted_running_boot_before_installation() {
+        for mutation in 0..3 {
+            let root = Root::new();
+            let input = fixture(&root.0, VmEngine::Firecracker);
+            let boot = input.directory().join("boot");
+            let kernel = boot.join("kernel");
+            match mutation {
+                0 => std::fs::remove_file(&kernel).unwrap(),
+                1 => {
+                    let mut file = sandsurf_native::local::open_private_file(
+                        &kernel,
+                        sandsurf_native::PrivateFileAccess::ReadWrite,
+                    );
+                    // pin_boot makes its input immutable to ordinary writes.
+                    // Fault injection explicitly simulates damaged host media.
+                    if file.is_err() {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(
+                                &kernel,
+                                std::fs::Permissions::from_mode(0o600),
+                            )
+                            .unwrap();
+                        }
+                        #[cfg(windows)]
+                        {
+                            let mut permissions = std::fs::metadata(&kernel).unwrap().permissions();
+                            permissions.set_readonly(false);
+                            std::fs::set_permissions(&kernel, permissions).unwrap();
+                        }
+                        file = sandsurf_native::local::open_private_file(
+                            &kernel,
+                            sandsurf_native::PrivateFileAccess::ReadWrite,
+                        );
+                    }
+                    file.unwrap().write_all(b"damaged").unwrap();
+                }
+                _ => {
+                    let changed = sandsurf_image::boot::FrozenBoot {
+                        architecture: sandsurf_image::Architecture::X64,
+                        kernel: sandsurf_image::ImageArtifact {
+                            path: "kernel".into(),
+                            sha256: "f".repeat(64),
+                        },
+                        initramfs: None,
+                    };
+                    let mut file = sandsurf_native::local::open_private_file(
+                        &boot.join("boot.json"),
+                        sandsurf_native::PrivateFileAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    file.set_len(0).unwrap();
+                    file.write_all(&serde_json::to_vec(&changed).unwrap())
+                        .unwrap();
+                }
+            }
+            assert!(input.execute().is_err());
+            assert!(!root.0.join("guardian/restore-integration.json").exists());
+        }
     }
 
     #[test]
