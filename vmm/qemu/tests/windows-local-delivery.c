@@ -94,6 +94,20 @@ static int experiment(const wchar_t *binary) {
     PSID sid = NULL;
     require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(name, &sid)),
             "fresh AppContainer identity");
+    /* Registration gives the native object namespace an identity. Deliberately
+     * do not create a writable AppContainer profile outside the bounded scope. */
+    typedef HRESULT (WINAPI *RegisterSid)(PSID, LPCWSTR, LPCWSTR);
+    typedef HRESULT (WINAPI *UnregisterSid)(PSID);
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    FARPROC address_register = GetProcAddress(kernelbase, "AppContainerRegisterSid");
+    FARPROC address_unregister = GetProcAddress(kernelbase, "AppContainerUnregisterSid");
+    RegisterSid register_sid = NULL;
+    UnregisterSid unregister_sid = NULL;
+    _Static_assert(sizeof(register_sid) == sizeof(address_register), "native function ABI");
+    memcpy(&register_sid, &address_register, sizeof(register_sid));
+    memcpy(&unregister_sid, &address_unregister, sizeof(unregister_sid));
+    require(register_sid != NULL && unregister_sid != NULL &&
+                SUCCEEDED(register_sid(sid, name, name)), "native identity registration");
     LPWSTR sid_text = NULL;
     require(ConvertSidToStringSidW(sid, &sid_text), "AppContainer SID text");
     wchar_t temporary[MAX_PATH], executable[MAX_PATH];
@@ -192,6 +206,7 @@ static int experiment(const wchar_t *binary) {
     CloseHandle(read_pipe);
     DeleteProcThreadAttributeList(attributes);
     free(attributes);
+    require(SUCCEEDED(unregister_sid(sid)), "native identity retirement");
     FreeSid(sid);
     require(DeleteFileW(executable), "fixture binary cleanup");
 

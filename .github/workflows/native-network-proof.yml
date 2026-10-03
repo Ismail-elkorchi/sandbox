@@ -9,6 +9,20 @@ on:
 permissions:
   contents: read
 jobs:
+  darwin-observation:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Observe the native PF control surface (no VM hardware required)
+        shell: bash
+        run: |
+          if [ "$RUNNER_ENVIRONMENT" != github-hosted ]; then exit 1; fi
+          trap 'sudo pfctl -d; sudo pfctl -f /etc/pf.conf' EXIT
+          sudo pfctl -f vmm/qemu/tests/darwin-local-delivery.conf
+          sudo pfctl -e
+          sudo pfctl -sa -vv
+          sudo pfctl -s Interfaces -v
   windows-network:
     runs-on: windows-2025
     timeout-minutes: 10
