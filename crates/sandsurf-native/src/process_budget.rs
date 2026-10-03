@@ -123,23 +123,13 @@ pub mod windows {
     unsafe impl Sync for JobEnvelope {}
 
     impl JobEnvelope {
-        pub fn install_current(budget: ProcessBudget) -> io::Result<Self> {
-            let value = Self::create(budget)?;
-            // SAFETY: value owns the Job; the pseudo handle names this process,
-            // never a discovered PID or a foreign process tree.
-            if unsafe { AssignProcessToJobObject(value.job, GetCurrentProcess()) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(value)
-        }
-
         /// Only fixed host workers may create separately bounded native owners.
         /// Their children explicitly break away, are proved outside all parent
         /// Jobs while suspended, and enter their own Job before execution.
         pub fn install_factory_current(
             role: crate::resource_broker::WorkerKind,
             budget: ProcessBudget,
-        ) -> io::Result<Self> {
+        ) -> io::Result<()> {
             if role.host_mode().is_none() || budget.processes != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -159,7 +149,13 @@ pub mod windows {
             if unsafe { AssignProcessToJobObject(value.job, GetCurrentProcess()) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(value)
+            // This Job contains its own handle owner, unlike an externally
+            // owned child Job. Closing it during Rust unwinding terminates the
+            // process before its actual failure status can be established.
+            // Retain exactly this one noninheritable handle until ExitProcess;
+            // the kernel closes it on normal exit, panic or forced death.
+            std::mem::forget(value);
+            Self::verify_current_factory(budget)
         }
 
         pub fn verify_current_factory(budget: ProcessBudget) -> io::Result<()> {

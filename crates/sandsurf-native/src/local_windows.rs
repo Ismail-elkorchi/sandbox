@@ -168,29 +168,33 @@ impl UserToken {
     }
 
     fn sid_string(&self) -> io::Result<String> {
-        let mut value: PWSTR = null_mut();
-        // SAFETY: the token SID and output pointer are valid.
-        if unsafe { ConvertSidToStringSidW(self.sid(), &mut value) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let allocation = LocalAllocation(value.cast());
-        let mut length = 0_usize;
-        // SAFETY: the API returns a NUL-terminated LocalAlloc UTF-16 string.
-        while unsafe { *value.add(length) } != 0 {
-            length += 1;
-            if length > 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "current user SID exceeds its bound",
-                ));
-            }
-        }
-        // SAFETY: the loop established the initialized string length.
-        let result = String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current SID is invalid"));
-        drop(allocation);
-        result
+        sid_text(self.sid())
     }
+}
+
+pub(crate) fn sid_text(sid: PSID) -> io::Result<String> {
+    let mut value: PWSTR = null_mut();
+    // SAFETY: the token SID and output pointer are valid.
+    if unsafe { ConvertSidToStringSidW(sid, &mut value) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let allocation = LocalAllocation(value.cast());
+    let mut length = 0_usize;
+    // SAFETY: the API returns a NUL-terminated LocalAlloc UTF-16 string.
+    while unsafe { *value.add(length) } != 0 {
+        length += 1;
+        if length > 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current user SID exceeds its bound",
+            ));
+        }
+    }
+    // SAFETY: the loop established the initialized string length.
+    let result = String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current SID is invalid"));
+    drop(allocation);
+    result
 }
 
 fn require_current_user(process_id: u32) -> io::Result<()> {
@@ -210,10 +214,14 @@ impl SecurityDescriptor {
     fn current_user(inheritable: bool) -> io::Result<Self> {
         let user = UserToken::current()?;
         let inheritance = if inheritable { "OICI" } else { "" };
-        let sddl = wide(&format!(
+        Self::from_sddl(&format!(
             "O:{0}D:P(A;{inheritance};GA;;;{0})",
             user.sid_string()?
-        ));
+        ))
+    }
+
+    fn from_sddl(value: &str) -> io::Result<Self> {
+        let sddl = wide(value);
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         // SAFETY: SDDL is terminated and descriptor is a writable output.
         if unsafe {
@@ -1173,6 +1181,12 @@ fn validate_private_path(
 }
 
 fn validate_private(file: &File, directory: bool, protected: bool) -> io::Result<FileIdentity> {
+    let identity = validate_object(file, directory)?;
+    validate_acl(file, protected)?;
+    Ok(identity)
+}
+
+fn validate_object(file: &File, directory: bool) -> io::Result<FileIdentity> {
     let information = file_information(file)?;
     if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
@@ -1182,7 +1196,6 @@ fn validate_private(file: &File, directory: bool, protected: bool) -> io::Result
             "local endpoint object has an unsafe type, link, or reparse identity",
         ));
     }
-    validate_acl(file, protected)?;
     Ok(FileIdentity {
         volume: information.dwVolumeSerialNumber,
         file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
@@ -1218,6 +1231,14 @@ pub fn directory_identity(path: &Path) -> io::Result<(u64, u64)> {
 }
 
 fn validate_acl(file: &File, protected: bool) -> io::Result<()> {
+    validate_acl_for(file, protected, None)
+}
+
+fn validate_acl_for(
+    file: &File,
+    protected: bool,
+    scope: Option<(&crate::windows_vmm::AppSid, ScopeAccess)>,
+) -> io::Result<()> {
     let user = UserToken::current()?;
     let mut owner: PSID = null_mut();
     let mut acl: *mut ACL = null_mut();
@@ -1262,18 +1283,32 @@ fn validate_acl(file: &File, protected: bool) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let entries_allocation = LocalAllocation(entries.cast());
-    if count > 64 || (count != 0 && entries.is_null()) {
+    if count > 64 || (count != 0 && entries.is_null()) || (scope.is_some() && count != 2) {
         return Err(denied("local endpoint DACL exceeds its trusted bound"));
     }
+    let mut owner_entries = 0;
+    let mut scope_entries = 0;
     if count != 0 {
         // SAFETY: enumeration returned exactly count initialized entries.
         for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
-            if (entry.grfAccessMode == GRANT_ACCESS || entry.grfAccessMode == SET_ACCESS)
-                && (entry.Trustee.TrusteeForm != TRUSTEE_IS_SID
-                    // SAFETY: SID-form trustee remains live with the descriptor.
-                    || unsafe { EqualSid(entry.Trustee.ptstrName.cast(), user.sid()) } == 0)
-            {
-                return Err(denied("local endpoint grants another principal access"));
+            if entry.grfAccessMode == GRANT_ACCESS || entry.grfAccessMode == SET_ACCESS {
+                if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID {
+                    return Err(denied("local endpoint DACL trustee is not a SID"));
+                }
+                // SAFETY: enumerated SID trustee and retained user SID are live.
+                if unsafe { EqualSid(entry.Trustee.ptstrName.cast(), user.sid()) } != 0 {
+                    owner_entries += 1;
+                } else if let Some((sid, access)) = scope {
+                    // SAFETY: both SID buffers are retained through this query.
+                    if unsafe { EqualSid(entry.Trustee.ptstrName.cast(), sid.raw()) } == 0
+                        || entry.grfAccessPermissions != access.mask()
+                    {
+                        return Err(denied("VMM scope principal or access differs"));
+                    }
+                    scope_entries += 1;
+                } else {
+                    return Err(denied("local endpoint grants another principal access"));
+                }
             }
             if entry.grfAccessMode != GRANT_ACCESS
                 && entry.grfAccessMode != SET_ACCESS
@@ -1281,11 +1316,159 @@ fn validate_acl(file: &File, protected: bool) -> io::Result<()> {
             {
                 return Err(denied("local endpoint DACL contains an audit entry"));
             }
+            if scope.is_some() && entry.grfAccessMode == DENY_ACCESS {
+                return Err(denied("VMM scope contains an unexpected deny entry"));
+            }
         }
+    }
+    if scope.is_some() && (owner_entries != 1 || scope_entries != 1) {
+        return Err(denied("VMM scope does not have its exact two principals"));
     }
     drop(entries_allocation);
     drop(descriptor_allocation);
     Ok(())
+}
+
+/// A VMM-owned native device namespace is not an account-private host store.
+/// Its one ephemeral AppContainer principal never enters private-file checks.
+#[derive(Clone, Copy)]
+pub(crate) enum ScopeAccess {
+    ReadExecute,
+    Devices,
+}
+impl ScopeAccess {
+    fn mask(self) -> u32 {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        };
+        FILE_GENERIC_READ
+            | FILE_GENERIC_EXECUTE
+            | if matches!(self, Self::Devices) {
+                FILE_GENERIC_WRITE
+            } else {
+                0
+            }
+    }
+    fn descriptor(
+        self,
+        sid: &crate::windows_vmm::AppSid,
+        directory: bool,
+    ) -> io::Result<SecurityDescriptor> {
+        let owner = UserToken::current()?.sid_string()?;
+        let inheritance = if directory { "OICI" } else { "" };
+        let label = if matches!(self, Self::Devices) {
+            "S:(ML;OICI;NW;;;LW)"
+        } else {
+            ""
+        };
+        SecurityDescriptor::from_sddl(&format!(
+            "O:{owner}D:P(A;{inheritance};GA;;;{owner})(A;{inheritance};0x{:x};;;{}){label}",
+            self.mask(),
+            sid.text()?,
+        ))
+    }
+}
+
+pub(crate) struct ScopedDirectory {
+    path: PathBuf,
+    held: File,
+    identity: FileIdentity,
+    sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+    access: ScopeAccess,
+}
+impl ScopedDirectory {
+    pub(crate) fn create(
+        path: &Path,
+        sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+        access: ScopeAccess,
+    ) -> io::Result<Self> {
+        let descriptor = access.descriptor(&sid, true)?;
+        let attributes = descriptor.attributes();
+        let native = wide_os(path)?;
+        // SAFETY: terminated path, immutable descriptor and initialized attributes.
+        if unsafe { CreateDirectoryW(native.as_ptr(), &attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::open(path, sid, access)
+    }
+
+    pub(crate) fn open(
+        path: &Path,
+        sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+        access: ScopeAccess,
+    ) -> io::Result<Self> {
+        let held = open_directory(path)?;
+        let identity = validate_object(&held, true)?;
+        validate_acl_for(&held, true, Some((&sid, access)))?;
+        let result = Self {
+            path: fs::canonicalize(path)?,
+            held,
+            identity,
+            sid,
+            access,
+        };
+        result.check()?;
+        Ok(result)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn check(&self) -> io::Result<()> {
+        let current = open_directory(&self.path)?;
+        for file in [&current, &self.held] {
+            if validate_object(file, true)? != self.identity {
+                return Err(denied("VMM namespace was replaced"));
+            }
+            validate_acl_for(file, true, Some((&self.sid, self.access)))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn create_input(&self, name: &str) -> io::Result<File> {
+        if !matches!(self.access, ScopeAccess::ReadExecute)
+            || name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.+-".contains(&b))
+        {
+            return Err(invalid("invalid sealed VMM input role"));
+        }
+        self.check()?;
+        let path = wide_os(&self.path.join(name))?;
+        let descriptor = self.access.descriptor(&self.sid, false)?;
+        let attributes = descriptor.attributes();
+        // SAFETY: exclusive creation with the exact readonly VMM scope ACL.
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful exclusive creation returned one owned file handle.
+        let file = unsafe { File::from_raw_handle(handle.cast()) };
+        validate_object(&file, false)?;
+        validate_acl_for(&file, true, Some((&self.sid, self.access)))?;
+        Ok(file)
+    }
+    pub(crate) fn input_lease(&self, name: &str) -> io::Result<File> {
+        self.check()?;
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(name))?;
+        validate_object(&file, false)?;
+        validate_acl_for(&file, true, Some((&self.sid, ScopeAccess::ReadExecute)))?;
+        Ok(file)
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {

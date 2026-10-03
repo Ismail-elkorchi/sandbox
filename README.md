@@ -4,7 +4,7 @@ Sandsurf is the persistent hardware-isolated Linux environment underlying autono
 
 The public distribution is the unscoped npm package `sandsurf`. Its TypeScript API connects to an independently running native host service. The host owns authority changes, reservations, and lifecycle intent. A separate guardian process per Machine owns native observations, guest transport and retained runtime evidence; guest reports are not attestations.
 
-Native engines are Firecracker/KVM on Linux and Sandsurf-owned QEMU using HVF on macOS or WHPX on Windows, with no software-emulation backend. Machine admission requires operator-provisioned bounded host and machine volumes and the adapter's complete enforced envelope. Inspect the host for supported operations and missing prerequisites: cross-platform image-worker integration is not yet complete. Real VM qualification remains separate from source and package validation; consult the current security scope before relying on containment or recovery guarantees.
+Native engines are Firecracker/KVM on Linux and Sandsurf-owned QEMU using HVF on macOS or WHPX on Windows, with no software-emulation backend. Machine admission requires operator-provisioned bounded host and machine volumes and the adapter's complete enforced envelope. Host inspection distinguishes enforced mechanisms, missing installation prerequisites and hardware qualification. Real VM qualification remains separate from source and package validation; consult the current security scope before relying on containment or recovery guarantees.
 
 ```ts
 import { Sandsurf } from "sandsurf";

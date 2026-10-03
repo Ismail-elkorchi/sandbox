@@ -31,6 +31,7 @@ impl Accelerator {
     }
 }
 
+#[derive(Clone)]
 pub struct LaunchConfig {
     pub accelerator: Accelerator,
     pub architecture: GuestArchitecture,

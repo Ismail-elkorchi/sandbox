@@ -60,8 +60,57 @@ impl QemuWorker {
         if config.firmware_directory != runtime.firmware_directory {
             return Err(invalid("native firmware differs from verified runtime"));
         }
+        #[cfg(target_os = "macos")]
         let executable = runtime.executable.as_path();
+        #[cfg(windows)]
+        let [(root, root_read_only), (secondary, secondary_read_only)] = config.devices.disks();
+        #[cfg(windows)]
+        let disks = [
+            sandsurf_native::owned_windows::disk_input(root, root_read_only)?,
+            sandsurf_native::owned_windows::disk_input(secondary, secondary_read_only)?,
+        ];
+        #[cfg(windows)]
+        let isolation = {
+            if restore.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "WHPX full-state restore is unavailable",
+                ));
+            }
+            let parent = sandsurf_native::windows_vmm::disk_volume(&disks[0])?;
+            let kernel = sandsurf_native::windows_vmm::boot_input(&config.kernel)?;
+            let initramfs = config
+                .initramfs
+                .as_deref()
+                .map(sandsurf_native::windows_vmm::boot_input)
+                .transpose()?;
+            let original_inputs: Vec<_> = runtime.original_inputs().collect();
+            sandsurf_native::windows_vmm::Isolation::create(
+                &parent,
+                runtime
+                    .executable
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| invalid("native executable name is invalid"))?,
+                &original_inputs,
+                &kernel,
+                initramfs.as_ref(),
+            )?
+        };
+        #[cfg(windows)]
+        let sealed = {
+            let mut sealed = config.clone();
+            sealed.kernel = isolation.kernel().to_owned();
+            sealed.initramfs = isolation.initramfs().map(Path::to_owned);
+            sealed.firmware_directory = isolation.firmware().to_owned();
+            sealed
+        };
+        #[cfg(windows)]
+        let config = &sealed;
+        #[cfg(target_os = "macos")]
         let mut endpoints = Endpoints::create()?;
+        #[cfg(windows)]
+        let mut endpoints = Endpoints::for_vmm(isolation.namespace())?;
         let mut arguments = config.arguments(endpoints.path())?;
         // The namespace exists before the kernel policy is installed. Future
         // capture files have one fixed shape, not access to the guardian tree.
@@ -122,17 +171,13 @@ impl QemuWorker {
             )?;
             let mut admitted = vec!["--sandsurf-cpu-cap".into(), cap.to_string().into()];
             admitted.extend(arguments);
-            let [(root, root_read_only), (secondary, secondary_read_only)] = config.devices.disks();
-            let disks = [
-                sandsurf_native::owned_windows::disk_input(root, root_read_only)?,
-                sandsurf_native::owned_windows::disk_input(secondary, secondary_read_only)?,
-            ];
             sandsurf_native::owned_windows::OwnedWorker::launch_vm(
-                executable,
+                isolation.executable(),
                 &admitted,
                 budget,
                 custody.clone(),
                 disks,
+                isolation.clone(),
             )?
         };
         let mut child = child;
@@ -144,7 +189,12 @@ impl QemuWorker {
         // this retained child's sockets without treating an absent endpoint
         // as permission to create a replacement native computer.
         let control = (|| {
-            let qmp = connect_device(&endpoints.path().join(QMP), &mut child, deadline)?;
+            let qmp = connect_device(
+                &endpoints.namespace(),
+                &endpoints.path().join(QMP),
+                &mut child,
+                deadline,
+            )?;
             QemuControl::open(
                 qmp,
                 deadline
@@ -191,14 +241,15 @@ impl QemuWorker {
             )
         })
     }
-    pub(crate) fn endpoints(&self) -> &Path {
-        self.endpoints.path()
+    pub(crate) fn namespace(&self) -> sandsurf_native::socket_io::SocketNamespace {
+        self.endpoints.namespace()
     }
     pub(crate) fn attach(&mut self, name: &str) -> io::Result<SocketConnection> {
         if !matches!(name, CONSOLE | NIC) {
             return Err(invalid("unknown native device attachment"));
         }
         connect_device(
+            &self.endpoints.namespace(),
             &self.endpoints.path().join(name),
             &mut self.child,
             self.startup_deadline,
@@ -207,6 +258,7 @@ impl QemuWorker {
     pub(crate) fn attach_control(&mut self, slot: usize) -> io::Result<SocketConnection> {
         let name = sandsurf_native::serial_channel::socket_name(slot)?;
         connect_device(
+            &self.endpoints.namespace(),
             &self.endpoints.path().join(name),
             &mut self.child,
             Instant::now() + Duration::from_secs(1),
@@ -249,6 +301,7 @@ impl Drop for QemuWorker {
     }
 }
 fn connect_device(
+    namespace: &sandsurf_native::socket_io::SocketNamespace,
     path: &Path,
     child: &mut NativeWorker,
     deadline: Instant,
@@ -265,7 +318,7 @@ fn connect_device(
                     "native device startup deadline exceeded",
                 )
             })?;
-        match SocketConnection::connect(path, child.process_id(), timeout) {
+        match SocketConnection::connect_in(namespace, path, child.process_id(), timeout) {
             Ok(socket) => return Ok(socket),
             Err(error)
                 if matches!(

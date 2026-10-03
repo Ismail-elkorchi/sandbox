@@ -30,11 +30,12 @@ pub(crate) fn validate(path: &Path) -> io::Result<()> {
 
 #[cfg(any(target_os = "macos", windows, test))]
 pub(crate) struct Endpoints {
-    directory: Option<sandsurf_native::local::Directory>,
+    directory: Option<sandsurf_native::socket_io::SocketNamespace>,
 }
 
 #[cfg(any(target_os = "macos", windows, test))]
 impl Endpoints {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn create() -> io::Result<Self> {
         // macOS's per-user TMPDIR is normally too long for native device names.
         // The sticky system directory is an ancestry, never an adopted owner.
@@ -45,6 +46,7 @@ impl Endpoints {
         Self::under(&parent)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn under(parent: &Path) -> io::Result<Self> {
         let parent = fs::canonicalize(parent)?;
         let mut nonce = [0_u8; 16];
@@ -55,8 +57,29 @@ impl Endpoints {
         // Exclusive creation, not ensure/adoption, even on a nonce collision.
         sandsurf_native::local::create_private_directory(&path)?;
         Ok(Self {
-            directory: Some(sandsurf_native::local::Directory::open(&path)?),
+            directory: Some(sandsurf_native::socket_io::SocketNamespace::private(
+                &sandsurf_native::local::canonical_private_directory(&path)?,
+            )?),
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn for_vmm(
+        namespace: sandsurf_native::socket_io::SocketNamespace,
+    ) -> io::Result<Self> {
+        validate(namespace.path())?;
+        namespace.check()?;
+        Ok(Self {
+            directory: Some(namespace),
+        })
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) fn namespace(&self) -> sandsurf_native::socket_io::SocketNamespace {
+        self.directory
+            .as_ref()
+            .expect("live native namespace")
+            .clone()
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -101,7 +124,7 @@ impl Endpoints {
                 if kind.is_dir() {
                     return Err(invalid("native endpoint is a directory"));
                 }
-                socket_name(&entry.path())?;
+                sandsurf_native::socket_io::verify_windows_socket_name(&entry.path())?;
             }
         }
         for entry in entries {
@@ -112,7 +135,8 @@ impl Endpoints {
         let path = self.path().to_owned();
         // Windows's retained private handle deliberately denies replacement.
         // Release it only after native exit and all admitted socket removals.
-        drop(self.directory.take());
+        self.directory.as_ref().expect("live namespace").close()?;
+        self.directory.take();
         fs::remove_dir(path)
     }
 
@@ -133,46 +157,12 @@ impl Drop for Endpoints {
             && directory.check().is_ok()
         {
             let path = directory.path().to_owned();
-            drop(directory);
+            let _ = directory.close();
             let _ = fs::remove_dir(path);
         }
     }
 }
 
-#[cfg(windows)]
-fn socket_name(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FileAttributeTagInfo, GetFileInformationByHandleEx,
-    };
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
-        FileAttributes: 0,
-        ReparseTag: 0,
-    };
-    // SAFETY: retained reparse-file handle and initialized exact ABI output.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle().cast(),
-            FileAttributeTagInfo,
-            (&raw mut tag).cast(),
-            std::mem::size_of_val(&tag) as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // The fixed SDK AF_UNIX tag, not arbitrary symlinks or mount points.
-    if tag.ReparseTag != 0x80000023 {
-        return Err(invalid("native endpoint is not an AF_UNIX socket"));
-    }
-    Ok(())
-}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }

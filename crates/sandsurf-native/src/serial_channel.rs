@@ -1,11 +1,11 @@
 //! Exclusive connection leases for QEMU's fixed virtio-serial device ports.
 //! An owner closes the pool when its child exits; stale channel clones cannot
 //! attach to a later owner, even if an operating system reuses the old PID.
-use crate::socket_io::SocketConnection;
+use crate::socket_io::{SocketConnection, SocketNamespace};
 use crate::{GuestChannel, GuestChannelError, GuestConnection};
 use sandsurf_protocol::GUEST_SERIAL_CONNECTIONS;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ struct Slots {
 }
 
 struct Pool {
+    namespace: SocketNamespace,
     paths: [PathBuf; GUEST_SERIAL_CONNECTIONS],
     process_id: u32,
     timeout: Duration,
@@ -49,18 +50,23 @@ impl PartialEq for SerialChannel {
 impl Eq for SerialChannel {}
 
 impl SerialOwner {
-    pub fn new(directory: &Path, process_id: u32, timeout: Duration) -> io::Result<Self> {
+    pub fn in_namespace(
+        namespace: SocketNamespace,
+        process_id: u32,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         if process_id == 0 || timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        if crate::local::canonical_private_directory(directory)? != directory {
-            return Err(io::Error::other("serial endpoint directory is an alias"));
-        }
+        namespace.check()?;
         Ok(Self {
             pool: Arc::new(Pool {
                 paths: std::array::from_fn(|slot| {
-                    directory.join(socket_name(slot).expect("fixed serial slot"))
+                    namespace
+                        .path()
+                        .join(socket_name(slot).expect("fixed serial slot"))
                 }),
+                namespace,
                 process_id,
                 timeout,
                 slots: Mutex::new(Slots {
@@ -166,7 +172,8 @@ impl GuestConnection for LeasedConnection {
 impl GuestChannel for SerialChannel {
     fn connect(&mut self) -> Result<Box<dyn GuestConnection>, GuestChannelError> {
         let lease = self.pool.acquire()?;
-        let stream = SocketConnection::connect(
+        let stream = SocketConnection::connect_in(
+            &self.pool.namespace,
             &self.pool.paths[lease.slot],
             self.pool.process_id,
             self.pool.timeout,
@@ -195,6 +202,7 @@ mod tests {
     }
     fn pool() -> Arc<Pool> {
         Arc::new(Pool {
+            namespace: SocketNamespace::closed(PathBuf::from("/")),
             paths: std::array::from_fn(|slot| PathBuf::from(format!("/control-{slot}"))),
             process_id: std::process::id(),
             timeout: Duration::from_secs(1),

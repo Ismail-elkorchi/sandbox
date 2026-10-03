@@ -6,7 +6,72 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+enum DirectoryRole {
+    Private(crate::local::Directory),
+    #[cfg(windows)]
+    VirtualMachine(crate::local::ScopedDirectory),
+}
+
+/// A retained native namespace, not a permission inferred from a pathname.
+/// Closing its original owner fences all cloned serial-device handles.
+#[derive(Clone)]
+pub struct SocketNamespace {
+    path: std::path::PathBuf,
+    original: Arc<Mutex<Option<DirectoryRole>>>,
+}
+impl SocketNamespace {
+    #[cfg(test)]
+    pub(crate) fn closed(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            original: Arc::new(Mutex::new(None)),
+        }
+    }
+    pub fn private(path: &Path) -> io::Result<Self> {
+        let original = crate::local::Directory::open(path)?;
+        if original.path().as_os_str() != path.as_os_str() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "native endpoint directory is an alias",
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            original: Arc::new(Mutex::new(Some(DirectoryRole::Private(original)))),
+        })
+    }
+    #[cfg(windows)]
+    pub(crate) fn virtual_machine(original: crate::local::ScopedDirectory) -> Self {
+        Self {
+            path: original.path().to_owned(),
+            original: Arc::new(Mutex::new(Some(DirectoryRole::VirtualMachine(original)))),
+        }
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn check(&self) -> io::Result<()> {
+        let held = self
+            .original
+            .lock()
+            .map_err(|_| io::Error::other("native namespace lock failed"))?;
+        match held.as_ref().ok_or(io::ErrorKind::NotConnected)? {
+            DirectoryRole::Private(directory) => directory.check(),
+            #[cfg(windows)]
+            DirectoryRole::VirtualMachine(directory) => directory.check(),
+        }
+    }
+    pub fn close(&self) -> io::Result<()> {
+        self.original
+            .lock()
+            .map_err(|_| io::Error::other("native namespace lock failed"))?
+            .take();
+        Ok(())
+    }
+}
 
 pub struct SocketConnection {
     socket: Socket,
@@ -14,7 +79,12 @@ pub struct SocketConnection {
 }
 
 impl SocketConnection {
-    pub fn connect(path: &Path, process_id: u32, timeout: Duration) -> io::Result<Self> {
+    pub fn connect_in(
+        namespace: &SocketNamespace,
+        path: &Path,
+        process_id: u32,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         if process_id == 0
             || !path.is_absolute()
             || path.components().any(|component| {
@@ -39,11 +109,21 @@ impl SocketConnection {
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("native socket has no owner directory"))?;
-        if crate::local::canonical_private_directory(parent)? != parent {
+        if namespace.path().as_os_str() != parent.as_os_str() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "native endpoint directory is an alias",
             ));
+        }
+        // Retain and validate the original role through native attachment.
+        let held = namespace
+            .original
+            .lock()
+            .map_err(|_| io::Error::other("native namespace lock failed"))?;
+        match held.as_ref().ok_or(io::ErrorKind::NotConnected)? {
+            DirectoryRole::Private(directory) => directory.check()?,
+            #[cfg(windows)]
+            DirectoryRole::VirtualMachine(directory) => directory.check()?,
         }
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
@@ -53,6 +133,7 @@ impl SocketConnection {
                 "native socket peer is not the owned VM process",
             ));
         }
+        drop(held);
         Self::new(socket, Some(timeout))
     }
 
@@ -205,6 +286,51 @@ fn native_socket_error() -> io::Error {
     })
 }
 
+#[cfg(windows)]
+pub fn verify_windows_socket_name(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    verify_windows_socket(&file)
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_windows_socket(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TAG_INFO, FileAttributeTagInfo, GetFileInformationByHandleEx,
+    };
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: retained reparse-file handle and initialized exact ABI output.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            std::mem::size_of_val(&tag) as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // The fixed SDK AF_UNIX tag, not arbitrary symlinks or mount points.
+    if tag.ReparseTag != 0x80000023 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "native endpoint is not an AF_UNIX socket",
+        ));
+    }
+    Ok(())
+}
+
 pub fn peer_process(socket: &Socket) -> io::Result<u32> {
     #[cfg(target_os = "linux")]
     {
@@ -304,12 +430,18 @@ mod tests {
         ));
         crate::local::create_private_directory(&root).unwrap();
         let root = crate::local::canonical_private_directory(&root).unwrap();
+        let namespace = SocketNamespace::private(&root).unwrap();
         let path = root.join("peer.sock");
         let server = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         server.bind(&SockAddr::unix(&path).unwrap()).unwrap();
         server.listen(8).unwrap();
-        let mut client =
-            SocketConnection::connect(&path, std::process::id(), Duration::from_secs(1)).unwrap();
+        let mut client = SocketConnection::connect_in(
+            &namespace,
+            &path,
+            std::process::id(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let (socket, _) = server.accept().unwrap();
         assert_eq!(peer_process(&socket).unwrap(), std::process::id());
         let mut peer = SocketConnection::new(socket, Some(Duration::from_secs(1))).unwrap();
@@ -320,7 +452,7 @@ mod tests {
         drop(client);
         drop(peer);
         assert_eq!(
-            SocketConnection::connect(&path, u32::MAX, Duration::from_secs(1))
+            SocketConnection::connect_in(&namespace, &path, u32::MAX, Duration::from_secs(1))
                 .err()
                 .unwrap()
                 .kind(),
@@ -339,9 +471,16 @@ mod tests {
         let alias = std::path::PathBuf::from(alias);
         assert!(alias.components().any(|part| part.as_os_str() == ".."));
         assert!(
-            SocketConnection::connect(&alias, std::process::id(), Duration::from_secs(1)).is_err()
+            SocketConnection::connect_in(
+                &namespace,
+                &alias,
+                std::process::id(),
+                Duration::from_secs(1)
+            )
+            .is_err()
         );
         drop(server);
+        namespace.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
     fn pair() -> (SocketConnection, TcpStream) {

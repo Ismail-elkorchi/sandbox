@@ -74,14 +74,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let values = arguments.collect::<Vec<_>>();
     let directory = argument(&values, "--directory")?;
     #[cfg(windows)]
-    let _service_job = match mode.as_str() {
-        "serve" => Some(windows_pool(
-            sandsurf_native::service_pool::ServicePool::Api,
-        )?),
-        "supervise" => Some(windows_pool(
-            sandsurf_native::service_pool::ServicePool::Supervisor,
-        )?),
-        _ => None,
+    match mode.as_str() {
+        "serve" => windows_pool(sandsurf_native::service_pool::ServicePool::Api)?,
+        "supervise" => windows_pool(sandsurf_native::service_pool::ServicePool::Supervisor)?,
+        _ => {}
     };
     match mode.as_str() {
         "storage-path" => {
@@ -336,9 +332,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(windows)]
-fn windows_pool(
-    pool: sandsurf_native::service_pool::ServicePool,
-) -> io::Result<sandsurf_native::process_budget::windows::JobEnvelope> {
+fn windows_pool(pool: sandsurf_native::service_pool::ServicePool) -> io::Result<()> {
     sandsurf_native::process_budget::windows::JobEnvelope::install_factory_current(
         pool.worker_kind(),
         pool.process_budget(),
@@ -803,14 +797,11 @@ mod windows_service {
             Role::Host => sandsurf_native::service_pool::ServicePool::Api,
             Role::Supervisor => sandsurf_native::service_pool::ServicePool::Supervisor,
         };
-        let _job = match super::windows_pool(pool) {
-            Ok(job) => job,
-            Err(error) => {
-                eprintln!("sandsurf service resource envelope: {error}");
-                report(SERVICE_STOPPED, 0, 0);
-                return;
-            }
-        };
+        if let Err(error) = super::windows_pool(pool) {
+            eprintln!("sandsurf service resource envelope: {error}");
+            report(SERVICE_STOPPED, 0, 0);
+            return;
+        }
         let result = match ROLE.get().expect("service role") {
             Role::Host => serve_host(directory, executable),
             Role::Supervisor => {

@@ -28,6 +28,22 @@ pub struct Runtime {
     _inputs: Vec<File>,
 }
 
+impl Runtime {
+    #[cfg(windows)]
+    pub(crate) fn original_inputs(&self) -> impl Iterator<Item = (&Path, &File)> {
+        let root = self.executable.parent().expect("verified runtime root");
+        self.read_paths
+            .iter()
+            .zip(&self._inputs[1..])
+            .map(move |(path, file)| {
+                (
+                    path.strip_prefix(root).expect("verified runtime member"),
+                    file,
+                )
+            })
+    }
+}
+
 pub fn verify(
     path: &Path,
     expected: &Digest,

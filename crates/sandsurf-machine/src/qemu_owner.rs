@@ -78,7 +78,7 @@ impl QemuOwner {
         let mut worker = QemuWorker::launch(config, budget, guest_cpu_quota, custody, restore)?;
         let process = worker.process_id();
         let timeout = std::time::Duration::from_secs(15);
-        let serial = SerialOwner::new(worker.endpoints(), process, timeout)?;
+        let serial = SerialOwner::in_namespace(worker.namespace(), process, timeout)?;
         let output = worker.attach(CONSOLE)?;
         let input = output.try_clone()?;
         output.set_io_timeout(None)?;

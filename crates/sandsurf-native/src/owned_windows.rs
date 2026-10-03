@@ -22,9 +22,10 @@ use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    GetExitCodeProcess, InitializeProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
+    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 struct Handle(HANDLE);
@@ -45,13 +46,14 @@ pub struct OwnedWorker {
     process_id: u32,
     job: JobEnvelope,
     _executable: File,
+    _isolation: Option<Arc<crate::windows_vmm::Isolation>>,
     exit: Option<u32>,
 }
 
 enum LaunchRole {
     Standalone,
     Factory,
-    VirtualMachine([Arc<File>; 2]),
+    VirtualMachine([Arc<File>; 2], Arc<crate::windows_vmm::Isolation>),
 }
 
 /// Open an explicit disk role through the already validated original file,
@@ -206,6 +208,7 @@ impl OwnedWorker {
         budget: ProcessBudget,
         custody: Vec<Arc<File>>,
         disks: [Arc<File>; 2],
+        isolation: Arc<crate::windows_vmm::Isolation>,
     ) -> io::Result<Self> {
         if budget.processes != 1 {
             return Err(invalid("a VMM cannot launch native descendants"));
@@ -219,7 +222,7 @@ impl OwnedWorker {
             arguments,
             budget,
             custody,
-            LaunchRole::VirtualMachine(disks),
+            LaunchRole::VirtualMachine(disks, isolation),
         )
     }
 
@@ -259,13 +262,24 @@ impl OwnedWorker {
             JobEnvelope::create_owned(budget)?
         };
         let mut files = custody.clone();
-        if let LaunchRole::VirtualMachine(disks) = &role {
+        let isolation = if let LaunchRole::VirtualMachine(disks, isolation) = &role {
+            if executable.as_os_str() != isolation.executable().as_os_str() {
+                return Err(invalid("VMM executable is outside the sealed native scope"));
+            }
+            crate::resource_broker::validate_custody_count(
+                crate::resource_broker::WorkerKind::VirtualMachine,
+                custody.len() + 1,
+            )?;
+            files.push(isolation.custody());
             files.extend(disks.iter().cloned());
-        }
+            Some(isolation.clone())
+        } else {
+            None
+        };
         let mut inherited = if files.is_empty() {
             None
         } else {
-            Some(InheritedCustody::new(&files)?)
+            Some(InheritedCustody::new(&files, isolation.clone())?)
         };
         let mut admitted = arguments.to_vec();
         if factory && let Some(value) = &inherited {
@@ -275,12 +289,12 @@ impl OwnedWorker {
             }
             admitted.push((value.handles[0].0 as usize).to_string().into());
         }
-        if matches!(&role, LaunchRole::VirtualMachine(_)) {
+        if matches!(&role, LaunchRole::VirtualMachine(_, _)) {
             let value = inherited
                 .as_ref()
                 .ok_or_else(|| invalid("native disk handles are missing"))?;
             admitted.push("--sandsurf-disk-handles".into());
-            for handle in &value.handles[custody.len()..] {
+            for handle in &value.handles[value.handles.len() - 2..] {
                 admitted.push((handle.0 as usize).to_string().into());
             }
         }
@@ -296,6 +310,9 @@ impl OwnedWorker {
             startup.lpAttributeList = value.list.as_mut_ptr().cast();
         }
         let mut native = PROCESS_INFORMATION::default();
+        if let Some(isolation) = &isolation {
+            isolation.claim_launch()?;
+        }
         // SAFETY: all UTF-16 input buffers are bounded, NUL-terminated and live;
         // command_line is writable. Only the explicit custody handle list is
         // inherited; no stdio, IPC, Job or credential handles leak. The
@@ -327,6 +344,9 @@ impl OwnedWorker {
             )
         } == 0
         {
+            if let Some(isolation) = &isolation {
+                isolation.native_exited();
+            }
             return Err(io::Error::last_os_error());
         }
         let thread = Handle(native.hThread);
@@ -335,6 +355,7 @@ impl OwnedWorker {
             process_id: native.dwProcessId,
             job,
             _executable: executable_file,
+            _isolation: isolation,
             exit: None,
         };
         if break_away && crate::process_budget::windows::process_in_job(worker.process.0)? {
@@ -346,6 +367,11 @@ impl OwnedWorker {
         }
         worker.job.assign_suspended(&worker.process)?;
         worker.job.verify()?;
+        if let Some(isolation) = &worker._isolation {
+            // Token and namespace proofs precede the first VMM instruction.
+            isolation.verify_process(worker.process.0)?;
+            isolation.check()?;
+        }
         // SAFETY: the retained initial thread belongs to this newly created
         // suspended worker; its process already has the verified envelope.
         let resumed = unsafe { ResumeThread(thread.0) };
@@ -401,6 +427,9 @@ impl OwnedWorker {
                     return Err(io::Error::last_os_error());
                 }
                 self.exit = Some(exit);
+                if let Some(isolation) = &self._isolation {
+                    isolation.native_exited();
+                }
                 Ok(Some(exit))
             }
             _ => Err(io::Error::last_os_error()),
@@ -448,16 +477,25 @@ struct InheritedCustody {
     handles: Vec<Handle>,
     raw_handles: Vec<HANDLE>,
     initialized: bool,
+    _isolation: Option<Arc<crate::windows_vmm::Isolation>>,
+    capabilities: Option<Box<windows_sys::Win32::Security::SECURITY_CAPABILITIES>>,
+    lpac_policy: Box<u32>,
 }
 
 impl InheritedCustody {
-    fn new(files: &[Arc<File>]) -> io::Result<Self> {
+    fn new(
+        files: &[Arc<File>],
+        isolation: Option<Arc<crate::windows_vmm::Isolation>>,
+    ) -> io::Result<Self> {
         if files.is_empty() || files.len() > crate::MAX_WORKER_CUSTODY + 2 {
             return Err(invalid("invalid native custody closure"));
         }
         let mut handles = Vec::with_capacity(files.len());
-        for file in files {
+        for (index, file) in files.iter().enumerate() {
             let mut handle = std::ptr::null_mut();
+            // Custody is lifetime evidence, not a writable host file. Reduced
+            // access preserves the original share-denial kernel file object.
+            let disk = isolation.is_some() && index >= files.len() - 2;
             // SAFETY: retained source and self process; each successful call
             // returns one inheritable reference to the original kernel object.
             if unsafe {
@@ -466,9 +504,13 @@ impl InheritedCustody {
                     file.as_raw_handle().cast(),
                     GetCurrentProcess(),
                     &mut handle,
-                    0,
+                    if disk {
+                        0
+                    } else {
+                        windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                    },
                     1,
-                    DUPLICATE_SAME_ACCESS,
+                    if disk { DUPLICATE_SAME_ACCESS } else { 0 },
                 )
             } == 0
             {
@@ -479,10 +521,12 @@ impl InheritedCustody {
         // This separate contiguous array never resizes while the attribute
         // list exists; moving the owner does not move its heap allocation.
         let raw_handles = handles.iter().map(|value| value.0).collect();
+        let count = if isolation.is_some() { 3 } else { 1 };
         let mut bytes = 0;
         // SAFETY: null sizing query with one attribute and writable byte count.
-        let result =
-            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };
+        let result = unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut bytes)
+        };
         if result != 0
             || io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
             || bytes == 0
@@ -495,11 +539,16 @@ impl InheritedCustody {
             handles,
             raw_handles,
             initialized: false,
+            capabilities: isolation
+                .as_ref()
+                .map(|scope| Box::new(scope.capabilities())),
+            _isolation: isolation,
+            lpac_policy: Box::new(1), // PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT
         };
         // SAFETY: usize storage supplies HANDLE alignment and the queried full
         // capacity; the vector never resizes while the native list exists.
         if unsafe {
-            InitializeProcThreadAttributeList(value.list.as_mut_ptr().cast(), 1, 0, &mut bytes)
+            InitializeProcThreadAttributeList(value.list.as_mut_ptr().cast(), count, 0, &mut bytes)
         } == 0
         {
             return Err(io::Error::last_os_error());
@@ -520,6 +569,40 @@ impl InheritedCustody {
         } == 0
         {
             return Err(io::Error::last_os_error());
+        }
+        if let Some(capabilities) = &value.capabilities {
+            // SAFETY: heap-stable capability/SID buffers and initialized list;
+            // both are retained until DeleteProcThreadAttributeList.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    value.list.as_mut_ptr().cast(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (&**capabilities as *const windows_sys::Win32::Security::SECURITY_CAPABILITIES)
+                        .cast(),
+                    size_of::<windows_sys::Win32::Security::SECURITY_CAPABILITIES>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: heap-stable scalar opt-out policy retained with the list.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    value.list.as_mut_ptr().cast(),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+                    (&*value.lpac_policy as *const u32).cast(),
+                    size_of::<u32>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
         }
         Ok(value)
     }

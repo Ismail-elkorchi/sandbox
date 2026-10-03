@@ -66,6 +66,19 @@ fn visit(path: &Path, depth: usize, count: &mut usize, total: &mut StorageUsage)
     }
     *count += 1;
     let metadata = fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            // Observe the original no-follow object. A kernel AF_UNIX name is
+            // transient IPC, not a retained output file or a traversable alias.
+            crate::socket_io::verify_windows_socket(&open_object(path)?)?;
+            return Ok(());
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -228,6 +241,21 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         assert_eq!(tree_usage(&tree.0).unwrap(), object_usage(&tree.0).unwrap());
         assert!(object_usage(&socket).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_ipc_names_are_not_retained_file_payload() {
+        let tree = Tree::new();
+        let path = tree.0.join("control.sock");
+        let socket =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&socket2::SockAddr::unix(&path).unwrap())
+            .unwrap();
+        assert_eq!(tree_usage(&tree.0).unwrap(), object_usage(&tree.0).unwrap());
+        assert!(object_usage(&path).is_err());
+        drop(socket);
     }
 
     #[cfg(unix)]
