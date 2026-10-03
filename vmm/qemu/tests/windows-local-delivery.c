@@ -56,9 +56,39 @@ static int delivered(SOCKET sender, SOCKET receiver, const char *ip,
     fflush(stdout);
     return received == 8 && memcmp(bytes, "boundary", 8) == 0;
 }
-static void child(DWORD recipient) {
+static void child(DWORD recipient, const char *moniker) {
+    /* The factory is trusted. Only socket creation impersonates the fixed
+     * network identity: granting an untrusted child PROCESS_DUP_HANDLE over
+     * its host recipient would grant authority over every host handle. */
+    wchar_t name[80];
+    require(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, moniker, -1,
+                               name, 80) > 0, "fixed network moniker");
+    PSID sid = NULL;
+    require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(name, &sid)),
+            "original network identity");
+    unsigned char internet[SECURITY_MAX_SID_SIZE], private_net[SECURITY_MAX_SID_SIZE];
+    DWORD sid_size = sizeof(internet);
+    require(CreateWellKnownSid(WinCapabilityInternetClientSid, NULL, internet,
+                              &sid_size), "Internet capability");
+    sid_size = sizeof(private_net);
+    require(CreateWellKnownSid(WinCapabilityPrivateNetworkClientServerSid, NULL,
+                              private_net, &sid_size), "private capability");
+    SID_AND_ATTRIBUTES capabilities[2] = {
+        {internet, SE_GROUP_ENABLED}, {private_net, SE_GROUP_ENABLED}};
+    SECURITY_CAPABILITIES security = {sid, capabilities, 2, 0};
+    typedef BOOL (WINAPI *CreateAppToken)(HANDLE, SECURITY_CAPABILITIES *, HANDLE *);
+    FARPROC address_create = GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),
+                                            "CreateAppContainerToken");
+    CreateAppToken create_token = NULL;
+    memcpy(&create_token, &address_create, sizeof(create_token));
+    HANDLE primary = NULL, restricted = NULL;
+    require(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE,
+                              &primary) && create_token != NULL &&
+                create_token(primary, &security, &restricted), "fixed socket token");
+    CloseHandle(primary);
     WSAPROTOCOL_INFOW receipts[2] = {0};
     for (int slot = 0; slot < 2; ++slot) {
+        require(ImpersonateLoggedOnUser(restricted), "socket creation identity");
         int type = slot == 0 ? SOCK_STREAM : SOCK_DGRAM;
         int protocol = slot == 0 ? IPPROTO_TCP : IPPROTO_UDP;
         SOCKET socket = WSASocketW(AF_INET, type, protocol, NULL, 0,
@@ -67,11 +97,14 @@ static void child(DWORD recipient) {
         struct sockaddr_in local = address("0.0.0.0", 0);
         require(bind(socket, (struct sockaddr *)&local, sizeof(local)) == 0,
                 "original restricted socket bind");
+        require(RevertToSelf(), "retire temporary socket creation identity");
         require(WSADuplicateSocketW(socket, recipient, &receipts[slot]) == 0,
                 "original restricted socket transfer");
         /* The last child descriptor closes at process exit. The parent's
          * duplicate is the only live owner when it starts using the socket. */
     }
+    CloseHandle(restricted);
+    FreeSid(sid);
     DWORD written = 0;
     require(WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), receipts,
                       sizeof(receipts), &written, NULL) &&
@@ -126,31 +159,11 @@ static int experiment(const wchar_t *binary) {
                 PROTECTED_DACL_SECURITY_INFORMATION, descriptor), "fixture ACL");
     LocalFree(descriptor);
     LocalFree(sid_text);
-    unsigned char internet[SECURITY_MAX_SID_SIZE], private_net[SECURITY_MAX_SID_SIZE];
-    DWORD sid_size = sizeof(internet);
-    require(CreateWellKnownSid(WinCapabilityInternetClientSid, NULL, internet,
-                              &sid_size), "Internet capability");
-    sid_size = sizeof(private_net);
-    require(CreateWellKnownSid(WinCapabilityPrivateNetworkClientServerSid, NULL,
-                              private_net, &sid_size), "private capability");
-    typedef BOOL (WINAPI *DeriveCapability)(LPCWSTR, PSID **, DWORD *, PSID **, DWORD *);
-    FARPROC address_derive = GetProcAddress(kernelbase, "DeriveCapabilitySidsFromName");
-    DeriveCapability derive_capability = NULL;
-    memcpy(&derive_capability, &address_derive, sizeof(derive_capability));
-    PSID *groups = NULL, *registry = NULL;
-    DWORD group_count = 0, registry_count = 0;
-    require(derive_capability != NULL && derive_capability(L"registryRead",
-                &groups, &group_count, &registry, &registry_count) && registry_count == 1,
-            "read-only OS catalog capability");
-    SID_AND_ATTRIBUTES capabilities[3] = {
-        {internet, SE_GROUP_ENABLED}, {private_net, SE_GROUP_ENABLED},
-        {registry[0], SE_GROUP_ENABLED}};
-    SECURITY_CAPABILITIES security = {sid, capabilities, 3, 0};
     SIZE_T attribute_bytes = 0;
-    InitializeProcThreadAttributeList(NULL, 3, 0, &attribute_bytes);
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_bytes);
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = malloc(attribute_bytes);
     require(attributes != NULL && InitializeProcThreadAttributeList(
-                attributes, 3, 0, &attribute_bytes), "native launch attributes");
+                attributes, 1, 0, &attribute_bytes), "native launch attributes");
     SECURITY_ATTRIBUTES inheritance = {sizeof(inheritance), NULL, TRUE};
     HANDLE read_pipe, write_pipe;
     require(CreatePipe(&read_pipe, &write_pipe, &inheritance, 0), "receipt pipe");
@@ -164,13 +177,6 @@ static int experiment(const wchar_t *binary) {
     require(UpdateProcThreadAttribute(attributes, 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
                 sizeof(inherited), NULL, NULL), "explicit receipt inheritance");
-    require(UpdateProcThreadAttribute(attributes, 0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security,
-                sizeof(security), NULL, NULL), "original network identity");
-    DWORD policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-    require(UpdateProcThreadAttribute(attributes, 0,
-                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy,
-                sizeof(policy), NULL, NULL), "low-privilege policy");
     STARTUPINFOEXW startup = {0};
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -178,8 +184,8 @@ static int experiment(const wchar_t *binary) {
     startup.StartupInfo.hStdError = diagnostic;
     startup.lpAttributeList = attributes;
     wchar_t command[2 * MAX_PATH];
-    require(swprintf(command, 2 * MAX_PATH, L"\"%ls\" child %lu", executable,
-              (unsigned long)GetCurrentProcessId()) > 0, "fixture child command");
+    require(swprintf(command, 2 * MAX_PATH, L"\"%ls\" child %lu %ls", executable,
+              (unsigned long)GetCurrentProcessId(), name) > 0, "fixture child command");
     PROCESS_INFORMATION process = {0};
     wchar_t environment[4 * MAX_PATH + 128] = {0};
     wcscpy(environment, L"SystemRoot=");
@@ -226,10 +232,6 @@ static int experiment(const wchar_t *binary) {
     CloseHandle(read_pipe);
     DeleteProcThreadAttributeList(attributes);
     free(attributes);
-    for (DWORD slot = 0; slot < group_count; ++slot) LocalFree(groups[slot]);
-    for (DWORD slot = 0; slot < registry_count; ++slot) LocalFree(registry[slot]);
-    LocalFree(groups);
-    LocalFree(registry);
     require(SUCCEEDED(unregister_sid(sid)), "native identity retirement");
     FreeSid(sid);
     require(DeleteFileW(executable), "fixture binary cleanup");
@@ -285,8 +287,8 @@ int main(int argc, char **argv) {
     int startup = WSAStartup(MAKEWORD(2, 2), &data);
     if (startup != 0) fprintf(stderr, "Winsock startup returned %d\n", startup);
     require(startup == 0, "Winsock initialization");
-    if (argc == 3 && strcmp(argv[1], "child") == 0) {
-        child((DWORD)strtoul(argv[2], NULL, 10));
+    if (argc == 4 && strcmp(argv[1], "child") == 0) {
+        child((DWORD)strtoul(argv[2], NULL, 10), argv[3]);
         return 0;
     }
     wchar_t binary[MAX_PATH];
