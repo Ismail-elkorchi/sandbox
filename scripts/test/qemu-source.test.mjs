@@ -48,8 +48,9 @@ test("the actual Windows QEMU entry rejects omitted or malformed caps before del
       assert.equal(child.stdout, "");
     }
     const source = await readFile("vmm/qemu/sandsurf-entry.c", "utf8");
-    assert.match(source, /deny process-fork/u);
-    assert.match(source, /deny process-exec/u);
+    assert.match(source, /sandbox_init\(profile, 0, &error\)/u);
+    assert.match(source, /--sandsurf-seatbelt/u);
+    assert.doesNotMatch(source, /sandbox_init\("/u);
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

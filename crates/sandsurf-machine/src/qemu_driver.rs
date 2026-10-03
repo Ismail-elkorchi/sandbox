@@ -103,6 +103,7 @@ mod native {
         pub launch: LaunchConfig,
         pub runtime_manifest: PathBuf,
         pub runtime_digest: Digest,
+        pub capture_directory: PathBuf,
     }
 
     pub struct QemuRestoreSource {
@@ -359,13 +360,13 @@ mod native {
                 return unavailable(b"qemu-storage-custody-missing");
             };
             let mut owner = match QemuOwner::launch(
-                &self.config.launch,
-                &self.config.runtime_manifest,
-                &self.config.runtime_digest,
+                &self.config,
                 budgets.virtual_machine,
                 budgets.guest_cpu_quota_micros,
                 custody,
-                self.restore.is_some(),
+                self.restore
+                    .as_ref()
+                    .map(|source| source.saved_state.as_path()),
             ) {
                 Ok(owner) => owner,
                 Err(error) => {

@@ -284,6 +284,8 @@ impl QemuGuardianEffect {
         sandsurf_native::storage::sync_directory(machine_root)?;
         let system_disk = disks.join("system.ext4");
         let authentication_disk = machine_root.join("guardian/auth.img");
+        let capture_directory = machine_root.join("guardian/full-captures");
+        ensure_private_directory(&capture_directory)?;
         let runtime = sandsurf_machine::qemu_runtime::verify(
             &config.runtime_manifest,
             &config.runtime_digest,
@@ -292,6 +294,7 @@ impl QemuGuardianEffect {
         let qemu = QemuConfig {
             runtime_manifest: config.runtime_manifest.clone(),
             runtime_digest: config.runtime_digest.clone(),
+            capture_directory,
             launch: LaunchConfig {
                 accelerator: accelerator(),
                 machine_id: config.machine_id.clone(),

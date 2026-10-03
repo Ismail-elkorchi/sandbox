@@ -22,6 +22,9 @@ struct Manifest {
 pub struct Runtime {
     pub executable: PathBuf,
     pub firmware_directory: PathBuf,
+    /// Individually verified inputs for the native filesystem boundary. A
+    /// runtime directory is not permission to read newly added host files.
+    pub read_paths: Vec<PathBuf>,
     _inputs: Vec<File>,
 }
 
@@ -120,9 +123,11 @@ pub fn verify(
         directory_inputs(root, "lib", &declared, false)?;
     }
     let mut inputs = vec![file];
+    let mut read_paths = Vec::new();
     let mut total = 0_u64;
     for (relative, digest) in manifest.files {
-        let mut input = open(&root.join(relative))?;
+        let path = root.join(relative);
+        let mut input = open(&path)?;
         let length = input.metadata()?.len();
         total = total
             .checked_add(length)
@@ -148,6 +153,7 @@ pub fn verify(
             return Err(invalid("native runtime input changed"));
         }
         inputs.push(input);
+        read_paths.push(path);
     }
     Ok(Runtime {
         executable: root.join(executable),
@@ -159,6 +165,7 @@ pub fn verify(
             root.to_owned()
         },
         _inputs: inputs,
+        read_paths,
     })
 }
 

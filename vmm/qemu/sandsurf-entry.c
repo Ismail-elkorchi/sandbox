@@ -79,7 +79,7 @@ static void *owner_watch(void *unused)
     return NULL;
 }
 
-static void darwin_gate(unsigned custody_count)
+static void darwin_gate(unsigned custody_count, const char *profile)
 {
     uid_t uid;
     gid_t gid;
@@ -122,7 +122,7 @@ static void darwin_gate(unsigned custody_count)
     char *error = NULL;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    int status = sandbox_init("(version 1)(allow default)(deny process-fork)(deny process-exec)", 0, &error);
+    int status = sandbox_init(profile, 0, &error);
     if (error) {
         sandbox_free_error(error);
     }
@@ -151,15 +151,17 @@ uint32_t sandsurf_qemu_cpu_cap(void)
 int sandsurf_qemu_enter(int argc, char ***argv)
 {
 #ifdef __APPLE__
-    if (argc < 6 || strcmp((*argv)[1], "--broker-worker") ||
+    if (argc < 8 || strcmp((*argv)[1], "--broker-worker") ||
         strcmp((*argv)[2], "virtual-machine") ||
         strcmp((*argv)[3], "--owned-leases") ||
-        strlen((*argv)[4]) != 1 || (*argv)[4][0] < '1' || (*argv)[4][0] > '8') {
+        strlen((*argv)[4]) != 1 || (*argv)[4][0] < '1' || (*argv)[4][0] > '8' ||
+        strcmp((*argv)[5], "--sandsurf-seatbelt") ||
+        !(*argv)[6][0] || strlen((*argv)[6]) > 65536) {
         _exit(70);
     }
-    darwin_gate((unsigned)((*argv)[4][0] - '0'));
-    memmove(*argv + 1, *argv + 5, (size_t)(argc - 4) * sizeof(char *));
-    return argc - 4;
+    darwin_gate((unsigned)((*argv)[4][0] - '0'), (*argv)[6]);
+    memmove(*argv + 1, *argv + 7, (size_t)(argc - 6) * sizeof(char *));
+    return argc - 6;
 #elif defined(_WIN32)
     if (argc < 4 || strcmp((*argv)[1], "--sandsurf-cpu-cap")) {
         exit(70);

@@ -1,7 +1,8 @@
 //! Original native QEMU custody, independent of computer attachments.
 //! No guest management, network policy, lifecycle intent, or catalog ownership.
 use crate::GuestArchitecture;
-use crate::qemu::{Accelerator, LaunchConfig, QemuControl};
+use crate::qemu::{Accelerator, QemuControl};
+use crate::qemu_driver::QemuConfig;
 use crate::qemu_endpoints::{CONSOLE, Endpoints, NIC, QMP};
 use sandsurf_native::process_budget::ProcessBudget;
 use sandsurf_native::socket_io::SocketConnection;
@@ -25,14 +26,14 @@ pub(crate) struct QemuWorker {
 }
 impl QemuWorker {
     pub(crate) fn launch(
-        config: &LaunchConfig,
-        runtime_manifest: &Path,
-        runtime_digest: &Digest,
+        machine: &QemuConfig,
         budget: ProcessBudget,
         guest_cpu_quota: u64,
         custody: Vec<Arc<File>>,
-        restoring: bool,
+        restore: Option<&Path>,
     ) -> io::Result<Self> {
+        let config = &machine.launch;
+        let captures = &machine.capture_directory;
         config.validate()?;
         budget.validate()?;
         let expected = if cfg!(target_os = "macos") {
@@ -50,14 +51,21 @@ impl QemuWorker {
                 "hardware accelerator and guest architecture must match this native host",
             ));
         }
-        let runtime = crate::qemu_runtime::verify(runtime_manifest, runtime_digest, architecture)?;
+        let runtime = crate::qemu_runtime::verify(
+            &machine.runtime_manifest,
+            &machine.runtime_digest,
+            architecture,
+        )?;
         if config.firmware_directory != runtime.firmware_directory {
             return Err(invalid("native firmware differs from verified runtime"));
         }
         let executable = runtime.executable.as_path();
         let mut endpoints = Endpoints::create()?;
         let mut arguments = config.arguments(endpoints.path())?;
-        if restoring {
+        // The namespace exists before the kernel policy is installed. Future
+        // capture files have one fixed shape, not access to the guardian tree.
+        sandsurf_native::local::canonical_private_directory(captures)?;
+        if restore.is_some() {
             arguments.extend(["-incoming".into(), "defer".into()]);
         }
         #[cfg(target_os = "macos")]
@@ -70,9 +78,22 @@ impl QemuWorker {
                     "HVF requires the installed resource-owned VMM and one aggregate task CPU cap",
                 ));
             }
+            let mut read_only = runtime.read_paths.clone();
+            read_only.extend([config.kernel.clone(), config.authentication_disk.clone()]);
+            read_only.extend(config.initramfs.iter().cloned());
+            read_only.extend(restore.map(Path::to_owned));
+            let profile = sandsurf_native::darwin_vmm::Files {
+                read_only,
+                disk: config.system_disk.clone(),
+                endpoints: endpoints.path().to_owned(),
+                captures: captures.to_owned(),
+            }
+            .profile()?;
+            let mut admitted = vec!["--sandsurf-seatbelt".into(), profile.into()];
+            admitted.extend(arguments);
             sandsurf_native::resource_broker::macos::launch_vm(
                 budget,
-                &arguments,
+                &admitted,
                 custody.clone(),
                 std::process::Stdio::null(),
             )?

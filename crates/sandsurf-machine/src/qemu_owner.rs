@@ -1,7 +1,7 @@
 //! One retained QEMU child, a private native control channel and one externally
 //! enforced NIC. Guest management is a separate optional serial attachment.
 //! This owner observes native state; it owns no grants or lifecycle intention.
-use crate::qemu::LaunchConfig;
+use crate::qemu_driver::QemuConfig;
 use crate::qemu_endpoints::{CONSOLE, NIC};
 use crate::qemu_worker::QemuWorker;
 use crate::{NativeConsole, NativePowerObservation};
@@ -29,23 +29,13 @@ impl QemuOwner {
     /// admitted policy, including after restore. No guest readiness handshake
     /// is needed to construct, observe, stop or capture this native computer.
     pub fn launch(
-        config: &LaunchConfig,
-        runtime_manifest: &Path,
-        runtime_digest: &Digest,
+        config: &QemuConfig,
         budget: ProcessBudget,
         guest_cpu_quota: u64,
         custody: Vec<Arc<File>>,
-        restoring: bool,
+        restore: Option<&Path>,
     ) -> io::Result<Self> {
-        let mut worker = QemuWorker::launch(
-            config,
-            runtime_manifest,
-            runtime_digest,
-            budget,
-            guest_cpu_quota,
-            custody,
-            restoring,
-        )?;
+        let mut worker = QemuWorker::launch(config, budget, guest_cpu_quota, custody, restore)?;
         let process = worker.process_id();
         let timeout = std::time::Duration::from_secs(15);
         let serial = SerialOwner::new(worker.endpoints(), process, timeout)?;
@@ -56,7 +46,7 @@ impl QemuOwner {
         let socket = worker.attach(NIC)?;
         let network = Arc::new(NativeNetworkGateway::start(
             PacketTransport::Stream(Box::new(PacketStream::new(socket.into_socket())?)),
-            LinkIdentity::for_machine(&config.machine_id),
+            LinkIdentity::for_machine(&config.launch.machine_id),
         )?);
         Ok(Self {
             worker,

@@ -189,6 +189,7 @@ fn kernel_envelopes_apply_after_exec_and_service_lifetime_is_not_observer_lifeti
         path,
         retained,
         custody_path,
+        snapshot_path,
         image_slot,
         root.join("image-ready"),
         root.join("image-release"),
