@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -27,6 +28,34 @@ static struct sockaddr_un address(const char *path)
     assert(strlen(path) < sizeof(result.sun_path));
     strcpy(result.sun_path, path);
     return result;
+}
+
+static void cannot_use_ip(int family, int type)
+{
+    // macOS does not consistently mediate socket allocation. Test actual
+    // authority: no bind, connection, or datagram may reach the host network.
+    int fd = socket(family, type, 0);
+    if (fd < 0) {
+        assert(errno == EPERM || errno == EACCES);
+        return;
+    }
+    assert(fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+    struct sockaddr_in v4 = { .sin_len = sizeof(v4), .sin_family = AF_INET,
+        .sin_port = htons(9), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    struct sockaddr_in6 v6 = { .sin6_len = sizeof(v6), .sin6_family = AF_INET6,
+        .sin6_port = htons(9), .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    const struct sockaddr *peer = family == AF_INET
+        ? (const struct sockaddr *)&v4 : (const struct sockaddr *)&v6;
+    socklen_t size = family == AF_INET ? sizeof(v4) : sizeof(v6);
+    assert(connect(fd, peer, size) == -1 && (errno == EPERM || errno == EACCES));
+    if (type == SOCK_DGRAM) {
+        assert(sendto(fd, "X", 1, 0, peer, size) == -1
+            && (errno == EPERM || errno == EACCES));
+    }
+    v4.sin_port = 0;
+    v6.sin6_port = 0;
+    assert(bind(fd, peer, size) == -1 && (errno == EPERM || errno == EACCES));
+    close(fd);
 }
 
 int main(int argc, char **argv)
@@ -57,11 +86,11 @@ int main(int argc, char **argv)
     close(capture);
     cannot_open(argv[5], O_WRONLY | O_CREAT);
     // The native machine has only AF_UNIX device endpoints, never host IP
-    // sockets or access to some unrelated host Unix service.
-    assert(socket(AF_INET, SOCK_STREAM, 0) == -1);
-    assert(errno == EPERM || errno == EACCES);
-    assert(socket(AF_INET6, SOCK_DGRAM, 0) == -1);
-    assert(errno == EPERM || errno == EACCES);
+    // network delivery or access to some unrelated host Unix service.
+    cannot_use_ip(AF_INET, SOCK_STREAM);
+    cannot_use_ip(AF_INET, SOCK_DGRAM);
+    cannot_use_ip(AF_INET6, SOCK_STREAM);
+    cannot_use_ip(AF_INET6, SOCK_DGRAM);
     int outgoing = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un other = address(argv[7]);
     assert(outgoing >= 0);
