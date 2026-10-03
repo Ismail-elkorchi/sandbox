@@ -336,7 +336,8 @@ pub(crate) mod tests {
                         &kernel,
                         sandsurf_native::PrivateFileAccess::ReadWrite,
                     );
-                    // pin_boot makes its input immutable to ordinary writes.
+                    // Unix pin_boot removes write bits. Windows uses a private
+                    // DACL and digest-bound publication, not a readonly attribute.
                     // Fault injection explicitly simulates damaged host media.
                     if file.is_err() {
                         #[cfg(unix)]
@@ -347,12 +348,6 @@ pub(crate) mod tests {
                                 std::fs::Permissions::from_mode(0o600),
                             )
                             .unwrap();
-                        }
-                        #[cfg(windows)]
-                        {
-                            let mut permissions = std::fs::metadata(&kernel).unwrap().permissions();
-                            permissions.set_readonly(false);
-                            std::fs::set_permissions(&kernel, permissions).unwrap();
                         }
                         file = sandsurf_native::local::open_private_file(
                             &kernel,

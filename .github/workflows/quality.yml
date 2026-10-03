@@ -231,6 +231,13 @@ jobs:
         shell: msys2 {0}
         run: npm run build:native
       - run: cargo test --no-fail-fast -p sandsurf-protocol -p sandsurf-state -p sandsurf-native -p sandsurf-image -p sandsurf-machine -p sandsurf-host -- --test-threads=1
+      - name: Independent service lifetime contract (no VM hardware required)
+        run: |
+          $artifacts = cargo test --locked -p sandsurf-host --test service_supervision --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'Service lifetime contract compilation failed' }
+          $binary = @($artifacts | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'service_supervision' -and $_.profile.test })
+          if ($binary.Count -ne 1 -or -not $binary[0].executable) { throw 'Missing unique service test executable' }
+          ./scripts/qualification/windows-independent-contract.ps1 -Contract supervision -TestBinary ($binary[0].executable)
       - name: Windows owned Job and transferred disk custody contracts (no VM hardware required)
         run: |
           cargo build -p sandsurf-native --example windows-budget-worker

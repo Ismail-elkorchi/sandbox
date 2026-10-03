@@ -1,5 +1,5 @@
 param(
-  [Parameter(Mandatory = $true)][ValidateSet('kernel', 'package')][string]$Contract,
+  [Parameter(Mandatory = $true)][ValidateSet('kernel', 'supervision', 'package')][string]$Contract,
   [string]$TestBinary,
   [string]$EvidenceDirectory,
   [string]$NodeExecutable,
@@ -21,7 +21,7 @@ if (-not $Worker) {
   $EvidenceDirectory = Join-Path $env:RUNNER_TEMP ('sandsurf-contract-' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
   $arguments = "-NoProfile -NonInteractive -File `"$PSCommandPath`" -Worker -Contract $Contract -EvidenceDirectory `"$EvidenceDirectory`""
-  if ($Contract -eq 'kernel') {
+  if ($Contract -ne 'package') {
     Require-Path $TestBinary 'Leaf'
     $arguments += " -TestBinary `"$TestBinary`""
   } else {
@@ -61,10 +61,14 @@ $log = Join-Path $EvidenceDirectory 'contract.log'
 $result = Join-Path $EvidenceDirectory 'contract.json'
 Set-Location -LiteralPath $repository
 try {
-  if ($Contract -eq 'kernel') {
+  if ($Contract -ne 'package') {
     Require-Path $TestBinary 'Leaf'
-    $env:SANDSURF_WINDOWS_RESOURCE_TEST = '1'
-    & $TestBinary '--test-threads=1' *> $log
+    if ($Contract -eq 'kernel') {
+      $env:SANDSURF_WINDOWS_RESOURCE_TEST = '1'
+      & $TestBinary '--test-threads=1' *> $log
+    } else {
+      & $TestBinary '--ignored' '--test-threads=1' *> $log
+    }
   } else {
     Require-Path $NodeExecutable 'Leaf'
     Require-Path $NpmCli 'Leaf'

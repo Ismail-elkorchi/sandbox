@@ -22,7 +22,7 @@ use sandsurf_protocol::{BootCapability, BootIdentity};
 use sandsurf_protocol::{
     Counter, Digest, Domain, GuestServiceRequest, LifecycleCommand, MachineId, MachineObservation,
     MachineState, NativeSnapshotRequest, NativeSnapshotResponse, NetworkPolicy, Resources,
-    RuntimeConfiguration, SnapshotArtifact, bytes_digest, digest,
+    RuntimeConfiguration, bytes_digest, digest,
 };
 use sandsurf_state::RuntimeJournal;
 use serde::{Deserialize, Serialize};
@@ -228,6 +228,7 @@ struct ActiveGuest {
     boot_identity: Digest,
     capability: [u8; 32],
     boot_directory: PathBuf,
+    boot: sandsurf_image::boot::FrozenBoot,
 }
 
 struct InstalledRuntime {
@@ -414,6 +415,7 @@ impl QemuGuardianEffect {
             boot_identity,
             capability,
             boot_directory,
+            boot,
             rebind: None,
         });
         self.machine

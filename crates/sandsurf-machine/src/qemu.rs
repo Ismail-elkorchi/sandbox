@@ -372,6 +372,8 @@ mod control {
         fn full_capture_requires_transfer_completion_and_a_stopped_cpu_postcondition() {
             for final_state in ["postmigrate", "paused", "running"] {
                 let (stream, peer) = pair();
+                let destination = std::env::temp_dir().join("owned/snapshot.vmstate");
+                let expected = destination.clone();
                 let worker = std::thread::spawn(move || {
                     let mut peer = BufReader::new(peer);
                     greeting(peer.get_mut());
@@ -395,7 +397,7 @@ mod control {
                         if operation == "migrate" {
                             assert_eq!(
                                 request["arguments"]["channels"][0]["addr"],
-                                json!({"transport":"file","filename":"/owned/snapshot.vmstate","offset":0})
+                                json!({"transport":"file","filename":expected,"offset":0})
                             );
                             assert!(request["arguments"].get("uri").is_none());
                         }
@@ -404,9 +406,7 @@ mod control {
                 });
                 let mut control = QemuControl::open(stream, Duration::from_secs(1)).unwrap();
                 assert_eq!(
-                    control
-                        .save_state(Path::new("/owned/snapshot.vmstate"))
-                        .is_ok(),
+                    control.save_state(&destination).is_ok(),
                     final_state != "running"
                 );
                 worker.join().unwrap();
@@ -441,7 +441,7 @@ mod control {
                 let mut control = QemuControl::open(stream, Duration::from_secs(1)).unwrap();
                 assert!(
                     control
-                        .save_state(Path::new("/owned/snapshot.vmstate"))
+                        .save_state(&std::env::temp_dir().join("owned/snapshot.vmstate"))
                         .is_err()
                 );
                 worker.join().unwrap();
@@ -522,7 +522,7 @@ mod control {
                 let mut control = QemuControl::open(stream, Duration::from_secs(1)).unwrap();
                 assert_eq!(
                     control
-                        .load_state(Path::new("/owned/snapshot.vmstate"))
+                        .load_state(&std::env::temp_dir().join("owned/snapshot.vmstate"))
                         .is_ok(),
                     final_state == "paused"
                 );
@@ -532,6 +532,11 @@ mod control {
         fn pair() -> (SocketConnection, TcpStream) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            // A rejected request must fail the mock instead of leaving a
+            // join blocked forever while the control handle remains live.
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            peer.set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let (socket, _) = listener.accept().unwrap();
             (
                 SocketConnection::new(socket.into(), Some(Duration::from_secs(1))).unwrap(),

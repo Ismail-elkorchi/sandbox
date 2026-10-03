@@ -22,7 +22,7 @@ fn process(mode: &str, directory: &Path) -> Process {
             .arg(directory)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     )
@@ -77,6 +77,10 @@ fn ready(mut operation: impl FnMut() -> bool) {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an independent Windows service owner, outside the CI runner Job"
+)]
 fn independently_owned_supervisor_survives_host_api_restart_and_rejects_unadmitted_launches() {
     #[cfg(target_os = "macos")]
     let parent = std::path::PathBuf::from("/tmp");
