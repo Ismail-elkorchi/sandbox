@@ -14,10 +14,11 @@ use std::sync::{
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
 use windows_sys::Win32::Security::{
-    CopySid, EqualSid, FreeSid, GetLengthSid, GetTokenInformation, PSID, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
-    TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
-    TokenIsLessPrivilegedAppContainer,
+    AccessCheck, CopySid, DuplicateToken, EqualSid, FreeSid, GENERIC_MAPPING, GetLengthSid,
+    GetTokenInformation, PRIVILEGE_SET, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
+    SecurityIdentification, TOKEN_APPCONTAINER_INFORMATION, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities,
+    TokenIsAppContainer,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -468,16 +469,15 @@ impl Isolation {
     pub(crate) fn verify_process(&self, process: HANDLE) -> io::Result<()> {
         let mut token = std::ptr::null_mut();
         // SAFETY: retained original process handle and writable token output.
-        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let result = (|| {
-            for class in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
-                let bytes = token_info(token, class)?;
-                if bytes.len() * size_of::<usize>() < 4 || (bytes[0] as u32) != 1 {
-                    return Err(invalid("native process lacks mandatory LPAC token"));
-                }
+            let bytes = token_info(token, TokenIsAppContainer)?;
+            if bytes.len() * size_of::<usize>() < 4 || (bytes[0] as u32) != 1 {
+                return Err(invalid("native process lacks mandatory AppContainer token"));
             }
+            verify_lpac_access(token, &self.sid)?;
             let identity = token_info(token, TokenAppContainerSid)?;
             if identity.len() * size_of::<usize>() < size_of::<TOKEN_APPCONTAINER_INFORMATION>() {
                 return Err(invalid("native AppContainer token is truncated"));
@@ -510,6 +510,74 @@ impl Isolation {
         unsafe { CloseHandle(token) };
         result
     }
+}
+
+/// The Win32 class named TokenIsLessPrivilegedAppContainer is not a supported
+/// query on current Windows. Prove the required kernel access semantics using
+/// this original suspended token, not a requested flag or a weaker fallback.
+fn verify_lpac_access(token: HANDLE, sid: &Sid) -> io::Result<()> {
+    let mut impersonation = std::ptr::null_mut();
+    // SAFETY: retained original token, fixed identification level and output.
+    if unsafe { DuplicateToken(token, SecurityIdentification, &mut impersonation) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        for (identity, expected) in [("AC".to_owned(), false), (sid.text()?, true)] {
+            let text: Vec<u16> = format!("O:SYG:SYD:(A;;0x1;;;{identity})")
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: fixed bounded SDDL and writable native allocation output.
+            if unsafe {
+                windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(), 1, &mut descriptor, std::ptr::null_mut())
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mapping = GENERIC_MAPPING {
+                GenericRead: 1,
+                GenericWrite: 1,
+                GenericExecute: 1,
+                GenericAll: 1,
+            };
+            let mut privileges = [0usize; 64];
+            let mut capacity = size_of_val(&privileges) as u32;
+            let mut granted = 0;
+            let mut allowed = 0;
+            // SAFETY: original identification token, native descriptor, exact
+            // initialized generic mapping and bounded aligned privilege output.
+            let status = unsafe {
+                AccessCheck(
+                    descriptor,
+                    impersonation,
+                    1,
+                    &mapping,
+                    privileges.as_mut_ptr().cast::<PRIVILEGE_SET>(),
+                    &mut capacity,
+                    &mut granted,
+                    &mut allowed,
+                )
+            };
+            let error = io::Error::last_os_error();
+            // SAFETY: the successful SDDL conversion owns this LocalAlloc buffer.
+            unsafe {
+                LocalFree(descriptor);
+            }
+            if status == 0 {
+                return Err(error);
+            }
+            if (allowed != 0) != expected || (expected && granted != 1) {
+                return Err(invalid("native token does not enforce LPAC scoped access"));
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: DuplicateToken returned this uniquely owned native handle.
+    unsafe {
+        CloseHandle(impersonation);
+    }
+    result
 }
 
 fn token_info(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {

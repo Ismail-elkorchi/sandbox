@@ -115,6 +115,9 @@ pub mod windows {
         pub io_write_bytes: u64,
         pub active_processes: u32,
         pub total_processes: u32,
+        /// Raw kernel count of processes terminated for Job-limit violations.
+        /// TotalProcesses includes historical associations, not live authority.
+        pub limit_terminated_processes: u32,
     }
     // SAFETY: this wrapper uniquely owns a real Job handle; Windows permits
     // concurrent native queries. Ownership transfers without duplicating Drop.
@@ -343,7 +346,7 @@ pub mod windows {
         pub fn current_factory_usage(budget: ProcessBudget) -> io::Result<JobUsage> {
             Self::verify_current_factory(budget)?;
             let mut usage = Self::query_usage(std::ptr::null_mut())?;
-            if usage.active_processes != 1 || usage.total_processes != 1 {
+            if usage.active_processes != 1 {
                 return Err(io::Error::other("native factory no longer has one member"));
             }
             // SAFETY: pseudo handle names only the calling factory process.
@@ -398,6 +401,7 @@ pub mod windows {
                 io_write_bytes: accounting.IoInfo.WriteTransferCount,
                 active_processes: accounting.BasicInfo.ActiveProcesses,
                 total_processes: accounting.BasicInfo.TotalProcesses,
+                limit_terminated_processes: accounting.BasicInfo.TotalTerminatedProcesses,
             })
         }
     }

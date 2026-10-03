@@ -394,7 +394,12 @@ impl OwnedWorker {
 
     pub fn usage(&self) -> io::Result<crate::process_budget::windows::JobUsage> {
         let mut usage = self.job.usage()?;
-        if usage.active_processes == 1 && usage.total_processes == 1 {
+        // Cumulative associations can include denied native creation attempts.
+        // Current memory belongs to the original live leader, not that counter.
+        // SAFETY: zero-time observation of this retained original process.
+        if usage.active_processes == 1
+            && unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_TIMEOUT
+        {
             let (memory, creation) =
                 crate::process_budget::windows::original_process_usage(self.process.0)?;
             usage.current_private_commit = Some(memory);

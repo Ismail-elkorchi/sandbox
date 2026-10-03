@@ -1,4 +1,4 @@
-//! Linux socket factory for the external packet gateway. The privileged owner
+//! Unix socket factory for the external packet gateway. The privileged owner
 //! makes ordinary TCP/UDP sockets bearing a fixed restrictive packet mark and
 //! exposes bounded observations of its original ELF and verified kernel rule.
 //! It accepts no destination, pathname, PID, executable, or application grant.
@@ -26,8 +26,15 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 pub const ROOT: &str = "/run/sandsurf-network";
+#[cfg(target_os = "macos")]
+pub const ROOT: &str = "/private/var/run/sandsurf-network";
+#[cfg(target_os = "linux")]
 const ENDPOINT: &str = "/run/sandsurf-network/sockets.sock";
+#[cfg(target_os = "macos")]
+const ENDPOINT: &str = "/private/var/run/sandsurf-network/sockets.sock";
+#[cfg(target_os = "linux")]
 pub const MARK: u32 = 0x53534601;
 const DEADLINE: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 32;
@@ -53,10 +60,10 @@ pub fn observe_boundary() -> io::Result<BoundaryObservation> {
     let deadline = Instant::now() + DEADLINE;
     let stream = crate::unix_io::connect_socket(Path::new(ENDPOINT), deadline)?;
     let credentials = peer(&stream)?;
-    if credentials.uid != 0 {
+    if credentials != 0 {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
-    observe_connection(stream, credentials.uid, deadline)
+    observe_connection(stream, credentials, deadline)
 }
 fn observe_connection(
     mut stream: UnixStream,
@@ -94,6 +101,7 @@ fn observe_connection(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn peer_process(stream: &UnixStream) -> io::Result<OwnedFd> {
     let mut descriptor = -1;
     let mut length = std::mem::size_of_val(&descriptor) as libc::socklen_t;
@@ -126,6 +134,7 @@ fn peer_process(stream: &UnixStream) -> io::Result<OwnedFd> {
     process_alive(&original)?;
     Ok(original)
 }
+#[cfg(target_os = "linux")]
 fn process_alive(original: &OwnedFd) -> io::Result<()> {
     let mut event = libc::pollfd {
         fd: original.as_raw_fd(),
@@ -141,6 +150,14 @@ fn process_alive(original: &OwnedFd) -> io::Result<()> {
         return Err(invalid("native boundary owner exited during observation"));
     }
     Ok(())
+}
+#[cfg(target_os = "macos")]
+fn peer_process(stream: &UnixStream) -> io::Result<[u32; 8]> {
+    crate::darwin_network::peer(stream)
+}
+#[cfg(target_os = "macos")]
+fn process_alive(original: &[u32; 8]) -> io::Result<()> {
+    crate::darwin_network::alive(original)
 }
 fn executable_digest(
     executable: &File,
@@ -190,6 +207,7 @@ fn executable_digest(
 /// Install explicitly, as an operator. The batch replaces only this dedicated
 /// table atomically. Do not flush the host ruleset or remove it on broker exit:
 /// transferred live sockets must remain restricted after service restart.
+#[cfg(target_os = "linux")]
 pub const NFT_RULES: &str = include_str!("../../../vmm/linux/network-boundary.nft");
 
 fn invalid(message: &'static str) -> io::Error {
@@ -239,7 +257,7 @@ impl SocketAdmission {
         // connecting Internet socket. Never poll/wait on the packet hot path.
         connection.connect(&socket2::SockAddr::unix(ENDPOINT)?)?;
         let control = UnixStream::from(OwnedFd::from(connection));
-        if peer(&control)?.uid != 0 {
+        if peer(&control)? != 0 {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         Ok(Self {
@@ -361,7 +379,8 @@ fn protected_endpoint() -> io::Result<()> {
     crate::filesystem::require_protected_ancestors(Path::new(ENDPOINT))
 }
 
-fn peer(stream: &UnixStream) -> io::Result<libc::ucred> {
+#[cfg(target_os = "linux")]
+fn peer(stream: &UnixStream) -> io::Result<u32> {
     // SAFETY: initialized credential output and its exact length for this socket.
     let mut value: libc::ucred = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
@@ -379,7 +398,17 @@ fn peer(stream: &UnixStream) -> io::Result<libc::ucred> {
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(value)
+    Ok(value.uid)
+}
+#[cfg(target_os = "macos")]
+fn peer(stream: &UnixStream) -> io::Result<u32> {
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: original connected socket and exact initialized scalar outputs.
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uid)
 }
 
 fn scalar(socket: &Socket, option: i32) -> io::Result<i32> {
@@ -402,6 +431,7 @@ fn scalar(socket: &Socket, option: i32) -> io::Result<i32> {
     Ok(value)
 }
 
+#[cfg(target_os = "linux")]
 fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
     if scalar(socket, libc::SO_MARK)? as u32 != MARK
         || scalar(socket, libc::SO_DOMAIN)? != if ipv6 { libc::AF_INET6 } else { libc::AF_INET }
@@ -424,6 +454,7 @@ fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn marked_socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
     let mark = MARK;
     let socket = Socket::new(
@@ -449,6 +480,35 @@ fn marked_socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
     Ok(socket)
 }
 
+#[cfg(target_os = "macos")]
+fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
+    if scalar(socket, libc::SO_TYPE)?
+        != if udp {
+            libc::SOCK_DGRAM
+        } else {
+            libc::SOCK_STREAM
+        }
+        || socket.local_addr()?.family()
+            != if ipv6 {
+                libc::AF_INET6 as u16
+            } else {
+                libc::AF_INET as u16
+            }
+        || socket.peer_addr().is_ok()
+    {
+        return Err(invalid("connected or wrong native socket role"));
+    }
+    // Darwin has no socket-UID query. The original protected root owner's
+    // exact SDK creator captures UID 65530; PF checks it at actual delivery.
+    Ok(())
+}
+#[cfg(target_os = "macos")]
+fn marked_socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
+    let socket = crate::darwin_network::socket(ipv6, udp)?;
+    socket.set_nonblocking(true)?;
+    verify_socket(&socket, ipv6, udp)?;
+    Ok(socket)
+}
 fn send(
     stream: &UnixStream,
     payload: &[u8],
@@ -529,8 +589,12 @@ impl Receipt {
         message.msg_control = ancillary.as_mut_ptr().cast();
         message.msg_controllen = std::mem::size_of_val(&ancillary);
         // SAFETY: retained socket, bounded payload and aligned ancillary storage.
-        let read =
-            unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_CMSG_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let flags = 0;
+        // SAFETY: original socket and bounded initialized output buffers.
+        let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, flags) };
         if read < 0 {
             let error = io::Error::last_os_error();
             if matches!(
@@ -565,6 +629,13 @@ impl Receipt {
                     unknown = true;
                 }
                 header = libc::CMSG_NXTHDR(&message, header);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        for descriptor in &received {
+            // SAFETY: newly owned descriptor is not published before CLOEXEC.
+            if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
             }
         }
         if read == 0
@@ -603,6 +674,7 @@ fn receive(stream: &UnixStream, deadline: Instant) -> io::Result<([u8; 8], Owned
 
 /// Verify the actual immutable enforcement expression, not merely a table name
 /// or a successful policy command. Kernel-assigned handles are observations.
+#[cfg(target_os = "linux")]
 fn verify_rules(bytes: &[u8]) -> io::Result<Digest> {
     use serde_json::json;
     if bytes.len() > 16384 {
@@ -654,11 +726,32 @@ fn inspect_rules() -> io::Result<Digest> {
     inspect_rules_until(Instant::now() + Duration::from_secs(5))
 }
 fn inspect_rules_until(deadline: Instant) -> io::Result<Digest> {
-    let nft = crate::filesystem::protected_tool(&["/usr/sbin/nft", "/sbin/nft"])?;
+    #[cfg(target_os = "macos")]
+    {
+        let tool = crate::filesystem::protected_tool(&["/sbin/pfctl"])?;
+        let rules = rule_output(&tool, &["-vvsr"], deadline)?;
+        let nat = rule_output(&tool, &["-vvsn"], deadline)?;
+        let anchors = rule_output(&tool, &["-s", "Anchors"], deadline)?;
+        let states = rule_output(&tool, &["-ss"], deadline)?;
+        let info = rule_output(&tool, &["-si"], deadline)?;
+        let interfaces = rule_output(&tool, &["-s", "Interfaces", "-v"], deadline)?;
+        crate::darwin_network::verify_policy(&rules, &nat, &anchors, &states, &info, &interfaces)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let nft = crate::filesystem::protected_tool(&["/usr/sbin/nft", "/sbin/nft"])?;
+        verify_rules(&rule_output(
+            &nft,
+            &["-j", "list", "table", "inet", "sandsurf_boundary"],
+            deadline,
+        )?)
+    }
+}
+fn rule_output(tool: &Path, arguments: &[&str], deadline: Instant) -> io::Result<Vec<u8>> {
     let mut child = RuleQuery(
-        Command::new(nft)
+        Command::new(tool)
             .env_clear()
-            .args(["-j", "list", "table", "inet", "sandsurf_boundary"])
+            .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -698,7 +791,7 @@ fn inspect_rules_until(deadline: Instant) -> io::Result<Digest> {
             if !status.success() {
                 return Err(invalid("native network rules are not installed"));
             }
-            return verify_rules(&bytes);
+            return Ok(bytes);
         }
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -767,15 +860,28 @@ fn own_endpoint() -> io::Result<(UnixListener, File)> {
 /// Operator-installed root service. Policy setup is explicit and external; an
 /// unavailable/conflicting rule fails before publishing a socket factory.
 pub fn serve() -> io::Result<()> {
-    crate::filesystem::protected_tool(&["/usr/local/libexec/sandsurf/sandsurf-host"])?;
-    if std::env::current_exe()? != Path::new("/usr/local/libexec/sandsurf/sandsurf-host") {
+    #[cfg(target_os = "linux")]
+    let program = Path::new("/usr/local/libexec/sandsurf/sandsurf-host");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let program = Path::new("/usr/local/libexec/sandsurf/sandsurf-host-macos-arm64");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let program = Path::new("/usr/local/libexec/sandsurf/sandsurf-host-macos-x64");
+    crate::filesystem::protected_tool(&[program
+        .to_str()
+        .ok_or_else(|| invalid("native owner path is not UTF-8"))?])?;
+    if std::env::current_exe()? != program {
         return Err(invalid("native socket owner must be operator-installed"));
     }
+    #[cfg(target_os = "macos")]
+    crate::process_budget::macos::install_broker_current()?;
     let (listener, _lease) = own_endpoint()?;
     inspect_rules()?;
     // Open this process's running ELF, not a mutable installation pathname.
     // The only observation capability disclosed is this read-only file handle.
+    #[cfg(target_os = "linux")]
     let executable = Arc::new(File::open("/proc/self/exe")?);
+    #[cfg(target_os = "macos")]
+    let executable = Arc::new(crate::darwin_network::executable()?);
     let connections = Arc::new(AtomicUsize::new(0));
     // At most one rule-query subprocess in addition to the bounded admission
     // threads. Socket production never waits on observation or a rules query.
@@ -1009,6 +1115,7 @@ mod tests {
         assert!(receipt.poll(&reader).is_err());
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn installed_rule_asset_and_socket_factory_use_the_same_mark() {
         assert!(NFT_RULES.contains(&format!("meta mark 0x{MARK:08x} drop")));
         assert!(NFT_RULES.contains("hook input priority -300"));
@@ -1035,11 +1142,12 @@ mod tests {
         .unwrap();
         drop(writer);
         let (_, received) = receive(&reader, Instant::now() + DEADLINE).unwrap();
-        assert!(verify_socket(&Socket::from(received), false, false).is_err());
+        assert!(verify_socket(&Socket::from(received), true, false).is_err());
     }
 
     #[test]
     #[ignore = "requires root in a separately created network namespace; no VM hardware required"]
+    #[cfg(target_os = "linux")]
     fn kernel_local_delivery_denial_survives_route_changes_and_factory_exit() {
         // Never install test rules or change addresses in the initial namespace.
         // CI executes this compiled test binary through sudo unshare --net.
@@ -1210,6 +1318,7 @@ mod tests {
         );
     }
     #[test]
+    #[cfg(target_os = "linux")]
     fn rule_verification_rejects_dormant_tables_wrong_hooks_extra_rules_and_changed_mark() {
         let base = serde_json::json!({"nftables":[
             {"metainfo":{"json_schema_version":1}},

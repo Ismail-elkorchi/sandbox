@@ -4,10 +4,12 @@
 //! They do not admit authority, launch arbitrary programs, or qualify a VM.
 
 pub mod capacity;
+#[cfg(any(target_os = "macos", test))]
+mod darwin_network;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub mod darwin_vmm;
 pub mod guest_channel;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod network_sockets;
 #[cfg(windows)]
 pub mod owned_windows;

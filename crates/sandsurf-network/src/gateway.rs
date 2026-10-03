@@ -316,7 +316,7 @@ struct Inbound {
     target: SocketAddr,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct PendingFlow {
     admission: sandsurf_native::network_sockets::SocketAdmission,
     frame: Vec<u8>,
@@ -329,7 +329,7 @@ struct Worker {
     sockets: SocketSet<'static>,
     tcp: HashMap<FlowKey, TcpFlow>,
     udp: HashMap<FlowKey, UdpFlow>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pending: HashMap<(FlowKey, bool), PendingFlow>,
     inbound: Vec<Inbound>,
     policy: PacketPolicy,
@@ -378,7 +378,7 @@ impl Worker {
             sockets: SocketSet::new(Vec::new()),
             tcp: HashMap::new(),
             udp: HashMap::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             pending: HashMap::new(),
             inbound: Vec::new(),
             policy: PacketPolicy::default(),
@@ -432,7 +432,7 @@ impl Worker {
             self.sockets.remove(f.handle);
         }
         self.udp.clear();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.pending.clear();
         self.inbound.clear();
         self.device.input.clear();
@@ -443,14 +443,14 @@ impl Worker {
         // Install deny and close native sockets before validation/bind. Failure
         // remains deny with no listeners, never successful partial revocation.
         self.close_flows();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if !policy.rules.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "native kernel local-delivery enforcement is unavailable; address observations cannot safely authorize egress",
             ));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if !policy.rules.is_empty() {
             sandsurf_native::network_sockets::probe()?;
         }
@@ -535,7 +535,7 @@ impl Worker {
                     Err(e) => return Err(e),
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.pump_admissions()?;
             self.accept_inbound();
             self.pump_tcp();
@@ -591,12 +591,12 @@ impl Worker {
                     {
                         return Ok(());
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         self.admit(key, false, frame)?;
                         return Ok(());
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     {
                         return Err(io::ErrorKind::Unsupported.into());
                     }
@@ -615,12 +615,12 @@ impl Worker {
                     if self.flow_count() >= MAX_FLOWS {
                         return Ok(());
                     }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     {
                         self.admit(key, true, frame)?;
                         return Ok(());
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     {
                         return Err(io::ErrorKind::Unsupported.into());
                     }
@@ -643,11 +643,11 @@ impl Worker {
     }
     fn flow_count(&self) -> usize {
         let count = self.tcp.len() + self.udp.len();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let count = count + self.pending.len();
         count
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn insert_tcp(&mut self, key: FlowKey, native: TcpStream) -> io::Result<()> {
         let mut socket = tcp_socket();
         socket.listen(key.remote).map_err(io::Error::other)?;
@@ -668,7 +668,7 @@ impl Worker {
         self.connection();
         Ok(())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn insert_udp(&mut self, key: FlowKey, native: UdpSocket) {
         self.udp.insert(
             key,
@@ -679,7 +679,7 @@ impl Worker {
         );
         self.connection();
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn admit(&mut self, key: FlowKey, udp: bool, frame: Vec<u8>) -> io::Result<()> {
         if self.pending.contains_key(&(key, udp)) {
             return Ok(());
@@ -693,7 +693,7 @@ impl Worker {
         }
         Ok(())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn pump_admissions(&mut self) -> io::Result<()> {
         let mut completed = Vec::new();
         for (key, flow) in &mut self.pending {
@@ -952,7 +952,7 @@ fn tcp_socket() -> Socket<'static> {
     socket.set_ack_delay(None);
     socket
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn connect_socket_nonblocking(
     socket: socket2::Socket,
     address: SocketAddr,

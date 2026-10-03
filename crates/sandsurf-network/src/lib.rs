@@ -14,7 +14,7 @@ pub mod linux;
 /// Enforcement implementation/installation, independently of VM qualification.
 /// Address enumeration alone cannot establish a kernel local-delivery boundary.
 pub fn egress_capability() -> sandsurf_protocol::Capability {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     match sandsurf_native::network_sockets::probe() {
         Ok(()) => sandsurf_protocol::Capability::Supported {
             qualification: sandsurf_protocol::Qualification::Unqualified {
@@ -25,7 +25,7 @@ pub fn egress_capability() -> sandsurf_protocol::Capability {
             reasons: vec![format!("native kernel socket boundary unavailable: {error}")],
         },
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     sandsurf_protocol::Capability::Unsupported {
         reasons: vec!["native kernel local-delivery enforcement is not implemented for this host; host-address observations alone are insufficient".into()],
     }

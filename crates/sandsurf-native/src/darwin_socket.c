@@ -68,7 +68,7 @@ int sandsurf_darwin_running_executable(void)
     if (fstat(descriptor, &file) != 0 || !S_ISREG(file.st_mode) ||
         file.st_uid != 0 || (file.st_mode & 0022) != 0 ||
         file.st_ino != region.prp_vip.vip_vi.vi_stat.vst_ino ||
-        file.st_dev != region.prp_vip.vip_vi.vi_stat.vst_dev) {
+        (uint32_t)file.st_dev != region.prp_vip.vip_vi.vi_stat.vst_dev) {
         close(descriptor);
         errno = EACCES;
         return -1;

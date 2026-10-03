@@ -251,7 +251,11 @@ fn kernel_limits_precede_execution_and_native_exit_259_is_not_running() {
         "CPU cap did not throttle: {usage:?}"
     );
     assert_eq!(usage.active_processes, 0);
-    assert_eq!(usage.total_processes, 1);
+    assert_eq!(
+        usage.total_processes,
+        1 + usage.limit_terminated_processes,
+        "live={live:?}, final={usage:?}"
+    );
     assert!(usage.current_private_commit.is_none());
     drop(worker);
 
@@ -264,7 +268,12 @@ fn kernel_limits_precede_execution_and_native_exit_259_is_not_running() {
 
     let mut worker = OwnedWorker::launch(&executable, &["no-child".into()], budget()).unwrap();
     assert_eq!(worker.wait_for(Duration::from_secs(5)).unwrap(), Some(0));
-    assert_eq!(worker.usage().unwrap().total_processes, 1);
+    let usage = worker.usage().unwrap();
+    assert_eq!(
+        usage.total_processes,
+        1 + usage.limit_terminated_processes,
+        "{usage:?}"
+    );
 }
 
 #[test]
