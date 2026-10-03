@@ -1128,7 +1128,7 @@ mod tests {
                 "capabilities": { "overlayfs": false, "vsock": false, "seccomp": false, "cgroupV2": false, "devpts": false } },
             "system": { "rootfs": { "path": "system.ext4", "sha256": bytes_digest(b"seed"), "format": "ext4" },
                 "cloneProfile": { "kind": "preserve" }, "defaults": { "environment": {}, "user": null, "workingDirectory": null },
-                "provenance": { "kind": "source-built", "sourceDigest": "a".repeat(64), "materials": { "fixture": "b".repeat(64) } } },
+                "provenance": { "kind": "assembled", "inputDigest": "a".repeat(64), "distribution": null, "materials": { "fixture": "b".repeat(64) } } },
             "signature": null
         });
         (serde_json::to_vec(&manifest).unwrap(), kernel)

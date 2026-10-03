@@ -7,6 +7,7 @@ pub mod distribution;
 pub mod ext4;
 pub mod identity;
 pub mod oci;
+pub mod packages;
 pub mod registry;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -69,9 +70,12 @@ pub struct ImageDefaults {
     deny_unknown_fields
 )]
 pub enum ImageProvenance {
-    SourceBuilt {
-        source_digest: String,
+    /// An assembled creation input. Signed binary packages are not represented
+    /// as software compiled from corresponding source by Sandsurf.
+    Assembled {
+        input_digest: String,
         materials: BTreeMap<String, String>,
+        distribution: Option<packages::DistributionInventory>,
     },
     Oci {
         index_digest: String,
@@ -345,11 +349,12 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
         ));
     }
     match &manifest.system.provenance {
-        ImageProvenance::SourceBuilt {
-            source_digest,
+        ImageProvenance::Assembled {
+            input_digest,
             materials,
+            distribution,
         } => {
-            validate_digest(source_digest)?;
+            validate_digest(input_digest)?;
             if materials.is_empty()
                 || materials.len() > 4096
                 || materials.iter().any(|(name, digest)| {
@@ -357,8 +362,11 @@ pub fn validate_image_manifest(manifest: &ImageManifest) -> Result<(), ImageErro
                 })
             {
                 return Err(ImageError::Invalid(
-                    "source-built image materials are malformed".into(),
+                    "assembled image materials are malformed".into(),
                 ));
+            }
+            if let Some(distribution) = distribution {
+                distribution.validate(manifest.architecture)?;
             }
         }
         ImageProvenance::Oci {
@@ -752,8 +760,9 @@ mod tests {
                     user: Some("agent".into()),
                     working_directory: Some("/workspace".into()),
                 },
-                provenance: ImageProvenance::SourceBuilt {
-                    source_digest: hex_sha256(b"source"),
+                provenance: ImageProvenance::Assembled {
+                    input_digest: hex_sha256(b"source"),
+                    distribution: None,
                     materials: BTreeMap::from([("fixture".into(), hex_sha256(b"fixture"))]),
                 },
             },

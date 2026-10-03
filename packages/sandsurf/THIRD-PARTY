@@ -1,6 +1,75 @@
 Third-party components
 
 adler2 2.0.1	0BSD OR MIT OR Apache-2.0
+alpine/alpine-base (noarch) 3.24.2-r0	MIT
+alpine/alpine-baselayout (x86_64) 3.7.2-r1	GPL-2.0-only
+alpine/alpine-baselayout-data (x86_64) 3.7.2-r1	GPL-2.0-only
+alpine/alpine-conf (x86_64) 3.22.0-r0	MIT
+alpine/alpine-keys (x86_64) 2.6-r0	MIT
+alpine/alpine-release (x86_64) 3.24.2-r0	MIT
+alpine/apk-tools (x86_64) 3.0.8-r0	GPL-2.0-only
+alpine/bridge (noarch) 1.5-r5	GPL-2.0-or-later
+alpine/brotli-libs (x86_64) 1.2.0-r1	MIT
+alpine/busybox (x86_64) 1.37.0-r31	GPL-2.0-only
+alpine/busybox-binsh (x86_64) 1.37.0-r31	GPL-2.0-only
+alpine/busybox-extras (x86_64) 1.37.0-r31	GPL-2.0-only
+alpine/busybox-mdev-openrc (noarch) 1.37.0-r31	GPL-2.0-only
+alpine/busybox-openrc (noarch) 1.37.0-r31	GPL-2.0-only
+alpine/busybox-suid (x86_64) 1.37.0-r31	GPL-2.0-only
+alpine/c-ares (x86_64) 1.34.8-r0	MIT
+alpine/ca-certificates (x86_64) 20260909-r0	MPL-2.0 AND MIT
+alpine/ca-certificates-bundle (x86_64) 20260909-r0	MPL-2.0 AND MIT
+alpine/cryptsetup-libs (x86_64) 2.8.6-r0	GPL-2.0-or-later WITH cryptsetup-OpenSSL-exception
+alpine/device-mapper-libs (x86_64) 2.03.35-r3	GPL-2.0-or-later AND LGPL-2.1-or-later
+alpine/e2fsprogs (x86_64) 1.47.4-r0	GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT
+alpine/e2fsprogs-extra (x86_64) 1.47.4-r0	GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT
+alpine/e2fsprogs-libs (x86_64) 1.47.4-r0	GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT
+alpine/git (x86_64) 2.54.0-r0	GPL-2.0-only
+alpine/git-init-template (noarch) 2.54.0-r0	GPL-2.0-only
+alpine/ifupdown-ng (x86_64) 0.13.0-r0	ISC
+alpine/json-c (x86_64) 0.18-r1	MIT
+alpine/kmod (x86_64) 34.2-r1	GPL-2.0-or-later
+alpine/kmod-libs (x86_64) 34.2-r1	LGPL-2.1-or-later
+alpine/lddtree (noarch) 1.27-r0	GPL-2.0-only
+alpine/libapk (x86_64) 3.0.8-r0	GPL-2.0-only
+alpine/libblkid (x86_64) 2.42.3-r1	LGPL-2.1-or-later
+alpine/libcap2 (x86_64) 2.78-r0	BSD-3-Clause OR GPL-2.0-only
+alpine/libcom_err (x86_64) 1.47.4-r0	GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT
+alpine/libcrypto3 (x86_64) 3.5.9-r0	Apache-2.0
+alpine/libcurl (x86_64) 8.22.0-r0	curl
+alpine/libeconf (x86_64) 0.8.3-r0	MIT
+alpine/libedit (x86_64) 20260508.3.1-r1	BSD-3-Clause
+alpine/libexpat (x86_64) 2.8.5-r0	MIT
+alpine/libidn2 (x86_64) 2.3.8-r0	GPL-2.0-or-later OR LGPL-3.0-or-later
+alpine/libncursesw (x86_64) 6.6_p20260516-r0	X11
+alpine/libpsl (x86_64) 0.21.5-r3	MIT
+alpine/libssl3 (x86_64) 3.5.9-r0	Apache-2.0
+alpine/libunistring (x86_64) 1.4.2-r0	GPL-2.0-or-later OR LGPL-3.0-or-later
+alpine/libuuid (x86_64) 2.42.3-r1	BSD-3-Clause
+alpine/linux-virt (x86_64) 6.18.54-r0	GPL-2.0-only
+alpine/mdev-conf (noarch) 4.10-r0	MIT
+alpine/mkinitfs (x86_64) 3.14.1-r0	GPL-2.0-only
+alpine/musl (x86_64) 1.2.6-r2	MIT
+alpine/musl-utils (x86_64) 1.2.6-r2	MIT AND BSD-2-Clause AND GPL-2.0-or-later
+alpine/ncurses-terminfo-base (noarch) 6.6_p20260516-r0	X11
+alpine/nghttp2-libs (x86_64) 1.69.0-r0	MIT
+alpine/openrc (x86_64) 0.63.2-r0	BSD-2-Clause
+alpine/openrc-user (x86_64) 0.63.2-r0	BSD-2-Clause
+alpine/openssh (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-client-common (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-client-default (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-keygen (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-server (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-server-common (noarch) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-server-common-openrc (noarch) 10.3_p1-r1	SSH-OpenSSH
+alpine/openssh-sftp-server (x86_64) 10.3_p1-r1	SSH-OpenSSH
+alpine/pcre2 (x86_64) 10.48-r0	BSD-3-Clause
+alpine/scanelf (x86_64) 1.3.9-r1	GPL-2.0-only
+alpine/ssl_client (x86_64) 1.37.0-r31	GPL-2.0-only
+alpine/sudo (x86_64) 1.9.17_p2-r1	custom ISC
+alpine/xz-libs (x86_64) 5.8.4-r0	GPL-2.0-or-later AND 0BSD AND Public-Domain AND LGPL-2.1-or-later
+alpine/zlib (x86_64) 1.3.2-r0	Zlib
+alpine/zstd-libs (x86_64) 1.5.7-r2	BSD-3-Clause OR GPL-2.0-or-later
 ambient-authority 0.0.2	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 atomic-waker 1.1.2	Apache-2.0 OR MIT
 aws-lc-rs 1.18.1	ISC AND (Apache-2.0 OR ISC)

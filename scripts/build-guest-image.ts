@@ -151,9 +151,10 @@ try {
         workingDirectory: "/home/agent",
       },
       provenance: {
-        kind: "source-built",
-        sourceDigest: systemMaterials.sourceDigest,
+        kind: "assembled",
+        inputDigest: systemMaterials.inputDigest,
         materials: systemMaterials.materials,
+        distribution: systemMaterials.distribution,
       },
     },
   } as const;
@@ -184,7 +185,7 @@ async function buildLinuxSystem(
   temporary: string,
   output: string,
   guestAgent: string,
-): Promise<{ sourceDigest: string; materials: Readonly<Record<string, string>> }> {
+): Promise<{ inputDigest: string; materials: Readonly<Record<string, string>>; distribution: unknown }> {
   if ((architecture === "x64" ? "x64" : "arm64") !== process.arch) {
     throw new Error("the isolated Alpine builder requires a Linux host of the target architecture");
   }
@@ -238,7 +239,7 @@ async function buildLinuxSystem(
   await run("cargo", ["run", "--locked", ...profileArguments, "-p", "sandsurf-image", "--example", "build_alpine", "--",
     targetArchive, stagedPackages, archive, output, resolve(temporary, "boot")]);
   const recipe = Object.fromEntries(await Promise.all(recipePaths.map(async (path) => [path, sha256(await readFile(resolve("scripts/guest-image", path)))])));
-  const helperSources = ["crates/sandsurf-image/src/appliance.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
+  const helperSources = ["crates/sandsurf-image/src/appliance.rs", "crates/sandsurf-image/src/appliance/operations.rs", "crates/sandsurf-image/src/boot.rs", "crates/sandsurf-image/src/packages.rs", "crates/sandsurf-image/examples/build_alpine.rs"];
   const helperRecipe = Object.fromEntries(await Promise.all(helperSources.map(async (path) => [path, sha256(await readFile(resolve(path)))])));
   const materials = {
     "alpine-minirootfs": imageBuild.alpineSha256,
@@ -247,8 +248,13 @@ async function buildLinuxSystem(
     "sandsurf-system-recipe": identityDigest(recipe),
     "sandsurf-appliance-recipe": identityDigest(helperRecipe),
     "sandsurf-management": sha256(await readFile(guestAgent)),
+    "alpine-installed-database": await sha256BoundedFile(resolve(temporary, "boot/package-database"), 4 * 1024 * 1024),
   };
-  return { sourceDigest: identityDigest(materials), materials };
+  // The isolated builder parses the final installed database. This is not the
+  // solver's predicted package list, and its build commits are source pointers,
+  // not a claim that corresponding source archives have already been supplied.
+  const distribution: unknown = JSON.parse((await boundedRegularFile(resolve(temporary, "boot/distribution.json"), 1024 * 1024, "installed package provenance")).toString("utf8"));
+  return { inputDigest: identityDigest(materials), materials, distribution };
 }
 
 function assertElfArchitecture(bytes: Buffer, label: string): void {

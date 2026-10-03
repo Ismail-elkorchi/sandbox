@@ -1300,7 +1300,6 @@ dependencies = [
  "sandsurf-protocol",
  "smoltcp",
  "socket2",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

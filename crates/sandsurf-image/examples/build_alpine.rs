@@ -49,6 +49,22 @@ fn main() -> io::Result<()> {
         sandsurf_image::Architecture::X64
     };
     sandsurf_image::boot::extract(output, artifacts, architecture)?;
+    sandsurf_image::appliance::download(
+        output,
+        "/lib/apk/db/installed",
+        &artifacts.join("package-database"),
+        4 * 1024 * 1024,
+    )?;
+    let inventory = sandsurf_image::packages::alpine_inventory(
+        &std::fs::read(artifacts.join("package-database"))?,
+        architecture,
+    )
+    .map_err(io::Error::other)?;
+    let mut file =
+        sandsurf_native::local::create_private_file(&artifacts.join("distribution.json"))?;
+    use std::io::Write;
+    file.write_all(&serde_json::to_vec(&inventory).map_err(io::Error::other)?)?;
+    file.sync_all()?;
     std::fs::File::open(output)?.sync_all()?;
     Ok(())
 }

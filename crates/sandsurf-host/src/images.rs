@@ -228,8 +228,8 @@ fn image_record(root: &Path, image: &VerifiedImage) -> Result<ImageRecord, Image
             .map_err(|error| ImageBuildError::Invalid(error.to_string()))
     };
     let (source_digest, provenance_digest, sensitive) = match &manifest.system.provenance {
-        ImageProvenance::SourceBuilt { source_digest, .. } => (
-            as_digest(source_digest)?,
+        ImageProvenance::Assembled { input_digest, .. } => (
+            as_digest(input_digest)?,
             digest(Domain::Image, &manifest.system.provenance)
                 .map_err(|error| ImageBuildError::Invalid(error.to_string()))?,
             false,
@@ -597,8 +597,9 @@ mod native_import_tests {
                         format: RootfsFormat::Ext4,
                     },
                     defaults: ImageDefaults::default(),
-                    provenance: ImageProvenance::SourceBuilt {
-                        source_digest: "a".repeat(64),
+                    provenance: ImageProvenance::Assembled {
+                        input_digest: "a".repeat(64),
+                        distribution: None,
                         materials: BTreeMap::from([("source".into(), "b".repeat(64))]),
                     },
                 },

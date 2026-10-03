@@ -23,6 +23,2421 @@
     },
     {
       "type": "library",
+      "name": "alpine/alpine-base (noarch)",
+      "version": "3.24.2-r0",
+      "purl": "pkg:apk/alpine/alpine-base@3.24.2-r0?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-base"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "d9d560d5de74ff9a7a73f3c903d6f126a0bf3142"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/d9d560d5de74ff9a7a73f3c903d6f126a0bf3142"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1dRnSKKSmlyRK/Hntx/BWTdTsP0U="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/alpine-baselayout (x86_64)",
+      "version": "3.7.2-r1",
+      "purl": "pkg:apk/alpine/alpine-baselayout@3.7.2-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-baselayout"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/60a7585bbab2fa0f762504eb617dbca90216e31f"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q18Pz9wvTaBYr2RzvEXE6rYpFiJbI="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/alpine-baselayout-data (x86_64)",
+      "version": "3.7.2-r1",
+      "purl": "pkg:apk/alpine/alpine-baselayout-data@3.7.2-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-baselayout"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/60a7585bbab2fa0f762504eb617dbca90216e31f"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1xvm97RfYRLbxsLtXZtLDXA1chQg="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/alpine-conf (x86_64)",
+      "version": "3.22.0-r0",
+      "purl": "pkg:apk/alpine/alpine-conf@3.22.0-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-conf"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "ffe51358504147f053bc39711afeb04ad89deb95"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/ffe51358504147f053bc39711afeb04ad89deb95"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q16CliiBBKgwsiM/O3ucF5orx3JuQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/alpine-keys (x86_64)",
+      "version": "2.6-r0",
+      "purl": "pkg:apk/alpine/alpine-keys@2.6-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-keys"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "b9f23becced4d7b3ccc0fa0f28530243ccd314a0"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/b9f23becced4d7b3ccc0fa0f28530243ccd314a0"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q12Na4DlPAWad+SRXaeLqWTz/+okA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/alpine-release (x86_64)",
+      "version": "3.24.2-r0",
+      "purl": "pkg:apk/alpine/alpine-release@3.24.2-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "alpine-base"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "d9d560d5de74ff9a7a73f3c903d6f126a0bf3142"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/d9d560d5de74ff9a7a73f3c903d6f126a0bf3142"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1b9G+RpyiNenGLxtz+j5b/6/etrU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/apk-tools (x86_64)",
+      "version": "3.0.8-r0",
+      "purl": "pkg:apk/alpine/apk-tools@3.0.8-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "apk-tools"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "4588b452722bd4800efdc6cce4f6e980e02a997f"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/4588b452722bd4800efdc6cce4f6e980e02a997f"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1eGEwqPLTrGn8MWEYdXt+gVG4uMM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/bridge (noarch)",
+      "version": "1.5-r5",
+      "purl": "pkg:apk/alpine/bridge@1.5-r5?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "bridge"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8bac74716d06c84627ab02d101fd9d2bafd0a34c"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8bac74716d06c84627ab02d101fd9d2bafd0a34c"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1gc+LmcD1tF4mNQGr627sSCDYHbA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/brotli-libs (x86_64)",
+      "version": "1.2.0-r1",
+      "purl": "pkg:apk/alpine/brotli-libs@1.2.0-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "brotli"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "1ee249c9da168084b1c6c9f7488bdffa2ac33c84"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/1ee249c9da168084b1c6c9f7488bdffa2ac33c84"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1gviBUWwEXwbyLX3AqDzGTKVU7xA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox (x86_64)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox@1.37.0-r31?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1tUBevAL33YvpW2JlxUskPVRWq48="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox-binsh (x86_64)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox-binsh@1.37.0-r31?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1XL0UrMbxgExbrGx33CxJLwELD8c="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox-extras (x86_64)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox-extras@1.37.0-r31?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q18sGfPOTAHPYobrCh6bXIAzC9jsQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox-mdev-openrc (noarch)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox-mdev-openrc@1.37.0-r31?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q17911Y5QO/WM6kH50Da7ruRLw+Ck="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox-openrc (noarch)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox-openrc@1.37.0-r31?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q14JOLaJA0Bdxr4Kx2WFKWIHwCsgw="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/busybox-suid (x86_64)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/busybox-suid@1.37.0-r31?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q10I131aeOncNTjS9OZyso/feLg6w="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/c-ares (x86_64)",
+      "version": "1.34.8-r0",
+      "purl": "pkg:apk/alpine/c-ares@1.34.8-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "c-ares"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "138a6bf9dea5974644e48fef4826b7c474f2f7d8"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/138a6bf9dea5974644e48fef4826b7c474f2f7d8"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1ZAoo/2JF9wHUZPulOgWxvGV8N6c="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/ca-certificates (x86_64)",
+      "version": "20260909-r0",
+      "purl": "pkg:apk/alpine/ca-certificates@20260909-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MPL-2.0 AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "ca-certificates"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "eb7078df3a16d666e8f7723f94bb92e00d4b9236"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/eb7078df3a16d666e8f7723f94bb92e00d4b9236"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1X8p9+exCokkN6LEF+NRJN+g/4uI="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/ca-certificates-bundle (x86_64)",
+      "version": "20260909-r0",
+      "purl": "pkg:apk/alpine/ca-certificates-bundle@20260909-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MPL-2.0 AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "ca-certificates"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "eb7078df3a16d666e8f7723f94bb92e00d4b9236"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/eb7078df3a16d666e8f7723f94bb92e00d4b9236"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1eRI3zuh3mIiTo1S19snETzXU7bk="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/cryptsetup-libs (x86_64)",
+      "version": "2.8.6-r0",
+      "purl": "pkg:apk/alpine/cryptsetup-libs@2.8.6-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later WITH cryptsetup-OpenSSL-exception"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "cryptsetup"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "d2f0440960e65952ee22c6b840faecb14d9f0173"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/d2f0440960e65952ee22c6b840faecb14d9f0173"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1C4p+QO2QI/vUYg58QzvN24VduYU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/device-mapper-libs (x86_64)",
+      "version": "2.03.35-r3",
+      "purl": "pkg:apk/alpine/device-mapper-libs@2.03.35-r3?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND LGPL-2.1-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "device-mapper"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "a9f462dee63c7d522585e53f5c04b71eab563ec7"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/a9f462dee63c7d522585e53f5c04b71eab563ec7"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1GxP2dFUjS4Fg/n9PGSdz3DBOGEs="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/e2fsprogs (x86_64)",
+      "version": "1.47.4-r0",
+      "purl": "pkg:apk/alpine/e2fsprogs@1.47.4-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "e2fsprogs"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1Z6MrNzc8bi6MpEmTrDMqNBbzxZ8="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/e2fsprogs-extra (x86_64)",
+      "version": "1.47.4-r0",
+      "purl": "pkg:apk/alpine/e2fsprogs-extra@1.47.4-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "e2fsprogs"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1DHT2V/EyESMQ+kIWjVUTlvmqJwQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/e2fsprogs-libs (x86_64)",
+      "version": "1.47.4-r0",
+      "purl": "pkg:apk/alpine/e2fsprogs-libs@1.47.4-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "e2fsprogs"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1fhNGSZRsEW+dt3doIy9Oyc+nwnE="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/git (x86_64)",
+      "version": "2.54.0-r0",
+      "purl": "pkg:apk/alpine/git@2.54.0-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "git"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "b3ed5f8f4ce6b2ef13adeaf7494557add6546bda"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1KlCtqvgihl9rC6XaaIME3EjkW8c="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/git-init-template (noarch)",
+      "version": "2.54.0-r0",
+      "purl": "pkg:apk/alpine/git-init-template@2.54.0-r0?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "git"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "b3ed5f8f4ce6b2ef13adeaf7494557add6546bda"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1Wr3MX1rbvj1gz82ht0ADMBTHI6s="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/ifupdown-ng (x86_64)",
+      "version": "0.13.0-r0",
+      "purl": "pkg:apk/alpine/ifupdown-ng@0.13.0-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "ISC"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "ifupdown-ng"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "2c26ffc5e83fc3bc626f2516235b465e67606bf9"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/2c26ffc5e83fc3bc626f2516235b465e67606bf9"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q10DH2ND1k/RsBcPEwxkixT+KhISU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/json-c (x86_64)",
+      "version": "0.18-r1",
+      "purl": "pkg:apk/alpine/json-c@0.18-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "json-c"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8e0faa63c91abd41feb359ce5fe4299a88a57ef1"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8e0faa63c91abd41feb359ce5fe4299a88a57ef1"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q12w0mSfr4pSQU34qdbkrNtgMDtAM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/kmod (x86_64)",
+      "version": "34.2-r1",
+      "purl": "pkg:apk/alpine/kmod@34.2-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "kmod"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "206e7b39f7884d62a174aba4d33a42454518c1c2"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/206e7b39f7884d62a174aba4d33a42454518c1c2"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q19o7eTAWB4M6r9a2KrwfCrhxt6Wo="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/kmod-libs (x86_64)",
+      "version": "34.2-r1",
+      "purl": "pkg:apk/alpine/kmod-libs@34.2-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "LGPL-2.1-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "kmod"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "206e7b39f7884d62a174aba4d33a42454518c1c2"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/206e7b39f7884d62a174aba4d33a42454518c1c2"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q17D3S9e+3rtDF8L4EKGr7FVQhKdk="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/lddtree (noarch)",
+      "version": "1.27-r0",
+      "purl": "pkg:apk/alpine/lddtree@1.27-r0?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "lddtree"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "007305e7880a70d5c804019aa3da115da732776b"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/007305e7880a70d5c804019aa3da115da732776b"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1qONm4YZ0VaHptpkpN1iMW1HwN3c="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libapk (x86_64)",
+      "version": "3.0.8-r0",
+      "purl": "pkg:apk/alpine/libapk@3.0.8-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "apk-tools"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "4588b452722bd4800efdc6cce4f6e980e02a997f"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/4588b452722bd4800efdc6cce4f6e980e02a997f"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1uTzpVzwdDbPup84yhBrQhXq8SlQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libblkid (x86_64)",
+      "version": "2.42.3-r1",
+      "purl": "pkg:apk/alpine/libblkid@2.42.3-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "LGPL-2.1-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "util-linux"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "d98c55af59055e6ca60fbe36e171546918709965"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/d98c55af59055e6ca60fbe36e171546918709965"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1B0eyM6avTem7+AUq2YfRl/hqcrQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libcap2 (x86_64)",
+      "version": "2.78-r0",
+      "purl": "pkg:apk/alpine/libcap2@2.78-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause OR GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libcap"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "0c35848136c4c16a1b1672cb812efa88fffef1c2"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/0c35848136c4c16a1b1672cb812efa88fffef1c2"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1Vi3y8KkXpS2XsFrXvtM0FK2izUs="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libcom_err (x86_64)",
+      "version": "1.47.4-r0",
+      "purl": "pkg:apk/alpine/libcom_err@1.47.4-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "e2fsprogs"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8683a6972cb245fbbdb535dad6435a9930bb9374"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1S5+1iZ6gscDPuyosWVJwRDfU7O8="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libcrypto3 (x86_64)",
+      "version": "3.5.9-r0",
+      "purl": "pkg:apk/alpine/libcrypto3@3.5.9-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "29b9ec24b1b5b39aeef51fa2a044210e2ec5258e"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1HA3ulzTPIvyXzdGBkTu9cQ5t+wg="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libcurl (x86_64)",
+      "version": "8.22.0-r0",
+      "purl": "pkg:apk/alpine/libcurl@8.22.0-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "curl"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "curl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "ab53c408436ac7199ed5b67bde204aaca73003bd"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/ab53c408436ac7199ed5b67bde204aaca73003bd"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1eBYAa2ryJwq25+hfdK25TBa9xIs="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libeconf (x86_64)",
+      "version": "0.8.3-r0",
+      "purl": "pkg:apk/alpine/libeconf@0.8.3-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libeconf"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "62db33049768522f381410614d59c7d732f72c3a"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/62db33049768522f381410614d59c7d732f72c3a"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1M57ga4q1Zc6sMwKtO44cuhd6S2g="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libedit (x86_64)",
+      "version": "20260508.3.1-r1",
+      "purl": "pkg:apk/alpine/libedit@20260508.3.1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libedit"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "7c805161e588c028cdee3f19f500849fb2c75d42"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/7c805161e588c028cdee3f19f500849fb2c75d42"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1QIT4/46D/hfODJ7D8xNgTWrcdIE="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libexpat (x86_64)",
+      "version": "2.8.5-r0",
+      "purl": "pkg:apk/alpine/libexpat@2.8.5-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "expat"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "41a9605db84bb52cd65c6349e5e087c2c7fe9efb"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/41a9605db84bb52cd65c6349e5e087c2c7fe9efb"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1H6vHuQDzoSWyIP9VB9qmd331BI0="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libidn2 (x86_64)",
+      "version": "2.3.8-r0",
+      "purl": "pkg:apk/alpine/libidn2@2.3.8-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later OR LGPL-3.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libidn2"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "8240e09aa2fdd8f9979b2016be082273965aff0c"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/8240e09aa2fdd8f9979b2016be082273965aff0c"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1WADRTOieFhSPTMwt90I1znrt+AA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libncursesw (x86_64)",
+      "version": "6.6_p20260516-r0",
+      "purl": "pkg:apk/alpine/libncursesw@6.6_p20260516-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "X11"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "ncurses"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "2cee8a7328d061418336ad327b512d96bcd7bc5e"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/2cee8a7328d061418336ad327b512d96bcd7bc5e"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1nzGObjJNaCcnSCkZTPasavut7RI="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libpsl (x86_64)",
+      "version": "0.21.5-r3",
+      "purl": "pkg:apk/alpine/libpsl@0.21.5-r3?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libpsl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "6bd45b53fb316dc01bda59f5feaf1e127eb64f22"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/6bd45b53fb316dc01bda59f5feaf1e127eb64f22"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1pVHd1dbLORPhofR7AvIa4Gi16Qo="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libssl3 (x86_64)",
+      "version": "3.5.9-r0",
+      "purl": "pkg:apk/alpine/libssl3@3.5.9-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "29b9ec24b1b5b39aeef51fa2a044210e2ec5258e"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1IMTJDqnSCp3ToE3q3yxsT2QjNkM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libunistring (x86_64)",
+      "version": "1.4.2-r0",
+      "purl": "pkg:apk/alpine/libunistring@1.4.2-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later OR LGPL-3.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "libunistring"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "30d9f19340385b2cd16eaf1cc6a9a8b30c4afe1c"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/30d9f19340385b2cd16eaf1cc6a9a8b30c4afe1c"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q19QnIAdBw+OqfdADVCTyIj/H+4C4="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/libuuid (x86_64)",
+      "version": "2.42.3-r1",
+      "purl": "pkg:apk/alpine/libuuid@2.42.3-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "util-linux"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "d98c55af59055e6ca60fbe36e171546918709965"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/d98c55af59055e6ca60fbe36e171546918709965"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1jwQe9jetdfOBzAwDTyr7uwMDJk4="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/linux-virt (x86_64)",
+      "version": "6.18.54-r0",
+      "purl": "pkg:apk/alpine/linux-virt@6.18.54-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "linux-lts"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "f8254a6d11c37b153dae6a0fd98ba378dd0d093d"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/f8254a6d11c37b153dae6a0fd98ba378dd0d093d"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q14mOk/Kg+cQ43f/JAtCJs9BAx+sY="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/mdev-conf (noarch)",
+      "version": "4.10-r0",
+      "purl": "pkg:apk/alpine/mdev-conf@4.10-r0?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "mdev-conf"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "203310a84fe34bc9b8dad2c97cba2f5189303415"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/203310a84fe34bc9b8dad2c97cba2f5189303415"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1KLmZv7/kWrWBUERvJrmnJvxXnRk="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/mkinitfs (x86_64)",
+      "version": "3.14.1-r0",
+      "purl": "pkg:apk/alpine/mkinitfs@3.14.1-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "mkinitfs"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "0baaf041a1e43e98a7381cfcaf0895a9204ab3d9"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/0baaf041a1e43e98a7381cfcaf0895a9204ab3d9"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1FSXn2c9DQmwOAywLCKxii9NbU2w="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/musl (x86_64)",
+      "version": "1.2.6-r2",
+      "purl": "pkg:apk/alpine/musl@1.2.6-r2?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "musl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "f5640d3a10f664c9119720c60515265d3d6f6d01"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/f5640d3a10f664c9119720c60515265d3d6f6d01"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1D35YJ+ThpzYxvtont4QxqLokDgU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/musl-utils (x86_64)",
+      "version": "1.2.6-r2",
+      "purl": "pkg:apk/alpine/musl-utils@1.2.6-r2?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT AND BSD-2-Clause AND GPL-2.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "musl"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "f5640d3a10f664c9119720c60515265d3d6f6d01"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/f5640d3a10f664c9119720c60515265d3d6f6d01"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1da2jxI1j7F2HxC/fk0o/3REpjcU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/ncurses-terminfo-base (noarch)",
+      "version": "6.6_p20260516-r0",
+      "purl": "pkg:apk/alpine/ncurses-terminfo-base@6.6_p20260516-r0?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "X11"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "ncurses"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "2cee8a7328d061418336ad327b512d96bcd7bc5e"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/2cee8a7328d061418336ad327b512d96bcd7bc5e"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1nVUdgo6cjuUsWAHB1gRoKOvxV1I="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/nghttp2-libs (x86_64)",
+      "version": "1.69.0-r0",
+      "purl": "pkg:apk/alpine/nghttp2-libs@1.69.0-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "nghttp2"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "2f3038c86a2a055b2becb5a8c4fd86365f77347a"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/2f3038c86a2a055b2becb5a8c4fd86365f77347a"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1UzG4xkH3qQkc4vQ9rSqZhRxPSxI="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openrc (x86_64)",
+      "version": "0.63.2-r0",
+      "purl": "pkg:apk/alpine/openrc@0.63.2-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-2-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openrc"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "30c61338b7a04d3c94509eabba5210b7bf81151a"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/30c61338b7a04d3c94509eabba5210b7bf81151a"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1sbrKI+PLDCITuRsoERGsT/DcUuo="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openrc-user (x86_64)",
+      "version": "0.63.2-r0",
+      "purl": "pkg:apk/alpine/openrc-user@0.63.2-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-2-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openrc"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "30c61338b7a04d3c94509eabba5210b7bf81151a"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/30c61338b7a04d3c94509eabba5210b7bf81151a"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1pNbfg2vFC2aIXpxZNbF/zlSZeG8="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1JwYxmdnWOWWLw1GV9aQcBSqeEkM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-client-common (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-client-common@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1eXWcEeWyZCuCErpVaWiWCLDoLPo="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-client-default (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-client-default@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1KjDLYLofq+mQM3pAX1Me4CQjKMw="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-keygen (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-keygen@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1G2l8Vg+uKMMb149uTw411IhR2XQ="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-server (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-server@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q19dPBY512GGMQMpalZ4nm4wlFT0o="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-server-common (noarch)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-server-common@10.3_p1-r1?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1aX7N80UUYz1dseAplHMUqyjnCCM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-server-common-openrc (noarch)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-server-common-openrc@10.3_p1-r1?arch=noarch",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1l3ifS5tnQYbLxEZowgncCh42UAw="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/openssh-sftp-server (x86_64)",
+      "version": "10.3_p1-r1",
+      "purl": "pkg:apk/alpine/openssh-sftp-server@10.3_p1-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "SSH-OpenSSH"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "openssh"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/da03ee144d27cece40d2a293c83214592415ae91"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1WLJNJreKekCwCwgqrFLCdBrMpeg="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/pcre2 (x86_64)",
+      "version": "10.48-r0",
+      "purl": "pkg:apk/alpine/pcre2@10.48-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "pcre2"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "abc383a51f67922cd61e338b1461cddaa1814b28"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/abc383a51f67922cd61e338b1461cddaa1814b28"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1R8XO5zv/GM4xu1AQQ8Yo8E0q+Uo="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/scanelf (x86_64)",
+      "version": "1.3.9-r1",
+      "purl": "pkg:apk/alpine/scanelf@1.3.9-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "pax-utils"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c61801eeacb3ffcd9c2025b09e402153bb93fb39"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c61801eeacb3ffcd9c2025b09e402153bb93fb39"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1AT+QPQuiGWc6673QT3S7XtgrAfA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/ssl_client (x86_64)",
+      "version": "1.37.0-r31",
+      "purl": "pkg:apk/alpine/ssl_client@1.37.0-r31?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "busybox"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/c3ef5d10e6ef6528852c51f0564963e2f8c1be19"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1wiD0pRJaMTr3M+mN75QTK7Hp1A0="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/sudo (x86_64)",
+      "version": "1.9.17_p2-r1",
+      "purl": "pkg:apk/alpine/sudo@1.9.17_p2-r1?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "custom ISC"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "sudo"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "a854c03acdac188901fb012f7acbee70a36e8041"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/a854c03acdac188901fb012f7acbee70a36e8041"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1FtyGMUdzQT2gFtNfhXK618N+AQU="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/xz-libs (x86_64)",
+      "version": "5.8.4-r0",
+      "purl": "pkg:apk/alpine/xz-libs@5.8.4-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "GPL-2.0-or-later AND 0BSD AND Public-Domain AND LGPL-2.1-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "xz"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "0c088d609f9fe69eedd6b4c7f4b99cdad847c20a"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/0c088d609f9fe69eedd6b4c7f4b99cdad847c20a"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1hQEGWxhighYwF0xmO0WXRGLCluE="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/zlib (x86_64)",
+      "version": "1.3.2-r0",
+      "purl": "pkg:apk/alpine/zlib@1.3.2-r0?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "Zlib"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "zlib"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "f248b33b5943c7dc69bf691031d7612ab2e8ed93"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/f248b33b5943c7dc69bf691031d7612ab2e8ed93"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q13Uw9ECrK7ypxoUlZUdVfq8hoBhM="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "alpine/zstd-libs (x86_64)",
+      "version": "1.5.7-r2",
+      "purl": "pkg:apk/alpine/zstd-libs@1.5.7-r2?arch=x86_64",
+      "licenses": [
+        {
+          "license": {
+            "name": "BSD-3-Clause OR GPL-2.0-or-later"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "sandsurf:distribution-origin",
+          "value": "zstd"
+        },
+        {
+          "name": "sandsurf:distribution-build-commit",
+          "value": "3c6e2ee2b16f403d53eab39c4426eb61f003c322"
+        },
+        {
+          "name": "sandsurf:source-pointer",
+          "value": "https://gitlab.alpinelinux.org/alpine/aports/-/commit/3c6e2ee2b16f403d53eab39c4426eb61f003c322"
+        },
+        {
+          "name": "sandsurf:apk-installed-record-checksum",
+          "value": "Q1lWnOOpfEEJ6OU93enz4b0nJhNUA="
+        },
+        {
+          "name": "sandsurf:machine-image",
+          "value": "28fcec2eddc881cfd4a7b9ec49c4389482c9d528fe791114660000ffeac505e0"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "name": "ambient-authority",
       "version": "0.0.2",
       "licenses": [

@@ -4,7 +4,7 @@ import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependenc
 import { verifyQemuRuntime } from "./qemu-runtime.ts";
 import { QEMU_CORRESPONDING_FILES, QEMU_SOURCE } from "./qemu-source.ts";
 
-export type ComponentLicense = { expression: string } | { license: { id: string } };
+export type ComponentLicense = { expression: string } | { license: { id: string } | { name: string } };
 export interface Component {
   type: string;
   name: string;

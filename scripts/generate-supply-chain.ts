@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { nativeComponents } from "./native-supply-chain.ts";
+import { imageComponents } from "./image-supply-chain.ts";
 import type { Component, ComponentLicense } from "./native-supply-chain.ts";
 import { captureCommand as capture } from "./capture-command.ts";
 import { resolve } from "node:path";
@@ -26,7 +27,8 @@ const nativeRoot = resolve("packages/sandsurf/native");
 const nativeManifest: unknown = JSON.parse(await readFile(resolve(nativeRoot, "manifest.json"), "utf8"));
 if (!isRecord(nativeManifest) || !isRecord(nativeManifest.files)) throw new Error("invalid native manifest");
 const native = await nativeComponents(nativeRoot, nativeManifest.files);
-await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), native);
+const images = await imageComponents(resolve("packages/sandsurf/images"));
+await generate(["sandsurf-host", "sandsurf-guest"], "sandsurf", resolve("packages/sandsurf"), [...native, ...images]);
 
 async function generate(rootNames: readonly string[], npmName: string, destination: string, additional: readonly Component[]): Promise<void> {
   const roots = rootNames.map((rootName) => {
@@ -117,5 +119,5 @@ function requiredString(value: unknown, label: string): string {
 
 function licenseText(license: ComponentLicense | undefined): string {
   if (license === undefined) return "UNKNOWN";
-  return "expression" in license ? license.expression : license.license.id;
+  return "expression" in license ? license.expression : "id" in license.license ? license.license.id : license.license.name;
 }

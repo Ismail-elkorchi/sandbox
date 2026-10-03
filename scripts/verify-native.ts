@@ -5,6 +5,7 @@ import { sha256File } from "../packages/sandsurf/src/file-integrity.ts";
 import { verifyDiskTransport } from "./image-sources.ts";
 import { verifyQemuRuntime } from "./qemu-runtime.ts";
 import { dependencySourceFiles, verifyDependencySources } from "./qemu-dependencies.ts";
+import { imageComponents } from "./image-supply-chain.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 await verifyManifest(resolve(repository, "native/manifest.json"), resolve(repository, "native"));
@@ -15,6 +16,7 @@ await verifyManifest(
 const imagesRoot = resolve(repository, "packages/sandsurf/images");
 const imageIndexPath = resolve(imagesRoot, "manifest.json");
 await verifyManifest(imageIndexPath, imagesRoot);
+await imageComponents(imagesRoot);
 const imageIndex: unknown = JSON.parse(await readFile(imageIndexPath, "utf8"));
 if (!isRecord(imageIndex) || !isRecord(imageIndex.files)) throw new Error("VM image index has an invalid shape");
 for (const entry of await readdir(imagesRoot, { withFileTypes: true })) {
@@ -33,11 +35,11 @@ for (const relative of Object.keys(imageIndex.files).sort()) {
       !isRecord(imageManifest.bootBundle) || !isRecord(imageManifest.bootBundle.kernel) ||
       !isRecord(imageManifest.system) ||
       !isRecord(imageManifest.system.rootfs) ||
-      !isRecord(imageManifest.system.provenance) || imageManifest.system.provenance.kind !== "source-built" ||
+      !isRecord(imageManifest.system.provenance) || imageManifest.system.provenance.kind !== "assembled" ||
       !isRecord(imageManifest.system.provenance.materials)) {
     throw new Error(`${architecture} VM image manifest has an invalid shape`);
   }
-  for (const material of ["alpine-minirootfs", "alpine-offline-packages", "alpine-package-lock", "sandsurf-system-recipe", "sandsurf-appliance-recipe", "sandsurf-management"]) {
+  for (const material of ["alpine-minirootfs", "alpine-offline-packages", "alpine-package-lock", "alpine-installed-database", "sandsurf-system-recipe", "sandsurf-appliance-recipe", "sandsurf-management"]) {
     if (!validDigest(imageManifest.system.provenance.materials[material])) {
       throw new Error(`${architecture} VM image is missing ${material} provenance`);
     }
