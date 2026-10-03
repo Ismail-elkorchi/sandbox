@@ -133,9 +133,19 @@ static int experiment(const wchar_t *binary) {
     sid_size = sizeof(private_net);
     require(CreateWellKnownSid(WinCapabilityPrivateNetworkClientServerSid, NULL,
                               private_net, &sid_size), "private capability");
-    SID_AND_ATTRIBUTES capabilities[2] = {
-        {internet, SE_GROUP_ENABLED}, {private_net, SE_GROUP_ENABLED}};
-    SECURITY_CAPABILITIES security = {sid, capabilities, 2, 0};
+    typedef BOOL (WINAPI *DeriveCapability)(LPCWSTR, PSID **, DWORD *, PSID **, DWORD *);
+    FARPROC address_derive = GetProcAddress(kernelbase, "DeriveCapabilitySidsFromName");
+    DeriveCapability derive_capability = NULL;
+    memcpy(&derive_capability, &address_derive, sizeof(derive_capability));
+    PSID *groups = NULL, *registry = NULL;
+    DWORD group_count = 0, registry_count = 0;
+    require(derive_capability != NULL && derive_capability(L"registryRead",
+                &groups, &group_count, &registry, &registry_count) && registry_count == 1,
+            "read-only OS catalog capability");
+    SID_AND_ATTRIBUTES capabilities[3] = {
+        {internet, SE_GROUP_ENABLED}, {private_net, SE_GROUP_ENABLED},
+        {registry[0], SE_GROUP_ENABLED}};
+    SECURITY_CAPABILITIES security = {sid, capabilities, 3, 0};
     SIZE_T attribute_bytes = 0;
     InitializeProcThreadAttributeList(NULL, 3, 0, &attribute_bytes);
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = malloc(attribute_bytes);
@@ -216,6 +226,10 @@ static int experiment(const wchar_t *binary) {
     CloseHandle(read_pipe);
     DeleteProcThreadAttributeList(attributes);
     free(attributes);
+    for (DWORD slot = 0; slot < group_count; ++slot) LocalFree(groups[slot]);
+    for (DWORD slot = 0; slot < registry_count; ++slot) LocalFree(registry[slot]);
+    LocalFree(groups);
+    LocalFree(registry);
     require(SUCCEEDED(unregister_sid(sid)), "native identity retirement");
     FreeSid(sid);
     require(DeleteFileW(executable), "fixture binary cleanup");
@@ -268,7 +282,9 @@ static int experiment(const wchar_t *binary) {
 }
 int main(int argc, char **argv) {
     WSADATA data;
-    require(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock initialization");
+    int startup = WSAStartup(MAKEWORD(2, 2), &data);
+    if (startup != 0) fprintf(stderr, "Winsock startup returned %d\n", startup);
+    require(startup == 0, "Winsock initialization");
     if (argc == 3 && strcmp(argv[1], "child") == 0) {
         child((DWORD)strtoul(argv[2], NULL, 10));
         return 0;
