@@ -114,7 +114,7 @@ static void alias(int add) {
     /* This executable runs only on a disposable elevated CI host. The caller
      * removes exactly the fixture address even when the experiment fails. */
     const char *command = add
-        ? "powershell.exe -NoProfile -NonInteractive -Command \"New-NetIPAddress -InterfaceIndex 1 -IPAddress 198.18.0.9 -PrefixLength 32 -AddressFamily IPv4 -ErrorAction Stop | Out-Null\""
+        ? "powershell.exe -NoProfile -NonInteractive -Command \"New-NetIPAddress -InterfaceIndex 1 -IPAddress 198.18.0.9 -PrefixLength 32 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null\""
         : "powershell.exe -NoProfile -NonInteractive -Command \"Remove-NetIPAddress -InterfaceIndex 1 -IPAddress 198.18.0.9 -Confirm:$false -ErrorAction Stop\"";
     require(system(command) == 0, add ? "fixture address acquisition" :
                                      "fixture address removal");

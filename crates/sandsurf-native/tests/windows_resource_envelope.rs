@@ -231,7 +231,20 @@ fn kernel_limits_precede_execution_and_native_exit_259_is_not_running() {
     assert!(live.process_creation_time.unwrap() > 0);
     assert_eq!(worker.wait_for(Duration::from_secs(15)).unwrap(), Some(0));
     let elapsed = start.elapsed().as_micros() as u64;
-    let usage = worker.usage().unwrap();
+    // Native process exit and aggregate Job accounting are distinct kernel
+    // observations. Keep querying this original Job until its counter settles.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let usage = loop {
+        let usage = worker.usage().unwrap();
+        if usage.active_processes == 0 {
+            break usage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original Job never observed exit: {usage:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(usage.cpu_micros > 100000, "CPU fixture did not run");
     assert!(
         usage.cpu_micros <= elapsed / 4 + 350000,

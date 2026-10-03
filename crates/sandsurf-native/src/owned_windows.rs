@@ -251,9 +251,6 @@ impl OwnedWorker {
                 .ok_or_else(|| invalid("worker has no directory"))?
                 .as_os_str(),
         )?;
-        // Preserve only the OS's native SystemRoot, not loader-influencing
-        // caller variables or an inherited PATH, TEMP, HOME or credentials.
-        let environment = environment()?;
         let factory = matches!(&role, LaunchRole::Factory);
         let break_away = !matches!(&role, LaunchRole::Standalone);
         let job = if factory {
@@ -276,6 +273,10 @@ impl OwnedWorker {
         } else {
             None
         };
+        // The OS needs LOCALAPPDATA for a registered AppContainer identity.
+        // All scratch paths refer to its original bounded device scope; no
+        // caller profile, loader variables, PATH or credentials are inherited.
+        let environment = environment(isolation.as_ref().map(|value| value.namespace()))?;
         let mut inherited = if files.is_empty() {
             None
         } else {
@@ -479,6 +480,7 @@ struct InheritedCustody {
     initialized: bool,
     _isolation: Option<Arc<crate::windows_vmm::Isolation>>,
     capabilities: Option<Box<windows_sys::Win32::Security::SECURITY_CAPABILITIES>>,
+    _capability: Option<Box<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>>,
     lpac_policy: Box<u32>,
 }
 
@@ -534,14 +536,18 @@ impl InheritedCustody {
         {
             return Err(io::Error::other("invalid native handle-list allocation"));
         }
+        let mut capability = isolation.as_ref().map(|scope| Box::new(scope.capability()));
+        let capabilities = isolation
+            .as_ref()
+            .zip(capability.as_mut())
+            .map(|(scope, capability)| Box::new(scope.capabilities(capability)));
         let mut value = Self {
             list: vec![0; bytes.div_ceil(size_of::<usize>())],
             handles,
             raw_handles,
             initialized: false,
-            capabilities: isolation
-                .as_ref()
-                .map(|scope| Box::new(scope.capabilities())),
+            capabilities,
+            _capability: capability,
             _isolation: isolation,
             lpac_policy: Box::new(1), // PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT
         };
@@ -629,7 +635,7 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn environment() -> io::Result<Vec<u16>> {
+fn environment(namespace: Option<crate::socket_io::SocketNamespace>) -> io::Result<Vec<u16>> {
     let mut root = [0u16; 4096];
     // SAFETY: exact initialized UTF-16 output capacity; no caller path input.
     let bytes = unsafe { GetWindowsDirectoryW(root.as_mut_ptr(), root.len() as u32) };
@@ -638,6 +644,15 @@ fn environment() -> io::Result<Vec<u16>> {
     }
     let mut environment: Vec<u16> = "SystemRoot=".encode_utf16().collect();
     environment.extend_from_slice(&root[..bytes as usize]);
-    environment.extend_from_slice(&[0, 0]);
+    environment.push(0);
+    if let Some(namespace) = namespace {
+        namespace.check()?;
+        let scratch = wide(namespace.path().as_os_str())?;
+        for name in ["LOCALAPPDATA=", "TEMP=", "TMP="] {
+            environment.extend(name.encode_utf16());
+            environment.extend_from_slice(&scratch);
+        }
+    }
+    environment.push(0);
     Ok(environment)
 }

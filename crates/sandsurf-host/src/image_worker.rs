@@ -774,7 +774,7 @@ fn prepare_machine(
         },
     )?;
     let disk_custody = crate::storage::attach(&disk)?;
-    crate::storage::reclaim_boot_inputs(&machine_root, &boot_directory, &disk_custody)?;
+    crate::storage::reclaim_detached_inputs(&machine_root, &boot_directory, &disk_custody)?;
     crate::storage::freeze_boot(
         executor,
         vec![disk_custody, image_custody],

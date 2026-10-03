@@ -1237,7 +1237,7 @@ fn validate_acl(file: &File, protected: bool) -> io::Result<()> {
 fn validate_acl_for(
     file: &File,
     protected: bool,
-    scope: Option<(&crate::windows_vmm::AppSid, ScopeAccess)>,
+    scope: Option<(&crate::windows_vmm::Sid, ScopeAccess)>,
 ) -> io::Result<()> {
     let user = UserToken::current()?;
     let mut owner: PSID = null_mut();
@@ -1351,7 +1351,7 @@ impl ScopeAccess {
     }
     fn descriptor(
         self,
-        sid: &crate::windows_vmm::AppSid,
+        sid: &crate::windows_vmm::Sid,
         directory: bool,
     ) -> io::Result<SecurityDescriptor> {
         let owner = UserToken::current()?.sid_string()?;
@@ -1373,13 +1373,13 @@ pub(crate) struct ScopedDirectory {
     path: PathBuf,
     held: File,
     identity: FileIdentity,
-    sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+    sid: std::sync::Arc<crate::windows_vmm::Sid>,
     access: ScopeAccess,
 }
 impl ScopedDirectory {
     pub(crate) fn create(
         path: &Path,
-        sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+        sid: std::sync::Arc<crate::windows_vmm::Sid>,
         access: ScopeAccess,
     ) -> io::Result<Self> {
         let descriptor = access.descriptor(&sid, true)?;
@@ -1394,7 +1394,7 @@ impl ScopedDirectory {
 
     pub(crate) fn open(
         path: &Path,
-        sid: std::sync::Arc<crate::windows_vmm::AppSid>,
+        sid: std::sync::Arc<crate::windows_vmm::Sid>,
         access: ScopeAccess,
     ) -> io::Result<Self> {
         let held = open_directory(path)?;

@@ -11,18 +11,21 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
 use windows_sys::Win32::Security::{
     CopySid, EqualSid, FreeSid, GetLengthSid, GetTokenInformation, PSID, SECURITY_CAPABILITIES,
-    TOKEN_APPCONTAINER_INFORMATION, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenAppContainerSid,
-    TokenCapabilities, TokenIsAppContainer, TokenIsLessPrivilegedAppContainer,
+    SID_AND_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+    TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenIsAppContainer,
+    TokenIsLessPrivilegedAppContainer,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 
-pub(crate) struct AppSid(Vec<usize>);
-impl AppSid {
+pub(crate) struct Sid(Vec<usize>);
+impl Sid {
     fn derive(name: &str) -> io::Result<Self> {
         let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let mut original = std::ptr::null_mut();
@@ -36,23 +39,25 @@ impl AppSid {
         if original.is_null() {
             return Err(invalid("native AppContainer SID is absent"));
         }
-        // SAFETY: successful derivation returned a valid newly allocated SID.
-        let bytes = unsafe { GetLengthSid(original) };
-        if !(8..=68).contains(&bytes) {
-            // SAFETY: the derivation returned this newly allocated SID.
-            unsafe { FreeSid(original) };
-            return Err(invalid("native AppContainer SID exceeds bound"));
-        }
-        let mut value = Self(vec![0; (bytes as usize).div_ceil(size_of::<usize>())]);
-        // SAFETY: bounded aligned destination and the retained original SID.
-        let copied = unsafe { CopySid(bytes, value.raw(), original) } != 0;
+        let value = Self::copy(original);
         // SAFETY: the original allocation came from AppContainer SID derivation.
         unsafe { FreeSid(original) };
-        if !copied {
-            return Err(invalid("native AppContainer SID exceeds bound"));
+        value
+    }
+    fn copy(original: PSID) -> io::Result<Self> {
+        if original.is_null() {
+            return Err(invalid("native SID is absent"));
         }
-        // Vec's allocation, not its owner, is used by launch attributes.
-        value.0.shrink_to_fit();
+        // SAFETY: caller retains a successful native SID allocation.
+        let bytes = unsafe { GetLengthSid(original) };
+        if !(8..=68).contains(&bytes) {
+            return Err(invalid("native SID exceeds bound"));
+        }
+        let value = Self(vec![0; (bytes as usize).div_ceil(size_of::<usize>())]);
+        // SAFETY: bounded aligned destination and retained native SID.
+        if unsafe { CopySid(bytes, value.raw(), original) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(value)
     }
     pub(crate) fn raw(&self) -> PSID {
@@ -63,10 +68,170 @@ impl AppSid {
     }
 }
 
+// SAFETY: these fixed native signatures are called only with retained SIDs and
+// terminated strings; ownership of returned buffers follows the OS API.
+type RegisterSid = unsafe extern "system" fn(PSID, *const u16, *const u16) -> i32;
+type LookupMoniker = unsafe extern "system" fn(PSID, *mut *mut u16) -> i32;
+type UnregisterSid = unsafe extern "system" fn(PSID) -> i32;
+// SAFETY: only AppContainerLookupMoniker allocations are released by this API.
+type FreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
+// SAFETY: the capability API supplies native allocations to writable outputs.
+type DeriveCapability = unsafe extern "system" fn(
+    *const u16,
+    *mut *mut PSID,
+    *mut u32,
+    *mut *mut PSID,
+    *mut u32,
+) -> i32;
+// SAFETY: GetProcAddress returns this native function representation; it is
+// never called untyped and is converted only to the mandatory exact signatures.
+type OsFunction = unsafe extern "system" fn() -> isize;
+
+/// Registration owns only the OS object-namespace identity. Creating a profile
+/// would also authorize a writable home outside the bounded machine volume.
+struct NativeRegistry {
+    register: RegisterSid,
+    lookup: LookupMoniker,
+    unregister: UnregisterSid,
+    free: FreeMemory,
+    derive_capability: DeriveCapability,
+}
+impl NativeRegistry {
+    fn open() -> io::Result<Self> {
+        let name: Vec<u16> = "kernelbase.dll".encode_utf16().chain([0]).collect();
+        // SAFETY: the fixed OS module is already loaded; no caller search path.
+        let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let export = |name: &[u8]| {
+            // SAFETY: fixed NUL-terminated names from the original OS module.
+            unsafe { GetProcAddress(module, name.as_ptr()) }.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "required native AppContainer API is absent",
+                )
+            })
+        };
+        let register = export(b"AppContainerRegisterSid\0")?;
+        let lookup = export(b"AppContainerLookupMoniker\0")?;
+        let unregister = export(b"AppContainerUnregisterSid\0")?;
+        let free = export(b"AppContainerFreeMemory\0")?;
+        let derive_capability = export(b"DeriveCapabilitySidsFromName\0")?;
+        // SAFETY: these mandatory KernelBase exports have the exact native
+        // signatures above. Absence is unsupported, never a weaker launch.
+        Ok(unsafe {
+            Self {
+                register: std::mem::transmute::<OsFunction, RegisterSid>(register),
+                lookup: std::mem::transmute::<OsFunction, LookupMoniker>(lookup),
+                unregister: std::mem::transmute::<OsFunction, UnregisterSid>(unregister),
+                free: std::mem::transmute::<OsFunction, FreeMemory>(free),
+                derive_capability: std::mem::transmute::<OsFunction, DeriveCapability>(
+                    derive_capability,
+                ),
+            }
+        })
+    }
+    fn moniker(&self, sid: &Sid) -> io::Result<Option<String>> {
+        let mut text = std::ptr::null_mut();
+        // SAFETY: retained SID and writable output, released by this API below.
+        let result = unsafe { (self.lookup)(sid.raw(), &mut text) };
+        if matches!(result as u32, 0x80070002 | 0x80070490) {
+            return Ok(None);
+        }
+        if result < 0 || text.is_null() {
+            return Err(invalid("native identity lookup failed"));
+        }
+        let value = (|| {
+            let mut value = Vec::new();
+            for index in 0..=64 {
+                // SAFETY: successful lookup returns a terminated native string.
+                let unit = unsafe { *text.add(index) };
+                if unit == 0 {
+                    return String::from_utf16(&value)
+                        .map(Some)
+                        .map_err(|_| invalid("native moniker is not UTF-16"));
+                }
+                value.push(unit);
+            }
+            Err(invalid("native moniker exceeds bound"))
+        })();
+        // SAFETY: successful native lookup returned this owned allocation.
+        unsafe { (self.free)(text.cast()) };
+        value
+    }
+    fn register(&self, sid: &Sid, name: &str) -> io::Result<()> {
+        if self.moniker(sid)?.is_some() {
+            return Err(invalid("native identity already registered"));
+        }
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: retained SID and fixed original terminated scope name.
+        if unsafe { (self.register)(sid.raw(), name.as_ptr(), name.as_ptr()) } < 0 {
+            return Err(invalid("native identity registration failed"));
+        }
+        Ok(())
+    }
+    fn retire(&self, sid: &Sid, name: &str) -> io::Result<()> {
+        match self.moniker(sid)? {
+            None => Ok(()), // Interrupted creation before registration.
+            Some(actual) if actual == name => {
+                // SAFETY: exclusive original scope custody and exact moniker.
+                if unsafe { (self.unregister)(sid.raw()) } < 0 {
+                    return Err(invalid("native identity retirement failed"));
+                }
+                Ok(())
+            }
+            Some(_) => Err(invalid("native identity belongs to another scope")),
+        }
+    }
+    fn registry_read(&self) -> io::Result<Sid> {
+        let name: Vec<u16> = "registryRead".encode_utf16().chain([0]).collect();
+        let mut groups = std::ptr::null_mut();
+        let mut capabilities = std::ptr::null_mut();
+        let mut group_count = 0;
+        let mut count = 0;
+        // SAFETY: fixed capability name and writable native allocation outputs.
+        if unsafe {
+            (self.derive_capability)(
+                name.as_ptr(),
+                &mut groups,
+                &mut group_count,
+                &mut capabilities,
+                &mut count,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let result = if count == 1 && !capabilities.is_null() {
+            // SAFETY: successful API supplies exactly one capability allocation.
+            Sid::copy(unsafe { *capabilities })
+        } else {
+            Err(invalid("OS catalog capability is not singular"))
+        };
+        for (array, count) in [(groups, group_count), (capabilities, count)] {
+            if !array.is_null() {
+                for index in 0..count {
+                    // SAFETY: native successful output owns each array entry.
+                    unsafe {
+                        LocalFree(*array.add(index as usize));
+                    }
+                }
+                // SAFETY: native output array is independently LocalAlloc-owned.
+                unsafe {
+                    LocalFree(array.cast());
+                }
+            }
+        }
+        result
+    }
+}
+
 /// This original scope is created before the process and can launch exactly
 /// once. Inputs are immutable independent copies, never ACL changes to stores.
 pub struct Isolation {
-    sid: Arc<AppSid>,
+    sid: Arc<Sid>,
+    registry_read: Sid,
     root: Option<Directory>,
     directories: Vec<ScopedDirectory>,
     inputs: Vec<File>,
@@ -102,7 +267,8 @@ impl Isolation {
         crate::local::create_private_directory(&path)?;
         let root = Directory::open(&path)?;
         let lease = Arc::new(crate::storage::disk_lease(&root.path().join(".owner"))?);
-        let sid = Arc::new(AppSid::derive(&name)?);
+        let sid = Arc::new(Sid::derive(&name)?);
+        let native_registry = NativeRegistry::open()?;
         let input_directory = ScopedDirectory::create(
             &root.path().join("r"),
             sid.clone(),
@@ -133,6 +299,7 @@ impl Isolation {
         let firmware = firmware_directory.path().to_owned();
         let mut value = Self {
             sid,
+            registry_read: native_registry.registry_read()?,
             root: Some(root),
             directories: vec![input_directory, firmware_directory],
             inputs: Vec::new(),
@@ -145,6 +312,7 @@ impl Isolation {
             launched: AtomicBool::new(false),
             exited: AtomicBool::new(false),
         };
+        native_registry.register(&value.sid, &name)?;
         if runtime.is_empty()
             || runtime.len() > 128
             || !["sandsurf-qemu-x64.exe", "sandsurf-qemu-arm64.exe"].contains(&executable_name)
@@ -260,11 +428,20 @@ impl Isolation {
     pub fn custody(&self) -> Arc<File> {
         self.lease.as_ref().expect("live native scope").clone()
     }
-    pub(crate) fn capabilities(&self) -> SECURITY_CAPABILITIES {
+    pub(crate) fn capability(&self) -> SID_AND_ATTRIBUTES {
+        SID_AND_ATTRIBUTES {
+            Sid: self.registry_read.raw(),
+            Attributes: SE_GROUP_ENABLED as u32,
+        }
+    }
+    pub(crate) fn capabilities(
+        &self,
+        capability: &mut SID_AND_ATTRIBUTES,
+    ) -> SECURITY_CAPABILITIES {
         SECURITY_CAPABILITIES {
             AppContainerSid: self.sid.raw(),
-            Capabilities: std::ptr::null_mut(),
-            CapabilityCount: 0,
+            Capabilities: capability,
+            CapabilityCount: 1,
             Reserved: 0,
         }
     }
@@ -314,12 +491,17 @@ impl Isolation {
                 return Err(invalid("native process belongs to a different scope"));
             }
             let groups = token_info(token, TokenCapabilities)?;
-            if groups.len() * size_of::<usize>() < size_of::<u32>() {
+            if groups.len() * size_of::<usize>() < size_of::<TOKEN_GROUPS>() {
                 return Err(invalid("native capabilities are truncated"));
             }
-            // TokenCapabilities can contain only its count and no group array.
-            // Do not create a reference to an absent TOKEN_GROUPS tail.
-            if groups[0] as u32 != 0 {
+            // SAFETY: aligned retained output contains the fixed header and
+            // one initialized SID_AND_ATTRIBUTES; count is checked before SID.
+            let groups = unsafe { &*groups.as_ptr().cast::<TOKEN_GROUPS>() };
+            if groups.GroupCount != 1 || groups.Groups[0].Attributes != SE_GROUP_ENABLED as u32
+                || groups.Groups[0].Sid.is_null()
+                // SAFETY: both capability SIDs remain retained here.
+                || unsafe { EqualSid(groups.Groups[0].Sid, self.registry_read.raw()) } == 0
+            {
                 return Err(invalid("native process acquired ambient capabilities"));
             }
             Ok(())
@@ -494,7 +676,7 @@ fn reclaim_scope(root: Directory, lease: File) -> io::Result<()> {
         .and_then(|name| name.to_str())
         .filter(|name| scope_name(name))
         .ok_or_else(|| invalid("native scope name is not canonical"))?;
-    let sid = Arc::new(AppSid::derive(name)?);
+    let sid = Arc::new(Sid::derive(name)?);
     let root_entries = entries(root.path(), 3)?;
     if root_entries
         .iter()
@@ -606,6 +788,7 @@ fn reclaim_scope(root: Directory, lease: File) -> io::Result<()> {
     // Validate the entire closure before unlinking any bytes. File leases fence
     // substitutions; unknown roles, aliases and foreign ACLs remain untouched.
     root.check()?;
+    NativeRegistry::open()?.retire(&sid, name)?;
     let paths: Vec<_> = files.iter().map(|(path, _)| path.clone()).collect();
     drop(files);
     for path in paths.into_iter().chain(sockets) {

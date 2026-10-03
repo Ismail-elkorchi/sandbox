@@ -399,11 +399,11 @@ pub(crate) fn attach(disk: &Path) -> io::Result<std::sync::Arc<std::fs::File>> {
     Ok(std::sync::Arc::new(lease))
 }
 
-/// Reclaim superseded boot inputs only while the caller owns the original
+/// Reclaim detached native work and superseded boot inputs only while the caller owns the original
 /// exclusive disk description. Snapshots contain independent boot copies;
 /// output archives and runtime observations are not part of this namespace.
 /// This is offline worker work, never a guardian control-path directory scan.
-pub(crate) fn reclaim_boot_inputs(
+pub(crate) fn reclaim_detached_inputs(
     machine_root: &Path,
     selected: &Path,
     custody: &fs::File,
@@ -420,6 +420,9 @@ pub(crate) fn reclaim_boot_inputs(
     }
     let mut files = Vec::new();
     let mut directories = Vec::new();
+    let mut children = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut remaining = 16384;
     for (index, entry) in fs::read_dir(held.path())?.take(4097).enumerate() {
         if index == 4096 {
             return Err(invalid("guardian boot inventory exceeds bound"));
@@ -460,24 +463,123 @@ pub(crate) fn reclaim_boot_inputs(
                 if file.metadata()?.len() > maximum {
                     return Err(invalid("detached boot input exceeds bound"));
                 }
+                children.push(artifact.path());
             }
             directories.push(directory);
+        } else {
+            #[cfg(target_os = "linux")]
+            if generation_object(name, "vm-", "") {
+                detached_linux_work(&path, &mut children, &mut directories, &mut remaining)?;
+            }
+        }
+        if directories.len() > 256 {
+            return Err(invalid("detached directory custody exceeds bound"));
         }
     }
     // Validate the complete bounded closure before removing any bytes. The
     // original slot description remains held through every unlink and fsync.
     held.check()?;
-    for path in files {
+    for directory in &directories {
+        directory.check()?;
+    }
+    for path in files.into_iter().chain(children) {
         fs::remove_file(path)?;
     }
+    // Exact inventoried children only. Neither this closure nor interrupted
+    // native work can justify recursively deleting unknown retained bytes.
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.path().components().count()));
     for directory in directories {
         directory.check()?;
         let path = directory.path().to_owned();
         // Windows directory custody denies replacement/deletion until close.
         drop(directory);
-        fs::remove_dir_all(path)?;
+        fs::remove_dir(path)?;
     }
     sync_directory(held.path())
+}
+
+/// Firecracker's discarded engine copies and IPC live below a generation's
+/// private vm-state directory. Original disk custody proves every writer has
+/// detached. No PID, guest health or lost native channel participates here.
+#[cfg(target_os = "linux")]
+fn detached_linux_work(
+    path: &Path,
+    files: &mut Vec<PathBuf>,
+    directories: &mut Vec<sandsurf_native::local::Directory>,
+    remaining: &mut usize,
+) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    let root = sandsurf_native::local::Directory::open(path)?;
+    let mut state = None;
+    for entry in fs::read_dir(root.path())?.take(2) {
+        let entry = entry?;
+        if entry.file_name() != "vm-state" || state.is_some() {
+            return Err(invalid("detached VM contains an unowned role; preserved"));
+        }
+        state = Some(sandsurf_native::local::Directory::open(&entry.path())?);
+    }
+    if let Some(state) = state {
+        for entry in fs::read_dir(state.path())? {
+            *remaining = remaining
+                .checked_sub(1)
+                .ok_or_else(|| invalid("detached native inventory exceeds bound"))?;
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| invalid("detached VM role is not canonical"))?;
+            let snapshot_role = |suffix: &str| {
+                name.strip_prefix("snapshot-")
+                    .and_then(|name| name.strip_suffix(suffix))
+                    .is_some_and(|identity| {
+                        !identity.is_empty()
+                            && identity.len() <= 128
+                            && identity
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                    })
+            };
+            let maximum = if name == "vmm.log" {
+                Some(8 * 1024 * 1024)
+            } else if snapshot_role(".vmstate") {
+                Some(1024 * 1024 * 1024)
+            } else if snapshot_role(".memory") {
+                Some(65536 * 1024 * 1024_u64)
+            } else {
+                None
+            };
+            // O_PATH observes sockets/FIFOs without blocking or consuming
+            // bytes, and O_NOFOLLOW makes a substituted symlink explicit.
+            let original = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(entry.path())?;
+            let metadata = original.metadata()?;
+            let uid = fs::symlink_metadata(root.path())?.uid();
+            if metadata.uid() != uid || metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
+                return Err(invalid(
+                    "detached VM object is not private original custody",
+                ));
+            }
+            let expected = match maximum {
+                Some(maximum) => metadata.is_file() && metadata.len() <= maximum,
+                None if matches!(name, "firecracker.socket" | "guest.vsock") => {
+                    metadata.file_type().is_socket()
+                }
+                None if name == "native-metrics.fifo" => metadata.file_type().is_fifo(),
+                None => false,
+            };
+            if !expected {
+                return Err(invalid(
+                    "detached VM contains an unowned or oversized object; preserved",
+                ));
+            }
+            files.push(entry.path());
+        }
+        directories.push(state);
+    }
+    directories.push(root);
+    Ok(())
 }
 
 fn generation_object(name: &str, prefix: &str, suffix: &str) -> bool {
@@ -821,6 +923,132 @@ mod tests {
     struct Fixture(std::path::PathBuf);
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn detached_native_work_reclaims_only_closed_roles_and_preserves_snapshot_and_output_originals()
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::net::UnixListener;
+        let fixture = Fixture::new();
+        let machine = sandsurf_native::local::canonical_private_directory(&fixture.0).unwrap();
+        for name in ["disks", "guardian", "snapshots", "output"] {
+            create_private_directory(&machine.join(name)).unwrap();
+        }
+        let guardian = machine.join("guardian");
+        let selected = guardian.join(format!("boot-2-{}", "a".repeat(64)));
+        let work = guardian.join(format!("vm-1-{}", "b".repeat(64)));
+        create_private_directory(&work).unwrap();
+        let state = work.join("vm-state");
+        create_private_directory(&state).unwrap();
+        for (name, value) in [
+            ("snapshot-op.memory", b"copied memory".as_slice()),
+            ("snapshot-op.vmstate", b"copied native state".as_slice()),
+            ("vmm.log", b"bounded diagnostic".as_slice()),
+        ] {
+            create_private_file(&state.join(name))
+                .unwrap()
+                .write_all(value)
+                .unwrap();
+        }
+        let socket = state.join("firecracker.socket");
+        let socket_directory = fs::File::open(&state).unwrap();
+        let listener = UnixListener::bind(format!(
+            "/proc/self/fd/{}/firecracker.socket",
+            socket_directory.as_raw_fd()
+        ))
+        .unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        drop(socket_directory);
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "0600"])
+                .arg(state.join("native-metrics.fifo"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        for path in [
+            machine.join("snapshots/original"),
+            machine.join("output/original"),
+        ] {
+            create_private_file(&path)
+                .unwrap()
+                .write_all(b"retained originals")
+                .unwrap();
+        }
+        let custody =
+            sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
+                .unwrap();
+        let wrong = sandsurf_native::storage::disk_lease(&machine.join("other.lock")).unwrap();
+        assert!(reclaim_detached_inputs(&machine, &selected, &wrong).is_err());
+        assert!(state.join("snapshot-op.memory").exists());
+        let unknown = state.join("receipt.json");
+        create_private_file(&unknown)
+            .unwrap()
+            .write_all(b"unowned evidence")
+            .unwrap();
+        assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
+        assert_eq!(
+            fs::read(state.join("snapshot-op.memory")).unwrap(),
+            b"copied memory"
+        );
+        assert_eq!(fs::read(&unknown).unwrap(), b"unowned evidence");
+        fs::remove_file(&unknown).unwrap();
+        let alias = state.join("guest.vsock");
+        symlink(machine.join("output/original"), &alias).unwrap();
+        assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(alias).unwrap();
+        reclaim_detached_inputs(&machine, &selected, &custody).unwrap();
+        assert!(!work.exists());
+        reclaim_detached_inputs(&machine, &selected, &custody).unwrap();
+        for path in [
+            machine.join("snapshots/original"),
+            machine.join("output/original"),
+        ] {
+            assert_eq!(fs::read(path).unwrap(), b"retained originals");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interrupted_native_work_does_not_require_a_live_handle_and_oversized_roles_remain_intact() {
+        let fixture = Fixture::new();
+        let machine = sandsurf_native::local::canonical_private_directory(&fixture.0).unwrap();
+        for name in ["disks", "guardian"] {
+            create_private_directory(&machine.join(name)).unwrap();
+        }
+        let guardian = machine.join("guardian");
+        let selected = guardian.join(format!("boot-2-{}", "a".repeat(64)));
+        let empty = guardian.join(format!("vm-1-{}", "b".repeat(64)));
+        let work = guardian.join(format!("vm-1-{}", "c".repeat(64)));
+        let foreign = guardian.join(format!("vm-01-{}", "d".repeat(64)));
+        for path in [&empty, &work, &foreign] {
+            create_private_directory(path).unwrap();
+        }
+        let state = work.join("vm-state");
+        create_private_directory(&state).unwrap();
+        let log = state.join("vmm.log");
+        let file = create_private_file(&log).unwrap();
+        file.set_len(8 * 1024 * 1024 + 1).unwrap();
+        let custody =
+            sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
+                .unwrap();
+        assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
+        assert!(empty.exists() && work.exists() && foreign.exists());
+        file.set_len(0).unwrap();
+        drop(file);
+        reclaim_detached_inputs(&machine, &selected, &custody).unwrap();
+        assert!(!empty.exists() && !work.exists() && foreign.exists());
+    }
+
+    #[test]
     fn detached_boot_reclamation_is_bounded_preserves_selection_and_never_touches_history() {
         let fixture = Fixture::new();
         let machine = sandsurf_native::local::canonical_private_directory(&fixture.0).unwrap();
@@ -857,20 +1085,20 @@ mod tests {
             sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
                 .unwrap();
         let wrong = sandsurf_native::storage::disk_lease(&machine.join("other.lock")).unwrap();
-        assert!(reclaim_boot_inputs(&machine, &selected, &wrong).is_err());
+        assert!(reclaim_detached_inputs(&machine, &selected, &wrong).is_err());
         assert!(old.exists() && auth.exists());
         let foreign = old.join("foreign");
         create_private_file(&foreign)
             .unwrap()
             .write_all(b"not ours")
             .unwrap();
-        assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+        assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
         assert!(
             old.exists() && auth.exists() && incomplete.exists(),
             "inventory validation must precede all removals"
         );
         fs::remove_file(foreign).unwrap();
-        reclaim_boot_inputs(&machine, &selected, &custody).unwrap();
+        reclaim_detached_inputs(&machine, &selected, &custody).unwrap();
         assert!(!old.exists() && !auth.exists() && !incomplete.exists());
         assert_eq!(fs::read(selected.join("kernel")).unwrap(), b"frozen kernel");
         for path in [
@@ -880,7 +1108,7 @@ mod tests {
         ] {
             assert_eq!(fs::read(path).unwrap(), b"retained");
         }
-        reclaim_boot_inputs(&machine, &selected, &custody).unwrap();
+        reclaim_detached_inputs(&machine, &selected, &custody).unwrap();
     }
 
     #[test]
@@ -899,13 +1127,13 @@ mod tests {
         let custody =
             sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
                 .unwrap();
-        assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+        assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
         assert_eq!(fs::metadata(&auth).unwrap().len(), 4097);
         fs::remove_file(&auth).unwrap();
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(machine.join("seed"), &auth).unwrap();
-            assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+            assert!(reclaim_detached_inputs(&machine, &selected, &custody).is_err());
             assert!(
                 fs::symlink_metadata(&auth)
                     .unwrap()
