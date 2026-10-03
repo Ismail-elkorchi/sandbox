@@ -399,6 +399,103 @@ pub(crate) fn attach(disk: &Path) -> io::Result<std::sync::Arc<std::fs::File>> {
     Ok(std::sync::Arc::new(lease))
 }
 
+/// Reclaim superseded boot inputs only while the caller owns the original
+/// exclusive disk description. Snapshots contain independent boot copies;
+/// output archives and runtime observations are not part of this namespace.
+/// This is offline worker work, never a guardian control-path directory scan.
+pub(crate) fn reclaim_boot_inputs(
+    machine_root: &Path,
+    selected: &Path,
+    custody: &fs::File,
+) -> io::Result<()> {
+    let disk = machine_root.join("disks/system.ext4");
+    sandsurf_native::storage::verify_transferred_lease(
+        custody,
+        &disk.with_extension("storage.lock"),
+    )?;
+    let guardian = machine_root.join("guardian");
+    let held = sandsurf_native::local::Directory::open(&guardian)?;
+    if selected.parent() != Some(held.path()) {
+        return Err(invalid("selected boot does not belong to this guardian"));
+    }
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    for (index, entry) in fs::read_dir(held.path())?.take(4097).enumerate() {
+        if index == 4096 {
+            return Err(invalid("guardian boot inventory exceeds bound"));
+        }
+        let entry = entry?;
+        let path = entry.path();
+        if path == selected {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if generation_object(name, "auth-", ".img") {
+            let file = open_private_file(&path, PrivateFileAccess::ReadOnly)?;
+            if file.metadata()?.len() > sandsurf_protocol::BOOT_RECORD_BYTES as u64 {
+                return Err(invalid("detached authentication input exceeds bound"));
+            }
+            files.push(path);
+        } else if generation_object(name, "boot-", "") || boot_stage_name(name) {
+            let directory = sandsurf_native::local::Directory::open(&path)?;
+            for (index, artifact) in fs::read_dir(directory.path())?.take(5).enumerate() {
+                if index == 4 {
+                    return Err(invalid("detached boot inventory exceeds bound"));
+                }
+                let artifact = artifact?;
+                let maximum = match artifact.file_name().to_str() {
+                    Some("kernel") => sandsurf_image::boot::MAX_KERNEL,
+                    Some("initramfs") => sandsurf_image::boot::MAX_INITRAMFS,
+                    Some("boot.json" | "selection.json") => 8192,
+                    _ => {
+                        return Err(invalid(
+                            "detached boot has an unowned input role; preserved",
+                        ));
+                    }
+                };
+                let file = open_private_file(&artifact.path(), PrivateFileAccess::ReadOnly)?;
+                if file.metadata()?.len() > maximum {
+                    return Err(invalid("detached boot input exceeds bound"));
+                }
+            }
+            directories.push(directory);
+        }
+    }
+    // Validate the complete bounded closure before removing any bytes. The
+    // original slot description remains held through every unlink and fsync.
+    held.check()?;
+    for path in files {
+        fs::remove_file(path)?;
+    }
+    for directory in directories {
+        directory.check()?;
+        let path = directory.path().to_owned();
+        // Windows directory custody denies replacement/deletion until close.
+        drop(directory);
+        fs::remove_dir_all(path)?;
+    }
+    sync_directory(held.path())
+}
+
+fn generation_object(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|name| name.strip_suffix(suffix))
+        .and_then(|name| name.split_once('-'))
+        .is_some_and(|(generation, digest)| {
+            !generation.starts_with('0')
+                && generation.len() <= 20
+                && generation.bytes().all(|byte| byte.is_ascii_digit())
+                && generation.parse::<u64>().is_ok_and(|value| value != 0)
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 /// Positive native-detachment evidence after loss of the volatile VM handle.
 /// Every computer VMM retains this slot's original open description until
 /// native exit. Acquiring it excludes those owners; an absent process handle
@@ -722,6 +819,112 @@ mod tests {
     use std::io::Write;
 
     struct Fixture(std::path::PathBuf);
+
+    #[test]
+    fn detached_boot_reclamation_is_bounded_preserves_selection_and_never_touches_history() {
+        let fixture = Fixture::new();
+        let machine = sandsurf_native::local::canonical_private_directory(&fixture.0).unwrap();
+        for name in ["disks", "guardian", "snapshots", "output"] {
+            create_private_directory(&machine.join(name)).unwrap();
+        }
+        let guardian = machine.join("guardian");
+        let selected = guardian.join(format!("boot-2-{}", "a".repeat(64)));
+        let old = guardian.join(format!("boot-1-{}", "b".repeat(64)));
+        let incomplete = boot_stage_path(&guardian).unwrap();
+        for path in [&selected, &old, &incomplete] {
+            create_private_directory(path).unwrap();
+            create_private_file(&path.join("kernel"))
+                .unwrap()
+                .write_all(b"frozen kernel")
+                .unwrap();
+        }
+        let auth = guardian.join(format!("auth-1-{}.img", "c".repeat(64)));
+        create_private_file(&auth)
+            .unwrap()
+            .write_all(b"partial authentication")
+            .unwrap();
+        for path in [
+            guardian.join("auth-01-foreign.img"),
+            machine.join("snapshots/retained"),
+            machine.join("output/original"),
+        ] {
+            create_private_file(&path)
+                .unwrap()
+                .write_all(b"retained")
+                .unwrap();
+        }
+        let custody =
+            sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
+                .unwrap();
+        let wrong = sandsurf_native::storage::disk_lease(&machine.join("other.lock")).unwrap();
+        assert!(reclaim_boot_inputs(&machine, &selected, &wrong).is_err());
+        assert!(old.exists() && auth.exists());
+        let foreign = old.join("foreign");
+        create_private_file(&foreign)
+            .unwrap()
+            .write_all(b"not ours")
+            .unwrap();
+        assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+        assert!(
+            old.exists() && auth.exists() && incomplete.exists(),
+            "inventory validation must precede all removals"
+        );
+        fs::remove_file(foreign).unwrap();
+        reclaim_boot_inputs(&machine, &selected, &custody).unwrap();
+        assert!(!old.exists() && !auth.exists() && !incomplete.exists());
+        assert_eq!(fs::read(selected.join("kernel")).unwrap(), b"frozen kernel");
+        for path in [
+            guardian.join("auth-01-foreign.img"),
+            machine.join("snapshots/retained"),
+            machine.join("output/original"),
+        ] {
+            assert_eq!(fs::read(path).unwrap(), b"retained");
+        }
+        reclaim_boot_inputs(&machine, &selected, &custody).unwrap();
+    }
+
+    #[test]
+    fn detached_boot_reclamation_refuses_links_and_oversized_private_inputs() {
+        let fixture = Fixture::new();
+        let machine = sandsurf_native::local::canonical_private_directory(&fixture.0).unwrap();
+        for name in ["disks", "guardian"] {
+            create_private_directory(&machine.join(name)).unwrap();
+        }
+        let guardian = machine.join("guardian");
+        let selected = guardian.join(format!("boot-2-{}", "a".repeat(64)));
+        let auth = guardian.join(format!("auth-1-{}.img", "b".repeat(64)));
+        let file = create_private_file(&auth).unwrap();
+        file.set_len(4097).unwrap();
+        drop(file);
+        let custody =
+            sandsurf_native::storage::disk_lease(&machine.join("disks/system.storage.lock"))
+                .unwrap();
+        assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+        assert_eq!(fs::metadata(&auth).unwrap().len(), 4097);
+        fs::remove_file(&auth).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(machine.join("seed"), &auth).unwrap();
+            assert!(reclaim_boot_inputs(&machine, &selected, &custody).is_err());
+            assert!(
+                fs::symlink_metadata(&auth)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        for name in [
+            "boot-0-x",
+            "boot-01-x",
+            "boot-1-../outside",
+            "auth-1-ABC.img",
+            "auth-18446744073709551616-000.img",
+        ] {
+            assert!(
+                !generation_object(name, "boot-", "") && !generation_object(name, "auth-", ".img")
+            );
+        }
+    }
 
     #[test]
     fn surviving_offline_owner_keeps_preparation_and_original_slot_custody() {
