@@ -11,7 +11,7 @@ CREATE TABLE configuration(id INTEGER PRIMARY KEY CHECK(id=1), host TEXT NOT NUL
 CREATE TABLE machines(id TEXT PRIMARY KEY, image TEXT NOT NULL, configuration TEXT NOT NULL, defaults TEXT NOT NULL, lifetime TEXT NOT NULL, activity INTEGER NOT NULL, revision INTEGER NOT NULL, sensitive INTEGER NOT NULL CHECK(sensitive IN (0,1)), released INTEGER NOT NULL DEFAULT 0) STRICT;
 CREATE INDEX active_machines ON machines(id) WHERE released=0;
 CREATE TABLE intents(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request TEXT NOT NULL, value TEXT NOT NULL) STRICT;
-CREATE INDEX completed_terminal_intents ON intents(machine) WHERE json_extract(value,'$.desired') IN ('stopped','destroyed') AND json_extract(value,'$.completion') IS NOT NULL;
+CREATE INDEX completed_lifecycle_intents ON intents(machine) WHERE json_extract(value,'$.completion') IS NOT NULL;
 CREATE TABLE configuration_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE transfer_operations(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), request_digest TEXT NOT NULL, value TEXT NOT NULL) STRICT;
 CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machines(id), digest TEXT NOT NULL, cpu INTEGER NOT NULL, network INTEGER NOT NULL) STRICT;
@@ -37,11 +37,15 @@ CREATE TABLE rollbacks(operation TEXT PRIMARY KEY, machine TEXT NOT NULL REFEREN
 CREATE UNIQUE INDEX pending_rollback_machine ON rollbacks(machine) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE INDEX pending_rollback_snapshot ON rollbacks(json_extract(value,'$.snapshotId')) WHERE json_extract(value,'$.phase') IS NOT 'applied';
 CREATE TABLE usage_observations(machine TEXT PRIMARY KEY REFERENCES machines(id), generation INTEGER NOT NULL, raw TEXT NOT NULL, cumulative TEXT NOT NULL) STRICT;
-CREATE TABLE suspensions(machine TEXT PRIMARY KEY REFERENCES machines(id), value TEXT NOT NULL) STRICT;
-CREATE INDEX suspension_snapshot ON suspensions(json_extract(value,'$.snapshotId'));
+CREATE TABLE suspension_captures(snapshot TEXT PRIMARY KEY REFERENCES snapshots(id), lifecycle TEXT UNIQUE NOT NULL REFERENCES intents(id)) STRICT;
 CREATE TABLE forks(machine TEXT PRIMARY KEY REFERENCES machines(id), operation TEXT UNIQUE NOT NULL REFERENCES intents(id), snapshot TEXT NOT NULL REFERENCES snapshots(id), value TEXT NOT NULL) STRICT;
 CREATE INDEX pending_fork_snapshot ON forks(snapshot,machine) WHERE json_extract(value,'$.materializedDisk') IS NULL;
 ";
+
+// Suspension is derived from one captured-input relationship and lifecycle
+// completion. There is no separately installed/cleared suspension authority
+// and no crash window after committing the native lifecycle reference.
+const SUSPENSION_INPUTS: &str = "SELECT c.snapshot,i.id AS lifecycle,i.machine,json_extract(i.value,'$.completion') AS completed FROM suspension_captures c JOIN intents i ON c.lifecycle=i.id WHERE NOT EXISTS(SELECT 1 FROM intents newer WHERE newer.machine=i.machine AND newer.rowid>i.rowid AND json_extract(newer.value,'$.completion') IS NOT NULL)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -213,8 +217,8 @@ pub struct MachineRecord {
     pub latest_intent: LifecycleIntent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Derived resumable-input view, never a separately persisted state owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuspensionRecord {
     pub machine_id: MachineId,
     pub lifecycle_operation_id: OperationId,
@@ -1245,12 +1249,23 @@ impl HostCatalog {
         for query in [
             "SELECT EXISTS(SELECT 1 FROM forks f JOIN machines m ON f.machine=m.id WHERE f.snapshot=?1 AND m.released=0 AND json_extract(f.value,'$.materializedDisk') IS NULL)",
             "SELECT EXISTS(SELECT 1 FROM rollbacks WHERE json_extract(value,'$.snapshotId')=?1 AND json_extract(value,'$.phase') IS NOT 'applied')",
-            "SELECT EXISTS(SELECT 1 FROM suspensions WHERE json_extract(value,'$.snapshotId')=?1)",
             "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$')='admitted')",
         ] {
             if tx.query_row(query, [snapshot_id.as_str()], |row| row.get::<_, bool>(0))? {
                 return Err(Error::Conflict("pending host operation pins this snapshot"));
             }
+        }
+        if tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM ({SUSPENSION_INPUTS}) WHERE snapshot=?1)"),
+            [snapshot_id.as_str()],
+            |row| row.get::<_, bool>(0),
+        )? {
+            // A newer accepted revision is not proof that a lost native
+            // suspension response was NotApplied. Keep its possible input
+            // until a later native lifecycle is actually completed.
+            return Err(Error::Conflict(
+                "pending or applied suspension pins this snapshot",
+            ));
         }
         capacity(&tx, "snapshot_releases", self.limits.operations)?;
         record_approval(&tx, &approval, self.limits.operations)?;
@@ -1340,106 +1355,29 @@ impl HostCatalog {
     }
 
     pub fn suspension(&self, machine: &MachineId) -> Result<Option<SuspensionRecord>> {
-        self.db
-            .connection
-            .query_row(
-                "SELECT value FROM suspensions WHERE machine=?1",
-                [machine.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| decode(&value))
-            .transpose()
-    }
-
-    pub fn record_suspension(
-        &mut self,
-        machine: &MachineId,
-        lifecycle_operation: &OperationId,
-        snapshot_id: &SnapshotId,
-        manifest_digest: &Digest,
-    ) -> Result<SuspensionRecord> {
-        let tx = self.db.connection.transaction()?;
-        let snapshot = snapshot_record(&tx, snapshot_id)?
-            .ok_or(Error::Missing("suspension snapshot is missing"))?;
-        let lifecycle = intent(&tx, lifecycle_operation)?
-            .ok_or(Error::Missing("suspension lifecycle intent is missing"))?;
-        let superseded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM intents WHERE machine=?1 AND json_extract(value,'$.desired') IN ('stopped','destroyed') AND json_extract(value,'$.completion') IS NOT NULL AND rowid>(SELECT rowid FROM intents WHERE id=?2))", params![machine.as_str(), lifecycle_operation.as_str()], |row| row.get(0))?;
-        if superseded {
-            return Err(Error::Conflict(
-                "completed native stop supersedes suspension association",
-            ));
-        }
-        if snapshot.request.machine_id != *machine
-            || snapshot.request.kind != SnapshotKind::Full
-            || snapshot.phase != SnapshotPhase::Ready
-            || snapshot.manifest_digest.as_ref() != Some(manifest_digest)
-            || snapshot.full.is_none()
-            || lifecycle.machine_id != *machine
-            || lifecycle.desired != DesiredState::Suspended
-            || lifecycle.completion.is_none()
-        {
-            return Err(Error::Conflict(
-                "suspension association lacks snapshot or lifecycle completion",
-            ));
-        }
-        let value = SuspensionRecord {
-            machine_id: machine.clone(),
-            lifecycle_operation_id: lifecycle_operation.clone(),
-            snapshot_id: snapshot_id.clone(),
-            manifest_digest: manifest_digest.clone(),
+        let operation: Option<String> = self.db.connection.query_row(
+            &format!("SELECT lifecycle FROM ({SUSPENSION_INPUTS}) WHERE machine=?1 AND completed IS NOT NULL"),
+            [machine.as_str()], |row| row.get(0),
+        ).optional()?;
+        let Some(operation) = operation else {
+            return Ok(None);
         };
-        if let Some(old) = tx
-            .query_row(
-                "SELECT value FROM suspensions WHERE machine=?1",
-                [machine.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|encoded| decode::<SuspensionRecord>(&encoded))
-            .transpose()?
-        {
-            return if old == value {
-                Ok(old)
-            } else {
-                Err(Error::Conflict(
-                    "machine is already bound to another suspension snapshot",
-                ))
-            };
+        let lifecycle = intent(&self.db.connection, &operation.try_into()?)?
+            .ok_or(Error::Corrupt("suspension lifecycle disappeared"))?;
+        let snapshot = suspension_capture(&self.db.connection, &lifecycle)?;
+        if snapshot.phase != SnapshotPhase::Ready {
+            return Err(Error::Corrupt(
+                "active suspension lost its retained capture",
+            ));
         }
-        tx.execute(
-            "INSERT INTO suspensions VALUES (?1,?2)",
-            params![machine.as_str(), encode(&value)?],
-        )?;
-        tx.commit()?;
-        Ok(value)
-    }
-
-    pub fn clear_suspension(
-        &mut self,
-        machine: &MachineId,
-        snapshot_id: &SnapshotId,
-    ) -> Result<()> {
-        let tx = self.db.connection.transaction()?;
-        let value = tx
-            .query_row(
-                "SELECT value FROM suspensions WHERE machine=?1",
-                [machine.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|encoded| decode::<SuspensionRecord>(&encoded))
-            .transpose()?
-            .ok_or(Error::Missing("suspension association is missing"))?;
-        if value.snapshot_id != *snapshot_id {
-            return Err(Error::Conflict("suspension snapshot identity changed"));
-        }
-        tx.execute(
-            "DELETE FROM suspensions WHERE machine=?1",
-            [machine.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(())
+        Ok(Some(SuspensionRecord {
+            machine_id: machine.clone(),
+            lifecycle_operation_id: lifecycle.operation_id,
+            snapshot_id: snapshot.request.id,
+            manifest_digest: snapshot
+                .manifest_digest
+                .ok_or(Error::Corrupt("suspension manifest disappeared"))?,
+        }))
     }
 
     pub fn snapshots(&self, after: Option<&SnapshotId>, limit: Counter) -> Result<Vec<Snapshot>> {
@@ -1567,7 +1505,16 @@ impl HostCatalog {
         let request_digest = digest(Domain::Snapshot, &("sandsurf-snapshot-v1", &request))?;
         let tx = self.db.connection.transaction()?;
         if let Some(old) = snapshot_record(&tx, &request.id)? {
-            return if old.request_digest == request_digest {
+            let owner: Option<String> = tx
+                .query_row(
+                    "SELECT lifecycle FROM suspension_captures WHERE snapshot=?1",
+                    [request.id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return if old.request_digest == request_digest
+                && owner.as_deref() == Some(lifecycle_operation.as_str())
+            {
                 Ok(old)
             } else {
                 Err(Error::Conflict("suspension snapshot identity conflict"))
@@ -1620,6 +1567,10 @@ impl HostCatalog {
                 value.request.machine_id.as_str(),
                 encode(&value)?
             ],
+        )?;
+        tx.execute(
+            "INSERT INTO suspension_captures VALUES (?1,?2)",
+            params![value.request.id.as_str(), lifecycle_operation.as_str()],
         )?;
         tx.commit()?;
         Ok(value)
@@ -2485,19 +2436,27 @@ impl HostCatalog {
             }
             return Ok(value);
         }
+        if value.desired == DesiredState::Suspended {
+            let snapshot = suspension_capture(&tx, &value)?;
+            if snapshot.phase != SnapshotPhase::Ready
+                && tx.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM ({SUSPENSION_INPUTS}) WHERE lifecycle=?1)"
+                    ),
+                    [value.operation_id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                return Err(Error::Conflict(
+                    "live suspension requires retained capture bytes",
+                ));
+            }
+        }
         value.completion = Some(reference);
         tx.execute(
             "UPDATE intents SET value=?2 WHERE id=?1",
             params![value.operation_id.as_str(), encode(&value)?],
         )?;
-        if matches!(
-            value.desired,
-            DesiredState::Stopped | DesiredState::Destroyed
-        ) {
-            // Applied stop/destruction discards resumable RAM intent. A late
-            // historical completion cannot clear a newer suspension owner.
-            tx.execute("DELETE FROM suspensions WHERE machine=?1 AND json_extract(value,'$.lifecycleOperationId') IN (SELECT id FROM intents WHERE machine=?1 AND rowid<(SELECT rowid FROM intents WHERE id=?2))", params![value.machine_id.as_str(), value.operation_id.as_str()])?;
-        }
         tx.commit()?;
         Ok(value)
     }
@@ -2914,6 +2873,35 @@ fn fork_record(db: &rusqlite::Connection, machine: &MachineId) -> Result<Option<
     .optional()?
     .map(|value| decode(&value))
     .transpose()
+}
+
+fn suspension_capture(db: &rusqlite::Connection, lifecycle: &LifecycleIntent) -> Result<Snapshot> {
+    let id: String = db
+        .query_row(
+            "SELECT snapshot FROM suspension_captures WHERE lifecycle=?1",
+            [lifecycle.operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(Error::Missing("suspension has no admitted capture"))?;
+    let snapshot = snapshot_record(db, &id.try_into()?)?
+        .ok_or(Error::Corrupt("suspension capture disappeared"))?;
+    if lifecycle.desired != DesiredState::Suspended
+        || snapshot.request.machine_id != lifecycle.machine_id
+        || snapshot.request.expected_revision.next()? != lifecycle.revision
+        || snapshot.request.kind != SnapshotKind::Full
+        || !matches!(
+            snapshot.phase,
+            SnapshotPhase::Ready | SnapshotPhase::Retiring | SnapshotPhase::Released
+        )
+        || snapshot.full.is_none()
+        || snapshot.manifest_digest.is_none()
+    {
+        return Err(Error::Conflict(
+            "suspension requires its exact published full capture",
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn snapshot_record(db: &rusqlite::Connection, id: &SnapshotId) -> Result<Option<Snapshot>> {

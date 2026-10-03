@@ -219,7 +219,13 @@ reconnectable `Operation` model; it does not silently replace live handles.
 `snapshot.release({ operationId? })` returns a host-owned retirement operation.
 Pending forks, rollback, suspension and image publication prevent retirement;
 completed independent copies do not pin their source. Retirement blocks new
-uses, but storage remains charged until detached cleanup commits. A full-state
+uses, but storage remains charged until detached cleanup commits.
+
+Suspension retains its capture from admission through native completion. Its
+resumable input is derived from committed lifecycle evidence, not a second
+state transaction. A newer request alone cannot release possibly consumed
+saved-state bytes; a later completed native lifecycle closes that dependency.
+A full-state
 snapshot can remain cleanup-pending while its source VMM retains native input
 custody, including after control-channel loss. `host.operations.get(id)` observes
 that progress after reconnection. Released snapshot metadata and lineage remain

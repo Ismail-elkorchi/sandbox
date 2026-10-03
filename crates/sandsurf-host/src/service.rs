@@ -1491,15 +1491,6 @@ impl HostService {
                 current.ok_or(HostError::Invalid("suspend requires a native observation"))?;
             let (snapshot_id, operation_id) = suspension_identities(&intent)?;
             if current.state == MachineState::Suspended {
-                let snapshot = self
-                    .catalog
-                    .snapshot(&snapshot_id)?
-                    .ok_or(HostError::Invalid(
-                        "suspended machine has no lifecycle snapshot",
-                    ))?;
-                let manifest_digest = snapshot
-                    .manifest_digest
-                    .ok_or(HostError::Invalid("suspension manifest is missing"))?;
                 return Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
                     machine_id: intent.machine_id,
                     provision,
@@ -1507,10 +1498,6 @@ impl HostService {
                         plan,
                         prepare: None,
                         custody: None,
-                        post: LifecyclePost::Suspend {
-                            snapshot_id,
-                            manifest_digest,
-                        },
                     }),
                 })));
             }
@@ -1580,9 +1567,6 @@ impl HostService {
                 },
                 expected: Box::new(full),
             });
-            effect.post = LifecyclePost::Restore {
-                snapshot_id: suspension.snapshot_id,
-            };
         }
         Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
             machine_id: intent.machine_id,
@@ -2171,10 +2155,6 @@ impl HostService {
                         operation_id: capturing.request.operation_id,
                         manifest_digest: manifest_digest.clone(),
                     }),
-                    post: LifecyclePost::Suspend {
-                        snapshot_id: snapshot.request.id,
-                        manifest_digest,
-                    },
                     custody: Some(custody),
                 };
                 Ok(HostDispatch::Task(Box::new(HostTask::Lifecycle {
@@ -2186,30 +2166,10 @@ impl HostService {
             HostTaskCompletion::Lifecycle {
                 machine_id,
                 result,
-                post,
                 custody: _custody,
             } => {
                 let lifecycle = result?.complete(&mut self.catalog)?;
                 if let Some(intent) = &lifecycle.completed_intent {
-                    match post {
-                        LifecyclePost::None => {}
-                        LifecyclePost::Suspend {
-                            snapshot_id,
-                            manifest_digest,
-                        } => {
-                            self.catalog.record_suspension(
-                                &machine_id,
-                                &intent.operation_id,
-                                &snapshot_id,
-                                &manifest_digest,
-                            )?;
-                        }
-                        LifecyclePost::Restore { snapshot_id } => {
-                            if self.catalog.suspension(&machine_id)?.is_some() {
-                                self.catalog.clear_suspension(&machine_id, &snapshot_id)?;
-                            }
-                        }
-                    }
                     if intent.desired == DesiredState::Running {
                         self.catalog.observe_activity(&machine_id, unix_millis()?)?;
                     }
@@ -2906,24 +2866,12 @@ fn perform_configuration(
     Ok(())
 }
 
-enum LifecyclePost {
-    None,
-    Suspend {
-        snapshot_id: SnapshotId,
-        manifest_digest: Digest,
-    },
-    Restore {
-        snapshot_id: SnapshotId,
-    },
-}
-
 struct LifecycleEffect {
     plan: LifecyclePlan,
     prepare: Option<NativeSnapshotRequest>,
-    post: LifecyclePost,
     // The native capture task remains exclusively owned across catalog
     // completion and CommitSuspend. It is never replaced by a record reference.
-    custody: Option<fs::File>,
+    custody: Option<crate::snapshots::CaptureCustody>,
 }
 
 impl LifecycleEffect {
@@ -2931,7 +2879,6 @@ impl LifecycleEffect {
         Box::new(Self {
             plan,
             prepare: None,
-            post: LifecyclePost::None,
             custody: None,
         })
     }
@@ -3480,12 +3427,7 @@ fn capture_snapshot(
 ) -> Result<crate::snapshots::CaptureResult> {
     let request = &capturing.request;
     let capture_root = crate::snapshots::root(root, capturing);
-    crate::snapshots::private_directory(&capture_root)?;
-    let _snapshot_custody = crate::snapshots::retain_input(&capture_root, &request.id)?;
-    let _custody = sandsurf_native::storage::disk_lease(&capture_root.join(format!(
-        ".{}.task.lock",
-        object_name(request.operation_id.as_str())
-    )))?;
+    let _custody = crate::snapshots::capture_custody(&capture_root, capturing)?;
     let machine_root = root
         .join("machines")
         .join(object_name(request.machine_id.as_str()));
@@ -3797,7 +3739,10 @@ enum HostTaskCompletion {
         intent: LifecycleIntent,
         provision: GuardianProvision,
         capturing: Box<Snapshot>,
-        result: Result<(crate::snapshots::CaptureResult, fs::File)>,
+        result: Result<(
+            crate::snapshots::CaptureResult,
+            crate::snapshots::CaptureCustody,
+        )>,
     },
     Fork {
         record: sandsurf_state::ForkRecord,
@@ -3812,8 +3757,7 @@ enum HostTaskCompletion {
     Lifecycle {
         machine_id: MachineId,
         result: Result<LifecycleEvidence>,
-        post: LifecyclePost,
-        custody: Option<fs::File>,
+        custody: Option<crate::snapshots::CaptureCustody>,
     },
     SnapshotInspect {
         request: Box<SnapshotRequest>,
@@ -4040,12 +3984,7 @@ impl HostTask {
             } => {
                 let result = (|| {
                     let capture_root = crate::snapshots::root(&root, &capturing);
-                    crate::snapshots::private_directory(&capture_root)?;
-                    let custody =
-                        sandsurf_native::storage::disk_lease(&capture_root.join(format!(
-                            ".{}.task.lock",
-                            object_name(capturing.request.operation_id.as_str()),
-                        )))?;
+                    let custody = crate::snapshots::capture_custody(&capture_root, &capturing)?;
                     let captured =
                         match crate::snapshots::published_filesystem(&capture_root, &capturing)? {
                             Some(captured) => captured,
@@ -4092,7 +4031,6 @@ impl HostTask {
                 let LifecycleEffect {
                     plan,
                     prepare,
-                    post,
                     custody,
                 } = *effect;
                 let result = (|| {
@@ -4113,7 +4051,6 @@ impl HostTask {
                 HostTaskCompletion::Lifecycle {
                     machine_id,
                     result,
-                    post,
                     custody,
                 }
             }
@@ -5498,7 +5435,7 @@ mod tests {
         };
         let completion = task.execute();
         assert!(
-            matches!(&completion, HostTaskCompletion::Snapshot { result: Err(HostError::Io(error)), .. } if error.kind() == io::ErrorKind::WouldBlock),
+            matches!(&completion, HostTaskCompletion::Snapshot { result: Err(HostError::Snapshot(crate::snapshots::SnapshotError::Io(error))), .. } if error.kind() == io::ErrorKind::WouldBlock),
             "custody must be acquired before recovery can send FinishDisk to the native owner"
         );
         assert!(service.complete_task(completion).is_err());
@@ -5509,7 +5446,7 @@ mod tests {
         let recovery = recovery.execute();
         assert!(
             matches!(recovery, HostTaskCompletion::Snapshot {
-                result: Err(HostError::Io(error)), ..
+                result: Err(HostError::Snapshot(crate::snapshots::SnapshotError::Io(error))), ..
             } if error.kind() == io::ErrorKind::WouldBlock),
             "background recovery must not release a live capture worker's native pause"
         );

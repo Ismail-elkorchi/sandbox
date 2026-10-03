@@ -48,6 +48,25 @@ pub(crate) fn retain_input(root: &Path, id: &SnapshotId) -> Result<File> {
     Ok(custody)
 }
 
+/// Two distinct responsibilities in one custody closure: immutable payload
+/// retention and exclusive execution of this exact capture task. Retain both
+/// across catalog publication and native CommitSuspend, not just disk copying.
+pub(crate) struct CaptureCustody {
+    _snapshot: File,
+    _task: File,
+}
+
+pub(crate) fn capture_custody(root: &Path, snapshot: &Snapshot) -> Result<CaptureCustody> {
+    private_directory(root)?;
+    Ok(CaptureCustody {
+        _snapshot: retain_input(root, &snapshot.request.id)?,
+        _task: sandsurf_native::storage::disk_lease(&root.join(format!(
+            ".{}.task.lock",
+            object_name(snapshot.request.operation_id.as_str()),
+        )))?,
+    })
+}
+
 /// An authenticated catalog retirement is materialized before deleting any
 /// bytes. The terminal marker fences delayed pre-retirement jobs after restart.
 /// Nothing here touches output archives, receipts, or guest retention claims.
@@ -1242,6 +1261,24 @@ mod tests {
         drop(native);
         cleanup(&temp.0, &snapshot, &record).unwrap();
         assert!(retirement_path(&root, &snapshot.request.id).exists());
+    }
+
+    #[test]
+    fn capture_custody_retains_payload_and_task_together_until_native_completion() {
+        let temp = Temp::new();
+        let snapshot = snapshot();
+        let root = temp.capture_root(&snapshot);
+        let custody = capture_custody(&root, &snapshot).unwrap();
+        assert!(
+            matches!(capture_custody(&root, &snapshot), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert!(
+            matches!(object_lease(&root, &snapshot.request.id, false), Err(SnapshotError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        drop(custody);
+        let custody = capture_custody(&root, &snapshot).unwrap();
+        drop(custody);
+        drop(object_lease(&root, &snapshot.request.id, false).unwrap());
     }
 
     #[test]

@@ -107,11 +107,11 @@ fn admitted_lifecycle(f: &mut Fixture, name: &str, desired: DesiredState) -> Lif
         .unwrap()
 }
 
-fn complete_lifecycle(
+fn observe_lifecycle(
     f: &mut Fixture,
     intent: &LifecycleIntent,
     state: MachineState,
-) -> LifecycleIntent {
+) -> CommittedObservation {
     let mut observation = f
         .runtime
         .last_observation()
@@ -126,7 +126,15 @@ fn complete_lifecycle(
         operation_id: intent.operation_id.clone(),
     };
     observation.evidence_digest = hash(intent.operation_id.as_str());
-    let evidence = f.runtime.observe(observation).unwrap();
+    f.runtime.observe(observation).unwrap()
+}
+
+fn complete_lifecycle(
+    f: &mut Fixture,
+    intent: &LifecycleIntent,
+    state: MachineState,
+) -> LifecycleIntent {
+    let evidence = observe_lifecycle(f, intent, state);
     f.host.complete_intent(&evidence).unwrap()
 }
 
@@ -140,8 +148,32 @@ fn completed_lifecycle(
     complete_lifecycle(f, &intent, state)
 }
 
+fn full_snapshot_metadata() -> FullSnapshotMetadata {
+    FullSnapshotMetadata {
+        engine: VmEngine::Firecracker,
+        engine_version: "fixture".into(),
+        architecture: "amd64".into(),
+        configuration_digest: hash("configuration"),
+        snapshot_state: SnapshotArtifact {
+            digest: hash("state"),
+            bytes: n(1),
+        },
+        memory: Some(SnapshotArtifact {
+            digest: hash("memory"),
+            bytes: n(1),
+        }),
+        reconnect_state: SnapshotArtifact {
+            digest: hash("reconnect"),
+            bytes: n(1),
+        },
+        executions: Vec::new(),
+        generation: hash("generation"),
+        fork_safe: false,
+    }
+}
+
 #[test]
-fn suspended_state_pins_snapshot_until_applied_stop_and_late_association_cannot_resurrect_it() {
+fn suspension_dependencies_survive_restart_and_historical_retries_cannot_resurrect_them() {
     let mut f = Fixture::new();
     let intent = admitted_lifecycle(&mut f, "suspend", DesiredState::Suspended);
     let request = SnapshotRequest {
@@ -165,36 +197,7 @@ fn suspended_state_pins_snapshot_until_applied_stop_and_late_association_cannot_
             hash("disk"),
             hash("manifest"),
             SnapshotConsistency::Machine,
-            FullSnapshotMetadata {
-                engine: VmEngine::Firecracker,
-                engine_version: "fixture".into(),
-                architecture: "amd64".into(),
-                configuration_digest: hash("configuration"),
-                snapshot_state: SnapshotArtifact {
-                    digest: hash("state"),
-                    bytes: n(1),
-                },
-                memory: Some(SnapshotArtifact {
-                    digest: hash("memory"),
-                    bytes: n(1),
-                }),
-                reconnect_state: SnapshotArtifact {
-                    digest: hash("reconnect"),
-                    bytes: n(1),
-                },
-                executions: Vec::new(),
-                generation: hash("generation"),
-                fork_safe: false,
-            },
-        )
-        .unwrap();
-    complete_lifecycle(&mut f, &intent, MachineState::Suspended);
-    f.host
-        .record_suspension(
-            &f.machine,
-            &intent.operation_id,
-            &request.id,
-            &hash("manifest"),
+            full_snapshot_metadata(),
         )
         .unwrap();
     let release: OperationId = "release-suspended".try_into().unwrap();
@@ -206,6 +209,35 @@ fn suspended_state_pins_snapshot_until_applied_stop_and_late_association_cannot_
         )
         .unwrap(),
     };
+    // Ready bytes alone cannot discharge a still-pending lifecycle consumer.
+    // A service restart between publication and CommitSuspend preserves it.
+    let host_path = f.root.0.join("host");
+    drop(f.host);
+    f.host = HostCatalog::open(&host_path).unwrap();
+    assert!(
+        f.host
+            .release_snapshot(release.clone(), request.id.clone(), approval.clone())
+            .is_err()
+    );
+    f.host
+        .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+        .unwrap();
+    // Accepting newer intent cannot prove that an earlier lost native response
+    // was non-application. Its possible saved-state input remains protected.
+    admitted_lifecycle(&mut f, "newer-unapplied-pause", DesiredState::Paused);
+    assert!(
+        f.host
+            .release_snapshot(release.clone(), request.id.clone(), approval.clone())
+            .is_err()
+    );
+    complete_lifecycle(&mut f, &intent, MachineState::Suspended);
+    assert_eq!(
+        f.host.suspension(&f.machine).unwrap().unwrap().snapshot_id,
+        request.id
+    );
+    // No second post-lifecycle transaction is needed to retain resumable bytes.
+    drop(f.host);
+    f.host = HostCatalog::open(&host_path).unwrap();
     assert!(
         f.host
             .release_snapshot(release.clone(), request.id.clone(), approval.clone())
@@ -218,18 +250,123 @@ fn suspended_state_pins_snapshot_until_applied_stop_and_late_association_cannot_
         MachineState::Stopped,
     );
     assert!(f.host.suspension(&f.machine).unwrap().is_none());
-    assert!(matches!(
-        f.host.record_suspension(
-            &f.machine,
-            &intent.operation_id,
-            &request.id,
-            &hash("manifest")
-        ),
-        Err(Error::Conflict(_))
-    ));
+    f.host
+        .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+        .unwrap();
+    assert!(f.host.suspension(&f.machine).unwrap().is_none());
     f.host
         .release_snapshot(release, request.id, approval)
         .unwrap();
+}
+
+#[test]
+fn suspension_capture_has_exact_durable_lifecycle_owner_and_rejects_adoption() {
+    let mut f = Fixture::new();
+    let intent = admitted_lifecycle(&mut f, "pending-suspend", DesiredState::Suspended);
+    let request = SnapshotRequest {
+        id: "pending-snapshot".try_into().unwrap(),
+        operation_id: "pending-capture".try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(intent.revision.get() - 1),
+        kind: SnapshotKind::Full,
+        parent: None,
+    };
+    let admitted = f
+        .host
+        .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+        .unwrap();
+    assert_eq!(
+        f.host
+            .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+            .unwrap(),
+        admitted
+    );
+    let other = admitted_lifecycle(&mut f, "newer-suspend", DesiredState::Suspended);
+    assert!(
+        f.host
+            .admit_suspension_snapshot(request.clone(), &other.operation_id)
+            .is_err()
+    );
+    let mut conflicting = request;
+    conflicting.id = "other-capture".try_into().unwrap();
+    conflicting.operation_id = "other-capture-op".try_into().unwrap();
+    // The original lifecycle is no longer current and has exactly one capture.
+    assert!(
+        f.host
+            .admit_suspension_snapshot(conflicting, &intent.operation_id)
+            .is_err()
+    );
+}
+
+#[test]
+fn late_suspend_completion_after_confirmed_stop_and_retirement_is_history_not_resurrection() {
+    let mut f = Fixture::new();
+    let intent = admitted_lifecycle(&mut f, "lost-suspend-response", DesiredState::Suspended);
+    let request = SnapshotRequest {
+        id: "lost-suspend-input".try_into().unwrap(),
+        operation_id: "lost-suspend-capture".try_into().unwrap(),
+        machine_id: f.machine.clone(),
+        expected_generation: n(1),
+        expected_revision: n(intent.revision.get() - 1),
+        kind: SnapshotKind::Full,
+        parent: None,
+    };
+    let admitted = f
+        .host
+        .admit_suspension_snapshot(request.clone(), &intent.operation_id)
+        .unwrap();
+    f.host
+        .begin_snapshot(&request.id, &admitted.request_digest)
+        .unwrap();
+    f.host
+        .complete_full_snapshot(
+            &request.id,
+            &admitted.request_digest,
+            hash("disk"),
+            hash("manifest"),
+            SnapshotConsistency::Machine,
+            full_snapshot_metadata(),
+        )
+        .unwrap();
+    let delayed = observe_lifecycle(&mut f, &intent, MachineState::Suspended);
+    completed_lifecycle(
+        &mut f,
+        "later-confirmed-stop",
+        DesiredState::Stopped,
+        MachineState::Stopped,
+    );
+    let operation: OperationId = "retire-unknown-suspend".try_into().unwrap();
+    let record = f
+        .host
+        .release_snapshot(
+            operation.clone(),
+            request.id.clone(),
+            Approval {
+                id: "approve-retirement".try_into().unwrap(),
+                request_digest: digest(
+                    Domain::Snapshot,
+                    &("sandsurf-release-snapshot-v1", &operation, &request.id),
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+    f.host
+        .complete_snapshot_release(&operation, &record.request_digest)
+        .unwrap();
+    assert!(
+        f.host
+            .complete_intent(&delayed)
+            .unwrap()
+            .completion
+            .is_some()
+    );
+    assert!(f.host.suspension(&f.machine).unwrap().is_none());
+    assert_eq!(
+        f.host.snapshot(&request.id).unwrap().unwrap().phase,
+        SnapshotPhase::Released
+    );
 }
 
 #[test]
@@ -277,8 +414,8 @@ fn substituted_snapshot_retirement_is_rejected_intact_and_recovery_uses_indexes(
             "pending_rollback_snapshot",
         ),
         (
-            "SELECT machine FROM suspensions WHERE json_extract(value,'$.snapshotId')='source'",
-            "suspension_snapshot",
+            "SELECT lifecycle FROM suspension_captures WHERE snapshot='source'",
+            "sqlite_autoindex_suspension_captures_1",
         ),
     ] {
         let mut statement = database
