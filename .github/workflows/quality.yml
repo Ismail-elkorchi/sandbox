@@ -184,6 +184,17 @@ jobs:
           codesign --force --sign - --options runtime target/debug/darwin-vmm-entry
           sudo install -o root -g wheel -m 0755 target/debug/darwin-vmm-entry /usr/local/libexec/sandsurf/sandsurf-qemu-arm64
           SANDSURF_DARWIN_VMM_TEST=1 cargo test --locked -p sandsurf-native --test darwin_vmm_confinement -- --test-threads=1
+      - name: Kernel local-delivery and original socket-owner contract (no VM hardware required)
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-local-delivery.c -o target/debug/darwin-local-delivery
+          sudo pfctl -nf vmm/qemu/tests/darwin-local-delivery.conf
+          # Only disposable CI may replace its root policy. Never run this on
+          # an operator's host or infer VM qualification from this contract.
+          trap 'sudo ifconfig lo0 -alias 198.18.0.9 2>/dev/null || true; sudo pfctl -f /etc/pf.conf' EXIT
+          sudo pfctl -f vmm/qemu/tests/darwin-local-delivery.conf
+          sudo pfctl -e || sudo pfctl -s info | grep -q 'Status: Enabled'
+          sudo target/debug/darwin-local-delivery
 
   windows:
     runs-on: windows-2025
