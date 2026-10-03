@@ -86,7 +86,7 @@ fn native_custody_survives_parent_descriptors_and_job_owner_death_contains_child
     drop(sandsurf_native::storage::disk_lease(&lock).unwrap());
 
     // This is an actual process/Job boundary, not an in-process Drop test. The
-    // fixture inherits this one file object into its contained native worker.
+    // fixture inherits disk and snapshot objects into its contained native worker.
     let mut owner = std::process::Command::new(executable)
         .arg("owner")
         .arg(&root)
@@ -104,6 +104,14 @@ fn native_custody_survives_parent_descriptors_and_job_owner_death_contains_child
             .kind(),
         std::io::ErrorKind::WouldBlock
     );
+    let snapshot = root.join("snapshot.lock");
+    assert_eq!(
+        sandsurf_native::storage::disk_lease(&snapshot)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(sandsurf_native::storage::read_lease(&snapshot).unwrap());
     owner.kill().unwrap();
     owner.wait().unwrap();
     loop {
@@ -122,8 +130,10 @@ fn native_custody_survives_parent_descriptors_and_job_owner_death_contains_child
             Err(error) => panic!("native custody recovery failed: {error}"),
         }
     }
-    // Only this test's two tiny files; no machine or retained output is erased.
+    drop(sandsurf_native::storage::disk_lease(&snapshot).unwrap());
+    // Only this test's three tiny files; no machine or retained output is erased.
     std::fs::remove_file(root.join("ready")).unwrap();
     std::fs::remove_file(lock).unwrap();
+    std::fs::remove_file(snapshot).unwrap();
     std::fs::remove_dir(root).unwrap();
 }

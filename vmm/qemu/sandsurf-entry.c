@@ -79,7 +79,7 @@ static void *owner_watch(void *unused)
     return NULL;
 }
 
-static void darwin_gate(void)
+static void darwin_gate(unsigned custody_count)
 {
     uid_t uid;
     gid_t gid;
@@ -92,9 +92,13 @@ static void darwin_gate(void)
         size != sizeof(type) || type != SOCK_STREAM ||
         getpeereid(3, &uid, &gid) || uid != 0 ||
         setsockopt(3, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) ||
-        fcntl(3, F_SETFD, FD_CLOEXEC) || fcntl(3, F_SETFL, O_NONBLOCK) ||
-        fcntl(5, F_SETFD, FD_CLOEXEC)) {
+        fcntl(3, F_SETFD, FD_CLOEXEC) || fcntl(3, F_SETFL, O_NONBLOCK)) {
         gate_failed();
+    }
+    for (unsigned index = 0; index < custody_count; ++index) {
+        if (fcntl(5 + (int)index, F_SETFD, FD_CLOEXEC)) {
+            gate_failed();
+        }
     }
     int64_t deadline = milliseconds() + 15000;
     char ready[] = "SSRDY001";
@@ -147,13 +151,15 @@ uint32_t sandsurf_qemu_cpu_cap(void)
 int sandsurf_qemu_enter(int argc, char ***argv)
 {
 #ifdef __APPLE__
-    if (argc < 4 || strcmp((*argv)[1], "--broker-worker") ||
-        strcmp((*argv)[2], "virtual-machine")) {
+    if (argc < 6 || strcmp((*argv)[1], "--broker-worker") ||
+        strcmp((*argv)[2], "virtual-machine") ||
+        strcmp((*argv)[3], "--owned-leases") ||
+        strlen((*argv)[4]) != 1 || (*argv)[4][0] < '1' || (*argv)[4][0] > '8') {
         _exit(70);
     }
-    darwin_gate();
-    memmove(*argv + 1, *argv + 3, (size_t)(argc - 2) * sizeof(char *));
-    return argc - 2;
+    darwin_gate((unsigned)((*argv)[4][0] - '0'));
+    memmove(*argv + 1, *argv + 5, (size_t)(argc - 4) * sizeof(char *));
+    return argc - 4;
 #elif defined(_WIN32)
     if (argc < 4 || strcmp((*argv)[1], "--sandsurf-cpu-cap")) {
         exit(70);

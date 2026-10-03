@@ -34,7 +34,7 @@ impl QemuOwner {
         runtime_digest: &Digest,
         budget: ProcessBudget,
         guest_cpu_quota: u64,
-        custody: Arc<File>,
+        custody: Vec<Arc<File>>,
         restoring: bool,
     ) -> io::Result<Self> {
         let mut worker = QemuWorker::launch(

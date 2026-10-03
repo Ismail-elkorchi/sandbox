@@ -95,10 +95,12 @@ fn kernel_envelopes_apply_after_exec_and_service_lifetime_is_not_observer_lifeti
     let custody_path = root.join("disk.lock");
     let custody = sandsurf_native::local::create_private_file(&custody_path).unwrap();
     custody.try_lock().unwrap();
+    let snapshot_path = root.join("snapshot.lock");
+    let snapshot = sandsurf_native::storage::read_lease(&snapshot_path).unwrap();
     let mut worker = launch_vm(
         budget,
         &["owner-loss".into()],
-        std::sync::Arc::new(custody),
+        vec![std::sync::Arc::new(custody), std::sync::Arc::new(snapshot)],
         Stdio::inherit(),
     )
     .unwrap();
@@ -112,12 +114,24 @@ fn kernel_envelopes_apply_after_exec_and_service_lifetime_is_not_observer_lifeti
         matches!(competing.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "observer released storage before native containment"
     );
+    let snapshot_competing = sandsurf_native::local::open_private_file(
+        &snapshot_path,
+        sandsurf_native::PrivateFileAccess::ReadWrite,
+    )
+    .unwrap();
+    assert!(matches!(
+        snapshot_competing.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(sandsurf_native::storage::read_lease(&snapshot_path).unwrap());
     let start = Instant::now();
     worker.terminate().unwrap();
     assert!(start.elapsed() < Duration::from_secs(5));
     assert_eq!(worker.wait().unwrap(), WorkerExit::Signaled(9));
     drop(worker);
     competing.try_lock().unwrap();
+    snapshot_competing.try_lock().unwrap();
+    drop(snapshot_competing);
     drop(competing);
     let image_slot = root.join("image-pool.lock");
     let original = std::sync::Arc::new(sandsurf_native::storage::disk_lease(&image_slot).unwrap());

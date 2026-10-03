@@ -117,7 +117,7 @@ mod native {
         config: QemuConfig,
         owner: Option<QemuOwner>,
         resources: Option<Resources>,
-        pending_custody: Option<Arc<File>>,
+        pending_custody: Option<Vec<Arc<File>>>,
         capture_paused: bool,
         capture_operation: Option<OperationId>,
         committed_suspend: Option<(OperationId, Digest)>,
@@ -174,7 +174,10 @@ mod native {
             self.config.launch.authentication_disk = authentication;
             self.config.launch.validate()
         }
-        pub fn stage_storage_custody(&mut self, custody: Arc<File>) -> io::Result<()> {
+        pub fn stage_storage_custody(&mut self, custody: Vec<Arc<File>>) -> io::Result<()> {
+            if custody.is_empty() || custody.len() > sandsurf_native::MAX_WORKER_CUSTODY {
+                return Err(invalid("invalid native custody closure"));
+            }
             if self.owner.is_some() || self.pending_custody.is_some() {
                 return Err(invalid("native storage custody is already held"));
             }
@@ -314,10 +317,13 @@ mod native {
             self.restore = Some(source);
             Ok(())
         }
-        pub fn restore_custody(&self) -> Option<Arc<File>> {
-            self.restore
-                .as_ref()
-                .map(|source| Arc::clone(&source.disk_custody))
+        pub fn restore_custody(&self) -> Option<Vec<Arc<File>>> {
+            self.restore.as_ref().map(|source| {
+                vec![
+                    Arc::clone(&source.disk_custody),
+                    Arc::clone(&source.snapshot_custody),
+                ]
+            })
         }
         pub fn staged_restore_binding(&self) -> Option<&Digest> {
             self.restore

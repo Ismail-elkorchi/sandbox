@@ -18,14 +18,26 @@ pub struct RestorePreparation {
 
 pub struct PreparedRestore {
     pub(crate) input: RestorePreparation,
-    pub(crate) directory: PathBuf,
-    pub(crate) staged_state: Option<PathBuf>,
     pub(crate) reconnect: Vec<u8>,
     pub(crate) disk_custody: Arc<File>,
     pub(crate) snapshot_custody: Arc<File>,
 }
 
 impl RestorePreparation {
+    pub(crate) fn directory(&self) -> PathBuf {
+        self.machine_root
+            .join("snapshots")
+            .join(sandsurf_native::storage::object_name(
+                self.snapshot_id.as_str(),
+            ))
+    }
+    pub(crate) fn staged_state_path(&self) -> Option<PathBuf> {
+        (self.expected.engine != VmEngine::Firecracker).then(|| {
+            self.machine_root
+                .join("guardian/restores")
+                .join(format!("{}.vmstate", self.manifest_digest.as_str()))
+        })
+    }
     pub(crate) fn binding(&self) -> Result<Digest> {
         sandsurf_protocol::digest(
             sandsurf_protocol::Domain::Snapshot,
@@ -70,9 +82,7 @@ impl RestorePreparation {
         // destruction and another preparation. Keep this same description
         // through installation and the actual VMM, never release/reacquire it.
         let disk_custody = crate::storage::attach(&disk)?;
-        let directory = snapshots.join(sandsurf_native::storage::object_name(
-            self.snapshot_id.as_str(),
-        ));
+        let directory = self.directory();
         for (name, artifact) in [
             ("system.ext4", &self.system_disk),
             ("snapshot.vmstate", &self.expected.snapshot_state),
@@ -106,13 +116,13 @@ impl RestorePreparation {
         if reconnect.len() > 1024 * 1024 {
             return Err(Error::Protocol("restore reconnect state exceeds its bound"));
         }
-        let staged_state = if self.expected.engine == VmEngine::Firecracker {
-            None // Firecracker retains mapped original memory under disk custody.
-        } else {
-            let restore_root = self.machine_root.join("guardian/restores");
-            crate::snapshots::private_directory(&restore_root)
-                .map_err(|_| Error::Protocol("restore staging root is not private"))?;
-            let staged = restore_root.join(format!("{}.vmstate", self.manifest_digest.as_str()));
+        if let Some(staged) = self.staged_state_path() {
+            crate::snapshots::private_directory(
+                staged
+                    .parent()
+                    .ok_or(Error::Protocol("native state copy has no owner"))?,
+            )
+            .map_err(|_| Error::Protocol("restore staging root is not private"))?;
             crate::snapshots::copy_and_verify(
                 &directory.join("snapshot.vmstate"),
                 &staged,
@@ -120,12 +130,9 @@ impl RestorePreparation {
                 Some(&self.expected.snapshot_state.digest),
             )
             .map_err(|_| Error::Protocol("saved machine state could not be staged"))?;
-            Some(staged)
-        };
+        }
         Ok(PreparedRestore {
             input: self,
-            directory,
-            staged_state,
             reconnect,
             disk_custody,
             snapshot_custody,
@@ -219,7 +226,7 @@ pub(crate) mod tests {
         let expected = input.clone();
         let prepared = input.execute().unwrap();
         assert_eq!(prepared.input, expected);
-        assert!(prepared.staged_state.is_none());
+        assert!(prepared.input.staged_state_path().is_none());
         let disk = root.0.join("disks/system.ext4");
         assert!(crate::storage::attach(&disk).is_err());
         let original_native_description = prepared.disk_custody.try_clone().unwrap();
@@ -255,11 +262,11 @@ pub(crate) mod tests {
         assert!(changed.execute().is_err());
         assert!(!root.0.join("guardian/restores").exists());
         let prepared = input.execute().unwrap();
-        let copy = prepared.staged_state.as_ref().unwrap();
-        assert_eq!(std::fs::read(copy).unwrap(), b"native saved state");
-        assert_ne!(copy.parent(), Some(prepared.directory.as_path()));
+        let copy = prepared.input.staged_state_path().unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"native saved state");
+        assert_ne!(copy.parent(), Some(prepared.input.directory().as_path()));
         assert_eq!(
-            std::fs::read(prepared.directory.join("snapshot.vmstate")).unwrap(),
+            std::fs::read(prepared.input.directory().join("snapshot.vmstate")).unwrap(),
             b"native saved state"
         );
         assert_eq!(prepared.reconnect, b"{}");

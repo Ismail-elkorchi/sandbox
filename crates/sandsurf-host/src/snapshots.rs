@@ -25,24 +25,16 @@ fn retirement_path(root: &Path, id: &SnapshotId) -> PathBuf {
     root.join(format!(".{}.retirement.json", object_name(id.as_str())))
 }
 
-/// Process-local immutable-input custody, not a transferable mutable disk
-/// lease. Native full-state inputs additionally depend on the original source
-/// machine disk custody until its VMM closes mapped memory files.
+/// Immutable-input custody transferable into the actual native consumer.
+/// Use kernel file-object share denial on Windows, not process-owned locks.
 fn object_lease(root: &Path, id: &SnapshotId, shared: bool) -> Result<File> {
     private_directory(root)?;
-    let file = open_write(&root.join(format!(".{}.object.lock", object_name(id.as_str()))))?;
-    let locked = if shared {
-        file.try_lock_shared()
+    let path = root.join(format!(".{}.object.lock", object_name(id.as_str())));
+    let file = if shared {
+        sandsurf_native::storage::read_lease(&path)?
     } else {
-        file.try_lock()
+        sandsurf_native::storage::disk_lease(&path)?
     };
-    locked.map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "snapshot payload has active readers or retirement",
-        ),
-        std::fs::TryLockError::Error(error) => error,
-    })?;
     Ok(file)
 }
 

@@ -43,6 +43,8 @@ fn main() {
             use std::io::Write;
             let root = std::path::PathBuf::from(args.next().unwrap());
             let custody = sandsurf_native::storage::disk_lease(&root.join("disk.lock")).unwrap();
+            let snapshot =
+                sandsurf_native::storage::read_lease(&root.join("snapshot.lock")).unwrap();
             let worker = OwnedWorker::launch_vm(
                 &std::env::current_exe().unwrap(),
                 &["hold".into()],
@@ -51,7 +53,7 @@ fn main() {
                     memory_bytes: 64 * 1024 * 1024,
                     processes: 1,
                 },
-                std::sync::Arc::new(custody),
+                vec![std::sync::Arc::new(custody), std::sync::Arc::new(snapshot)],
             )
             .unwrap();
             let mut ready =

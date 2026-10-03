@@ -20,7 +20,7 @@ pub(crate) struct QemuWorker {
     pub(crate) control: QemuControl,
     endpoints: Endpoints,
     startup_deadline: Instant,
-    _custody: Arc<File>,
+    _custody: Vec<Arc<File>>,
     _runtime: crate::qemu_runtime::Runtime,
 }
 impl QemuWorker {
@@ -30,7 +30,7 @@ impl QemuWorker {
         runtime_digest: &Digest,
         budget: ProcessBudget,
         guest_cpu_quota: u64,
-        custody: Arc<File>,
+        custody: Vec<Arc<File>>,
         restoring: bool,
     ) -> io::Result<Self> {
         config.validate()?;
@@ -73,7 +73,7 @@ impl QemuWorker {
             sandsurf_native::resource_broker::macos::launch_vm(
                 budget,
                 &arguments,
-                Arc::clone(&custody),
+                custody.clone(),
                 std::process::Stdio::null(),
             )?
         };
@@ -89,7 +89,7 @@ impl QemuWorker {
                 executable,
                 &admitted,
                 budget,
-                Arc::clone(&custody),
+                custody.clone(),
             )?
         };
         let mut child = child;

@@ -56,7 +56,7 @@ impl OwnedWorker {
         arguments: &[OsString],
         budget: ProcessBudget,
     ) -> io::Result<Self> {
-        Self::launch_inner(executable, arguments, budget, None, false, false)
+        Self::launch_inner(executable, arguments, budget, Vec::new(), false, false)
     }
 
     /// The only factory entry is this installed host executable with a closed
@@ -80,7 +80,7 @@ impl OwnedWorker {
         }
         let mut admitted = vec![mode.into()];
         admitted.extend_from_slice(arguments);
-        Self::launch_inner(executable, &admitted, budget, None, true, true)
+        Self::launch_inner(executable, &admitted, budget, Vec::new(), true, true)
     }
 
     /// Closed image-worker launch, retaining the pool lease before the child
@@ -99,7 +99,7 @@ impl OwnedWorker {
             executable,
             &admitted,
             crate::service_pool::ServicePool::Images.process_budget(),
-            Some(custody),
+            vec![custody],
             true,
             true,
         )
@@ -144,25 +144,29 @@ impl OwnedWorker {
     }
 
     /// Transfer the kernel file object's share-denial lease into the VMM. The
-    /// child inherits this one handle only, not stdio, grants or host endpoints.
-    /// `custody` comes from storage::disk_lease, never a guest-selected file.
+    /// child inherits this bounded closure only, not stdio/grants/host endpoints.
+    /// Inputs are original storage/input leases, never guest-selected handles.
     pub fn launch_vm(
         executable: &Path,
         arguments: &[OsString],
         budget: ProcessBudget,
-        custody: Arc<File>,
+        custody: Vec<Arc<File>>,
     ) -> io::Result<Self> {
         if budget.processes != 1 {
             return Err(invalid("a VMM cannot launch native descendants"));
         }
-        Self::launch_inner(executable, arguments, budget, Some(custody), false, true)
+        crate::resource_broker::validate_custody_count(
+            crate::resource_broker::WorkerKind::VirtualMachine,
+            custody.len(),
+        )?;
+        Self::launch_inner(executable, arguments, budget, custody, false, true)
     }
 
     fn launch_inner(
         executable: &Path,
         arguments: &[OsString],
         budget: ProcessBudget,
-        custody: Option<Arc<File>>,
+        custody: Vec<Arc<File>>,
         factory: bool,
         break_away: bool,
     ) -> io::Result<Self> {
@@ -192,14 +196,18 @@ impl OwnedWorker {
         } else {
             JobEnvelope::create_owned(budget)?
         };
-        let mut inherited = custody
-            .as_ref()
-            .map(|file| InheritedCustody::new(file))
-            .transpose()?;
+        let mut inherited = if custody.is_empty() {
+            None
+        } else {
+            Some(InheritedCustody::new(&custody)?)
+        };
         let mut admitted = arguments.to_vec();
         if factory && let Some(value) = &inherited {
             admitted.push("--owned-lease".into());
-            admitted.push((value.handle.0 as usize).to_string().into());
+            if value.handles.len() != 1 {
+                return Err(invalid("an image factory owns exactly one pool lease"));
+            }
+            admitted.push((value.handles[0].0 as usize).to_string().into());
         }
         let mut command_line =
             crate::windows_arguments::command_line(executable.as_os_str(), &admitted)?;
@@ -362,32 +370,40 @@ impl JobEnvelope {
 
 struct InheritedCustody {
     list: Vec<usize>,
-    handle: Box<Handle>,
+    handles: Vec<Handle>,
+    raw_handles: Vec<HANDLE>,
     initialized: bool,
 }
 
 impl InheritedCustody {
-    fn new(file: &File) -> io::Result<Self> {
-        let mut handle = std::ptr::null_mut();
-        // SAFETY: file and self process are retained; DuplicateHandle returns
-        // one new inheritable reference to the same kernel file object.
-        if unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                file.as_raw_handle().cast(),
-                GetCurrentProcess(),
-                &mut handle,
-                0,
-                1,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
+    fn new(files: &[Arc<File>]) -> io::Result<Self> {
+        if files.is_empty() || files.len() > crate::MAX_WORKER_CUSTODY {
+            return Err(invalid("invalid native custody closure"));
         }
-        // Attribute values must retain their address until list destruction.
-        // A boxed handle remains stable when this owner moves between frames.
-        let handle = Box::new(Handle(handle));
+        let mut handles = Vec::with_capacity(files.len());
+        for file in files {
+            let mut handle = std::ptr::null_mut();
+            // SAFETY: retained source and self process; each successful call
+            // returns one inheritable reference to the original kernel object.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    file.as_raw_handle().cast(),
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            handles.push(Handle(handle));
+        }
+        // This separate contiguous array never resizes while the attribute
+        // list exists; moving the owner does not move its heap allocation.
+        let raw_handles = handles.iter().map(|value| value.0).collect();
         let mut bytes = 0;
         // SAFETY: null sizing query with one attribute and writable byte count.
         let result =
@@ -401,7 +417,8 @@ impl InheritedCustody {
         }
         let mut value = Self {
             list: vec![0; bytes.div_ceil(size_of::<usize>())],
-            handle,
+            handles,
+            raw_handles,
             initialized: false,
         };
         // SAFETY: usize storage supplies HANDLE alignment and the queried full
@@ -414,14 +431,14 @@ impl InheritedCustody {
         }
         value.initialized = true;
         // SAFETY: the initialized list has one slot; its attribute is one live
-        // inheritable file handle. No broader inheritance or arbitrary PID.
+        // bounded inheritable file handles. No ambient inheritance/arbitrary PID.
         if unsafe {
             UpdateProcThreadAttribute(
                 value.list.as_mut_ptr().cast(),
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                (&raw const value.handle.0).cast(),
-                size_of::<HANDLE>(),
+                value.raw_handles.as_ptr().cast(),
+                value.raw_handles.len() * size_of::<HANDLE>(),
                 std::ptr::null_mut(),
                 std::ptr::null(),
             )

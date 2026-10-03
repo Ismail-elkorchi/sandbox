@@ -45,9 +45,9 @@ pub struct FirecrackerConfig {
     pub initial_ramdisk: Option<PathBuf>,
     /// Exclusively attached, host-owned writable Linux system disk.
     pub system_disk: PathBuf,
-    /// The storage owner's exclusive slot lease, transferred into the actual
+    /// Complete original storage/input custody transferred into the actual
     /// VMM. Never unlock a duplicate while a native attachment still exists.
-    pub storage_lease: std::sync::Arc<File>,
+    pub storage_custody: Vec<std::sync::Arc<File>>,
     pub authentication_image: PathBuf,
     pub owner_token: String,
     pub guest_cid: u32,
@@ -181,9 +181,21 @@ impl FirecrackerProcess {
             .map(|path| add_file(&mut files, path))
             .transpose()?;
         let system_fd_index = add_file(&mut files, &config.system_disk)?;
-        let storage_lease_fd_index = files.len();
-        let storage_lease_identity = file_identity(config.storage_lease.as_raw_fd())?;
-        files.push(config.storage_lease.try_clone()?);
+        if config.storage_custody.is_empty()
+            || config.storage_custody.len() > sandsurf_native::MAX_WORKER_CUSTODY
+        {
+            return Err(FirecrackerError::Invalid(
+                "invalid native custody closure".into(),
+            ));
+        }
+        let mut storage_custody = Vec::with_capacity(config.storage_custody.len());
+        for original in &config.storage_custody {
+            storage_custody.push(crate::launcher::CustodyDescriptor {
+                fd_index: files.len(),
+                identity: file_identity(original.as_raw_fd())?,
+            });
+            files.push(original.try_clone()?);
+        }
         let authentication_fd_index = add_file(&mut files, &config.authentication_image)?;
         let serial_input_fd_index = files.len();
         files.push(serial_slave);
@@ -229,8 +241,7 @@ impl FirecrackerProcess {
             kernel_fd_index,
             initramfs_fd_index,
             system_fd_index,
-            storage_lease_fd_index,
-            storage_lease_identity,
+            storage_custody,
             authentication_fd_index,
             serial_input_fd_index,
             configuration_fd_index,

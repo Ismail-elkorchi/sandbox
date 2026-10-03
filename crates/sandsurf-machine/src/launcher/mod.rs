@@ -41,8 +41,7 @@ pub(crate) struct VmmMachineSpec {
     pub firecracker_sha256: String,
     pub state_directory_fd_index: usize,
     pub state_directory_identity: FileIdentity,
-    pub storage_lease_fd_index: usize,
-    pub storage_lease_identity: FileIdentity,
+    pub storage_custody: Vec<CustodyDescriptor>,
     pub serial_input_fd_index: usize,
     pub args: Vec<String>,
     pub open_files_limit: u64,
@@ -66,8 +65,7 @@ pub struct VmmLaunchSpec {
     pub kernel_fd_index: usize,
     pub initramfs_fd_index: Option<usize>,
     pub system_fd_index: usize,
-    pub storage_lease_fd_index: usize,
-    pub storage_lease_identity: FileIdentity,
+    pub storage_custody: Vec<CustodyDescriptor>,
     pub authentication_fd_index: usize,
     pub serial_input_fd_index: usize,
     pub configuration_fd_index: usize,
@@ -100,6 +98,13 @@ pub struct FileIdentity {
     pub device: u64,
     pub inode: u64,
     pub mode: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustodyDescriptor {
+    pub fd_index: usize,
+    pub identity: FileIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,13 +530,21 @@ fn validate_vmm_spec(spec: &VmmLaunchSpec, descriptor_count: usize) -> io::Resul
         spec.firecracker_fd_index,
         spec.kernel_fd_index,
         spec.system_fd_index,
-        spec.storage_lease_fd_index,
         spec.authentication_fd_index,
         spec.serial_input_fd_index,
         spec.configuration_fd_index,
         spec.state_directory_fd_index,
         spec.kvm_fd_index,
     ];
+    if spec.storage_custody.is_empty()
+        || spec.storage_custody.len() > sandsurf_native::MAX_WORKER_CUSTODY
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid native custody closure",
+        ));
+    }
+    indexes.extend(spec.storage_custody.iter().map(|value| value.fd_index));
     if let Some(index) = spec.initramfs_fd_index {
         indexes.push(index);
     }
@@ -668,8 +681,7 @@ fn vmm_launch_spec(spec: &VmmLaunchSpec) -> VmmMachineSpec {
         firecracker_sha256: spec.firecracker_sha256.clone(),
         state_directory_fd_index: spec.state_directory_fd_index,
         state_directory_identity: spec.state_directory_identity,
-        storage_lease_fd_index: spec.storage_lease_fd_index,
-        storage_lease_identity: spec.storage_lease_identity,
+        storage_custody: spec.storage_custody.clone(),
         serial_input_fd_index: spec.serial_input_fd_index,
         args,
         open_files_limit: spec.open_files_limit,
@@ -689,7 +701,11 @@ fn namespace_init(
     // Keep custody until the VMM and its descendants have actually been reaped.
     // The VMM inherits a duplicate too, fencing replacement if this supervisor
     // dies while PID-namespace teardown is still in progress.
-    let storage_custody = files[spec.storage_lease_fd_index].try_clone()?;
+    let storage_custody = spec
+        .storage_custody
+        .iter()
+        .map(|value| files[value.fd_index].try_clone())
+        .collect::<io::Result<Vec<_>>>()?;
     let (exec_status_read, mut exec_status_write) = pipe_cloexec()?;
     // SAFETY: namespace init remains single-threaded, and the child immediately performs bounded setup then exec/_exit.
     let target_pid = unsafe { libc::fork() };
@@ -755,17 +771,19 @@ fn vmm_exec(spec: &VmmMachineSpec, files: &[File]) -> io::Result<()> {
     // VMM-created state and memory contain the whole guest, including secrets.
     // Admit them privately at creation, independently of the caller's umask.
     private_creation_mask();
-    let storage_lease = files.get(spec.storage_lease_fd_index).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "storage custody index is invalid",
-        )
-    })?;
-    if file_identity(storage_lease.as_raw_fd())? != spec.storage_lease_identity {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "storage custody identity changed",
-        ));
+    for custody in &spec.storage_custody {
+        let file = files.get(custody.fd_index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "storage custody index is invalid",
+            )
+        })?;
+        if file_identity(file.as_raw_fd())? != custody.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "storage custody identity changed",
+            ));
+        }
     }
     let state_directory = files.get(spec.state_directory_fd_index).ok_or_else(|| {
         io::Error::new(
@@ -854,9 +872,12 @@ fn vmm_exec(spec: &VmmMachineSpec, files: &[File]) -> io::Result<()> {
     apply_seccomp().map_err(|error| context("install seccomp filter", error))?;
 
     prepare_descriptors_for_exec().map_err(|error| context("close ambient descriptors", error))?;
-    // This sole host-control descriptor is not mounted or exposed as virtual
-    // hardware. It carries disk custody, never host API or signing authority.
-    namespace::inherit(storage_lease).map_err(|error| context("retain disk custody", error))?;
+    // These descriptions are not mounted or exposed as virtual hardware.
+    // They retain the complete input closure, never host API/signing authority.
+    for custody in &spec.storage_custody {
+        namespace::inherit(&files[custody.fd_index])
+            .map_err(|error| context("retain native input custody", error))?;
+    }
 
     let executable_name = CString::new("/.sandsurf/firecracker").map_err(invalid_data)?;
     let mut arguments = Vec::with_capacity(spec.args.len() + 1);
@@ -966,7 +987,12 @@ fn validate_vmm_machine_spec(spec: &VmmMachineSpec, descriptor_count: usize) -> 
         || spec.nic_handoff_fd_index >= descriptor_count
         || spec.firecracker_fd_index >= descriptor_count
         || spec.state_directory_fd_index >= descriptor_count
-        || spec.storage_lease_fd_index >= descriptor_count
+        || spec.storage_custody.is_empty()
+        || spec.storage_custody.len() > sandsurf_native::MAX_WORKER_CUSTODY
+        || spec
+            .storage_custody
+            .iter()
+            .any(|value| value.fd_index >= descriptor_count)
         || spec.serial_input_fd_index >= descriptor_count
         || spec
             .mounts
@@ -1897,41 +1923,62 @@ mod tests {
                 .as_nanos()
         ));
         create_private_directory(&root).unwrap();
-        let path = root.join("storage.lock");
-        let owner = create_private_file(&path).unwrap();
-        owner.try_lock().unwrap();
+        let paths =
+            ["storage.lock", "snapshot.lock", "image-pool.lock"].map(|name| root.join(name));
+        let originals: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                if index == 1 {
+                    return sandsurf_native::storage::read_lease(path).unwrap();
+                }
+                let file = create_private_file(path).unwrap();
+                file.try_lock().unwrap();
+                file
+            })
+            .collect();
         let (sender, receiver) = UnixStream::pair().unwrap();
-        send_fds(sender.as_raw_fd(), 0, &[owner]).unwrap();
+        send_fds(sender.as_raw_fd(), 0, &originals).unwrap();
+        drop(originals);
         let (_, files) = receive_fds(receiver.as_raw_fd()).unwrap();
-        let custody = files.into_iter().next().unwrap();
         let mut command = Command::new("/bin/cat");
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let inherited = custody.try_clone().unwrap();
+        let inherited: Vec<_> = files.iter().map(|file| file.try_clone().unwrap()).collect();
         // SAFETY: only async-signal-safe descriptor flag changes occur between
         // fork and exec; inherited owns the intended storage description.
         unsafe {
             command.pre_exec(move || {
                 prepare_descriptors_for_exec()?;
-                namespace::inherit(&inherited)
+                for file in &inherited {
+                    namespace::inherit(file)?;
+                }
+                Ok(())
             });
         }
         let mut child = ChildOwner(command.spawn().unwrap());
         drop(command);
-        drop(custody);
+        drop(files);
         sender.shutdown(std::net::Shutdown::Both).unwrap();
         // A fresh description cannot mutate storage despite every sender-side
         // description and transport being gone. Only actual native exit frees it.
-        let next = open_private_file(&path, PrivateFileAccess::ReadWrite).unwrap();
-        assert!(matches!(
-            next.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
+        let next: Vec<_> = paths
+            .iter()
+            .map(|path| open_private_file(path, PrivateFileAccess::ReadWrite).unwrap())
+            .collect();
+        for file in &next {
+            assert!(matches!(
+                file.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        }
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        next.try_lock().unwrap();
+        for file in &next {
+            file.try_lock().unwrap();
+        }
         drop(next);
         fs::remove_dir_all(root).unwrap();
     }

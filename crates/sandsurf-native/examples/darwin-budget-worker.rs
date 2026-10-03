@@ -12,6 +12,11 @@ fn main() {
         WorkerKind::Api | WorkerKind::VirtualMachine | WorkerKind::Images
     ));
     let budget = enter_worker().unwrap();
+    if role == WorkerKind::VirtualMachine {
+        assert_eq!(args.next().as_deref(), Some("--owned-leases"));
+        let count: usize = args.next().unwrap().parse().unwrap();
+        assert!((1..=sandsurf_native::MAX_WORKER_CUSTODY).contains(&count));
+    }
     match args.next().as_deref() {
         Some("cpu") => {
             let usage = sandsurf_native::resource_broker::macos::current_worker_usage().unwrap();

@@ -18,6 +18,9 @@ pub mod socket_io;
 pub mod storage;
 pub mod storage_usage;
 pub mod volume;
+/// Original file descriptions retained by one native worker, never reacquired
+/// from paths. Bounds apply before descriptor/handle transfer on every host.
+pub const MAX_WORKER_CUSTODY: usize = 8;
 #[cfg(any(windows, test))]
 mod windows_arguments;
 

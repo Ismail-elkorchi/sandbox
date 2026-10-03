@@ -34,6 +34,35 @@ pub fn disk_lease(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Shared immutable-input custody follows the original native file object.
+/// Windows uses read-only share denial, not process-owned LockFileEx locks.
+/// Unix uses shared flock on an original open description. Every retirement
+/// must acquire the exclusive disk_lease of this same private lease name.
+pub fn read_lease(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        crate::local::read_lease(path)
+    }
+    #[cfg(unix)]
+    {
+        let lease = match crate::local::create_private_file(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                crate::local::open_private_file(path, crate::PrivateFileAccess::ReadOnly)?
+            }
+            Err(error) => return Err(error),
+        };
+        lease.try_lock_shared().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "immutable input has an exclusive owner",
+            ),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(lease)
+    }
+}
+
 /// Check the received original lease against the admitted private name without
 /// locking another description. Retention, not pathname observation, owns it.
 pub fn verify_transferred_lease(file: &File, path: &Path) -> io::Result<()> {
@@ -290,6 +319,46 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn immutable_readers_share_original_custody_and_exclude_retirement_until_last_close() {
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-read-custody-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        crate::local::create_private_directory(&root).unwrap();
+        let path = root.join("object.lock");
+        let first = read_lease(&path).unwrap();
+        let second = read_lease(&path).unwrap();
+        let original = first.try_clone().unwrap();
+        verify_transferred_lease(&original, &path).unwrap();
+        assert_eq!(
+            disk_lease(&path).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        drop(second);
+        #[cfg(windows)]
+        assert!(
+            fs::remove_file(&path).is_err(),
+            "the inherited read object must deny deletion too"
+        );
+        assert_eq!(
+            disk_lease(&path).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(original);
+        let writer = disk_lease(&path).unwrap();
+        assert_eq!(
+            read_lease(&path).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(writer);
+        drop(read_lease(&path).unwrap());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn transferred_custody_verification_never_reacquires_or_releases_the_slot() {

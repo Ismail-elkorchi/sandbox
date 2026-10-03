@@ -1066,22 +1066,20 @@ impl LinuxGuardianEffect {
         &mut self,
         prepared: crate::restore_preparation::PreparedRestore,
     ) -> ControlResult<NativeSnapshotResponse> {
-        if self.prepare_full_restore(prepared.input.clone())? != prepared.input
-            || prepared.staged_state.is_some()
-        {
+        if self.prepare_full_restore(prepared.input.clone())? != prepared.input {
             return Err(ControlError::Protocol(
                 "prepared restore native binding changed",
             ));
         }
         let preparation_digest = prepared.input.binding()?;
         let response = prepared.input.evidence()?;
+        let directory = prepared.input.directory();
         let crate::restore_preparation::RestorePreparation {
             snapshot_id,
             manifest_digest,
             expected,
             ..
         } = prepared.input;
-        let directory = prepared.directory;
         let reconnect: ReconnectState = serde_json::from_slice(&prepared.reconnect)
             .map_err(|_| ControlError::Protocol("restore reconnect state is invalid"))?;
         if reconnect.format_version != 1 || reconnect.snapshot_id != snapshot_id {
@@ -1490,7 +1488,7 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
             machine_id,
             generation,
             resources,
-            storage_lease,
+            vec![storage_lease],
             boot_directory,
             boot,
         )
@@ -1567,13 +1565,16 @@ impl FirecrackerGenerationFactory for LinuxGenerationFactory {
         }
         // StageRestore already verified the restored disk against the capture.
         // Resume does not install an OS, customize identities, or read /boot.
-        let storage_lease = Arc::clone(&source.disk_custody);
+        let storage_custody = vec![
+            Arc::clone(&source.disk_custody),
+            Arc::clone(&source.snapshot_custody),
+        ];
         let resources = self.config.resources.clone();
         let configuration = self.configuration_from_boot(
             machine_id,
             generation,
             &resources,
-            storage_lease,
+            storage_custody,
             boot_directory,
             reconnect.boot.clone(),
         )?;
@@ -1671,7 +1672,7 @@ impl LinuxGenerationFactory {
         machine_id: &MachineId,
         generation: Counter,
         resources: &Resources,
-        storage_lease: Arc<File>,
+        storage_custody: Vec<Arc<File>>,
         boot_directory: PathBuf,
         boot: sandsurf_image::boot::FrozenBoot,
     ) -> Result<FirecrackerConfig, Digest> {
@@ -1717,7 +1718,7 @@ impl LinuxGenerationFactory {
             kernel_image: kernel,
             initial_ramdisk,
             system_disk: self.system_disk.clone(),
-            storage_lease,
+            storage_custody,
             authentication_image,
             owner_token,
             guest_cid: self.config.guest_cid,
@@ -2021,8 +2022,18 @@ mod storage_tests {
             root.join("snapshot/boot/kernel")
         );
         assert!(configuration.initial_ramdisk.is_none());
+        assert_eq!(configuration.storage_custody.len(), 2);
+        assert!(Arc::ptr_eq(
+            &configuration.storage_custody[0],
+            &source.disk_custody
+        ));
+        assert!(Arc::ptr_eq(
+            &configuration.storage_custody[1],
+            &source.snapshot_custody
+        ));
         assert_eq!(fs::read(&disk).unwrap(), [7; 4096]);
         drop(configuration);
+        drop(source);
         drop(factory);
         fs::remove_dir_all(root).unwrap();
     }

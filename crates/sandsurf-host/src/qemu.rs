@@ -373,8 +373,10 @@ impl QemuGuardianEffect {
                 .restore_custody()
                 .ok_or_else(|| bytes_digest(b"qemu-restore-custody-missing"))?
         } else {
-            crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
-                .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?
+            vec![
+                crate::storage::attach(&self.machine_root.join("disks/system.ext4"))
+                    .map_err(|_| bytes_digest(b"qemu-system-disk-attachment-failed"))?,
+            ]
         };
         let (kernel, initramfs) = sandsurf_image::boot::paths(&boot_directory, &boot);
         sandsurf_image::boot::validate_kernel(&kernel, boot.architecture)
@@ -676,9 +678,12 @@ impl QemuGuardianEffect {
         }
         let preparation_digest = prepared.input.binding()?;
         let response = prepared.input.evidence()?;
-        let staged_state = prepared.staged_state.ok_or(ControlError::Protocol(
-            "prepared restore has no native state copy",
-        ))?;
+        let staged_state = prepared
+            .input
+            .staged_state_path()
+            .ok_or(ControlError::Protocol(
+                "prepared restore has no native state copy",
+            ))?;
         let crate::restore_preparation::RestorePreparation {
             snapshot_id,
             manifest_digest,

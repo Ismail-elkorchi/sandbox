@@ -169,6 +169,20 @@ impl WorkerKind {
     }
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn validate_custody_count(kind: WorkerKind, count: usize) -> io::Result<()> {
+    let valid = match kind {
+        WorkerKind::VirtualMachine => (1..=crate::MAX_WORKER_CUSTODY).contains(&count),
+        WorkerKind::Images => count == 1,
+        WorkerKind::Api | WorkerKind::Supervisor | WorkerKind::Guardian => count == 0,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid("native custody count differs from worker role"))
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn argument_bounds(kind: WorkerKind) -> (usize, usize) {
     match kind {
@@ -526,7 +540,7 @@ pub mod macos {
                 "this worker role requires transferred storage custody",
             ));
         }
-        launch_inner(kind, budget, arguments, None, stdin, stdout, stderr)
+        launch_inner(kind, budget, arguments, Vec::new(), stdin, stdout, stderr)
     }
 
     /// One admitted image slot is acquired before fork and follows the worker,
@@ -539,7 +553,7 @@ pub mod macos {
             WorkerKind::Images,
             crate::service_pool::ServicePool::Images.process_budget(),
             arguments,
-            Some(custody),
+            vec![custody],
             Stdio::null(),
             Stdio::null(),
             Stdio::null(),
@@ -551,14 +565,14 @@ pub mod macos {
     pub fn launch_vm(
         budget: ProcessBudget,
         arguments: &[OsString],
-        custody: Arc<fs::File>,
+        custody: Vec<Arc<fs::File>>,
         stderr: Stdio,
     ) -> io::Result<OwnedWorker> {
         launch_inner(
             WorkerKind::VirtualMachine,
             budget,
             arguments,
-            Some(custody),
+            custody,
             Stdio::null(),
             Stdio::null(),
             stderr,
@@ -569,12 +583,13 @@ pub mod macos {
         kind: WorkerKind,
         budget: ProcessBudget,
         arguments: &[OsString],
-        custody: Option<Arc<fs::File>>,
+        custody: Vec<Arc<fs::File>>,
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
     ) -> io::Result<OwnedWorker> {
         validate_arguments(kind, arguments)?;
+        validate_custody_count(kind, custody.len())?;
         let applied = worker_budget(budget)?;
         protected_installed("sandsurf-resource-broker", true)?;
         let (mut lease, peer) = UnixStream::pair()?;
@@ -583,7 +598,7 @@ pub mod macos {
         // Otherwise dup2 of one source could overwrite the other source.
         let duplicate = |fd| -> io::Result<OwnedFd> {
             // SAFETY: a retained source FD, owned CLOEXEC duplicate and scalar bound.
-            let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 16) };
+            let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 32) };
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -592,11 +607,11 @@ pub mod macos {
         };
         let source = duplicate(peer.as_raw_fd())?;
         let storage = custody
-            .as_ref()
+            .iter()
             .map(|file| duplicate(file.as_raw_fd()))
-            .transpose()?;
+            .collect::<io::Result<Vec<_>>>()?;
         let fd = source.as_raw_fd();
-        let storage_fd = storage.as_ref().map(AsRawFd::as_raw_fd);
+        let storage_fds: Vec<_> = storage.iter().map(AsRawFd::as_raw_fd).collect();
         let mut command = Command::new(BROKER);
         command
             .env_clear()
@@ -604,6 +619,7 @@ pub mod macos {
                 kind.name(),
                 &budget.cpu_quota_micros.to_string(),
                 &budget.memory_bytes.to_string(),
+                &custody.len().to_string(),
             ])
             .args(arguments)
             .stdin(stdin)
@@ -617,12 +633,14 @@ pub mod macos {
                     return Err(io::Error::last_os_error());
                 }
                 libc::close(3);
-                if let Some(fd) = storage_fd {
-                    if libc::dup2(fd, 5) < 0 || libc::fcntl(5, libc::F_SETFD, 0) < 0 {
+                for (index, fd) in storage_fds.iter().enumerate() {
+                    let target = 5 + index as libc::c_int;
+                    if libc::dup2(*fd, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                } else {
-                    libc::close(5);
+                }
+                for index in storage_fds.len()..crate::MAX_WORKER_CUSTODY {
+                    libc::close(5 + index as libc::c_int);
                 }
                 Ok(())
             });
@@ -719,7 +737,7 @@ pub mod macos {
             if fd < 0 {
                 return Err(io::Error::other("invalid native descriptor inventory"));
             }
-            if fd >= 3 && fd != 4 && fd != 5 {
+            if fd >= 3 && fd != 4 && !(5..5 + crate::MAX_WORKER_CUSTODY as i32).contains(&fd) {
                 // SAFETY: the single-threaded broker exclusively owns each
                 // enumerated descriptor; no concurrent code can reuse an FD.
                 if unsafe { libc::close(fd) } != 0 {
@@ -849,14 +867,17 @@ pub mod macos {
             processes: 2,
         };
         let budget = worker_budget(budget)?;
+        let custody_count = usize::try_from(number(args.next())?)
+            .map_err(|_| invalid("invalid native custody count"))?;
+        validate_custody_count(kind, custody_count)?;
         let args: Vec<_> = args.take(argument_bounds(kind).0 + 1).collect();
         validate_arguments(kind, &args)?;
-        if matches!(kind, WorkerKind::VirtualMachine | WorkerKind::Images) {
+        for index in 0..custody_count {
             // SAFETY: initialized native stat output for the inherited lease,
             // never a host pathname opened with elevated credentials.
             let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: fstat checks the scalar FD before bounded output write.
-            if unsafe { libc::fstat(5, &mut metadata) } != 0
+            if unsafe { libc::fstat(5 + index as i32, &mut metadata) } != 0
                 || metadata.st_mode & libc::S_IFMT != libc::S_IFREG
                 || metadata.st_uid != uid
                 || metadata.st_nlink != 1
@@ -866,10 +887,11 @@ pub mod macos {
                     "native worker has no private transferred storage lease",
                 ));
             }
-        } else {
+        }
+        for index in custody_count..crate::MAX_WORKER_CUSTODY {
             // SAFETY: the single-threaded broker discards any caller-selected
             // storage descriptor; ordinary service workers inherit no custody.
-            unsafe { libc::close(5) };
+            unsafe { libc::close(5 + index as i32) };
         }
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
@@ -887,11 +909,11 @@ pub mod macos {
         timed(&gate)?;
         let fd = peer.as_raw_fd();
         let mut command = Command::new(program);
-        command
-            .env_clear()
-            .arg("--broker-worker")
-            .arg(kind.name())
-            .args(&args);
+        command.env_clear().arg("--broker-worker").arg(kind.name());
+        if kind == WorkerKind::VirtualMachine {
+            command.arg("--owned-leases").arg(custody_count.to_string());
+        }
+        command.args(&args);
         // SAFETY: a fresh child calls only async-signal-safe credential/FD
         // operations before exec. No user data is opened with root credentials.
         unsafe {
@@ -1083,6 +1105,27 @@ pub mod macos {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custody_closures_have_one_bounded_role_contract() {
+        use super::{WorkerKind, validate_custody_count};
+        for count in 0..=crate::MAX_WORKER_CUSTODY + 1 {
+            assert_eq!(
+                validate_custody_count(WorkerKind::VirtualMachine, count).is_ok(),
+                (1..=crate::MAX_WORKER_CUSTODY).contains(&count)
+            );
+            assert_eq!(
+                validate_custody_count(WorkerKind::Images, count).is_ok(),
+                count == 1
+            );
+            for kind in [
+                WorkerKind::Api,
+                WorkerKind::Supervisor,
+                WorkerKind::Guardian,
+            ] {
+                assert_eq!(validate_custody_count(kind, count).is_ok(), count == 0);
+            }
+        }
+    }
     use super::*;
     #[test]
     fn usage_is_fixed_bounded_and_distinguishes_absence_from_zero() {

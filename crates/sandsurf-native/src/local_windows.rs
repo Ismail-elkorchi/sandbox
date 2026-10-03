@@ -503,6 +503,27 @@ pub(crate) fn disk_lease(path: &Path) -> io::Result<File> {
     })
 }
 
+pub(crate) fn read_lease(path: &Path) -> io::Result<File> {
+    // Creation establishes only the private name, not reader custody. Close
+    // its writable handle before opening the read-only shared object. A writer
+    // winning that interval makes this admission fail, never coexist unsafely.
+    match create_file(path, FILE_SHARE_READ | FILE_SHARE_WRITE) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    open_file(path, crate::PrivateFileAccess::ReadOnly, FILE_SHARE_READ).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(32 | 33)) {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "immutable input has an exclusive owner",
+            )
+        } else {
+            error
+        }
+    })
+}
+
 /// Compare custody with a read-only observation of its admitted name. This
 /// neither reacquires the writer's share-denial lease nor creates a new owner.
 pub(crate) fn verify_transferred_lease(file: &File, path: &Path) -> io::Result<()> {
