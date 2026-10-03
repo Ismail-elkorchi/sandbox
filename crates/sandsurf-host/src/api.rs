@@ -221,6 +221,10 @@ pub enum HostRequest {
     GetImageImport {
         operation_id: OperationId,
     },
+    CancelImageImport {
+        operation_id: OperationId,
+        expected_request: Digest,
+    },
     ReleaseImage {
         digest: Digest,
         operation_id: OperationId,

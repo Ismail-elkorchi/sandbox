@@ -30,6 +30,22 @@ export class Operation {
     this.#observation = observation;
     return observation;
   }
+
+  /** Cancel an image import before candidate adoption. Physical cleanup may
+   * remain pending while the original native worker still owns its inputs. */
+  async cancel(): Promise<OperationInspection> {
+    const expected = this.#observation;
+    if (expected.owner !== "host-authority" || expected.observation.kind !== "image-import" || expected.requestDigest === null) {
+      throw new TypeError("only a host image import supports cancellation");
+    }
+    const response = await this.#host[transport]({ kind: "cancel-image-import", operationId: this.id, expectedRequest: expected.requestDigest });
+    if (response.kind !== "image-import") throw protocol("image cancellation response");
+    const observation = parseOperationRecord({ kind: "image-import", value: response.operation }, this.id, undefined, "host-authority");
+    if (observation.requestDigest !== expected.requestDigest || observation.observation.kind !== "image-import" ||
+        (observation.observation.phase !== "cancelling" && observation.observation.phase !== "cancelled")) throw protocol("image cancellation binding or phase");
+    this.#observation = observation;
+    return observation;
+  }
 }
 
 async function inspectOperation(host: Sandsurf, operationId: string, machineId?: string): Promise<OperationInspection | undefined> {

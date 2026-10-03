@@ -22,6 +22,11 @@ impl SocketConnection {
                     component,
                     std::path::Component::CurDir | std::path::Component::ParentDir
                 )
+                    // Verbatim Windows prefixes leave dot components as
+                    // Normal. Reject their lexical spelling before any OS
+                    // resolution rather than relying on canonical equality.
+                    || component.as_os_str() == "."
+                    || component.as_os_str() == ".."
             })
             || timeout.is_zero()
             || timeout > Duration::from_secs(300)

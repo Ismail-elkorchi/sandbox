@@ -1927,15 +1927,15 @@ fn image_recipes_reopen_exactly_and_pending_dependencies_cannot_be_reclaimed() {
     .unwrap();
     for (query, index) in [
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND operation>'' ORDER BY operation LIMIT 32",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$') NOT IN ('published','cancelled') AND operation>'' ORDER BY operation LIMIT 32",
             "pending_image_imports",
         ),
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND dependency_image='image'",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$') NOT IN ('published','cancelled') AND dependency_image='image'",
             "pending_import_image",
         ),
         (
-            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND dependency_snapshot='snapshot'",
+            "EXPLAIN QUERY PLAN SELECT operation FROM image_imports WHERE json_extract(phase,'$') NOT IN ('published','cancelled') AND dependency_snapshot='snapshot'",
             "pending_import_snapshot",
         ),
         (
@@ -2239,6 +2239,190 @@ fn image_import_admission_and_publication_are_durable_and_idempotent() {
             .complete_image_release(&release_operation, &release_digest)
             .unwrap()
             .cleanup_pending
+    );
+}
+
+#[test]
+fn image_cancellation_is_durable_and_keeps_dependencies_until_physical_completion() {
+    let root = TempRoot::new();
+    let path = root.0.join("host");
+    let mut host =
+        HostCatalog::create(&path, "cancel-host".try_into().unwrap(), catalog_limits()).unwrap();
+    let boot = publish_image(&mut host, "boot", "boot-image", 100);
+    let operation: OperationId = "cancel-image".try_into().unwrap();
+    let input = ImageImportInput::Oci {
+        source: OciSource::Layout {
+            path: root.0.join("external-layout"),
+        },
+        recipe: MachineImageRecipe {
+            boot_image_digest: boot.digest.clone(),
+        },
+        platform: "linux/amd64".into(),
+    };
+    let request = input.request_digest(&operation).unwrap();
+    let approval = Approval {
+        id: "approve-cancel-image".try_into().unwrap(),
+        request_digest: request.clone(),
+    };
+    host.admit_image_import(operation.clone(), input.clone(), approval.clone())
+        .unwrap();
+    assert!(
+        host.complete_image_cancellation(&operation, &request)
+            .is_err()
+    );
+    assert!(
+        host.cancel_image_import(&operation, &hash("other-request"))
+            .is_err()
+    );
+    let cancelling = host.cancel_image_import(&operation, &request).unwrap();
+    assert_eq!(cancelling.phase, ImageImportPhase::Cancelling);
+    assert_eq!(
+        host.cancel_image_import(&operation, &request).unwrap(),
+        cancelling
+    );
+    let release: OperationId = "release-boot".try_into().unwrap();
+    let release_approval = Approval {
+        id: "approve-release-boot".try_into().unwrap(),
+        request_digest: digest(
+            Domain::Image,
+            &("sandsurf-release-image-v1", &release, &boot.digest),
+        )
+        .unwrap(),
+    };
+    assert!(
+        host.release_image(
+            release.clone(),
+            boot.digest.clone(),
+            release_approval.clone()
+        )
+        .is_err()
+    );
+    assert!(
+        host.prepare_image_import(&operation, &request, image("late-worker", 100))
+            .is_err()
+    );
+    drop(host);
+    let mut host = HostCatalog::open(&path).unwrap();
+    assert_eq!(
+        host.pending_image_imports(None, n(10)).unwrap(),
+        vec![cancelling]
+    );
+    let cancelled = host
+        .complete_image_cancellation(&operation, &request)
+        .unwrap();
+    assert_eq!(cancelled.phase, ImageImportPhase::Cancelled);
+    assert!(cancelled.image.is_none());
+    assert_eq!(
+        host.admit_image_import(operation.clone(), input, approval)
+            .unwrap(),
+        cancelled
+    );
+    assert_eq!(
+        host.cancel_image_import(&operation, &request).unwrap(),
+        cancelled
+    );
+    assert_eq!(
+        host.complete_image_cancellation(&operation, &request)
+            .unwrap(),
+        cancelled
+    );
+    assert!(host.pending_image_imports(None, n(10)).unwrap().is_empty());
+    assert!(
+        host.prepare_image_import(&operation, &request, image("late-worker", 100))
+            .is_err()
+    );
+    host.release_image(release, boot.digest, release_approval)
+        .unwrap();
+    let adopted: OperationId = "boot".try_into().unwrap();
+    let record = host.image_import(&adopted).unwrap().unwrap();
+    assert!(
+        host.cancel_image_import(&adopted, &record.request_digest)
+            .is_err()
+    );
+    drop(host);
+    let host = HostCatalog::open(&path).unwrap();
+    assert_eq!(host.image_import(&operation).unwrap(), Some(cancelled));
+}
+
+#[test]
+fn image_cancellation_discharges_snapshot_inputs_but_never_adopted_candidates() {
+    let mut fixture = Fixture::new();
+    let snapshot = ready_snapshot(&mut fixture, "cancel-source");
+    let operation: OperationId = "cancel-publication".try_into().unwrap();
+    let input = ImageImportInput::PublishSnapshot {
+        snapshot: Box::new(snapshot.clone()),
+        allow_sensitive: false,
+    };
+    let request = input.request_digest(&operation).unwrap();
+    fixture
+        .host
+        .admit_image_import(
+            operation.clone(),
+            input,
+            Approval {
+                id: "approve-cancel-publication".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    fixture
+        .host
+        .cancel_image_import(&operation, &request)
+        .unwrap();
+    let release: OperationId = "release-cancel-source".try_into().unwrap();
+    let approval = Approval {
+        id: "approve-release-cancel-source".try_into().unwrap(),
+        request_digest: digest(
+            Domain::Snapshot,
+            &(
+                "sandsurf-release-snapshot-v1",
+                &release,
+                &snapshot.request.id,
+            ),
+        )
+        .unwrap(),
+    };
+    assert!(
+        fixture
+            .host
+            .release_snapshot(
+                release.clone(),
+                snapshot.request.id.clone(),
+                approval.clone()
+            )
+            .is_err()
+    );
+    fixture
+        .host
+        .complete_image_cancellation(&operation, &request)
+        .unwrap();
+    fixture
+        .host
+        .release_snapshot(release, snapshot.request.id, approval)
+        .unwrap();
+    let adopted: OperationId = "adopted".try_into().unwrap();
+    let input = image_input(hash("adopted-input"));
+    let request = input.request_digest(&adopted).unwrap();
+    fixture
+        .host
+        .admit_image_import(
+            adopted.clone(),
+            input,
+            Approval {
+                id: "approve-adopted".try_into().unwrap(),
+                request_digest: request.clone(),
+            },
+        )
+        .unwrap();
+    fixture
+        .host
+        .prepare_image_import(&adopted, &request, image("adopted", 100))
+        .unwrap();
+    assert!(
+        fixture
+            .host
+            .cancel_image_import(&adopted, &request)
+            .is_err()
     );
 }
 

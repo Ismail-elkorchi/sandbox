@@ -275,6 +275,14 @@ impl HostService {
             HostRequest::GetImageImport { operation_id } => {
                 self.prepare_image_lookup(operation_id, ImageLookupReply::ImageImport)
             }
+            HostRequest::CancelImageImport {
+                operation_id,
+                expected_request,
+            } => self
+                .catalog
+                .cancel_image_import(&operation_id, &expected_request)
+                .map_err(HostError::from)
+                .and_then(|record| self.prepare_image_materialization(record)),
             request @ HostRequest::ReleaseImage { .. } => self.prepare_image_release(request),
             HostRequest::ReleaseSnapshot {
                 snapshot_id,
@@ -964,6 +972,23 @@ impl HostService {
         &self,
         record: sandsurf_state::ImageImportRecord,
     ) -> Result<HostDispatch> {
+        match record.phase {
+            sandsurf_state::ImageImportPhase::Cancelling => {
+                return Ok(HostDispatch::Task(Box::new(HostTask::ImageCancel {
+                    root: self.root.clone(),
+                    record,
+                    reply: ImageLookupReply::ImageImport,
+                })));
+            }
+            sandsurf_state::ImageImportPhase::Cancelled
+            | sandsurf_state::ImageImportPhase::Published => {
+                return Ok(HostDispatch::Ready(Box::new(HostResponse::ImageImport {
+                    operation: record,
+                })));
+            }
+            sandsurf_state::ImageImportPhase::Admitted
+            | sandsurf_state::ImageImportPhase::Prepared => {}
+        }
         if record.phase == sandsurf_state::ImageImportPhase::Prepared {
             return Ok(self.prepare_image_publication(record, ImageLookupReply::ImageImport));
         }
@@ -1295,6 +1320,7 @@ impl HostService {
             )),
             HostRequest::GetHostOperation { .. }
             | HostRequest::GetImageImport { .. }
+            | HostRequest::CancelImageImport { .. }
             | HostRequest::ReleaseImage { .. } => Err(HostError::Invalid(
                 "image verification and cleanup require detached effects",
             )),
@@ -1684,14 +1710,26 @@ impl HostService {
         operation: OperationId,
         reply: ImageLookupReply,
     ) -> Result<HostDispatch> {
-        if let Some(record) = self.catalog.image_import(&operation)?
-            && record.phase != sandsurf_state::ImageImportPhase::Published
-        {
-            return Ok(HostDispatch::Task(Box::new(HostTask::ImageInspect {
-                root: self.root.clone(),
-                record,
-                reply,
-            })));
+        if let Some(record) = self.catalog.image_import(&operation)? {
+            match record.phase {
+                sandsurf_state::ImageImportPhase::Cancelling => {
+                    return Ok(HostDispatch::Task(Box::new(HostTask::ImageCancel {
+                        root: self.root.clone(),
+                        record,
+                        reply,
+                    })));
+                }
+                sandsurf_state::ImageImportPhase::Admitted
+                | sandsurf_state::ImageImportPhase::Prepared => {
+                    return Ok(HostDispatch::Task(Box::new(HostTask::ImageInspect {
+                        root: self.root.clone(),
+                        record,
+                        reply,
+                    })));
+                }
+                sandsurf_state::ImageImportPhase::Published
+                | sandsurf_state::ImageImportPhase::Cancelled => {}
+            }
         }
         Ok(HostDispatch::Ready(Box::new(
             self.image_lookup_response(&operation, reply)?,
@@ -2008,11 +2046,61 @@ impl HostService {
 
     fn complete_task(&mut self, completion: HostTaskCompletion) -> Result<HostDispatch> {
         match completion {
+            HostTaskCompletion::ImageCancel {
+                record,
+                reply,
+                result,
+            } => {
+                let current =
+                    self.catalog
+                        .image_import(&record.operation_id)?
+                        .ok_or(HostError::Invalid(
+                            "image cancellation admission disappeared",
+                        ))?;
+                if current.request_digest != record.request_digest {
+                    return Err(HostError::Invalid(
+                        "image cancellation admission binding changed",
+                    ));
+                }
+                match result {
+                    Ok(_custody) => {
+                        self.catalog.complete_image_cancellation(
+                            &record.operation_id,
+                            &record.request_digest,
+                        )?;
+                    }
+                    Err(HostError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(HostError::Image(crate::images::ImageBuildError::Io(error)))
+                        if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+                Ok(HostDispatch::Ready(Box::new(
+                    self.image_lookup_response(&record.operation_id, reply)?,
+                )))
+            }
             HostTaskCompletion::Image {
                 operation,
                 request_digest,
                 result,
             } => {
+                let current = self
+                    .catalog
+                    .image_import(&operation)?
+                    .ok_or(HostError::Invalid(
+                        "image materialization admission disappeared",
+                    ))?;
+                if current.request_digest != request_digest {
+                    return Err(HostError::Invalid(
+                        "image materialization admission binding changed",
+                    ));
+                }
+                if matches!(
+                    current.phase,
+                    sandsurf_state::ImageImportPhase::Cancelling
+                        | sandsurf_state::ImageImportPhase::Cancelled
+                ) {
+                    return self.prepare_image_materialization(current);
+                }
                 let record =
                     self.catalog
                         .prepare_image_import(&operation, &request_digest, result?)?;
@@ -2037,7 +2125,12 @@ impl HostService {
                 if current.request_digest != record.request_digest {
                     return Err(HostError::Invalid("image lookup binding changed"));
                 }
-                if current.phase == sandsurf_state::ImageImportPhase::Published {
+                if matches!(
+                    current.phase,
+                    sandsurf_state::ImageImportPhase::Published
+                        | sandsurf_state::ImageImportPhase::Cancelling
+                        | sandsurf_state::ImageImportPhase::Cancelled
+                ) {
                     return Ok(HostDispatch::Ready(Box::new(
                         self.image_lookup_response(&record.operation_id, reply)?,
                     )));
@@ -2411,6 +2504,7 @@ impl HostService {
             | HostTaskCompletion::Fork { .. }
             | HostTaskCompletion::Image { .. }
             | HostTaskCompletion::ImagePublish { .. }
+            | HostTaskCompletion::ImageCancel { .. }
             | HostTaskCompletion::ImageInspect { .. } => Err(HostError::Invalid(
                 "machine effects require staged completion",
             )),
@@ -3752,6 +3846,11 @@ fn capture_full_state(
 }
 
 enum HostTask {
+    ImageCancel {
+        root: PathBuf,
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+    },
     ImageCandidateCleanup {
         root: PathBuf,
         record: sandsurf_state::ImageImportRecord,
@@ -3886,6 +3985,11 @@ enum HostTask {
     },
 }
 enum HostTaskCompletion {
+    ImageCancel {
+        record: sandsurf_state::ImageImportRecord,
+        reply: ImageLookupReply,
+        result: Result<crate::image_worker::CancellationCustody>,
+    },
     ImageCandidateCleanup {
         record: sandsurf_state::ImageImportRecord,
         reply: Option<ImageLookupReply>,
@@ -4004,6 +4108,22 @@ enum HostTaskCompletion {
 impl HostTask {
     fn execute(self) -> HostTaskCompletion {
         match self {
+            Self::ImageCancel {
+                root,
+                record,
+                reply,
+            } => {
+                let result = crate::image_worker::cancel(
+                    &root,
+                    &record.operation_id,
+                    &record.request_digest,
+                );
+                HostTaskCompletion::ImageCancel {
+                    record,
+                    reply,
+                    result,
+                }
+            }
             Self::ImageCandidateCleanup {
                 root,
                 record,
@@ -6329,6 +6449,154 @@ mod tests {
                 Some(admitted.clone())
             );
         }
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn image_cancellation_recovers_original_custody_and_never_adopts_late_results() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "ssimage-cancel-{}-{}",
+            std::process::id(),
+            unix_millis().unwrap().get()
+        ));
+        let mut service = intent_service(&root);
+        let operation: OperationId = "interrupted-import".try_into().unwrap();
+        let input = sandsurf_state::ImageImportInput::Native {
+            manifest_path: root.join("external-manifest.json"),
+            manifest_digest: bytes_digest(b"source"),
+        };
+        let request = input.request_digest(&operation).unwrap();
+        service
+            .catalog
+            .admit_image_import(
+                operation.clone(),
+                input.clone(),
+                Approval {
+                    id: "approve-import".try_into().unwrap(),
+                    request_digest: request.clone(),
+                },
+            )
+            .unwrap();
+        prepare_directory(&root.join("image-workers")).unwrap();
+        let worker = root
+            .join("image-workers")
+            .join(object_name(operation.as_str()));
+        prepare_directory(&worker).unwrap();
+        crate::image_records::publish(
+            &worker.join("job.json"),
+            &crate::image_worker::Job {
+                operation: operation.clone(),
+                request_digest: request.clone(),
+                build: crate::image_worker::Build::Image { input },
+            },
+        )
+        .unwrap();
+        let writer =
+            Arc::new(sandsurf_native::storage::disk_lease(&worker.join(".owner")).unwrap());
+        let surviving_native_owner = writer.clone();
+        let stage = root
+            .join("images/imports")
+            .join(object_name(operation.as_str()));
+        prepare_directory(&root.join("images/imports")).unwrap();
+        prepare_directory(&stage).unwrap();
+        crate::image_records::publish(
+            &stage.join("request.json"),
+            &serde_json::json!({ "requestDigest": request }),
+        )
+        .unwrap();
+        let candidate = stage.join("candidate");
+        prepare_directory(&candidate).unwrap();
+        let mut disk =
+            sandsurf_native::local::create_private_file(&candidate.join("private-disk")).unwrap();
+        disk.write_all(b"interrupted bytes").unwrap();
+        disk.sync_all().unwrap();
+        drop(disk);
+        let cancellation = HostRequest::CancelImageImport {
+            operation_id: operation.clone(),
+            expected_request: request.clone(),
+        };
+        assert!(
+            matches!(service.handle(cancellation), HostResponse::ImageImport { operation: record }
+            if record.phase == sandsurf_state::ImageImportPhase::Cancelling)
+        );
+        assert_eq!(
+            fs::read(candidate.join("private-disk")).unwrap(),
+            b"interrupted bytes"
+        );
+        assert!(worker.join("cancel.json").exists());
+        drop(writer);
+        assert!(
+            matches!(service.handle(HostRequest::GetImageImport { operation_id: operation.clone() }),
+            HostResponse::ImageImport { operation: record } if record.phase == sandsurf_state::ImageImportPhase::Cancelling)
+        );
+        assert!(
+            candidate.exists(),
+            "a controller exit cannot release a surviving original VMM's bytes"
+        );
+        drop(surviving_native_owner);
+        let HostDispatch::Task(task) = service.route(HostRequest::GetImageImport {
+            operation_id: operation.clone(),
+        }) else {
+            panic!("cleanup was not detached");
+        };
+        let completion = task.execute();
+        assert!(matches!(
+            &completion,
+            HostTaskCompletion::ImageCancel { result: Ok(_), .. }
+        ));
+        assert!(!candidate.exists());
+        assert!(
+            sandsurf_native::storage::disk_lease(&worker.join(".owner")).is_err(),
+            "cleanup custody must survive until catalog completion"
+        );
+        drop(completion); // Interrupted after physical cleanup, before catalog commit.
+        drop(service);
+        let mut service = HostService::open(&root, root.join("absent-executable")).unwrap();
+        let mut work = Vec::new();
+        service
+            .reconcile_import_page(
+                &mut ReconciliationCursor::default(),
+                &BTreeSet::new(),
+                1,
+                &mut work,
+            )
+            .unwrap();
+        let (_, HostDispatch::Task(task)) = work.pop().unwrap() else {
+            panic!("cancel recovery was not detached");
+        };
+        assert!(matches!(&*task, HostTask::ImageCancel { .. }));
+        assert!(
+            matches!(service.complete_task(task.execute()).unwrap().finish(), HostResponse::ImageImport { operation: record }
+            if record.phase == sandsurf_state::ImageImportPhase::Cancelled)
+        );
+        let late = HostTaskCompletion::Image {
+            operation: operation.clone(),
+            request_digest: request.clone(),
+            result: Err(HostError::Invalid("late worker failure")),
+        };
+        assert!(
+            matches!(service.complete_task(late).unwrap().finish(), HostResponse::ImageImport { operation: record }
+            if record.phase == sandsurf_state::ImageImportPhase::Cancelled)
+        );
+        assert!(matches!(
+            service.route(HostRequest::GetHostOperation {
+                operation_id: operation.clone()
+            }),
+            HostDispatch::Ready(_)
+        ));
+        assert!(
+            service
+                .catalog
+                .pending_image_imports(None, counter(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            worker.join("job.json").exists() && worker.join("cancel.json").exists(),
+            "immutable replay fences are not discarded with private bytes"
+        );
         drop(service);
         fs::remove_dir_all(root).unwrap();
     }

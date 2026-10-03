@@ -104,6 +104,87 @@ struct BootResult {
     boot: sandsurf_image::boot::FrozenBoot,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancellationBinding {
+    request_digest: Digest,
+}
+
+fn require_not_cancelled(root: &Path, job: &Job) -> Result<()> {
+    match read::<CancellationBinding>(&directory(root, &job.operation).join("cancel.json")) {
+        Ok(binding) => Err(HostError::Invalid(
+            if binding.request_digest == job.request_digest {
+                "image import was cancelled"
+            } else {
+                "image cancellation binding changed; preserved"
+            },
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Original ownership, not an observed dead PID. Every offline VMM inherited
+/// the operation's open description. Keep both leases through catalog commit.
+pub(crate) struct CancellationCustody {
+    _worker: std::fs::File,
+    _materializer: std::fs::File,
+}
+
+pub(crate) fn cancel(
+    root: &Path,
+    operation: &OperationId,
+    request_digest: &Digest,
+) -> Result<CancellationCustody> {
+    let root = sandsurf_native::local::canonical_private_directory(root)?;
+    ensure_private_directory(&root.join("image-workers"))?;
+    let stage = directory(&root, operation);
+    ensure_private_directory(&stage)?;
+    match read::<Job>(&stage.join("job.json")) {
+        Ok(job) => {
+            job.validate()?;
+            if job.operation != *operation
+                || job.request_digest != *request_digest
+                || !matches!(job.build, Build::Image { .. })
+            {
+                return Err(HostError::Invalid(
+                    "image cancellation addresses a different worker",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Deliver the host's monotonic intent before testing custody. A delayed
+    // dispatch cannot resurrect a cancelled job after this owner releases it.
+    let binding = stage.join("cancel.json");
+    let cancellation = CancellationBinding {
+        request_digest: request_digest.clone(),
+    };
+    match read::<CancellationBinding>(&binding) {
+        Ok(old) if old.request_digest == *request_digest => {}
+        Ok(_) => {
+            return Err(HostError::Invalid(
+                "image cancellation binding changed; preserved",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = publish(&binding, &cancellation)
+                && read::<CancellationBinding>(&binding)?.request_digest != *request_digest
+            {
+                return Err(error.into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let worker = sandsurf_native::storage::disk_lease(&stage.join(".owner"))?;
+    let materializer = crate::images::reclaim_unadopted(&root, operation, request_digest)?;
+    Ok(CancellationCustody {
+        _worker: worker,
+        _materializer: materializer,
+    })
+}
+
 fn result(root: &Path, job: &Job) -> Result<Option<Outcome>> {
     if let Build::DiskSnapshot { snapshot } = &job.build {
         return Ok(crate::snapshots::published_filesystem(
@@ -314,6 +395,7 @@ pub(crate) fn finish_disk_snapshot(
 fn dispatch(root: &Path, executable: &Path, job: Job) -> Result<Outcome> {
     job.validate()?;
     let root = sandsurf_native::local::canonical_private_directory(root)?;
+    require_not_cancelled(&root, &job)?;
     sandsurf_native::volume::inspect(&root)?;
     ensure_private_directory(&root.join("image-workers"))?;
     let stage = directory(&root, &job.operation);
@@ -378,6 +460,7 @@ fn dispatch(root: &Path, executable: &Path, job: Job) -> Result<Outcome> {
     let deadline = Instant::now() + DEADLINE;
     let mut next_probe = Instant::now() + Duration::from_millis(500);
     loop {
+        require_not_cancelled(&root, &job)?;
         if let Some(image) = result(&root, &job)? {
             return Ok(image);
         }
@@ -479,6 +562,7 @@ pub fn serve(root: &Path, operation: OperationId, lease: std::fs::File) -> Resul
     let operation_custody = std::sync::Arc::new(sandsurf_native::storage::disk_lease(
         &directory(&root, &operation).join(".owner"),
     )?);
+    require_not_cancelled(&root, &job)?;
     let mut executor = crate::offline::Executor::new(
         &root,
         vec![pool_custody, operation_custody],
@@ -873,6 +957,44 @@ mod tests {
         // retaining another request's approval digest.
         publish(&altered_stage.join("job.json"), &changed).unwrap();
         assert!(admitted(&root, &altered).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_fences_dispatch_before_launch_and_preserves_exact_identity() {
+        let mut nonce = [0; 16];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-cancel-fence-{}",
+            sandsurf_protocol::bytes_digest(&nonce).as_str()
+        ));
+        ensure_private_directory(&root).unwrap();
+        ensure_private_directory(&root.join("images")).unwrap();
+        let operation: OperationId = "cancel-before-dispatch".try_into().unwrap();
+        let input = ImageImportInput::Native {
+            manifest_path: root.join("absent-manifest.json"),
+            manifest_digest: sandsurf_protocol::bytes_digest(b"source"),
+        };
+        let job = Job {
+            request_digest: input.request_digest(&operation).unwrap(),
+            operation,
+            build: Build::Image { input },
+        };
+        let custody = cancel(&root, &job.operation, &job.request_digest).unwrap();
+        assert!(matches!(
+            dispatch(&root, &root.join("absent-executable"), job.clone()),
+            Err(HostError::Invalid("image import was cancelled"))
+        ));
+        drop(custody);
+        assert!(
+            cancel(
+                &root,
+                &job.operation,
+                &sandsurf_protocol::bytes_digest(b"different request")
+            )
+            .is_err()
+        );
+        assert!(cancel(&root, &job.operation, &job.request_digest).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

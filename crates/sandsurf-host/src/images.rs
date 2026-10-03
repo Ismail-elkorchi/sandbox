@@ -199,34 +199,7 @@ fn prepare_import(
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let entries = fs::read_dir(&stage)?
-                .take(9)
-                .collect::<io::Result<Vec<_>>>()?;
-            if entries.len() > 8
-                || entries.iter().any(|entry| {
-                    !entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| crate::image_records::pending_name("request", name))
-                })
-            {
-                return Err(ImageBuildError::Invalid(
-                    "unbound image stage contains unowned bytes; preserved".into(),
-                ));
-            }
-            for entry in &entries {
-                let path = entry.path();
-                let file = sandsurf_native::local::open_private_file(
-                    &path,
-                    sandsurf_native::PrivateFileAccess::ReadOnly,
-                )?;
-                if file.metadata()?.len() > 1024 * 1024 {
-                    return Err(ImageBuildError::Invalid(
-                        "image binding stage exceeds its bound".into(),
-                    ));
-                }
-                drop(file);
-            }
+            let entries = unbound_request_entries(&stage)?;
             for entry in entries {
                 fs::remove_file(entry.path())?;
             }
@@ -253,7 +226,7 @@ fn prepare_import(
 }
 
 fn reclaim_preparation(stage: &Path) -> Result<(), ImageBuildError> {
-    for name in ["artifact", "tree", "layout", "rootfs.tar"] {
+    for name in ["artifact", "tree", "layout", "rootfs.tar", ".offline"] {
         let path = stage.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata)
@@ -622,6 +595,84 @@ pub(crate) fn reclaim_candidate(
         ));
     }
     reclaim_preparation(&stage)?;
+    remove_candidate(&stage)?;
+    sandsurf_native::storage::sync_directory(&stage)?;
+    Ok(())
+}
+
+/// A host-cancelled, never adopted materialization. The worker operation lease
+/// has already fenced all original native consumers. Preserve immutable small
+/// bindings, but reclaim only the private byte roles that admission created.
+fn unbound_request_entries(stage: &Path) -> Result<Vec<fs::DirEntry>, ImageBuildError> {
+    let entries = fs::read_dir(stage)?
+        .take(9)
+        .collect::<io::Result<Vec<_>>>()?;
+    if entries.len() > 8
+        || entries.iter().any(|entry| {
+            !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| crate::image_records::pending_name("request", name))
+        })
+    {
+        return Err(ImageBuildError::Invalid(
+            "unbound image stage contains unowned bytes; preserved".into(),
+        ));
+    }
+    for entry in &entries {
+        let file = sandsurf_native::local::open_private_file(
+            &entry.path(),
+            sandsurf_native::PrivateFileAccess::ReadOnly,
+        )?;
+        if file.metadata()?.len() > 1024 * 1024 {
+            return Err(ImageBuildError::Invalid(
+                "image binding stage exceeds its bound".into(),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+pub(crate) fn reclaim_unadopted(
+    root: &Path,
+    operation: &OperationId,
+    request: &Digest,
+) -> Result<File, ImageBuildError> {
+    let imports = root.join("images/imports");
+    prepare_private_directory(&imports)?;
+    let custody = sandsurf_native::storage::disk_lease(
+        &imports.join(format!(".owner-{}", object_name(operation.as_str()))),
+    )?;
+    let stage = imports.join(object_name(operation.as_str()));
+    match fs::symlink_metadata(&stage) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(custody),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    sandsurf_native::local::canonical_private_directory(&stage)?;
+    let binding = crate::image_records::read::<ImportBinding>(&stage.join("request.json"));
+    match binding {
+        Ok(binding) if binding.request_digest == *request => {}
+        Ok(_) => {
+            return Err(ImageBuildError::Invalid(
+                "image cancellation materialization binding changed; preserved".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // No byte role is created before this binding. An interrupted
+            // binding publication may leave bounded metadata, never a disk.
+            unbound_request_entries(&stage)?;
+            return Ok(custody);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    reclaim_preparation(&stage)?;
+    remove_candidate(&stage)?;
+    sandsurf_native::storage::sync_directory(&stage)?;
+    Ok(custody)
+}
+
+fn remove_candidate(stage: &Path) -> Result<(), ImageBuildError> {
     let candidate = stage.join("candidate");
     match fs::symlink_metadata(&candidate) {
         Ok(_) => {
@@ -631,7 +682,6 @@ pub(crate) fn reclaim_candidate(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    sandsurf_native::storage::sync_directory(&stage)?;
     Ok(())
 }
 
@@ -1038,6 +1088,60 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn cancelled_preparation_preserves_unbound_foreign_bytes_and_changed_bindings() {
+        use sandsurf_protocol::bytes_digest;
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "sandsurf-cancel-private-{}",
+            short_nonce().unwrap()
+        ));
+        prepare_private_directory(&root).unwrap();
+        prepare_private_directory(&root.join("images")).unwrap();
+        prepare_private_directory(&root.join("images/imports")).unwrap();
+        let operation: OperationId = "unbound-cancel".try_into().unwrap();
+        let request = bytes_digest(b"approved");
+        let stage = root
+            .join("images/imports")
+            .join(object_name(operation.as_str()));
+        prepare_private_directory(&stage).unwrap();
+        let foreign = stage.join("foreign");
+        create_private_file(&foreign)
+            .unwrap()
+            .write_all(b"not ours")
+            .unwrap();
+        assert!(reclaim_unadopted(&root, &operation, &request).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"not ours");
+        fs::remove_file(&foreign).unwrap();
+        let pending = stage.join(format!("request.{}.pending", "a".repeat(64)));
+        symlink(root.join("absent"), &pending).unwrap();
+        assert!(reclaim_unadopted(&root, &operation, &request).is_err());
+        assert!(
+            fs::symlink_metadata(&pending)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&pending).unwrap();
+        let oversized = create_private_file(&pending).unwrap();
+        oversized.set_len(1024 * 1024 + 1).unwrap();
+        drop(oversized);
+        assert!(reclaim_unadopted(&root, &operation, &request).is_err());
+        fs::remove_file(&pending).unwrap();
+        crate::image_records::publish(
+            &stage.join("request.json"),
+            &ImportBinding {
+                request_digest: bytes_digest(b"different"),
+            },
+        )
+        .unwrap();
+        let candidate = stage.join("candidate");
+        prepare_private_directory(&candidate).unwrap();
+        assert!(reclaim_unadopted(&root, &operation, &request).is_err());
+        assert!(candidate.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     #[ignore = "requires reviewed-image-bound native build, packaged Firecracker and SANDSURF_OFFLINE_TEST_DIRECTORY on an operator-bounded volume"]

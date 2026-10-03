@@ -759,6 +759,29 @@ test("image preparation is observable but cannot produce a ready image handle", 
     platform: "linux/amd64", operationId: operation.operationId, recipe: { bootImage: image.digest } }), SandsurfHostError);
 });
 
+test("image cancellation retains expected identity and distinguishes native cleanup from intent", async () => {
+  const requests = [];
+  const operation = { operationId: "cancel-import", requestDigest: "a".repeat(64), phase: "admitted", image: null };
+  const host = new Sandsurf({ request: async (request) => {
+    requests.push(request);
+    if (request.kind === "get-host-operation") return { kind: "host-operation", value: { kind: "image-import", value: operation } };
+    assert.equal(request.kind, "cancel-image-import");
+    return { kind: "image-import", operation };
+  } }, () => { throw new Error("cancellation must not grant new authority"); });
+  const handle = await host.operations.get(operation.operationId);
+  operation.phase = "cancelling";
+  assert.equal((await handle.cancel()).observation.phase, "cancelling");
+  assert.deepEqual(requests[1], { kind: "cancel-image-import", operationId: operation.operationId, expectedRequest: operation.requestDigest });
+  operation.phase = "cancelled";
+  assert.equal((await handle.inspect()).observation.phase, "cancelled");
+  assert.equal((await handle.cancel()).observation.phase, "cancelled");
+  operation.requestDigest = "b".repeat(64);
+  await assert.rejects(handle.cancel(), SandsurfHostError);
+  operation.requestDigest = "a".repeat(64);
+  operation.phase = "published";
+  await assert.rejects(handle.cancel(), SandsurfHostError);
+});
+
 test("native image import binds immutable input authority and rejects mismatched publication", async () => {
   const requests = [];
   const approvals = [];

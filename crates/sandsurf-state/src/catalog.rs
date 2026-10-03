@@ -18,10 +18,10 @@ CREATE TABLE usage(id TEXT PRIMARY KEY, machine TEXT NOT NULL REFERENCES machine
 CREATE TABLE approvals(id TEXT PRIMARY KEY, digest TEXT NOT NULL) STRICT;
 CREATE TABLE image_imports(operation TEXT PRIMARY KEY, request_digest TEXT NOT NULL, input TEXT NOT NULL, dependency_image TEXT REFERENCES images(digest), dependency_snapshot TEXT REFERENCES snapshots(id), phase TEXT NOT NULL, candidate TEXT, image TEXT, candidate_cleanup_pending INTEGER NOT NULL CHECK(candidate_cleanup_pending IN (0,1)),
  CHECK(candidate_cleanup_pending=0 OR json_extract(phase,'$')='published'),
- CHECK((json_extract(phase,'$')='admitted' AND candidate IS NULL AND image IS NULL) OR (json_extract(phase,'$')='prepared' AND candidate IS NOT NULL AND image IS NULL) OR (json_extract(phase,'$')='published' AND candidate IS NULL AND image IS NOT NULL))) STRICT;
-CREATE INDEX pending_image_imports ON image_imports(operation) WHERE json_extract(phase,'$')<>'published';
-CREATE INDEX pending_import_image ON image_imports(dependency_image) WHERE json_extract(phase,'$')<>'published';
-CREATE INDEX pending_import_snapshot ON image_imports(dependency_snapshot) WHERE json_extract(phase,'$')<>'published';
+ CHECK((json_extract(phase,'$') IN ('admitted','cancelling','cancelled') AND candidate IS NULL AND image IS NULL) OR (json_extract(phase,'$')='prepared' AND candidate IS NOT NULL AND image IS NULL) OR (json_extract(phase,'$')='published' AND candidate IS NULL AND image IS NOT NULL))) STRICT;
+CREATE INDEX pending_image_imports ON image_imports(operation) WHERE json_extract(phase,'$') NOT IN ('published','cancelled');
+CREATE INDEX pending_import_image ON image_imports(dependency_image) WHERE json_extract(phase,'$') NOT IN ('published','cancelled');
+CREATE INDEX pending_import_snapshot ON image_imports(dependency_snapshot) WHERE json_extract(phase,'$') NOT IN ('published','cancelled');
 CREATE INDEX prepared_image_target ON image_imports(json_extract(candidate,'$.digest')) WHERE json_extract(phase,'$')='prepared';
 CREATE INDEX pending_candidate_cleanup ON image_imports(operation) WHERE candidate_cleanup_pending=1;
 CREATE TABLE images(digest TEXT PRIMARY KEY, value TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0) STRICT;
@@ -108,6 +108,10 @@ pub enum ReservationState {
 #[serde(rename_all = "kebab-case")]
 pub enum ImageImportPhase {
     Admitted,
+    /// Host cancellation intent. Original native/storage owners still pin inputs.
+    Cancelling,
+    /// Private materialization bytes were reclaimed under original custody.
+    Cancelled,
     Prepared,
     Published,
 }
@@ -957,6 +961,74 @@ impl HostCatalog {
         Ok(value)
     }
 
+    /// Cancel before candidate adoption. Prepared candidates have crossed the
+    /// catalog's publication boundary and finish through publication/release.
+    /// Client disconnect and worker failure never imply this explicit intent.
+    pub fn cancel_image_import(
+        &mut self,
+        operation: &OperationId,
+        expected_request: &Digest,
+    ) -> Result<ImageImportRecord> {
+        let tx = self.db.connection.transaction()?;
+        let old = image_import(&tx, operation)?
+            .ok_or(Error::Missing("image import operation is missing"))?;
+        if old.request_digest != *expected_request {
+            return Err(Error::Conflict(
+                "image cancellation request binding changed",
+            ));
+        }
+        match old.phase {
+            ImageImportPhase::Cancelling | ImageImportPhase::Cancelled => return Ok(old),
+            ImageImportPhase::Prepared | ImageImportPhase::Published => {
+                return Err(Error::Conflict(
+                    "image candidate was already adopted for publication",
+                ));
+            }
+            ImageImportPhase::Admitted => {}
+        }
+        tx.execute(
+            "UPDATE image_imports SET phase=?2 WHERE operation=?1",
+            params![operation.as_str(), encode(&ImageImportPhase::Cancelling)?],
+        )?;
+        tx.commit()?;
+        Ok(ImageImportRecord {
+            phase: ImageImportPhase::Cancelling,
+            ..old
+        })
+    }
+
+    /// Called only after the cancellation effect retains original worker and
+    /// materializer custody through this transaction's commit.
+    pub fn complete_image_cancellation(
+        &mut self,
+        operation: &OperationId,
+        expected_request: &Digest,
+    ) -> Result<ImageImportRecord> {
+        let tx = self.db.connection.transaction()?;
+        let old = image_import(&tx, operation)?
+            .ok_or(Error::Missing("image cancellation operation is missing"))?;
+        if old.request_digest != *expected_request {
+            return Err(Error::Conflict(
+                "image cancellation request binding changed",
+            ));
+        }
+        if old.phase == ImageImportPhase::Cancelled {
+            return Ok(old);
+        }
+        if old.phase != ImageImportPhase::Cancelling {
+            return Err(Error::Conflict("image cancellation was not admitted"));
+        }
+        tx.execute(
+            "UPDATE image_imports SET phase=?2,dependency_image=NULL,dependency_snapshot=NULL WHERE operation=?1",
+            params![operation.as_str(), encode(&ImageImportPhase::Cancelled)?],
+        )?;
+        tx.commit()?;
+        Ok(ImageImportRecord {
+            phase: ImageImportPhase::Cancelled,
+            ..old
+        })
+    }
+
     /// Reserve and bind a private materialization before shared publication.
     /// A candidate is not yet an image from which a machine can be created.
     /// Only this catalog owner may adopt it; builders own bytes, not authority.
@@ -1141,7 +1213,7 @@ impl HostCatalog {
             ));
         }
         let mut statement = self.db.connection.prepare(
-            "SELECT operation FROM image_imports WHERE json_extract(phase,'$')<>'published' AND operation>?1 ORDER BY operation LIMIT ?2")?;
+            "SELECT operation FROM image_imports WHERE json_extract(phase,'$') NOT IN ('published','cancelled') AND operation>?1 ORDER BY operation LIMIT ?2")?;
         let operations = statement
             .query_map(
                 params![after.map_or("", OperationId::as_str), limit.get()],
@@ -1221,7 +1293,7 @@ impl HostCatalog {
             return Err(Error::Conflict("retained snapshots pin this image"));
         }
         let import_references: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$')<>'published' AND (dependency_image=?1 OR json_extract(candidate,'$.digest')=?1))",
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE json_extract(phase,'$') NOT IN ('published','cancelled') AND (dependency_image=?1 OR json_extract(candidate,'$.digest')=?1))",
             [image_digest.as_str()], |row| row.get(0))?;
         if import_references {
             return Err(Error::Conflict(
@@ -1351,7 +1423,7 @@ impl HostCatalog {
         for query in [
             "SELECT EXISTS(SELECT 1 FROM forks f JOIN machines m ON f.machine=m.id WHERE f.snapshot=?1 AND m.released=0 AND json_extract(f.value,'$.materializedDisk') IS NULL)",
             "SELECT EXISTS(SELECT 1 FROM rollbacks WHERE json_extract(value,'$.snapshotId')=?1 AND json_extract(value,'$.phase') IS NOT 'applied')",
-            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$')<>'published')",
+            "SELECT EXISTS(SELECT 1 FROM image_imports WHERE dependency_snapshot=?1 AND json_extract(phase,'$') NOT IN ('published','cancelled'))",
         ] {
             if tx.query_row(query, [snapshot_id.as_str()], |row| row.get::<_, bool>(0))? {
                 return Err(Error::Conflict("pending host operation pins this snapshot"));
@@ -3487,7 +3559,9 @@ fn image_import(
             decode_image_input(operation, &request_digest, &input)?;
             let phase: ImageImportPhase = decode(&phase)?;
             if match phase {
-                ImageImportPhase::Admitted => candidate.is_some() || published.is_some(),
+                ImageImportPhase::Admitted
+                | ImageImportPhase::Cancelling
+                | ImageImportPhase::Cancelled => candidate.is_some() || published.is_some(),
                 ImageImportPhase::Prepared => candidate.is_none() || published.is_some(),
                 ImageImportPhase::Published => candidate.is_some() || published.is_none(),
             } {

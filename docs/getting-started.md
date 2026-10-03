@@ -89,6 +89,14 @@ raw system-disk contract. QEMU x64 boot requires a supported 64-bit Linux boot
 image or an ELF kernel with a validated physical PVH entry; boot artifacts are
 verified before native launch.
 
+An admitted image import can be cancelled through its reconnectable
+`host.operations.get(operationId)` handle before candidate adoption. `cancel()`
+records intent; `cancelling` does not mean its native worker has stopped.
+`cancelled` requires exclusive original-worker custody and durable cleanup of
+private build bytes. Prepared candidates finish publication and can then be
+released through the image API. Cancellation does not delete source images,
+snapshots, machine disks, or retained execution output.
+
 OCI conversion accepts a complete Linux OS filesystem with an executable
 `/sbin/init` and an explicit boot-image recipe:
 
@@ -256,4 +264,4 @@ For a complete segment, use `{ kind: "continuing-retention", segment: id }`:
 source cleanup retains precisely the frames still owned by segments. Sealing
 alone does not rotate a producer's output quota or discard its guest spool.
 
-Native networking, storage recovery and immutable restored execution/output lineage require real-machine qualification; compilation and API tests do not establish it. Linux hardware qualification is a separate prerequisite-gated run. macOS HVF and Windows WHPX use owned QEMU processes with native resource envelopes, but managed image/boot preparation and authorized egress still have source gaps. Missing enforcement or preparation is refused explicitly. Consult the reported capabilities and [security scope](../SECURITY.md).
+Native networking, storage recovery and immutable restored execution/output lineage require real-machine qualification; compilation and API tests do not establish it. Linux hardware qualification is a separate prerequisite-gated run. macOS HVF and Windows WHPX use owned QEMU processes with native resource envelopes and a reviewed isolated disk executor. Authorized egress still requires a native local-delivery enforcement implementation on these hosts; missing enforcement is refused explicitly. Consult the reported capabilities and [security scope](../SECURITY.md).

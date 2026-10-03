@@ -30,9 +30,9 @@ export function parseOperationRecord(raw: unknown, expectedId: string, expectedM
       case "transfer": observation = { kind, applied: operationBoolean(value.applied) }; break;
       case "image-import": {
         const phase = text(value.phase);
-        if (phase !== "admitted" && phase !== "prepared" && phase !== "published") throw protocol("image import phase");
+        if (phase !== "admitted" && phase !== "cancelling" && phase !== "cancelled" && phase !== "prepared" && phase !== "published") throw protocol("image import phase");
         const image = value.image === null ? null : parseImage(value.image);
-        if ((phase !== "admitted") !== (image !== null)) throw protocol("image import completion");
+        if ((phase === "prepared" || phase === "published") !== (image !== null)) throw protocol("image import completion");
         observation = { kind, phase, image }; break;
       }
       case "image-release": observation = { kind, imageDigest: digest(text(value.imageDigest)), cleanupPending: operationBoolean(value.cleanupPending) }; break;
