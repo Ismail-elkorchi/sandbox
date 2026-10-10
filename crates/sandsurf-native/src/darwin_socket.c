@@ -7,7 +7,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -22,16 +21,21 @@ int sandsurf_darwin_network_socket(int family, int type, int protocol)
         errno = EINVAL;
         return -1;
     }
-    /* This tiny synchronous section runs no callbacks, allocations, Rust or
-     * arbitrary workload while impersonating. Other threads retain root.
-     * Failure to restore is fatal, never continuation under a wrong identity. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (pthread_setugid_np(SANDSURF_NETWORK_UID, SANDSURF_NETWORK_UID) != 0) return -1;
+    /* XNU socreate captures kauth_cred_proc_ref(p), not thread credentials.
+     * This owner must therefore be single-threaded. Validate the SDK task
+     * observation before changing the process credential; no callback or
+     * allocation occurs until root is restored. */
+    struct proc_taskinfo task = {0};
+    if (getuid() != 0 || geteuid() != 0 ||
+        proc_pidinfo(getpid(), PROC_PIDTASKINFO, 0, &task, sizeof(task)) != (int)sizeof(task) ||
+        task.pti_threadnum != 1) {
+        errno = EPERM;
+        return -1;
+    }
+    if (seteuid(SANDSURF_NETWORK_UID) != 0) return -1;
     int descriptor = socket(family, type, protocol);
     int saved = errno;
-    if (pthread_setugid_np(KAUTH_UID_NONE, KAUTH_GID_NONE) != 0) _exit(70);
-#pragma clang diagnostic pop
+    if (seteuid(0) != 0) _exit(70);
     errno = saved;
     return descriptor;
 }

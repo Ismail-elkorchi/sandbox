@@ -1,4 +1,5 @@
-# Disposable CI contract only. This is not an operator installation recipe.
+# Exclusive operator-owned stateless PF profile. Installation is an explicit
+# host-administrator decision; Sandsurf verifies this policy but never loads it.
 # Classify actual output delivery, not an address inventory or an mbuf tag
 # whose lifetime does not extend across Darwin's loopback input path. Local
 # unicast routes use lo0, including routes to another interface's own address.

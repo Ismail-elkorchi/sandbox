@@ -188,11 +188,11 @@ jobs:
         run: |
           test "$RUNNER_ENVIRONMENT" = github-hosted
           clang -std=c11 -Wall -Wextra -Werror vmm/qemu/tests/darwin-local-delivery.c crates/sandsurf-native/src/darwin_socket.c -o target/debug/darwin-local-delivery
-          sudo pfctl -nf vmm/qemu/tests/darwin-local-delivery.conf
+          sudo pfctl -nf vmm/darwin/network-boundary.pf
           # Only disposable CI may replace its root policy. Never run this on
           # an operator's host or infer VM qualification from this contract.
           trap 'sudo ifconfig lo0 -alias 198.18.0.9 2>/dev/null || true; sudo pfctl -f /etc/pf.conf' EXIT
-          sudo pfctl -f vmm/qemu/tests/darwin-local-delivery.conf
+          sudo pfctl -f vmm/darwin/network-boundary.pf
           sudo pfctl -e || sudo pfctl -s info | grep -q 'Status: Enabled'
           if ! sudo target/debug/darwin-local-delivery; then
             sudo pfctl -vvsr
@@ -260,6 +260,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup toolchain install stable --profile minimal
+      - name: Production native socket boundary (no VM hardware required)
+        run: cargo test --locked -p sandsurf-native --test windows_network_boundary -- --ignored --test-threads=1
       - run: cargo build --locked -p sandsurf-host
       - name: Independent service lifetime contract (no VM hardware required)
         run: |

@@ -3,7 +3,7 @@
 use sandsurf_protocol::{Digest, bytes_digest};
 use std::io;
 
-pub const PF_RULES: &str = include_str!("../../../vmm/qemu/tests/darwin-local-delivery.conf");
+pub const PF_RULES: &str = include_str!("../../../vmm/darwin/network-boundary.pf");
 const FILTER: [&str; 5] = [
     "@0 block drop out quick on lo0 proto tcp all user = 65530",
     "@1 block drop out quick on lo0 proto udp all user = 65530",

@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Threading::OpenProcessToken;
 
 pub(crate) struct Sid(Vec<usize>);
 impl Sid {
-    fn derive(name: &str) -> io::Result<Self> {
+    pub(crate) fn derive(name: &str) -> io::Result<Self> {
         let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let mut original = std::ptr::null_mut();
         // SAFETY: terminated name and writable SID output. No profile is created:
@@ -63,6 +63,25 @@ impl Sid {
     }
     pub(crate) fn raw(&self) -> PSID {
         self.0.as_ptr().cast_mut().cast()
+    }
+    pub(crate) fn well_known(
+        kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> io::Result<Self> {
+        let value = Self(vec![0; 68usize.div_ceil(size_of::<usize>())]);
+        let mut bytes = 68;
+        // SAFETY: aligned maximum SID storage and exact initialized size.
+        if unsafe {
+            windows_sys::Win32::Security::CreateWellKnownSid(
+                kind,
+                std::ptr::null_mut(),
+                value.raw(),
+                &mut bytes,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
     }
     pub(crate) fn text(&self) -> io::Result<String> {
         crate::local::sid_text(self.raw())

@@ -52,7 +52,7 @@ fn wait_file(root: &Path, name: &str) {
 fn socket_owner() -> Peer {
     let mut child = Peer(
         Command::new("/usr/local/libexec/sandsurf/sandsurf-host")
-            .arg("--linux-network-sockets")
+            .arg("--native-network-sockets")
             .spawn()
             .unwrap(),
     );

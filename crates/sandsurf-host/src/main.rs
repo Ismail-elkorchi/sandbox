@@ -42,7 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (mode, None)
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if mode == "--linux-network-sockets" {
+    if mode == "--native-network-sockets" {
         if arguments.next().is_some() {
             return Err("native socket owner accepts no arguments".into());
         }

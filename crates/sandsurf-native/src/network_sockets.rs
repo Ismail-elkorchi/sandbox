@@ -24,10 +24,9 @@ use std::os::unix::fs::{
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -41,6 +40,7 @@ const ENDPOINT: &str = "/private/var/run/sandsurf-network/sockets.sock";
 #[cfg(target_os = "linux")]
 pub const MARK: u32 = 0x53534601;
 const DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
 const MAX_CONNECTIONS: usize = 32;
 const OBSERVE: [u8; 8] = *b"SSNO\x01\0\0\0";
 
@@ -887,58 +887,70 @@ pub fn serve() -> io::Result<()> {
     let executable = Arc::new(File::open("/proc/self/exe")?);
     #[cfg(target_os = "macos")]
     let executable = Arc::new(crate::darwin_network::executable()?);
+    #[cfg(target_os = "linux")]
     let connections = Arc::new(AtomicUsize::new(0));
-    // At most one rule-query subprocess in addition to the bounded admission
-    // threads. Socket production never waits on observation or a rules query.
+    // At most one bounded rule query. Darwin serializes admission because XNU
+    // captures the process credential; a thread override does not label sockets.
     let observations = Arc::new(Mutex::new(()));
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        if connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-            connections.fetch_sub(1, Ordering::AcqRel);
-            continue;
-        }
-        struct Admission(Arc<AtomicUsize>);
-        impl Drop for Admission {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
+        let stream = stream?;
+        #[cfg(target_os = "macos")]
+        let _ = serve_connection(stream, &executable, &observations);
+        #[cfg(target_os = "linux")]
+        {
+            if connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                connections.fetch_sub(1, Ordering::AcqRel);
+                continue;
             }
+            struct Admission(Arc<AtomicUsize>);
+            impl Drop for Admission {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let admission = Admission(Arc::clone(&connections));
+            let observations = Arc::clone(&observations);
+            let executable = Arc::clone(&executable);
+            std::thread::Builder::new()
+                .name("network-socket".into())
+                .spawn(move || {
+                    let _admission = admission;
+                    let _ = serve_connection(stream, &executable, &observations);
+                })?;
         }
-        let admission = Admission(Arc::clone(&connections));
-        let observations = Arc::clone(&observations);
-        let executable = Arc::clone(&executable);
-        std::thread::Builder::new()
-            .name("network-socket".into())
-            .spawn(move || {
-                let _admission = admission;
-                let _ = (|| -> io::Result<()> {
-                    let _credentials = peer(&stream)?; // kernel credentials, no caller claims
-                    stream.set_nonblocking(true)?;
-                    let deadline = Instant::now() + DEADLINE;
-                    let mut value = [0; 8];
-                    DeadlineIo {
-                        stream: &mut stream,
-                        deadline: Some(deadline),
-                    }
-                    .read_exact(&mut value)?;
-                    if value == OBSERVE {
-                        let _query = observations
-                            .try_lock()
-                            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-                        let expression = inspect_rules_until(deadline)?;
-                        send(&stream, &OBSERVE, executable.as_ref(), deadline)?;
-                        let mut io = DeadlineIo {
-                            stream: &mut stream,
-                            deadline: Some(deadline),
-                        };
-                        return io.write_all(expression.as_str().as_bytes());
-                    }
-                    let (ipv6, udp) = decode(&value)?;
-                    let socket = marked_socket(ipv6, udp)?;
-                    send(&stream, &value, &socket, deadline)
-                })();
-            })?;
     }
     Ok(())
+}
+
+fn serve_connection(
+    mut stream: UnixStream,
+    executable: &File,
+    observations: &Mutex<()>,
+) -> io::Result<()> {
+    let _credentials = peer(&stream)?;
+    stream.set_nonblocking(true)?;
+    let deadline = Instant::now() + DEADLINE;
+    let mut value = [0; 8];
+    DeadlineIo {
+        stream: &mut stream,
+        deadline: Some(deadline),
+    }
+    .read_exact(&mut value)?;
+    if value == OBSERVE {
+        let _query = observations
+            .try_lock()
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let expression = inspect_rules_until(deadline)?;
+        send(&stream, &OBSERVE, executable, deadline)?;
+        return DeadlineIo {
+            stream: &mut stream,
+            deadline: Some(deadline),
+        }
+        .write_all(expression.as_str().as_bytes());
+    }
+    let (ipv6, udp) = decode(&value)?;
+    let socket = marked_socket(ipv6, udp)?;
+    send(&stream, &value, &socket, deadline)
 }
 
 #[cfg(test)]

@@ -12,6 +12,9 @@ pub mod guest_channel;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod network_sockets;
 #[cfg(windows)]
+#[path = "network_sockets_windows.rs"]
+pub mod network_sockets;
+#[cfg(windows)]
 pub mod owned_windows;
 pub mod process_budget;
 pub mod resource_broker;
