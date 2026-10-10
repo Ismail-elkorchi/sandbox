@@ -17,8 +17,8 @@ use windows_sys::Win32::Security::{
     AccessCheck, CopySid, DuplicateToken, EqualSid, FreeSid, GENERIC_MAPPING, GetLengthSid,
     GetTokenInformation, PRIVILEGE_SET, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     SecurityIdentification, TOKEN_APPCONTAINER_INFORMATION, TOKEN_DUPLICATE, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities,
-    TokenIsAppContainer,
+    TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenCapabilities,
+    TokenIsAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -516,6 +516,16 @@ impl Isolation {
 /// query on current Windows. Prove the required kernel access semantics using
 /// this original suspended token, not a requested flag or a weaker fallback.
 fn verify_lpac_access(token: HANDLE, sid: &Sid) -> io::Result<()> {
+    let user = token_info(token, TokenUser)?;
+    if user.len() * size_of::<usize>() < size_of::<TOKEN_USER>() {
+        return Err(invalid("native token user is truncated"));
+    }
+    // SAFETY: aligned original-token output contains its initialized user SID.
+    let user_sid = unsafe { (&*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if user_sid.is_null() {
+        return Err(invalid("native token user is absent"));
+    }
+    let user_text = crate::local::sid_text(user_sid)?;
     let mut impersonation = std::ptr::null_mut();
     // SAFETY: retained original token, fixed identification level and output.
     if unsafe { DuplicateToken(token, SecurityIdentification, &mut impersonation) } == 0 {
@@ -523,7 +533,8 @@ fn verify_lpac_access(token: HANDLE, sid: &Sid) -> io::Result<()> {
     }
     let result = (|| {
         for (identity, expected) in [("AC".to_owned(), false), (sid.text()?, true)] {
-            let text: Vec<u16> = format!("O:SYG:SYD:(A;;0x1;;;{identity})")
+            // Both the ordinary user and package portions must pass this DACL.
+            let text: Vec<u16> = format!("O:SYG:SYD:(A;;0x1;;;{user_text})(A;;0x1;;;{identity})")
                 .encode_utf16()
                 .chain([0])
                 .collect();

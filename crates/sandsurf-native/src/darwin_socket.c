@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/kauth.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -29,7 +30,7 @@ int sandsurf_darwin_network_socket(int family, int type, int protocol)
     if (pthread_setugid_np(SANDSURF_NETWORK_UID, SANDSURF_NETWORK_UID) != 0) return -1;
     int descriptor = socket(family, type, protocol);
     int saved = errno;
-    if (pthread_setugid_np((uid_t)-1, (gid_t)-1) != 0) _exit(70);
+    if (pthread_setugid_np(KAUTH_UID_NONE, KAUTH_GID_NONE) != 0) _exit(70);
 #pragma clang diagnostic pop
     errno = saved;
     return descriptor;

@@ -7,10 +7,14 @@
 //! packets never become host raw sockets. Host-owned allow policy remains in
 //! sandsurf-network; this module is not a second authorization database.
 use crate::unix_io::{DeadlineIo, wait_ready};
-use sandsurf_protocol::{Digest, bytes_digest};
+use sandsurf_protocol::Digest;
+#[cfg(any(target_os = "linux", test))]
+use sandsurf_protocol::bytes_digest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(any(target_os = "linux", test))]
+use socket2::Protocol;
+use socket2::{Domain, Socket, Type};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -490,9 +494,9 @@ fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
         }
         || socket.local_addr()?.family()
             != if ipv6 {
-                libc::AF_INET6 as u16
+                libc::AF_INET6 as libc::sa_family_t
             } else {
-                libc::AF_INET as u16
+                libc::AF_INET as libc::sa_family_t
             }
         || socket.peer_addr().is_ok()
     {
@@ -587,7 +591,7 @@ impl Receipt {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = ancillary.as_mut_ptr().cast();
-        message.msg_controllen = std::mem::size_of_val(&ancillary);
+        message.msg_controllen = std::mem::size_of_val(&ancillary) as _;
         // SAFETY: retained socket, bounded payload and aligned ancillary storage.
         #[cfg(target_os = "linux")]
         let flags = libc::MSG_CMSG_CLOEXEC;
@@ -615,7 +619,8 @@ impl Receipt {
             while !header.is_null() {
                 let value = &*header;
                 if value.cmsg_level == libc::SOL_SOCKET && value.cmsg_type == libc::SCM_RIGHTS {
-                    let bytes = value.cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
+                    let bytes =
+                        (value.cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
                     if !bytes.is_multiple_of(std::mem::size_of::<i32>()) {
                         unknown = true;
                     }

@@ -1,5 +1,5 @@
 param(
-  [Parameter(Mandatory = $true)][ValidateSet('kernel', 'supervision', 'package')][string]$Contract,
+  [Parameter(Mandatory = $true)][ValidateSet('kernel', 'supervision', 'package', 'sdk')][string]$Contract,
   [string]$TestBinary,
   [string]$EvidenceDirectory,
   [string]$NodeExecutable,
@@ -21,7 +21,7 @@ if (-not $Worker) {
   $EvidenceDirectory = Join-Path $env:RUNNER_TEMP ('sandsurf-contract-' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $EvidenceDirectory | Out-Null
   $arguments = "-NoProfile -NonInteractive -File `"$PSCommandPath`" -Worker -Contract $Contract -EvidenceDirectory `"$EvidenceDirectory`""
-  if ($Contract -ne 'package') {
+  if ($Contract -in @('kernel', 'supervision')) {
     Require-Path $TestBinary 'Leaf'
     $arguments += " -TestBinary `"$TestBinary`""
   } else {
@@ -61,7 +61,7 @@ $log = Join-Path $EvidenceDirectory 'contract.log'
 $result = Join-Path $EvidenceDirectory 'contract.json'
 Set-Location -LiteralPath $repository
 try {
-  if ($Contract -ne 'package') {
+  if ($Contract -in @('kernel', 'supervision')) {
     Require-Path $TestBinary 'Leaf'
     if ($Contract -eq 'kernel') {
       $env:SANDSURF_WINDOWS_RESOURCE_TEST = '1'
@@ -74,7 +74,8 @@ try {
     Require-Path $NpmCli 'Leaf'
     $env:PATH = (Split-Path $NodeExecutable) + ';' + $env:PATH
     $env:NODE_OPTIONS = '--max-old-space-size=512'
-    & $NodeExecutable $NpmCli 'run' 'test:package' *> $log
+    $script = if ($Contract -eq 'package') { 'test:package' } else { 'test:ts' }
+    & $NodeExecutable $NpmCli 'run' $script *> $log
   }
   $code = $LASTEXITCODE
   if ($null -eq $code) { throw 'The contract process has no exit status' }
