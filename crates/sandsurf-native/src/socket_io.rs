@@ -1,4 +1,4 @@
-//! Deadline-aware private AF_UNIX streams on Unix and Windows. QEMU endpoints
+//! Native socket readiness and deadline-aware private AF_UNIX streams. QEMU endpoints
 //! live below account-private directories, and kernel peer identity must match
 //! the retained child process. A reachable socket is not evidence of VM power.
 use crate::GuestConnection;
@@ -240,40 +240,91 @@ fn remaining(deadline: Option<Instant>) -> io::Result<i32> {
 fn wait_ready(socket: &Socket, write: bool, deadline: Option<Instant>) -> io::Result<()> {
     loop {
         let timeout = remaining(deadline)?;
-        #[cfg(unix)]
-        let result = {
-            use std::os::fd::AsRawFd;
-            let mut event = libc::pollfd {
-                fd: socket.as_raw_fd(),
-                events: if write { libc::POLLOUT } else { libc::POLLIN },
-                revents: 0,
-            };
-            // SAFETY: event is one initialized pollfd for a live borrowed socket.
-            unsafe { libc::poll(&mut event, 1, timeout) }
-        };
-        #[cfg(windows)]
-        let result = {
-            use std::os::windows::io::AsRawSocket;
-            use windows_sys::Win32::Networking::WinSock::{
-                POLLRDNORM, POLLWRNORM, WSAPOLLFD, WSAPoll,
-            };
-            let mut event = WSAPOLLFD {
-                fd: socket.as_raw_socket() as _,
-                events: if write { POLLWRNORM } else { POLLRDNORM },
-                revents: 0,
-            };
-            // SAFETY: event is one initialized WSAPOLLFD for a live borrowed socket.
-            unsafe { WSAPoll(&mut event, 1, timeout) }
-        };
-        if result > 0 {
-            return Ok(());
+        match poll_socket(socket, write, timeout) {
+            Ok((true, _) | (_, true)) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
-        if result < 0 {
-            let error = native_socket_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+    }
+}
+
+/// Observe completion of a previously started nonblocking TCP connect. A peer
+/// address (notably Winsock's pending destination) is not connection readiness.
+/// This never waits, sleeps, allocates, or changes the socket's blocking mode.
+pub fn tcp_connected(stream: &std::net::TcpStream) -> io::Result<bool> {
+    let socket = socket2::SockRef::from(stream);
+    let (ready, failed) = match poll_socket(&socket, true, 0) {
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(false),
+        result => result?,
+    };
+    if !ready && !failed {
+        return Ok(false);
+    }
+    if let Some(error) = socket.take_error()? {
+        return Err(error);
+    }
+    if failed {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
+    match stream.peer_addr() {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(false)
         }
+        Err(error) => Err(error),
+    }
+}
+
+/// Requested readiness and terminal/error readiness from one bounded native
+/// observation. SO_ERROR belongs to the caller; polling must not consume it.
+fn poll_socket(socket: &Socket, write: bool, timeout: i32) -> io::Result<(bool, bool)> {
+    #[cfg(unix)]
+    let (result, events, requested, failures) = {
+        use std::os::fd::AsRawFd;
+        let mut event = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: if write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd borrowing a retained live socket.
+        let result = unsafe { libc::poll(&mut event, 1, timeout) };
+        (
+            result,
+            event.revents,
+            event.events,
+            libc::POLLERR | libc::POLLHUP | libc::POLLNVAL,
+        )
+    };
+    #[cfg(windows)]
+    let (result, events, requested, failures) = {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM, WSAPOLLFD, WSAPoll,
+        };
+        let mut event = WSAPOLLFD {
+            fd: socket.as_raw_socket() as _,
+            events: if write { POLLWRNORM } else { POLLRDNORM },
+            revents: 0,
+        };
+        // SAFETY: one initialized WSAPOLLFD borrowing a retained live socket.
+        let result = unsafe { WSAPoll(&mut event, 1, timeout) };
+        (
+            result,
+            event.revents,
+            event.events,
+            POLLERR | POLLHUP | POLLNVAL,
+        )
+    };
+    if result < 0 {
+        Err(native_socket_error())
+    } else {
+        Ok((events & requested != 0, events & failures != 0))
     }
 }
 
@@ -415,6 +466,47 @@ pub fn peer_process(socket: &Socket) -> io::Result<u32> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+    #[test]
+    fn tcp_readiness_requires_completed_connect_and_preserves_stream_bytes() {
+        for ip in ["127.0.0.1", "::1"] {
+            let listener = TcpListener::bind((ip, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let socket = Socket::new(
+                Domain::for_address(address),
+                Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let stream: TcpStream = socket.into();
+            assert!(!matches!(tcp_connected(&stream), Ok(true)));
+            let socket = socket2::SockRef::from(&stream);
+            if let Err(error) = socket.connect(&address.into()) {
+                #[cfg(unix)]
+                assert_eq!(error.raw_os_error(), Some(libc::EINPROGRESS));
+                #[cfg(windows)]
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !tcp_connected(&stream).unwrap() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let (mut accepted, _) = listener.accept().unwrap();
+            accepted
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            accepted.write_all(b"ready").unwrap();
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut bytes = [0; 5];
+            (&stream).read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"ready");
+        }
+    }
+
     #[test]
     fn private_endpoint_verifies_kernel_pid_and_rejects_an_alias_directory() {
         // Darwin's per-user TMPDIR plus the fixture nonce can exceed sun_path.

@@ -93,16 +93,13 @@ fn connect(socket: socket2::Socket, address: SocketAddr) -> std::io::Result<TcpS
             return Err(error);
         }
     }
-    // Use the same native postcondition as the gateway. Darwin may return
-    // success from connect/poll without a connected peer, including PF denial.
+    let stream: TcpStream = socket.into();
+    // Exercise the same nonblocking readiness contract as the packet gateway.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if let Some(error) = socket.take_error()? {
-            return Err(error);
-        }
-        if socket.peer_addr().is_ok() {
-            socket.set_nonblocking(false)?;
-            return Ok(socket.into());
+        if sandsurf_native::socket_io::tcp_connected(&stream)? {
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
         }
         if std::time::Instant::now() >= deadline {
             return Err(ErrorKind::TimedOut.into());

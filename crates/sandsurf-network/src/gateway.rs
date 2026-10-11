@@ -809,7 +809,7 @@ impl Worker {
                     remove.push(*key);
                     continue;
                 }
-                match connected(&flow.native) {
+                match sandsurf_native::socket_io::tcp_connected(&flow.native) {
                     Ok(false) => continue,
                     Ok(true) => flow.connecting = false,
                     Err(_) => {
@@ -956,24 +956,6 @@ fn new_tcp_socket(address: SocketAddr) -> io::Result<socket2::Socket> {
     bound_socket_buffers(&socket)?;
     Ok(socket)
 }
-fn connected(stream: &TcpStream) -> io::Result<bool> {
-    if let Some(error) = stream.take_error()? {
-        return Err(error);
-    }
-    match stream.peer_addr() {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotConnected | io::ErrorKind::WouldBlock
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn bound_socket_buffers(socket: &socket2::Socket) -> io::Result<()> {
     socket.set_recv_buffer_size(WINDOW)?;
     socket.set_send_buffer_size(WINDOW)?;
