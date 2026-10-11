@@ -350,6 +350,13 @@ mod tests {
     use super::*;
     struct Pool(std::path::PathBuf);
     impl Pool {
+        #[cfg(windows)]
+        fn new() -> Self {
+            // Windows uses the original native scope, not a Unix custody
+            // pool. Do not add ancestry to already-bounded AF_UNIX names.
+            Self(fs::canonicalize(std::env::temp_dir()).unwrap())
+        }
+        #[cfg(unix)]
         fn new() -> Self {
             let mut nonce = [0_u8; 4];
             getrandom::getrandom(&mut nonce).unwrap();
@@ -369,9 +376,11 @@ mod tests {
     impl Drop for Pool {
         fn drop(&mut self) {
             #[cfg(unix)]
-            let _ = fs::remove_file(self.0.join(POOL_LOCK));
-            // Never recursively remove unexpected test bytes on failure.
-            let _ = fs::remove_dir(&self.0);
+            {
+                let _ = fs::remove_file(self.0.join(POOL_LOCK));
+                // Never recursively remove unexpected test bytes on failure.
+                let _ = fs::remove_dir(&self.0);
+            }
         }
     }
     fn remove_marker(path: &Path) {
