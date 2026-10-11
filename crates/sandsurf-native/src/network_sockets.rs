@@ -249,6 +249,8 @@ pub struct SocketAdmission {
     receipt: Receipt,
     expected: [u8; 8],
     written: usize,
+    transferred: Option<Socket>,
+    acknowledged: usize,
     deadline: Instant,
     finished: bool,
 }
@@ -269,6 +271,8 @@ impl SocketAdmission {
             receipt: Receipt::default(),
             expected: request(ipv6, udp),
             written: 0,
+            transferred: None,
+            acknowledged: 0,
             deadline: Instant::now() + DEADLINE,
             finished: false,
         })
@@ -280,56 +284,70 @@ impl SocketAdmission {
         if Instant::now() >= self.deadline {
             self.finished = true;
             self.receipt.descriptor.take();
+            self.transferred.take();
             return Err(io::ErrorKind::TimedOut.into());
         }
         let result = self.poll_inner();
         if !matches!(result, Ok(None)) {
             self.finished = true;
             self.receipt.descriptor.take();
+            self.transferred.take();
         }
         result
     }
     fn poll_inner(&mut self) -> io::Result<Option<Socket>> {
-        if self.written < self.expected.len() {
-            // SAFETY: retained socket and bounded remaining receipt bytes.
-            let count = unsafe {
-                libc::send(
-                    self.control.as_raw_fd(),
-                    self.expected[self.written..].as_ptr().cast(),
-                    self.expected.len() - self.written,
-                    libc::MSG_NOSIGNAL,
-                )
-            };
-            if count < 0 {
-                let error = io::Error::last_os_error();
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
-            if count == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            self.written += count as usize;
-            if self.written != self.expected.len() {
-                return Ok(None);
-            }
-        }
-        let Some((received, fd)) = self.receipt.poll(&self.control)? else {
+        if !send_progress(&self.control, &self.expected, &mut self.written)? {
             return Ok(None);
-        };
-        if received != self.expected {
-            return Err(invalid("native socket receipt differs from request"));
         }
-        let socket = Socket::from(fd);
-        let (ipv6, udp) = decode(&self.expected)?;
-        verify_socket(&socket, ipv6, udp)?;
-        socket.set_nonblocking(true)?;
-        Ok(Some(socket))
+        if self.transferred.is_none() {
+            let Some((received, fd)) = self.receipt.poll(&self.control)? else {
+                return Ok(None);
+            };
+            if received != self.expected {
+                return Err(invalid("native socket receipt differs from request"));
+            }
+            let socket = Socket::from(fd);
+            let (ipv6, udp) = decode(&self.expected)?;
+            verify_socket(&socket, ipv6, udp)?;
+            socket.set_nonblocking(true)?;
+            self.transferred = Some(socket);
+        }
+        // Darwin's stream-rights disposal can flush a socket still queued in
+        // SCM_RIGHTS when the sender closes. Acknowledge only after the kernel
+        // has installed our original FD and its role has been verified. The
+        // factory retains its original until this bounded handoff completes.
+        if !send_progress(&self.control, &self.expected, &mut self.acknowledged)? {
+            return Ok(None);
+        }
+        Ok(self.transferred.take())
     }
+}
+
+fn send_progress(stream: &UnixStream, bytes: &[u8; 8], offset: &mut usize) -> io::Result<bool> {
+    if *offset == bytes.len() {
+        return Ok(true);
+    }
+    // SAFETY: retained socket and the bounded remaining protocol bytes.
+    let count = unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            bytes[*offset..].as_ptr().cast(),
+            bytes.len() - *offset,
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(false),
+            _ => Err(error),
+        };
+    }
+    if count == 0 {
+        return Err(io::ErrorKind::WriteZero.into());
+    }
+    *offset += count as usize;
+    Ok(*offset == bytes.len())
 }
 
 /// Probe admission with one shared absolute deadline. This is a control-plane
@@ -356,7 +374,7 @@ pub fn probe() -> io::Result<()> {
         };
         wait_ready(
             next.control.as_raw_fd(),
-            if next.written < 8 {
+            if next.written < 8 || next.transferred.is_some() {
                 libc::POLLOUT
             } else {
                 libc::POLLIN
@@ -950,7 +968,26 @@ fn serve_connection(
     }
     let (ipv6, udp) = decode(&value)?;
     let socket = marked_socket(ipv6, udp)?;
-    send(&stream, &value, &socket, deadline)
+    handoff(&mut stream, &value, &socket, deadline)
+}
+
+fn handoff(
+    stream: &mut UnixStream,
+    value: &[u8; 8],
+    socket: &Socket,
+    deadline: Instant,
+) -> io::Result<()> {
+    send(stream, value, socket, deadline)?;
+    let mut acknowledged = [0; 8];
+    DeadlineIo {
+        stream,
+        deadline: Some(deadline),
+    }
+    .read_exact(&mut acknowledged)?;
+    if acknowledged != *value {
+        return Err(invalid("native socket custody acknowledgement differs"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1053,6 +1090,8 @@ mod tests {
             receipt: Receipt::default(),
             expected,
             written: 8,
+            transferred: None,
+            acknowledged: 0,
             deadline: Instant::now() + Duration::from_millis(250),
             finished: false,
         };
@@ -1093,6 +1132,140 @@ mod tests {
         } else {
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
+        assert!(admission.poll().is_err());
+    }
+
+    #[test]
+    fn custody_handoff_retains_the_sender_until_receiver_acknowledges_installed_fd() {
+        let (mut writer, control) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        control.set_nonblocking(true).unwrap();
+        let expected = request(false, false);
+        let deadline = Instant::now() + DEADLINE;
+        let (done, observed) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let original = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+            let result = handoff(&mut writer, &expected, &original, deadline);
+            drop(original);
+            drop(writer);
+            done.send(result).unwrap();
+        });
+        let (received, fd) = receive(&control, deadline).unwrap();
+        assert_eq!(received, expected);
+        assert!(matches!(
+            observed.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        // Role verification is covered by the installed factory tests; here
+        // supply an ordinary socket at that completed phase to isolate custody.
+        let mut admission = SocketAdmission {
+            control,
+            receipt: Receipt::default(),
+            expected,
+            written: 8,
+            transferred: Some(Socket::from(fd)),
+            acknowledged: 0,
+            deadline,
+            finished: false,
+        };
+        let socket = loop {
+            if let Some(socket) = admission.poll().unwrap() {
+                break socket;
+            }
+            std::thread::yield_now();
+        };
+        observed.recv_timeout(DEADLINE).unwrap().unwrap();
+        owner.join().unwrap();
+        assert!(admission.poll().is_err());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket
+            .connect_timeout(
+                &listener.local_addr().unwrap().into(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.write_all(b"retained").unwrap();
+        let mut socket: std::net::TcpStream = socket.into();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = [0; 8];
+        socket.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"retained");
+    }
+
+    #[test]
+    fn wrong_or_incomplete_custody_acknowledgement_never_completes_handoff() {
+        for complete in [false, true] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            writer.set_nonblocking(true).unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let expected = request(false, true);
+            let owner = std::thread::spawn(move || {
+                let original = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+                handoff(
+                    &mut writer,
+                    &expected,
+                    &original,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap_err()
+                .kind()
+            });
+            let (_received, _fd) = receive(&reader, Instant::now() + DEADLINE).unwrap();
+            if complete {
+                reader.write_all(&[0; 8]).unwrap();
+            } else {
+                reader.write_all(&expected[..3]).unwrap();
+            }
+            assert_eq!(
+                owner.join().unwrap(),
+                if complete {
+                    io::ErrorKind::InvalidData
+                } else {
+                    io::ErrorKind::TimedOut
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn backpressured_custody_acknowledgement_keeps_one_deadline_and_never_blocks() {
+        let (_reader, mut control) = UnixStream::pair().unwrap();
+        control.set_nonblocking(true).unwrap();
+        let mut filled = 0;
+        loop {
+            match control.write(&[0; 1]) {
+                Ok(count) => {
+                    filled += count;
+                    assert!(filled < 4 * 1024 * 1024);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                result => panic!("unexpected native pipe fill: {result:?}"),
+            }
+        }
+        let original = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let mut admission = SocketAdmission {
+            control,
+            receipt: Receipt::default(),
+            expected: request(false, false),
+            written: 8,
+            transferred: Some(original),
+            acknowledged: 0,
+            deadline: Instant::now() + DEADLINE,
+            finished: false,
+        };
+        let start = Instant::now();
+        assert!(admission.poll().unwrap().is_none());
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert!(admission.transferred.is_some());
+        admission.deadline = Instant::now();
+        assert_eq!(
+            admission.poll().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(admission.transferred.is_none());
         assert!(admission.poll().is_err());
     }
 

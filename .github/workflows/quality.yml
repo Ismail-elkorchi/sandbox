@@ -204,31 +204,9 @@ jobs:
           cargo build --locked -p sandsurf-host
           codesign --force --sign - --options runtime target/debug/sandsurf-host
           sudo install -o root -g wheel -m 0755 target/debug/sandsurf-host /usr/local/libexec/sandsurf/sandsurf-host-macos-arm64
-          ls -lde /usr/local /usr/local/libexec /usr/local/libexec/sandsurf /private/var/run /private/var/db
-          sudo pfctl -vvsn
-          sudo pfctl -s Anchors
-          sudo pfctl -ss
           test_binary=$(cargo test --locked -p sandsurf-native --test darwin_network_boundary --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "darwin_network_boundary" and .profile.test == true) | .executable')
           test -n "$test_binary"
-          # Bounded header-only diagnostics distinguish native delivery errors
-          # from HTTP fixture failures. No application payload is printed.
-          sudo python3 -c '
-          import subprocess
-          try:
-              subprocess.run(["tcpdump", "-l", "-nn", "-i", "any", "-s", "96", "-c", "128", "tcp port 80"], timeout=15, check=True)
-          except subprocess.TimeoutExpired:
-              pass
-          ' > "$RUNNER_TEMP/sandsurf-tcp.log" 2>&1 &
-          capture=$!
-          result=0
-          sudo env RUNNER_ENVIRONMENT=github-hosted "$test_binary" --ignored --test-threads=1 || result=$?
-          wait "$capture" || true
-          if test "$result" != 0; then
-            sed -n '1,160p' "$RUNNER_TEMP/sandsurf-tcp.log"
-            sudo pfctl -vvsr
-            sudo pfctl -ss
-          fi
-          exit "$result"
+          sudo env RUNNER_ENVIRONMENT=github-hosted "$test_binary" --ignored --test-threads=1
 
   windows:
     runs-on: windows-2025

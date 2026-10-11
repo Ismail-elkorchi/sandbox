@@ -16,10 +16,12 @@
 int sandsurf_darwin_network_socket_identity(int descriptor)
 {
     /* XNU soo_stat reports the same immutable so_cred UID used by PF's
-     * in_pcblookup_hash_exists. Check the original socket, not its owner PID. */
+     * in_pcblookup_hash_exists. Its mode also exposes a prematurely shut-down
+     * read/write side. Admission requires a fresh full-duplex original. */
     struct stat original;
     if (fstat(descriptor, &original) != 0) return -1;
-    if (!S_ISSOCK(original.st_mode) || original.st_uid != SANDSURF_NETWORK_UID) {
+    if (!S_ISSOCK(original.st_mode) || original.st_uid != SANDSURF_NETWORK_UID ||
+        (original.st_mode & 0666) != 0666) {
         errno = EACCES;
         return -1;
     }

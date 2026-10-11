@@ -91,7 +91,6 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
 }
 
 fn connect(socket: socket2::Socket, address: SocketAddr) -> std::io::Result<TcpStream> {
-    describe(&socket, "before connect");
     if let Err(error) = socket.connect(&address.into()) {
         #[cfg(unix)]
         let pending = error.raw_os_error() == Some(libc::EINPROGRESS);
@@ -107,7 +106,6 @@ fn connect(socket: socket2::Socket, address: SocketAddr) -> std::io::Result<TcpS
     loop {
         if sandsurf_native::socket_io::tcp_connected(&stream)? {
             stream.set_nonblocking(false)?;
-            describe(&socket2::SockRef::from(&stream), "connected");
             return Ok(stream);
         }
         if std::time::Instant::now() >= deadline {
@@ -121,11 +119,8 @@ fn http(mut stream: TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     stream.write_all(b"HEAD / HTTP/1.0\r\nHost: github.com\r\n\r\n")?;
-    describe(&socket2::SockRef::from(&stream), "before read");
     let mut response = [0; 5];
-    let result = stream.read_exact(&mut response);
-    describe(&socket2::SockRef::from(&stream), "after read");
-    result?;
+    stream.read_exact(&mut response)?;
     if &response != b"HTTP/" {
         return Err(ErrorKind::InvalidData.into());
     }
@@ -137,7 +132,6 @@ fn admit(ipv6: bool, udp: bool) -> socket2::Socket {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         if let Some(socket) = admission.poll().unwrap() {
-            describe(&socket, "admitted");
             assert!(
                 admission.poll().is_err(),
                 "completed admission replayed its handle"
@@ -150,24 +144,4 @@ fn admit(ipv6: bool, udp: bool) -> socket2::Socket {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-}
-
-fn describe(socket: &socket2::Socket, stage: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        // SAFETY: exact initialized native stat output for a borrowed socket.
-        let mut state: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: retained socket and writable native stat output.
-        assert_eq!(unsafe { libc::fstat(socket.as_raw_fd(), &mut state) }, 0);
-        eprintln!(
-            "{stage}: fd={} mode={:o} uid={} recv_buffer={:?}",
-            socket.as_raw_fd(),
-            state.st_mode,
-            state.st_uid,
-            socket.recv_buffer_size()
-        );
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (socket, stage);
 }

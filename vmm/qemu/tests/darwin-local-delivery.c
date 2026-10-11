@@ -54,6 +54,10 @@ static int restricted_socket(int family, int type)
         header->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(header), &descriptor, sizeof(descriptor));
         require(sendmsg(channel[1], &message, 0) == 1, "original socket transfer");
+        struct pollfd acknowledged = {.fd = channel[1], .events = POLLIN};
+        require(poll(&acknowledged, 1, 3000) == 1, "custody acknowledgement deadline");
+        require(recv(channel[1], &payload, 1, 0) == 1 && payload == 1,
+                "receiver owns the original before creator closes");
         close(descriptor);
         close(channel[1]);
         _exit(0);
@@ -78,6 +82,7 @@ static int restricted_socket(int family, int type)
     int descriptor = -1;
     memcpy(&descriptor, CMSG_DATA(header), sizeof(descriptor));
     require(descriptor >= 0 && fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0, "private socket receipt");
+    require(send(channel[0], &payload, 1, 0) == 1, "acknowledge installed original custody");
     close(channel[0]);
     int status = 0;
     require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
