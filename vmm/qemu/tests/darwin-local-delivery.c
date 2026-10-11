@@ -32,7 +32,7 @@ static void require(int condition, const char *message)
 static int restricted_socket(int family, int type)
 {
     int channel[2];
-    require(socketpair(AF_UNIX, SOCK_DGRAM, 0, channel) == 0, "factory channel");
+    require(socketpair(AF_UNIX, SOCK_STREAM, 0, channel) == 0, "factory channel");
     pid_t child = fork();
     require(child >= 0, "factory fork");
     if (child == 0) {
