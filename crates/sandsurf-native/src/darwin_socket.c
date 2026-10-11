@@ -13,6 +13,19 @@
 
 #define SANDSURF_NETWORK_UID 65530
 
+int sandsurf_darwin_network_socket_identity(int descriptor)
+{
+    /* XNU soo_stat reports the same immutable so_cred UID used by PF's
+     * in_pcblookup_hash_exists. Check the original socket, not its owner PID. */
+    struct stat original;
+    if (fstat(descriptor, &original) != 0) return -1;
+    if (!S_ISSOCK(original.st_mode) || original.st_uid != SANDSURF_NETWORK_UID) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
 int sandsurf_darwin_network_socket(int family, int type, int protocol)
 {
     if (!((family == AF_INET || family == AF_INET6) &&
@@ -36,6 +49,11 @@ int sandsurf_darwin_network_socket(int family, int type, int protocol)
     int descriptor = socket(family, type, protocol);
     int saved = errno;
     if (seteuid(0) != 0) _exit(70);
+    if (descriptor >= 0 && sandsurf_darwin_network_socket_identity(descriptor) != 0) {
+        saved = errno;
+        close(descriptor);
+        descriptor = -1;
+    }
     errno = saved;
     return descriptor;
 }

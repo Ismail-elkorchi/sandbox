@@ -84,6 +84,7 @@ mod native {
     // initialized audit-token envelopes. No request selects paths or PIDs.
     unsafe extern "C" {
         pub(super) fn sandsurf_darwin_network_socket(family: i32, kind: i32, protocol: i32) -> i32;
+        pub(super) fn sandsurf_darwin_network_socket_identity(descriptor: i32) -> i32;
         pub(super) fn sandsurf_darwin_peer_identity(socket: i32, identity: *mut u32) -> i32;
         pub(super) fn sandsurf_darwin_peer_alive(identity: *const u32) -> i32;
         pub(super) fn sandsurf_darwin_running_executable() -> i32;
@@ -95,6 +96,13 @@ mod native {
             Ok(value)
         }
     }
+}
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_socket(socket: &socket2::Socket) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: borrowed original descriptor; the SDK shim performs only fstat.
+    native::result(unsafe { native::sandsurf_darwin_network_socket_identity(socket.as_raw_fd()) })?;
+    Ok(())
 }
 #[cfg(target_os = "macos")]
 pub(crate) fn socket(ipv6: bool, udp: bool) -> io::Result<socket2::Socket> {

@@ -486,6 +486,7 @@ fn marked_socket(ipv6: bool, udp: bool) -> io::Result<Socket> {
 
 #[cfg(target_os = "macos")]
 fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
+    crate::darwin_network::verify_socket(socket)?;
     if scalar(socket, libc::SO_TYPE)?
         != if udp {
             libc::SOCK_DGRAM
@@ -502,8 +503,8 @@ fn verify_socket(socket: &Socket, ipv6: bool, udp: bool) -> io::Result<()> {
     {
         return Err(invalid("connected or wrong native socket role"));
     }
-    // Darwin has no socket-UID query. The original protected root owner's
-    // exact SDK creator captures UID 65530; PF checks it at actual delivery.
+    // The transferred original has the same immutable UID that PF checks at
+    // actual delivery. A valid role alone cannot authenticate that restriction.
     Ok(())
 }
 #[cfg(target_os = "macos")]
@@ -1328,10 +1329,9 @@ mod tests {
             received.local_addr().unwrap(),
             original.local_addr().unwrap()
         );
-        #[cfg(target_os = "linux")]
         assert!(
             verify_socket(&received, false, true).is_err(),
-            "unmarked socket was accepted"
+            "unrestricted socket was accepted"
         );
     }
     #[test]
