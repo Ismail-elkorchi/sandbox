@@ -1,6 +1,6 @@
 use sandsurf_native::network_sockets::{SocketAdmission, probe};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
@@ -65,35 +65,62 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
         .filter(|v| v.is_ipv4())
         .take(4)
     {
-        let socket = admit(false, false);
-        if socket
-            .connect_timeout(&address.into(), Duration::from_secs(3))
-            .is_ok()
-        {
-            socket.set_nonblocking(false).unwrap();
-            let mut stream: TcpStream = socket.into();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            if stream
-                .write_all(b"HEAD / HTTP/1.0\r\nHost: github.com\r\n\r\n")
-                .is_ok()
-            {
-                let mut response = [0; 5];
-                if stream.read_exact(&mut response).is_ok() && &response == b"HTTP/" {
-                    connected = true;
-                    break;
-                }
-            }
+        let ordinary = TcpStream::connect_timeout(&address, Duration::from_secs(3)).and_then(http);
+        eprintln!("public {address}: ordinary={ordinary:?}");
+        if ordinary.is_err() {
+            continue;
+        }
+        let restricted = connect(admit(false, false), address).and_then(http);
+        eprintln!("public {address}: restricted={restricted:?}");
+        if restricted.is_ok() {
+            connected = true;
+            break;
         }
     }
     assert!(
         connected,
         "production network identity could not exchange bytes over public TCP"
     );
+}
+
+fn connect(socket: socket2::Socket, address: SocketAddr) -> std::io::Result<TcpStream> {
+    if let Err(error) = socket.connect(&address.into()) {
+        #[cfg(unix)]
+        let pending = error.raw_os_error() == Some(libc::EINPROGRESS);
+        #[cfg(windows)]
+        let pending = error.kind() == ErrorKind::WouldBlock;
+        if !pending {
+            return Err(error);
+        }
+    }
+    // Use the same native postcondition as the gateway. Darwin may return
+    // success from connect/poll without a connected peer, including PF denial.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(error) = socket.take_error()? {
+            return Err(error);
+        }
+        if socket.peer_addr().is_ok() {
+            socket.set_nonblocking(false)?;
+            return Ok(socket.into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn http(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.write_all(b"HEAD / HTTP/1.0\r\nHost: github.com\r\n\r\n")?;
+    let mut response = [0; 5];
+    stream.read_exact(&mut response)?;
+    if &response != b"HTTP/" {
+        return Err(ErrorKind::InvalidData.into());
+    }
+    Ok(())
 }
 
 fn admit(ipv6: bool, udp: bool) -> socket2::Socket {
