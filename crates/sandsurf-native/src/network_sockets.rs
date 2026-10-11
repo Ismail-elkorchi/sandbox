@@ -736,11 +736,10 @@ fn inspect_rules_until(deadline: Instant) -> io::Result<Digest> {
         let tool = crate::filesystem::protected_tool(&["/sbin/pfctl"])?;
         let rules = rule_output(&tool, &["-vvsr"], deadline)?;
         let nat = rule_output(&tool, &["-vvsn"], deadline)?;
-        let anchors = rule_output(&tool, &["-s", "Anchors"], deadline)?;
         let states = rule_output(&tool, &["-ss"], deadline)?;
         let info = rule_output(&tool, &["-si"], deadline)?;
         let interfaces = rule_output(&tool, &["-s", "Interfaces", "-v"], deadline)?;
-        crate::darwin_network::verify_policy(&rules, &nat, &anchors, &states, &info, &interfaces)
+        crate::darwin_network::verify_policy(&rules, &nat, &states, &info, &interfaces)
     }
     #[cfg(target_os = "linux")]
     {

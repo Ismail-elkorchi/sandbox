@@ -29,6 +29,17 @@ if (-not $Worker) {
     $NpmCli = Join-Path (Split-Path $NodeExecutable) 'node_modules/npm/bin/npm-cli.js'
     Require-Path $NodeExecutable 'Leaf'
     Require-Path $NpmCli 'Leaf'
+    if ($Contract -eq 'sdk') {
+      # Compile as the build account. The independent test owner needs only
+      # the resulting SDK/fixtures, never this account's Rustup configuration.
+      Push-Location -LiteralPath $repository
+      try {
+        & $NodeExecutable $NpmCli 'run' 'build:test'
+        if ($LASTEXITCODE -ne 0) { throw 'Source test fixture compilation failed' }
+      } finally {
+        Pop-Location
+      }
+    }
     $arguments += " -NodeExecutable `"$NodeExecutable`" -NpmCli `"$NpmCli`""
   }
   $task = 'SandsurfContract-' + [Guid]::NewGuid().ToString('N')
@@ -74,8 +85,11 @@ try {
     Require-Path $NpmCli 'Leaf'
     $env:PATH = (Split-Path $NodeExecutable) + ';' + $env:PATH
     $env:NODE_OPTIONS = '--max-old-space-size=512'
-    $script = if ($Contract -eq 'package') { 'test:package' } else { 'test:ts' }
-    & $NodeExecutable $NpmCli 'run' $script *> $log
+    if ($Contract -eq 'package') {
+      & $NodeExecutable $NpmCli 'run' 'test:package' *> $log
+    } else {
+      & $NodeExecutable '--test' '--test-concurrency=1' 'packages/sandsurf/test/*.test.mjs' *> $log
+    }
   }
   $code = $LASTEXITCODE
   if ($null -eq $code) { throw 'The contract process has no exit status' }

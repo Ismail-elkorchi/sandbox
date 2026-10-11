@@ -15,7 +15,6 @@ const FILTER: [&str; 5] = [
 pub(crate) fn verify_policy(
     rules: &[u8],
     nat: &[u8],
-    anchors: &[u8],
     states: &[u8],
     info: &[u8],
     interfaces: &[u8],
@@ -26,13 +25,11 @@ pub(crate) fn verify_policy(
         }
         std::str::from_utf8(bytes).map_err(|_| invalid("PF observation is not UTF-8"))
     }
-    if !text(nat)?.trim().is_empty()
-        || !text(anchors)?.trim().is_empty()
-        || !text(states)?.trim().is_empty()
-    {
-        return Err(invalid(
-            "PF has additional translation, anchors or cached state",
-        ));
+    if !text(nat)?.trim().is_empty() {
+        return Err(invalid("PF has additional translation"));
+    }
+    if !text(states)?.trim().is_empty() {
+        return Err(invalid("PF has cached state"));
     }
     let mut observed = Vec::new();
     for line in text(rules)?
@@ -57,6 +54,8 @@ pub(crate) fn verify_policy(
         }
         return Err(invalid("PF filter observation has an unknown clause"));
     }
+    // The entire active root policy is closed: no rule can call an anchor.
+    // Dormant named anchors are not reachable policy and confer no authority.
     if observed != FILTER {
         return Err(invalid(
             "PF filter is not the exclusive stateless socket-origin boundary",
@@ -163,29 +162,30 @@ mod tests {
         let info = b"Status: Enabled for 0 days 00:00:01 Debug: Urgent\n";
         let interfaces = b"ALL\nen0\nlo0\n";
         assert_eq!(
-            verify_policy(&rules, b"", b"", b"", info, interfaces).unwrap(),
+            verify_policy(&rules, b"", b"", info, interfaces).unwrap(),
             bytes_digest(PF_RULES.as_bytes())
         );
-        for slot in 0..3 {
-            let mut extras: [&[u8]; 3] = [b"", b"", b""];
+        for slot in 0..2 {
+            let mut extras: [&[u8]; 2] = [b"", b""];
             extras[slot] = b"additional authority";
-            assert!(
-                verify_policy(&rules, extras[0], extras[1], extras[2], info, interfaces).is_err()
-            );
+            assert!(verify_policy(&rules, extras[0], extras[1], info, interfaces).is_err());
         }
-        assert!(verify_policy(&rules, b"", b"", b"", b"Status: Disabled", interfaces).is_err());
-        assert!(verify_policy(&rules, b"", b"", b"", info, b"ALL\nlo0\n  skip\n").is_err());
-        assert!(verify_policy(&rules, b"", b"", b"", info, b"ALL\nen0\n").is_err());
+        assert!(verify_policy(&rules, b"", b"", b"Status: Disabled", interfaces).is_err());
+        assert!(verify_policy(&rules, b"", b"", info, b"ALL\nlo0\n  skip\n").is_err());
+        assert!(verify_policy(&rules, b"", b"", info, b"ALL\nen0\n").is_err());
         let changed = String::from_utf8(rules.clone())
             .unwrap()
             .replace("no state", "keep state");
-        assert!(verify_policy(changed.as_bytes(), b"", b"", b"", info, interfaces).is_err());
+        assert!(verify_policy(changed.as_bytes(), b"", b"", info, interfaces).is_err());
         let mut extra = rules.clone();
         extra.extend_from_slice(b"\n@5 pass all keep state");
-        assert!(verify_policy(&extra, b"", b"", b"", info, interfaces).is_err());
+        assert!(verify_policy(&extra, b"", b"", info, interfaces).is_err());
+        let mut anchor = rules.clone();
+        anchor.extend_from_slice(b"\n@5 anchor \"com.apple/*\" all");
+        assert!(verify_policy(&anchor, b"", b"", info, interfaces).is_err());
         let mut state = rules;
         state.extend_from_slice(b"\n[ Evaluations: 0 States: 1     ]");
-        assert!(verify_policy(&state, b"", b"", b"", info, interfaces).is_err());
+        assert!(verify_policy(&state, b"", b"", info, interfaces).is_err());
         assert!(PF_RULES.contains("user 65530"));
     }
 }

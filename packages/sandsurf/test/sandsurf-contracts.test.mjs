@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { before, test } from "node:test";
@@ -249,8 +250,7 @@ test("execution outcomes are closed unions and receipts retain their exact hash-
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const fixture = resolve(root, `target/debug/examples/contract_fixture${process.platform === "win32" ? ".exe" : ""}`);
 before(() => {
-  const built = spawnSync("cargo", ["build", "--locked", "-p", "sandsurf-protocol", "--example", "contract_fixture"], { cwd: root, encoding: "utf8", timeout: 120_000 });
-  assert.equal(built.status, 0, built.stderr);
+  assert(statSync(fixture).isFile(), "Build source fixtures with npm run build:test before executing contracts");
 });
 function native(mode, input, ...args) { return spawnSync(fixture, [mode, ...args], { input, maxBuffer: 1024 * 1024, timeout: 10_000 }); }
 
