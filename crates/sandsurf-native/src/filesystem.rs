@@ -49,7 +49,12 @@ pub fn require_protected_ancestors(path: &Path) -> io::Result<()> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "private state ancestor permits foreign path replacement",
+                format!(
+                    "private state ancestor {} permits foreign path replacement (uid {}, mode {:o})",
+                    ancestor.display(),
+                    metadata.uid(),
+                    metadata.mode() & 0o7777
+                ),
             ));
         }
         #[cfg(target_os = "macos")]

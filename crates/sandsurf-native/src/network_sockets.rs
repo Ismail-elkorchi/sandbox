@@ -1,9 +1,9 @@
 //! Unix socket factory for the external packet gateway. The privileged owner
-//! makes ordinary TCP/UDP sockets bearing a fixed restrictive packet mark and
-//! exposes bounded observations of its original ELF and verified kernel rule.
+//! makes ordinary TCP/UDP sockets bearing a restrictive native identity and
+//! exposes bounded observations of its original executable and kernel rule.
 //! It accepts no destination, pathname, PID, executable, or application grant.
-//! A separately operator-installed nftables INPUT rule rejects marked packets
-//! at actual local delivery, including after address/route/NAT changes. Guest
+//! Operator-installed nftables/PF policy rejects actual local delivery,
+//! including after address/route changes. Guest
 //! packets never become host raw sockets. Host-owned allow policy remains in
 //! sandsurf-network; this module is not a second authorization database.
 use crate::unix_io::{DeadlineIo, wait_ready};
@@ -32,11 +32,11 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 pub const ROOT: &str = "/run/sandsurf-network";
 #[cfg(target_os = "macos")]
-pub const ROOT: &str = "/private/var/run/sandsurf-network";
+pub const ROOT: &str = "/private/var/db/sandsurf-network";
 #[cfg(target_os = "linux")]
 const ENDPOINT: &str = "/run/sandsurf-network/sockets.sock";
 #[cfg(target_os = "macos")]
-const ENDPOINT: &str = "/private/var/run/sandsurf-network/sockets.sock";
+const ENDPOINT: &str = "/private/var/db/sandsurf-network/sockets.sock";
 #[cfg(target_os = "linux")]
 pub const MARK: u32 = 0x53534601;
 const DEADLINE: Duration = Duration::from_secs(2);

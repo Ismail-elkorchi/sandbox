@@ -61,7 +61,9 @@ static void cannot_use_ip(int family, int type)
 int main(int argc, char **argv)
 {
     argc = sandsurf_qemu_enter(argc, &argv);
-    assert(argc == 8 && argv[argc] == NULL);
+    assert(argc == 9 && argv[argc] == NULL);
+    cannot_open(argv[8], O_WRONLY);
+    assert(unlink(argv[8]) == -1 && (errno == EPERM || errno == EACCES));
     int disk = open(argv[1], O_RDWR);
     assert(disk >= 0 && pwrite(disk, "D", 1, 0) == 1 && fsync(disk) == 0);
     close(disk);

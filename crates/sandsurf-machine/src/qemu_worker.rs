@@ -109,6 +109,12 @@ impl QemuWorker {
         let config = &sealed;
         #[cfg(target_os = "macos")]
         let mut endpoints = Endpoints::create()?;
+        #[cfg(target_os = "macos")]
+        let custody = {
+            let mut custody = custody;
+            custody.push(endpoints.custody());
+            custody
+        };
         #[cfg(windows)]
         let mut endpoints = Endpoints::for_vmm(isolation.namespace())?;
         let mut arguments = config.arguments(endpoints.path())?;

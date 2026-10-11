@@ -92,6 +92,12 @@ impl Files {
             quoted(&endpoints)?
         )
         .unwrap();
+        writeln!(
+            profile,
+            "(deny file-write* (literal {}))",
+            quoted(&endpoints.join(crate::socket_io::NAMESPACE_LEASE))?
+        )
+        .unwrap();
         for operation in ["network-bind", "network-inbound"] {
             writeln!(
                 profile,

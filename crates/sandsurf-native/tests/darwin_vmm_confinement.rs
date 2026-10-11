@@ -35,6 +35,8 @@ fn actual_vmm_gate_denies_host_files_and_network_outside_its_footprint() {
     let capture = operation.join("snapshot.vmstate");
     let record = operation.join("capture.json");
     let endpoint = endpoints.join("control.sock");
+    let endpoint_lease = endpoints.join(sandsurf_native::socket_io::NAMESPACE_LEASE);
+    let _endpoint_custody = sandsurf_native::storage::disk_lease(&endpoint_lease).unwrap();
     let other = root.join("unrelated.sock");
     let unrelated = UnixListener::bind(&other).unwrap();
     let profile = Files {
@@ -49,9 +51,18 @@ fn actual_vmm_gate_denies_host_files_and_network_outside_its_footprint() {
     let custody = Arc::new(sandsurf_native::storage::disk_lease(&lease_path).unwrap());
     let mut arguments = vec!["--sandsurf-seatbelt".into(), profile.into()];
     arguments.extend(
-        [&disk, &input, &hidden, &capture, &record, &endpoint, &other]
-            .into_iter()
-            .map(|path| path.as_os_str().to_owned()),
+        [
+            &disk,
+            &input,
+            &hidden,
+            &capture,
+            &record,
+            &endpoint,
+            &other,
+            &endpoint_lease,
+        ]
+        .into_iter()
+        .map(|path| path.as_os_str().to_owned()),
     );
     let mut worker = launch_vm(
         ProcessBudget {
@@ -100,7 +111,16 @@ fn actual_vmm_gate_denies_host_files_and_network_outside_its_footprint() {
     drop(worker);
     drop(unrelated);
     // Exact small test-owned objects only; no VM or retained agent data.
-    for path in [disk, input, hidden, capture, endpoint, other, lease_path] {
+    for path in [
+        disk,
+        input,
+        hidden,
+        capture,
+        endpoint,
+        other,
+        lease_path,
+        endpoint_lease,
+    ] {
         fs::remove_file(path).unwrap();
     }
     for directory in [operation, captures, endpoints, root] {

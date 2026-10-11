@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Original Unix namespace custody, never a file the VMM may replace or unlink.
+pub const NAMESPACE_LEASE: &str = ".owner";
+
 enum DirectoryRole {
     Private(crate::local::Directory),
     #[cfg(windows)]
