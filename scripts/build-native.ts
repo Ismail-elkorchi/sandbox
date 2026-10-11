@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { captureCommand } from "./capture-command.ts";
 import { dirname, resolve } from "node:path";
@@ -75,6 +75,9 @@ try {
     }
   }
   if (nativePlatform === "macos") {
+    await replaceArtifact(resolve(repository, "vmm/darwin/network-boundary.pf"), resolve(payload, "network-boundary.pf"), 0o644);
+    const service = await readFile(resolve(repository, "vmm/darwin/org.sandsurf.network.plist"), "utf8");
+    await writeFile(resolve(payload, "org.sandsurf.network.plist"), service.replaceAll("@ARCH@", architecture), { flag: "wx", mode: 0o644 });
     await run("/usr/bin/codesign", ["--force", "--sign", "-", "--options", "runtime", destination], {});
     const broker = resolve(payload, "sandsurf-resource-broker");
     await replaceArtifact(resolve(repository, "target", ...(target === undefined ? [] : [target]),

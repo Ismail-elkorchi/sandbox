@@ -13,7 +13,7 @@ export const releasePlatforms = ["linux-x64", "linux-arm64", "macos-x64", "macos
 function payload(platform: typeof releasePlatforms[number], runtime: readonly string[] = []): string[] {
   const architecture = platform.endsWith("arm64") ? "arm64" : "x64";
   const host = `sandsurf-host-${platform}${platform.startsWith("windows-") ? ".exe" : ""}`;
-  if (platform.startsWith("macos-")) return [host, "sandsurf-resource-broker", "qemu-runtime.json", "qemu-build.json", ...runtime];
+  if (platform.startsWith("macos-")) return [host, "sandsurf-resource-broker", "network-boundary.pf", "org.sandsurf.network.plist", "qemu-runtime.json", "qemu-build.json", ...runtime];
   if (platform.startsWith("linux-")) return [host,
     `firecracker-v1.17.0-${architecture === "x64" ? "x86_64" : "aarch64"}`,
     "firecracker-LICENSE", "firecracker-NOTICE", "firecracker-THIRD-PARTY",

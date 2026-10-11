@@ -36,12 +36,52 @@ fn main() {
             std::hint::black_box(work);
         }
         Some("memory") => {
-            let mut bytes = vec![0u8; 128 * 1024 * 1024];
-            for offset in (0..bytes.len()).step_by(4096) {
-                bytes[offset] = 42;
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            };
+            const MIB: usize = 1024 * 1024;
+            // Test actual committed, writable pages, independent of an
+            // allocator's abort policy or a historical kernel peak counter.
+            // SAFETY: request an OS-owned region, no caller address to overwrite.
+            let excessive = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    128 * MIB,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            if !excessive.is_null() {
+                std::process::exit(99);
             }
-            std::hint::black_box(bytes);
-            std::process::exit(99);
+            let mut allocations = [std::ptr::null_mut(); 65];
+            let mut count = 0;
+            for allocation in &mut allocations {
+                // SAFETY: one newly reserved and committed bounded native region.
+                *allocation = unsafe {
+                    VirtualAlloc(
+                        std::ptr::null(),
+                        MIB,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_READWRITE,
+                    )
+                };
+                if allocation.is_null() {
+                    break;
+                }
+                count += 1;
+                for offset in (0..MIB).step_by(4096) {
+                    // SAFETY: every touched page belongs to this successful allocation.
+                    unsafe { allocation.cast::<u8>().add(offset).write_volatile(42) };
+                }
+            }
+            if count == 0 || count >= 64 {
+                std::process::exit(99);
+            }
+            for allocation in allocations.into_iter().filter(|p| !p.is_null()) {
+                // SAFETY: original complete region, released once after use.
+                assert_ne!(unsafe { VirtualFree(allocation, 0, MEM_RELEASE) }, 0);
+            }
         }
         Some("no-child") => {
             let result = std::process::Command::new(std::env::current_exe().unwrap())

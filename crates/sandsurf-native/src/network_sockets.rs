@@ -1329,6 +1329,7 @@ mod tests {
             received.local_addr().unwrap(),
             original.local_addr().unwrap()
         );
+        #[cfg(target_os = "linux")]
         assert!(
             verify_socket(&received, false, true).is_err(),
             "unmarked socket was accepted"

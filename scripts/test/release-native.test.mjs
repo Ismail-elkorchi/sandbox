@@ -11,8 +11,8 @@ import { assembleNativeRelease, releasePlatforms } from "../assemble-release-nat
 const payloads = {
   "linux-x64": ["sandsurf-host-linux-x64", "firecracker-v1.17.0-x86_64", "firecracker-LICENSE", "firecracker-NOTICE", "firecracker-THIRD-PARTY", "network-boundary.nft", "sandsurf-network.service"],
   "linux-arm64": ["sandsurf-host-linux-arm64", "firecracker-v1.17.0-aarch64", "firecracker-LICENSE", "firecracker-NOTICE", "firecracker-THIRD-PARTY", "network-boundary.nft", "sandsurf-network.service"],
-  "macos-x64": ["sandsurf-host-macos-x64", "sandsurf-resource-broker", "qemu-build.json", ...qemuRequiredInputs("macos-x64"), "lib/libglib.dylib"],
-  "macos-arm64": ["sandsurf-host-macos-arm64", "sandsurf-resource-broker", "qemu-build.json", ...qemuRequiredInputs("macos-arm64"), "lib/libglib.dylib"],
+  "macos-x64": ["sandsurf-host-macos-x64", "sandsurf-resource-broker", "network-boundary.pf", "org.sandsurf.network.plist", "qemu-build.json", ...qemuRequiredInputs("macos-x64"), "lib/libglib.dylib"],
+  "macos-arm64": ["sandsurf-host-macos-arm64", "sandsurf-resource-broker", "network-boundary.pf", "org.sandsurf.network.plist", "qemu-build.json", ...qemuRequiredInputs("macos-arm64"), "lib/libglib.dylib"],
   "windows-x64": ["sandsurf-host-windows-x64.exe", "qemu-build.json", ...qemuRequiredInputs("windows-x64"), "libglib.dll"],
 };
 
@@ -35,7 +35,7 @@ async function fixture(context) {
     }
     if (!platform.startsWith("linux-")) {
       const runtime = Object.fromEntries(Object.entries(files).filter(([key]) =>
-        !/\/(?:sandsurf-host-|sandsurf-resource-broker$|qemu-build\.json$)/u.test(key))
+        !/\/(?:sandsurf-host-|sandsurf-resource-broker$|network-boundary\.pf$|org\.sandsurf\.network\.plist$|qemu-build\.json$)/u.test(key))
         .map(([key, digest]) => [key.slice(platform.length + 1), digest]));
       const bytes = Buffer.from(JSON.stringify({ formatVersion: 1, architecture: platform.endsWith("arm64") ? "arm64" : "amd64",
         qemuVersion: "11.1.2", files: runtime }));

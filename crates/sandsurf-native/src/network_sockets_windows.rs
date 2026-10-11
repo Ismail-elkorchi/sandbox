@@ -2,7 +2,7 @@
 //! unregistered AppContainer identity denies local delivery even after the
 //! originating thread reverts. The gateway still owns all destination policy.
 //! No profile, privileged helper, address cache or socket-transfer protocol.
-use crate::windows_vmm::Sid;
+use crate::windows_security::Sid;
 use socket2::{SockAddr, Socket};
 use std::io;
 use std::mem::size_of;
