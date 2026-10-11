@@ -9,9 +9,12 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
         let tcp = TcpListener::bind((ip, 0)).unwrap();
         tcp.set_nonblocking(true).unwrap();
         let address = tcp.local_addr().unwrap();
-        let mut ordinary = TcpStream::connect(address).unwrap();
+        let mut ordinary = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
         ordinary.write_all(b"control").unwrap();
         let (mut accepted, _) = tcp.accept().unwrap();
+        // Darwin inherits O_NONBLOCK from the listener; SO_RCVTIMEO alone
+        // does not turn a nonblocking accepted socket into a bounded read.
+        accepted.set_nonblocking(false).unwrap();
         accepted
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
