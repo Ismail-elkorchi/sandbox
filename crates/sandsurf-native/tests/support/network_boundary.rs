@@ -22,12 +22,24 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
         accepted.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"control");
         let restricted = admit(address.is_ipv6(), false);
-        assert!(
-            restricted
-                .connect_timeout(&address.into(), Duration::from_secs(1))
-                .is_err()
+        let attempt = restricted.connect(&address.into());
+        eprintln!(
+            "restricted {address}: connect={attempt:?}, peer={:?}",
+            restricted.peer_addr()
         );
-        assert_eq!(tcp.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        let mut restricted: TcpStream = restricted.into();
+        let _ = restricted.write(b"denied");
+        // Packet denial is actual non-delivery, not a library's interpretation
+        // of connect/poll completion. Keep the positive control above intact.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                tcp.accept().unwrap_err().kind(),
+                ErrorKind::WouldBlock,
+                "restricted TCP reached the local listener"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         let udp = UdpSocket::bind((ip, 0)).unwrap();
         udp.set_read_timeout(Some(Duration::from_millis(200)))
@@ -47,7 +59,7 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
     // Denial alone is insufficient: the same native identity must carry real
     // external traffic after the allocation credential has been restored.
     let mut connected = false;
-    for address in ("github.com", 443)
+    for address in ("github.com", 80)
         .to_socket_addrs()
         .unwrap()
         .filter(|v| v.is_ipv4())
@@ -58,13 +70,29 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
             .connect_timeout(&address.into(), Duration::from_secs(3))
             .is_ok()
         {
-            connected = true;
-            break;
+            socket.set_nonblocking(false).unwrap();
+            let mut stream: TcpStream = socket.into();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            if stream
+                .write_all(b"HEAD / HTTP/1.0\r\nHost: github.com\r\n\r\n")
+                .is_ok()
+            {
+                let mut response = [0; 5];
+                if stream.read_exact(&mut response).is_ok() && &response == b"HTTP/" {
+                    connected = true;
+                    break;
+                }
+            }
         }
     }
     assert!(
         connected,
-        "production network identity could not reach public TCP"
+        "production network identity could not exchange bytes over public TCP"
     );
 }
 
