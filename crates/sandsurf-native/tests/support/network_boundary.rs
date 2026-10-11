@@ -65,7 +65,14 @@ pub fn original_sockets_deny_local_delivery_and_allow_public_tcp() {
         .filter(|v| v.is_ipv4())
         .take(4)
     {
-        let ordinary = TcpStream::connect_timeout(&address, Duration::from_secs(3)).and_then(http);
+        let ordinary = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        ordinary.set_nonblocking(true).unwrap();
+        let ordinary = connect(ordinary, address).and_then(http);
         eprintln!("public {address}: ordinary={ordinary:?}");
         if ordinary.is_err() {
             continue;

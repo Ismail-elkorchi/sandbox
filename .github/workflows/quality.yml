@@ -210,7 +210,20 @@ jobs:
           sudo pfctl -ss
           test_binary=$(cargo test --locked -p sandsurf-native --test darwin_network_boundary --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "darwin_network_boundary" and .profile.test == true) | .executable')
           test -n "$test_binary"
-          sudo env RUNNER_ENVIRONMENT=github-hosted "$test_binary" --ignored --test-threads=1
+          # Bounded header-only diagnostics distinguish native delivery errors
+          # from HTTP fixture failures. No application payload is printed.
+          sudo tcpdump -l -nn -i any -s 96 -c 128 'tcp port 80' > "$RUNNER_TEMP/sandsurf-tcp.log" 2>&1 &
+          capture=$!
+          result=0
+          sudo env RUNNER_ENVIRONMENT=github-hosted "$test_binary" --ignored --test-threads=1 || result=$?
+          sudo kill -INT "$capture" 2>/dev/null || true
+          wait "$capture" || true
+          if test "$result" != 0; then
+            sed -n '1,160p' "$RUNNER_TEMP/sandsurf-tcp.log"
+            sudo pfctl -vvsr
+            sudo pfctl -ss
+          fi
+          exit "$result"
 
   windows:
     runs-on: windows-2025
