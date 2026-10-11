@@ -6,12 +6,15 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -183,12 +186,65 @@ static void route_change_contract(void)
     close(restricted);
 }
 
+static int public_exchange(int descriptor, const struct addrinfo *target, const char *role)
+{
+    struct stat original = {0};
+    require(fstat(descriptor, &original) == 0, "original socket state");
+    fprintf(stderr, "%s: mode=%o uid=%u\n", role, (unsigned)original.st_mode, original.st_uid);
+    require(fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0, "public nonblocking connect");
+    int result = connect(descriptor, target->ai_addr, target->ai_addrlen);
+    if (result != 0 && errno != EINPROGRESS) return 0;
+    struct pollfd ready = {.fd = descriptor, .events = POLLOUT};
+    if (poll(&ready, 1, 3000) != 1 || (ready.revents & POLLOUT) == 0) return 0;
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) return 0;
+    require(fcntl(descriptor, F_SETFL, 0) == 0, "public bounded blocking I/O");
+    struct timeval timeout = {.tv_sec = 3};
+    require(setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+            setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0,
+            "public byte exchange deadline");
+    const char request[] = "HEAD / HTTP/1.0\r\nHost: github.com\r\n\r\n";
+    if (send(descriptor, request, sizeof(request) - 1, 0) != (ssize_t)(sizeof(request) - 1)) return 0;
+    char bytes[5];
+    size_t count = 0;
+    while (count < sizeof(bytes)) {
+        ssize_t received = recv(descriptor, bytes + count, sizeof(bytes) - count, 0);
+        fprintf(stderr, "%s: recv=%zd errno=%d\n", role, received, errno);
+        if (received <= 0) return 0;
+        count += (size_t)received;
+    }
+    return memcmp(bytes, "HTTP/", sizeof(bytes)) == 0;
+}
+
+static void public_contract(void)
+{
+    int ordinary = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    require(ordinary >= 0, "ordinary public socket");
+    int direct = sandsurf_darwin_network_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    require(direct >= 0, "direct native socket");
+    int transferred = restricted_socket(AF_INET, SOCK_STREAM);
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *target = NULL;
+    require(getaddrinfo("github.com", "80", &hints, &target) == 0 && target != NULL,
+            "public fixture resolution");
+    int control = public_exchange(ordinary, target, "ordinary");
+    close(ordinary);
+    int local = public_exchange(direct, target, "native original");
+    close(direct);
+    int remote = public_exchange(transferred, target, "native transferred after owner exit");
+    close(transferred);
+    freeaddrinfo(target);
+    require(control && local && remote, "public TCP bytes must survive original owner exit");
+}
+
 int main(void)
 {
     require(getuid() == 0, "disposable runner root is required explicitly");
     local_contract(AF_INET, "127.0.0.1");
     local_contract(AF_INET6, "::1");
     route_change_contract();
+    public_contract();
     puts("original-socket-owner-exit, IPv4/IPv6 TCP/UDP local delivery, and live UDP route transition: passed");
     return 0;
 }
