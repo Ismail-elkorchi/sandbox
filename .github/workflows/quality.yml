@@ -212,11 +212,16 @@ jobs:
           test -n "$test_binary"
           # Bounded header-only diagnostics distinguish native delivery errors
           # from HTTP fixture failures. No application payload is printed.
-          sudo tcpdump -l -nn -i any -s 96 -c 128 'tcp port 80' > "$RUNNER_TEMP/sandsurf-tcp.log" 2>&1 &
+          sudo python3 -c '
+          import subprocess
+          try:
+              subprocess.run(["tcpdump", "-l", "-nn", "-i", "any", "-s", "96", "-c", "128", "tcp port 80"], timeout=15, check=True)
+          except subprocess.TimeoutExpired:
+              pass
+          ' > "$RUNNER_TEMP/sandsurf-tcp.log" 2>&1 &
           capture=$!
           result=0
           sudo env RUNNER_ENVIRONMENT=github-hosted "$test_binary" --ignored --test-threads=1 || result=$?
-          sudo kill -INT "$capture" 2>/dev/null || true
           wait "$capture" || true
           if test "$result" != 0; then
             sed -n '1,160p' "$RUNNER_TEMP/sandsurf-tcp.log"
